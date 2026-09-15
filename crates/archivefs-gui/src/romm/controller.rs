@@ -11,21 +11,21 @@ impl ArchiveFsApp {
         context: egui::Context,
         operation: RommOperation,
     ) -> bool {
-        if let Some(running) = &self.romm_operation {
+        if let Some(running) = &self.romm_ui.operation {
             // A status load asked for while something else runs is dropped rather
             // than queued: the operation that finishes will refresh anyway.
             let _ = running;
             return false;
         }
-        self.romm_generation = self.romm_generation.wrapping_add(1);
-        let generation = self.romm_generation;
+        self.romm_ui.generation = self.romm_ui.generation.wrapping_add(1);
+        let generation = self.romm_ui.generation;
         let cancellation = Arc::new(AtomicBool::new(false));
         let worker_cancellation = cancellation.clone();
         let (sender, receiver) = mpsc::channel();
         let (progress_sender, progress_receiver) = mpsc::channel();
         // A fresh operation supersedes the previous result, so the card never shows
         // an old outcome beside new progress.
-        self.romm_ui.last_outcome = None;
+        self.romm_ui.card.last_outcome = None;
         if operation.is_mutating() {
             self.history.record(HistoryEntry::new(
                 ActivityAction::RommSource,
@@ -34,7 +34,7 @@ impl ArchiveFsApp {
                 format!("{}.", operation.label()),
             ));
         }
-        self.romm_operation = Some(RunningRommOperation {
+        self.romm_ui.operation = Some(RunningRommOperation {
             generation,
             operation: operation.clone(),
             cancellation,
@@ -68,7 +68,7 @@ impl ArchiveFsApp {
     /// Asks the running operation to stop. Only the current one: an older
     /// generation has already been forgotten.
     pub(crate) fn cancel_romm_operation(&mut self) {
-        if let Some(running) = self.romm_operation.as_mut() {
+        if let Some(running) = self.romm_ui.operation.as_mut() {
             running.cancellation.store(true, Ordering::Release);
             running.cancellation_requested = true;
         }
@@ -76,7 +76,7 @@ impl ArchiveFsApp {
 
     pub(crate) fn poll_romm_operation(&mut self, context: &egui::Context) {
         // Progress first, discarding anything from a superseded generation.
-        if let Some(running) = self.romm_operation.as_mut() {
+        if let Some(running) = self.romm_ui.operation.as_mut() {
             let current = running.generation;
             for (generation, event) in running.progress_receiver.try_iter() {
                 if generation != current {
@@ -87,18 +87,18 @@ impl ArchiveFsApp {
                     RommProgressEvent::Import(import) => progress.absorb(import),
                     RommProgressEvent::Note(note) => progress.note(note),
                     RommProgressEvent::StaleProgress { probed, total } => {
-                        self.romm_stale_progress =
+                        self.romm_ui.stale_progress =
                             Some(crate::romm_browse::StaleProgress { probed, total });
                     }
                     RommProgressEvent::Hashing(hashing) => {
-                        self.romm_hash_progress = Some(hashing);
+                        self.romm_ui.hash_progress = Some(hashing);
                     }
                 }
             }
         }
 
         let Some((generation, operation, result)) =
-            self.romm_operation.as_ref().and_then(|running| {
+            self.romm_ui.operation.as_ref().and_then(|running| {
                 running
                     .receiver
                     .try_recv()
@@ -108,30 +108,30 @@ impl ArchiveFsApp {
         else {
             return;
         };
-        if generation != self.romm_generation {
+        if generation != self.romm_ui.generation {
             // A result from an operation that has already been superseded. Dropping
             // it is what stops it overwriting the current one's outcome.
-            self.romm_operation = None;
+            self.romm_ui.operation = None;
             return;
         }
-        self.romm_operation = None;
-        self.romm_hash_progress = None;
+        self.romm_ui.operation = None;
+        self.romm_ui.hash_progress = None;
 
-        let previous_outcome = self.romm_ui.last_outcome.take();
-        let offline_usable = self.romm_snapshot.as_deref().is_some_and(|snapshot| {
+        let previous_outcome = self.romm_ui.card.last_outcome.take();
+        let offline_usable = self.romm_ui.snapshot.as_deref().is_some_and(|snapshot| {
             snapshot.status.state
                 == archivefs_core::identity_source::status::ProviderState::ReadyOffline
         });
-        self.romm_ui.last_outcome = Some(romm_source::build_result_view(
+        self.romm_ui.card.last_outcome = Some(romm_source::build_result_view(
             &operation,
             result.as_ref().map_err(String::as_str),
             offline_usable,
         ));
         if let Ok(RommOperationOutcome::Linkage(report)) = &result {
-            self.romm_ui.linkage_report = Some(report.clone());
+            self.romm_ui.card.linkage_report = Some(report.clone());
         }
         if let Ok(RommOperationOutcome::MappingPlan(plan)) = &result {
-            self.romm_ui.mapping_plan = Some(plan.clone());
+            self.romm_ui.card.mapping_plan = Some(plan.clone());
         }
         if operation.is_mutating() {
             // A failed connection test while imported identity is still being
@@ -170,7 +170,7 @@ impl ArchiveFsApp {
         if let Ok(outcome) = &result {
             let landed = match outcome {
                 RommOperationOutcome::Records(page) => {
-                    match self.romm_browse.as_mut() {
+                    match self.romm_ui.browse.as_mut() {
                         Some(state) => {
                             if state.accepts_page(page, &page.cache) {
                                 state.needs_reload = false;
@@ -188,7 +188,7 @@ impl ArchiveFsApp {
                     }
                 }
                 RommOperationOutcome::RecordDetail(detail) => {
-                    if let Some(state) = self.romm_browse.as_mut() {
+                    if let Some(state) = self.romm_ui.browse.as_mut() {
                         let requested_id = match &operation {
                             RommOperation::LoadRecordDetail { romm_game_id } => romm_game_id,
                             _ => unreachable!("a detail result must come from a detail request"),
@@ -207,7 +207,7 @@ impl ArchiveFsApp {
                     true
                 }
                 RommOperationOutcome::Conflicts(page) => {
-                    if let Some(state) = self.romm_browse.as_mut() {
+                    if let Some(state) = self.romm_ui.browse.as_mut() {
                         if state.accepts_conflicts(page, &page.cache) {
                             state.conflicts = Some(page.clone());
                         } else {
@@ -217,38 +217,38 @@ impl ArchiveFsApp {
                     true
                 }
                 RommOperationOutcome::Stale(view) => {
-                    if let Some(state) = self.romm_browse.as_mut() {
+                    if let Some(state) = self.romm_ui.browse.as_mut() {
                         if state.accepts_stale(view, &view.cache) {
                             state.stale = Some(view.clone());
                         } else {
                             state.needs_reload = true;
                         }
                     }
-                    self.romm_stale_progress = None;
+                    self.romm_ui.stale_progress = None;
                     true
                 }
                 RommOperationOutcome::GameIdentity(panel) => {
-                    if self.romm_game.accepts_panel(panel) {
-                        self.romm_game.panel = Some(panel.clone());
-                        self.romm_game.needs_reload = false;
+                    if self.romm_ui.game.accepts_panel(panel) {
+                        self.romm_ui.game.panel = Some(panel.clone());
+                        self.romm_ui.game.needs_reload = false;
                     } else {
                         // The selection moved while this was in flight. Drawing it
                         // would attach one game's evidence to another's file.
-                        self.romm_game.needs_reload = true;
+                        self.romm_ui.game.needs_reload = true;
                     }
                     true
                 }
                 RommOperationOutcome::Cover(outcome) => {
-                    if self.romm_game.accepts_cover(outcome) {
+                    if self.romm_ui.game.accepts_cover(outcome) {
                         // The texture is dropped here rather than in the renderer, so
                         // a cover cleared mid-fetch cannot leave the old pixels up.
-                        self.romm_game.cover_texture = None;
-                        self.romm_game.cover_key = None;
-                        self.romm_game.cover = outcome.state.clone();
-                        self.romm_game.cover_cache =
+                        self.romm_ui.game.cover_texture = None;
+                        self.romm_ui.game.cover_key = None;
+                        self.romm_ui.game.cover = outcome.state.clone();
+                        self.romm_ui.game.cover_cache =
                             Some((outcome.cached_items, outcome.cached_bytes));
                     }
-                    if let Some(state) = self.romm_browse.as_mut()
+                    if let Some(state) = self.romm_ui.browse.as_mut()
                         && state.accepts_cover(outcome)
                     {
                         state.detail_cover_texture = None;
@@ -260,10 +260,10 @@ impl ArchiveFsApp {
                     true
                 }
                 RommOperationOutcome::Screenshot(outcome) => {
-                    if self.romm_game.accepts_cover(outcome) {
-                        self.romm_game.screenshot_texture = None;
-                        self.romm_game.screenshot_key = None;
-                        self.romm_game.screenshot = outcome.state.clone();
+                    if self.romm_ui.game.accepts_cover(outcome) {
+                        self.romm_ui.game.screenshot_texture = None;
+                        self.romm_ui.game.screenshot_key = None;
+                        self.romm_ui.game.screenshot = outcome.state.clone();
                     }
                     true
                 }
@@ -271,13 +271,13 @@ impl ArchiveFsApp {
             };
             if landed {
                 // Not a card result: browsing produces no outcome banner.
-                self.romm_ui.last_outcome = previous_outcome;
+                self.romm_ui.card.last_outcome = previous_outcome;
                 return;
             }
         }
         if let (RommOperation::LoadRecordDetail { romm_game_id }, Err(message)) =
             (&operation, &result)
-            && let Some(state) = self.romm_browse.as_mut()
+            && let Some(state) = self.romm_ui.browse.as_mut()
             && state.pending_detail_id.as_deref() == Some(romm_game_id)
         {
             state.pending_detail_id = None;
@@ -287,12 +287,12 @@ impl ArchiveFsApp {
             // Both a card result and panel state: the panel inside it was rebuilt
             // from the verification that was just stored, so the verdict on screen is
             // recomputed rather than assumed.
-            if self.romm_game.accepts_verification(outcome) {
-                self.romm_game.panel = Some(outcome.panel.clone());
-                self.romm_game.verification = Some(outcome.clone());
-                self.romm_game.needs_reload = false;
+            if self.romm_ui.game.accepts_verification(outcome) {
+                self.romm_ui.game.panel = Some(outcome.panel.clone());
+                self.romm_ui.game.verification = Some(outcome.clone());
+                self.romm_ui.game.needs_reload = false;
             }
-            self.romm_hash_progress = None;
+            self.romm_ui.hash_progress = None;
         }
         // An import that actually *published* replaced the identity cache, so what any
         // local path resolves to may have changed. Gamer View's worker holds its path
@@ -307,7 +307,7 @@ impl ArchiveFsApp {
         // index.
         if matches!(&result, Ok(RommOperationOutcome::Import(summary)) if summary.published) {
             if let Ok(RommOperationOutcome::Import(summary)) = &result {
-                self.verify_romm_summary = Some(VerifyRommSummary::from_import(summary));
+                self.romm_ui.verify_summary = Some(VerifyRommSummary::from_import(summary));
             }
             // Ready covers become `Revalidating`: their textures are kept so an
             // unchanged record costs no decode, but the placeholder is drawn until
@@ -326,15 +326,15 @@ impl ArchiveFsApp {
         if let Ok(RommOperationOutcome::Preview(summary)) = &result {
             // A preview is only meaningful while the dialog that asked for it is
             // open; if it has been closed, the result is dropped.
-            if self.romm_config_draft.is_some() {
-                self.romm_preview = Some(summary.clone());
+            if self.romm_ui.config_draft.is_some() {
+                self.romm_ui.preview = Some(summary.clone());
             }
         }
         if let Ok(RommOperationOutcome::Saved(_)) = &result {
             // Saved, so the dialog has served its purpose and the card is reloaded
             // from disk rather than from what was typed.
             self.close_romm_configuration();
-            self.verify_romm_summary = None;
+            self.romm_ui.verify_summary = None;
             // This is a deliberate reload boundary. Rendering never reloads the
             // application configuration, and a failed reload retains the previous
             // usable snapshot instead of replacing it with an empty one.
@@ -356,9 +356,9 @@ impl ArchiveFsApp {
         if let Ok(RommOperationOutcome::Snapshot(snapshot)) = &result {
             // The one result that is not a user-visible outcome: it *is* the card's
             // state. A snapshot never overwrites a real result view.
-            self.romm_snapshot = Some(snapshot.clone());
-            self.verify_romm_summary = snapshot.verify_summary;
-            self.romm_ui.last_outcome = previous_outcome;
+            self.romm_ui.snapshot = Some(snapshot.clone());
+            self.romm_ui.verify_summary = snapshot.verify_summary;
+            self.romm_ui.card.last_outcome = previous_outcome;
             return;
         }
         // A mutating operation may have changed what the card shows, so the card is
@@ -373,15 +373,15 @@ impl ArchiveFsApp {
     /// Loads the snapshot. Separate from `start_romm_operation` so it can run
     /// straight after another operation completes.
     pub(crate) fn start_romm_status_load(&mut self, context: egui::Context) {
-        if self.romm_operation.is_some() {
+        if self.romm_ui.operation.is_some() {
             return;
         }
-        self.romm_generation = self.romm_generation.wrapping_add(1);
-        let generation = self.romm_generation;
+        self.romm_ui.generation = self.romm_ui.generation.wrapping_add(1);
+        let generation = self.romm_ui.generation;
         let cancellation = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
         let (_progress_sender, progress_receiver) = mpsc::channel();
-        self.romm_operation = Some(RunningRommOperation {
+        self.romm_ui.operation = Some(RunningRommOperation {
             generation,
             operation: RommOperation::LoadStatus,
             cancellation,
@@ -403,29 +403,29 @@ impl ArchiveFsApp {
     /// Opening it twice is impossible: the draft *is* the open flag, so a second
     /// request while one is open is a no-op rather than a second dialog.
     pub(crate) fn open_romm_configuration(&mut self) {
-        if self.romm_config_draft.is_some() {
+        if self.romm_ui.config_draft.is_some() {
             return;
         }
-        let draft = match self.romm_snapshot.as_deref() {
+        let draft = match self.romm_ui.snapshot.as_deref() {
             Some(snapshot) => RommConfigDraft::from_snapshot(snapshot),
             // A source that has never been configured still needs the dialog - that
             // is the only way it ever gets configured.
             None => RommConfigDraft::blank(),
         };
-        self.romm_config_draft = Some(Box::new(draft));
-        self.romm_preview = None;
+        self.romm_ui.config_draft = Some(Box::new(draft));
+        self.romm_ui.preview = None;
     }
 
     /// Opens the existing safe configuration editor with only the reviewed
     /// RomM mappings changed. The final Save button remains the explicit apply
     /// confirmation and its worker validates the whole configuration again.
     pub(crate) fn open_romm_mapping_plan(&mut self) {
-        if self.romm_config_draft.is_some() {
+        if self.romm_ui.config_draft.is_some() {
             return;
         }
         let (Some(snapshot), Some(plan)) = (
-            self.romm_snapshot.as_deref(),
-            self.romm_ui.mapping_plan.as_deref(),
+            self.romm_ui.snapshot.as_deref(),
+            self.romm_ui.card.mapping_plan.as_deref(),
         ) else {
             return;
         };
@@ -433,8 +433,8 @@ impl ArchiveFsApp {
         proposed.settings.source.mappings = plan.proposed_mappings.clone();
         let mut draft = RommConfigDraft::from_snapshot(&proposed);
         draft.dirty = true;
-        self.romm_config_draft = Some(Box::new(draft));
-        self.romm_preview = None;
+        self.romm_ui.config_draft = Some(Box::new(draft));
+        self.romm_ui.preview = None;
     }
 
     /// Draws the configuration dialog.
@@ -449,20 +449,20 @@ impl ArchiveFsApp {
         let source_roots_result = self.gui_config.source_roots().map(Vec::from);
         let source_roots = source_roots_result.clone().unwrap_or_default();
         let busy = self
-            .romm_operation
+            .romm_ui.operation
             .as_ref()
             .is_some_and(|running| running.operation.blocks_actions());
         let preview_running = self
-            .romm_operation
+            .romm_ui.operation
             .as_ref()
             .is_some_and(|running| matches!(running.operation, RommOperation::Preview { .. }));
         let previous = self
-            .romm_snapshot
+            .romm_ui.snapshot
             .as_deref()
             .map(|snapshot| snapshot.settings.clone());
-        let preview = self.romm_preview.clone();
+        let preview = self.romm_ui.preview.clone();
 
-        let draft = self.romm_config_draft.as_mut()?;
+        let draft = self.romm_ui.config_draft.as_mut()?;
         // The token file's verdict comes from the core loader, and only its verdict:
         // the contents are never read into the GUI.
         let token_state = {
@@ -523,20 +523,20 @@ impl ArchiveFsApp {
             .map(Vec::from)
             .unwrap_or_default();
         let busy = self
-            .romm_operation
+            .romm_ui.operation
             .as_ref()
             .is_some_and(|running| running.operation.blocks_actions());
         let preview_running = self
-            .romm_operation
+            .romm_ui.operation
             .as_ref()
             .is_some_and(|running| matches!(running.operation, RommOperation::Preview { .. }));
         let previous = self
-            .romm_snapshot
+            .romm_ui.snapshot
             .as_deref()
             .map(|snapshot| snapshot.settings.clone());
-        let preview = self.romm_preview.clone();
+        let preview = self.romm_ui.preview.clone();
 
-        let draft = self.romm_config_draft.as_mut()?;
+        let draft = self.romm_ui.config_draft.as_mut()?;
         let token_state = {
             let trimmed = draft.token_path.trim();
             if trimmed.is_empty() {
@@ -585,7 +585,7 @@ impl ArchiveFsApp {
         &mut self,
         context: &egui::Context,
     ) -> Option<ConfigDialogRequest> {
-        self.romm_config_draft.as_ref()?;
+        self.romm_ui.config_draft.as_ref()?;
         let mut request = None;
         let viewport = context.input(|input| input.screen_rect().size());
         let (initial, maximum) = romm_dialog_sizes(viewport, egui::vec2(640.0, 760.0));
@@ -653,7 +653,7 @@ impl ArchiveFsApp {
     /// Opening it twice is impossible for the same reason the configuration dialog
     /// cannot be: the state *is* the open flag.
     pub(crate) fn open_romm_browse(&mut self, view: crate::romm_browse::BrowseView) {
-        match self.romm_browse.as_mut() {
+        match self.romm_ui.browse.as_mut() {
             Some(state) if state.view != view => {
                 state.view = view;
                 state.detail = None;
@@ -662,14 +662,14 @@ impl ArchiveFsApp {
             }
             Some(_) => {}
             None => {
-                self.romm_browse = Some(Box::new(crate::romm_browse::BrowseState::opened_at(view)));
+                self.romm_ui.browse = Some(Box::new(crate::romm_browse::BrowseState::opened_at(view)));
             }
         }
     }
 
     pub(crate) fn close_romm_browse(&mut self) {
-        self.romm_browse = None;
-        self.romm_stale_progress = None;
+        self.romm_ui.browse = None;
+        self.romm_ui.stale_progress = None;
     }
 
     /// Draws the RomM records browser as its own persistent window.
@@ -682,7 +682,7 @@ impl ArchiveFsApp {
     /// visible change whatsoever and read as a dead button. A window appears
     /// where the user is looking, on the frame the button is pressed.
     ///
-    /// Opening twice cannot duplicate it: `self.romm_browse` *is* the open
+    /// Opening twice cannot duplicate it: `self.romm_ui.browse` *is* the open
     /// flag (see `open_romm_browse`), and the window carries a fixed id, so a
     /// second click at most switches which view is shown.
     ///
@@ -694,16 +694,16 @@ impl ArchiveFsApp {
         &mut self,
         context: &egui::Context,
     ) -> Option<crate::romm_browse::BrowseRequest> {
-        self.romm_browse.as_ref()?;
+        self.romm_ui.browse.as_ref()?;
         let busy = self
-            .romm_operation
+            .romm_ui.operation
             .as_ref()
             .is_some_and(|running| running.operation.blocks_actions());
-        let progress = self.romm_stale_progress;
+        let progress = self.romm_ui.stale_progress;
         let viewport = context.input(|input| input.screen_rect().size());
         let (initial, maximum) = romm_dialog_sizes(viewport, egui::vec2(900.0, 780.0));
         let title = self
-            .romm_browse
+            .romm_ui.browse
             .as_ref()
             .map(|state| state.view.title())
             .unwrap_or("RomM records");
@@ -737,7 +737,7 @@ impl ArchiveFsApp {
                     .max_height(body_height)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        if let Some(found) = self.romm_browse.as_mut().and_then(|state| {
+                        if let Some(found) = self.romm_ui.browse.as_mut().and_then(|state| {
                             crate::romm_browse::show_browse_panel(
                                 ui,
                                 state,
@@ -757,7 +757,7 @@ impl ArchiveFsApp {
         // it closes that, not the browser underneath it - so the browser only
         // consumes Escape when nothing is layered on top.
         let detail_open = self
-            .romm_browse
+            .romm_ui.browse
             .as_ref()
             .is_some_and(|state| state.detail.is_some());
         if request.is_none()
@@ -778,11 +778,11 @@ impl ArchiveFsApp {
         use crate::romm_browse::BrowseRequest;
         match request {
             BrowseRequest::LoadRecords { offset, limit } => {
-                if let Some(state) = self.romm_browse.as_mut() {
+                if let Some(state) = self.romm_ui.browse.as_mut() {
                     state.invalidate_detail_request();
                 }
                 let filters = self
-                    .romm_browse
+                    .romm_ui.browse
                     .as_ref()
                     .map(|state| state.filters.clone())
                     .unwrap_or_default();
@@ -800,13 +800,13 @@ impl ArchiveFsApp {
                 if self.start_romm_operation(
                     context.clone(),
                     RommOperation::LoadRecordDetail { romm_game_id },
-                ) && let Some(state) = self.romm_browse.as_mut()
+                ) && let Some(state) = self.romm_ui.browse.as_mut()
                 {
                     state.begin_detail(requested_id);
                 }
             }
             BrowseRequest::CloseDetail => {
-                if let Some(state) = self.romm_browse.as_mut() {
+                if let Some(state) = self.romm_ui.browse.as_mut() {
                     state.detail = None;
                     state.pending_detail_id = None;
                     state.detail_problem = None;
@@ -825,7 +825,7 @@ impl ArchiveFsApp {
                         local_path,
                         romm_game_id,
                     },
-                ) && let Some(state) = self.romm_browse.as_mut()
+                ) && let Some(state) = self.romm_ui.browse.as_mut()
                 {
                     state.detail_cover = crate::romm_game::CoverState::Loading;
                 }
@@ -834,7 +834,7 @@ impl ArchiveFsApp {
                 self.start_romm_operation(context.clone(), RommOperation::LoadConflicts { offset });
             }
             BrowseRequest::RunStaleSummary => {
-                self.romm_stale_progress = None;
+                self.romm_ui.stale_progress = None;
                 self.start_romm_operation(context.clone(), RommOperation::StaleSummary);
             }
             BrowseRequest::Cancel => self.cancel_romm_operation(),
@@ -868,22 +868,22 @@ impl ArchiveFsApp {
     pub(crate) fn show_romm_game_panel(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
         // Following the selection discards the previous game's panel, cover and
         // verification, but starts nothing: a lookup is a button press.
-        self.romm_game
+        self.romm_ui.game
             .focus(self.archive_context.focused.as_deref());
         let running = self
-            .romm_operation
+            .romm_ui.operation
             .as_ref()
             .map(|running| &running.operation);
         let busy = running.is_some_and(RommOperation::blocks_actions);
         let busy_reason = running.map(|operation| operation.label());
         let cache_present = self
-            .romm_snapshot
+            .romm_ui.snapshot
             .as_deref()
             .is_some_and(|snapshot| snapshot.status.records_imported > 0);
-        let hash_progress = self.romm_hash_progress.clone();
+        let hash_progress = self.romm_ui.hash_progress.clone();
         let request = crate::romm_game::show_game_identity_panel(
             ui,
-            &mut self.romm_game,
+            &mut self.romm_ui.game,
             &crate::romm_game::GamePanelInputs {
                 busy,
                 busy_reason,
@@ -903,7 +903,7 @@ impl ArchiveFsApp {
     ) {
         use crate::romm_game::GamePanelRequest;
 
-        let Some(local_path) = self.romm_game.local_path.clone() else {
+        let Some(local_path) = self.romm_ui.game.local_path.clone() else {
             return;
         };
         let local_platform = Box::new(self.romm_local_platform(&local_path));
@@ -914,18 +914,18 @@ impl ArchiveFsApp {
                     RommOperation::ResolveGame {
                         local_path,
                         local_platform,
-                        chosen_game_id: self.romm_game.chosen_game_id.clone(),
+                        chosen_game_id: self.romm_ui.game.chosen_game_id.clone(),
                     },
                 );
             }
             GamePanelRequest::Choose { romm_game_id } => {
                 // A choice is recorded and then re-resolved, so the verdict on screen
                 // is the one that record actually earns rather than a relabelling.
-                self.romm_game.chosen_game_id = Some(romm_game_id.clone());
-                self.romm_game.verification = None;
-                self.romm_game.cover = crate::romm_game::CoverState::Idle;
-                self.romm_game.cover_texture = None;
-                self.romm_game.cover_key = None;
+                self.romm_ui.game.chosen_game_id = Some(romm_game_id.clone());
+                self.romm_ui.game.verification = None;
+                self.romm_ui.game.cover = crate::romm_game::CoverState::Idle;
+                self.romm_ui.game.cover_texture = None;
+                self.romm_ui.game.cover_key = None;
                 self.start_romm_operation(
                     context.clone(),
                     RommOperation::ResolveGame {
@@ -942,7 +942,7 @@ impl ArchiveFsApp {
                         local_path,
                         romm_game_id,
                         local_platform,
-                        chosen_game_id: self.romm_game.chosen_game_id.clone(),
+                        chosen_game_id: self.romm_ui.game.chosen_game_id.clone(),
                     },
                 );
             }
@@ -954,7 +954,7 @@ impl ArchiveFsApp {
                         romm_game_id,
                     },
                 ) {
-                    self.romm_game.cover = crate::romm_game::CoverState::Loading;
+                    self.romm_ui.game.cover = crate::romm_game::CoverState::Loading;
                 }
             }
             GamePanelRequest::LoadScreenshot { romm_game_id } => {
@@ -965,7 +965,7 @@ impl ArchiveFsApp {
                         romm_game_id,
                     },
                 ) {
-                    self.romm_game.screenshot = crate::romm_game::CoverState::Loading;
+                    self.romm_ui.game.screenshot = crate::romm_game::CoverState::Loading;
                 }
             }
             GamePanelRequest::OpenManual { romm_game_id } => {
@@ -981,17 +981,17 @@ impl ArchiveFsApp {
             GamePanelRequest::Close => {
                 // Closed for this selection only. Choosing a different archive brings
                 // it back, which is what someone expects from a per-game panel.
-                self.romm_game.dismissed = true;
+                self.romm_ui.game.dismissed = true;
             }
             GamePanelRequest::Reopen => {
-                self.romm_game.dismissed = false;
+                self.romm_ui.game.dismissed = false;
             }
         }
     }
 
     pub(crate) fn close_romm_configuration(&mut self) {
-        self.romm_config_draft = None;
-        self.romm_preview = None;
+        self.romm_ui.config_draft = None;
+        self.romm_ui.preview = None;
     }
 
     /// Routes one request from the configuration dialog.

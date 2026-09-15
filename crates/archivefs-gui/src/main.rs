@@ -284,6 +284,8 @@ mod romm;
 use romm::*;
 mod romm_operation_controller;
 use romm_operation_controller::{load_romm_snapshot, run_romm_operation};
+mod romm_ui_state;
+use romm_ui_state::RommUiState;
 pub(crate) mod romm_browse;
 pub(crate) mod romm_config;
 pub(crate) mod romm_game;
@@ -306,11 +308,11 @@ mod ui;
 pub mod view_mode;
 
 use crate::romm_config::{
-    ConfigDialogRequest, RommConfigDraft, RommPreviewSummary, build_mappings_view,
+    ConfigDialogRequest, build_mappings_view,
     show_config_dialog, token_field_state, validate_draft,
 };
 use crate::romm_source::{
-    RommCardRequest, RommCardState, RommOperation, RommOperationOutcome, RommProgress,
+    RommCardRequest, RommOperation, RommOperationOutcome, RommProgress,
     RommProgressEvent, RommSnapshot, VerifyRommSummary,
 };
 use activity_history::{
@@ -2286,12 +2288,7 @@ struct ArchiveFsApp {
     gui_config: GuiConfigSnapshot,
     /// The last authoritative RomM snapshot. `None` until the first status load,
     /// so the card shows "reading" rather than a screenful of zeroes.
-    romm_snapshot: Option<Box<RommSnapshot>>,
-    /// Cached RomM identity aggregates for Verify. Replaced only when the
-    /// authoritative snapshot/import changes, never while rendering.
-    verify_romm_summary: Option<VerifyRommSummary>,
-    romm_operation: Option<RunningRommOperation>,
-    romm_generation: u64,
+    romm_ui: RommUiState,
     /// GUI Batch A: the Selected page's real, read-only identity/evidence
     /// panel state - see `selected_evidence_page`'s own module doc. Starts
     /// `Idle`; loading is always an explicit action, never automatic.
@@ -2339,23 +2336,6 @@ struct ArchiveFsApp {
     /// always an explicit action, never automatic.
     plan_preview: plan_preview_page::PlanPreviewState,
     plan_preview_generation: u64,
-    romm_ui: RommCardState,
-    /// The configuration dialog's draft. `Some` exactly while it is open, which is
-    /// the same open/closed convention every other dialog in this app uses - and is
-    /// what makes opening a second one impossible.
-    romm_config_draft: Option<Box<RommConfigDraft>>,
-    /// The last preview, kept until the dialog closes or another one is asked for.
-    romm_preview: Option<Box<RommPreviewSummary>>,
-    /// The browsing panel. `Some` exactly while it is open, which is what stops a
-    /// second Browse click opening a second one.
-    romm_browse: Option<Box<crate::romm_browse::BrowseState>>,
-    /// How far the stale summary's metadata probes have got.
-    romm_stale_progress: Option<crate::romm_browse::StaleProgress>,
-    /// The selected game's RomM identity panel. Reset whenever the selection moves,
-    /// so one game's cover or verification can never appear beside another's.
-    romm_game: crate::romm_game::GamePanelState,
-    /// Progress from a running hash verification, if one is running.
-    romm_hash_progress: Option<crate::romm_game::HashProgressView>,
     catalogue_manager: CatalogueManagerState,
     catalogue_review: Option<CatalogueReview>,
     catalogue_retrieval: Option<RunningCatalogueRetrieval>,
@@ -2763,10 +2743,7 @@ impl ArchiveFsApp {
             bsfree_operation: None,
             bsfree_ui: BsFreeGuiState::default(),
             gui_config,
-            romm_snapshot: None,
-            verify_romm_summary: None,
-            romm_operation: None,
-            romm_generation: 0,
+            romm_ui: RommUiState::default(),
             selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
             selected_evidence_generation: 0,
             selected_evidence_cancel: None,
@@ -2781,13 +2758,6 @@ impl ArchiveFsApp {
             scummvm_check_generation: 0,
             plan_preview: plan_preview_page::PlanPreviewState::Idle,
             plan_preview_generation: 0,
-            romm_ui: RommCardState::default(),
-            romm_config_draft: None,
-            romm_preview: None,
-            romm_browse: None,
-            romm_stale_progress: None,
-            romm_game: crate::romm_game::GamePanelState::default(),
-            romm_hash_progress: None,
             catalogue_manager: CatalogueManagerState::NotLoaded,
             catalogue_review: None,
             catalogue_retrieval: None,
@@ -3670,16 +3640,16 @@ impl ArchiveFsApp {
 
         ui.add_space(theme::SECTION_GAP);
         let romm_view = romm_source::build_card_view(
-            self.romm_snapshot.as_deref(),
-            self.romm_operation
+            self.romm_ui.snapshot.as_deref(),
+            self.romm_ui.operation
                 .as_ref()
                 .map(|running| &running.operation),
-            self.romm_operation
+            self.romm_ui.operation
                 .as_ref()
                 .is_some_and(|running| running.cancellation_requested),
         );
         let romm_progress = self
-            .romm_operation
+            .romm_ui.operation
             .as_ref()
             .and_then(|running| running.progress.as_ref())
             .cloned();
@@ -3697,7 +3667,7 @@ impl ArchiveFsApp {
         if let Some(request) = romm_source::show_romm_source_card(
             ui,
             &romm_view,
-            &mut self.romm_ui,
+            &mut self.romm_ui.card,
             romm_progress.as_ref(),
         ) {
             match request {
@@ -3812,7 +3782,7 @@ impl ArchiveFsApp {
         if dat_changed || page.is_busy() {
             ui.ctx().request_repaint();
         }
-        let view = page.view_with_romm_summary(self.verify_romm_summary);
+        let view = page.view_with_romm_summary(self.romm_ui.verify_summary);
         let action = if identify_rename {
             if self.quick_rename_mode {
                 dat_sources_page::show_quick_rename_page(ui, &view, &mut self.dat_sources_ui)
@@ -4916,8 +4886,8 @@ impl ArchiveFsApp {
         // Only once the Sources page is actually open, and only local reads - so
         // starting EmuWiz still makes no network request of any kind.
         if self.view == MainView::Sources
-            && self.romm_snapshot.is_none()
-            && self.romm_operation.is_none()
+            && self.romm_ui.snapshot.is_none()
+            && self.romm_ui.operation.is_none()
         {
             self.start_romm_status_load(context.clone());
         }
@@ -5872,7 +5842,7 @@ impl ArchiveFsApp {
                         .as_ref()
                         .map(|page| page.registered_source_count());
                     let romm_state_label = self
-                        .romm_snapshot
+                        .romm_ui.snapshot
                         .as_ref()
                         .map(|snapshot| romm_readiness_label(&snapshot.status.state));
 

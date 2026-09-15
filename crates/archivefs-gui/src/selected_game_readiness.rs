@@ -21,7 +21,7 @@ impl ArchiveFsApp {
                 action: Some(feature_discovery::FeatureDiscoveryAction::OpenCheats),
             });
 
-        let romm = self.romm_snapshot.as_deref().map(|snapshot| {
+        let romm = self.romm_ui.snapshot.as_deref().map(|snapshot| {
             let stale = snapshot
                 .verify_summary
                 .map(|summary| summary.stale + summary.unmatched)
