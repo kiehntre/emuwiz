@@ -188,6 +188,7 @@ use library_view_controller::{
     load_library_views, run_library_view_action, start_library_view_worker,
 };
 mod database_load;
+mod live_library_controller;
 mod setup_controller;
 #[allow(unused_imports)]
 use setup_controller::{
@@ -1138,18 +1139,6 @@ fn gather_selected_evidence_with_registry_at_and_platform(
     result
 }
 
-type LoadResult = Result<LoadedData, String>;
-type LoadMessage = (RefreshGeneration, LoadResult);
-enum LoadState {
-    Loading {
-        generation: RefreshGeneration,
-        receiver: Receiver<LoadMessage>,
-        previous: Option<Box<LoadedData>>,
-    },
-    Ready(Box<LoadedData>),
-    Error(String),
-}
-
 // ---------------------------------------------------------------------
 // Persistent library database (stage 4): a read-only, background-loaded
 // cache of archivefs_core::Database that speeds up startup and browsing.
@@ -1169,6 +1158,9 @@ use database_load::{
     CachedLibrarySnapshot, DatabaseGeneration, DatabaseLoadError, DatabaseLoadResult,
     DatabaseMessage, DatabaseOutcome, DatabaseState, classify_unhealthy_database,
     load_database_snapshot, load_database_snapshot_at, load_snapshot_from, start_database_load,
+};
+use live_library_controller::{
+    LiveLibraryPoll, LoadMessage, LoadResult, LoadState, poll_load, start_load,
 };
 
 #[derive(Debug)]
@@ -3772,73 +3764,41 @@ impl ArchiveFsApp {
     }
 
     fn poll_load(&mut self, _context: &egui::Context) {
-        let result = match &self.state {
-            LoadState::Loading {
-                generation,
-                receiver,
-                ..
-            } => match receiver.try_recv() {
-                Ok(message) => Some(message),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some((
-                    *generation,
-                    Err("background data loader stopped unexpectedly".to_string()),
-                )),
-            },
-            LoadState::Ready(_) | LoadState::Error(_) => None,
+        let Some(result) = poll_load(
+            &mut self.state,
+            self.refresh_generation,
+            self.database_state.snapshot(),
+        ) else {
+            return;
         };
-
-        if let Some((generation, result)) = result {
-            if generation != self.refresh_generation {
-                return;
+        match result {
+            LiveLibraryPoll::Completed { merged_rows } => {
+                self.filtered_rows = matching_row_indices(&merged_rows, &self.filter);
+                self.prune_selection(&merged_rows);
+                self.refresh_error = None;
+                self.snapshot_stale = false;
+                self.snapshot_generation = Some(self.refresh_generation);
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::Refresh,
+                    None,
+                    ActivityOutcome::Completed,
+                    "Your library was refreshed.",
+                ));
             }
-            let (state_generation, previous) = match std::mem::replace(
-                &mut self.state,
-                LoadState::Error("load result pending".to_string()),
-            ) {
-                LoadState::Loading {
-                    generation,
-                    previous,
-                    ..
-                } => (Some(generation), previous),
-                LoadState::Ready(_) | LoadState::Error(_) => (None, None),
-            };
-            if state_generation != Some(generation) {
-                return;
+            LiveLibraryPoll::Failed {
+                error,
+                has_previous,
+            } => {
+                self.snapshot_stale = has_previous;
+                self.refresh_error = Some(error.clone());
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::Refresh,
+                    None,
+                    ActivityOutcome::Failed,
+                    error,
+                ));
+                self.tools_overlay = ToolsOverlay::Diagnostics;
             }
-            self.state = match result {
-                Ok(data) => {
-                    let merged = build_display_rows(
-                        &data.records,
-                        &data.rows,
-                        self.database_state.snapshot(),
-                    );
-                    self.filtered_rows = matching_row_indices(&merged, &self.filter);
-                    self.prune_selection(&merged);
-                    self.history.record(HistoryEntry::new(
-                        ActivityAction::Refresh,
-                        None,
-                        ActivityOutcome::Completed,
-                        "Your library was refreshed.",
-                    ));
-                    self.refresh_error = None;
-                    self.snapshot_stale = false;
-                    self.snapshot_generation = Some(generation);
-                    LoadState::Ready(Box::new(data))
-                }
-                Err(error) => {
-                    self.history.record(HistoryEntry::new(
-                        ActivityAction::Refresh,
-                        None,
-                        ActivityOutcome::Failed,
-                        error.clone(),
-                    ));
-                    self.refresh_error = Some(error.clone());
-                    self.snapshot_stale = previous.is_some();
-                    self.tools_overlay = ToolsOverlay::Diagnostics;
-                    previous.map_or_else(|| LoadState::Error(error), LoadState::Ready)
-                }
-            };
         }
     }
 
@@ -8708,24 +8668,6 @@ impl eframe::App for ArchiveFsApp {
     }
 }
 
-fn start_load(
-    context: egui::Context,
-    generation: RefreshGeneration,
-    previous: Option<Box<LoadedData>>,
-) -> LoadState {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let result = load_data();
-        let _ = sender.send((generation, result));
-        context.request_repaint();
-    });
-    LoadState::Loading {
-        generation,
-        receiver,
-        previous,
-    }
-}
-
 pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Result<()> {
     let (program, argument) = if cfg!(target_os = "windows") {
         ("explorer", folder.as_os_str())
@@ -8746,12 +8688,6 @@ pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Resu
         });
     }
     Ok(())
-}
-
-fn load_data() -> LoadResult {
-    load_read_only_snapshot_default()
-        .map(LoadedData::from_snapshot)
-        .map_err(|error| error.to_string())
 }
 
 fn apply_missing_removal(
