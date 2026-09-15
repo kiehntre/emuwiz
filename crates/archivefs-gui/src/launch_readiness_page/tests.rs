@@ -1218,6 +1218,7 @@ fn base_dolphin_roots(fixture: &DolphinFixture) -> DolphinLocalDiscoveryRoots {
         known_version_outputs: BTreeMap::new(),
         appimage_directory: None,
         dolphin_emu_userpath_override: None,
+        path_override: Some(Vec::new()),
     }
 }
 
@@ -1232,6 +1233,7 @@ fn empty_dolphin_roots() -> DolphinLocalDiscoveryRoots {
         known_version_outputs: BTreeMap::new(),
         appimage_directory: None,
         dolphin_emu_userpath_override: None,
+        path_override: Some(Vec::new()),
     }
 }
 
@@ -1857,6 +1859,7 @@ fn base_pcsx2_roots(fixture: &Pcsx2Fixture) -> Pcsx2ProfileDiscoveryRoots {
         appimage_directory: None,
         portable_configuration_roots: Vec::new(),
         explicit_executables: Vec::new(),
+        path_override: Some(Vec::new()),
     }
 }
 
@@ -1987,6 +1990,7 @@ fn empty_pcsx2_context() -> Pcsx2LaunchContext {
             appimage_directory: None,
             portable_configuration_roots: Vec::new(),
             explicit_executables: Vec::new(),
+            path_override: Some(Vec::new()),
         },
         firmware_evidence: Vec::new(),
         verified_ps2_serial: Some(PS2_SERIAL.to_string()),

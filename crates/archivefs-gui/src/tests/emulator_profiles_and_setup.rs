@@ -4211,6 +4211,7 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
         known_version_outputs: std::collections::BTreeMap::new(),
         appimage_directory: None,
         dolphin_emu_userpath_override: None,
+        path_override: Some(Vec::new()),
     };
     let discovery = archivefs_core::patch_manager::discover_dolphin_local_profiles(&roots);
     let profile_id = format!("dolphin:{}", directory.display());
@@ -4283,6 +4284,7 @@ fn selected_page_pcsx2_readiness_requires_matching_firmware_evidence_and_threads
         appimage_directory: None,
         portable_configuration_roots: Vec::new(),
         explicit_executables: Vec::new(),
+        path_override: Some(Vec::new()),
     };
     let profile_root = roots.xdg_config_home.join("PCSX2");
     std::fs::create_dir_all(profile_root.join("bios")).unwrap();
