@@ -112,10 +112,6 @@ fn fbneo_compatible(result: &ArcadeEmulatorCompatibility<FbNeoSetCompatibility>)
     )
 }
 
-fn evaluated(result: &ArcadeEmulatorCompatibility<impl Sized>) -> bool {
-    matches!(result, ArcadeEmulatorCompatibility::Evaluated(_))
-}
-
 fn comparison_for(
     mame: &ArcadeEmulatorCompatibility<MameSetCompatibility>,
     fbneo: &ArcadeEmulatorCompatibility<FbNeoSetCompatibility>,
@@ -131,7 +127,19 @@ fn comparison_for(
         ArcadeCompatibilityComparison::MameOnly
     } else if fbneo_compatible(fbneo) {
         ArcadeCompatibilityComparison::FbneoOnly
-    } else if evaluated(mame) && evaluated(fbneo) {
+    } else if matches!(
+        (mame, fbneo),
+        (
+            ArcadeEmulatorCompatibility::Evaluated(MameSetCompatibility {
+                state: MameSetCompatibilityState::Incompatible,
+                ..
+            }),
+            ArcadeEmulatorCompatibility::Evaluated(FbNeoSetCompatibility {
+                state: FbNeoSetCompatibilityState::Incompatible,
+                ..
+            })
+        )
+    ) {
         ArcadeCompatibilityComparison::BothIncompatible
     } else {
         ArcadeCompatibilityComparison::InsufficientEvidence

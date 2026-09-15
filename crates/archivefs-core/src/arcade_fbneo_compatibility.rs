@@ -380,6 +380,26 @@ pub fn audit_fbneo_set(
             collection_provenance_known,
         );
     }
+    if matches!(
+        observed.completeness,
+        ObservedEvidenceCompleteness::NotGathered | ObservedEvidenceCompleteness::Unknown
+    ) {
+        return result(
+            set_name,
+            fbneo,
+            Some(expectation),
+            FbNeoSetCompatibilityState::Unknown,
+            vec![FbNeoMismatch {
+                reason: FbNeoMismatchReason::EvidenceUnavailable,
+                set_name: observed.set_name.clone(),
+                member_name: None,
+                expected_size: None,
+                observed_size: None,
+                detail: "Observed FBNeo evidence was not gathered".into(),
+            }],
+            collection_provenance_known,
+        );
+    }
     let mut mismatches = Vec::new();
     for dependency in &expectation.dependencies.closure_set_names {
         if !observed
@@ -387,6 +407,9 @@ pub fn audit_fbneo_set(
             .iter()
             .any(|name| name == dependency)
         {
+            if observed.completeness != ObservedEvidenceCompleteness::Complete {
+                continue;
+            }
             let reason = if dependency == &expectation.set_name {
                 FbNeoMismatchReason::RequiredFileMissing
             } else if expectation
@@ -431,6 +454,9 @@ pub fn audit_fbneo_set(
             continue;
         }
         let Some(observed_rom) = observed_rom else {
+            if observed.completeness != ObservedEvidenceCompleteness::Complete {
+                continue;
+            }
             mismatches.push(mismatch(
                 FbNeoMismatchReason::RequiredFileMissing,
                 expected,
@@ -507,6 +533,9 @@ pub fn audit_fbneo_set(
             .iter()
             .find(|item| item.set_name == expected.set_name && item.name == expected.name);
         if observed_disk.is_none() {
+            if observed.completeness != ObservedEvidenceCompleteness::Complete {
+                continue;
+            }
             mismatches.push(FbNeoMismatch {
                 reason: FbNeoMismatchReason::ChdMissing,
                 set_name: expected.set_name.clone(),
@@ -747,6 +776,89 @@ mod tests {
         let result = audit_fbneo_set(&fbneo(), Some(expectation()), &evidence);
         assert_eq!(result.state, FbNeoSetCompatibilityState::Unknown);
         assert_eq!(result.ready_to_play_state, Some(ReadyToPlayState::Unknown));
+    }
+
+    #[test]
+    fn partial_absence_remains_unknown_instead_of_missing() {
+        let mut evidence = observed();
+        evidence.completeness = ObservedEvidenceCompleteness::Partial;
+        evidence.observed_roms.clear();
+        let result = audit_fbneo_set(&fbneo(), Some(expectation()), &evidence);
+        assert_eq!(result.state, FbNeoSetCompatibilityState::Unknown);
+        assert!(
+            !result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == FbNeoMismatchReason::RequiredFileMissing)
+        );
+        assert!(
+            result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == FbNeoMismatchReason::EvidenceUnavailable)
+        );
+    }
+
+    #[test]
+    fn partial_observed_contradiction_remains_incompatible() {
+        let mut evidence = observed();
+        evidence.completeness = ObservedEvidenceCompleteness::Partial;
+        evidence.observed_roms[0].size_bytes = Some(3);
+        let result = audit_fbneo_set(&fbneo(), Some(expectation()), &evidence);
+        assert_eq!(result.state, FbNeoSetCompatibilityState::Incompatible);
+        assert!(
+            result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == FbNeoMismatchReason::WrongSize)
+        );
+    }
+
+    #[test]
+    fn complete_absence_is_proven_missing() {
+        let mut evidence = observed();
+        evidence.observed_roms.clear();
+        let result = audit_fbneo_set(&fbneo(), Some(expectation()), &evidence);
+        assert_eq!(result.state, FbNeoSetCompatibilityState::Incompatible);
+        assert!(
+            result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == FbNeoMismatchReason::RequiredFileMissing)
+        );
+    }
+
+    #[test]
+    fn partial_dependency_absence_is_not_proven_missing() {
+        let mut evidence = observed();
+        evidence.completeness = ObservedEvidenceCompleteness::Partial;
+        let mut exp = expectation();
+        exp.dependencies.closure_set_names = vec!["game".into(), "parent".into()];
+        exp.dependencies.parent = Some("parent".into());
+        let result = audit_fbneo_set(&fbneo(), Some(exp), &evidence);
+        assert_eq!(result.state, FbNeoSetCompatibilityState::Unknown);
+        assert!(
+            !result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == FbNeoMismatchReason::ParentMissing)
+        );
+    }
+
+    #[test]
+    fn not_gathered_evidence_does_not_infer_missing_members() {
+        let mut evidence = observed();
+        evidence.completeness = ObservedEvidenceCompleteness::NotGathered;
+        evidence.observed_roms.clear();
+        evidence.observed_set_names.clear();
+        let result = audit_fbneo_set(&fbneo(), Some(expectation()), &evidence);
+        assert_eq!(result.state, FbNeoSetCompatibilityState::Unknown);
+        assert!(
+            !result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == FbNeoMismatchReason::RequiredFileMissing)
+        );
     }
 
     #[test]

@@ -304,13 +304,14 @@ impl ObservedArcadeSetEvidence {
                 self.collection_provenance_known,
             );
         }
-        let mut compatibility = audit_mame_set(
+        let mut compatibility = audit_mame_set_with_completeness(
             mame,
             expectation,
             &self.observed_set_names,
             &self.observed_roms,
             &self.observed_disks,
             self.collection_provenance_known,
+            self.completeness,
         );
         if self.completeness == ObservedEvidenceCompleteness::Partial
             && matches!(
@@ -511,6 +512,26 @@ pub fn audit_mame_set(
     observed_disks: &[MameObservedDisk],
     collection_provenance_known: bool,
 ) -> MameSetCompatibility {
+    audit_mame_set_with_completeness(
+        mame,
+        expectation,
+        observed_set_names,
+        observed_roms,
+        observed_disks,
+        collection_provenance_known,
+        ObservedEvidenceCompleteness::Complete,
+    )
+}
+
+fn audit_mame_set_with_completeness(
+    mame: &InstalledMameEvidence,
+    expectation: MameSetExpectation,
+    observed_set_names: &[String],
+    observed_roms: &[MameObservedRom],
+    observed_disks: &[MameObservedDisk],
+    collection_provenance_known: bool,
+    completeness: ObservedEvidenceCompleteness,
+) -> MameSetCompatibility {
     if !mame.usable {
         return result(
             mame,
@@ -530,7 +551,9 @@ pub fn audit_mame_set(
 
     let mut mismatches = Vec::new();
     for dependency in &expectation.dependencies.closure_set_names {
-        if !observed_set_names.iter().any(|name| name == dependency) {
+        if completeness == ObservedEvidenceCompleteness::Complete
+            && !observed_set_names.iter().any(|name| name == dependency)
+        {
             let reason = if dependency == &expectation.set_name {
                 MameMismatchReason::RequiredFileMissing
             } else if expectation
@@ -571,6 +594,9 @@ pub fn audit_mame_set(
             continue;
         }
         let Some(observed) = observed else {
+            if completeness != ObservedEvidenceCompleteness::Complete {
+                continue;
+            }
             mismatches.push(mismatch(
                 MameMismatchReason::RequiredFileMissing,
                 expected,
@@ -659,6 +685,9 @@ pub fn audit_mame_set(
                 detail: "CHD identity is unavailable in the pinned expectation".into(),
             });
         } else if observed.is_none() {
+            if completeness != ObservedEvidenceCompleteness::Complete {
+                continue;
+            }
             mismatches.push(MameMismatch {
                 reason: MameMismatchReason::ChdMissing,
                 set_name: expected.set_name.clone(),
@@ -1004,5 +1033,63 @@ mod tests {
         let result = bridge.audit(&mame(), MameSetExpectation::from_game(&game(None)));
         assert_eq!(result.state, MameSetCompatibilityState::Unknown);
         assert_eq!(result.ready_to_play_state, Some(ReadyToPlayState::Unknown));
+    }
+
+    #[test]
+    fn partial_absence_remains_unknown_instead_of_missing() {
+        let bridge =
+            ObservedArcadeSetEvidence::new("pacman", ObservedEvidenceCompleteness::Partial);
+        let result = bridge.audit(&mame(), MameSetExpectation::from_game(&game(None)));
+        assert_eq!(result.state, MameSetCompatibilityState::Unknown);
+        assert!(
+            !result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == MameMismatchReason::RequiredFileMissing)
+        );
+        assert!(
+            result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == MameMismatchReason::EvidenceUnavailable)
+        );
+    }
+
+    #[test]
+    fn partial_observed_contradiction_remains_incompatible() {
+        let mut bridge =
+            ObservedArcadeSetEvidence::new("pacman", ObservedEvidenceCompleteness::Partial);
+        let mut wrong = observed();
+        wrong.size_bytes = Some(3);
+        bridge.observed_set_names.push("pacman".into());
+        bridge.observed_roms.push(wrong);
+        let result = bridge.audit(&mame(), MameSetExpectation::from_game(&game(None)));
+        assert_eq!(result.state, MameSetCompatibilityState::Incompatible);
+        assert!(
+            result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == MameMismatchReason::WrongSize)
+        );
+    }
+
+    #[test]
+    fn partial_dependency_absence_is_not_proven_missing() {
+        let mut bridge =
+            ObservedArcadeSetEvidence::new("pacman", ObservedEvidenceCompleteness::Partial);
+        bridge.observed_set_names.push("pacman".into());
+        bridge.observed_roms.push(observed());
+        let mut expectation = MameSetExpectation::from_game(&game(None));
+        expectation.dependencies.closure_set_names = vec!["pacman".into(), "parent".into()];
+        expectation.parent = Some("parent".into());
+        expectation.dependencies.parent = Some("parent".into());
+        let result = bridge.audit(&mame(), expectation);
+        assert_eq!(result.state, MameSetCompatibilityState::Unknown);
+        assert!(
+            !result
+                .mismatches
+                .iter()
+                .any(|item| item.reason == MameMismatchReason::ParentMissing)
+        );
     }
 }
