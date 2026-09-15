@@ -3045,11 +3045,11 @@ fn real_ctrl_a_keyboard_selection_is_unchanged_by_the_selection_controls_refacto
 fn select_all_visible_button_click_never_touches_duplicate_review_selection() {
     let mut app = app_for_operation_tests();
     // Duplicate Review's own independent selection.
-    app.selected_duplicate_group = Some(DuplicateGroupIdentity {
+    app.health_duplicate_ui.selected_duplicate_group = Some(DuplicateGroupIdentity {
         normalized_title: "sonic_the_hedgehog".to_string(),
         platform: "Genesis".to_string(),
     });
-    app.selected_duplicate_archive = Some(PathBuf::from("/backup/Sonic.7z"));
+    app.health_duplicate_ui.selected_duplicate_archive = Some(PathBuf::from("/backup/Sonic.7z"));
 
     let merged_rows = vec![
         row_with_fields("/roms/a.zip", "SNES", "Live", "a.zip", "/mnt/a"),
@@ -3082,7 +3082,7 @@ fn select_all_visible_button_click_never_touches_duplicate_review_selection() {
         "the ordinary-library selection must still update normally"
     );
     assert_eq!(
-        app.selected_duplicate_group,
+        app.health_duplicate_ui.selected_duplicate_group,
         Some(DuplicateGroupIdentity {
             normalized_title: "sonic_the_hedgehog".to_string(),
             platform: "Genesis".to_string(),
@@ -3090,7 +3090,7 @@ fn select_all_visible_button_click_never_touches_duplicate_review_selection() {
         "Duplicate Review's selected group must remain untouched"
     );
     assert_eq!(
-        app.selected_duplicate_archive,
+        app.health_duplicate_ui.selected_duplicate_archive,
         Some(PathBuf::from("/backup/Sonic.7z")),
         "Duplicate Review's selected archive must remain untouched"
     );

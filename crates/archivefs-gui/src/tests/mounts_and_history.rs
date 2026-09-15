@@ -192,8 +192,8 @@ fn duplicate_review_state_is_separate_from_library_state_and_activity() {
     let history_len = app.history.len();
 
     app.view = MainView::Duplicates;
-    app.duplicate_filters.search = "sonic".to_string();
-    app.selected_duplicate_archive = Some(PathBuf::from("/backup/Sonic.7z"));
+    app.health_duplicate_ui.duplicate_filters.search = "sonic".to_string();
+    app.health_duplicate_ui.selected_duplicate_archive = Some(PathBuf::from("/backup/Sonic.7z"));
     app.view = MainView::Library;
 
     assert_eq!(app.library_ui.filter, "ordinary search");

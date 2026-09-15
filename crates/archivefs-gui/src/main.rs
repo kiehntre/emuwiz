@@ -167,6 +167,7 @@ mod emulator_inventory_page;
 mod emulator_setup_overrides;
 mod emulator_setup_page;
 mod gamer_platform_shelf;
+mod health_duplicate_ui_state;
 #[allow(dead_code)]
 mod onframe_install_session;
 #[allow(dead_code)]
@@ -1183,6 +1184,7 @@ use mount_operation_controller::{
     run_unmount_with_cleanup,
 };
 use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
+use health_duplicate_ui_state::HealthDuplicateUiState;
 
 #[derive(Debug)]
 enum BsFreeManagerState {
@@ -1724,7 +1726,7 @@ enum SourcesTab {
 /// selected. Content dispatch (`match self.library_tab { ... }`) stays in
 /// `ArchiveFsApp::update`'s central-panel closure, since each arm needs
 /// direct `&mut self` field access the existing per-page renderers
-/// already require (`self.health_filters`, `self.duplicate_filters`,
+/// already require (`self.health_duplicate_ui.health_filters`, `self.health_duplicate_ui.duplicate_filters`,
 /// `self.library_views`, ...) - bundling all of that into this function's
 /// parameters would mean exactly the giant parameter-heavy universal
 /// renderer this milestone was asked to avoid. Broken out on its own so
@@ -2210,22 +2212,7 @@ struct ArchiveFsApp {
     /// above, this is never consumed/cleared by a reload; it stays visible
     /// on the Sources page until superseded by a newer Sources-page scan.
     sources_last_scan: Option<SourcesLastScan>,
-    /// The library table's vertical scroll offset and other Library-only
-    /// presentation/action state live in `library_ui`.
-    duplicate_filters: DuplicateReviewFilters,
-    duplicate_sort_field: DuplicateSortField,
-    duplicate_sort_ascending: bool,
-    selected_duplicate_group: Option<DuplicateGroupIdentity>,
-    selected_duplicate_archive: Option<PathBuf>,
-    health_filters: HealthDashboardFilters,
-    health_sort_field: HealthSortField,
-    health_sort_ascending: bool,
-    selected_health_issue: Option<PathBuf>,
-    diagnostics_refresh_generation: RefreshGeneration,
-    /// The Health Dashboard's cached report - see `cached_health_issues`.
-    /// `None` until first built. Never read directly; always go through
-    /// `cached_health_issues`, which is the only code that may rebuild it.
-    health_report_cache: Option<HealthReportCache>,
+    health_duplicate_ui: HealthDuplicateUiState,
     /// The real OS clipboard backing every text field's context menu -
     /// see `NativeClipboard`'s doc comment for why this is kept for the
     /// app's whole lifetime rather than opened per click.
@@ -2692,17 +2679,7 @@ impl ArchiveFsApp {
             snapshot_stale: false,
             refresh_generation: generation,
             snapshot_generation: None,
-            duplicate_filters: DuplicateReviewFilters::initial(),
-            duplicate_sort_field: DuplicateSortField::Title,
-            duplicate_sort_ascending: true,
-            selected_duplicate_group: None,
-            selected_duplicate_archive: None,
-            health_filters: HealthDashboardFilters::default(),
-            health_sort_field: HealthSortField::default(),
-            health_sort_ascending: true,
-            selected_health_issue: None,
-            diagnostics_refresh_generation: RefreshGeneration::INITIAL,
-            health_report_cache: None,
+            health_duplicate_ui: HealthDuplicateUiState::default(),
             clipboard: NativeClipboard::new(),
             view: MainView::default(),
             library_tab: LibraryTab::default(),
@@ -3144,8 +3121,8 @@ impl ArchiveFsApp {
             .snapshot()
             .map(|snapshot| snapshot.duplicate_report.clone());
         prune_duplicate_review_selection(
-            &mut self.selected_duplicate_group,
-            &mut self.selected_duplicate_archive,
+            &mut self.health_duplicate_ui.selected_duplicate_group,
+            &mut self.health_duplicate_ui.selected_duplicate_archive,
             duplicate_report.as_ref(),
         );
 
@@ -3180,7 +3157,7 @@ impl ArchiveFsApp {
     }
 
     fn refresh_diagnostics(&mut self, context: &egui::Context) {
-        self.diagnostics_refresh_generation = self.diagnostics_refresh_generation.next();
+        self.health_duplicate_ui.diagnostics_refresh_generation = self.health_duplicate_ui.diagnostics_refresh_generation.next();
         self.history.record(HistoryEntry::new(
             ActivityAction::Diagnostics,
             None,
@@ -3207,10 +3184,10 @@ impl ArchiveFsApp {
                 .database_state
                 .snapshot()
                 .map(|snapshot| std::ptr::from_ref(snapshot) as usize),
-            diagnostics_generation: self.diagnostics_refresh_generation,
+            diagnostics_generation: self.health_duplicate_ui.diagnostics_refresh_generation,
         };
 
-        let cache_is_fresh = self.health_report_cache.as_ref().is_some_and(|cache| {
+        let cache_is_fresh = self.health_duplicate_ui.health_report_cache.as_ref().is_some_and(|cache| {
             cache.key == key
                 && cache.lazy_unmount_offers == self.lazy_unmount_offers
                 && cache.remount_offers == self.remount_offers
@@ -3230,7 +3207,7 @@ impl ArchiveFsApp {
                 ),
                 _ => Vec::new(),
             };
-            self.health_report_cache = Some(HealthReportCache {
+            self.health_duplicate_ui.health_report_cache = Some(HealthReportCache {
                 key,
                 lazy_unmount_offers: self.lazy_unmount_offers.clone(),
                 remount_offers: self.remount_offers.clone(),
@@ -3238,7 +3215,7 @@ impl ArchiveFsApp {
             });
         }
 
-        &self.health_report_cache.as_ref().unwrap().issues
+        &self.health_duplicate_ui.health_report_cache.as_ref().unwrap().issues
     }
 
     fn poll_diagnostics(&mut self) {
@@ -6892,10 +6869,10 @@ impl ArchiveFsApp {
                                     snapshot,
                                     &issues,
                                     HealthDashboardViewState {
-                                        filters: &mut self.health_filters,
-                                        sort_field: &mut self.health_sort_field,
-                                        sort_ascending: &mut self.health_sort_ascending,
-                                        selected_issue: &mut self.selected_health_issue,
+                                        filters: &mut self.health_duplicate_ui.health_filters,
+                                        sort_field: &mut self.health_duplicate_ui.health_sort_field,
+                                        sort_ascending: &mut self.health_duplicate_ui.health_sort_ascending,
+                                        selected_issue: &mut self.health_duplicate_ui.selected_health_issue,
                                         busy: archive_actions_blocked,
                                         clipboard: &mut self.clipboard,
                                     },
@@ -6911,11 +6888,11 @@ impl ArchiveFsApp {
                                     ui,
                                     &snapshot.duplicate_report,
                                     DuplicateReviewViewState {
-                                        filters: &mut self.duplicate_filters,
-                                        sort_field: &mut self.duplicate_sort_field,
-                                        sort_ascending: &mut self.duplicate_sort_ascending,
-                                        selected_group: &mut self.selected_duplicate_group,
-                                        selected_archive: &mut self.selected_duplicate_archive,
+                                        filters: &mut self.health_duplicate_ui.duplicate_filters,
+                                        sort_field: &mut self.health_duplicate_ui.duplicate_sort_field,
+                                        sort_ascending: &mut self.health_duplicate_ui.duplicate_sort_ascending,
+                                        selected_group: &mut self.health_duplicate_ui.selected_duplicate_group,
+                                        selected_archive: &mut self.health_duplicate_ui.selected_duplicate_archive,
                                         clipboard: &mut self.clipboard,
                                     },
                                 ) {
@@ -7238,7 +7215,7 @@ impl ArchiveFsApp {
                     requested_action = Some(AppOperationRequest::InspectArchive(path));
                 }
                 HealthDashboardAction::FilterByCategory(filter) => {
-                    self.health_filters.category = filter;
+                    self.health_duplicate_ui.health_filters.category = filter;
                 }
             }
         }

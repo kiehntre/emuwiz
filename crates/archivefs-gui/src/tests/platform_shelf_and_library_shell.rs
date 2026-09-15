@@ -853,8 +853,8 @@ fn selected_archive_and_filters_survive_a_library_tab_switch() {
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
     app.library_ui.filter = "mario".to_string();
     app.library_ui.library_filters.missing = true;
-    app.health_filters.category = HealthIssueFilter::UnknownPlatform;
-    app.duplicate_filters.platform = Some("SNES".to_string());
+    app.health_duplicate_ui.health_filters.category = HealthIssueFilter::UnknownPlatform;
+    app.health_duplicate_ui.duplicate_filters.platform = Some("SNES".to_string());
 
     for tab in [
         LibraryTab::Health,
@@ -880,12 +880,12 @@ fn selected_archive_and_filters_survive_a_library_tab_switch() {
         "Library row filters must survive switching tabs"
     );
     assert_eq!(
-        app.health_filters.category,
+        app.health_duplicate_ui.health_filters.category,
         HealthIssueFilter::UnknownPlatform,
         "Health filter state must survive switching tabs"
     );
     assert_eq!(
-        app.duplicate_filters.platform.as_deref(),
+        app.health_duplicate_ui.duplicate_filters.platform.as_deref(),
         Some("SNES"),
         "Duplicate filter state must survive switching tabs"
     );

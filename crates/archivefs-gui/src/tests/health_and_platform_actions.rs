@@ -2101,16 +2101,16 @@ fn changing_dashboard_filters_and_sort_does_not_rebuild_the_cached_report() {
 
     let before_ptr = app.cached_health_issues().as_ptr();
 
-    app.health_filters.search = "something".to_string();
-    app.health_filters.category = HealthIssueFilter::Retryable;
-    app.health_sort_field = HealthSortField::Reason;
-    app.health_sort_ascending = false;
+    app.health_duplicate_ui.health_filters.search = "something".to_string();
+    app.health_duplicate_ui.health_filters.category = HealthIssueFilter::Retryable;
+    app.health_duplicate_ui.health_sort_field = HealthSortField::Reason;
+    app.health_duplicate_ui.health_sort_ascending = false;
     let issues_snapshot = app.cached_health_issues().to_vec();
     let _ = visible_health_issue_indices(
         &issues_snapshot,
-        &app.health_filters,
-        app.health_sort_field,
-        app.health_sort_ascending,
+        &app.health_duplicate_ui.health_filters,
+        app.health_duplicate_ui.health_sort_field,
+        app.health_duplicate_ui.health_sort_ascending,
     );
 
     let after_ptr = app.cached_health_issues().as_ptr();
@@ -2129,15 +2129,15 @@ fn health_dashboard_state_is_separate_from_library_state_and_activity() {
     app.library_ui.sort_field = Some(SortField::State);
     app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/library.zip")].into_iter().collect();
-    app.selected_duplicate_archive = Some(PathBuf::from("/backup/Other.7z"));
+    app.health_duplicate_ui.selected_duplicate_archive = Some(PathBuf::from("/backup/Other.7z"));
     let history_len = app.history.len();
 
     app.view = MainView::Health;
-    app.health_filters.search = "luigi".to_string();
-    app.health_filters.category = HealthIssueFilter::Missing;
-    app.health_sort_field = HealthSortField::Reason;
-    app.health_sort_ascending = false;
-    app.selected_health_issue = Some(PathBuf::from("/roms/health-issue.zip"));
+    app.health_duplicate_ui.health_filters.search = "luigi".to_string();
+    app.health_duplicate_ui.health_filters.category = HealthIssueFilter::Missing;
+    app.health_duplicate_ui.health_sort_field = HealthSortField::Reason;
+    app.health_duplicate_ui.health_sort_ascending = false;
+    app.health_duplicate_ui.selected_health_issue = Some(PathBuf::from("/roms/health-issue.zip"));
     app.view = MainView::Library;
 
     assert_eq!(app.library_ui.filter, "ordinary search");
@@ -2152,7 +2152,7 @@ fn health_dashboard_state_is_separate_from_library_state_and_activity() {
         [PathBuf::from("/roms/library.zip")].into_iter().collect()
     );
     assert_eq!(
-        app.selected_duplicate_archive,
+        app.health_duplicate_ui.selected_duplicate_archive,
         Some(PathBuf::from("/backup/Other.7z")),
         "Duplicate Review's selection must remain independent of the health dashboard"
     );
