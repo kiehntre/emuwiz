@@ -2124,7 +2124,7 @@ fn health_dashboard_state_is_separate_from_library_state_and_activity() {
     app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/library.zip")].into_iter().collect();
     app.selected_duplicate_archive = Some(PathBuf::from("/backup/Other.7z"));
-    let history_len = app.history.entries.len();
+    let history_len = app.history.len();
 
     app.view = MainView::Health;
     app.health_filters.search = "luigi".to_string();
@@ -2151,7 +2151,7 @@ fn health_dashboard_state_is_separate_from_library_state_and_activity() {
         "Duplicate Review's selection must remain independent of the health dashboard"
     );
     assert_eq!(
-        app.history.entries.len(),
+        app.history.len(),
         history_len,
         "opening, filtering, sorting, and selecting in the dashboard must never add \
              Activity entries"
@@ -2166,7 +2166,7 @@ fn sources_and_tools_overlay_navigation_never_touches_library_state_or_activity(
     app.sort_field = Some(SortField::State);
     app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
     app.library_source_filter = Some(Some(PathBuf::from("/home/davedap/Archives")));
-    let history_len = app.history.entries.len();
+    let history_len = app.history.len();
 
     app.view = MainView::Sources;
     app.tools_overlay = ToolsOverlay::DoctorChecks;
@@ -2188,7 +2188,7 @@ fn sources_and_tools_overlay_navigation_never_touches_library_state_or_activity(
         Some(Some(PathBuf::from("/home/davedap/Archives")))
     );
     assert_eq!(
-        app.history.entries.len(),
+        app.history.len(),
         history_len,
         "visiting Sources or any Tools overlay must never add Activity entries"
     );

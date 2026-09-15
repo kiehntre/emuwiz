@@ -2927,7 +2927,7 @@ fn text_edit_context_menu_functions_never_touch_activity_history() {
     // structurally, none of them can record an Activity entry. This
     // pins that down as an explicit regression guard.
     let app = app_for_operation_tests();
-    let history_len = app.history.entries.len();
+    let history_len = app.history.len();
 
     let ctx = egui::Context::default();
     let id = egui::Id::new("activity_guard_direct_test");
@@ -2942,7 +2942,7 @@ fn text_edit_context_menu_functions_never_touch_activity_history() {
         text_edit_context_menu_action_available(TextEditContextMenuAction::Cut, true, false, true);
 
     assert_eq!(
-        app.history.entries.len(),
+        app.history.len(),
         history_len,
         "no context-menu action may ever add an Activity entry"
     );

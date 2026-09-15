@@ -189,7 +189,7 @@ fn duplicate_review_state_is_separate_from_library_state_and_activity() {
     app.library_filters.missing = true;
     app.sort_field = Some(SortField::State);
     app.archive_context.focused = Some(PathBuf::from("/roms/library.zip"));
-    let history_len = app.history.entries.len();
+    let history_len = app.history.len();
 
     app.view = MainView::Duplicates;
     app.duplicate_filters.search = "sonic".to_string();
@@ -203,7 +203,7 @@ fn duplicate_review_state_is_separate_from_library_state_and_activity() {
         app.archive_context.focused,
         Some(PathBuf::from("/roms/library.zip"))
     );
-    assert_eq!(app.history.entries.len(), history_len);
+    assert_eq!(app.history.len(), history_len);
 }
 
 #[test]
@@ -2010,9 +2010,9 @@ fn history_is_capped_at_fifty_entries() {
         history.record(history_entry(ActivityOutcome::Started, index.to_string()));
     }
 
-    assert_eq!(history.entries.len(), HISTORY_LIMIT);
-    assert_eq!(history.entries.front().unwrap().message, "59");
-    assert_eq!(history.entries.back().unwrap().message, "10");
+    assert_eq!(history.len(), HISTORY_LIMIT);
+    assert_eq!(history.entries().next().unwrap().message, "59");
+    assert_eq!(history.entries().last().unwrap().message, "10");
 }
 
 #[test]
@@ -2023,7 +2023,7 @@ fn clearing_history_removes_every_entry() {
 
     history.clear();
 
-    assert!(history.entries.is_empty());
+    assert_eq!(history.len(), 0);
 }
 
 #[test]
