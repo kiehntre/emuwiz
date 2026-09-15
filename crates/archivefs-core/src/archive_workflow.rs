@@ -176,11 +176,31 @@ pub fn inventory_archive_tools() -> ArchiveToolInventory {
     }
 }
 pub fn classify_archive(path: &Path) -> Option<ArchiveFormat> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "zip" => Some(ArchiveFormat::Zip),
-        "7z" => Some(ArchiveFormat::SevenZ),
-        "rar" => Some(ArchiveFormat::Rar),
-        _ => None,
+    if let Some(format) = path.extension().and_then(|extension| {
+        match extension.to_str()?.to_ascii_lowercase().as_str() {
+            "zip" => Some(ArchiveFormat::Zip),
+            "7z" => Some(ArchiveFormat::SevenZ),
+            "rar" => Some(ArchiveFormat::Rar),
+            _ => None,
+        }
+    }) {
+        return Some(format);
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let mut signature = [0u8; 8];
+    let count = std::io::Read::read(&mut file, &mut signature).ok()?;
+    let signature = &signature[..count];
+    if signature.starts_with(b"PK\x03\x04")
+        || signature.starts_with(b"PK\x05\x06")
+        || signature.starts_with(b"PK\x07\x08")
+    {
+        Some(ArchiveFormat::Zip)
+    } else if signature.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        Some(ArchiveFormat::SevenZ)
+    } else if signature.starts_with(b"Rar!\x1A\x07") {
+        Some(ArchiveFormat::Rar)
+    } else {
+        None
     }
 }
 

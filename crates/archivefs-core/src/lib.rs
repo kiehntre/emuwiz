@@ -539,6 +539,8 @@ pub mod mod_catalogue;
 
 /// Pure review projection for provider-neutral catalogue records.
 pub mod mod_catalogue_review;
+/// Local, immutable handoff from downloaded bytes to existing mod inspectors.
+pub mod mod_download_inspection;
 /// Pure, no-network policy validation for future external mod payload fetches.
 pub mod mod_download_policy;
 /// Bounded HTTPS transport for policy-approved external mod payloads.
