@@ -391,6 +391,7 @@ pub use retroarch_resource_projection::{
     RetroArchResourcePlan, RetroArchResourcePlanError, RetroArchResourceRequest,
     cleanup_retroarch_projection, command_with_retroarch_resource_plan,
     materialize_retroarch_resource_plan, plan_retroarch_resource_grants,
+    approved_retroarch_launch_root,
 };
 pub use rmg_command::{
     RMG_SUPPORTED_PLATFORM_ID, RmgCommand, RmgCommandPlan, RmgCommandSelection,

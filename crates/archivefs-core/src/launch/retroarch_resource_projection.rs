@@ -329,6 +329,12 @@ pub enum RetroArchProjectionError {
     Plan(RetroArchResourcePlanError),
     UnsupportedPlatform,
     RootConflict(PathBuf),
+    MarkerMissing(PathBuf),
+    MarkerMalformed(PathBuf),
+    WrongLaunchId(PathBuf),
+    LaunchRootOutsideApprovedRoot(PathBuf),
+    LaunchRootIsSymlink(PathBuf),
+    PartialDeletion { path: PathBuf, detail: String },
     SourceInvalid(PathBuf),
     DestinationConflict(PathBuf),
     Io(String),
@@ -344,6 +350,34 @@ impl std::fmt::Display for RetroArchProjectionError {
             Self::RootConflict(path) => write!(
                 f,
                 "launch root is not an EmuWiz-owned directory: {}",
+                path.display()
+            ),
+            Self::MarkerMissing(path) => write!(
+                f,
+                "RetroArch launch ownership marker is missing: {}",
+                path.display()
+            ),
+            Self::MarkerMalformed(path) => write!(
+                f,
+                "RetroArch launch ownership marker is malformed: {}",
+                path.display()
+            ),
+            Self::WrongLaunchId(path) => write!(
+                f,
+                "RetroArch launch ownership marker has the wrong launch id: {}",
+                path.display()
+            ),
+            Self::LaunchRootOutsideApprovedRoot(path) => write!(
+                f,
+                "RetroArch launch root is outside the approved EmuWiz temporary root: {}",
+                path.display()
+            ),
+            Self::LaunchRootIsSymlink(path) => {
+                write!(f, "RetroArch launch root is a symlink: {}", path.display())
+            }
+            Self::PartialDeletion { path, detail } => write!(
+                f,
+                "RetroArch launch cleanup was incomplete at {}: {detail}",
                 path.display()
             ),
             Self::SourceInvalid(path) => write!(
@@ -362,6 +396,39 @@ impl std::fmt::Display for RetroArchProjectionError {
 }
 
 impl std::error::Error for RetroArchProjectionError {}
+
+/// Every recursive cleanup target must be below this EmuWiz-owned temporary
+/// root. Callers may choose a per-launch child, but may not authorize an
+/// arbitrary absolute path for recursive deletion.
+pub fn approved_retroarch_launch_root() -> PathBuf {
+    std::env::temp_dir().join("emuwiz/retroarch-launches")
+}
+
+fn validate_launch_root(root: &Path) -> Result<(), RetroArchProjectionError> {
+    let approved = approved_retroarch_launch_root();
+    if !root.is_absolute()
+        || root
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        || root == approved
+        || !root.starts_with(&approved)
+    {
+        return Err(RetroArchProjectionError::LaunchRootOutsideApprovedRoot(
+            root.to_path_buf(),
+        ));
+    }
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(
+            RetroArchProjectionError::LaunchRootIsSymlink(root.to_path_buf()),
+        ),
+        Ok(metadata) if !metadata.is_dir() => {
+            Err(RetroArchProjectionError::RootConflict(root.to_path_buf()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RetroArchProjectionError::Io(error.to_string())),
+    }
+}
 
 #[cfg(unix)]
 fn create_link(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -430,16 +497,7 @@ pub fn materialize_retroarch_resource_plan(
         .validate()
         .map_err(RetroArchResourcePlanError::from)
         .map_err(RetroArchProjectionError::Plan)?;
-    if !plan.launch_root.is_absolute()
-        || plan
-            .launch_root
-            .components()
-            .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(RetroArchProjectionError::RootConflict(
-            plan.launch_root.clone(),
-        ));
-    }
+    validate_launch_root(&plan.launch_root)?;
     let mut created = Vec::new();
     match fs::symlink_metadata(&plan.launch_root) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -547,36 +605,43 @@ pub fn materialize_retroarch_resource_plan(
     })
 }
 
-/// Remove only paths recorded by the receipt, deepest first, after verifying
-/// the ownership marker. Source files, saves, and unknown paths are untouched.
+/// Remove the complete verified EmuWiz-owned launch-only tree after checking
+/// its fixed ownership boundary and marker. `remove_dir_all` removes symlink
+/// entries themselves and does not traverse their targets.
 pub fn cleanup_retroarch_projection(
     receipt: &RetroArchProjectionReceipt,
 ) -> Result<(), RetroArchProjectionError> {
+    validate_launch_root(&receipt.launch_root)?;
     let marker = receipt.launch_root.join(".emuwiz-retroarch-launch");
+    let marker_metadata = fs::symlink_metadata(&marker).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            RetroArchProjectionError::MarkerMissing(marker.clone())
+        } else {
+            RetroArchProjectionError::Io(error.to_string())
+        }
+    })?;
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return Err(RetroArchProjectionError::MarkerMalformed(marker));
+    }
     let marker_text = fs::read_to_string(&marker)
         .map_err(|error| RetroArchProjectionError::Io(error.to_string()))?;
-    if marker_text != format!("EMUWIZ_RETROARCH_LAUNCH\n{}\n", receipt.launch_id) {
-        return Err(RetroArchProjectionError::RootConflict(marker));
+    let expected = format!("EMUWIZ_RETROARCH_LAUNCH\n{}\n", receipt.launch_id);
+    if marker_text != expected {
+        let marker_launch_id = marker_text
+            .strip_prefix("EMUWIZ_RETROARCH_LAUNCH\n")
+            .and_then(|value| value.strip_suffix('\n'));
+        return if marker_launch_id.is_some() {
+            Err(RetroArchProjectionError::WrongLaunchId(marker))
+        } else {
+            Err(RetroArchProjectionError::MarkerMalformed(marker))
+        };
     }
-    let mut paths = receipt.created_paths.clone();
-    paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
-    for path in paths {
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
-                fs::remove_file(&path)
-                    .map_err(|error| RetroArchProjectionError::Io(error.to_string()))?;
-            }
-            Ok(metadata) if metadata.is_dir() => {
-                if fs::remove_dir(&path).is_err() {
-                    // Never recursively delete a non-empty directory.
-                }
-            }
-            Ok(_) => return Err(RetroArchProjectionError::RootConflict(path)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(RetroArchProjectionError::Io(error.to_string())),
+    fs::remove_dir_all(&receipt.launch_root).map_err(|error| {
+        RetroArchProjectionError::PartialDeletion {
+            path: receipt.launch_root.clone(),
+            detail: error.to_string(),
         }
-    }
-    Ok(())
+    })
 }
 
 /// Add the generated append-config argument to an already-built command.
@@ -600,7 +665,8 @@ mod tests {
     use crate::bios_projection::{BiosEvidenceSource, BiosMatchStatus};
 
     fn request(temp: &tempfile::TempDir) -> RetroArchResourceRequest {
-        let root = temp.path().join("launch");
+        let root = approved_retroarch_launch_root()
+            .join(temp.path().file_name().expect("tempdir has a name"));
         let bios_root = temp.path().join("bios");
         let source = bios_root.join("kick40068.A1200");
         std::fs::create_dir_all(&bios_root).unwrap();
@@ -684,11 +750,118 @@ mod tests {
         cleanup_retroarch_projection(&receipt).unwrap();
         assert!(!link.exists());
         assert!(!plan.config_path.exists());
+        assert!(!plan.launch_root.exists());
+        assert!(request.save_directory.exists());
         assert_eq!(
             std::fs::read(&request.bios_root.join("kick40068.A1200")).unwrap(),
             source_hash
         );
         request.launch_id = "second".into();
+    }
+
+    #[test]
+    fn cleanup_removes_unrecorded_emulator_files_and_nested_runtime_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request(&temp);
+        std::fs::write(&request.content_path, b"game").unwrap();
+        std::fs::create_dir_all(&request.save_directory).unwrap();
+        let plan = plan_retroarch_resource_grants(&request).unwrap();
+        let receipt = materialize_retroarch_resource_plan(&plan).unwrap();
+        let generated = plan.system_directory.join("WHDLoad.prefs");
+        let backup = plan.system_directory.join("runtime/cache/old.bak");
+        std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+        std::fs::write(&generated, b"runtime").unwrap();
+        std::fs::write(&backup, b"backup").unwrap();
+
+        cleanup_retroarch_projection(&receipt).unwrap();
+
+        assert!(!plan.launch_root.exists());
+        assert!(request.save_directory.exists());
+    }
+
+    #[test]
+    fn cleanup_refuses_invalid_ownership_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = approved_retroarch_launch_root().join(temp.path().file_name().unwrap());
+        std::fs::create_dir_all(&root).unwrap();
+        let receipt = RetroArchProjectionReceipt {
+            launch_id: "launch-1".into(),
+            launch_root: root.clone(),
+            created_paths: vec![],
+        };
+        assert!(matches!(
+            cleanup_retroarch_projection(&receipt),
+            Err(RetroArchProjectionError::MarkerMissing(_))
+        ));
+        std::fs::write(root.join(".emuwiz-retroarch-launch"), "garbage").unwrap();
+        assert!(matches!(
+            cleanup_retroarch_projection(&receipt),
+            Err(RetroArchProjectionError::MarkerMalformed(_))
+        ));
+        std::fs::write(
+            root.join(".emuwiz-retroarch-launch"),
+            "EMUWIZ_RETROARCH_LAUNCH\nother\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            cleanup_retroarch_projection(&receipt),
+            Err(RetroArchProjectionError::WrongLaunchId(_))
+        ));
+    }
+
+    #[test]
+    fn cleanup_refuses_outside_root_and_symlink_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"keep").unwrap();
+        let outside_receipt = RetroArchProjectionReceipt {
+            launch_id: "launch-1".into(),
+            launch_root: outside.clone(),
+            created_paths: vec![],
+        };
+        assert!(matches!(
+            cleanup_retroarch_projection(&outside_receipt),
+            Err(RetroArchProjectionError::LaunchRootOutsideApprovedRoot(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            let linked = approved_retroarch_launch_root().join(temp.path().file_name().unwrap());
+            std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&outside, &linked).unwrap();
+            let linked_receipt = RetroArchProjectionReceipt {
+                launch_id: "launch-1".into(),
+                launch_root: linked.clone(),
+                created_paths: vec![],
+            };
+            assert!(matches!(
+                cleanup_retroarch_projection(&linked_receipt),
+                Err(RetroArchProjectionError::LaunchRootIsSymlink(_))
+            ));
+            assert!(outside.join("keep").exists());
+            std::fs::remove_file(linked).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_removes_symlink_entry_without_touching_external_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request(&temp);
+        std::fs::write(&request.content_path, b"game").unwrap();
+        std::fs::create_dir_all(&request.save_directory).unwrap();
+        let plan = plan_retroarch_resource_grants(&request).unwrap();
+        let receipt = materialize_retroarch_resource_plan(&plan).unwrap();
+        let external = temp.path().join("external");
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(&external, plan.launch_root.join("link")).unwrap();
+
+        cleanup_retroarch_projection(&receipt).unwrap();
+
+        assert!(!plan.launch_root.exists());
+        assert!(external.join("keep").exists());
     }
 
     #[test]
