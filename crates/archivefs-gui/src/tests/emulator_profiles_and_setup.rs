@@ -4199,7 +4199,7 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
     std::fs::write(directory.join("Dolphin.ini"), b"[Core]\n").unwrap();
 
     let mut app = dolphin_workflow_with_matched_identity(&directory, "GALE01");
-    app.selected_evidence = ready_selected_evidence_state(Path::new("/roms/a.zip"));
+    app.selected_evidence_ui.selected_evidence = ready_selected_evidence_state(Path::new("/roms/a.zip"));
 
     let roots = archivefs_core::patch_manager::DolphinLocalDiscoveryRoots {
         home: directory.join("home"),
@@ -4314,7 +4314,7 @@ fn selected_page_pcsx2_readiness_requires_matching_firmware_evidence_and_threads
     } else {
         panic!("fixture must retain its verified PS2 identity report");
     }
-    app.selected_evidence = ready_selected_evidence_state(&content);
+    app.selected_evidence_ui.selected_evidence = ready_selected_evidence_state(&content);
     app.pcsx2_launch_profiles =
         Pcsx2LaunchProfilesState::Ready(Pcsx2LaunchProfilesReady { discovery, roots });
 

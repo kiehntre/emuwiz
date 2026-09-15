@@ -298,6 +298,7 @@ pub(crate) mod selected_evidence_no_intro;
 #[allow(dead_code)]
 pub(crate) mod selected_evidence_page;
 mod selected_evidence_pipeline;
+mod selected_evidence_ui_state;
 use selected_evidence_pipeline::*;
 pub mod selection_guard;
 mod source_state;
@@ -1185,6 +1186,7 @@ use mount_operation_controller::{
 };
 use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
 use health_duplicate_ui_state::HealthDuplicateUiState;
+use selected_evidence_ui_state::SelectedEvidenceUiState;
 
 #[derive(Debug)]
 enum BsFreeManagerState {
@@ -2276,53 +2278,7 @@ struct ArchiveFsApp {
     /// The last authoritative RomM snapshot. `None` until the first status load,
     /// so the card shows "reading" rather than a screenful of zeroes.
     romm_ui: RommUiState,
-    /// GUI Batch A: the Selected page's real, read-only identity/evidence
-    /// panel state - see `selected_evidence_page`'s own module doc. Starts
-    /// `Idle`; loading is always an explicit action, never automatic.
-    selected_evidence: selected_evidence_page::SelectedEvidenceState,
-    selected_evidence_generation: u64,
-    /// Cancellation shared by the current selection's fast and deferred
-    /// workers. Replaced (and set) as soon as focus moves, so a stale
-    /// multi-gigabyte hash stops instead of merely losing its receiver.
-    selected_evidence_cancel: Option<Arc<AtomicBool>>,
-    /// The deferred enrichment pass for a selected loose file: the whole-file
-    /// checksum and its No-Intro DAT lookup. Compressed archives terminate
-    /// after bounded identity inspection instead. Kept separate from
-    /// `selected_evidence` so the structural / verified identity in a
-    /// `Ready` report is shown immediately and this - which can cost
-    /// minutes for a multi-gigabyte ISO or a large DAT set - fills in
-    /// `hashes`/`no_intro` afterwards without ever blocking the panel.
-    selected_evidence_enrichment: SelectedEvidenceEnrichmentState,
-    /// Resolves the registered DAT source registry down to the No-Intro
-    /// source relevant to a selected file's platform, without ever
-    /// reparsing an unchanged registry - see
-    /// `selected_evidence_no_intro::NoIntroSourceCache`. Shared behind
-    /// `Arc<Mutex<_>>` because the resolve+lookup itself runs inside the
-    /// same background thread `start_selected_evidence_load` already
-    /// spawns, and the cache must survive across separate loads to be
-    /// useful.
-    no_intro_source_cache: Arc<Mutex<selected_evidence_no_intro::NoIntroSourceCache>>,
-    /// GUI Batch B: the read-only "Sources & Providers" status shown on the
-    /// Selected page below the evidence panel - see
-    /// `identity_sources_page`'s own module doc. Starts `Idle`; loading is
-    /// always an explicit action, never automatic.
-    identity_sources: identity_sources_page::IdentitySourcesState,
-    identity_sources_generation: u64,
-    /// ScummVM Detection: whether the native ScummVM detector is present -
-    /// see `identity_sources_page::ScummVmReadinessState`'s own doc.
-    /// Probed once automatically (like `dolphin_local_profiles`), never
-    /// repeated, and never offers a download/install action.
-    scummvm_readiness: identity_sources_page::ScummVmReadinessState,
-    /// ScummVM Detection: the read-only "Check ScummVM games" job - see
-    /// `identity_sources_page::ScummVmCheckState`'s own doc. Starts `Idle`;
-    /// running it is always an explicit action, never automatic.
-    scummvm_check: identity_sources_page::ScummVmCheckState,
-    scummvm_check_generation: u64,
-    /// GUI Batch C: the read-only "Plan Preview" for the selected file -
-    /// see `plan_preview_page`'s own module doc. Starts `Idle`; loading is
-    /// always an explicit action, never automatic.
-    plan_preview: plan_preview_page::PlanPreviewState,
-    plan_preview_generation: u64,
+    selected_evidence_ui: SelectedEvidenceUiState,
     /// The "Add Folder" dialog's open/closed state and its own fields -
     /// see `SourcesAddDialogState`.
     sources_add_dialog: Option<SourcesAddDialogState>,
@@ -2697,20 +2653,7 @@ impl ArchiveFsApp {
             catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
             gui_config,
             romm_ui: RommUiState::default(),
-            selected_evidence: selected_evidence_page::SelectedEvidenceState::Idle,
-            selected_evidence_generation: 0,
-            selected_evidence_cancel: None,
-            selected_evidence_enrichment: SelectedEvidenceEnrichmentState::Idle,
-            no_intro_source_cache: Arc::new(Mutex::new(
-                selected_evidence_no_intro::NoIntroSourceCache::new(),
-            )),
-            identity_sources: identity_sources_page::IdentitySourcesState::Idle,
-            identity_sources_generation: 0,
-            scummvm_readiness: identity_sources_page::ScummVmReadinessState::NotChecked,
-            scummvm_check: identity_sources_page::ScummVmCheckState::Idle,
-            scummvm_check_generation: 0,
-            plan_preview: plan_preview_page::PlanPreviewState::Idle,
-            plan_preview_generation: 0,
+            selected_evidence_ui: SelectedEvidenceUiState::default(),
             sources_add_dialog: None,
             gamer_view_pending_first_scan: None,
             gamer_view_scan_review_available: false,
@@ -3347,7 +3290,7 @@ impl ArchiveFsApp {
 
     fn show_optical_conversion_page(&mut self, ui: &mut egui::Ui) {
         let selected_context = self.archive_context.focused.as_ref().map(|path| {
-            let platform = match &self.selected_evidence {
+            let platform = match &self.selected_evidence_ui.selected_evidence {
                 selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
                     if report.path == *path =>
                 {
@@ -4378,7 +4321,7 @@ impl ArchiveFsApp {
     /// report is not `Ready` (nothing to plan for yet).
     fn start_plan_preview_load(&mut self, context: egui::Context) {
         let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
-            &self.selected_evidence
+            &self.selected_evidence_ui.selected_evidence
         else {
             return;
         };
@@ -4387,10 +4330,10 @@ impl ArchiveFsApp {
         let identity_presentation = report.identity.clone();
         let physical_hash = report.hashes.as_ref().map(|hashes| hashes.sha1.clone());
 
-        self.plan_preview_generation += 1;
-        let generation = self.plan_preview_generation;
+        self.selected_evidence_ui.plan_preview_generation += 1;
+        let generation = self.selected_evidence_ui.plan_preview_generation;
         let (sender, receiver) = mpsc::channel();
-        self.plan_preview = plan_preview_page::PlanPreviewState::Loading {
+        self.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Loading {
             generation,
             receiver,
         };
@@ -4430,11 +4373,11 @@ impl ArchiveFsApp {
         if let plan_preview_page::PlanPreviewState::Loading {
             generation,
             receiver,
-        } = &self.plan_preview
+        } = &self.selected_evidence_ui.plan_preview
             && let Ok((message_generation, outcome)) = receiver.try_recv()
             && message_generation == *generation
         {
-            self.plan_preview = plan_preview_page::PlanPreviewState::Ready {
+            self.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Ready {
                 generation: message_generation,
                 outcome,
             };
@@ -5397,7 +5340,7 @@ impl ArchiveFsApp {
                         }
                     }
                     if let Some(path) = self.archive_context.focused.clone() {
-                        let evidence_is_stale = match &self.selected_evidence {
+                        let evidence_is_stale = match &self.selected_evidence_ui.selected_evidence {
                             selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
                                 report.path != path
                             }
@@ -5483,7 +5426,7 @@ impl ArchiveFsApp {
                     let gamer_launch_input = self.build_launch_readiness_input(data);
                     let gamer_play_action =
                         launch_readiness_page::gamer_play_action(&gamer_launch_input);
-                    let gamer_identity_status = match &self.selected_evidence {
+                    let gamer_identity_status = match &self.selected_evidence_ui.selected_evidence {
                         selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
                             Some(gamer_identity_status_from_verdict(report.identity.status))
                         }
@@ -6592,7 +6535,7 @@ impl ArchiveFsApp {
                         .as_ref()
                         .filter(|path| tape_analysis_page::is_tape_path(path))
                     {
-                        let evidence_is_stale = match &self.selected_evidence {
+                        let evidence_is_stale = match &self.selected_evidence_ui.selected_evidence {
                             selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
                                 report.path != *path
                             }
@@ -6608,7 +6551,7 @@ impl ArchiveFsApp {
                             self.start_selected_evidence_load(context.clone(), path.clone());
                         }
                     }
-                    let (analysis, analysis_error) = match &self.selected_evidence {
+                    let (analysis, analysis_error) = match &self.selected_evidence_ui.selected_evidence {
                         selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
                             if Some(report.path.as_path()) == selected_path.as_deref() =>
                         {
@@ -7106,7 +7049,7 @@ impl ArchiveFsApp {
                                 platform_custom_text: &mut self.library_ui.platform_custom_text,
                                 platform_busy: self.library_ui.platform_action.is_some(),
                                 retroarch_profiles: &self.retroarch_profiles,
-                                selected_evidence: &self.selected_evidence,
+                                selected_evidence: &self.selected_evidence_ui.selected_evidence,
                                 selected_archives: &mut self.archive_context.selected,
                                 bulk_platform_choice: &mut self.library_ui.bulk_platform_choice,
                                 bulk_platform_busy: self.library_ui.bulk_platform_action.is_some(),

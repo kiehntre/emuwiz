@@ -10,19 +10,19 @@ impl ArchiveFsApp {
     /// read-only.
     pub(crate) fn start_selected_evidence_load(&mut self, context: egui::Context, path: PathBuf) {
         self.cancel_selected_evidence_work();
-        self.selected_evidence_generation += 1;
-        let generation = self.selected_evidence_generation;
+        self.selected_evidence_ui.selected_evidence_generation += 1;
+        let generation = self.selected_evidence_ui.selected_evidence_generation;
         let cancel = Arc::new(AtomicBool::new(false));
-        self.selected_evidence_cancel = Some(Arc::clone(&cancel));
+        self.selected_evidence_ui.selected_evidence_cancel = Some(Arc::clone(&cancel));
         let (sender, receiver) = mpsc::channel();
-        self.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
+        self.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
             generation,
             path: path.clone(),
             receiver,
         };
         // A new selection invalidates any in-flight or completed enrichment
         // pass for the previous file.
-        self.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
+        self.selected_evidence_ui.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
         let platform_hint = match &self.state {
             LoadState::Ready(data) => data
                 .records
@@ -68,7 +68,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn cancel_selected_evidence_work(&mut self) {
-        if let Some(cancel) = self.selected_evidence_cancel.take() {
+        if let Some(cancel) = self.selected_evidence_ui.selected_evidence_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
         }
     }
@@ -78,7 +78,7 @@ impl ArchiveFsApp {
     /// still guard every reply; cancellation additionally stops the costly
     /// hash instead of allowing stale I/O to continue in the background.
     pub(crate) fn reconcile_selected_evidence_selection(&mut self) {
-        let state_path = match &self.selected_evidence {
+        let state_path = match &self.selected_evidence_ui.selected_evidence {
             selected_evidence_page::SelectedEvidenceState::Loading { path, .. }
             | selected_evidence_page::SelectedEvidenceState::Error { path, .. } => Some(path),
             selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
@@ -90,8 +90,8 @@ impl ArchiveFsApp {
             && state_path.is_some()
         {
             self.cancel_selected_evidence_work();
-            self.selected_evidence = selected_evidence_page::SelectedEvidenceState::Idle;
-            self.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
+            self.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Idle;
+            self.selected_evidence_ui.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
         }
     }
 
@@ -110,16 +110,16 @@ impl ArchiveFsApp {
         platform: Option<String>,
     ) {
         let (sender, receiver) = mpsc::channel();
-        self.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Loading {
+        self.selected_evidence_ui.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Loading {
             generation,
             path: path.clone(),
             receiver,
         };
         let cancel = Arc::clone(
-            self.selected_evidence_cancel
+            self.selected_evidence_ui.selected_evidence_cancel
                 .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
         );
-        let no_intro_source_cache = Arc::clone(&self.no_intro_source_cache);
+        let no_intro_source_cache = Arc::clone(&self.selected_evidence_ui.no_intro_source_cache);
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if cancel.load(Ordering::Relaxed) {
@@ -176,7 +176,7 @@ impl ArchiveFsApp {
     pub(crate) fn maybe_start_selected_evidence_enrichment(&mut self, context: &egui::Context) {
         let selected_evidence_page::SelectedEvidenceState::Ready {
             generation, report, ..
-        } = &self.selected_evidence
+        } = &self.selected_evidence_ui.selected_evidence
         else {
             return;
         };
@@ -188,7 +188,7 @@ impl ArchiveFsApp {
         }
         let generation = *generation;
         let path = report.path.clone();
-        let already = match &self.selected_evidence_enrichment {
+        let already = match &self.selected_evidence_ui.selected_evidence_enrichment {
             SelectedEvidenceEnrichmentState::Idle => false,
             SelectedEvidenceEnrichmentState::Loading {
                 generation: g,
@@ -218,7 +218,7 @@ impl ArchiveFsApp {
     pub(crate) fn start_selected_hasheous_check(&mut self, context: egui::Context) {
         let selected_evidence_page::SelectedEvidenceState::Ready {
             generation, report, ..
-        } = &mut self.selected_evidence
+        } = &mut self.selected_evidence_ui.selected_evidence
         else {
             return;
         };
@@ -228,7 +228,7 @@ impl ArchiveFsApp {
         let generation = *generation;
         let (sender, receiver) = mpsc::channel();
         if let selected_evidence_page::SelectedEvidenceState::Ready { hasheous, .. } =
-            &mut self.selected_evidence
+            &mut self.selected_evidence_ui.selected_evidence
         {
             *hasheous = selected_evidence_page::HasheousState::Loading {
                 generation,
@@ -274,7 +274,7 @@ impl ArchiveFsApp {
     /// (the same stale-result guard every other background loader in this
     /// app uses).
     pub(crate) fn poll_selected_evidence(&mut self) {
-        let base_result = match &self.selected_evidence {
+        let base_result = match &self.selected_evidence_ui.selected_evidence {
             selected_evidence_page::SelectedEvidenceState::Loading {
                 generation,
                 receiver,
@@ -291,14 +291,14 @@ impl ArchiveFsApp {
             _ => None,
         };
         if let Some((state_generation, message_generation, result)) = base_result
-            && state_generation == self.selected_evidence_generation
+            && state_generation == self.selected_evidence_ui.selected_evidence_generation
             && message_generation == state_generation
         {
-            let path = match &self.selected_evidence {
+            let path = match &self.selected_evidence_ui.selected_evidence {
                 selected_evidence_page::SelectedEvidenceState::Loading { path, .. } => path.clone(),
                 _ => return,
             };
-            self.selected_evidence = match result {
+            self.selected_evidence_ui.selected_evidence = match result {
                 Ok(report) => selected_evidence_page::SelectedEvidenceState::Ready {
                     generation: message_generation,
                     report: Box::new(report),
@@ -311,13 +311,13 @@ impl ArchiveFsApp {
                 },
             };
         }
-        // Two separate borrows of `self.selected_evidence` (read to poll the
+        // Two separate borrows of `self.selected_evidence_ui.selected_evidence` (read to poll the
         // channel, then a fresh mutable one to write the result) rather than
         // one collapsed condition - the write must start after the read
         // borrow above has already ended.
         #[allow(clippy::collapsible_if)]
         if let selected_evidence_page::SelectedEvidenceState::Ready { hasheous, .. } =
-            &self.selected_evidence
+            &self.selected_evidence_ui.selected_evidence
             && let selected_evidence_page::HasheousState::Loading {
                 generation,
                 receiver,
@@ -326,7 +326,7 @@ impl ArchiveFsApp {
             && message_generation == *generation
         {
             if let selected_evidence_page::SelectedEvidenceState::Ready { hasheous, .. } =
-                &mut self.selected_evidence
+                &mut self.selected_evidence_ui.selected_evidence
             {
                 *hasheous = selected_evidence_page::HasheousState::Done {
                     generation: message_generation,
@@ -338,7 +338,7 @@ impl ArchiveFsApp {
         // Drain a completed deferred enrichment pass (whole-file checksum +
         // No-Intro lookup) and merge it into the `Ready` report the panel is
         // already showing, if the selection has not moved on since.
-        let enrichment_result = match &self.selected_evidence_enrichment {
+        let enrichment_result = match &self.selected_evidence_ui.selected_evidence_enrichment {
             SelectedEvidenceEnrichmentState::Loading {
                 generation,
                 receiver,
@@ -359,10 +359,10 @@ impl ArchiveFsApp {
             | SelectedEvidenceEnrichmentState::Done { .. } => None,
         };
         if let Some((state_generation, message_generation, result)) = enrichment_result
-            && state_generation == self.selected_evidence_generation
+            && state_generation == self.selected_evidence_ui.selected_evidence_generation
             && message_generation == state_generation
         {
-            let (generation, path) = match &self.selected_evidence_enrichment {
+            let (generation, path) = match &self.selected_evidence_ui.selected_evidence_enrichment {
                 SelectedEvidenceEnrichmentState::Loading {
                     generation, path, ..
                 } => (*generation, path.clone()),
@@ -373,7 +373,7 @@ impl ArchiveFsApp {
                 generation: ready_generation,
                 report,
                 ..
-            } = &mut self.selected_evidence
+            } = &mut self.selected_evidence_ui.selected_evidence
                 && *ready_generation == generation
                 && report.path == path
             {
@@ -390,7 +390,7 @@ impl ArchiveFsApp {
                     }
                 }
             }
-            self.selected_evidence_enrichment =
+            self.selected_evidence_ui.selected_evidence_enrichment =
                 SelectedEvidenceEnrichmentState::Done { generation, path };
         }
     }
@@ -399,10 +399,10 @@ impl ArchiveFsApp {
     /// Providers" status load - see `identity_sources_page`'s own module
     /// doc. Explicit only (a button press); never called automatically.
     pub(crate) fn start_identity_sources_load(&mut self, context: egui::Context) {
-        self.identity_sources_generation += 1;
-        let generation = self.identity_sources_generation;
+        self.selected_evidence_ui.identity_sources_generation += 1;
+        let generation = self.selected_evidence_ui.identity_sources_generation;
         let (sender, receiver) = mpsc::channel();
-        self.identity_sources = identity_sources_page::IdentitySourcesState::Loading {
+        self.selected_evidence_ui.identity_sources = identity_sources_page::IdentitySourcesState::Loading {
             generation,
             receiver,
         };
@@ -435,11 +435,11 @@ impl ArchiveFsApp {
         if let identity_sources_page::IdentitySourcesState::Loading {
             generation,
             receiver,
-        } = &self.identity_sources
+        } = &self.selected_evidence_ui.identity_sources
             && let Ok((message_generation, status)) = receiver.try_recv()
             && message_generation == *generation
         {
-            self.identity_sources = identity_sources_page::IdentitySourcesState::Ready {
+            self.selected_evidence_ui.identity_sources = identity_sources_page::IdentitySourcesState::Ready {
                 generation: message_generation,
                 status,
             };

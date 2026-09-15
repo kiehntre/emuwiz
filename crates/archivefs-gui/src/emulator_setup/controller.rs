@@ -653,7 +653,7 @@ impl ArchiveFsApp {
         use launch_readiness_page::LaunchReadinessInput;
 
         if !matches!(
-            self.selected_evidence,
+            self.selected_evidence_ui.selected_evidence,
             selected_evidence_page::SelectedEvidenceState::Ready { .. }
         ) {
             return LaunchReadinessInput::EvidenceNotLoaded;
@@ -674,7 +674,7 @@ impl ArchiveFsApp {
 
         let focused = self.archive_context.focused.as_deref();
         let selected_game_identity_report =
-            focused.and_then(|focused| match &self.selected_evidence {
+            focused.and_then(|focused| match &self.selected_evidence_ui.selected_evidence {
                 selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
                     if report.path == focused =>
                 {
@@ -1454,7 +1454,7 @@ impl ArchiveFsApp {
     /// `archivefs_core::scummvm_detection`.
     pub(crate) fn start_scummvm_readiness_check(&mut self, context: egui::Context) {
         let (sender, receiver) = mpsc::channel();
-        self.scummvm_readiness =
+        self.selected_evidence_ui.scummvm_readiness =
             identity_sources_page::ScummVmReadinessState::Checking { receiver };
         thread::spawn(move || {
             let readiness = identity_sources_page::gather_scummvm_readiness();
@@ -1465,10 +1465,10 @@ impl ArchiveFsApp {
 
     pub(crate) fn poll_scummvm_readiness(&mut self) {
         if let identity_sources_page::ScummVmReadinessState::Checking { receiver } =
-            &self.scummvm_readiness
+            &self.selected_evidence_ui.scummvm_readiness
             && let Ok(readiness) = receiver.try_recv()
         {
-            self.scummvm_readiness = identity_sources_page::ScummVmReadinessState::Ready(readiness);
+            self.selected_evidence_ui.scummvm_readiness = identity_sources_page::ScummVmReadinessState::Ready(readiness);
         }
     }
 
@@ -1486,10 +1486,10 @@ impl ArchiveFsApp {
             return;
         };
         let candidates = identity_sources_page::scummvm_candidates_from_rows(&data.rows);
-        self.scummvm_check_generation += 1;
-        let generation = self.scummvm_check_generation;
+        self.selected_evidence_ui.scummvm_check_generation += 1;
+        let generation = self.selected_evidence_ui.scummvm_check_generation;
         let (sender, receiver) = mpsc::channel();
-        self.scummvm_check = identity_sources_page::ScummVmCheckState::Checking {
+        self.selected_evidence_ui.scummvm_check = identity_sources_page::ScummVmCheckState::Checking {
             generation,
             receiver,
             checked: 0,
@@ -1542,7 +1542,7 @@ impl ArchiveFsApp {
             checked,
             total,
             current,
-        } = &mut self.scummvm_check
+        } = &mut self.selected_evidence_ui.scummvm_check
         {
             let generation = *generation;
             while let Ok((message_generation, message)) = receiver.try_recv() {
@@ -1560,7 +1560,7 @@ impl ArchiveFsApp {
                         *current = Some(new_current);
                     }
                     identity_sources_page::ScummVmCheckMessage::Done(summary) => {
-                        self.scummvm_check = identity_sources_page::ScummVmCheckState::Ready {
+                        self.selected_evidence_ui.scummvm_check = identity_sources_page::ScummVmCheckState::Ready {
                             generation,
                             summary,
                         };

@@ -100,7 +100,7 @@ impl ArchiveFsApp {
             .as_deref()
             .or(record.metadata.platform.as_deref())?
             .to_string();
-        let video_available = match &self.selected_evidence {
+        let video_available = match &self.selected_evidence_ui.selected_evidence {
             selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
                 if report.path == *path =>
             {
@@ -114,7 +114,7 @@ impl ArchiveFsApp {
             }
             _ => None,
         };
-        let evidence_report = match &self.selected_evidence {
+        let evidence_report = match &self.selected_evidence_ui.selected_evidence {
             selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
                 if report.path == *path =>
             {
@@ -199,7 +199,7 @@ impl ArchiveFsApp {
             screenshot_count: self.gamer_screenshots.screenshot_count(path),
             video_available,
             dat_verified: matches!(
-                &self.selected_evidence,
+                &self.selected_evidence_ui.selected_evidence,
                 selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
                     if report.path == *path
                         && matches!(
@@ -256,7 +256,7 @@ impl ArchiveFsApp {
         archive_action_block_reason: Option<&'static str>,
     ) -> Option<MountPageAction> {
         if let Some(path) = self.archive_context.focused.clone() {
-            let should_load_evidence = match &self.selected_evidence {
+            let should_load_evidence = match &self.selected_evidence_ui.selected_evidence {
                 selected_evidence_page::SelectedEvidenceState::Loading {
                     path: loading_path,
                     ..
@@ -296,7 +296,7 @@ impl ArchiveFsApp {
             self.start_flycast_profile_scan(context.clone());
         }
         if matches!(
-            self.scummvm_readiness,
+            self.selected_evidence_ui.scummvm_readiness,
             identity_sources_page::ScummVmReadinessState::NotChecked
         ) {
             self.start_scummvm_readiness_check(context.clone());
@@ -323,7 +323,7 @@ impl ArchiveFsApp {
             ui,
             self.ui_mode == GuiMode::AdvancedView,
             self.archive_context.focused.as_deref(),
-            &self.selected_evidence,
+            &self.selected_evidence_ui.selected_evidence,
         );
         self.handle_selected_evidence_action(context, evidence_action);
         ui.add_space(crate::ui::theme::SECTION_GAP);
@@ -398,7 +398,7 @@ impl ArchiveFsApp {
         let identity_sources_action = identity_sources_page::show_identity_sources_panel(
             ui,
             self.ui_mode == GuiMode::AdvancedView,
-            &self.identity_sources,
+            &self.selected_evidence_ui.identity_sources,
         );
         self.handle_identity_sources_action(context, identity_sources_action);
         ui.add_space(crate::ui::theme::SECTION_GAP);
@@ -406,9 +406,9 @@ impl ArchiveFsApp {
         self.poll_scummvm_check();
         let scummvm_action = identity_sources_page::show_scummvm_detection_panel(
             ui,
-            &self.scummvm_readiness,
+            &self.selected_evidence_ui.scummvm_readiness,
             scummvm_candidate_count,
-            &self.scummvm_check,
+            &self.selected_evidence_ui.scummvm_check,
         );
         self.handle_scummvm_action(context, scummvm_action);
         ui.add_space(crate::ui::theme::SECTION_GAP);
@@ -416,7 +416,7 @@ impl ArchiveFsApp {
             ui,
             self.ui_mode == GuiMode::AdvancedView,
             self.archive_context.focused.as_deref(),
-            &self.plan_preview,
+            &self.selected_evidence_ui.plan_preview,
         );
         self.handle_plan_preview_action(context, plan_preview_action);
         ui.add_space(crate::ui::theme::SECTION_GAP);
