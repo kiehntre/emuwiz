@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::sync::Arc;
 
 use crate::dat::rename_apply::{
     ApplyError, ApplyOutcome, RenameTransaction, TransactionOperation, capture_identity,
@@ -54,7 +56,23 @@ pub struct PublisherDestinationRootIdentity {
     pub changed: i64,
     #[cfg(unix)]
     pub changed_nsec: i64,
+    #[cfg(unix)]
+    pub link_count: u64,
 }
+
+#[cfg(unix)]
+#[derive(Debug, Clone)]
+struct PublisherDestinationRootHandle(Arc<std::fs::File>);
+
+#[cfg(unix)]
+impl PartialEq for PublisherDestinationRootHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(unix)]
+impl Eq for PublisherDestinationRootHandle {}
 
 /// Publisher-specific directory plan wrapped around the existing shared
 /// transaction. The shared transaction's `created_directories` remains the
@@ -66,6 +84,8 @@ pub struct PublisherTransaction {
     pub link_mode: PublisherLinkMode,
     pub destination_root: PathBuf,
     pub destination_root_identity: PublisherDestinationRootIdentity,
+    #[cfg(unix)]
+    destination_root_handle: PublisherDestinationRootHandle,
 }
 
 /// A typed refusal from the publisher adapter. Every variant is fail-closed:
@@ -161,6 +181,16 @@ pub fn build_publisher_transaction_with_policy(
             path: plan.destination_root.clone(),
             detail: error.to_string(),
         })?;
+    #[cfg(unix)]
+    let destination_root_handle = PublisherDestinationRootHandle(Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open(&plan.destination_root)
+            .map_err(|error| PublisherExecutionError::DirectoryConflict {
+                path: plan.destination_root.clone(),
+                detail: error.to_string(),
+            })?,
+    ));
 
     let mut selected: Vec<_> = plan
         .items
@@ -426,6 +456,8 @@ pub fn build_publisher_transaction_with_policy(
         link_mode,
         destination_root: plan.destination_root.clone(),
         destination_root_identity,
+        #[cfg(unix)]
+        destination_root_handle,
     })
 }
 
@@ -472,6 +504,37 @@ pub fn apply_publisher_transaction(
             vec!["publisher destination root changed since preview".to_string()],
         )]));
     }
+    #[cfg(unix)]
+    {
+        let reviewed_handle_identity = capture_destination_root_identity_from_metadata(
+            &publisher
+                .destination_root_handle
+                .0
+                .metadata()
+                .map_err(|error| {
+                    ApplyError::HardConflicts(vec![(
+                        root.clone(),
+                        vec![format!(
+                            "reviewed publisher destination root is no longer valid: {error}"
+                        )],
+                    )])
+                })?,
+        )
+        .map_err(|error| {
+            ApplyError::HardConflicts(vec![(
+                root.clone(),
+                vec![format!(
+                    "reviewed publisher destination root is invalid: {error}"
+                )],
+            )])
+        })?;
+        if publisher.destination_root_identity != reviewed_handle_identity {
+            return Err(ApplyError::HardConflicts(vec![(
+                root,
+                vec!["reviewed publisher destination root was replaced".to_string()],
+            )]));
+        }
+    }
     let outcome = crate::platform_evidence_fusion::plan_transaction::apply_plan_transaction(
         &mut publisher.transaction,
         current_generation,
@@ -499,6 +562,12 @@ fn capture_destination_root_identity(
     path: &Path,
 ) -> std::io::Result<PublisherDestinationRootIdentity> {
     let metadata = std::fs::symlink_metadata(path)?;
+    capture_destination_root_identity_from_metadata(&metadata)
+}
+
+fn capture_destination_root_identity_from_metadata(
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<PublisherDestinationRootIdentity> {
     if !metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotADirectory,
@@ -508,13 +577,15 @@ fn capture_destination_root_identity(
     Ok(PublisherDestinationRootIdentity {
         modified: metadata.modified()?,
         #[cfg(unix)]
-        ino: std::os::unix::fs::MetadataExt::ino(&metadata),
+        ino: std::os::unix::fs::MetadataExt::ino(metadata),
         #[cfg(unix)]
-        dev: std::os::unix::fs::MetadataExt::dev(&metadata),
+        dev: std::os::unix::fs::MetadataExt::dev(metadata),
         #[cfg(unix)]
-        changed: std::os::unix::fs::MetadataExt::ctime(&metadata),
+        changed: std::os::unix::fs::MetadataExt::ctime(metadata),
         #[cfg(unix)]
-        changed_nsec: std::os::unix::fs::MetadataExt::ctime_nsec(&metadata),
+        changed_nsec: std::os::unix::fs::MetadataExt::ctime_nsec(metadata),
+        #[cfg(unix)]
+        link_count: std::os::unix::fs::MetadataExt::nlink(metadata),
     })
 }
 
@@ -907,6 +978,38 @@ mod tests {
         std::fs::create_dir(&destination).unwrap();
         let journal = temp.path().join("journal");
         std::fs::create_dir(&journal).unwrap();
+        let error = apply_publisher_transaction(
+            &mut publisher,
+            1,
+            TrustedRoots::from_paths([temp.path()]),
+            &journal,
+            &AtomicBool::new(false),
+        )
+        .expect_err("changed destination root must block apply");
+        assert!(matches!(error, ApplyError::HardConflicts(_)));
+        assert!(!destination.join("roms").exists());
+        assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+    }
+
+    #[test]
+    fn hardlink_mode_blocks_when_destination_root_changes_after_preview() {
+        use crate::safe_read::TrustedRoots;
+        use std::sync::atomic::AtomicBool;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("Game.rom");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let destination = temp.path().join("published");
+        prepare_destination(&destination);
+        let plan = publisher_plan(std::slice::from_ref(&source), &destination);
+        let mut publisher =
+            build_publisher_transaction_with_policy(&plan, 1, PublisherLinkMode::Hardlink).unwrap();
+        std::fs::remove_dir_all(&destination).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let journal = temp.path().join("journal");
+        std::fs::create_dir(&journal).unwrap();
+
         let error = apply_publisher_transaction(
             &mut publisher,
             1,
