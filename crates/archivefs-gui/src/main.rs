@@ -204,6 +204,9 @@ mod selected_game_panel;
 use selected_game_panel::*;
 mod dat_identity_panel;
 use dat_identity_panel::*;
+mod source_controller;
+#[allow(unused_imports)]
+use source_controller::{SourcesAddDialogState, SourcesRemoveDialogState};
 pub mod bulk_confirmation;
 pub(crate) mod cheat_sources_page;
 mod collection_discovery_page;
@@ -1789,23 +1792,6 @@ struct BsFreeGuiState {
     search_result: Option<Result<BsFreeGameSearchResult, String>>,
     selected_game: Option<BsFreeGame>,
     cheats: Option<Result<archivefs_core::patch_manager::ProviderPage<BsFreeCheat>, String>>,
-}
-
-/// The "Add Folder" dialog's state - `Some` on `ArchiveFsApp` exactly
-/// while the dialog is open, mirroring how every other confirmation
-/// dialog in this app (`confirm_unmount`, `confirm_remove_missing`, ...)
-/// uses `Option` as its own open/closed flag rather than a separate
-/// `bool`.
-#[derive(Clone, Debug, Default)]
-struct SourcesAddDialogState {
-    path_text: String,
-    validation_message: Option<String>,
-}
-#[derive(Clone, Debug)]
-struct SourcesRemoveDialogState {
-    path: PathBuf,
-    last_archive_count: Option<i64>,
-    keep_catalogue: bool,
 }
 
 struct RunningMissingRemoval {
