@@ -177,6 +177,16 @@ mod emulator_setup_focus;
 use emulator_setup_focus::*;
 mod library_view;
 use library_view::*;
+mod library_view_controller;
+#[allow(unused_imports)]
+use library_view_controller::{
+    LibraryViewAction, LibraryViewActionOutcome, LibraryViewFormDialogState, LibraryViewPlanFilter,
+    LibraryViewRemoveDialogState, RunningLibraryViewAction, library_view_action_log_category,
+    library_view_action_started_message, library_view_action_success_message,
+    library_view_apply_summary_message, library_view_current_skip_count, library_view_dialog_size,
+    library_view_form_profile, library_view_selections_side_by_side, library_view_submit_blocker,
+    load_library_views, run_library_view_action, start_library_view_worker,
+};
 mod navigation;
 #[allow(unused_imports)]
 use navigation::{
@@ -404,9 +414,6 @@ fn responsive_library_column_widths(available_width: f32, spacing: f32) -> Libra
 
 const HEALTH_METRIC_MIN_WIDTH: f32 = 148.0;
 const HEALTH_METRIC_HEIGHT: f32 = 58.0;
-const LIBRARY_VIEW_DIALOG_MAX_WIDTH: f32 = 780.0;
-const LIBRARY_VIEW_DIALOG_MAX_HEIGHT: f32 = 720.0;
-
 fn responsive_card_columns(
     available_width: f32,
     minimum_card_width: f32,
@@ -420,54 +427,6 @@ fn responsive_card_columns(
         .clamp(1, item_count)
 }
 
-fn library_view_dialog_size(viewport_size: egui::Vec2) -> egui::Vec2 {
-    egui::vec2(
-        (viewport_size.x - 24.0).clamp(320.0, LIBRARY_VIEW_DIALOG_MAX_WIDTH),
-        (viewport_size.y - 24.0).clamp(360.0, LIBRARY_VIEW_DIALOG_MAX_HEIGHT),
-    )
-}
-
-fn library_view_selections_side_by_side(dialog_width: f32) -> bool {
-    dialog_width >= 680.0
-}
-
-fn library_view_submit_blocker(name: &str, destination: &str, busy: bool) -> Option<&'static str> {
-    if busy {
-        Some("Wait for the current Library View operation to finish.")
-    } else if name.trim().is_empty() {
-        Some("Enter a name for this Library View.")
-    } else if destination.trim().is_empty() {
-        Some("Choose a destination folder for this Library View.")
-    } else {
-        None
-    }
-}
-
-/// Builds the `FrontendProfile` the dialog's submit handler sends to
-/// `archivefs_core` from `dialog`'s current state - the one place a
-/// `FrontendPlatformMapping` is ever constructed from the edited override
-/// list. `romm_overrides` is folded in regardless of `profile_kind` (a
-/// harmless no-op for `Generic`/`EsDe`, since neither ever reads
-/// `platform_mapping_overrides`) rather than conditionally dropped, so
-/// switching the radio button back and forth never silently discards what
-/// the person already typed. Kept as its own pure function - not inlined
-/// into the submit handler - so a test can exercise exactly what gets sent
-/// without simulating a button click (mirrors
-/// `validate_library_view_destination`'s own use in
-/// `library_view_form_dialog_rejects_a_destination_inside_a_source_with_an_inline_message`).
-fn library_view_form_profile(dialog: &LibraryViewFormDialogState) -> FrontendProfile {
-    let mut platform_mapping_overrides = FrontendPlatformMapping::default();
-    for (platform, slug) in &dialog.romm_overrides {
-        platform_mapping_overrides.insert(platform.clone(), slug.clone());
-    }
-    FrontendProfile {
-        kind: dialog.profile_kind,
-        policy: FrontendProfilePolicy {
-            platform_mapping_overrides,
-            ..Default::default()
-        },
-    }
-}
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
 const ACTIVITY_EXPANDED_BY_DEFAULT: bool = false;
 /// Matches the collapsed activity panel's real content: one row of
@@ -1852,175 +1811,6 @@ struct SourcesRemoveDialogState {
 struct RunningMissingRemoval {
     requested_paths: usize,
     receiver: Receiver<Result<MissingArchiveRemovalResult, String>>,
-}
-
-/// One Library Views background action - mirrors `SourceAction` exactly:
-/// every variant calls straight into the same, already-tested
-/// `archivefs_core` `*_default` function the CLI's matching `view`
-/// subcommand calls (see `run_library_view_action`), never a second
-/// implementation of planning, applying, or persistence.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LibraryViewAction {
-    Add {
-        name: String,
-        destination_root: PathBuf,
-        source_folders: Vec<PathBuf>,
-        platforms: Vec<String>,
-        profile: FrontendProfile,
-    },
-    Edit {
-        identifier: String,
-        name: String,
-        destination_root: PathBuf,
-        source_folders: Vec<PathBuf>,
-        platforms: Vec<String>,
-        profile: FrontendProfile,
-    },
-    SetEnabled {
-        identifier: String,
-        enabled: bool,
-    },
-    Preview(String),
-    Apply(String),
-    Repair(String),
-    Remove {
-        identifier: String,
-        keep_definition: bool,
-    },
-}
-
-/// What a completed [`LibraryViewAction`] produced - just enough for
-/// `poll_library_view_action` to build a truthful, specific feedback/
-/// Activity message per variant, and to update `library_view_last_plan`/
-/// `library_views`/open dialogs without re-deriving any of it.
-#[derive(Debug, Clone)]
-enum LibraryViewActionOutcome {
-    Added(LibraryViewConfig),
-    Edited(LibraryViewConfig),
-    SetEnabled(LibraryViewConfig),
-    Previewed {
-        view: LibraryViewConfig,
-        plan: LibraryViewPlan,
-    },
-    Applied {
-        view: LibraryViewConfig,
-        report: LibraryViewApplyReport,
-        /// The current plan's `counts.skip` - re-previewed immediately
-        /// after applying, so a partial RomM result (unresolved platform
-        /// mappings, collisions) is never silently presented as a fully
-        /// complete apply. `None` only if the re-preview itself could not
-        /// be run (e.g. the view was removed between apply and preview) -
-        /// the success message falls back to omitting the count rather
-        /// than fabricating one.
-        skipped: Option<usize>,
-    },
-    Repaired {
-        view: LibraryViewConfig,
-        report: LibraryViewApplyReport,
-        skipped: Option<usize>,
-    },
-    Removed {
-        view: LibraryViewConfig,
-        report: LibraryViewApplyReport,
-        kept_definition: bool,
-    },
-}
-
-struct RunningLibraryViewAction {
-    action: LibraryViewAction,
-    receiver: Receiver<Result<LibraryViewActionOutcome, String>>,
-}
-
-/// The Add View / Edit View dialog's state - `Some` on `ArchiveFsApp`
-/// exactly while the dialog is open, mirroring `SourcesAddDialogState`.
-/// `editing_id` is `None` for Add and `Some(view.id)` for Edit - one
-/// dialog type for both, since the fields being edited are identical;
-/// only the submit action (`LibraryViewAction::Add` vs `::Edit`) differs.
-/// `selected_source_folders`/`selected_platforms` empty means "all" -
-/// mirroring `LibraryViewConfig`'s own empty-means-all-inclusive
-/// semantics exactly, so what the dialog shows checked/unchecked never
-/// disagrees with what the resulting view actually includes.
-#[derive(Clone, Debug, Default)]
-struct LibraryViewFormDialogState {
-    editing_id: Option<String>,
-    name: String,
-    destination_text: String,
-    selected_source_folders: HashSet<PathBuf>,
-    selected_platforms: HashSet<String>,
-    validation_message: Option<String>,
-    /// Which frontend the resulting view is nominally shaped for - see
-    /// `FrontendProfileKind`. `Generic` (the derived default) keeps every
-    /// existing Add/Edit flow byte-for-byte unchanged.
-    profile_kind: FrontendProfileKind,
-    /// Explicit `catalogue platform -> RomM slug` overrides, edited as an
-    /// ordered list (insertion order is cosmetic only - never a safety
-    /// concern, since `FrontendPlatformMapping` is `BTreeMap`-backed and a
-    /// duplicate platform key simply overwrites its previous value on
-    /// submit). Only ever read/written when `profile_kind` is `Romm`.
-    romm_overrides: Vec<(String, String)>,
-    /// Scratch input for the "add an override" row - cleared after each
-    /// successful add, never itself submitted.
-    romm_override_platform_input: String,
-    romm_override_slug_input: String,
-}
-
-/// The Remove-view confirmation dialog's state. `view_name` is copied at
-/// the moment the dialog opens purely for display - the actual removal
-/// always re-resolves the view by `view_id` at commit time (mirrors
-/// `SourcesRemoveDialogState`'s `path`/re-resolve-by-path split).
-/// `keep_definition` defaults to `true` - unlike `SourcesRemoveDialogState`'s
-/// `keep_catalogue`, both defaults exist to make the *safer* (more
-/// reversible) choice the one a careless click keeps: keeping a view's
-/// definition costs nothing and is trivially undone by removing it
-/// explicitly later, so it is the safe default here exactly as keeping
-/// catalogue rows is for source removal.
-#[derive(Clone, Debug)]
-struct LibraryViewRemoveDialogState {
-    view_id: String,
-    view_name: String,
-    keep_definition: bool,
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum LibraryViewPlanFilter {
-    #[default]
-    All,
-    Create,
-    Correct,
-    Repair,
-    Remove,
-    Collision,
-    Skip,
-}
-
-impl LibraryViewPlanFilter {
-    fn label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Create => "Create",
-            Self::Correct => "Correct",
-            Self::Repair => "Repair",
-            Self::Remove => "Remove",
-            Self::Collision => "Collision",
-            Self::Skip => "Skip",
-        }
-    }
-
-    fn matches(self, action: LibraryViewPlanAction) -> bool {
-        match self {
-            Self::All => action != LibraryViewPlanAction::AlreadyCorrect,
-            Self::Create => action == LibraryViewPlanAction::Create,
-            Self::Correct => action == LibraryViewPlanAction::AlreadyCorrect,
-            Self::Repair => action == LibraryViewPlanAction::Repair,
-            Self::Remove => action == LibraryViewPlanAction::RemoveStale,
-            Self::Collision => action == LibraryViewPlanAction::Collision,
-            Self::Skip => matches!(
-                action,
-                LibraryViewPlanAction::SkipUnknownPlatform
-                    | LibraryViewPlanAction::SkipMissingSourceArchive
-                    | LibraryViewPlanAction::SkipInvalidPath
-            ),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -5784,29 +5574,20 @@ impl ArchiveFsApp {
     /// actually fail once the file exists is a corrupt/foreign-format
     /// file, which the next successful Add/Edit save overwrites anyway.
     fn reload_library_views(&mut self) {
-        self.library_views = load_library_view_configs_default().unwrap_or_default();
+        self.library_views = load_library_views();
     }
 
     fn start_library_view_action(&mut self, context: egui::Context, action: LibraryViewAction) {
         if !self.library_view_action_available() {
             return;
         }
-        let (sender, receiver) = mpsc::channel();
         self.history.record(HistoryEntry::new(
             library_view_action_log_category(&action),
             None,
             ActivityOutcome::Started,
             library_view_action_started_message(&action),
         ));
-        self.library_view_action = Some(RunningLibraryViewAction {
-            action: action.clone(),
-            receiver,
-        });
-        thread::spawn(move || {
-            let result = run_library_view_action(&action);
-            let _ = sender.send(result);
-            context.request_repaint();
-        });
+        self.library_view_action = Some(start_library_view_worker(action, context));
     }
 
     /// Mirrors `poll_source_action`: refreshes `library_views` from disk on
@@ -10878,230 +10659,6 @@ fn show_archive_inspector_panel(
         });
 
     close
-}
-
-fn library_view_action_log_category(action: &LibraryViewAction) -> ActivityAction {
-    match action {
-        LibraryViewAction::Add { .. } => ActivityAction::LibraryViewAdded,
-        LibraryViewAction::Edit { .. } => ActivityAction::LibraryViewEdited,
-        LibraryViewAction::SetEnabled { enabled: true, .. } => ActivityAction::LibraryViewEnabled,
-        LibraryViewAction::SetEnabled { enabled: false, .. } => ActivityAction::LibraryViewDisabled,
-        LibraryViewAction::Preview(_) => ActivityAction::LibraryViewPreview,
-        LibraryViewAction::Apply(_) => ActivityAction::LibraryViewApply,
-        LibraryViewAction::Repair(_) => ActivityAction::LibraryViewRepair,
-        LibraryViewAction::Remove { .. } => ActivityAction::LibraryViewRemoved,
-    }
-}
-
-fn library_view_action_started_message(action: &LibraryViewAction) -> String {
-    match action {
-        LibraryViewAction::Add { name, .. } => format!("Adding library view '{name}'."),
-        LibraryViewAction::Edit { name, .. } => format!("Saving changes to library view '{name}'."),
-        LibraryViewAction::SetEnabled {
-            identifier,
-            enabled: true,
-        } => format!("Enabling library view '{identifier}'."),
-        LibraryViewAction::SetEnabled {
-            identifier,
-            enabled: false,
-        } => format!("Disabling library view '{identifier}'."),
-        LibraryViewAction::Preview(identifier) => {
-            format!("Previewing library view '{identifier}'.")
-        }
-        LibraryViewAction::Apply(identifier) => format!("Applying library view '{identifier}'."),
-        LibraryViewAction::Repair(identifier) => format!("Repairing library view '{identifier}'."),
-        LibraryViewAction::Remove {
-            identifier,
-            keep_definition: true,
-        } => format!(
-            "Removing managed symlinks for library view '{identifier}' (keeping its definition)."
-        ),
-        LibraryViewAction::Remove {
-            identifier,
-            keep_definition: false,
-        } => format!("Removing library view '{identifier}' and its managed symlinks."),
-    }
-}
-
-/// Builds the Apply/Repair feedback message, including the current skip
-/// count so a partial RomM result (unresolved platform mappings,
-/// collisions) is never worded as a plain, unqualified success - see
-/// `library_view_current_skip_count`. `skipped` is `None` only when the
-/// post-apply re-preview itself could not run; the message still reports
-/// the apply's own outcome truthfully in that case, it just cannot add a
-/// skip count.
-fn library_view_apply_summary_message(
-    verb: &str,
-    view_name: &str,
-    report: &LibraryViewApplyReport,
-    skipped: Option<usize>,
-) -> String {
-    let base = format!(
-        "{verb} '{}': {} created, {} repaired, {} removed, {} unchanged, {} failed",
-        view_name, report.created, report.repaired, report.removed, report.unchanged, report.failed
-    );
-    match skipped {
-        Some(0) => format!("{base}, 0 skipped."),
-        Some(skipped) => format!(
-            "{base}, {skipped} skipped - this view is not fully applied. Unresolved platform \
-             mappings or collisions remain; see Preview for details."
-        ),
-        None => format!("{base}."),
-    }
-}
-
-fn library_view_action_success_message(outcome: &LibraryViewActionOutcome) -> String {
-    match outcome {
-        LibraryViewActionOutcome::Added(view) => format!(
-            "Library view added: {} -> {}.",
-            view.name,
-            view.destination_root.display()
-        ),
-        LibraryViewActionOutcome::Edited(view) => format!("Library view updated: {}.", view.name),
-        LibraryViewActionOutcome::SetEnabled(view) => {
-            if view.enabled {
-                format!("Library view enabled: {}.", view.name)
-            } else {
-                format!("Library view disabled: {}.", view.name)
-            }
-        }
-        LibraryViewActionOutcome::Previewed { view, plan } => format!(
-            "Preview for '{}': {} to create, {} correct, {} to repair, {} to remove, {} \
-             collision(s), {} skipped.",
-            view.name,
-            plan.counts.create,
-            plan.counts.correct,
-            plan.counts.repair,
-            plan.counts.remove,
-            plan.counts.collision,
-            plan.counts.skip
-        ),
-        LibraryViewActionOutcome::Applied {
-            view,
-            report,
-            skipped,
-        } => library_view_apply_summary_message("Applied", &view.name, report, *skipped),
-        LibraryViewActionOutcome::Repaired {
-            view,
-            report,
-            skipped,
-        } => library_view_apply_summary_message("Repaired", &view.name, report, *skipped),
-        LibraryViewActionOutcome::Removed {
-            view,
-            report,
-            kept_definition,
-        } => {
-            if *kept_definition {
-                format!(
-                    "Removed {} managed symlink(s) for '{}'. Its definition was kept.",
-                    report.removed, view.name
-                )
-            } else {
-                format!(
-                    "Removed {} managed symlink(s) for '{}' and its definition.",
-                    report.removed, view.name
-                )
-            }
-        }
-    }
-}
-
-/// Re-previews `view_id` immediately after an Apply/Repair, purely to read
-/// off the resulting plan's `counts.skip` for an honest post-apply summary -
-/// never used to decide whether the apply itself succeeded (that already
-/// happened, via the existing `apply_library_view_default`/
-/// `repair_library_view_default` call), and never fed back into another
-/// apply. Uses the same `preview_library_view_default` the Preview button
-/// already calls - no second planning implementation. `None` on any error
-/// (e.g. the view was concurrently removed) rather than fabricating a count.
-fn library_view_current_skip_count(view_id: &str) -> Option<usize> {
-    preview_library_view_default(view_id)
-        .ok()
-        .map(|(_, plan)| plan.counts.skip)
-}
-
-/// Runs one [`LibraryViewAction`] against the default config/database
-/// paths - the production entry point `ArchiveFsApp::start_library_view_action`
-/// runs on a background thread. Every arm calls straight into the same,
-/// already-tested `archivefs_core` `*_default` function the CLI's matching
-/// `view` subcommand calls (see `crates/archivefs-cli/src/main.rs`'s `view
-/// list`/`preview`/`apply`/`repair`/`remove` handlers) - never a second
-/// implementation of planning, applying, or persistence.
-fn run_library_view_action(action: &LibraryViewAction) -> Result<LibraryViewActionOutcome, String> {
-    match action {
-        LibraryViewAction::Add {
-            name,
-            destination_root,
-            source_folders,
-            platforms,
-            profile,
-        } => add_library_view_default(
-            name.clone(),
-            destination_root.clone(),
-            source_folders.clone(),
-            platforms.clone(),
-            LibraryViewLayoutTemplate::PlatformFilename,
-            profile.clone(),
-        )
-        .map(LibraryViewActionOutcome::Added)
-        .map_err(|error| error.to_string()),
-        LibraryViewAction::Edit {
-            identifier,
-            name,
-            destination_root,
-            source_folders,
-            platforms,
-            profile,
-        } => edit_library_view_default(
-            identifier,
-            name.clone(),
-            destination_root.clone(),
-            source_folders.clone(),
-            platforms.clone(),
-            profile.clone(),
-        )
-        .map(LibraryViewActionOutcome::Edited)
-        .map_err(|error| error.to_string()),
-        LibraryViewAction::SetEnabled {
-            identifier,
-            enabled,
-        } => set_library_view_enabled_default(identifier, *enabled)
-            .map(LibraryViewActionOutcome::SetEnabled)
-            .map_err(|error| error.to_string()),
-        LibraryViewAction::Preview(identifier) => preview_library_view_default(identifier)
-            .map(|(view, plan)| LibraryViewActionOutcome::Previewed { view, plan })
-            .map_err(|error| error.to_string()),
-        LibraryViewAction::Apply(identifier) => apply_library_view_default(identifier)
-            .map(|(view, report)| {
-                let skipped = library_view_current_skip_count(&view.id);
-                LibraryViewActionOutcome::Applied {
-                    view,
-                    report,
-                    skipped,
-                }
-            })
-            .map_err(|error| error.to_string()),
-        LibraryViewAction::Repair(identifier) => repair_library_view_default(identifier)
-            .map(|(view, report)| {
-                let skipped = library_view_current_skip_count(&view.id);
-                LibraryViewActionOutcome::Repaired {
-                    view,
-                    report,
-                    skipped,
-                }
-            })
-            .map_err(|error| error.to_string()),
-        LibraryViewAction::Remove {
-            identifier,
-            keep_definition,
-        } => remove_library_view_default(identifier, *keep_definition)
-            .map(|(view, report)| LibraryViewActionOutcome::Removed {
-                view,
-                report,
-                kept_definition: *keep_definition,
-            })
-            .map_err(|error| error.to_string()),
-    }
 }
 
 /// A source's actual platform state, derived purely from the archives the
