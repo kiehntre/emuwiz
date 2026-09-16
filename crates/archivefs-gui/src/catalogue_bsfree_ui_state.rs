@@ -1,5 +1,10 @@
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
+use archivefs_core::patch_manager::{
+    BsFreeCheat, BsFreeGame, BsFreeGameSearchRequest, BsFreeGameSearchResult, BsFreeSourceStatus,
+    BsFreeSystem,
+};
 use archivefs_core::patch_manager::{
     CheatSourceError, CheatSourceFetchResult, DolphinCatalogueError, DolphinCatalogueFetchResult,
     DolphinCatalogueUpdateCheck,
@@ -9,8 +14,6 @@ use crate::sources_page::{
     CatalogueManagerState, CatalogueReview, DolphinCatalogueManagerState,
     DolphinCatalogueRetrievalKind, RunningCatalogueRetrieval, RunningDolphinCatalogueRetrieval,
 };
-
-use crate::{BsFreeGuiState, BsFreeManagerState, RunningBsFreeOperation};
 
 /// UI/session state for BSFree and catalogue surfaces.
 ///
@@ -59,4 +62,58 @@ impl Default for CatalogueBsFreeUiState {
             dolphin_catalogue_update_check: None,
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum BsFreeManagerState {
+    NotLoaded,
+    Ready(Box<BsFreeSourceStatus>),
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BsFreeOperation {
+    LoadStatus,
+    Download,
+    Import(PathBuf),
+    Validate,
+    SetEnabled(bool),
+    Remove,
+    LoadSystems,
+    Search(BsFreeGameSearchRequest),
+    LoadGame { upstream_uid: i64, offset: u32 },
+}
+
+#[derive(Debug)]
+pub(crate) enum BsFreeOperationResult {
+    Status(Box<BsFreeSourceStatus>),
+    Removed,
+    Search(BsFreeGameSearchResult),
+    Systems(archivefs_core::patch_manager::ProviderPage<BsFreeSystem>),
+    Game(
+        BsFreeGame,
+        archivefs_core::patch_manager::ProviderPage<BsFreeCheat>,
+    ),
+}
+
+pub(crate) struct RunningBsFreeOperation {
+    pub(crate) operation: BsFreeOperation,
+    pub(crate) receiver: Receiver<Result<BsFreeOperationResult, String>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BsFreeGuiState {
+    pub(crate) import_path: String,
+    pub(crate) download_confirm: bool,
+    pub(crate) remove_confirm: bool,
+    pub(crate) search_context: Option<PathBuf>,
+    pub(crate) search_title: String,
+    pub(crate) search_platform: String,
+    pub(crate) search_system_id: Option<i64>,
+    pub(crate) platforms: Option<Result<Vec<BsFreeSystem>, String>>,
+    pub(crate) platform_query: String,
+    pub(crate) search_result: Option<Result<BsFreeGameSearchResult, String>>,
+    pub(crate) selected_game: Option<BsFreeGame>,
+    pub(crate) cheats:
+        Option<Result<archivefs_core::patch_manager::ProviderPage<BsFreeCheat>, String>>,
 }

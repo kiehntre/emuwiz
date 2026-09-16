@@ -50,30 +50,29 @@ use archivefs_core::patch_manager::{
     BrowserImportErrorKind, BrowserImportKind, BrowserImportLocalIdentity, BrowserImportOutcome,
     BrowserImportPlan, BrowserImportPlatform, BrowserImportRequest, BrowserImportSource,
     BrowserImportTextOrigin, BsFreeCatalogue, BsFreeCheat, BsFreeDedupFinding,
-    BsFreeDedupFindingKind, BsFreeDownloadOptions, BsFreeGame, BsFreeGameCubeCheat,
+    BsFreeDedupFindingKind, BsFreeDownloadOptions, BsFreeGameCubeCheat,
     BsFreeGameCubeCheatSelection, BsFreeGameCubeCodeFormat, BsFreeGameCubeError,
     BsFreeGameCubeErrorKind, BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch,
-    BsFreeGameCubeSearchOutcome, BsFreeGameCubeSearchStatus, BsFreeGameSearchRequest,
-    BsFreeGameSearchResult, BsFreePaths, BsFreeSourceStatus, BsFreeSystem, BsFreeWiiCheat,
-    BsFreeWiiCheatSelection, BsFreeWiiCodeFormat, BsFreeWiiDedupFinding, BsFreeWiiError,
-    BsFreeWiiErrorKind, BsFreeWiiInstallPreviewRequest, BsFreeWiiMatch, BsFreeWiiSearchOutcome,
-    BsFreeWiiSearchStatus, CheatCandidate, CheatCandidateArchive, CheatCandidateClassification,
-    CheatCandidateList, CheatCandidateOptions, CheatCatalogueStatus, CheatDestinationRequest,
-    CheatInstallPlanError, CheatInstallPreviewRequest, CheatJourneyGameIdentity,
-    CheatJourneyIdentityEvidence, CheatJourneyIdentityEvidenceKind, CheatJourneyIdentityState,
-    CheatProviderSourceState, CheatSelection, CheatSourceCancellation, CheatSourceError,
-    CheatSourceExclusionKind, CheatSourceFetchOptions, CheatSourceFetchResult,
-    CheatSourceFetchStatus, CheatSourceFreshness, CheatSourceList, CheatSourceListEntry,
-    CheatSourceProgress, CheatSourceProgressPhase, CheatSourceProgressReporter,
-    DesktopBrowserLauncher, DeviceFormatCompatibility, DolphinCandidate, DolphinCatalogue,
-    DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
-    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinDedupFinding,
-    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
-    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
-    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
-    EmulatorProfileSelectReason, EmulatorProfileSelection, FlycastProfileDiscovery,
-    FlycastProfileDiscoveryRoots, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
+    BsFreeGameCubeSearchOutcome, BsFreeGameCubeSearchStatus, BsFreeGameSearchRequest, BsFreePaths,
+    BsFreeSystem, BsFreeWiiCheat, BsFreeWiiCheatSelection, BsFreeWiiCodeFormat,
+    BsFreeWiiDedupFinding, BsFreeWiiError, BsFreeWiiErrorKind, BsFreeWiiInstallPreviewRequest,
+    BsFreeWiiMatch, BsFreeWiiSearchOutcome, BsFreeWiiSearchStatus, CheatCandidate,
+    CheatCandidateArchive, CheatCandidateClassification, CheatCandidateList, CheatCandidateOptions,
+    CheatCatalogueStatus, CheatDestinationRequest, CheatInstallPlanError,
+    CheatInstallPreviewRequest, CheatJourneyGameIdentity, CheatJourneyIdentityEvidence,
+    CheatJourneyIdentityEvidenceKind, CheatJourneyIdentityState, CheatProviderSourceState,
+    CheatSelection, CheatSourceCancellation, CheatSourceError, CheatSourceExclusionKind,
+    CheatSourceFetchOptions, CheatSourceFetchResult, CheatSourceFetchStatus, CheatSourceFreshness,
+    CheatSourceList, CheatSourceListEntry, CheatSourceProgress, CheatSourceProgressPhase,
+    CheatSourceProgressReporter, DesktopBrowserLauncher, DeviceFormatCompatibility,
+    DolphinCandidate, DolphinCatalogue, DolphinCatalogueError, DolphinCatalogueErrorKind,
+    DolphinCatalogueFetchOptions, DolphinCatalogueFetchResult, DolphinCatalogueLoad,
+    DolphinDedupFinding, DolphinGameIniInventory, DolphinGeckoLookupResult,
+    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
+    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
+    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
+    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
     GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
     GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
     GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
@@ -554,7 +553,10 @@ use archive_inspector_controller::{
     DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH, INSPECTOR_DETAILS_COLUMN_WIDTH, InspectorSortField,
     show_archive_inspector_panel, show_inspector_row, visible_inspector_entry_indices,
 };
-use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
+use catalogue_bsfree_ui_state::{
+    BsFreeGuiState, BsFreeManagerState, BsFreeOperation, BsFreeOperationResult,
+    CatalogueBsFreeUiState, RunningBsFreeOperation,
+};
 use database_load::{
     CachedLibrarySnapshot, DatabaseGeneration, DatabaseLoadError, DatabaseLoadResult,
     DatabaseMessage, DatabaseOutcome, DatabaseState, classify_unhealthy_database,
@@ -581,59 +583,6 @@ use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 use sources_ui_state::SourcesUiState;
 use artwork_media_state::ArtworkMediaState;
-
-#[derive(Debug)]
-enum BsFreeManagerState {
-    NotLoaded,
-    Ready(Box<BsFreeSourceStatus>),
-    Failed(String),
-}
-
-#[derive(Clone, Debug)]
-enum BsFreeOperation {
-    LoadStatus,
-    Download,
-    Import(PathBuf),
-    Validate,
-    SetEnabled(bool),
-    Remove,
-    LoadSystems,
-    Search(BsFreeGameSearchRequest),
-    LoadGame { upstream_uid: i64, offset: u32 },
-}
-
-#[derive(Debug)]
-enum BsFreeOperationResult {
-    Status(Box<BsFreeSourceStatus>),
-    Removed,
-    Search(BsFreeGameSearchResult),
-    Systems(archivefs_core::patch_manager::ProviderPage<BsFreeSystem>),
-    Game(
-        BsFreeGame,
-        archivefs_core::patch_manager::ProviderPage<BsFreeCheat>,
-    ),
-}
-
-struct RunningBsFreeOperation {
-    operation: BsFreeOperation,
-    receiver: Receiver<Result<BsFreeOperationResult, String>>,
-}
-
-#[derive(Debug, Default)]
-struct BsFreeGuiState {
-    import_path: String,
-    download_confirm: bool,
-    remove_confirm: bool,
-    search_context: Option<PathBuf>,
-    search_title: String,
-    search_platform: String,
-    search_system_id: Option<i64>,
-    platforms: Option<Result<Vec<BsFreeSystem>, String>>,
-    platform_query: String,
-    search_result: Option<Result<BsFreeGameSearchResult, String>>,
-    selected_game: Option<BsFreeGame>,
-    cheats: Option<Result<archivefs_core::patch_manager::ProviderPage<BsFreeCheat>, String>>,
-}
 
 struct RunningMissingRemoval {
     requested_paths: usize,
