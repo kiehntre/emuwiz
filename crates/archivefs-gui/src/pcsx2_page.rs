@@ -1175,7 +1175,7 @@ mod tests {
     fn memory_card_contents_render_save_and_child_file_without_mutating_actions() {
         let ctx = egui::Context::default();
         let card = sample_ps2_card();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 show_memory_card_contents(ui, true, std::slice::from_ref(&card));
             });
@@ -1205,7 +1205,7 @@ mod tests {
             .save_directories
             .clear();
         let ctx = egui::Context::default();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 show_memory_card_contents(ui, false, std::slice::from_ref(&card));
             });
@@ -1300,7 +1300,7 @@ mod tests {
         });
         let ctx = egui::Context::default();
         ctx.data_mut(|data| data.insert_temp(psu_export_dialog_id(), result));
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| show_psu_export_dialog(ui, false));
         });
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1334,7 +1334,7 @@ mod tests {
                 ),
             )
         });
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
         });
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1376,7 +1376,7 @@ mod tests {
                 }),
             )
         });
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
         });
         let output = ctx.run(egui::RawInput::default(), |ctx| {
@@ -1395,7 +1395,7 @@ mod tests {
     fn export_surface_has_no_whole_save_actions_and_keeps_advanced_evidence_separate() {
         let ctx = egui::Context::default();
         let card = sample_ps2_card();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 show_memory_card_contents(ui, true, std::slice::from_ref(&card));
             });

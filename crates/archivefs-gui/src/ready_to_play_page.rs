@@ -3,6 +3,7 @@
 //! This module owns no discovery or launch policy.  The caller supplies the
 //! result projected from evidence that has already been gathered elsewhere.
 
+#[cfg(test)]
 use archivefs_core::diagnostics::DoctorSeverity;
 use archivefs_core::mame_input_requirements::{
     ArcadeInputRequirement, ArcadeInputRequirementFamily, ArcadeInputRequirements,
@@ -43,6 +44,11 @@ impl ReadyToPlayPageState {
 
     /// Supplies already-normalized static MAME metadata for display. This is
     /// intentionally separate from readiness results and performs no probing.
+    ///
+    /// No caller feeds it yet, so `original_controls` stays empty and the
+    /// section it fills never renders. The renderer below is live; only the
+    /// feed is missing. Supplying it is a product decision, not a lint fix.
+    #[allow(dead_code)]
     pub(crate) fn set_original_controls(
         &mut self,
         controls: Vec<(String, ArcadeInputRequirements)>,

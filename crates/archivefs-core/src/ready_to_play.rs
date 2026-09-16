@@ -10,7 +10,7 @@ use crate::attention::{
     AttentionCategory, AttentionDestination, AttentionItem, AttentionSeverity, AttentionSnapshot,
 };
 use crate::diagnostics::DoctorSeverity;
-use crate::launch::planning::{CanonicalIdentityStatus, LaunchPlan};
+use crate::launch::planning::LaunchPlan;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]

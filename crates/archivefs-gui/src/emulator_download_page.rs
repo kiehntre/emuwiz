@@ -517,6 +517,13 @@ impl EmulatorDownloadPageState {
     }
 
     /// Render the complete managed-emulator catalogue.
+    ///
+    /// Not currently reached: the app renders `show_bootstrap` instead,
+    /// which deliberately presents only the two approval-bound policy
+    /// targets (see its doc comment). Kept as the full-catalogue renderer
+    /// for when policy admits more entries; wiring it is a product
+    /// decision, not a lint fix.
+    #[allow(dead_code)]
     pub(crate) fn show(&self, ui: &mut egui::Ui) -> Option<EmulatorDownloadPageAction> {
         self.show_specs(ui, Self::managed_specs())
     }

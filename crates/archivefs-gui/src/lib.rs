@@ -372,45 +372,37 @@ use crate::romm_source::{
 };
 use activity_history::{
     ACTIVITY_EXPANDED_BY_DEFAULT, ALL_ACTIVITY_ACTIONS, ALL_ACTIVITY_OUTCOMES, ActivityAction,
-    ActivityOutcome, ActivityPanelAction, HISTORY_LIMIT, HistoryEntry, HistoryLogFilters,
-    OperationHistory, activity_outcome_tone, activity_summary_entry, show_activity_panel,
-    visible_history_entries,
+    ActivityOutcome, ActivityPanelAction, HistoryEntry, HistoryLogFilters, OperationHistory,
+    activity_outcome_tone, show_activity_panel, visible_history_entries,
 };
 use administration_pages::*;
 use sources_page::*;
 
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveMountSession, ArchivePresence, ArchiveRecord,
-    ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
-    BulkPlatformAssignmentResult, CatalogueDuplicateArchive, CatalogueDuplicateGroup,
-    CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary, Config, ConfigIdentity,
-    Database, DatabaseHealth, DatabaseHealthReport, DoctorReport, DoctorStatus,
-    FrontendPlatformMapping, FrontendProfile, FrontendProfileKind, FrontendProfilePolicy,
-    HealthCategory, HealthIssue, InspectorEntry, InspectorEntryClassification, InspectorEntryKind,
-    InspectorReport, LazyUnmountCleanupResult, LibraryViewApplyReport, LibraryViewConfig,
-    LibraryViewLayoutTemplate, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanEntry,
-    MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, MountOneOutcome, MountState,
-    PersistedArchive, PlatformAlias, PlatformAssignmentChange, PlatformProvenanceDetails,
-    RecentScanAdditions, RecoveryAction, RecoveryOffer, RemoveSourceFolderOutcome,
-    ScanPersistSummary, SetSourceFolderEnabledOutcome, SetupDiagnosticStatus, SetupDiagnostics,
+    ArchiveUnmountSession, BulkPlatformAssignmentResult, CatalogueDuplicateArchive,
+    CatalogueDuplicateGroup, CatalogueDuplicateReport, Config, Database, DatabaseHealthReport,
+    DoctorReport, DoctorStatus, FrontendProfileKind, HealthCategory, HealthIssue, InspectorEntry,
+    InspectorEntryClassification, InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult,
+    LibraryViewConfig, LibraryViewPlan, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
+    MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
+    PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction,
+    RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
     SourceAvailability, SourceFolderConfig, SourceFolderView, SourceHealthIssue, UnmountOneOutcome,
-    add_library_view_default, add_source_folder_default, apply_library_view_default,
-    assign_source_platform_default, build_source_folder_views, canonical_platform_names,
-    catalogue_filename_duplicates, check_archive_index_freshness, check_database_health,
-    classify_archive_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
-    create_starter_config_default, default_config_path, default_database_path, default_index_path,
-    diagnose_database, edit_library_view_default, format_unix_timestamp_utc, inspect_archive,
-    is_inspectable, is_known_disc_companion, latest_schema_version,
-    lazy_unmount_one_archive_path_with_progress, list_source_folder_views_default,
-    load_library_view_configs_default, load_read_only_snapshot_default,
-    load_source_folder_configs_from, mount_one_archive_path, pending_schema_migration_versions,
-    persisted_archive_has_unknown_platform, plan_stale_mount_directories,
-    preview_library_view_default, read_archive_index, remount_one_archive_path,
-    remove_library_view_default, remove_source_folder_default, repair_library_view_default,
-    run_setup_diagnostics_default, scan_all_enabled_sources_default, scan_and_persist,
-    scan_source_folder_default, set_library_view_enabled_default, set_mount_root_default,
-    set_source_folder_enabled_default, source_health_issues, unmount_one_archive_path,
-    upgrade_library_database, validate_library_view_destination, validate_new_source_folder,
+    add_source_folder_default, assign_source_platform_default, build_source_folder_views,
+    canonical_platform_names, catalogue_filename_duplicates, check_archive_index_freshness,
+    check_database_health, classify_archive_health, cleanup_selected_mount_tree,
+    default_config_path, default_database_path, default_index_path, diagnose_database,
+    format_unix_timestamp_utc, inspect_archive, is_inspectable, is_known_disc_companion,
+    latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    list_source_folder_views_default, load_library_view_configs_default,
+    load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
+    pending_schema_migration_versions, persisted_archive_has_unknown_platform,
+    plan_stale_mount_directories, read_archive_index, remount_one_archive_path,
+    remove_source_folder_default, scan_all_enabled_sources_default, scan_and_persist,
+    scan_source_folder_default, set_source_folder_enabled_default, source_health_issues,
+    unmount_one_archive_path, upgrade_library_database, validate_library_view_destination,
+    validate_new_source_folder,
 };
 use eframe::egui;
 use ui::components::{
@@ -570,18 +562,14 @@ fn run_clipboard_check() {
 // ---------------------------------------------------------------------
 
 use archive_inspector_controller::{
-    ArchiveInspectorState, ArchiveInspectorStatus, ArchivePreparationState,
-    DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH, INSPECTOR_DETAILS_COLUMN_WIDTH, InspectorSortField,
-    show_archive_inspector_panel, show_inspector_row, visible_inspector_entry_indices,
+    ArchiveInspectorState, ArchivePreparationState, show_archive_inspector_panel,
 };
 use catalogue_bsfree_ui_state::{
     BsFreeGuiState, BsFreeManagerState, BsFreeOperation, BsFreeOperationResult,
     CatalogueBsFreeUiState, RunningBsFreeOperation,
 };
 use database_load::{
-    CachedLibrarySnapshot, DatabaseGeneration, DatabaseLoadError, DatabaseLoadResult,
-    DatabaseMessage, DatabaseOutcome, DatabaseState, classify_unhealthy_database,
-    load_database_snapshot, load_database_snapshot_at, load_snapshot_from, start_database_load,
+    CachedLibrarySnapshot, DatabaseGeneration, DatabaseState, start_database_load,
 };
 use doctor_repair_state::DoctorRepairState;
 use emulator_readiness_state::EmulatorReadinessState;
@@ -590,15 +578,11 @@ use health_duplicate_ui_state::{
     HealthDuplicateUiState, HealthIssueFilter, HealthSortField,
 };
 use live_library_controller::{
-    LiveLibraryPoll, LoadMessage, LoadResult, LoadState, RefreshGeneration, poll_load, start_load,
+    LiveLibraryPoll, LoadState, RefreshGeneration, poll_load, start_load,
 };
 use mount_operation_controller::{
-    ArchiveAction, CleanupOutcome, LAZY_CLEANUP_FAILURE, LAZY_CLEANUP_SUCCESS,
-    LAZY_UNMOUNT_SUCCESS, LAZY_UNMOUNT_WARNING, NORMAL_UNMOUNT_FAILURE_SUMMARY,
-    NORMAL_UNMOUNT_RECOVERY_GUIDANCE, OperationFailure, OperationProgress, OperationRequest,
-    OperationResult, OperationSuccess, REMOUNT_GUIDANCE, RunningOperation,
-    cleanup_completed_message, perform_archive_action, record_cleanup_finished_activity,
-    record_cleanup_started_activity, run_unmount_with_cleanup,
+    ArchiveAction, LAZY_UNMOUNT_WARNING, OperationRequest, REMOUNT_GUIDANCE, RunningOperation,
+    record_cleanup_started_activity,
 };
 use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
@@ -640,6 +624,34 @@ pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Resu
 // dispatches through - it never re-implements mount, cheat-install, or
 // rollback logic.
 // =====================================================================
+
+// Re-exports the test modules reach through `use super::*;`. They are not
+// part of the running application, so they are gated rather than left as
+// unconditional imports that the library build reports as unused.
+#[cfg(test)]
+use activity_history::{HISTORY_LIMIT, activity_summary_entry};
+#[cfg(test)]
+use archive_inspector_controller::{
+    ArchiveInspectorStatus, DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH, INSPECTOR_DETAILS_COLUMN_WIDTH,
+    InspectorSortField, show_inspector_row, visible_inspector_entry_indices,
+};
+#[cfg(test)]
+use archivefs_core::{
+    ArchiveStats, ArchiveStatus, CatalogueStats, CompletedScanSummary, ConfigIdentity,
+    DatabaseHealth, FrontendProfile, LibraryViewApplyReport, LibraryViewLayoutTemplate,
+    LibraryViewPlanAction, SetupDiagnosticStatus, SetupDiagnostics,
+};
+#[cfg(test)]
+use database_load::{
+    DatabaseLoadError, DatabaseMessage, DatabaseOutcome, classify_unhealthy_database,
+    load_database_snapshot_at,
+};
+#[cfg(test)]
+use mount_operation_controller::{
+    CleanupOutcome, LAZY_UNMOUNT_SUCCESS, NORMAL_UNMOUNT_FAILURE_SUMMARY,
+    NORMAL_UNMOUNT_RECOVERY_GUIDANCE, OperationFailure, OperationProgress, OperationSuccess,
+    record_cleanup_finished_activity, run_unmount_with_cleanup,
+};
 
 #[cfg(test)]
 mod tests;

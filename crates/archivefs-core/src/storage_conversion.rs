@@ -5,7 +5,7 @@ use crate::storage_health::{
     StorageOpportunityKind, StorageRoundTripClass,
 };
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

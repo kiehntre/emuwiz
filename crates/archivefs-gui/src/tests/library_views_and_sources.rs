@@ -16,8 +16,7 @@
 use super::*;
 use crate::ui::text_edit::{
     TextEditContextMenuAction, apply_copy, apply_cut, apply_paste, apply_select_all,
-    set_text_edit_caret, text_edit_context_menu_action_available, text_edit_cursor_char_range,
-    text_edit_selected_char_range,
+    text_edit_context_menu_action_available,
 };
 
 #[test]

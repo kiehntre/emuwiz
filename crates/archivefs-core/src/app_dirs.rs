@@ -68,6 +68,7 @@ fn path_is_present(path: &Path) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn config_dir_in(home: &Path) -> PathBuf {
     config_dir_in_with_roots(home, None, None)
 }
@@ -118,6 +119,7 @@ pub(crate) fn config_path_in(home: &Path, leaf: &str) -> PathBuf {
     config_dir_in(home).join(leaf)
 }
 
+#[cfg(test)]
 pub(crate) fn data_path_in(home: &Path, leaf: &str) -> PathBuf {
     data_dir_in(home).join(leaf)
 }
