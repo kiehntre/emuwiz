@@ -262,14 +262,6 @@ use dat_identity_panel::*;
 mod source_controller;
 #[allow(unused_imports)]
 use source_controller::{SourcesAddDialogState, SourcesRemoveDialogState};
-// Preparatory models from the GUI Foundation Extraction milestone
-// (docs/GUI_FOUNDATION_EXTRACTION.md). Each is partly or wholly unadopted:
-// the library boundary makes that visible for the first time, because `pub`
-// at a binary crate root exempted them from dead-code analysis and
-// `pub(crate)` in a library does not. Marked rather than deleted - deciding
-// what to keep is an ownership question of its own, the same shape as the
-// `ViewMode` removal, and does not belong in a build-layout change.
-#[allow(dead_code)]
 pub(crate) mod bulk_confirmation;
 use bulk_confirmation::show_bulk_action_typed_count_gate;
 pub(crate) mod cheat_sources_page;
@@ -301,7 +293,6 @@ pub(crate) mod exact_duplicate_review_page;
 #[allow(dead_code)]
 pub(crate) mod feature_discovery;
 pub(crate) mod game_metadata;
-#[allow(dead_code)]
 pub(crate) mod game_presentation;
 use game_presentation::{
     UNKNOWN_PLATFORM_EXPLANATION, platform_provenance_lines, unknown_platform_aggregate_headline,
@@ -358,12 +349,9 @@ pub(crate) mod selected_evidence_page;
 mod selected_evidence_pipeline;
 mod selected_evidence_ui_state;
 use selected_evidence_pipeline::*;
-#[allow(dead_code)]
-pub(crate) mod selection_guard;
 mod source_state;
 use source_state::{source_platform_state, source_platform_value_label};
 mod sources_page;
-#[allow(dead_code)]
 pub(crate) mod status_wording;
 use status_wording::{
     format_database_upgrade_success, format_scan_activity, format_scan_completion,

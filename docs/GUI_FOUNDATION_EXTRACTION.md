@@ -1,8 +1,18 @@
 # GUI Foundation Extraction
 
-This milestone adds UI-independent presentation and safety models for the
-approved Gamer View / Advanced View redesign. It does not implement either
+This milestone added UI-independent presentation and safety models for the
+approved Gamer View / Advanced View redesign. It did not implement either
 view's screens, navigation, or actions.
+
+> **Outcome (2026-09-16): none of the five models was adopted.** The redesign
+> shipped its own live implementations instead, and the preparatory code sat
+> unreferenced for roughly seven weeks. It was removed once the GUI became a
+> library target, which is what made the dead code visible: `pub` at a binary
+> crate root exempts items from dead-code analysis and `pub(crate)` in a
+> library does not. Each section below records what replaced it. The two
+> modules that survive - `bulk_confirmation` and `game_presentation` - kept
+> only the parts the shipped GUI actually calls, which were moved into them
+> later and are unrelated to this milestone.
 
 ## Modules and responsibilities
 
@@ -22,51 +32,40 @@ the single mode identity. The persisted values are unchanged (`gamer` /
 
 ### `status_wording`
 
-- `StatusContext` accepts existing `MountState` and `IdentityStatus` values,
-  plus path and mount applicability facts.
-- `plain_status()` returns `PlainStatus { headline, detail }` for Gamer View.
-- The mapper does not alter core enums. Technical values stay available to the
-  selected-game model for Advanced View.
+`StatusContext`, `PlainStatus` and `plain_status()` were the beginner-wording
+mapper. **Removed.** Its only caller was `SelectedGamePresentation`, itself
+never called. The live beginner wording is
+`cheats_mods::controller::mount_validation_label`, pinned by
+`mount_validation_labels_distinguish_ready_mounted_and_collision`. The module
+now holds only the scan/upgrade wording moved into it later.
 
 ### `game_presentation`
 
-- `SelectedGamePresentation::from_live()` derives title, platform, format,
-  path availability, mount/direct-use applicability, and status from an
-  existing `ArchiveRecord`.
-- `SelectedGamePresentation::from_cached()` handles a selected cache-only or
-  missing `PersistedArchive` without inventing a live mount state.
-- `PathAvailability` distinguishes available, known-missing, and unavailable
-  paths.
-- `GameTechnicalStatus` retains raw archive kind, mount state, identity status,
-  and health separately from beginner wording.
-- `cheats_mods_available` and `undo_available` are inputs. Claude Code should
-  pass the results of the existing adapter/provider/history gates; this module
-  deliberately does not reproduce backend capability policy.
+`SelectedGamePresentation`, `PathAvailability`, `GameTechnicalStatus` and the
+kind/label helpers were the selected-game model. **Removed** - and already
+recorded as dead by `docs/reviews/CHEATS_MODS_COMPLETION_AUDIT.md`. The live
+selected-game surfaces are `selected_game_panel::show_selected_page` for
+Advanced View and `gamer_view/stage.rs` for Gamer View. The module now holds
+only the platform identity wording moved into it later.
 
 ### `bulk_confirmation`
 
-- `BulkConfirmation::new(count)` captures the exact item count.
-- `mark_preview_complete()` is required before any confirmation can succeed.
-- Counts 1 through `TYPED_CONFIRMATION_THRESHOLD` (25) use normal
-  confirmation; larger counts require `set_typed_count()` to match exactly.
-- `validation()` exposes preview-required, typed-count-required, invalid-count,
-  zero-item, cancelled, and confirmed outcomes without executing an action.
-- `confirm()` and `cancel()` transition to terminal states. The model owns no
-  operation payload and is not wired to Mount All or another real action.
+`BulkConfirmation`, `ConfirmationState`, `ConfirmationValidation` and
+`TYPED_CONFIRMATION_THRESHOLD` were the confirmation state machine.
+**Removed.** The shipped gate is `show_bulk_action_typed_count_gate` with
+`bulk_action_requires_typed_count` / `_typed_count_matches` /
+`_confirm_enabled` - same threshold of 25, five call sites in `library_view`,
+and a superset of the removed tests' assertions. The module now holds only
+that gate.
 
 ### `selection_guard`
 
-- `SelectionGuard::update()` advances a generation only when exact selection
-  changes.
-- `SelectionGuard::token()` captures exact selection and generation when async
-  work begins.
-- `bind_if_current()` rejects a late result unless both fields still match.
-- `clear_stale()` clears selection-bound identity or Cheats & Mods presentation
-  caches after a selection change.
-- `current_value()` prevents a game A value from being read beneath game B.
-- These helpers complement the GUI's existing provider request keys and
-  generation checks. They do not replace or weaken those protections, and no
-  async provider code was rewritten in this milestone.
+`SelectionGuard`, `SelectionToken` and `SelectionBound`. **Module deleted** -
+it had zero references anywhere in the repository, production or test. As this
+section already said, the helpers only *complemented* protections the GUI
+already had: `RefreshGeneration`, `DatabaseGeneration`, the inspector and
+preparation generations, and the stale-generation check every `poll_*` performs
+before installing a result. Those remain and are extensively tested.
 
 ## Intended integration
 
