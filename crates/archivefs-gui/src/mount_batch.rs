@@ -22,6 +22,8 @@ use std::sync::mpsc::Receiver;
 use archivefs_core::{ArchiveRecord, MountState};
 use eframe::egui;
 
+use crate::ui::components as widgets;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MountAllItem {
     pub(crate) archive_path: PathBuf,
@@ -697,4 +699,117 @@ pub(crate) fn show_unmount_all_result(ui: &mut egui::Ui, result: &UnmountAllResu
                 });
         }
     });
+}
+
+/// Drops queued paths whose archive no longer exists in the live
+/// snapshot (source removed, rescan, etc.). Deliberately keeps queued
+/// archives that are merely no longer `Pending` (mounted meanwhile, or a
+/// destination collision) - those stay visible on the Mount page with
+/// their skip reason instead of vanishing silently.
+pub(crate) fn prune_mount_queue(queue: &mut Vec<PathBuf>, records: &[ArchiveRecord]) {
+    queue.retain(|path| {
+        records
+            .iter()
+            .any(|record| record.mount_plan.archive.path == *path)
+    });
+}
+
+/// The queued paths that a "Mount queue" run will actually attempt - in
+/// queue order, `Pending` archives only, mirroring
+/// `show_bulk_row_context_menu`'s contract that
+/// `mount_all_items_for_paths` is only ever fed genuinely eligible
+/// archives.
+pub(crate) fn queued_pending_paths(queue: &[PathBuf], records: &[ArchiveRecord]) -> Vec<PathBuf> {
+    queue
+        .iter()
+        .filter(|path| {
+            records.iter().any(|record| {
+                record.mount_plan.archive.path == **path
+                    && record.mount_state == MountState::Pending
+                    && record.is_mount_input()
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Case-insensitive substring match over the fields the Mount page
+/// displays (name, platform, archive path, planned destination) - the
+/// Mount page's counterpart of the Library's `search_text` matching.
+pub(crate) fn mount_row_matches(record: &ArchiveRecord, filter: &str) -> bool {
+    let needle = filter.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    format!(
+        "{} {} {} {}",
+        record.identity.display_name,
+        record.identity.platform.as_deref().unwrap_or(""),
+        record.mount_plan.archive.path.display(),
+        record.mount_plan.mount_path.display()
+    )
+    .to_lowercase()
+    .contains(&needle)
+}
+
+/// What the Mount page asks `update` to do - executing a mount goes
+/// through the app's own `start_mount_all` (the proven batch engine),
+/// never directly from render code.
+pub(crate) enum MountPageAction {
+    MountQueue,
+    Refresh,
+    /// Navigate to the Mount page (the Selected page's plain "Open Mounts"
+    /// shortcut into the real mount-queue workflow).
+    GoToMount,
+    /// Open the first-class Cheats & Mods workspace for this exact
+    /// archive (the Selected page's entry point).
+    OpenCheatsMods(PathBuf),
+    /// Start the shared background RetroArch profile scan from the
+    /// Selected page's entry section.
+    ScanRetroArchProfiles,
+}
+
+/// What the user chose in the shared mount-queue confirmation strip.
+pub(crate) enum QueueConfirmChoice {
+    Mount,
+    Cancel,
+}
+
+/// The inline "mount the queue" confirmation strip, used by the Mount
+/// page's own queue review (`show_mount_page`). The Selected page no longer
+/// renders any mount queue at all, so this is not shared with it anymore.
+pub(crate) fn show_mount_queue_confirmation(
+    ui: &mut egui::Ui,
+    attempted: usize,
+    busy: bool,
+) -> Option<QueueConfirmChoice> {
+    let mut choice = None;
+    widgets::card(ui, |ui| {
+        widgets::status_badge(ui, "Confirmation", widgets::StatusTone::Warning);
+        if attempted == 1 {
+            ui.strong("Mount 1 queued archive?");
+        } else {
+            ui.strong(format!("Mount {attempted} queued archives?"));
+        }
+        ui.label(
+            "Only archives that are ready to mount are attempted; already-mounted \
+             archives and existing destinations are skipped by the batch engine.",
+        );
+        ui.horizontal(|ui| {
+            if widgets::action_button(
+                ui,
+                "Mount now",
+                widgets::ActionStyle::Primary,
+                !busy && attempted > 0,
+            )
+            .clicked()
+            {
+                choice = Some(QueueConfirmChoice::Mount);
+            }
+            if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() {
+                choice = Some(QueueConfirmChoice::Cancel);
+            }
+        });
+    });
+    choice
 }
