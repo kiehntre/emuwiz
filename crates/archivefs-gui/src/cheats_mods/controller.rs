@@ -5613,6 +5613,230 @@ impl ArchiveFsApp {
             workflow.xenia_show_exact_changes = false;
         }
     }
+
+    pub(crate) fn start_catalogue_status_load(&mut self, context: egui::Context) {
+        if matches!(
+            self.catalogue_bsfree_ui.catalogue_manager,
+            CatalogueManagerState::Loading(_)
+        ) {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Loading(receiver);
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root()
+                .and_then(|root| list_retroarch_cheat_sources(&root));
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    pub(crate) fn start_catalogue_retrieval(&mut self, context: egui::Context) {
+        if self.catalogue_bsfree_ui.catalogue_retrieval.is_some() {
+            return;
+        }
+        let Some(review) = self.catalogue_bsfree_ui.catalogue_review.take() else {
+            return;
+        };
+        self.catalogue_bsfree_ui.catalogue_generation = self
+            .catalogue_bsfree_ui
+            .catalogue_generation
+            .wrapping_add(1);
+        let generation = self.catalogue_bsfree_ui.catalogue_generation;
+        let source_id = review.source_id;
+        let force_refresh = review.kind == CatalogueRetrievalKind::Update;
+        let cancellation = CheatSourceCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        self.history.record(HistoryEntry::new(
+            ActivityAction::CheatSourceRetrieval,
+            None,
+            ActivityOutcome::Started,
+            format!(
+                "RetroArch catalogue {review_kind} started for '{source_id}'.",
+                review_kind = if force_refresh { "update" } else { "download" }
+            ),
+        ));
+        self.catalogue_bsfree_ui.catalogue_retrieval = Some(RunningCatalogueRetrieval {
+            generation,
+            source_id: source_id.clone(),
+            cancellation,
+            receiver,
+            progress_receiver,
+            progress: None,
+            cancellation_requested: false,
+        });
+        let progress_context = context.clone();
+        let progress = CheatSourceProgressReporter::new(move |event| {
+            let _ = progress_sender.send(event);
+            progress_context.request_repaint();
+        });
+        thread::spawn(move || {
+            let result = default_cheat_source_cache_root().and_then(|cache_root| {
+                fetch_retroarch_cheat_source(
+                    &source_id,
+                    &CheatSourceFetchOptions {
+                        cache_root,
+                        force_refresh,
+                        offline: false,
+                        expected_sha256: None,
+                        max_download_bytes: None,
+                        cancellation: Some(worker_cancellation),
+                        progress: Some(progress),
+                    },
+                    &HttpsCheatSourceTransport::new(),
+                )
+            });
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    /// The single dispatch point for `CatalogueManagerAction` - shared by
+    /// every page that renders `show_retroarch_catalogue_manager` (Sources,
+    /// and now Cheats & Mods) so the Review-then-Confirm two-step and the
+    /// "no automatic network access" guarantee it enforces cannot drift
+    /// between call sites.
+    pub(crate) fn handle_catalogue_manager_action(
+        &mut self,
+        context: &egui::Context,
+        action: CatalogueManagerAction,
+    ) {
+        match action {
+            CatalogueManagerAction::Refresh => {
+                self.start_catalogue_status_load(context.clone());
+            }
+            CatalogueManagerAction::Review { source_id, kind } => {
+                self.catalogue_bsfree_ui.catalogue_review =
+                    Some(CatalogueReview { source_id, kind });
+            }
+            CatalogueManagerAction::Confirm => {
+                self.start_catalogue_retrieval(context.clone());
+            }
+            CatalogueManagerAction::CancelReview => {
+                self.catalogue_bsfree_ui.catalogue_review = None;
+            }
+            CatalogueManagerAction::CancelRunning => {
+                if let Some(running) = self.catalogue_bsfree_ui.catalogue_retrieval.as_mut() {
+                    running.cancellation.cancel();
+                    running.cancellation_requested = true;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn poll_catalogue_manager(&mut self, context: &egui::Context) {
+        if let CatalogueManagerState::Loading(receiver) =
+            &self.catalogue_bsfree_ui.catalogue_manager
+        {
+            match receiver.try_recv() {
+                Ok(Ok(list)) => {
+                    self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Ready(list)
+                }
+                Ok(Err(error)) => {
+                    self.catalogue_bsfree_ui.catalogue_manager =
+                        CatalogueManagerState::Failed(error)
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.catalogue_bsfree_ui.catalogue_manager =
+                        CatalogueManagerState::Failed(CheatSourceError {
+                            schema_version:
+                                archivefs_core::patch_manager::CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+                            stage: archivefs_core::patch_manager::CheatSourceErrorStage::Cache,
+                            code: "status_worker_stopped".to_string(),
+                            message: "catalogue status worker stopped unexpectedly".to_string(),
+                            retry_after_seconds: None,
+                        });
+                }
+            }
+        }
+        if let Some(running) = self.catalogue_bsfree_ui.catalogue_retrieval.as_mut() {
+            for progress in running.progress_receiver.try_iter() {
+                running.progress = Some(progress);
+            }
+        }
+        let result = self
+            .catalogue_bsfree_ui
+            .catalogue_retrieval
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.generation, running.source_id.clone(), result))
+            });
+        let Some((generation, source_id, result)) = result else {
+            return;
+        };
+        self.catalogue_bsfree_ui.catalogue_retrieval = None;
+        if generation != self.catalogue_bsfree_ui.catalogue_generation {
+            return;
+        }
+        match &result {
+            Ok(fetch) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "RetroArch catalogue '{}': revision resolved to {}.",
+                        source_id, fetch.manifest.resolved_revision
+                    ),
+                ));
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "RetroArch catalogue '{}': download and verification completed ({} bytes, {} manifest files).",
+                        source_id,
+                        fetch.manifest.downloaded_bytes,
+                        fetch.manifest.files.len()
+                    ),
+                ));
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!(
+                        "RetroArch catalogue '{}' activated at revision {} ({} files verified; {} indexed, {} excluded).",
+                        source_id,
+                        fetch.manifest.resolved_revision,
+                        fetch.manifest.files.len(),
+                        fetch.manifest.indexed_file_count,
+                        fetch.manifest.malformed_cheat_count
+                            + fetch.manifest.excluded_unsupported_count
+                            + fetch.manifest.excluded_path_encoding_count
+                    ),
+                ));
+                if let Some(workflow) = self.cheat_workflow.as_mut() {
+                    workflow.source_fetch = CheatStepResource::Ready(fetch.clone());
+                    workflow.source_list = CheatStepResource::NotLoaded;
+                    clear_cheat_candidate_state(workflow);
+                }
+            }
+            Err(error) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CheatSourceRetrieval,
+                    None,
+                    if error.code == "cancelled" {
+                        ActivityOutcome::Skipped
+                    } else {
+                        ActivityOutcome::Failed
+                    },
+                    format!(
+                        "RetroArch catalogue '{source_id}': {error}. Existing snapshot retained."
+                    ),
+                ));
+            }
+        }
+        self.catalogue_bsfree_ui.catalogue_last_result = Some(result);
+        self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::NotLoaded;
+        self.start_catalogue_status_load(context.clone());
+    }
 }
 
 /// Runs the legacy CRC-only PNACH migration (staged alongside the primary
