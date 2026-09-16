@@ -19,6 +19,13 @@
 //! user visits that page. Home omits those badges until their real state is
 //! known rather than presenting an ordinary lazy load as a problem.
 
+use std::collections::HashMap;
+
+// The snapshot projection moved here from `main.rs` still spells this
+// page's own items `home_page::…`; keeping that name in scope leaves the
+// moved body byte-for-byte identical to what `main.rs` ran.
+use crate::CachedLibrarySnapshot;
+use crate::home_page;
 use crate::ui::{components as widgets, theme};
 use archivefs_core::identity_source::model::MediaCoverage;
 use eframe::egui;
@@ -1051,3 +1058,52 @@ fn show_task_card(ui: &mut egui::Ui, card: &HomeCardView) -> Option<HomeCard> {
 
 #[cfg(test)]
 mod tests;
+
+///
+/// Projects the already-loaded catalogue into the small collection summary
+/// Museum's platform grid consumes. This is deliberately an in-memory
+/// projection: it never scans source folders, opens media, or asks RomM for
+/// fresh data while rendering.
+///
+/// RomM per-platform media coverage is not enriched here - that requires the
+/// RomM/Home-Intelligence snapshot's `media_coverage`/`platform_media_coverage`
+/// fields, which are a separate, not-yet-reconciled batch; every
+/// `romm_media_coverage` this function produces is `None` until that lands.
+pub(crate) fn home_library_snapshot(
+    snapshot: &CachedLibrarySnapshot,
+) -> home_page::HomeLibrarySnapshot {
+    let mut by_platform: HashMap<String, (usize, usize, usize)> = HashMap::new();
+    for archive in &snapshot.archives {
+        let Some(platform) = archive.platform.as_deref() else {
+            continue;
+        };
+        let entry = by_platform.entry(platform.to_string()).or_default();
+        entry.0 += 1;
+        entry.1 += 1;
+        entry.2 += usize::from(archive.last_verified_missing_at.is_some());
+    }
+    let mut platforms = by_platform
+        .into_iter()
+        .map(
+            |(name, (total, identified, missing))| home_page::HomePlatformSummary {
+                name,
+                total,
+                identified,
+                missing,
+                romm_media_coverage: None,
+            },
+        )
+        .collect::<Vec<_>>();
+    platforms.sort_by(|left, right| left.name.cmp(&right.name));
+
+    home_page::HomeLibrarySnapshot {
+        total: snapshot.stats.total_archives.max(0) as usize,
+        present: snapshot.stats.present_archives.max(0) as usize,
+        identified: snapshot.stats.archives_with_platform.max(0) as usize,
+        unresolved: snapshot.stats.archives_unknown_platform.max(0) as usize,
+        missing: snapshot.stats.missing_archives.max(0) as usize,
+        duplicate_groups: snapshot.duplicate_report.groups.len(),
+        platforms,
+        romm_media_coverage: None,
+    }
+}

@@ -1576,3 +1576,9 @@ mod tests {
         assert!(!rendered_text_contains(&output, "Technical details"));
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArrowDirection {
+    Up,
+    Down,
+}

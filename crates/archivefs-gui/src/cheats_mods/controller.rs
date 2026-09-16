@@ -6008,3 +6008,16 @@ pub(crate) fn mount_validation_label(state: MountState) -> &'static str {
         MountState::NotMountable => "Loose ROM · no EmuWiz mount required",
     }
 }
+
+/// Whether the RetroArch cheat-database status should be (re)loaded for the
+/// currently active view - lazily, at most once per `NotLoaded` state, on
+/// both Sources (its original home) and Cheats & Mods (its new shortcut -
+/// see `show_retroarch_catalogue_manager`'s call site there), so opening
+/// either page shows current status without a manual refresh.
+pub(crate) fn catalogue_status_load_needed(
+    view: MainView,
+    catalogue_manager: &CatalogueManagerState,
+) -> bool {
+    matches!(view, MainView::Sources | MainView::CheatsMods)
+        && matches!(catalogue_manager, CatalogueManagerState::NotLoaded)
+}

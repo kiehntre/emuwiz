@@ -174,6 +174,7 @@ use clipboard::{
     ClipboardBackend, ClipboardTextStatus, NativeClipboard, clipboard_environment_summary,
     clipboard_status_label,
 };
+use ui::components::ArrowDirection;
 use ui::text_edit::show_text_edit_with_context_menu;
 mod emulator_download_page;
 mod emulator_readiness_state;
@@ -285,6 +286,7 @@ use game_presentation::{
 #[allow(dead_code)]
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
+use home_page::home_library_snapshot;
 pub(crate) mod identity_sources_page;
 #[allow(dead_code)]
 pub(crate) mod launch_readiness_page;
@@ -590,88 +592,6 @@ use selected_evidence_ui_state::SelectedEvidenceUiState;
 use sources_ui_state::SourcesUiState;
 use artwork_media_state::ArtworkMediaState;
 
-///
-/// Projects the already-loaded catalogue into the small collection summary
-/// Museum's platform grid consumes. This is deliberately an in-memory
-/// projection: it never scans source folders, opens media, or asks RomM for
-/// fresh data while rendering.
-///
-/// RomM per-platform media coverage is not enriched here - that requires the
-/// RomM/Home-Intelligence snapshot's `media_coverage`/`platform_media_coverage`
-/// fields, which are a separate, not-yet-reconciled batch; every
-/// `romm_media_coverage` this function produces is `None` until that lands.
-fn home_library_snapshot(snapshot: &CachedLibrarySnapshot) -> home_page::HomeLibrarySnapshot {
-    let mut by_platform: HashMap<String, (usize, usize, usize)> = HashMap::new();
-    for archive in &snapshot.archives {
-        let Some(platform) = archive.platform.as_deref() else {
-            continue;
-        };
-        let entry = by_platform.entry(platform.to_string()).or_default();
-        entry.0 += 1;
-        entry.1 += 1;
-        entry.2 += usize::from(archive.last_verified_missing_at.is_some());
-    }
-    let mut platforms = by_platform
-        .into_iter()
-        .map(
-            |(name, (total, identified, missing))| home_page::HomePlatformSummary {
-                name,
-                total,
-                identified,
-                missing,
-                romm_media_coverage: None,
-            },
-        )
-        .collect::<Vec<_>>();
-    platforms.sort_by(|left, right| left.name.cmp(&right.name));
-
-    home_page::HomeLibrarySnapshot {
-        total: snapshot.stats.total_archives.max(0) as usize,
-        present: snapshot.stats.present_archives.max(0) as usize,
-        identified: snapshot.stats.archives_with_platform.max(0) as usize,
-        unresolved: snapshot.stats.archives_unknown_platform.max(0) as usize,
-        missing: snapshot.stats.missing_archives.max(0) as usize,
-        duplicate_groups: snapshot.duplicate_report.groups.len(),
-        platforms,
-        romm_media_coverage: None,
-    }
-}
-
-/// Whether the RetroArch cheat-database status should be (re)loaded for the
-/// currently active view - lazily, at most once per `NotLoaded` state, on
-/// both Sources (its original home) and Cheats & Mods (its new shortcut -
-/// see `show_retroarch_catalogue_manager`'s call site there), so opening
-/// either page shows current status without a manual refresh.
-fn catalogue_status_load_needed(view: MainView, catalogue_manager: &CatalogueManagerState) -> bool {
-    matches!(view, MainView::Sources | MainView::CheatsMods)
-        && matches!(catalogue_manager, CatalogueManagerState::NotLoaded)
-}
-
-/// Maps a RomM `ProviderState` to the three-bucket readiness Home shows,
-/// without pulling `archivefs_core::identity_source` into `home_page`
-/// itself. `NeverImported`/`Disabled`/`Importing`/`Stale`/`Error` are all
-/// "configured, but not currently serving" - distinct both from "never set
-/// up" and from "ready" - matching `ProviderState`'s own doc comments on
-/// why each of those is not conflated with an error or with not-configured.
-fn romm_readiness_label(
-    state: &archivefs_core::identity_source::status::ProviderState,
-) -> home_page::RommReadinessLabel {
-    use archivefs_core::identity_source::status::ProviderState;
-    use home_page::RommReadinessLabel;
-    match state {
-        ProviderState::NotConfigured => RommReadinessLabel::NotConfigured("Not configured"),
-        ProviderState::Disabled => RommReadinessLabel::Unavailable("Disabled"),
-        ProviderState::NeverImported => {
-            RommReadinessLabel::Unavailable("Enabled, nothing imported yet")
-        }
-        ProviderState::Importing => RommReadinessLabel::Unavailable("Importing"),
-        ProviderState::Ready => RommReadinessLabel::Ready("Ready"),
-        ProviderState::ReadyOffline => RommReadinessLabel::Ready("Ready (offline)"),
-        ProviderState::Stale { .. } => RommReadinessLabel::Unavailable("Stale"),
-        ProviderState::Error { .. } => RommReadinessLabel::Unavailable("Error"),
-    }
-}
-
 /// Authoritative archive context shared by every primary workflow.
 ///
 /// Invariants:
@@ -867,12 +787,6 @@ pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Resu
         });
     }
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ArrowDirection {
-    Up,
-    Down,
 }
 
 // =====================================================================

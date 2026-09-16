@@ -1053,3 +1053,28 @@ pub(crate) fn romm_dialog_sizes(
     let initial = egui::vec2(preferred.x.min(maximum.x), preferred.y.min(maximum.y));
     (initial, maximum)
 }
+
+/// Maps a RomM `ProviderState` to the three-bucket readiness Home shows,
+/// without pulling `archivefs_core::identity_source` into `home_page`
+/// itself. `NeverImported`/`Disabled`/`Importing`/`Stale`/`Error` are all
+/// "configured, but not currently serving" - distinct both from "never set
+/// up" and from "ready" - matching `ProviderState`'s own doc comments on
+/// why each of those is not conflated with an error or with not-configured.
+pub(crate) fn romm_readiness_label(
+    state: &archivefs_core::identity_source::status::ProviderState,
+) -> home_page::RommReadinessLabel {
+    use archivefs_core::identity_source::status::ProviderState;
+    use home_page::RommReadinessLabel;
+    match state {
+        ProviderState::NotConfigured => RommReadinessLabel::NotConfigured("Not configured"),
+        ProviderState::Disabled => RommReadinessLabel::Unavailable("Disabled"),
+        ProviderState::NeverImported => {
+            RommReadinessLabel::Unavailable("Enabled, nothing imported yet")
+        }
+        ProviderState::Importing => RommReadinessLabel::Unavailable("Importing"),
+        ProviderState::Ready => RommReadinessLabel::Ready("Ready"),
+        ProviderState::ReadyOffline => RommReadinessLabel::Ready("Ready (offline)"),
+        ProviderState::Stale { .. } => RommReadinessLabel::Unavailable("Stale"),
+        ProviderState::Error { .. } => RommReadinessLabel::Unavailable("Error"),
+    }
+}
