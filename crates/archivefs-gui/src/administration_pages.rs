@@ -4322,3 +4322,98 @@ pub(super) fn missing_removal_confirmation_text(count: usize) -> String {
         if count == 1 { "y" } else { "ies" }
     )
 }
+
+pub(crate) const HEALTH_METRIC_MIN_WIDTH: f32 = 148.0;
+
+pub(crate) const HEALTH_METRIC_HEIGHT: f32 = 58.0;
+
+pub(crate) fn responsive_card_columns(
+    available_width: f32,
+    minimum_card_width: f32,
+    spacing: f32,
+    item_count: usize,
+) -> usize {
+    if item_count == 0 {
+        return 0;
+    }
+    (((available_width + spacing) / (minimum_card_width + spacing)).floor() as usize)
+        .clamp(1, item_count)
+}
+
+/// What the Settings page asks `update` to do - each maps onto an
+/// existing proven workflow (`SetupAction::OpenConfigFolder`, the
+/// diagnostics refresh, the Diagnostics overlay, the background
+/// profile-discovery scan), never new machinery.
+pub(crate) enum SettingsPageAction {
+    OpenConfigFolder,
+    ValidateConfiguration,
+    OpenDiagnostics,
+    RescanRetroArchProfiles,
+    PlatformArtwork(PlatformArtworkManagerAction),
+    /// "Run first-time setup again": re-enters the onboarding overlay
+    /// (`onboarding::restart_onboarding`) without touching source folders,
+    /// DAT registrations, or any other configured state.
+    RunFirstTimeSetupAgain,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SummaryMetric<'a> {
+    pub(crate) label: &'a str,
+    pub(crate) value: usize,
+    pub(crate) tone: widgets::StatusTone,
+}
+
+pub(crate) fn show_health_metric_card(ui: &mut egui::Ui, width: f32, metric: SummaryMetric<'_>) {
+    let color = metric.tone.color(ui);
+    let content_width = (width - 20.0).max(64.0);
+    let fill = if metric.value == 0 {
+        theme::card_fill(ui)
+    } else {
+        color.gamma_multiply(0.10)
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(theme::border(ui))
+        .corner_radius(7)
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            ui.set_min_size(egui::vec2(content_width, HEALTH_METRIC_HEIGHT - 10.0));
+            ui.set_max_width(content_width);
+            ui.vertical_centered(|ui| {
+                let value = egui::RichText::new(metric.value.to_string()).strong();
+                ui.label(if metric.value == 0 {
+                    value.color(ui.visuals().weak_text_color())
+                } else {
+                    value.color(color)
+                });
+                ui.add_sized(
+                    [content_width, ui.text_style_height(&egui::TextStyle::Small)],
+                    egui::Label::new(egui::RichText::new(metric.label).small()).truncate(),
+                )
+                .on_hover_text(metric.label);
+            });
+        });
+}
+
+pub(crate) fn show_health_metric_cards(ui: &mut egui::Ui, metrics: &[SummaryMetric<'_>]) {
+    let spacing = ui.spacing().item_spacing.x;
+    let columns = responsive_card_columns(
+        ui.available_width(),
+        HEALTH_METRIC_MIN_WIDTH,
+        spacing,
+        metrics.len(),
+    );
+    if columns == 0 {
+        return;
+    }
+    for row in metrics.chunks(columns) {
+        let width = ((ui.available_width() - spacing * (columns.saturating_sub(1) as f32))
+            / columns as f32)
+            .max(1.0);
+        ui.horizontal(|ui| {
+            for metric in row {
+                show_health_metric_card(ui, width, *metric);
+            }
+        });
+    }
+}
