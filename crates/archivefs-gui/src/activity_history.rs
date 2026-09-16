@@ -2,6 +2,11 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use eframe::egui;
+
+use crate::ClipboardBackend;
+use crate::ui::components as widgets;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActivityAction {
     Refresh,
@@ -352,3 +357,228 @@ impl OperationHistory {
 }
 
 pub(crate) const HISTORY_LIMIT: usize = 50;
+
+pub(crate) const ACTIVITY_EXPANDED_BY_DEFAULT: bool = false;
+
+/// Matches the collapsed activity panel's real content: one row of
+/// buttons/badges plus its frame margin. Only used as the very first
+/// frame's guess for the "activity_collapsed" panel id - actual content
+/// height takes over immediately after and is what gets persisted.
+pub(crate) const ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT: f32 = 44.0;
+
+/// Matches the expanded activity panel's real content: the button row,
+/// separator, and the history list's own `max_height(220.0)` scroll area.
+/// Only used as the very first frame's guess for the "activity_expanded"
+/// panel id, for the same reason as the collapsed default above.
+pub(crate) const ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT: f32 = 220.0;
+
+pub(crate) enum ActivityPanelAction {
+    ShowRelatedArchive(PathBuf),
+}
+
+pub(crate) fn activity_outcome_tone(outcome: ActivityOutcome) -> widgets::StatusTone {
+    match outcome {
+        ActivityOutcome::Completed => widgets::StatusTone::Success,
+        ActivityOutcome::Failed | ActivityOutcome::Rejected => widgets::StatusTone::Blocked,
+        ActivityOutcome::OfflineUsable => widgets::StatusTone::Info,
+        ActivityOutcome::Started | ActivityOutcome::Retried | ActivityOutcome::Confirmed => {
+            widgets::StatusTone::Active
+        }
+        ActivityOutcome::Offered | ActivityOutcome::Skipped | ActivityOutcome::Cancelled => {
+            widgets::StatusTone::Pending
+        }
+    }
+}
+
+pub(crate) fn activity_summary_entry(history: &OperationHistory) -> Option<&HistoryEntry> {
+    history
+        .entries()
+        .find(|entry| {
+            matches!(
+                entry.outcome,
+                ActivityOutcome::Failed | ActivityOutcome::Rejected
+            )
+        })
+        .or_else(|| history.entries().next())
+}
+
+pub(crate) fn show_activity_panel(
+    context: &egui::Context,
+    history: &mut OperationHistory,
+    expanded: &mut bool,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<ActivityPanelAction> {
+    let mut action = None;
+    // Root cause of the bottom-clipping bug: `TopBottomPanel::bottom` picks
+    // this frame's panel height by loading `PanelState` persisted under
+    // its *own id* from the previous frame (egui's `panel.rs`), and only
+    // falls back to a fresh default the very first time that id is ever
+    // shown. Collapsed and expanded here render wildly different content
+    // heights (one status row vs. a history list up to ~220px tall plus a
+    // button row), but previously both used the *same* id ("activity") -
+    // so the frame right after toggling from collapsed to expanded loaded
+    // the collapsed height, squeezed the expanded content into it (that
+    // content's own clip rect is the panel rect: see egui's `panel.rs`,
+    // "If we overflow, don't do so visibly"), and only corrected itself
+    // one frame later. A user's screenshot taken in that window - or
+    // rendered while the app is between reactive repaints - shows exactly
+    // "one line of content" jammed near the screen edge. Giving each
+    // visual state its own id keeps their persisted heights from ever
+    // contaminating each other, so there is no longer a wrong state to
+    // render even transiently.
+    let (panel_id, default_height) = if *expanded {
+        ("activity_expanded", ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT)
+    } else {
+        (
+            "activity_collapsed",
+            ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT,
+        )
+    };
+    let maximum_height = if *expanded {
+        (context.input(|input| input.screen_rect().height()) * 0.28)
+            .clamp(120.0, ACTIVITY_PANEL_EXPANDED_DEFAULT_HEIGHT)
+    } else {
+        ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT
+    };
+    egui::TopBottomPanel::bottom(panel_id)
+        .resizable(*expanded)
+        .default_height(default_height)
+        .height_range(ACTIVITY_PANEL_COLLAPSED_DEFAULT_HEIGHT..=maximum_height)
+        .show(context, |ui| {
+            ui.horizontal(|ui| {
+                if widgets::action_button(
+                    ui,
+                    if *expanded {
+                        "Hide activity"
+                    } else {
+                        "Show activity"
+                    },
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
+                {
+                    *expanded = !*expanded;
+                }
+                widgets::status_badge(
+                    ui,
+                    format!("{} events", history.len()),
+                    widgets::StatusTone::Info,
+                );
+                if !*expanded && let Some(entry) = activity_summary_entry(history) {
+                    widgets::status_badge(
+                        ui,
+                        entry.outcome.to_string(),
+                        activity_outcome_tone(entry.outcome),
+                    );
+                    ui.add(egui::Label::new(&entry.message).truncate())
+                        .on_hover_text(&entry.message);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if *expanded
+                        && widgets::action_button(
+                            ui,
+                            "Clear activity history",
+                            widgets::ActionStyle::Destructive,
+                            history.entries().next().is_some(),
+                        )
+                        .clicked()
+                    {
+                        history.clear();
+                    }
+                });
+            });
+            if !*expanded {
+                return;
+            }
+            ui.separator();
+
+            if history.entries().next().is_none() {
+                ui.weak("No recent activity.");
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("activity_history")
+                .max_height(220.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Collected as owned data *before* the loop, rather
+                    // than iterating `history.entries()` directly, so a
+                    // menu item can freely call `history.clear()`/
+                    // `history.remove()` without fighting the borrow
+                    // checker over a `history` still being iterated.
+                    let rows: Vec<(
+                        usize,
+                        ActivityAction,
+                        ActivityOutcome,
+                        String,
+                        Option<PathBuf>,
+                    )> = history
+                        .entries()
+                        .enumerate()
+                        .map(|(index, entry)| {
+                            (
+                                index,
+                                entry.action,
+                                entry.outcome,
+                                entry.message.clone(),
+                                entry.archive_path.clone(),
+                            )
+                        })
+                        .collect();
+                    let mut remove_index = None;
+                    for (index, activity, outcome, text, archive_path) in &rows {
+                        let response = widgets::card(ui, |ui| {
+                            widgets::activity_row_header(
+                                ui,
+                                outcome.to_string(),
+                                activity_outcome_tone(*outcome),
+                                activity.to_string(),
+                                None,
+                                |_ui| {},
+                            );
+                            ui.add(
+                                egui::Label::new(text)
+                                    .selectable(true)
+                                    .wrap()
+                                    .sense(egui::Sense::click()),
+                            )
+                        });
+                        ui.add_space(6.0);
+                        response.context_menu(|ui| {
+                            if ui.button("Copy message").clicked() {
+                                let _ = clipboard.set_text(text.clone());
+                                ui.close();
+                            }
+                            if let Some(archive_path) = archive_path {
+                                if ui.button("Copy related path").clicked() {
+                                    let _ = clipboard.set_text(archive_path.display().to_string());
+                                    ui.close();
+                                }
+                                if ui.button("Show related archive").clicked() {
+                                    action = Some(ActivityPanelAction::ShowRelatedArchive(
+                                        archive_path.clone(),
+                                    ));
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Remove this entry").clicked() {
+                                remove_index = Some(*index);
+                                ui.close();
+                            }
+                            if ui.button("Clear activity history").clicked() {
+                                history.clear();
+                                ui.close();
+                            }
+                        });
+                    }
+                    // Deferred to after the loop: removing mid-iteration
+                    // would shift every later index out from under `rows`.
+                    if let Some(index) = remove_index {
+                        history.remove(index);
+                    }
+                });
+        });
+    action
+}
