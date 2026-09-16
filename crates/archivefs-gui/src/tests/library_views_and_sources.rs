@@ -14,6 +14,11 @@
 //! Predominant theme observed in this slice: library view dialogs, DAT/cheat sources pages, clipboard text editing.
 
 use super::*;
+use crate::ui::text_edit::{
+    TextEditContextMenuAction, apply_copy, apply_cut, apply_paste, apply_select_all,
+    set_text_edit_caret, text_edit_context_menu_action_available, text_edit_cursor_char_range,
+    text_edit_selected_char_range,
+};
 
 #[test]
 fn gamer_add_success_queues_the_existing_scan_one_action_for_the_exact_folder() {
