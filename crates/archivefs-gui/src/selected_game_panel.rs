@@ -712,3 +712,180 @@ pub(crate) fn show_bulk_platform_action_bar(
     ui.add_space(4.0);
     action
 }
+
+/// The Selected page's own view state - a game-details/review surface, not a
+/// mount-queue screen. Queue review, manipulation, and the mount-queue
+/// confirmation flow live only on the Mount page (`show_mount_page`,
+/// `administration_pages.rs`), which already owns that machinery end to end;
+/// this page never re-implements or duplicates it, and offers only a plain
+/// "Open Mounts" shortcut into the real workflow.
+pub(crate) struct SelectedPageViewState<'a> {
+    pub(crate) selected_archive: Option<&'a Path>,
+    pub(crate) selected_count: usize,
+    pub(crate) retroarch_profiles: &'a RetroArchProfilesState,
+    pub(crate) busy: bool,
+    pub(crate) block_reason: Option<&'a str>,
+}
+
+/// Renders the Selected page: a focused game-details/review surface (Cheats
+/// & Mods entry point here; identity evidence, launch readiness, identity
+/// sources, plan preview, and RPCS3/PCSX2 panels rendered by the caller
+/// immediately after this returns). Never renders or manipulates the mount
+/// queue - see `SelectedPageViewState`'s own doc.
+pub(crate) fn show_selected_page(
+    ui: &mut egui::Ui,
+    live: Option<&LoadedData>,
+    view_state: SelectedPageViewState<'_>,
+) -> Option<MountPageAction> {
+    let SelectedPageViewState {
+        selected_archive,
+        selected_count,
+        retroarch_profiles,
+        busy,
+        block_reason,
+    } = view_state;
+    let mut action = None;
+    widgets::page_header_with_icon(
+        ui,
+        crate::ui::icons::SELECTED,
+        "Game Details",
+        "Review identity, launch readiness and available actions for this game.",
+    );
+
+    widgets::section_header(
+        ui,
+        "Cheats & Mods",
+        Some("Open the dedicated workspace for the archive selected in Library."),
+    );
+    match selected_archive {
+        Some(path) => {
+            if widgets::path_value(ui, "Selected archive", path) {
+                ui.ctx().copy_text(path.display().to_string());
+            }
+        }
+        None => {
+            ui.label("No archive is selected in the Library.");
+        }
+    }
+    let entry_blocker = cheat_entry_blocker(
+        selected_archive,
+        selected_count,
+        live.map(|data| data.records.as_slice()),
+        retroarch_profiles,
+    );
+    ui.horizontal(|ui| {
+        if widgets::action_button(
+            ui,
+            "Open Cheats & Mods",
+            widgets::ActionStyle::Secondary,
+            entry_blocker.is_none() && !busy,
+        )
+        .clicked()
+            && let Some(path) = selected_archive
+        {
+            action = Some(MountPageAction::OpenCheatsMods(path.to_path_buf()));
+        }
+        // The only mount-related affordance this page offers: a plain
+        // shortcut into the real Mount page/workflow. No queue is reviewed,
+        // built, or confirmed here.
+        if widgets::action_button(ui, "Open Mounts", widgets::ActionStyle::Quiet, !busy).clicked() {
+            action = Some(MountPageAction::GoToMount);
+        }
+        if matches!(
+            retroarch_profiles,
+            RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
+        ) && widgets::action_button(
+            ui,
+            "Scan for RetroArch profiles",
+            widgets::ActionStyle::Quiet,
+            !busy,
+        )
+        .clicked()
+        {
+            action = Some(MountPageAction::ScanRetroArchProfiles);
+        }
+    });
+    if let Some(reason) = entry_blocker {
+        widgets::banner(ui, "Unavailable", reason, widgets::StatusTone::Pending);
+    }
+    if busy && let Some(reason) = block_reason {
+        ui.label(reason);
+    }
+    action
+}
+
+/// The persisted database row backing the selected archive, if the
+/// library database knows about it - live or cache-only alike, unlike
+/// `selected_record` (live only). This is what makes manual platform
+/// assignment available for a cache-only/missing row: it is metadata
+/// only, never a mount action, so it does not need `selected_record`'s
+/// live-only restriction. Matches by exact path bytes (`PersistedArchive::absolute_path`),
+/// never a lossy display string.
+pub(crate) fn selected_persisted_archive<'a>(
+    cached: Option<&'a CachedLibrarySnapshot>,
+    selected_archive: Option<&Path>,
+) -> Option<&'a PersistedArchive> {
+    let selected_archive = selected_archive?;
+    cached?
+        .archives
+        .iter()
+        .find(|persisted| persisted.absolute_path == selected_archive)
+}
+
+pub(crate) fn selected_platform_details<'a>(
+    cached: Option<&'a CachedLibrarySnapshot>,
+    persisted: Option<&PersistedArchive>,
+) -> Option<&'a PlatformProvenanceDetails> {
+    cached?.platform_details.get(&persisted?.id)
+}
+
+pub(crate) fn available_action(mount_state: MountState) -> ArchiveAction {
+    match mount_state {
+        MountState::Mounted => ArchiveAction::Unmount,
+        MountState::Pending | MountState::MountPathExists | MountState::NotMountable => {
+            ArchiveAction::Mount
+        }
+    }
+}
+
+pub(crate) fn individual_actions_available(busy: bool) -> bool {
+    !busy
+}
+
+pub(crate) fn confirmation_actions_available(busy: bool) -> bool {
+    individual_actions_available(busy)
+}
+
+pub(crate) fn record_recovery_activity(
+    history: &mut OperationHistory,
+    action: ActivityAction,
+    archive_path: &Path,
+    outcome: ActivityOutcome,
+    message: &'static str,
+) {
+    history.record(HistoryEntry::new(
+        action,
+        Some(archive_path.to_path_buf()),
+        outcome,
+        message,
+    ));
+}
+
+pub(crate) fn advance_to_final_lazy_confirmation(
+    warning_confirmation: &mut Option<PathBuf>,
+    final_confirmation: &mut Option<PathBuf>,
+    focus_final_cancel: &mut bool,
+    archive_path: &Path,
+) {
+    *final_confirmation = Some(archive_path.to_path_buf());
+    *warning_confirmation = None;
+    *focus_final_cancel = true;
+}
+
+pub(crate) fn lazy_confirmation_available(
+    confirmed_archive: &Path,
+    offered_archives: &HashSet<PathBuf>,
+    busy: bool,
+) -> bool {
+    !busy && offered_archives.contains(confirmed_archive)
+}
