@@ -151,6 +151,8 @@ mod app_pages;
 mod app_polling;
 mod app_reactions;
 mod app_shell;
+mod archive_context;
+use archive_context::ArchiveContext;
 mod archive_inspector_controller;
 mod artwork_media_state;
 mod catalogue_bsfree_ui_state;
@@ -595,52 +597,6 @@ use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 use sources_ui_state::SourcesUiState;
 use artwork_media_state::ArtworkMediaState;
-
-/// Authoritative archive context shared by every primary workflow.
-///
-/// Invariants:
-/// - `focused` is the Library/Selected detail identity, never a row index.
-/// - `selected` is the exact multi-selection used for highlighting and bulk
-///   actions. A single selection always equals `focused`.
-/// - the active Cheats & Mods archive is derived from `focused`; it is not
-///   stored a second time. Adapter state may be cached for this identity,
-///   but may never choose a different archive.
-/// - queue membership and mounted records are independent and must never
-///   clear or replace this context.
-#[derive(Default)]
-struct ArchiveContext {
-    focused: Option<PathBuf>,
-    selected: HashSet<PathBuf>,
-}
-
-impl ArchiveContext {
-    fn select_only(&mut self, path: PathBuf) {
-        self.selected.clear();
-        self.selected.insert(path.clone());
-        self.focused = Some(path);
-    }
-
-    fn clear_selection(&mut self) {
-        self.focused = None;
-        self.selected.clear();
-    }
-
-    fn prune(&mut self, rows: &[ArchiveRow]) {
-        self.selected
-            .retain(|path| rows.iter().any(|row| &row.path == path));
-        if self
-            .focused
-            .as_ref()
-            .is_some_and(|focused| !rows.iter().any(|row| &row.path == focused))
-        {
-            self.focused = None;
-        }
-    }
-
-    fn active_cheats(&self) -> Option<&Path> {
-        self.focused.as_deref()
-    }
-}
 
 pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Result<()> {
     let (program, argument) = if cfg!(target_os = "windows") {
