@@ -24,9 +24,11 @@ scripts/task-postcheck.sh --baseline /tmp/emuwiz-task-baseline.txt \
   --allow path/to/allowed-file.rs
 ```
 
-## `main.rs` architecture policy
+## GUI root architecture policy
 
-`crates/archivefs-gui/src/main.rs` is a coordination boundary. It may contain
+`crates/archivefs-gui/src/lib.rs` is a coordination boundary. (It was
+`src/main.rs` until the GUI became a library with thin `src/bin/` launchers;
+the policy is unchanged, only the path.) It may contain
 application bootstrap, genuinely global `ArchiveFsApp` state, top-level
 eframe/egui composition, thin cross-feature dispatch, and coordination that
 really spans multiple subsystems.
@@ -44,7 +46,7 @@ stop and reconsider placement. Small wiring changes are allowed.
 
 - A feature owns its state, actions, rendering, and helpers.
 - A controller owns focused orchestration and that feature's persistence/async coordination.
-- `main.rs` owns app-wide coordination only.
+- the GUI library root owns app-wide coordination only.
 
 Reuse focused modules where possible; do not create parallel models casually.
 

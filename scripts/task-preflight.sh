@@ -30,8 +30,8 @@ echo "Branch: $(git branch --show-current)"
 echo "HEAD: $(git rev-parse HEAD)"
 echo "Status:"
 git status --short
-echo "main.rs lines: $(wc -l < crates/archivefs-gui/src/main.rs)"
-echo "main.rs fixed maximum: none; the 30-line diff ratchet is reported by the boundary guard."
+echo "GUI library root lines: $(wc -l < crates/archivefs-gui/src/lib.rs)"
+echo "GUI library root fixed maximum: none; the 30-line diff ratchet is reported by the boundary guard."
 echo "Reminder: create a scope baseline before editing task files."
 if [[ -n "$baseline" ]]; then
     "$repo_root/scripts/check-working-tree-scope.sh" --write-baseline "$baseline"

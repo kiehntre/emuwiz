@@ -2,22 +2,40 @@
 name = "archivefs-gui"
 version.workspace = true
 edition.workspace = true
+# Every binary is declared explicitly below; nothing in `src/bin/` should be
+# picked up implicitly.
+autobins = false
+
+# The GUI itself is a library (`src/lib.rs`): `ArchiveFsApp`, every page and
+# controller module, and the native startup in `run()`. Building it as one
+# library target means the module tree - and its tests - compile once rather
+# than once per binary name, which is what three `path = "src/main.rs"`
+# binaries used to do.
+[lib]
+name = "archivefs_gui"
+path = "src/lib.rs"
 
 # Binary naming during the EmuWiz rename (staged): `emuwiz` and
 # `emuwiz-gui` are the primary names; `archivefs-gui` remains as a legacy
 # compatibility alias so existing launchers keep working. All three run the
-# exact same code.
+# exact same code - each is a thin launcher that calls `archivefs_gui::run()`.
 [[bin]]
 name = "emuwiz"
-path = "src/main.rs"
+path = "src/bin/emuwiz.rs"
+# Nothing to test in a launcher; the suite lives in the library target.
+test = false
 
 [[bin]]
 name = "emuwiz-gui"
-path = "src/main.rs"
+path = "src/bin/emuwiz-gui.rs"
+# Nothing to test in a launcher; the suite lives in the library target.
+test = false
 
 [[bin]]
 name = "archivefs-gui"
-path = "src/main.rs"
+path = "src/bin/archivefs-gui.rs"
+# Nothing to test in a launcher; the suite lives in the library target.
+test = false
 
 [dependencies]
 archivefs-core = { path = "../archivefs-core" }

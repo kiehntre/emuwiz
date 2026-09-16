@@ -71,7 +71,11 @@ the single mode identity. The persisted values are unchanged (`gamer` /
 ## Intended integration
 
 The only shared-file integration is five public module declarations near the
-top of `crates/archivefs-gui/src/main.rs`. Claude Code can consume the models
+top of the GUI crate root. (Those declarations are now `pub(crate)` in
+`crates/archivefs-gui/src/lib.rs`: the GUI became a library with thin
+`src/bin/` launchers, and a library's `pub` is real public API, so the four
+surviving modules are crate-internal and marked `#[allow(dead_code)]` while
+they remain unadopted.) Claude Code can consume the models
 incrementally from the new modules while implementing screens. No current
 rendering function calls them, so cherry-picking does not change visible
 behaviour.

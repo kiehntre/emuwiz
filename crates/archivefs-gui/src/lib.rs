@@ -1,3 +1,16 @@
+//! The EmuWiz GUI.
+//!
+//! This library owns the whole GUI: `ArchiveFsApp`, every page and
+//! controller module, and the native startup in [`run`]. The three shipped
+//! executables - `emuwiz`, `emuwiz-gui` and `archivefs-gui` - are thin
+//! launchers in `src/bin/` that do nothing but call it, so the module tree
+//! and its tests compile once instead of once per binary name.
+//!
+//! This file is the coordination boundary the repository's GUI root
+//! architecture policy describes (see AGENTS.md): module declarations,
+//! bootstrap, native options and the eframe launch. Feature logic belongs
+//! in a focused module.
+
 // egui 0.34 keeps the 0.32 panel/context entry points as compatibility
 // shims. Retaining them in this security-only dependency update avoids a
 // broad layout rewrite; the dedicated GUI migration can remove this once
@@ -249,7 +262,15 @@ use dat_identity_panel::*;
 mod source_controller;
 #[allow(unused_imports)]
 use source_controller::{SourcesAddDialogState, SourcesRemoveDialogState};
-pub mod bulk_confirmation;
+// Preparatory models from the GUI Foundation Extraction milestone
+// (docs/GUI_FOUNDATION_EXTRACTION.md). Each is partly or wholly unadopted:
+// the library boundary makes that visible for the first time, because `pub`
+// at a binary crate root exempted them from dead-code analysis and
+// `pub(crate)` in a library does not. Marked rather than deleted - deciding
+// what to keep is an ownership question of its own, the same shape as the
+// `ViewMode` removal, and does not belong in a build-layout change.
+#[allow(dead_code)]
+pub(crate) mod bulk_confirmation;
 use bulk_confirmation::show_bulk_action_typed_count_gate;
 pub(crate) mod cheat_sources_page;
 mod collection_discovery_page;
@@ -280,7 +301,8 @@ pub(crate) mod exact_duplicate_review_page;
 #[allow(dead_code)]
 pub(crate) mod feature_discovery;
 pub(crate) mod game_metadata;
-pub mod game_presentation;
+#[allow(dead_code)]
+pub(crate) mod game_presentation;
 use game_presentation::{
     UNKNOWN_PLATFORM_EXPLANATION, platform_provenance_lines, unknown_platform_aggregate_headline,
     unknown_platform_banner_visible,
@@ -336,11 +358,13 @@ pub(crate) mod selected_evidence_page;
 mod selected_evidence_pipeline;
 mod selected_evidence_ui_state;
 use selected_evidence_pipeline::*;
-pub mod selection_guard;
+#[allow(dead_code)]
+pub(crate) mod selection_guard;
 mod source_state;
 use source_state::{source_platform_state, source_platform_value_label};
 mod sources_page;
-pub mod status_wording;
+#[allow(dead_code)]
+pub(crate) mod status_wording;
 use status_wording::{
     format_database_upgrade_success, format_scan_activity, format_scan_completion,
 };
@@ -469,7 +493,13 @@ fn app_icon() -> Option<egui::IconData> {
     }
 }
 
-fn main() -> eframe::Result<()> {
+/// Run the EmuWiz GUI: the entire behaviour of the shipped executables.
+///
+/// Handles `--version`/`-V` and `--clipboard-check` before opening a
+/// window, then launches eframe with the app id and icon. Returns
+/// `eframe::Result` so a launcher's `main` can forward it unchanged and
+/// keep the existing exit-code behaviour.
+pub fn run() -> eframe::Result<()> {
     init_logging();
     let arguments = std::env::args().collect::<Vec<_>>();
     if arguments
@@ -506,7 +536,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-/// `archivefs-gui --clipboard-check` - see `main`'s doc comment. Prints
+/// `archivefs-gui --clipboard-check` - see [`run`]'s doc comment. Prints
 /// exactly three lines to stdout and nothing else clipboard-related; the
 /// environment summary and any error detail also already went to stderr
 /// via `NativeClipboard::new`, so this only needs to report the outcome.
