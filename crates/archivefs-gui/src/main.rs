@@ -333,6 +333,9 @@ pub mod selection_guard;
 mod source_state;
 mod sources_page;
 pub mod status_wording;
+use status_wording::{
+    format_database_upgrade_success, format_scan_activity, format_scan_completion,
+};
 #[allow(dead_code)]
 pub(crate) mod tape_analysis_page;
 #[allow(dead_code)]
@@ -360,21 +363,20 @@ use archivefs_core::{
     ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
     BulkPlatformAssignmentResult, CatalogueDuplicateArchive, CatalogueDuplicateGroup,
     CatalogueDuplicateReport, CatalogueStats, CompletedScanSummary, Config, ConfigIdentity,
-    Database, DatabaseHealth, DatabaseHealthReport, DatabaseUpgradeReport, DoctorReport,
-    DoctorStatus, FrontendPlatformMapping, FrontendProfile, FrontendProfileKind,
-    FrontendProfilePolicy, HealthCategory, HealthIssue, InspectorEntry,
-    InspectorEntryClassification, InspectorEntryKind, InspectorReport, LazyUnmountCleanupResult,
-    LibraryViewApplyReport, LibraryViewConfig, LibraryViewLayoutTemplate, LibraryViewPlan,
-    LibraryViewPlanAction, LibraryViewPlanEntry, MANUAL_PLATFORM_SOURCE,
-    MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
-    PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction,
-    RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
-    SetupDiagnosticStatus, SetupDiagnostics, SourceAvailability, SourceFolderConfig,
-    SourceFolderView, SourceHealthIssue, UnmountOneOutcome, add_library_view_default,
-    add_source_folder_default, apply_library_view_default, assign_source_platform_default,
-    build_source_folder_views, canonical_platform_names, catalogue_filename_duplicates,
-    check_archive_index_freshness, check_database_health, classify_archive_health,
-    cleanup_selected_mount_tree, create_configured_mount_root_default,
+    Database, DatabaseHealth, DatabaseHealthReport, DoctorReport, DoctorStatus,
+    FrontendPlatformMapping, FrontendProfile, FrontendProfileKind, FrontendProfilePolicy,
+    HealthCategory, HealthIssue, InspectorEntry, InspectorEntryClassification, InspectorEntryKind,
+    InspectorReport, LazyUnmountCleanupResult, LibraryViewApplyReport, LibraryViewConfig,
+    LibraryViewLayoutTemplate, LibraryViewPlan, LibraryViewPlanAction, LibraryViewPlanEntry,
+    MANUAL_PLATFORM_SOURCE, MissingArchiveRemovalResult, MountOneOutcome, MountState,
+    PersistedArchive, PlatformAlias, PlatformAssignmentChange, PlatformProvenanceDetails,
+    RecentScanAdditions, RecoveryAction, RecoveryOffer, RemoveSourceFolderOutcome,
+    ScanPersistSummary, SetSourceFolderEnabledOutcome, SetupDiagnosticStatus, SetupDiagnostics,
+    SourceAvailability, SourceFolderConfig, SourceFolderView, SourceHealthIssue, UnmountOneOutcome,
+    add_library_view_default, add_source_folder_default, apply_library_view_default,
+    assign_source_platform_default, build_source_folder_views, canonical_platform_names,
+    catalogue_filename_duplicates, check_archive_index_freshness, check_database_health,
+    classify_archive_health, cleanup_selected_mount_tree, create_configured_mount_root_default,
     create_starter_config_default, default_config_path, default_database_path, default_index_path,
     diagnose_database, edit_library_view_default, format_unix_timestamp_utc, inspect_archive,
     is_inspectable, is_known_disc_companion, latest_schema_version,
@@ -902,56 +904,6 @@ fn apply_missing_removal_at(
         ids.push(archive_id);
     }
     database.remove_missing_archives(&ids)
-}
-
-fn format_scan_completion(summary: &ScanPersistSummary) -> String {
-    format!(
-        "Scan completed\nSeen: {}\nAdded: {}\nUpdated: {} (including {} restored)\nNewly missing: {}\nUnchanged: {}\nSkipped unsupported: {}\nSkipped ambiguous: {}\nErrors: {}",
-        summary.counts.archives_seen,
-        summary.counts.archives_added,
-        summary.counts.archives_updated,
-        summary.counts.archives_restored,
-        summary.counts.archives_missing,
-        summary.counts.archives_unchanged,
-        summary.counts.skipped_unsupported_extension,
-        summary.counts.skipped_ambiguous_platform,
-        summary.counts.errors_count,
-    )
-}
-
-fn format_scan_activity(summary: &ScanPersistSummary) -> String {
-    format!(
-        "Scan completed: seen {}, added {}, updated {} (including {} restored), newly missing {}, unchanged {}, skipped {}, errors {}.",
-        summary.counts.archives_seen,
-        summary.counts.archives_added,
-        summary.counts.archives_updated,
-        summary.counts.archives_restored,
-        summary.counts.archives_missing,
-        summary.counts.archives_unchanged,
-        summary.counts.skipped_unsupported_extension + summary.counts.skipped_ambiguous_platform,
-        summary.counts.errors_count,
-    )
-}
-
-fn format_database_upgrade_success(
-    report: &DatabaseUpgradeReport,
-    summary: &ScanPersistSummary,
-) -> String {
-    let migration_chain = report
-        .applied_versions
-        .iter()
-        .map(i64::to_string)
-        .collect::<Vec<_>>()
-        .join(" → ");
-    format!(
-        "Library database upgraded safely from schema {} to schema {} using migrations {}. The \
-         original database is recoverable from {}. {}",
-        report.from_version,
-        report.to_version,
-        migration_chain,
-        report.backup_path.display(),
-        format_scan_activity(summary)
-    )
 }
 
 /// A source's actual platform state, derived purely from the archives the
