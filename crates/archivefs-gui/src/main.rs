@@ -143,6 +143,7 @@ use archivefs_core::patch_manager::{
 use collection_discovery_page::*;
 mod activity_history;
 mod administration_pages;
+mod app_polling;
 mod app_shell;
 mod archive_inspector_controller;
 mod artwork_media_state;
@@ -4467,88 +4468,7 @@ impl ArchiveFsApp {
     }
 
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.reconcile_library_tab();
-        self.reconcile_problems_repair_tab();
-        self.reconcile_sources_tab();
-        self.reconcile_selected_evidence_selection();
-        self.reconcile_archive_preparation();
-        self.poll_needs_attention(context);
-        self.poll_platform_artwork_task(context);
-        self.poll_shared_history();
-        // Gamer View's "Undo last change" (docs/GUI_NAVIGATION_RESET_DESIGN.md
-        // mandatory risk #2) drives this exact same `shared_rollback` state
-        // machine while `self.view` stays `Library` (Gamer View never sets
-        // `MainView::HistoryLogs`) - so this Advanced-View-only cleanup rule
-        // must not fire while in Gamer View, or a rollback preview/review
-        // started from Gamer View would be reset to `Idle` before the user
-        // ever sees it. Advanced View's own behaviour (reset on leaving
-        // History & Logs) is completely unchanged.
-        if self.view != MainView::HistoryLogs
-            && self.ui_mode != GuiMode::GamerView
-            && matches!(
-                self.shared_rollback,
-                SharedRollbackState::Previewing { .. } | SharedRollbackState::Review { .. }
-            )
-        {
-            self.shared_rollback = SharedRollbackState::Idle;
-        }
-        self.poll_shared_rollback();
-        if self.view == MainView::HistoryLogs
-            && matches!(self.shared_history, SharedHistoryState::NotLoaded)
-        {
-            self.refresh_shared_history(context.clone());
-        }
-        self.poll_load(context);
-        self.poll_database_load(context);
-        if self.sources_ui.dat_authority.tick(
-            self.database_generation.0,
-            database_state_path(&self.database_state),
-            matches!(self.view, MainView::DatSources | MainView::NeedsAttention)
-                && !self.database_state.is_loading(),
-            context,
-        ) {
-            self.invalidate_needs_attention();
-        }
-        self.poll_diagnostics();
-        self.poll_setup_action(context);
-        self.poll_doctor_scan();
-        self.poll_rpcs3_status();
-        self.poll_pcsx2_status();
-        self.poll_platform_action(context);
-        self.poll_bulk_platform_action(context);
-        self.poll_alias_action(context);
-        self.poll_source_action(context);
-        self.poll_bsfree_operation(context);
-        self.poll_romm_operation(context);
-        self.poll_catalogue_manager(context);
-        self.poll_dolphin_catalogue_manager(context);
-        self.poll_library_view_action(context);
-        self.poll_archive_inspection();
-        self.poll_archive_preparation(context);
-        self.poll_selected_evidence();
-        self.poll_identity_sources();
-        self.poll_plan_preview();
-        self.poll_missing_removal(context);
-        self.poll_operation(context);
-        self.poll_mount_all(context);
-        self.poll_unmount_all(context);
-        self.poll_retroarch_profiles();
-        self.poll_pcsx2_profiles();
-        self.poll_dolphin_profiles();
-        self.poll_dolphin_local_profiles();
-        self.poll_pcsx2_launch_profiles();
-        self.poll_flycast_profiles();
-        self.poll_pcsx2_firmware_evidence();
-        self.poll_cheat_workflow(context);
-        self.cheatbase_page.poll(context);
-        self.emulator_download_page.poll(context);
-        if let Some(_installed_id) = self.emulator_download_page.take_completed_install() {
-            // A managed AppImage was just installed: re-run the read-only
-            // discovery / Doctor / readiness so Emulator Setup and Play
-            // availability reflect it. Discovery is authoritative - the
-            // download page never asserts launch readiness itself.
-            self.start_doctor_scan(context.clone());
-        }
+        app_polling::poll_and_reconcile(self, context);
         if matches!(
             self.view,
             MainView::Sources | MainView::CheatsMods | MainView::CheatSources
