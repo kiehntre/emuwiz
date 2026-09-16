@@ -79,3 +79,157 @@ pub(crate) fn apply_shell_request(
         None => {}
     }
 }
+
+/// Apply the requests the central panel raised this frame.
+///
+/// `update` used to run this block inline immediately after the panel
+/// closed; the order of the arms is unchanged, including the health
+/// dashboard's ability to raise an `AppOperationRequest` that the final
+/// arm then services in the same frame.
+pub(crate) fn apply_page_requests(
+    app: &mut ArchiveFsApp,
+    context: &egui::Context,
+    outcome: app_pages::PageDispatchOutcome,
+) {
+    let app_pages::PageDispatchOutcome {
+        retry,
+        mut requested_action,
+        diagnostics_action,
+        health_dashboard_action,
+        stop_mount_all,
+        stop_unmount_all,
+    } = outcome;
+    if stop_mount_all {
+        app.request_mount_all_stop();
+    }
+    if let Some(action) = diagnostics_action {
+        match action {
+            DiagnosticsUiAction::Refresh => app.refresh_diagnostics(context),
+            DiagnosticsUiAction::Continue => {
+                app.tools_overlay = ToolsOverlay::None;
+                app.refresh(context);
+            }
+            DiagnosticsUiAction::ViewLastSnapshot => {
+                app.tools_overlay = ToolsOverlay::None;
+            }
+            DiagnosticsUiAction::CreateStarterConfig => {
+                app.start_setup_action(context.clone(), SetupAction::CreateStarterConfig)
+            }
+            DiagnosticsUiAction::CreateMountRoot => {
+                app.start_setup_action(context.clone(), SetupAction::CreateMountRoot)
+            }
+            DiagnosticsUiAction::OpenConfigFolder => {
+                app.start_setup_action(context.clone(), SetupAction::OpenConfigFolder)
+            }
+            DiagnosticsUiAction::CopyConfigPath => {
+                if let DiagnosticsState::Ready { report, .. } = &app.doctor_repair.diagnostics
+                    && let Some(path) = &report.config_path
+                {
+                    let path = path.display().to_string();
+                    let _ = app.clipboard.set_text(path.clone());
+                    app.history.record(HistoryEntry::new(
+                        ActivityAction::Setup,
+                        None,
+                        ActivityOutcome::Completed,
+                        format!("Copied config path: {path}"),
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(action) = health_dashboard_action {
+        match action {
+            HealthDashboardAction::BackToLibrary => {
+                app.navigate_to_library_tab(LibraryTab::Archives);
+            }
+            HealthDashboardAction::Archive(request) => {
+                requested_action = Some(AppOperationRequest::Archive(request));
+            }
+            HealthDashboardAction::RefreshDiagnostics => {
+                app.refresh_diagnostics(context);
+            }
+            HealthDashboardAction::OpenMissingReview => {
+                app.navigate_to_missing_catalogue_review();
+            }
+            HealthDashboardAction::OpenDuplicateReview => {
+                app.navigate_to_library_tab(LibraryTab::Duplicates);
+            }
+            HealthDashboardAction::ViewInLibrary(path) => {
+                app.navigate_to_library_tab(LibraryTab::Archives);
+                app.archive_context.select_only(path);
+            }
+            HealthDashboardAction::Inspect(path) => {
+                requested_action = Some(AppOperationRequest::InspectArchive(path));
+            }
+            HealthDashboardAction::FilterByCategory(filter) => {
+                app.health_duplicate_ui.health_filters.category = filter;
+            }
+        }
+    }
+    if stop_unmount_all {
+        app.request_unmount_all_stop();
+    }
+    if retry {
+        app.refresh(context);
+    }
+    if let Some(request) = requested_action {
+        match request {
+            AppOperationRequest::Archive(request) => {
+                app.start_operation(
+                    context.clone(),
+                    request.action,
+                    request.archive_path,
+                    request.cleanup_after_unmount,
+                );
+            }
+            AppOperationRequest::MountAll(items) => {
+                app.start_mount_all(context.clone(), items);
+            }
+            AppOperationRequest::UnmountAll {
+                items,
+                cleanup_after_unmount,
+            } => {
+                app.start_unmount_all(context.clone(), items, cleanup_after_unmount);
+            }
+            AppOperationRequest::PlatformAssignment {
+                archive_path,
+                action,
+            } => {
+                app.start_platform_action(context.clone(), archive_path, action);
+            }
+            AppOperationRequest::BulkPlatformAssignment {
+                archive_paths,
+                kind,
+            } => {
+                app.start_bulk_platform_action(context.clone(), archive_paths, kind);
+            }
+            AppOperationRequest::RemoveMissing(archive_paths) => {
+                app.start_missing_removal(context.clone(), archive_paths);
+            }
+            AppOperationRequest::UpdateGameFolder => {
+                app.navigate_to_sources_tab(SourcesTab::Libraries);
+            }
+            AppOperationRequest::FullRescan => {
+                app.start_source_action(context.clone(), SourceAction::ScanAll);
+            }
+            AppOperationRequest::ReviewMissingGames => {
+                app.navigate_to_missing_catalogue_review();
+            }
+            AppOperationRequest::InspectArchive(archive_path) => {
+                app.start_archive_inspection(context.clone(), archive_path);
+            }
+            AppOperationRequest::ShowInLibraryViews(archive_path) => {
+                app.navigate_to_library_tab(LibraryTab::Views);
+                app.library_view_focus_archive = Some(archive_path);
+            }
+            AppOperationRequest::OpenCheatsMods(archive_path) => {
+                app.archive_context.select_only(archive_path.clone());
+                app.open_cheats_mods_workspace(context, archive_path);
+            }
+            AppOperationRequest::OpenDatSources => {
+                app.sources_ui.quick_rename_mode = false;
+                app.view = MainView::DatSources;
+            }
+        }
+    }
+}

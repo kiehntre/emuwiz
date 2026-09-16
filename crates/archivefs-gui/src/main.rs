@@ -4612,14 +4612,7 @@ impl ArchiveFsApp {
 
         app_overlays::show_global_overlays(self, context);
 
-        let app_pages::PageDispatchOutcome {
-            retry,
-            mut requested_action,
-            diagnostics_action,
-            health_dashboard_action,
-            stop_mount_all,
-            stop_unmount_all,
-        } = app_pages::show_pages(
+        let outcome = app_pages::show_pages(
             self,
             context,
             app_pages::PageDispatchInputs {
@@ -4630,139 +4623,7 @@ impl ArchiveFsApp {
                 missing_removal_available,
             },
         );
-        if stop_mount_all {
-            self.request_mount_all_stop();
-        }
-        if let Some(action) = diagnostics_action {
-            match action {
-                DiagnosticsUiAction::Refresh => self.refresh_diagnostics(context),
-                DiagnosticsUiAction::Continue => {
-                    self.tools_overlay = ToolsOverlay::None;
-                    self.refresh(context);
-                }
-                DiagnosticsUiAction::ViewLastSnapshot => {
-                    self.tools_overlay = ToolsOverlay::None;
-                }
-                DiagnosticsUiAction::CreateStarterConfig => {
-                    self.start_setup_action(context.clone(), SetupAction::CreateStarterConfig)
-                }
-                DiagnosticsUiAction::CreateMountRoot => {
-                    self.start_setup_action(context.clone(), SetupAction::CreateMountRoot)
-                }
-                DiagnosticsUiAction::OpenConfigFolder => {
-                    self.start_setup_action(context.clone(), SetupAction::OpenConfigFolder)
-                }
-                DiagnosticsUiAction::CopyConfigPath => {
-                    if let DiagnosticsState::Ready { report, .. } = &self.doctor_repair.diagnostics
-                        && let Some(path) = &report.config_path
-                    {
-                        let path = path.display().to_string();
-                        let _ = self.clipboard.set_text(path.clone());
-                        self.history.record(HistoryEntry::new(
-                            ActivityAction::Setup,
-                            None,
-                            ActivityOutcome::Completed,
-                            format!("Copied config path: {path}"),
-                        ));
-                    }
-                }
-            }
-        }
-        if let Some(action) = health_dashboard_action {
-            match action {
-                HealthDashboardAction::BackToLibrary => {
-                    self.navigate_to_library_tab(LibraryTab::Archives);
-                }
-                HealthDashboardAction::Archive(request) => {
-                    requested_action = Some(AppOperationRequest::Archive(request));
-                }
-                HealthDashboardAction::RefreshDiagnostics => {
-                    self.refresh_diagnostics(context);
-                }
-                HealthDashboardAction::OpenMissingReview => {
-                    self.navigate_to_missing_catalogue_review();
-                }
-                HealthDashboardAction::OpenDuplicateReview => {
-                    self.navigate_to_library_tab(LibraryTab::Duplicates);
-                }
-                HealthDashboardAction::ViewInLibrary(path) => {
-                    self.navigate_to_library_tab(LibraryTab::Archives);
-                    self.archive_context.select_only(path);
-                }
-                HealthDashboardAction::Inspect(path) => {
-                    requested_action = Some(AppOperationRequest::InspectArchive(path));
-                }
-                HealthDashboardAction::FilterByCategory(filter) => {
-                    self.health_duplicate_ui.health_filters.category = filter;
-                }
-            }
-        }
-        if stop_unmount_all {
-            self.request_unmount_all_stop();
-        }
-        if retry {
-            self.refresh(context);
-        }
-        if let Some(request) = requested_action {
-            match request {
-                AppOperationRequest::Archive(request) => {
-                    self.start_operation(
-                        context.clone(),
-                        request.action,
-                        request.archive_path,
-                        request.cleanup_after_unmount,
-                    );
-                }
-                AppOperationRequest::MountAll(items) => {
-                    self.start_mount_all(context.clone(), items);
-                }
-                AppOperationRequest::UnmountAll {
-                    items,
-                    cleanup_after_unmount,
-                } => {
-                    self.start_unmount_all(context.clone(), items, cleanup_after_unmount);
-                }
-                AppOperationRequest::PlatformAssignment {
-                    archive_path,
-                    action,
-                } => {
-                    self.start_platform_action(context.clone(), archive_path, action);
-                }
-                AppOperationRequest::BulkPlatformAssignment {
-                    archive_paths,
-                    kind,
-                } => {
-                    self.start_bulk_platform_action(context.clone(), archive_paths, kind);
-                }
-                AppOperationRequest::RemoveMissing(archive_paths) => {
-                    self.start_missing_removal(context.clone(), archive_paths);
-                }
-                AppOperationRequest::UpdateGameFolder => {
-                    self.navigate_to_sources_tab(SourcesTab::Libraries);
-                }
-                AppOperationRequest::FullRescan => {
-                    self.start_source_action(context.clone(), SourceAction::ScanAll);
-                }
-                AppOperationRequest::ReviewMissingGames => {
-                    self.navigate_to_missing_catalogue_review();
-                }
-                AppOperationRequest::InspectArchive(archive_path) => {
-                    self.start_archive_inspection(context.clone(), archive_path);
-                }
-                AppOperationRequest::ShowInLibraryViews(archive_path) => {
-                    self.navigate_to_library_tab(LibraryTab::Views);
-                    self.library_view_focus_archive = Some(archive_path);
-                }
-                AppOperationRequest::OpenCheatsMods(archive_path) => {
-                    self.archive_context.select_only(archive_path.clone());
-                    self.open_cheats_mods_workspace(context, archive_path);
-                }
-                AppOperationRequest::OpenDatSources => {
-                    self.sources_ui.quick_rename_mode = false;
-                    self.view = MainView::DatSources;
-                }
-            }
-        }
+        app_reactions::apply_page_requests(self, context, outcome);
     }
 }
 
