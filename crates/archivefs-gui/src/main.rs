@@ -3097,46 +3097,6 @@ impl ArchiveFsApp {
         }
     }
 
-    /// Applies a `MountPageAction` returned by the Mount or Selected
-    /// page. Queue execution re-derives eligibility from the live
-    /// snapshot at the moment of the click (queue order, `Pending`
-    /// only), then hands the items to the proven `start_mount_all`
-    /// batch engine - never a stale item list captured at render time.
-    fn handle_mount_page_action(
-        &mut self,
-        context: &egui::Context,
-        action: Option<MountPageAction>,
-    ) {
-        match action {
-            Some(MountPageAction::MountQueue) => {
-                let items = match &self.state {
-                    LoadState::Ready(data) => {
-                        let eligible =
-                            queued_pending_paths(&self.mount_ui.mount_queue, &data.records);
-                        mount_all_items_for_paths(&data.records, &eligible)
-                    }
-                    _ => Vec::new(),
-                };
-                if !items.is_empty() {
-                    self.start_mount_all(context.clone(), items);
-                }
-            }
-            Some(MountPageAction::Refresh) => self.refresh(context),
-            Some(MountPageAction::GoToMount) => {
-                self.view = MainView::Mount;
-                self.tools_overlay = ToolsOverlay::None;
-            }
-            Some(MountPageAction::OpenCheatsMods(archive_path)) => {
-                self.archive_context.select_only(archive_path.clone());
-                self.open_cheats_mods_workspace(context, archive_path);
-            }
-            Some(MountPageAction::ScanRetroArchProfiles) => {
-                self.start_retroarch_profile_scan(context.clone());
-            }
-            None => {}
-        }
-    }
-
     /// GUI Batch C: starts (or refreshes) the read-only "Plan Preview" load
     /// for the currently-ready selected-evidence report - see
     /// `plan_preview_page`'s own module doc. Explicit only (a button
