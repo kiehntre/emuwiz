@@ -13,6 +13,7 @@ use super::{
     ActionFeedback, ActivityAction, ActivityOutcome, ArchiveFsApp, HistoryEntry, LoadState,
     RefreshGeneration, ToolsOverlay, open_folder_in_file_manager, sources_page,
 };
+use crate::ui::theme;
 
 pub(crate) type DiagnosticsMessage = (RefreshGeneration, SetupDiagnostics);
 
@@ -461,4 +462,203 @@ impl ArchiveFsApp {
             }
         }
     }
+}
+
+pub(crate) fn show_setup_diagnostics(
+    ui: &mut egui::Ui,
+    state: &DiagnosticsState,
+    action_running: bool,
+    feedback: Option<&ActionFeedback>,
+    refresh_error: Option<&str>,
+    has_last_snapshot: bool,
+    config_previously_confirmed: bool,
+) -> Option<DiagnosticsUiAction> {
+    let mut action = None;
+    ui.heading("Setup / Diagnostics");
+    ui.label("Check configuration, folders, and required system tools before using EmuWiz.");
+    ui.add_space(8.0);
+    if let Some(error) = refresh_error {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            format!("Archive refresh failed: {error}"),
+        );
+        ui.label("Diagnostics are being refreshed from the current configuration.");
+        if has_last_snapshot
+            && ui
+                .add_enabled(
+                    !action_running,
+                    egui::Button::new("View Last Known Snapshot"),
+                )
+                .clicked()
+        {
+            return Some(DiagnosticsUiAction::ViewLastSnapshot);
+        }
+        ui.add_space(8.0);
+    }
+    if let DiagnosticsState::Error { message, .. } = state {
+        ui.colored_label(ui.visuals().error_fg_color, message);
+        ui.label("Select Refresh Diagnostics to try again.");
+        if ui
+            .add_enabled(!action_running, egui::Button::new("Refresh Diagnostics"))
+            .clicked()
+        {
+            return Some(DiagnosticsUiAction::Refresh);
+        }
+        return None;
+    }
+    let DiagnosticsState::Ready { report, .. } = state else {
+        ui.spinner();
+        ui.label("Running diagnostics in the background...");
+        ui.add_enabled(false, egui::Button::new("Continue to EmuWiz"));
+        return None;
+    };
+    if report.config_missing && report.config_path_error.is_none() {
+        if missing_config_is_first_run(config_previously_confirmed) {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Welcome to EmuWiz");
+                ui.label(
+                    "EmuWiz is not configured yet - that is expected on a fresh install, not \
+                     an error. Select Create Starter Config below to begin, then add a source \
+                     folder on the Sources page.",
+                );
+                ui.label(
+                    "DAT Sources and Cheat Sources live on their own pages and start empty; \
+                     both are optional. RomM is optional too. Audits are always read-only: \
+                     EmuWiz will not rename, move or delete any ROM without a later, \
+                     explicit, reviewed action.",
+                );
+            });
+        } else {
+            // Not a first run: this session already saw the config file
+            // present and readable, and it is now gone. That can be an
+            // intentional removal, but it can just as easily mean a real
+            // problem (deleted by accident, an unmounted drive, a bug) -
+            // so this is never dressed up as an ordinary welcome.
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.colored_label(theme::WARNING, "Configuration file is no longer found");
+                ui.label(
+                    "EmuWiz found your configuration earlier in this session, and it is no \
+                     longer present. If you did not remove it intentionally, check whether it \
+                     was deleted, moved, or is on a drive that is no longer mounted, before \
+                     creating a new one below.",
+                );
+            });
+        }
+        ui.add_space(8.0);
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("Config path:");
+        match &report.config_path {
+            Some(path) => {
+                ui.monospace(path.display().to_string());
+                if ui
+                    .add_enabled(!action_running, egui::Button::new("Copy Config Path"))
+                    .clicked()
+                {
+                    action = Some(DiagnosticsUiAction::CopyConfigPath);
+                }
+                if ui
+                    .add_enabled(!action_running, egui::Button::new("Open Config Folder"))
+                    .clicked()
+                {
+                    action = Some(DiagnosticsUiAction::OpenConfigFolder);
+                }
+            }
+            None => {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    report
+                        .config_path_error
+                        .as_deref()
+                        .unwrap_or("Config path could not be resolved."),
+                );
+            }
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        if starter_config_available(report)
+            && ui
+                .add_enabled(!action_running, egui::Button::new("Create Starter Config"))
+                .clicked()
+        {
+            action = Some(DiagnosticsUiAction::CreateStarterConfig);
+        }
+        if report.can_create_mount_root
+            && ui
+                .add_enabled(!action_running, egui::Button::new("Create Mount Root"))
+                .clicked()
+        {
+            action = Some(DiagnosticsUiAction::CreateMountRoot);
+        }
+        if ui
+            .add_enabled(!action_running, egui::Button::new("Refresh Diagnostics"))
+            .clicked()
+        {
+            action = Some(DiagnosticsUiAction::Refresh);
+        }
+        if ui
+            .add_enabled(
+                !action_running && diagnostics_state_can_continue(state),
+                egui::Button::new("Continue to EmuWiz"),
+            )
+            .clicked()
+        {
+            action = Some(DiagnosticsUiAction::Continue);
+        }
+        if action_running {
+            ui.spinner();
+            ui.label("Setup action running...");
+        }
+    });
+    if let Some(feedback) = feedback {
+        ui.colored_label(
+            if feedback.succeeded {
+                egui::Color32::from_rgb(70, 170, 90)
+            } else {
+                ui.visuals().error_fg_color
+            },
+            &feedback.message,
+        );
+    }
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt("setup_diagnostics_checks")
+        .show(ui, |ui| {
+            for check in &report.checks {
+                let (state_label, color) = match check.status {
+                    SetupDiagnosticStatus::Ready => ("Ready", egui::Color32::from_rgb(70, 170, 90)),
+                    // Neither a pass nor a problem: the check did not run.
+                    SetupDiagnosticStatus::NotChecked => ("Not checked", theme::muted(ui)),
+                    // Expected on a fresh install - informational, not red.
+                    SetupDiagnosticStatus::NotConfigured => ("Not configured", theme::muted(ui)),
+                    SetupDiagnosticStatus::Warning => {
+                        ("Warning", egui::Color32::from_rgb(220, 170, 40))
+                    }
+                    SetupDiagnosticStatus::Error => ("Error", ui.visuals().error_fg_color),
+                };
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(color, state_label);
+                        ui.strong(&check.name);
+                    });
+                    ui.label(&check.detail);
+                    if check.status != SetupDiagnosticStatus::Ready {
+                        ui.label(format!("Why it matters: {}", check.why_it_matters));
+                        ui.label(format!("Next step: {}", check.next_step));
+                    }
+                });
+                ui.add_space(4.0);
+            }
+        });
+    action
+}
+
+/// Whether a currently-missing config should be framed as an ordinary
+/// first run rather than a possible problem: only when this session has
+/// never once seen the config file present and readable. Kept as its own
+/// pure predicate (mirroring `library_table_message`/
+/// `gamer_empty_list_guidance`) so the distinction is directly testable
+/// without an `egui::Ui`.
+pub(crate) fn missing_config_is_first_run(config_previously_confirmed: bool) -> bool {
+    !config_previously_confirmed
 }
