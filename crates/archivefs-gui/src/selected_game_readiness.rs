@@ -49,7 +49,7 @@ impl ArchiveFsApp {
             }
         });
 
-        let emulator = Some(match setup_check_summary(&self.doctor_scan) {
+        let emulator = Some(match setup_check_summary(&self.doctor_repair.doctor_scan) {
             home_page::SetupCheckSummary::Healthy => FeatureStatus::Available {
                 label: "Emulator setup checks passed".to_string(),
                 action_label: Some("Open Emulator Setup"),
@@ -292,7 +292,10 @@ impl ArchiveFsApp {
         ) {
             self.start_pcsx2_firmware_evidence_load(context.clone());
         }
-        if matches!(self.emulator_readiness.flycast_profiles, FlycastProfilesState::NotScanned) {
+        if matches!(
+            self.emulator_readiness.flycast_profiles,
+            FlycastProfilesState::NotScanned
+        ) {
             self.start_flycast_profile_scan(context.clone());
         }
         if matches!(

@@ -244,7 +244,7 @@ pub(crate) enum RommReadinessLabel {
 /// "Set up emulators" card's destination (Problems & Repair -> Diagnostics)
 /// renders. Built by `main.rs` (see `setup_check_summary`) so this module
 /// needs no dependency on the Doctor engine, and so the card summarises the
-/// *same* state a click opens - never the separate `self.diagnostics`
+/// *same* state a click opens - never the separate `self.doctor_repair.diagnostics`
 /// background report, which is a different subsystem with a different notion
 /// of "last run".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

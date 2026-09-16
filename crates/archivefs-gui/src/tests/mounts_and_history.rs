@@ -1825,7 +1825,14 @@ fn mount_all_stop_request_is_recorded_and_signalled() {
     app.request_mount_all_stop();
 
     assert!(stop.load(Ordering::Acquire));
-    assert!(app.mount_ui.mount_all.as_ref().unwrap().progress.stop_requested);
+    assert!(
+        app.mount_ui
+            .mount_all
+            .as_ref()
+            .unwrap()
+            .progress
+            .stop_requested
+    );
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::MountAll
             && entry.outcome == ActivityOutcome::Cancelled
@@ -1930,7 +1937,10 @@ fn start_operation_rejects_a_second_operation_without_replacing_the_receiver() {
         PathBuf::from("/roms/Beta.7z"),
         true,
     ));
-    assert_eq!(app.mount_ui.operation.as_ref().unwrap().action, ArchiveAction::Mount);
+    assert_eq!(
+        app.mount_ui.operation.as_ref().unwrap().action,
+        ArchiveAction::Mount
+    );
 
     sender
         .send(Ok(OperationSuccess {
@@ -2371,7 +2381,9 @@ fn successful_lazy_unmount_with_cleanup_failure_still_offers_remount() {
     let archive_path = PathBuf::from("/roms/Game.zip");
     let mount_path = PathBuf::from("/mount/Game");
     let (sender, receiver) = mpsc::channel();
-    app.mount_ui.lazy_unmount_offers.insert(archive_path.clone());
+    app.mount_ui
+        .lazy_unmount_offers
+        .insert(archive_path.clone());
     app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::LazyUnmount,
         archive_path: archive_path.clone(),
@@ -2790,7 +2802,11 @@ fn unmount_all_activity_records_batch_archive_cleanup_and_recovery_lifecycle() {
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::UnmountAll && entry.outcome == ActivityOutcome::Completed
     }));
-    assert!(app.mount_ui.lazy_unmount_offers.contains(&failed.archive_path));
+    assert!(
+        app.mount_ui
+            .lazy_unmount_offers
+            .contains(&failed.archive_path)
+    );
 }
 
 #[test]
@@ -2811,7 +2827,11 @@ fn successful_batch_unmount_clears_only_its_previous_lazy_offer() {
 
     app.poll_unmount_all(&egui::Context::default());
 
-    assert!(!app.mount_ui.lazy_unmount_offers.contains(&item.archive_path));
+    assert!(
+        !app.mount_ui
+            .lazy_unmount_offers
+            .contains(&item.archive_path)
+    );
     assert!(app.mount_ui.lazy_unmount_offers.contains(&other));
     let mounted_again = record("/roms/Game.zip", MountState::Mounted);
     assert!(!lazy_unmount_available(
@@ -2842,7 +2862,11 @@ fn no_longer_mounted_batch_skip_clears_only_its_previous_lazy_offer() {
 
     app.poll_unmount_all(&egui::Context::default());
 
-    assert!(!app.mount_ui.lazy_unmount_offers.contains(&item.archive_path));
+    assert!(
+        !app.mount_ui
+            .lazy_unmount_offers
+            .contains(&item.archive_path)
+    );
     assert!(app.mount_ui.lazy_unmount_offers.contains(&other));
 }
 
@@ -2866,14 +2890,18 @@ fn failed_normal_batch_unmount_retains_its_exact_lazy_offer() {
 
     app.poll_unmount_all(&egui::Context::default());
 
-    assert!(app.mount_ui.lazy_unmount_offers.contains(&item.archive_path));
+    assert!(
+        app.mount_ui
+            .lazy_unmount_offers
+            .contains(&item.archive_path)
+    );
 }
 
 #[test]
 fn missing_config_load_opens_setup_instead_of_leaving_a_fatal_view() {
     let mut app = app_for_operation_tests();
     let (_diagnostics_sender, diagnostics_receiver) = mpsc::channel();
-    app.diagnostics = DiagnosticsState::Loading {
+    app.doctor_repair.diagnostics = DiagnosticsState::Loading {
         generation: RefreshGeneration::INITIAL,
         receiver: diagnostics_receiver,
     };
@@ -2894,8 +2922,13 @@ fn missing_config_load_opens_setup_instead_of_leaving_a_fatal_view() {
 
     assert_eq!(app.tools_overlay, ToolsOverlay::Diagnostics);
     assert!(matches!(app.state, LoadState::Error(_)));
-    assert!(matches!(app.diagnostics, DiagnosticsState::Loading { .. }));
-    assert!(!diagnostics_state_can_continue(&app.diagnostics));
+    assert!(matches!(
+        app.doctor_repair.diagnostics,
+        DiagnosticsState::Loading { .. }
+    ));
+    assert!(!diagnostics_state_can_continue(
+        &app.doctor_repair.diagnostics
+    ));
     assert!(app.refresh_error.is_some());
 }
 
@@ -2903,7 +2936,7 @@ fn missing_config_load_opens_setup_instead_of_leaving_a_fatal_view() {
 fn failed_refresh_retains_snapshot_and_invalidates_stale_diagnostics() {
     let mut app = app_for_operation_tests();
     let (_diagnostics_sender, diagnostics_receiver) = mpsc::channel();
-    app.diagnostics = DiagnosticsState::Loading {
+    app.doctor_repair.diagnostics = DiagnosticsState::Loading {
         generation: RefreshGeneration::INITIAL,
         receiver: diagnostics_receiver,
     };
@@ -2927,8 +2960,13 @@ fn failed_refresh_retains_snapshot_and_invalidates_stale_diagnostics() {
         LoadState::Ready(data) if data.mount_root == Path::new("/old-mount")
     ));
     assert!(app.snapshot_stale);
-    assert!(matches!(app.diagnostics, DiagnosticsState::Loading { .. }));
-    assert!(!diagnostics_state_can_continue(&app.diagnostics));
+    assert!(matches!(
+        app.doctor_repair.diagnostics,
+        DiagnosticsState::Loading { .. }
+    ));
+    assert!(!diagnostics_state_can_continue(
+        &app.doctor_repair.diagnostics
+    ));
     assert_eq!(app.refresh_error.as_deref(), Some("config became invalid"));
 }
 
@@ -2965,7 +3003,7 @@ fn fresh_invalid_diagnostics_keep_setup_open() {
     let mut app = app_for_operation_tests();
     app.tools_overlay = ToolsOverlay::Diagnostics;
     let (sender, receiver) = mpsc::channel();
-    app.diagnostics = DiagnosticsState::Loading {
+    app.doctor_repair.diagnostics = DiagnosticsState::Loading {
         generation: RefreshGeneration::INITIAL,
         receiver,
     };
@@ -2976,7 +3014,9 @@ fn fresh_invalid_diagnostics_keep_setup_open() {
     app.poll_diagnostics();
 
     assert_eq!(app.tools_overlay, ToolsOverlay::Diagnostics);
-    assert!(!diagnostics_state_can_continue(&app.diagnostics));
+    assert!(!diagnostics_state_can_continue(
+        &app.doctor_repair.diagnostics
+    ));
 }
 
 #[test]
@@ -2987,7 +3027,7 @@ fn successful_refresh_invalidates_stale_action_readiness() {
         app.snapshot_generation,
         app.snapshot_stale,
         snapshot_identity(&app.state),
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
     ));
 
     app.refresh(&egui::Context::default());
@@ -2996,7 +3036,7 @@ fn successful_refresh_invalidates_stale_action_readiness() {
     app.snapshot_generation = Some(current);
 
     assert!(matches!(
-        app.diagnostics,
+        app.doctor_repair.diagnostics,
         DiagnosticsState::Loading {
             generation,
             ..
@@ -3007,7 +3047,7 @@ fn successful_refresh_invalidates_stale_action_readiness() {
         app.snapshot_generation,
         app.snapshot_stale,
         snapshot_identity(&app.state),
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
     ));
 }
 
@@ -3028,10 +3068,10 @@ fn refresh_recomputes_action_readiness_as_true_once_diagnostics_complete() {
         app.snapshot_generation,
         app.snapshot_stale,
         snapshot_identity(&app.state),
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
     ));
 
-    app.diagnostics = DiagnosticsState::Ready {
+    app.doctor_repair.diagnostics = DiagnosticsState::Ready {
         generation: current,
         report: setup_report(true, true),
     };
@@ -3042,7 +3082,7 @@ fn refresh_recomputes_action_readiness_as_true_once_diagnostics_complete() {
             app.snapshot_generation,
             app.snapshot_stale,
             snapshot_identity(&app.state),
-            &app.diagnostics,
+            &app.doctor_repair.diagnostics,
         ),
         "action readiness must recompute to true once the new generation's \
              diagnostics complete as Ready"
@@ -3054,7 +3094,7 @@ fn refresh_recomputes_action_readiness_as_true_once_diagnostics_complete() {
             app.snapshot_generation,
             app.snapshot_stale,
             snapshot_identity(&app.state),
-            &app.diagnostics,
+            &app.doctor_repair.diagnostics,
         ),
         None,
         "block_reason must agree: no reason once readiness is restored"
@@ -3075,7 +3115,7 @@ fn opening_and_closing_the_archive_inspector_does_not_stale_action_readiness() {
         app.snapshot_generation,
         app.snapshot_stale,
         snapshot_identity(&app.state),
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
     );
     assert!(before, "the fixture must start in the actions-safe state");
 
@@ -3087,7 +3127,7 @@ fn opening_and_closing_the_archive_inspector_does_not_stale_action_readiness() {
             app.snapshot_generation,
             app.snapshot_stale,
             snapshot_identity(&app.state),
-            &app.diagnostics,
+            &app.doctor_repair.diagnostics,
         ),
         "opening Inspector must not stale action readiness"
     );
@@ -3099,7 +3139,7 @@ fn opening_and_closing_the_archive_inspector_does_not_stale_action_readiness() {
             app.snapshot_generation,
             app.snapshot_stale,
             snapshot_identity(&app.state),
-            &app.diagnostics,
+            &app.doctor_repair.diagnostics,
         ),
         "closing Inspector must not stale action readiness"
     );
@@ -3139,7 +3179,7 @@ fn late_diagnostics_from_an_older_generation_are_ignored() {
     let current = RefreshGeneration(2);
     app.refresh_generation = current;
     let (sender, receiver) = mpsc::channel();
-    app.diagnostics = DiagnosticsState::Loading {
+    app.doctor_repair.diagnostics = DiagnosticsState::Loading {
         generation: current,
         receiver,
     };
@@ -3150,7 +3190,7 @@ fn late_diagnostics_from_an_older_generation_are_ignored() {
     app.poll_diagnostics();
 
     assert!(matches!(
-        app.diagnostics,
+        app.doctor_repair.diagnostics,
         DiagnosticsState::Loading {
             generation,
             ..
@@ -3161,7 +3201,7 @@ fn late_diagnostics_from_an_older_generation_are_ignored() {
         Some(current),
         false,
         snapshot_identity(&app.state),
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
     ));
 }
 
@@ -3195,7 +3235,7 @@ fn disconnected_diagnostics_stop_loading_and_allow_retry() {
     app.state = LoadState::Ready(Box::new(empty_loaded_data("/last-good")));
     let (sender, receiver) = mpsc::channel::<DiagnosticsMessage>();
     drop(sender);
-    app.diagnostics = DiagnosticsState::Loading {
+    app.doctor_repair.diagnostics = DiagnosticsState::Loading {
         generation: app.refresh_generation,
         receiver,
     };
@@ -3203,7 +3243,7 @@ fn disconnected_diagnostics_stop_loading_and_allow_retry() {
     app.poll_diagnostics();
 
     assert!(matches!(
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
         DiagnosticsState::Error { message, .. }
             if message.contains("Run diagnostics again")
     ));
@@ -3211,14 +3251,16 @@ fn disconnected_diagnostics_stop_loading_and_allow_retry() {
         &app.state,
         LoadState::Ready(data) if data.mount_root == snapshot_root
     ));
-    assert!(!diagnostics_state_can_continue(&app.diagnostics));
+    assert!(!diagnostics_state_can_continue(
+        &app.doctor_repair.diagnostics
+    ));
     assert_eq!(app.tools_overlay, ToolsOverlay::Diagnostics);
     assert!(!latest_generation_actions_safe(
         app.refresh_generation,
         app.snapshot_generation,
         app.snapshot_stale,
         snapshot_identity(&app.state),
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
     ));
 }
 
@@ -3308,7 +3350,7 @@ fn config_changed_between_worker_starts_cannot_produce_trusted_combined_state() 
         config_path: Some(PathBuf::from("/config/archivefs.toml")),
         content_digest: Some([9; 32]),
     };
-    app.diagnostics = DiagnosticsState::Ready {
+    app.doctor_repair.diagnostics = DiagnosticsState::Ready {
         generation: current,
         report: SetupDiagnostics {
             config_identity: changed_identity,
@@ -3321,7 +3363,7 @@ fn config_changed_between_worker_starts_cannot_produce_trusted_combined_state() 
         app.snapshot_generation,
         app.snapshot_stale,
         snapshot_identity(&app.state),
-        &app.diagnostics,
+        &app.doctor_repair.diagnostics,
     ));
 }
 

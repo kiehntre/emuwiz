@@ -216,15 +216,16 @@ impl ArchiveFsApp {
     /// be settled for this session (right after diagnostics complete),
     /// never before.
     pub(crate) fn maybe_auto_open_onboarding(&mut self) {
-        if self.onboarding_auto_open_checked {
+        if self.doctor_repair.onboarding_auto_open_checked {
             return;
         }
-        self.onboarding_auto_open_checked = true;
-        if self.onboarding_state == OnboardingState::NotStarted
-            && missing_config_is_first_run(self.config_previously_confirmed)
+        self.doctor_repair.onboarding_auto_open_checked = true;
+        if self.doctor_repair.onboarding_state == OnboardingState::NotStarted
+            && missing_config_is_first_run(self.doctor_repair.config_previously_confirmed)
         {
-            self.onboarding_state = OnboardingState::InProgress(OnboardingStep::Welcome);
-            save_onboarding_state(self.onboarding_state);
+            self.doctor_repair.onboarding_state =
+                OnboardingState::InProgress(OnboardingStep::Welcome);
+            save_onboarding_state(self.doctor_repair.onboarding_state);
             self.tools_overlay = ToolsOverlay::Onboarding;
         }
     }
@@ -234,8 +235,8 @@ impl ArchiveFsApp {
     /// each step's body will simply render whatever already-configured
     /// state those pages already have, exactly as the design requires.
     pub(crate) fn restart_onboarding(&mut self) {
-        self.onboarding_state = OnboardingState::InProgress(OnboardingStep::Welcome);
-        save_onboarding_state(self.onboarding_state);
+        self.doctor_repair.onboarding_state = OnboardingState::InProgress(OnboardingStep::Welcome);
+        save_onboarding_state(self.doctor_repair.onboarding_state);
         self.tools_overlay = ToolsOverlay::Onboarding;
     }
 
@@ -245,14 +246,14 @@ impl ArchiveFsApp {
         step: OnboardingStep,
     ) {
         let finished = step.next().is_none();
-        self.onboarding_state = match step.next() {
+        self.doctor_repair.onboarding_state = match step.next() {
             Some(next) => OnboardingState::InProgress(next),
             None => {
                 self.tools_overlay = ToolsOverlay::None;
                 OnboardingState::Completed
             }
         };
-        save_onboarding_state(self.onboarding_state);
+        save_onboarding_state(self.doctor_repair.onboarding_state);
         if finished {
             // The very first archive-snapshot load (`ArchiveFsApp::new`'s
             // own `start_load`) ran before onboarding ever added a source
@@ -274,8 +275,8 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn onboarding_skip_entirely(&mut self, context: &egui::Context) {
-        self.onboarding_state = OnboardingState::Skipped;
-        save_onboarding_state(self.onboarding_state);
+        self.doctor_repair.onboarding_state = OnboardingState::Skipped;
+        save_onboarding_state(self.doctor_repair.onboarding_state);
         self.tools_overlay = ToolsOverlay::None;
         // Same reasoning as the completion branch of `onboarding_advance_from`:
         // this is also a terminal exit from onboarding, and the archive
@@ -299,7 +300,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn show_onboarding_overlay(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        let OnboardingState::InProgress(step) = self.onboarding_state else {
+        let OnboardingState::InProgress(step) = self.doctor_repair.onboarding_state else {
             // Defensive only: this overlay is only ever entered while
             // `InProgress`. If state has drifted (e.g. persisted state
             // changed underneath a long-running session), fail safely by

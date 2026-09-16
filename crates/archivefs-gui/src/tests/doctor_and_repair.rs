@@ -198,11 +198,12 @@ fn dolphin_workflow_states_render_every_row_through_the_shared_status_rows_compo
     let workflow = app.cheat_workflow.as_mut().unwrap();
     workflow.adapter = CheatEmulatorAdapter::Dolphin;
     workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
-    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
-        profiles: vec![dolphin_profile_fixture()],
-        warnings: Vec::new(),
-        complete: true,
-    });
+    app.emulator_readiness.dolphin_profiles =
+        DolphinProfilesState::Ready(DolphinProfileDiscovery {
+            profiles: vec![dolphin_profile_fixture()],
+            warnings: Vec::new(),
+            complete: true,
+        });
     let ctx = egui::Context::default();
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -2327,7 +2328,7 @@ fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
 
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
-    app.doctor_scan = doctor_outcome(scan);
+    app.doctor_repair.doctor_scan = doctor_outcome(scan);
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
@@ -2356,8 +2357,9 @@ fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
 fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
-    app.doctor_scan = DoctorScanState::NotRun;
-    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.doctor_repair.doctor_scan = DoctorScanState::NotRun;
+    app.emulator_readiness.retroarch_profiles =
+        RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
@@ -2373,8 +2375,9 @@ fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
 fn emulator_setup_summary_starts_the_shared_doctor_scan() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
-    app.doctor_scan = DoctorScanState::NotRun;
-    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.doctor_repair.doctor_scan = DoctorScanState::NotRun;
+    app.emulator_readiness.retroarch_profiles =
+        RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     app.view = MainView::EmulatorSetup;
 
     let ctx = egui::Context::default();
@@ -2424,7 +2427,7 @@ fn emulator_setup_summary_starts_the_shared_doctor_scan() {
             ..Default::default()
         },
     );
-    assert!(app.doctor_scan.is_running());
+    assert!(app.doctor_repair.doctor_scan.is_running());
 
     let output = render_problems_repair_app(&mut app);
     assert!(rendered_text_contains(&output, "Checking…"));
@@ -2440,8 +2443,9 @@ fn emulator_setup_candidates_are_visible_without_running_doctor() {
     // now surface the catalogue and its per-emulator state directly.
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
-    app.doctor_scan = DoctorScanState::NotRun;
-    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.doctor_repair.doctor_scan = DoctorScanState::NotRun;
+    app.emulator_readiness.retroarch_profiles =
+        RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
@@ -2463,7 +2467,7 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
     // Same engine, same `doctor_scan` - no second scan, no divergent state.
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
-    app.doctor_scan = doctor_outcome(doctor_scan_from(&[]));
+    app.doctor_repair.doctor_scan = doctor_outcome(doctor_scan_from(&[]));
 
     app.view = MainView::EmulatorSetup;
     let on_setup = render_problems_repair_app(&mut app);
@@ -2479,11 +2483,12 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
 fn emulator_setup_app_ready() -> ArchiveFsApp {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
-    app.doctor_scan = doctor_outcome(doctor_scan_from(&[]));
+    app.doctor_repair.doctor_scan = doctor_outcome(doctor_scan_from(&[]));
     app.view = MainView::EmulatorSetup;
     // Pre-seed a finished scan so rendering never spawns a real discovery
     // thread; the empty environment yields zero usable cores.
-    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.emulator_readiness.retroarch_profiles =
+        RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     // Exercise the current candidate-first page with a bounded real filter,
     // so the independent RetroArch setup card remains in the rendered frame.
     app.emulator_readiness.emulator_setup_page.platform_filter = "SNES".to_string();
@@ -2493,7 +2498,11 @@ fn emulator_setup_app_ready() -> ArchiveFsApp {
 #[test]
 fn retroarch_card_keeps_folder_mode_technical_and_shows_recovery_actions() {
     let mut app = emulator_setup_app_ready();
-    assert!(app.emulator_readiness.retroarch_core_directory_override.is_none());
+    assert!(
+        app.emulator_readiness
+            .retroarch_core_directory_override
+            .is_none()
+    );
 
     let output = render_problems_repair_app(&mut app);
     assert!(!rendered_text_contains(&output, "Automatic core folder"));
@@ -2533,7 +2542,8 @@ fn retroarch_failure_leads_with_try_again_then_choose_folder() {
 #[test]
 fn retroarch_core_folder_card_shows_custom_mode_and_reset_when_an_override_is_active() {
     let mut app = emulator_setup_app_ready();
-    app.emulator_readiness.retroarch_core_directory_override = Some(PathBuf::from("/custom/libretro/cores"));
+    app.emulator_readiness.retroarch_core_directory_override =
+        Some(PathBuf::from("/custom/libretro/cores"));
 
     let output = render_problems_repair_app(&mut app);
     assert!(!rendered_text_contains(&output, "Custom core folder"));
@@ -2549,8 +2559,15 @@ fn choosing_an_unusable_core_folder_is_reported_and_never_persisted() {
     app.apply_picked_retroarch_core_folder(missing.clone(), egui::Context::default());
 
     // Nothing was saved: the active folder is still automatic.
-    assert!(app.emulator_readiness.retroarch_core_directory_override.is_none());
-    assert_eq!(app.emulator_readiness.retroarch_core_folder_rejected_pick, Some(missing));
+    assert!(
+        app.emulator_readiness
+            .retroarch_core_directory_override
+            .is_none()
+    );
+    assert_eq!(
+        app.emulator_readiness.retroarch_core_folder_rejected_pick,
+        Some(missing)
+    );
 
     let output = render_problems_repair_app(&mut app);
     assert!(rendered_text_contains(&output, "Folder not usable"));
@@ -3101,7 +3118,10 @@ fn running_doctor_does_not_refresh_or_reload_the_application() {
 
     app.start_doctor_scan(egui::Context::default());
 
-    assert!(app.doctor_scan.is_running(), "the scan started");
+    assert!(
+        app.doctor_repair.doctor_scan.is_running(),
+        "the scan started"
+    );
     assert_eq!(
         match &app.state {
             LoadState::Ready(data) => std::ptr::from_ref(data.as_ref()) as usize,
@@ -3126,9 +3146,9 @@ fn a_superseded_doctor_run_is_discarded_rather_than_shown() {
     let mut app = app_for_operation_tests();
     // A result carrying an older generation must be ignored.
     let (sender, receiver) = mpsc::channel();
-    app.doctor_scan_generation = RefreshGeneration::INITIAL.next().next();
-    app.doctor_scan = DoctorScanState::Running {
-        generation: app.doctor_scan_generation,
+    app.doctor_repair.doctor_scan_generation = RefreshGeneration::INITIAL.next().next();
+    app.doctor_repair.doctor_scan = DoctorScanState::Running {
+        generation: app.doctor_repair.doctor_scan_generation,
         receiver,
         previous: None,
     };
@@ -3156,7 +3176,7 @@ fn a_superseded_doctor_run_is_discarded_rather_than_shown() {
         .expect("send");
     app.poll_doctor_scan();
     assert!(
-        app.doctor_scan.is_running(),
+        app.doctor_repair.doctor_scan.is_running(),
         "a stale result must not complete the run"
     );
 }
@@ -3165,14 +3185,14 @@ fn a_superseded_doctor_run_is_discarded_rather_than_shown() {
 fn a_current_doctor_run_completes_and_records_when_it_finished() {
     let mut app = app_for_operation_tests();
     let (sender, receiver) = mpsc::channel();
-    app.doctor_scan = DoctorScanState::Running {
-        generation: app.doctor_scan_generation,
+    app.doctor_repair.doctor_scan = DoctorScanState::Running {
+        generation: app.doctor_repair.doctor_scan_generation,
         receiver,
         previous: None,
     };
     sender
         .send((
-            app.doctor_scan_generation,
+            app.doctor_repair.doctor_scan_generation,
             DoctorGathered {
                 mount_root_safety: Gathered::Failed(
                     "the mount root could not be inspected".to_string(),
@@ -3196,7 +3216,7 @@ fn a_current_doctor_run_completes_and_records_when_it_finished() {
         .expect("send");
     app.poll_doctor_scan();
 
-    let outcome = match &app.doctor_scan {
+    let outcome = match &app.doctor_repair.doctor_scan {
         DoctorScanState::Ready(outcome) => outcome,
         _ => panic!("the run must complete"),
     };
@@ -3333,21 +3353,23 @@ fn a_repair_that_rescans_the_library_says_so_before_confirming() {
 #[test]
 fn cancelling_a_review_leaves_no_repair_pending_and_changes_nothing() {
     let mut app = app_for_operation_tests();
-    app.doctor_scan = doctor_outcome(doctor_scan_with_repair());
-    app.doctor_repair_review = Some(doctor_review());
+    app.doctor_repair.doctor_scan = doctor_outcome(doctor_scan_with_repair());
+    app.doctor_repair.doctor_repair_review = Some(doctor_review());
     let history_before = app.history.entries().count();
 
     app.cancel_doctor_repair();
 
-    assert!(app.doctor_repair_review.is_none());
-    assert!(app.doctor_repair_result.is_none());
+    assert!(app.doctor_repair.doctor_repair_review.is_none());
+    assert!(app.doctor_repair.doctor_repair_result.is_none());
     assert_eq!(
         app.history.entries().count(),
         history_before,
         "cancelling is not an attempt, so it is not recorded"
     );
     assert!(
-        app.doctor_repair_finished_at_unix_seconds.is_none(),
+        app.doctor_repair
+            .doctor_repair_finished_at_unix_seconds
+            .is_none(),
         "nothing ran"
     );
 }
@@ -3355,8 +3377,8 @@ fn cancelling_a_review_leaves_no_repair_pending_and_changes_nothing() {
 #[test]
 fn opening_a_review_executes_nothing() {
     let mut app = app_for_operation_tests();
-    app.doctor_scan = doctor_outcome(doctor_scan_with_repair());
-    let findings_before = match &app.doctor_scan {
+    app.doctor_repair.doctor_scan = doctor_outcome(doctor_scan_with_repair());
+    let findings_before = match &app.doctor_repair.doctor_scan {
         DoctorScanState::Ready(outcome) => outcome.scan.findings.len(),
         _ => panic!("ready"),
     };
@@ -3368,11 +3390,17 @@ fn opening_a_review_executes_nothing() {
         "/mount/SNES/Old Game".to_string(),
     );
 
-    assert!(app.doctor_repair_review.is_some(), "the review is open");
-    assert!(app.doctor_repair_result.is_none(), "nothing was executed");
+    assert!(
+        app.doctor_repair.doctor_repair_review.is_some(),
+        "the review is open"
+    );
+    assert!(
+        app.doctor_repair.doctor_repair_result.is_none(),
+        "nothing was executed"
+    );
     assert_eq!(app.history.entries().count(), history_before);
     assert_eq!(
-        match &app.doctor_scan {
+        match &app.doctor_repair.doctor_scan {
             DoctorScanState::Ready(outcome) => outcome.scan.findings.len(),
             _ => panic!("ready"),
         },
@@ -3388,8 +3416,8 @@ fn a_refused_repair_is_recorded_in_history_and_shown_as_refused() {
     let mut app = app_for_operation_tests();
     // The finding names a path that does not exist, so revalidation
     // refuses it. Nothing in the fixture can be mutated either way.
-    app.doctor_scan = doctor_outcome(doctor_scan_with_repair());
-    app.doctor_repair_review = Some(doctor_review());
+    app.doctor_repair.doctor_scan = doctor_outcome(doctor_scan_with_repair());
+    app.doctor_repair.doctor_repair_review = Some(doctor_review());
     let history_before = app.history.entries().count();
 
     // Configuration supplied directly. Reading the real one made this test
@@ -3435,19 +3463,30 @@ fn a_refused_repair_is_recorded_in_history_and_shown_as_refused() {
     );
     assert!(entry.message.contains("undo="), "{}", entry.message);
 
-    let outcome = app.doctor_repair_result.as_deref().expect("result");
+    let outcome = app
+        .doctor_repair
+        .doctor_repair_result
+        .as_deref()
+        .expect("result");
     assert_ne!(outcome.record.status, DoctorRepairStatus::Succeeded);
     assert!(outcome.record.changed_paths.is_empty());
-    assert!(app.doctor_repair_review.is_none(), "the review closed");
-    assert!(app.doctor_repair_finished_at_unix_seconds.is_some());
+    assert!(
+        app.doctor_repair.doctor_repair_review.is_none(),
+        "the review closed"
+    );
+    assert!(
+        app.doctor_repair
+            .doctor_repair_finished_at_unix_seconds
+            .is_some()
+    );
 
     // The result is rendered honestly, and the scan timestamp is kept.
     let output = render_doctor_page_with(
-        &app.doctor_scan,
+        &app.doctor_repair.doctor_scan,
         &mut None,
         None,
-        app.doctor_repair_result.as_deref(),
-        app.doctor_repair_finished_at_unix_seconds,
+        app.doctor_repair.doctor_repair_result.as_deref(),
+        app.doctor_repair.doctor_repair_finished_at_unix_seconds,
     );
     assert!(rendered_text_contains(&output, "nothing was changed"));
     assert!(rendered_text_contains(&output, "Last run: "));
@@ -3602,19 +3641,19 @@ fn a_verified_repair_removes_only_that_finding_and_keeps_the_rest() {
     let mut inputs = DoctorScanInputs::none_loaded();
     inputs.health_issues = Gathered::Ready(issues.as_slice());
     inputs.stale_mount_directories = Gathered::Ready(stale.as_slice());
-    app.doctor_scan = doctor_outcome(run_doctor_scan(&inputs));
-    let before = match &app.doctor_scan {
+    app.doctor_repair.doctor_scan = doctor_outcome(run_doctor_scan(&inputs));
+    let before = match &app.doctor_repair.doctor_scan {
         DoctorScanState::Ready(outcome) => outcome.scan.findings.len(),
         _ => panic!("ready"),
     };
     assert!(before >= 3);
 
-    app.doctor_repair_review = Some(doctor_review());
+    app.doctor_repair.doctor_repair_review = Some(doctor_review());
     app.confirm_doctor_repair();
 
     // The repair is refused here (the path does not exist), so nothing is
     // removed - unrelated findings are preserved either way.
-    let after = match &app.doctor_scan {
+    let after = match &app.doctor_repair.doctor_scan {
         DoctorScanState::Ready(outcome) => &outcome.scan.findings,
         _ => panic!("ready"),
     };

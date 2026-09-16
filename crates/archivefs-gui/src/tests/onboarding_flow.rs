@@ -20,12 +20,12 @@ fn app_with_no_source() -> ArchiveFsApp {
 #[test]
 fn first_run_opens_onboarding_at_the_welcome_step() {
     let mut app = app_for_operation_tests();
-    app.config_previously_confirmed = false;
-    app.onboarding_state = onboarding::OnboardingState::NotStarted;
+    app.doctor_repair.config_previously_confirmed = false;
+    app.doctor_repair.onboarding_state = onboarding::OnboardingState::NotStarted;
     app.maybe_auto_open_onboarding();
     assert_eq!(app.tools_overlay, ToolsOverlay::Onboarding);
     assert_eq!(
-        app.onboarding_state,
+        app.doctor_repair.onboarding_state,
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome)
     );
 }
@@ -33,21 +33,27 @@ fn first_run_opens_onboarding_at_the_welcome_step() {
 #[test]
 fn completed_onboarding_does_not_reopen_automatically() {
     let mut app = app_for_operation_tests();
-    app.config_previously_confirmed = false;
-    app.onboarding_state = onboarding::OnboardingState::Completed;
+    app.doctor_repair.config_previously_confirmed = false;
+    app.doctor_repair.onboarding_state = onboarding::OnboardingState::Completed;
     app.maybe_auto_open_onboarding();
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
-    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Completed);
+    assert_eq!(
+        app.doctor_repair.onboarding_state,
+        onboarding::OnboardingState::Completed
+    );
 }
 
 #[test]
 fn skipped_onboarding_does_not_reopen_automatically() {
     let mut app = app_for_operation_tests();
-    app.config_previously_confirmed = false;
-    app.onboarding_state = onboarding::OnboardingState::Skipped;
+    app.doctor_repair.config_previously_confirmed = false;
+    app.doctor_repair.onboarding_state = onboarding::OnboardingState::Skipped;
     app.maybe_auto_open_onboarding();
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
-    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Skipped);
+    assert_eq!(
+        app.doctor_repair.onboarding_state,
+        onboarding::OnboardingState::Skipped
+    );
 }
 
 #[test]
@@ -56,12 +62,12 @@ fn an_existing_confirmed_install_never_gets_auto_onboarding() {
     // real config file - not a fresh install, even though the onboarding
     // sidecar itself has never been written (e.g. it predates this feature).
     let mut app = app_for_operation_tests();
-    app.config_previously_confirmed = true;
-    app.onboarding_state = onboarding::OnboardingState::NotStarted;
+    app.doctor_repair.config_previously_confirmed = true;
+    app.doctor_repair.onboarding_state = onboarding::OnboardingState::NotStarted;
     app.maybe_auto_open_onboarding();
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
     assert_eq!(
-        app.onboarding_state,
+        app.doctor_repair.onboarding_state,
         onboarding::OnboardingState::NotStarted
     );
 }
@@ -69,8 +75,8 @@ fn an_existing_confirmed_install_never_gets_auto_onboarding() {
 #[test]
 fn the_auto_open_check_runs_at_most_once_per_session() {
     let mut app = app_for_operation_tests();
-    app.config_previously_confirmed = false;
-    app.onboarding_state = onboarding::OnboardingState::NotStarted;
+    app.doctor_repair.config_previously_confirmed = false;
+    app.doctor_repair.onboarding_state = onboarding::OnboardingState::NotStarted;
     app.maybe_auto_open_onboarding();
     assert_eq!(app.tools_overlay, ToolsOverlay::Onboarding);
 
@@ -79,7 +85,7 @@ fn the_auto_open_check_runs_at_most_once_per_session() {
     // never happen in practice, but proves the one-shot guard actually
     // guards rather than re-deriving from state each call).
     app.tools_overlay = ToolsOverlay::None;
-    app.onboarding_state = onboarding::OnboardingState::NotStarted;
+    app.doctor_repair.onboarding_state = onboarding::OnboardingState::NotStarted;
     app.maybe_auto_open_onboarding();
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
 }
@@ -99,9 +105,9 @@ fn resume_reconstructs_the_exact_persisted_step() {
     );
 
     let mut app = app_for_operation_tests();
-    app.onboarding_state = resumed;
+    app.doctor_repair.onboarding_state = resumed;
     assert_eq!(
-        app.onboarding_state,
+        app.doctor_repair.onboarding_state,
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::EmulatorSetup)
     );
 }
@@ -131,12 +137,12 @@ fn a_missing_sidecar_file_is_read_as_not_started() {
 fn skipping_the_source_step_advances_without_fabricating_a_source() {
     let mut app = app_with_no_source();
     assert!(!app.onboarding_has_source());
-    app.onboarding_state =
+    app.doctor_repair.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::AddSource);
     let context = egui::Context::default();
     app.onboarding_advance_from(&context, onboarding::OnboardingStep::AddSource);
     assert_eq!(
-        app.onboarding_state,
+        app.doctor_repair.onboarding_state,
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::DatSetup)
     );
     // Advancing past the step must never itself add a source folder.
@@ -156,26 +162,29 @@ fn the_dat_step_count_matches_the_real_dat_sources_page_count_never_a_duplicate_
 #[test]
 fn finish_persists_completion_and_closes_the_overlay() {
     let mut app = app_for_operation_tests();
-    app.onboarding_state =
+    app.doctor_repair.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Verify);
     app.tools_overlay = ToolsOverlay::Onboarding;
     let context = egui::Context::default();
     app.onboarding_advance_from(&context, onboarding::OnboardingStep::Verify);
-    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Completed);
+    assert_eq!(
+        app.doctor_repair.onboarding_state,
+        onboarding::OnboardingState::Completed
+    );
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
 }
 
 #[test]
 fn run_again_resets_only_onboarding_progress_and_touches_nothing_else() {
     let mut app = app_for_operation_tests();
-    app.onboarding_state = onboarding::OnboardingState::Completed;
+    app.doctor_repair.onboarding_state = onboarding::OnboardingState::Completed;
     let source_folders_before = app.gui_config.source_roots().map(<[_]>::to_vec);
     let dat_page_was_none_before = app.dat_sources_page.is_none();
 
     app.restart_onboarding();
 
     assert_eq!(
-        app.onboarding_state,
+        app.doctor_repair.onboarding_state,
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome)
     );
     assert_eq!(app.tools_overlay, ToolsOverlay::Onboarding);
@@ -195,12 +204,15 @@ fn run_again_resets_only_onboarding_progress_and_touches_nothing_else() {
 #[test]
 fn skipping_setup_entirely_persists_skipped_and_closes_the_overlay() {
     let mut app = app_for_operation_tests();
-    app.onboarding_state =
+    app.doctor_repair.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome);
     app.tools_overlay = ToolsOverlay::Onboarding;
     let context = egui::Context::default();
     app.onboarding_skip_entirely(&context);
-    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Skipped);
+    assert_eq!(
+        app.doctor_repair.onboarding_state,
+        onboarding::OnboardingState::Skipped
+    );
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
 }
 
@@ -232,7 +244,7 @@ fn finishing_onboarding_in_the_same_session_retries_the_stale_archive_load() {
     // finished (its worker thread has already exited) with an error, because
     // no config file existed yet at that moment.
     app.state = LoadState::Error("configuration file is missing".to_string());
-    app.onboarding_state =
+    app.doctor_repair.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Verify);
     app.tools_overlay = ToolsOverlay::Onboarding;
     let generation_before = app.refresh_generation;
@@ -240,7 +252,10 @@ fn finishing_onboarding_in_the_same_session_retries_the_stale_archive_load() {
     let context = egui::Context::default();
     app.onboarding_advance_from(&context, onboarding::OnboardingStep::Verify);
 
-    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Completed);
+    assert_eq!(
+        app.doctor_repair.onboarding_state,
+        onboarding::OnboardingState::Completed
+    );
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
     match &app.state {
         LoadState::Loading { generation, .. } => {
@@ -270,7 +285,7 @@ fn finishing_onboarding_in_the_same_session_retries_the_stale_archive_load() {
 fn skipping_onboarding_entirely_also_retries_the_stale_archive_load() {
     let mut app = app_for_operation_tests();
     app.state = LoadState::Error("configuration file is missing".to_string());
-    app.onboarding_state =
+    app.doctor_repair.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome);
     app.tools_overlay = ToolsOverlay::Onboarding;
     let generation_before = app.refresh_generation;
@@ -278,7 +293,10 @@ fn skipping_onboarding_entirely_also_retries_the_stale_archive_load() {
     let context = egui::Context::default();
     app.onboarding_skip_entirely(&context);
 
-    assert_eq!(app.onboarding_state, onboarding::OnboardingState::Skipped);
+    assert_eq!(
+        app.doctor_repair.onboarding_state,
+        onboarding::OnboardingState::Skipped
+    );
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
     match &app.state {
         LoadState::Loading { generation, .. } => {
@@ -297,7 +315,7 @@ fn advancing_through_a_non_final_onboarding_step_does_not_reload_the_archive_sna
     // browsing the wizard.
     let mut app = app_for_operation_tests();
     app.state = LoadState::Ready(Box::new(empty_loaded_data("/mount")));
-    app.onboarding_state =
+    app.doctor_repair.onboarding_state =
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::Welcome);
     let generation_before = app.refresh_generation;
 
@@ -305,7 +323,7 @@ fn advancing_through_a_non_final_onboarding_step_does_not_reload_the_archive_sna
     app.onboarding_advance_from(&context, onboarding::OnboardingStep::Welcome);
 
     assert_eq!(
-        app.onboarding_state,
+        app.doctor_repair.onboarding_state,
         onboarding::OnboardingState::InProgress(onboarding::OnboardingStep::AddSource)
     );
     assert_eq!(

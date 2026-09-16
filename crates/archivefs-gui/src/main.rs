@@ -66,13 +66,13 @@ use archivefs_core::patch_manager::{
     CheatSourceProgress, CheatSourceProgressPhase, CheatSourceProgressReporter,
     DesktopBrowserLauncher, DeviceFormatCompatibility, DolphinCandidate, DolphinCatalogue,
     DolphinCatalogueError, DolphinCatalogueErrorKind, DolphinCatalogueFetchOptions,
-    DolphinCatalogueFetchResult, DolphinCatalogueLoad,
-    DolphinDedupFinding, DolphinGameIniInventory, DolphinGeckoLookupResult,
-    DolphinInstallPlanError, DolphinInstallPreviewRequest, DolphinInstallationType,
-    DolphinMatchState, DolphinProfile, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
-    DolphinProfileScope, DolphinProviderCodeSelection, DolphinSettingsDirectoryState,
-    EmulatorProfileCandidate, EmulatorProfileSelectReason, EmulatorProfileSelection,
-    FlycastProfileDiscovery, FlycastProfileDiscoveryRoots, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
+    DolphinCatalogueFetchResult, DolphinCatalogueLoad, DolphinDedupFinding,
+    DolphinGameIniInventory, DolphinGeckoLookupResult, DolphinInstallPlanError,
+    DolphinInstallPreviewRequest, DolphinInstallationType, DolphinMatchState, DolphinProfile,
+    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DolphinProfileScope,
+    DolphinProviderCodeSelection, DolphinSettingsDirectoryState, EmulatorProfileCandidate,
+    EmulatorProfileSelectReason, EmulatorProfileSelection, FlycastProfileDiscovery,
+    FlycastProfileDiscoveryRoots, GAMEHACKING_BROWSER_IMPORT_BLOCKED_BODY,
     GAMEHACKING_BROWSER_IMPORT_BLOCKED_TITLE, GAMEHACKING_PROVIDER_CHALLENGE_MESSAGE,
     GameCubeCheatSelection, GameCubeCodeFormat, GameCubeGameHackingInstallPreviewRequest,
     GameCubeGameIdentity, GameCubeInstallPlanError, GameCubeInstallPlanErrorKind,
@@ -144,9 +144,9 @@ use collection_discovery_page::*;
 mod activity_history;
 mod administration_pages;
 mod archive_inspector_controller;
+mod catalogue_bsfree_ui_state;
 mod cheats_mods;
 mod cheats_mods_preview;
-mod catalogue_bsfree_ui_state;
 #[allow(dead_code)]
 mod es_de_media_state;
 #[allow(dead_code)]
@@ -156,13 +156,13 @@ mod onboarding;
 mod platform_artwork_manager;
 use cheats_mods::*;
 use cheats_mods_preview::*;
-mod cheat_reconciliation_review;
-mod cheatbase_page;
 #[allow(dead_code)]
 mod bios_projection_page;
+mod cheat_reconciliation_review;
+mod cheatbase_page;
 mod emulator_download_page;
-mod emulator_setup;
 mod emulator_readiness_state;
+mod emulator_setup;
 use emulator_setup::*;
 mod emulator_inventory_page;
 mod emulator_setup_overrides;
@@ -194,6 +194,7 @@ use library_view_controller::{
 mod library_ui_state;
 use library_ui_state::LibraryUiState;
 mod database_load;
+mod doctor_repair_state;
 mod live_library_controller;
 mod setup_controller;
 #[allow(unused_imports)]
@@ -264,8 +265,8 @@ pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod local_mod_package_page;
 mod mount_operation_controller;
-mod mount_ui_state;
 mod mount_operations;
+mod mount_ui_state;
 #[allow(dead_code)]
 pub(crate) mod museum_page;
 pub(crate) mod needs_attention;
@@ -313,12 +314,11 @@ mod ui;
 pub mod view_mode;
 
 use crate::romm_config::{
-    ConfigDialogRequest, build_mappings_view,
-    show_config_dialog, token_field_state, validate_draft,
+    ConfigDialogRequest, build_mappings_view, show_config_dialog, token_field_state, validate_draft,
 };
 use crate::romm_source::{
-    RommCardRequest, RommOperation, RommOperationOutcome, RommProgress,
-    RommProgressEvent, VerifyRommSummary,
+    RommCardRequest, RommOperation, RommOperationOutcome, RommProgress, RommProgressEvent,
+    VerifyRommSummary,
 };
 use activity_history::{
     ALL_ACTIVITY_ACTIONS, ALL_ACTIVITY_OUTCOMES, ActivityAction, ActivityOutcome, HISTORY_LIMIT,
@@ -1172,11 +1172,15 @@ use archive_inspector_controller::{
     ArchiveInspectorState, ArchiveInspectorStatus, ArchivePreparationState,
     DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH, InspectorSortField,
 };
+use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
 use database_load::{
     CachedLibrarySnapshot, DatabaseGeneration, DatabaseLoadError, DatabaseLoadResult,
     DatabaseMessage, DatabaseOutcome, DatabaseState, classify_unhealthy_database,
     load_database_snapshot, load_database_snapshot_at, load_snapshot_from, start_database_load,
 };
+use doctor_repair_state::DoctorRepairState;
+use emulator_readiness_state::EmulatorReadinessState;
+use health_duplicate_ui_state::HealthDuplicateUiState;
 use live_library_controller::{
     LiveLibraryPoll, LoadMessage, LoadResult, LoadState, poll_load, start_load,
 };
@@ -1186,9 +1190,6 @@ use mount_operation_controller::{
     perform_archive_action, record_cleanup_finished_activity, record_cleanup_started_activity,
     run_unmount_with_cleanup,
 };
-use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
-use health_duplicate_ui_state::HealthDuplicateUiState;
-use emulator_readiness_state::EmulatorReadinessState;
 use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 
@@ -1947,9 +1948,7 @@ struct ArchiveFsApp {
     shared_history: SharedHistoryState,
     shared_history_operation: Option<String>,
     shared_rollback: SharedRollbackState,
-    database_restore_plan: Option<archivefs_core::DatabaseRestorePlan>,
-    database_restore_confirmation: String,
-    database_restore_feedback: Option<String>,
+    doctor_repair: DoctorRepairState,
     emulator_readiness: EmulatorReadinessState,
     /// The Tape Inspector library browser's persisted search/platform/format
     /// filter state, retained across page re-renders.
@@ -1990,7 +1989,7 @@ struct ArchiveFsApp {
     confirm_cheat_archive_change: Option<PathBuf>,
     feedback: Option<ActionFeedback>,
     history: OperationHistory,
-    diagnostics: DiagnosticsState,
+
     /// Set once this session has seen a diagnostics report where the
     /// config file was confirmed present and readable. Lets the Setup
     /// screen tell a genuine first run apart from a config that
@@ -1998,21 +1997,20 @@ struct ArchiveFsApp {
     /// something was deleted, unmounted, or is otherwise a real problem,
     /// and must never be presented with the same reassuring "you have not
     /// configured this yet" framing as a fresh install.
-    config_previously_confirmed: bool,
+
     /// First-run onboarding: loaded once at startup from
     /// `onboarding_state.txt` (see `onboarding.rs`), advanced only through
     /// `onboarding::*` helper methods, and persisted back on every
     /// transition. Never duplicates source/DAT/emulator state - it only
     /// tracks which step of the guided tour the user is on.
-    onboarding_state: onboarding::OnboardingState,
+
     /// One-shot: whether the auto-open check (first genuine run only, see
     /// `maybe_auto_open_onboarding`) has already run this session.
-    onboarding_auto_open_checked: bool,
+
     /// Doctor Stage 1A: the current read-only diagnostic scan. Entirely
     /// separate from `self.state`/`self.refresh`, so running Doctor never
     /// reloads the application.
-    doctor_scan: DoctorScanState,
-    doctor_scan_generation: RefreshGeneration,
+
     /// The Cheat Sources page, loaded lazily the first time it is opened so
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
@@ -2061,15 +2059,14 @@ struct ArchiveFsApp {
     /// than in the page state because none of it is policy.
     dat_sources_ui: dat_sources_page::DatSourcesPageUi,
     /// The finding whose evidence panel is open, by stable finding id.
-    doctor_selected_finding: Option<String>,
+
     /// The repair awaiting confirmation, if any.
-    doctor_repair_review: Option<DoctorRepairReview>,
+
     /// The most recent repair result, kept on screen next to the finding it
     /// was for.
-    doctor_repair_result: Option<Box<DoctorRepairOutcome>>,
+
     /// When the last repair finished, alongside (never replacing) the scan's
     /// own timestamp.
-    doctor_repair_finished_at_unix_seconds: Option<i64>,
     setup_action: Option<RunningSetupAction>,
     refresh_error: Option<String>,
     snapshot_stale: bool,
@@ -2431,9 +2428,7 @@ impl ArchiveFsApp {
             shared_history: SharedHistoryState::NotLoaded,
             shared_history_operation: None,
             shared_rollback: SharedRollbackState::Idle,
-            database_restore_plan: None,
-            database_restore_confirmation: String::new(),
-            database_restore_feedback: None,
+            doctor_repair: DoctorRepairState::new(context.clone(), generation),
             emulator_readiness: EmulatorReadinessState::new(),
             storage_health_page: storage_health_page::StorageHealthPageState::default(),
             tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
@@ -2450,16 +2445,6 @@ impl ArchiveFsApp {
             confirm_cheat_archive_change: None,
             feedback: None,
             history,
-            diagnostics: start_diagnostics(context.clone(), generation),
-            config_previously_confirmed: false,
-            onboarding_state: onboarding::load_onboarding_state(),
-            onboarding_auto_open_checked: false,
-            doctor_scan: DoctorScanState::NotRun,
-            doctor_scan_generation: RefreshGeneration::INITIAL,
-            doctor_selected_finding: None,
-            doctor_repair_review: None,
-            doctor_repair_result: None,
-            doctor_repair_finished_at_unix_seconds: None,
             setup_action: None,
             refresh_error: None,
             snapshot_stale: false,
@@ -2925,14 +2910,18 @@ impl ArchiveFsApp {
     }
 
     fn refresh_diagnostics(&mut self, context: &egui::Context) {
-        self.health_duplicate_ui.diagnostics_refresh_generation = self.health_duplicate_ui.diagnostics_refresh_generation.next();
+        self.health_duplicate_ui.diagnostics_refresh_generation = self
+            .health_duplicate_ui
+            .diagnostics_refresh_generation
+            .next();
         self.history.record(HistoryEntry::new(
             ActivityAction::Diagnostics,
             None,
             ActivityOutcome::Started,
             "Refreshing setup diagnostics.",
         ));
-        self.diagnostics = start_diagnostics(context.clone(), self.refresh_generation);
+        self.doctor_repair.diagnostics =
+            start_diagnostics(context.clone(), self.refresh_generation);
     }
 
     /// The Health Dashboard's report, rebuilt only when the underlying
@@ -2955,11 +2944,15 @@ impl ArchiveFsApp {
             diagnostics_generation: self.health_duplicate_ui.diagnostics_refresh_generation,
         };
 
-        let cache_is_fresh = self.health_duplicate_ui.health_report_cache.as_ref().is_some_and(|cache| {
-            cache.key == key
-                && cache.lazy_unmount_offers == self.mount_ui.lazy_unmount_offers
-                && cache.remount_offers == self.mount_ui.remount_offers
-        });
+        let cache_is_fresh = self
+            .health_duplicate_ui
+            .health_report_cache
+            .as_ref()
+            .is_some_and(|cache| {
+                cache.key == key
+                    && cache.lazy_unmount_offers == self.mount_ui.lazy_unmount_offers
+                    && cache.remount_offers == self.mount_ui.remount_offers
+            });
 
         if !cache_is_fresh {
             let live_records = match &self.state {
@@ -2983,7 +2976,12 @@ impl ArchiveFsApp {
             });
         }
 
-        &self.health_duplicate_ui.health_report_cache.as_ref().unwrap().issues
+        &self
+            .health_duplicate_ui
+            .health_report_cache
+            .as_ref()
+            .unwrap()
+            .issues
     }
 
     fn poll_diagnostics(&mut self) {
@@ -2992,7 +2990,7 @@ impl ArchiveFsApp {
             Disconnected(RefreshGeneration),
         }
 
-        let result = match &self.diagnostics {
+        let result = match &self.doctor_repair.diagnostics {
             DiagnosticsState::Loading {
                 generation,
                 receiver,
@@ -3018,9 +3016,9 @@ impl ArchiveFsApp {
                     },
                 ));
                 if !report.config_missing && report.config_path_error.is_none() {
-                    self.config_previously_confirmed = true;
+                    self.doctor_repair.config_previously_confirmed = true;
                 }
-                self.diagnostics = DiagnosticsState::Ready { generation, report };
+                self.doctor_repair.diagnostics = DiagnosticsState::Ready { generation, report };
                 self.maybe_auto_open_onboarding();
             }
             Some(PollResult::Disconnected(generation)) if generation == self.refresh_generation => {
@@ -3032,7 +3030,7 @@ impl ArchiveFsApp {
                     ActivityOutcome::Failed,
                     message.clone(),
                 ));
-                self.diagnostics = DiagnosticsState::Error {
+                self.doctor_repair.diagnostics = DiagnosticsState::Error {
                     generation,
                     message,
                 };
@@ -3349,15 +3347,18 @@ impl ArchiveFsApp {
         ui.add_space(theme::SECTION_GAP);
         let romm_view = romm_source::build_card_view(
             self.romm_ui.snapshot.as_deref(),
-            self.romm_ui.operation
+            self.romm_ui
+                .operation
                 .as_ref()
                 .map(|running| &running.operation),
-            self.romm_ui.operation
+            self.romm_ui
+                .operation
                 .as_ref()
                 .is_some_and(|running| running.cancellation_requested),
         );
         let romm_progress = self
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .and_then(|running| running.progress.as_ref())
             .cloned();
@@ -3634,7 +3635,10 @@ impl ArchiveFsApp {
     }
 
     fn start_catalogue_status_load(&mut self, context: egui::Context) {
-        if matches!(self.catalogue_bsfree_ui.catalogue_manager, CatalogueManagerState::Loading(_)) {
+        if matches!(
+            self.catalogue_bsfree_ui.catalogue_manager,
+            CatalogueManagerState::Loading(_)
+        ) {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -3654,7 +3658,10 @@ impl ArchiveFsApp {
         let Some(review) = self.catalogue_bsfree_ui.catalogue_review.take() else {
             return;
         };
-        self.catalogue_bsfree_ui.catalogue_generation = self.catalogue_bsfree_ui.catalogue_generation.wrapping_add(1);
+        self.catalogue_bsfree_ui.catalogue_generation = self
+            .catalogue_bsfree_ui
+            .catalogue_generation
+            .wrapping_add(1);
         let generation = self.catalogue_bsfree_ui.catalogue_generation;
         let source_id = review.source_id;
         let force_refresh = review.kind == CatalogueRetrievalKind::Update;
@@ -3721,7 +3728,8 @@ impl ArchiveFsApp {
                 self.start_catalogue_status_load(context.clone());
             }
             CatalogueManagerAction::Review { source_id, kind } => {
-                self.catalogue_bsfree_ui.catalogue_review = Some(CatalogueReview { source_id, kind });
+                self.catalogue_bsfree_ui.catalogue_review =
+                    Some(CatalogueReview { source_id, kind });
             }
             CatalogueManagerAction::Confirm => {
                 self.start_catalogue_retrieval(context.clone());
@@ -3739,20 +3747,28 @@ impl ArchiveFsApp {
     }
 
     fn poll_catalogue_manager(&mut self, context: &egui::Context) {
-        if let CatalogueManagerState::Loading(receiver) = &self.catalogue_bsfree_ui.catalogue_manager {
+        if let CatalogueManagerState::Loading(receiver) =
+            &self.catalogue_bsfree_ui.catalogue_manager
+        {
             match receiver.try_recv() {
-                Ok(Ok(list)) => self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Ready(list),
-                Ok(Err(error)) => self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Failed(error),
+                Ok(Ok(list)) => {
+                    self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Ready(list)
+                }
+                Ok(Err(error)) => {
+                    self.catalogue_bsfree_ui.catalogue_manager =
+                        CatalogueManagerState::Failed(error)
+                }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.catalogue_bsfree_ui.catalogue_manager = CatalogueManagerState::Failed(CheatSourceError {
-                        schema_version:
-                            archivefs_core::patch_manager::CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
-                        stage: archivefs_core::patch_manager::CheatSourceErrorStage::Cache,
-                        code: "status_worker_stopped".to_string(),
-                        message: "catalogue status worker stopped unexpectedly".to_string(),
-                        retry_after_seconds: None,
-                    });
+                    self.catalogue_bsfree_ui.catalogue_manager =
+                        CatalogueManagerState::Failed(CheatSourceError {
+                            schema_version:
+                                archivefs_core::patch_manager::CHEAT_SOURCE_RESULT_SCHEMA_VERSION,
+                            stage: archivefs_core::patch_manager::CheatSourceErrorStage::Cache,
+                            code: "status_worker_stopped".to_string(),
+                            message: "catalogue status worker stopped unexpectedly".to_string(),
+                            retry_after_seconds: None,
+                        });
                 }
             }
         }
@@ -3761,13 +3777,17 @@ impl ArchiveFsApp {
                 running.progress = Some(progress);
             }
         }
-        let result = self.catalogue_bsfree_ui.catalogue_retrieval.as_ref().and_then(|running| {
-            running
-                .receiver
-                .try_recv()
-                .ok()
-                .map(|result| (running.generation, running.source_id.clone(), result))
-        });
+        let result = self
+            .catalogue_bsfree_ui
+            .catalogue_retrieval
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.generation, running.source_id.clone(), result))
+            });
         let Some((generation, source_id, result)) = result else {
             return;
         };
@@ -4114,7 +4134,8 @@ impl ArchiveFsApp {
             Some(MountPageAction::MountQueue) => {
                 let items = match &self.state {
                     LoadState::Ready(data) => {
-                        let eligible = queued_pending_paths(&self.mount_ui.mount_queue, &data.records);
+                        let eligible =
+                            queued_pending_paths(&self.mount_ui.mount_queue, &data.records);
                         mount_all_items_for_paths(&data.records, &eligible)
                     }
                     _ => Vec::new(),
@@ -4212,11 +4233,12 @@ impl ArchiveFsApp {
     /// Looks up the remembered profile id for an adapter key (`"dolphin"`
     /// or `"xenia"`), if any.
     fn remembered_profile_id(&self, adapter: &str) -> Option<String> {
-        remembered_profile_for(&self.emulator_readiness.remembered_emulator_profiles, adapter)
-            .filter(|profile| {
-                adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root)
-            })
-            .map(|profile| profile.profile_id.clone())
+        remembered_profile_for(
+            &self.emulator_readiness.remembered_emulator_profiles,
+            adapter,
+        )
+        .filter(|profile| adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root))
+        .map(|profile| profile.profile_id.clone())
     }
 
     /// Looks up the remembered profile's root directory for an adapter
@@ -4224,11 +4246,12 @@ impl ArchiveFsApp {
     /// portable/explicit profile is rediscovered without the user typing
     /// it again every session.
     fn remembered_profile_root(&self, adapter: &str) -> Option<PathBuf> {
-        remembered_profile_for(&self.emulator_readiness.remembered_emulator_profiles, adapter)
-            .filter(|profile| {
-                adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root)
-            })
-            .map(|profile| profile.root.clone())
+        remembered_profile_for(
+            &self.emulator_readiness.remembered_emulator_profiles,
+            adapter,
+        )
+        .filter(|profile| adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root))
+        .map(|profile| profile.root.clone())
     }
 
     /// Persists `profile_id`/`root` as the remembered profile for
@@ -4239,8 +4262,11 @@ impl ArchiveFsApp {
     /// session-level selection already succeeded regardless of whether it
     /// could be remembered for next time.
     fn persist_remembered_profile(&mut self, adapter: &str, profile_id: &str, root: &Path) {
-        let already_current = remembered_profile_for(&self.emulator_readiness.remembered_emulator_profiles, adapter)
-            .is_some_and(|profile| profile.profile_id == profile_id && profile.root == root);
+        let already_current = remembered_profile_for(
+            &self.emulator_readiness.remembered_emulator_profiles,
+            adapter,
+        )
+        .is_some_and(|profile| profile.profile_id == profile_id && profile.root == root);
         if already_current {
             return;
         }
@@ -4261,14 +4287,16 @@ impl ArchiveFsApp {
         let write_result: Result<(), ArchiveFsError> = Ok(());
         match write_result {
             Ok(()) => {
-                self.emulator_readiness.remembered_emulator_profiles
+                self.emulator_readiness
+                    .remembered_emulator_profiles
                     .retain(|profile| profile.adapter != adapter);
-                self.emulator_readiness.remembered_emulator_profiles
-                    .push(RememberedEmulatorProfile {
+                self.emulator_readiness.remembered_emulator_profiles.push(
+                    RememberedEmulatorProfile {
                         adapter: adapter.to_string(),
                         profile_id: profile_id.to_string(),
                         root: root.to_path_buf(),
-                    });
+                    },
+                );
             }
             Err(error) => {
                 let action = if adapter == "xenia" {
@@ -4586,8 +4614,10 @@ impl ArchiveFsApp {
         if matches!(
             self.view,
             MainView::Sources | MainView::CheatsMods | MainView::CheatSources
-        ) && matches!(self.catalogue_bsfree_ui.bsfree_manager, BsFreeManagerState::NotLoaded)
-            && self.catalogue_bsfree_ui.bsfree_operation.is_none()
+        ) && matches!(
+            self.catalogue_bsfree_ui.bsfree_manager,
+            BsFreeManagerState::NotLoaded
+        ) && self.catalogue_bsfree_ui.bsfree_operation.is_none()
         {
             self.start_bsfree_operation(context.clone(), BsFreeOperation::LoadStatus);
         }
@@ -4605,14 +4635,20 @@ impl ArchiveFsApp {
                     && workflow.selected_dolphin_profile_id.is_some()
                     && matches!(workflow.dolphin_inventory, CheatStepResource::NotLoaded)
             })
-            && matches!(self.emulator_readiness.dolphin_profiles, DolphinProfilesState::Ready(_))
+            && matches!(
+                self.emulator_readiness.dolphin_profiles,
+                DolphinProfilesState::Ready(_)
+            )
         {
             self.start_dolphin_inventory(context.clone());
         }
         if catalogue_status_load_needed(self.view, &self.catalogue_bsfree_ui.catalogue_manager) {
             self.start_catalogue_status_load(context.clone());
         }
-        if dolphin_catalogue_status_load_needed(self.view, &self.catalogue_bsfree_ui.dolphin_catalogue_manager) {
+        if dolphin_catalogue_status_load_needed(
+            self.view,
+            &self.catalogue_bsfree_ui.dolphin_catalogue_manager,
+        ) {
             self.start_dolphin_catalogue_status_load(context.clone());
         }
         // The one quiet, automatic "Check for updates" per session: only
@@ -4620,8 +4656,14 @@ impl ArchiveFsApp {
         // (`dolphin_catalogue_update_available` starts `None` and this is
         // the only place that can set it besides an explicit click).
         if self.view == MainView::CheatsMods
-            && self.catalogue_bsfree_ui.dolphin_catalogue_update_available.is_none()
-            && self.catalogue_bsfree_ui.dolphin_catalogue_update_check.is_none()
+            && self
+                .catalogue_bsfree_ui
+                .dolphin_catalogue_update_available
+                .is_none()
+            && self
+                .catalogue_bsfree_ui
+                .dolphin_catalogue_update_check
+                .is_none()
             && matches!(
                 &self.catalogue_bsfree_ui.dolphin_catalogue_manager,
                 DolphinCatalogueManagerState::Ready(snapshot) if snapshot.catalogue.is_some()
@@ -4655,14 +4697,17 @@ impl ArchiveFsApp {
         // exactly one entry point, and every call to it produces a visible
         // state (see `start_cheat_candidate_match`'s doc comment).
         let loading = matches!(self.state, LoadState::Loading { .. });
-        let diagnostics_loading = matches!(self.diagnostics, DiagnosticsState::Loading { .. });
+        let diagnostics_loading = matches!(
+            self.doctor_repair.diagnostics,
+            DiagnosticsState::Loading { .. }
+        );
         let busy = self.is_busy();
         let actions_safe = latest_generation_actions_safe(
             self.refresh_generation,
             self.snapshot_generation,
             self.snapshot_stale,
             snapshot_identity(&self.state),
-            &self.diagnostics,
+            &self.doctor_repair.diagnostics,
         );
         let archive_actions_blocked = busy || !actions_safe;
         let archive_action_block_reason = archive_action_block_reason(
@@ -4671,7 +4716,7 @@ impl ArchiveFsApp {
             self.snapshot_generation,
             self.snapshot_stale,
             snapshot_identity(&self.state),
-            &self.diagnostics,
+            &self.doctor_repair.diagnostics,
         );
         let action_readiness_debug_lines = action_readiness_debug_lines(
             busy,
@@ -4679,7 +4724,7 @@ impl ArchiveFsApp {
             self.snapshot_generation,
             self.snapshot_stale,
             snapshot_identity(&self.state),
-            &self.diagnostics,
+            &self.doctor_repair.diagnostics,
         );
         let missing_removal_available = self.missing_removal_action_available();
         if loading || diagnostics_loading || busy {
@@ -5004,7 +5049,7 @@ impl ArchiveFsApp {
                 context,
                 &mut self.show_about,
                 &self.database_state,
-                &self.diagnostics,
+                &self.doctor_repair.diagnostics,
                 mount_root,
                 &mut self.clipboard,
             );
@@ -5050,12 +5095,12 @@ impl ArchiveFsApp {
                         ToolsOverlay::Diagnostics => {
                             diagnostics_action = show_setup_diagnostics(
                                 ui,
-                                &self.diagnostics,
+                                &self.doctor_repair.diagnostics,
                                 self.setup_action.is_some(),
                                 self.feedback.as_ref(),
                                 self.refresh_error.as_deref(),
                                 self.snapshot_stale && matches!(self.state, LoadState::Ready(_)),
-                                self.config_previously_confirmed,
+                                self.doctor_repair.config_previously_confirmed,
                             );
                         }
                         ToolsOverlay::PlatformAliases => {
@@ -5532,12 +5577,12 @@ impl ArchiveFsApp {
                     // background setup diagnostics; the "Set up emulators"
                     // card's readiness comes from `doctor_scan` - the same
                     // state its "Open Doctor" action lands on.
-                    let config_missing = match &self.diagnostics {
+                    let config_missing = match &self.doctor_repair.diagnostics {
                         DiagnosticsState::Ready { report, .. } => report.config_missing,
                         DiagnosticsState::Loading { .. } | DiagnosticsState::Error { .. } => false,
                     };
-                    let setup_check = setup_check_summary(&self.doctor_scan);
-                    let first_run = missing_config_is_first_run(self.config_previously_confirmed);
+                    let setup_check = setup_check_summary(&self.doctor_repair.doctor_scan);
+                    let first_run = missing_config_is_first_run(self.doctor_repair.config_previously_confirmed);
                     // Never triggers the load these pages themselves start
                     // on first visit - `None` here means "not visited yet
                     // this session", not "not configured".
@@ -6469,9 +6514,9 @@ impl ArchiveFsApp {
                         &mut self.history,
                         &mut self.history_filters,
                         &mut self.clipboard,
-                        &mut self.database_restore_plan,
-                        &mut self.database_restore_confirmation,
-                        &mut self.database_restore_feedback,
+                        &mut self.doctor_repair.database_restore_plan,
+                        &mut self.doctor_repair.database_restore_confirmation,
+                        &mut self.doctor_repair.database_restore_feedback,
                         self.database_state.is_loading() || busy,
                     );
                     match history_action {
@@ -6497,29 +6542,29 @@ impl ArchiveFsApp {
                                 .and_then(|live| archivefs_core::prepare_database_restore(live, backup_path))
                             {
                                 Ok(plan) => {
-                                    self.database_restore_plan = Some(plan);
-                                    self.database_restore_confirmation.clear();
-                                    self.database_restore_feedback = None;
+                                    self.doctor_repair.database_restore_plan = Some(plan);
+                                    self.doctor_repair.database_restore_confirmation.clear();
+                                    self.doctor_repair.database_restore_feedback = None;
                                 }
-                                Err(error) => self.database_restore_feedback = Some(error.to_string()),
+                                Err(error) => self.doctor_repair.database_restore_feedback = Some(error.to_string()),
                             }
                         }
                         Some(HistoryPageAction::ExecuteDatabaseRestore) => {
                             if self.database_state.is_loading() || self.is_busy() {
-                                self.database_restore_feedback = Some("Database is busy loading or scanning; restore remains blocked until it is idle.".into());
-                            } else if let Some(plan) = self.database_restore_plan.clone() {
-                                match archivefs_core::restore_database(&plan, &self.database_restore_confirmation) {
+                                self.doctor_repair.database_restore_feedback = Some("Database is busy loading or scanning; restore remains blocked until it is idle.".into());
+                            } else if let Some(plan) = self.doctor_repair.database_restore_plan.clone() {
+                                match archivefs_core::restore_database(&plan, &self.doctor_repair.database_restore_confirmation) {
                                     Ok(result) => {
-                                        self.database_restore_feedback = Some(format!("{} Emergency backup: {}", result.receipt.message, result.emergency_backup_path.display()));
-                                        self.database_restore_plan = None;
-                                        self.database_restore_confirmation.clear();
+                                        self.doctor_repair.database_restore_feedback = Some(format!("{} Emergency backup: {}", result.receipt.message, result.emergency_backup_path.display()));
+                                        self.doctor_repair.database_restore_plan = None;
+                                        self.doctor_repair.database_restore_confirmation.clear();
                                         self.database_generation = self.database_generation.next();
                                         let generation = self.database_generation;
                                         let previous = self.database_state.snapshot().cloned().map(Box::new);
                                         self.database_state = start_database_load(context.clone(), generation, previous, false);
                                         self.shared_history = SharedHistoryState::NotLoaded;
                                     }
-                                    Err(error) => self.database_restore_feedback = Some(error.to_string()),
+                                    Err(error) => self.doctor_repair.database_restore_feedback = Some(error.to_string()),
                                 }
                             }
                         }
@@ -6544,7 +6589,7 @@ impl ArchiveFsApp {
                     let action = show_settings_page(
                         ui,
                         &self.database_state,
-                        &self.diagnostics,
+                        &self.doctor_repair.diagnostics,
                         &self.emulator_readiness.retroarch_profiles,
                         mount_root,
                         busy,
@@ -6586,7 +6631,7 @@ impl ArchiveFsApp {
                     show_about_contents(
                         ui,
                         &self.database_state,
-                        &self.diagnostics,
+                        &self.doctor_repair.diagnostics,
                         mount_root,
                         &mut self.clipboard,
                     );
@@ -6945,7 +6990,7 @@ impl ArchiveFsApp {
                     self.start_setup_action(context.clone(), SetupAction::OpenConfigFolder)
                 }
                 DiagnosticsUiAction::CopyConfigPath => {
-                    if let DiagnosticsState::Ready { report, .. } = &self.diagnostics
+                    if let DiagnosticsState::Ready { report, .. } = &self.doctor_repair.diagnostics
                         && let Some(path) = &report.config_path
                     {
                         let path = path.display().to_string();

@@ -13,20 +13,21 @@ impl ArchiveFsApp {
     /// run's result is discarded on arrival, and the previous result stays
     /// visible until a newer one completes.
     pub(crate) fn start_doctor_scan(&mut self, context: egui::Context) {
-        let generation = self.doctor_scan_generation.next();
-        self.doctor_scan_generation = generation;
+        let generation = self.doctor_repair.doctor_scan_generation.next();
+        self.doctor_repair.doctor_scan_generation = generation;
         let emulator_overrides = self.emulator_readiness.emulator_setup_overrides.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let _ = sender.send((generation, gather_doctor_inputs(&emulator_overrides)));
             context.request_repaint();
         });
-        let previous = match std::mem::replace(&mut self.doctor_scan, DoctorScanState::NotRun) {
-            DoctorScanState::Ready(outcome) => Some(outcome),
-            DoctorScanState::Running { previous, .. } => previous,
-            DoctorScanState::NotRun => None,
-        };
-        self.doctor_scan = DoctorScanState::Running {
+        let previous =
+            match std::mem::replace(&mut self.doctor_repair.doctor_scan, DoctorScanState::NotRun) {
+                DoctorScanState::Ready(outcome) => Some(outcome),
+                DoctorScanState::Running { previous, .. } => previous,
+                DoctorScanState::NotRun => None,
+            };
+        self.doctor_repair.doctor_scan = DoctorScanState::Running {
             generation,
             receiver,
             previous,
@@ -42,7 +43,7 @@ impl ArchiveFsApp {
     /// a subsystem has not been loaded in this session it is reported as not
     /// checked, never as a pass.
     pub(crate) fn poll_doctor_scan(&mut self) {
-        let received = match &self.doctor_scan {
+        let received = match &self.doctor_repair.doctor_scan {
             DoctorScanState::Running {
                 generation,
                 receiver,
@@ -137,7 +138,7 @@ impl ArchiveFsApp {
 
         // The already-computed setup diagnostics, never recomputed here:
         // recomputing would run the mount-root write probe.
-        let setup = match &self.diagnostics {
+        let setup = match &self.doctor_repair.diagnostics {
             DiagnosticsState::Ready { report, .. } => Gathered::Ready(report),
             DiagnosticsState::Error { message, .. } => Gathered::Failed(message.clone()),
             DiagnosticsState::Loading { .. } => Gathered::NotLoaded(
@@ -186,14 +187,14 @@ impl ArchiveFsApp {
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
         // Keep the selected finding only if it still exists.
-        if let Some(selected) = &self.doctor_selected_finding
+        if let Some(selected) = &self.doctor_repair.doctor_selected_finding
             && scan
                 .finding(doctor_page::doctor_finding_key_id(selected))
                 .is_none()
         {
-            self.doctor_selected_finding = None;
+            self.doctor_repair.doctor_selected_finding = None;
         }
-        self.doctor_scan = DoctorScanState::Ready(Box::new(DoctorScanOutcome {
+        self.doctor_repair.doctor_scan = DoctorScanState::Ready(Box::new(DoctorScanOutcome {
             scan,
             finished_at_unix_seconds,
         }));
@@ -202,7 +203,7 @@ impl ArchiveFsApp {
     /// Opens the confirmation screen for a repair. Opening it changes
     /// nothing; only `confirm_doctor_repair` can execute.
     pub(crate) fn review_doctor_repair(&mut self, action: DoctorRepairAction, finding_id: String) {
-        let Some(outcome) = self.doctor_scan.displayed() else {
+        let Some(outcome) = self.doctor_repair.doctor_scan.displayed() else {
             return;
         };
         // Ambiguous by id alone means the caller should have supplied the
@@ -210,14 +211,14 @@ impl ArchiveFsApp {
         let Some(finding) = outcome.scan.finding_for(&finding_id, None).found() else {
             return;
         };
-        self.doctor_repair_review = Some(DoctorRepairReview {
+        self.doctor_repair.doctor_repair_review = Some(DoctorRepairReview {
             action,
             finding_id,
             affected: finding.affected.as_ref().map(|path| path.display.clone()),
             finding_title: finding.title.clone(),
             evidence: finding.evidence.clone(),
         });
-        self.doctor_repair_result = None;
+        self.doctor_repair.doctor_repair_result = None;
     }
 
     /// Same as [`Self::review_doctor_repair`], for a finding identified by
@@ -228,7 +229,7 @@ impl ArchiveFsApp {
         finding_id: String,
         affected: String,
     ) {
-        let Some(outcome) = self.doctor_scan.displayed() else {
+        let Some(outcome) = self.doctor_repair.doctor_scan.displayed() else {
             return;
         };
         // The resource comes from a finding this scan reproduced, and is
@@ -240,20 +241,20 @@ impl ArchiveFsApp {
         else {
             return;
         };
-        self.doctor_repair_review = Some(DoctorRepairReview {
+        self.doctor_repair.doctor_repair_review = Some(DoctorRepairReview {
             action,
             finding_id,
             affected: Some(affected),
             finding_title: finding.title.clone(),
             evidence: finding.evidence.clone(),
         });
-        self.doctor_repair_result = None;
+        self.doctor_repair.doctor_repair_result = None;
     }
 
     pub(crate) fn cancel_doctor_repair(&mut self) {
         // Cancelling is purely a state reset. Nothing was executed, so there
         // is nothing to undo.
-        self.doctor_repair_review = None;
+        self.doctor_repair.doctor_repair_review = None;
     }
 
     pub(crate) fn show_repair_review_page(&mut self, ui: &mut egui::Ui) {
@@ -303,11 +304,11 @@ impl ArchiveFsApp {
     pub(crate) fn show_doctor_page_body(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let action = doctor_page::show_doctor_page(
             ui,
-            &self.doctor_scan,
-            &mut self.doctor_selected_finding,
-            self.doctor_repair_review.as_ref(),
-            self.doctor_repair_result.as_deref(),
-            self.doctor_repair_finished_at_unix_seconds,
+            &self.doctor_repair.doctor_scan,
+            &mut self.doctor_repair.doctor_selected_finding,
+            self.doctor_repair.doctor_repair_review.as_ref(),
+            self.doctor_repair.doctor_repair_result.as_deref(),
+            self.doctor_repair.doctor_repair_finished_at_unix_seconds,
             &mut self.clipboard,
             self.ui_mode == GuiMode::GamerView,
         );
@@ -352,15 +353,18 @@ impl ArchiveFsApp {
         }
         match self.problems_repair_tab {
             ProblemsRepairTab::Overview => {
-                if let Some(tab) =
-                    problems_repair_page::show_problems_repair_overview(ui, &self.doctor_scan)
-                {
+                if let Some(tab) = problems_repair_page::show_problems_repair_overview(
+                    ui,
+                    &self.doctor_repair.doctor_scan,
+                ) {
                     self.navigate_to_problems_repair_tab(tab);
                 }
             }
             ProblemsRepairTab::Diagnostics => {
-                let stale_review_clicked =
-                    problems_repair_page::show_stale_library_review_entry(ui, &self.doctor_scan);
+                let stale_review_clicked = problems_repair_page::show_stale_library_review_entry(
+                    ui,
+                    &self.doctor_repair.doctor_scan,
+                );
                 self.show_doctor_page_body(ui, context);
                 if stale_review_clicked {
                     self.navigate_to_missing_catalogue_review();
@@ -428,7 +432,7 @@ impl ArchiveFsApp {
         let config = match Config::load_default() {
             Ok(config) => config,
             Err(error) => {
-                self.doctor_repair_review.take();
+                self.doctor_repair.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -441,7 +445,7 @@ impl ArchiveFsApp {
         let index_path = match default_index_path() {
             Ok(path) => path,
             Err(error) => {
-                self.doctor_repair_review.take();
+                self.doctor_repair.doctor_repair_review.take();
                 self.history.record(HistoryEntry::new(
                     ActivityAction::DoctorRepair,
                     None,
@@ -462,10 +466,10 @@ impl ArchiveFsApp {
     /// on a machine that happened to have `~/.config/archivefs/config.toml` and
     /// failed on CI, which does not.
     pub(crate) fn confirm_doctor_repair_with(&mut self, config: Config, index_path: PathBuf) {
-        let Some(review) = self.doctor_repair_review.take() else {
+        let Some(review) = self.doctor_repair.doctor_repair_review.take() else {
             return;
         };
-        let Some(displayed) = self.doctor_scan.displayed() else {
+        let Some(displayed) = self.doctor_repair.doctor_scan.displayed() else {
             return;
         };
         let request = DoctorRepairRequest {
@@ -503,7 +507,7 @@ impl ArchiveFsApp {
             },
             doctor_page::doctor_repair_history_detail(&outcome),
         ));
-        self.doctor_repair_finished_at_unix_seconds = Some(
+        self.doctor_repair.doctor_repair_finished_at_unix_seconds = Some(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|duration| duration.as_secs() as i64)
@@ -514,7 +518,7 @@ impl ArchiveFsApp {
         // findings must be preserved.
         if outcome.record.status == DoctorRepairStatus::Succeeded
             && outcome.record.verification == DoctorRepairVerification::Verified
-            && let DoctorScanState::Ready(displayed) = &mut self.doctor_scan
+            && let DoctorScanState::Ready(displayed) = &mut self.doctor_repair.doctor_scan
         {
             let finding_id = outcome.record.finding_id.clone();
             let affected = outcome
@@ -528,14 +532,15 @@ impl ArchiveFsApp {
             });
         }
         if self
+            .doctor_repair
             .doctor_selected_finding
             .as_deref()
             .map(doctor_page::doctor_finding_key_id)
             == Some(outcome.record.finding_id.as_str())
         {
-            self.doctor_selected_finding = None;
+            self.doctor_repair.doctor_selected_finding = None;
         }
-        self.doctor_repair_result = Some(Box::new(outcome));
+        self.doctor_repair.doctor_repair_result = Some(Box::new(outcome));
     }
 }
 
@@ -552,7 +557,7 @@ impl ArchiveFsApp {
 /// `run_setup_diagnostics` is deliberately **not** called: its "Mount root
 /// is writable" check probes by creating and removing a file, which changes
 /// the mount root's modification time. Doctor borrows the already-computed
-/// `SetupDiagnostics` from `self.diagnostics` instead, so opening Doctor
+/// `SetupDiagnostics` from `self.doctor_repair.diagnostics` instead, so opening Doctor
 /// never performs that write.
 ///
 /// The one child process started from here is `arcade_version_probe`'s

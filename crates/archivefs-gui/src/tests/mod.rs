@@ -712,11 +712,12 @@ fn dolphin_workflow_with_matched_identity(
         game_settings_state: DolphinSettingsDirectoryState::Missing,
         ..dolphin_profile_fixture()
     };
-    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
-        profiles: vec![profile],
-        warnings: Vec::new(),
-        complete: true,
-    });
+    app.emulator_readiness.dolphin_profiles =
+        DolphinProfilesState::Ready(DolphinProfileDiscovery {
+            profiles: vec![profile],
+            warnings: Vec::new(),
+            complete: true,
+        });
     let workflow = app.cheat_workflow.as_mut().unwrap();
     workflow.platform = Some("GameCube".to_string());
     workflow.adapter = CheatEmulatorAdapter::Dolphin;
@@ -850,7 +851,12 @@ fn render_dolphin_workflow(app: &mut ArchiveFsApp) -> egui::FullOutput {
     ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let workflow = app.cheat_workflow.as_mut().unwrap();
-            let _ = show_dolphin_workflow(ui, workflow, &app.emulator_readiness.dolphin_profiles, &mut clipboard);
+            let _ = show_dolphin_workflow(
+                ui,
+                workflow,
+                &app.emulator_readiness.dolphin_profiles,
+                &mut clipboard,
+            );
         });
     })
 }
@@ -1019,9 +1025,24 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             database_path: PathBuf::from("/config/library.sqlite3"),
         },
         database_generation: DatabaseGeneration::INITIAL,
-        database_restore_plan: None,
-        database_restore_confirmation: String::new(),
-        database_restore_feedback: None,
+        doctor_repair: DoctorRepairState {
+            database_restore_plan: None,
+            database_restore_confirmation: String::new(),
+            database_restore_feedback: None,
+            diagnostics: DiagnosticsState::Ready {
+                generation: RefreshGeneration::INITIAL,
+                report: setup_report(true, true),
+            },
+            config_previously_confirmed: true,
+            onboarding_state: onboarding::OnboardingState::NotStarted,
+            onboarding_auto_open_checked: false,
+            doctor_scan: DoctorScanState::NotRun,
+            doctor_scan_generation: RefreshGeneration::INITIAL,
+            doctor_selected_finding: None,
+            doctor_repair_review: None,
+            doctor_repair_result: None,
+            doctor_repair_finished_at_unix_seconds: None,
+        },
         needs_attention: needs_attention::AttentionWorkspace::default(),
         dat_authority: dat_authority_dashboard::DashboardState::default(),
         media_sets_page: media_sets_page::MediaSetsPageState::default(),
@@ -1048,12 +1069,6 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
         dat_sources_page: None,
         dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
-        doctor_scan: DoctorScanState::NotRun,
-        doctor_scan_generation: RefreshGeneration::INITIAL,
-        doctor_selected_finding: None,
-        doctor_repair_review: None,
-        doctor_repair_result: None,
-        doctor_repair_finished_at_unix_seconds: None,
         library_ui: LibraryUiState::default(),
         archive_context: ArchiveContext::default(),
         mount_ui: MountUiState::default(),
@@ -1061,8 +1076,6 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         shared_history: SharedHistoryState::NotLoaded,
         shared_history_operation: None,
         shared_rollback: SharedRollbackState::Idle,
-        onboarding_state: onboarding::OnboardingState::NotStarted,
-        onboarding_auto_open_checked: false,
         emulator_readiness: EmulatorReadinessState::default(),
         tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
         cheat_workflow: None,
@@ -1076,11 +1089,6 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         confirm_cheat_archive_change: None,
         feedback: None,
         history: OperationHistory::default(),
-        diagnostics: DiagnosticsState::Ready {
-            generation: RefreshGeneration::INITIAL,
-            report: setup_report(true, true),
-        },
-        config_previously_confirmed: true,
         setup_action: None,
         refresh_error: None,
         snapshot_stale: false,

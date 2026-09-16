@@ -97,7 +97,8 @@ impl ArchiveFsApp {
     ) {
         if self.emulator_readiness.pcsx2_status_archive_path.as_deref() != focused_archive {
             self.emulator_readiness.pcsx2_status = pcsx2_page::Pcsx2StatusState::Idle;
-            self.emulator_readiness.pcsx2_status_archive_path = focused_archive.map(Path::to_path_buf);
+            self.emulator_readiness.pcsx2_status_archive_path =
+                focused_archive.map(Path::to_path_buf);
         }
     }
 
@@ -174,7 +175,8 @@ impl ArchiveFsApp {
                 emulator,
                 path,
             )) => {
-                self.emulator_readiness.emulator_setup_overrides
+                self.emulator_readiness
+                    .emulator_setup_overrides
                     .set_executable(emulator, Some(path));
                 self.start_doctor_scan(context.clone());
             }
@@ -182,18 +184,22 @@ impl ArchiveFsApp {
                 emulator,
                 path,
             )) => {
-                self.emulator_readiness.emulator_setup_overrides
+                self.emulator_readiness
+                    .emulator_setup_overrides
                     .set_configuration_folder(emulator, Some(path));
                 self.start_doctor_scan(context.clone());
             }
             Some(emulator_setup_page::EmulatorSetupAction::ResetExecutableOverride(emulator)) => {
-                self.emulator_readiness.emulator_setup_overrides.set_executable(emulator, None);
+                self.emulator_readiness
+                    .emulator_setup_overrides
+                    .set_executable(emulator, None);
                 self.start_doctor_scan(context.clone());
             }
             Some(emulator_setup_page::EmulatorSetupAction::ResetConfigurationFolderOverride(
                 emulator,
             )) => {
-                self.emulator_readiness.emulator_setup_overrides
+                self.emulator_readiness
+                    .emulator_setup_overrides
                     .set_configuration_folder(emulator, None);
                 self.start_doctor_scan(context.clone());
             }
@@ -216,16 +222,20 @@ impl ArchiveFsApp {
         // after a repair-action navigation may scroll the relevant card
         // into view, and every later frame (and any manual scroll) is left
         // alone. Sidebar/Home navigation never sets this, so it is `None`.
-        let (focus_retroarch, focus_emulator) = match self.emulator_readiness.emulator_setup_focus.take() {
-            Some(EmulatorSetupFocus::RetroArch) => (true, None),
-            Some(EmulatorSetupFocus::Emulator(name)) => (false, Some(name)),
-            None => (false, None),
-        };
+        let (focus_retroarch, focus_emulator) =
+            match self.emulator_readiness.emulator_setup_focus.take() {
+                Some(EmulatorSetupFocus::RetroArch) => (true, None),
+                Some(EmulatorSetupFocus::Emulator(name)) => (false, Some(name)),
+                None => (false, None),
+            };
         // RetroArch has a dedicated, cached discovery lane because its
         // profile/environment scan is also used by Cheats & Mods. Starting
         // it here makes Emulator Setup truthful on first use without moving
         // filesystem work into the pure Doctor runner.
-        if matches!(self.emulator_readiness.retroarch_profiles, RetroArchProfilesState::NotScanned) {
+        if matches!(
+            self.emulator_readiness.retroarch_profiles,
+            RetroArchProfilesState::NotScanned
+        ) {
             self.start_retroarch_profile_scan(context.clone());
         }
         widgets::page_header_with_icon(
@@ -239,10 +249,11 @@ impl ArchiveFsApp {
         let setup_action = emulator_setup_page::show(
             ui,
             &mut self.emulator_readiness.emulator_setup_page,
-            self.doctor_scan
+            self.doctor_repair
+                .doctor_scan
                 .displayed()
                 .map(|outcome| outcome.scan.findings.as_slice()),
-            self.doctor_scan.is_running(),
+            self.doctor_repair.doctor_scan.is_running(),
             match &self.emulator_readiness.retroarch_profiles {
                 RetroArchProfilesState::NotScanned => {
                     emulator_setup_page::RetroArchSetupStatus::NotChecked
@@ -503,7 +514,11 @@ impl ArchiveFsApp {
             CoreFolderMode, CoreFolderReadinessKind, CoreFolderScan, core_folder_readiness,
         };
 
-        let mode = CoreFolderMode::from_override(self.emulator_readiness.retroarch_core_directory_override.as_deref());
+        let mode = CoreFolderMode::from_override(
+            self.emulator_readiness
+                .retroarch_core_directory_override
+                .as_deref(),
+        );
         let scanning = matches!(
             self.emulator_readiness.retroarch_profiles,
             RetroArchProfilesState::Scanning { .. }
@@ -517,7 +532,10 @@ impl ArchiveFsApp {
             };
             core_folder_readiness(scan, &mode)
         };
-        let rejected_pick = self.emulator_readiness.retroarch_core_folder_rejected_pick.clone();
+        let rejected_pick = self
+            .emulator_readiness
+            .retroarch_core_folder_rejected_pick
+            .clone();
 
         enum CoreFolderAction {
             Rescan,
@@ -658,7 +676,10 @@ impl ArchiveFsApp {
         ) {
             return LaunchReadinessInput::EvidenceNotLoaded;
         }
-        let retroarch_scanned = matches!(self.emulator_readiness.retroarch_profiles, RetroArchProfilesState::Ready(_));
+        let retroarch_scanned = matches!(
+            self.emulator_readiness.retroarch_profiles,
+            RetroArchProfilesState::Ready(_)
+        );
         let empty_retroarch =
             archivefs_core::emulator_environment::retroarch::RetroArchEnvironmentReport {
                 format_version: 2,
@@ -674,14 +695,16 @@ impl ArchiveFsApp {
 
         let focused = self.archive_context.focused.as_deref();
         let selected_game_identity_report =
-            focused.and_then(|focused| match &self.selected_evidence_ui.selected_evidence {
-                selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
-                    if report.path == focused =>
-                {
-                    Some(&report.game_identity_report)
-                }
-                _ => None,
-            });
+            focused.and_then(
+                |focused| match &self.selected_evidence_ui.selected_evidence {
+                    selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                        if report.path == focused =>
+                    {
+                        Some(&report.game_identity_report)
+                    }
+                    _ => None,
+                },
+            );
         // Keep older in-process test/compatibility fixtures usable when they
         // have not yet been given the new selected-evidence report. A real
         // selected game always takes the evidence-worker report above, so
@@ -1363,23 +1386,24 @@ impl ArchiveFsApp {
                         }),
                     }
                 });
-        let xenia_context = if let XeniaProfilesState::Ready(discovery) = &self.emulator_readiness.xenia_profiles {
-            let roots = archivefs_core::patch_manager::XeniaProfileDiscoveryRoots {
-                explicit_configuration_roots: discovery
-                    .profiles
-                    .iter()
-                    .map(|profile| profile.configuration_path.clone())
-                    .collect(),
+        let xenia_context =
+            if let XeniaProfilesState::Ready(discovery) = &self.emulator_readiness.xenia_profiles {
+                let roots = archivefs_core::patch_manager::XeniaProfileDiscoveryRoots {
+                    explicit_configuration_roots: discovery
+                        .profiles
+                        .iter()
+                        .map(|profile| profile.configuration_path.clone())
+                        .collect(),
+                };
+                game_identity_report.map(|report| launch_readiness_page::XeniaLaunchContext {
+                    discovery: discovery.clone(),
+                    roots,
+                    verified_xex_title_id: report.verified_xex_title_id().map(str::to_owned),
+                    verified_xex_media_id: report.verified_xex_media_id().map(str::to_owned),
+                })
+            } else {
+                None
             };
-            game_identity_report.map(|report| launch_readiness_page::XeniaLaunchContext {
-                discovery: discovery.clone(),
-                roots,
-                verified_xex_title_id: report.verified_xex_title_id().map(str::to_owned),
-                verified_xex_media_id: report.verified_xex_media_id().map(str::to_owned),
-            })
-        } else {
-            None
-        };
 
         let standalone_scans_complete = match &identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) => {
@@ -1394,7 +1418,10 @@ impl ArchiveFsApp {
                         self.emulator_readiness.pcsx2_launch_profiles,
                         Pcsx2LaunchProfilesState::Ready(_)
                     ),
-                    "Xbox360" => matches!(self.emulator_readiness.xenia_profiles, XeniaProfilesState::Ready(_)),
+                    "Xbox360" => matches!(
+                        self.emulator_readiness.xenia_profiles,
+                        XeniaProfilesState::Ready(_)
+                    ),
                     // These lanes are already discovered synchronously by
                     // this read-only input builder using their existing
                     // adapter roots.
@@ -1469,7 +1496,8 @@ impl ArchiveFsApp {
             &self.selected_evidence_ui.scummvm_readiness
             && let Ok(readiness) = receiver.try_recv()
         {
-            self.selected_evidence_ui.scummvm_readiness = identity_sources_page::ScummVmReadinessState::Ready(readiness);
+            self.selected_evidence_ui.scummvm_readiness =
+                identity_sources_page::ScummVmReadinessState::Ready(readiness);
         }
     }
 
@@ -1490,13 +1518,14 @@ impl ArchiveFsApp {
         self.selected_evidence_ui.scummvm_check_generation += 1;
         let generation = self.selected_evidence_ui.scummvm_check_generation;
         let (sender, receiver) = mpsc::channel();
-        self.selected_evidence_ui.scummvm_check = identity_sources_page::ScummVmCheckState::Checking {
-            generation,
-            receiver,
-            checked: 0,
-            total: candidates.len(),
-            current: None,
-        };
+        self.selected_evidence_ui.scummvm_check =
+            identity_sources_page::ScummVmCheckState::Checking {
+                generation,
+                receiver,
+                checked: 0,
+                total: candidates.len(),
+                current: None,
+            };
         thread::spawn(move || {
             let summary = identity_sources_page::check_scummvm_candidates(
                 &executable,
@@ -1561,10 +1590,11 @@ impl ArchiveFsApp {
                         *current = Some(new_current);
                     }
                     identity_sources_page::ScummVmCheckMessage::Done(summary) => {
-                        self.selected_evidence_ui.scummvm_check = identity_sources_page::ScummVmCheckState::Ready {
-                            generation,
-                            summary,
-                        };
+                        self.selected_evidence_ui.scummvm_check =
+                            identity_sources_page::ScummVmCheckState::Ready {
+                                generation,
+                                summary,
+                            };
                         return;
                     }
                 }
@@ -1669,7 +1699,9 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_dolphin_profiles(&mut self) {
-        if let DolphinProfilesState::Scanning { receiver } = &self.emulator_readiness.dolphin_profiles {
+        if let DolphinProfilesState::Scanning { receiver } =
+            &self.emulator_readiness.dolphin_profiles
+        {
             match receiver.try_recv() {
                 Ok(Ok(discovery)) => {
                     let eligible = eligible_dolphin_profile_ids(&discovery);
@@ -1718,10 +1750,12 @@ impl ArchiveFsApp {
                         }
                         workflow.dolphin_profile_selection = Some(selection);
                     }
-                    self.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(discovery);
-                    if let (Some(workflow), DolphinProfilesState::Ready(discovery)) =
-                        (self.cheat_workflow.as_mut(), &self.emulator_readiness.dolphin_profiles)
-                        && workflow.adapter == CheatEmulatorAdapter::Dolphin
+                    self.emulator_readiness.dolphin_profiles =
+                        DolphinProfilesState::Ready(discovery);
+                    if let (Some(workflow), DolphinProfilesState::Ready(discovery)) = (
+                        self.cheat_workflow.as_mut(),
+                        &self.emulator_readiness.dolphin_profiles,
+                    ) && workflow.adapter == CheatEmulatorAdapter::Dolphin
                         && matches!(workflow.transaction, CheatTransactionState::Idle)
                     {
                         reconcile_dolphin_provider_selection(workflow, discovery);
@@ -1753,7 +1787,8 @@ impl ArchiveFsApp {
     /// remembered, never writes anything.
     pub(crate) fn start_dolphin_local_profile_scan(&mut self, context: egui::Context) {
         let (sender, receiver) = mpsc::channel();
-        self.emulator_readiness.dolphin_local_profiles = DolphinLocalProfilesState::Scanning { receiver };
+        self.emulator_readiness.dolphin_local_profiles =
+            DolphinLocalProfilesState::Scanning { receiver };
         thread::spawn(move || {
             let result =
                 archivefs_core::patch_manager::DolphinLocalDiscoveryRoots::from_environment()
@@ -1769,10 +1804,13 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_dolphin_local_profiles(&mut self) {
-        if let DolphinLocalProfilesState::Scanning { receiver } = &self.emulator_readiness.dolphin_local_profiles {
+        if let DolphinLocalProfilesState::Scanning { receiver } =
+            &self.emulator_readiness.dolphin_local_profiles
+        {
             match receiver.try_recv() {
                 Ok(Ok(ready)) => {
-                    self.emulator_readiness.dolphin_local_profiles = DolphinLocalProfilesState::Ready(ready);
+                    self.emulator_readiness.dolphin_local_profiles =
+                        DolphinLocalProfilesState::Ready(ready);
                 }
                 Ok(Err(message)) => {
                     self.history.record(HistoryEntry::new(
@@ -1781,7 +1819,8 @@ impl ArchiveFsApp {
                         ActivityOutcome::Failed,
                         format!("Dolphin launch-profile discovery failed: {message}"),
                     ));
-                    self.emulator_readiness.dolphin_local_profiles = DolphinLocalProfilesState::Error(message);
+                    self.emulator_readiness.dolphin_local_profiles =
+                        DolphinLocalProfilesState::Error(message);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
@@ -1792,7 +1831,8 @@ impl ArchiveFsApp {
                         ActivityOutcome::Failed,
                         format!("Dolphin launch-profile discovery failed: {message}"),
                     ));
-                    self.emulator_readiness.dolphin_local_profiles = DolphinLocalProfilesState::Error(message);
+                    self.emulator_readiness.dolphin_local_profiles =
+                        DolphinLocalProfilesState::Error(message);
                 }
             }
         }
@@ -1804,7 +1844,8 @@ impl ArchiveFsApp {
     /// [`Self::start_dolphin_local_profile_scan`].
     pub(crate) fn start_pcsx2_launch_profile_scan(&mut self, context: egui::Context) {
         let (sender, receiver) = mpsc::channel();
-        self.emulator_readiness.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Scanning { receiver };
+        self.emulator_readiness.pcsx2_launch_profiles =
+            Pcsx2LaunchProfilesState::Scanning { receiver };
         thread::spawn(move || {
             let result = Pcsx2ProfileDiscoveryRoots::from_environment()
                 .map_err(|error| error.to_string())
@@ -1831,13 +1872,17 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_pcsx2_launch_profiles(&mut self) {
-        if let Pcsx2LaunchProfilesState::Scanning { receiver } = &self.emulator_readiness.pcsx2_launch_profiles {
+        if let Pcsx2LaunchProfilesState::Scanning { receiver } =
+            &self.emulator_readiness.pcsx2_launch_profiles
+        {
             match receiver.try_recv() {
                 Ok(Ok(ready)) => {
-                    self.emulator_readiness.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Ready(ready);
+                    self.emulator_readiness.pcsx2_launch_profiles =
+                        Pcsx2LaunchProfilesState::Ready(ready);
                 }
                 Ok(Err(message)) => {
-                    self.emulator_readiness.pcsx2_launch_profiles = Pcsx2LaunchProfilesState::Error(message);
+                    self.emulator_readiness.pcsx2_launch_profiles =
+                        Pcsx2LaunchProfilesState::Error(message);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
@@ -1868,9 +1913,13 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_flycast_profiles(&mut self) {
-        if let FlycastProfilesState::Scanning { receiver } = &self.emulator_readiness.flycast_profiles {
+        if let FlycastProfilesState::Scanning { receiver } =
+            &self.emulator_readiness.flycast_profiles
+        {
             match receiver.try_recv() {
-                Ok(Ok(ready)) => self.emulator_readiness.flycast_profiles = FlycastProfilesState::Ready(ready),
+                Ok(Ok(ready)) => {
+                    self.emulator_readiness.flycast_profiles = FlycastProfilesState::Ready(ready)
+                }
                 Ok(Err(message)) => {
                     self.emulator_readiness.flycast_profiles = FlycastProfilesState::Error(message);
                 }
@@ -1890,7 +1939,8 @@ impl ArchiveFsApp {
     /// DAT files already on disk, never downloads or writes anything.
     pub(crate) fn start_pcsx2_firmware_evidence_load(&mut self, context: egui::Context) {
         let (sender, receiver) = mpsc::channel();
-        self.emulator_readiness.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Loading { receiver };
+        self.emulator_readiness.pcsx2_firmware_evidence =
+            Pcsx2FirmwareEvidenceState::Loading { receiver };
         thread::spawn(move || {
             let result = load_pcsx2_firmware_evidence_from_registry();
             let _ = sender.send(result);
@@ -1899,19 +1949,24 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_pcsx2_firmware_evidence(&mut self) {
-        if let Pcsx2FirmwareEvidenceState::Loading { receiver } = &self.emulator_readiness.pcsx2_firmware_evidence {
+        if let Pcsx2FirmwareEvidenceState::Loading { receiver } =
+            &self.emulator_readiness.pcsx2_firmware_evidence
+        {
             match receiver.try_recv() {
                 Ok(Ok(evidence)) => {
-                    self.emulator_readiness.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(evidence);
+                    self.emulator_readiness.pcsx2_firmware_evidence =
+                        Pcsx2FirmwareEvidenceState::Ready(evidence);
                 }
                 Ok(Err(message)) => {
-                    self.emulator_readiness.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Error(message);
+                    self.emulator_readiness.pcsx2_firmware_evidence =
+                        Pcsx2FirmwareEvidenceState::Error(message);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
-                    self.emulator_readiness.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Error(
-                        "PS2 firmware evidence load stopped unexpectedly.".to_string(),
-                    );
+                    self.emulator_readiness.pcsx2_firmware_evidence =
+                        Pcsx2FirmwareEvidenceState::Error(
+                            "PS2 firmware evidence load stopped unexpectedly.".to_string(),
+                        );
                 }
             }
         }
@@ -1930,7 +1985,10 @@ impl ArchiveFsApp {
             "RetroArch profile discovery started.",
         ));
         self.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Scanning { receiver };
-        let core_directory_override = self.emulator_readiness.retroarch_core_directory_override.clone();
+        let core_directory_override = self
+            .emulator_readiness
+            .retroarch_core_directory_override
+            .clone();
         thread::spawn(move || {
             let filesystem = HostReadOnlyFilesystem;
             let environment = DiscoveryEnvironment::from_process_environment();
@@ -1953,7 +2011,11 @@ impl ArchiveFsApp {
     /// Emulator Setup repair flow does exactly that.
     pub(crate) fn set_retroarch_core_directory_override(&mut self, path: PathBuf) {
         self.emulator_readiness.retroarch_core_directory_override = Some(path);
-        save_retroarch_core_directory_override(self.emulator_readiness.retroarch_core_directory_override.as_deref());
+        save_retroarch_core_directory_override(
+            self.emulator_readiness
+                .retroarch_core_directory_override
+                .as_deref(),
+        );
     }
 
     /// Drop any persisted RetroArch core-directory override, returning
@@ -1989,7 +2051,9 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_retroarch_profiles(&mut self) {
-        if let RetroArchProfilesState::Scanning { receiver } = &self.emulator_readiness.retroarch_profiles {
+        if let RetroArchProfilesState::Scanning { receiver } =
+            &self.emulator_readiness.retroarch_profiles
+        {
             match receiver.try_recv() {
                 Ok(Ok(discovery)) => {
                     let eligible = discovery
@@ -2011,7 +2075,8 @@ impl ArchiveFsApp {
                         let eligible = eligible_profile_ids(&discovery);
                         (eligible.len() == 1).then(|| eligible[0].to_string())
                     };
-                    self.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(discovery);
+                    self.emulator_readiness.retroarch_profiles =
+                        RetroArchProfilesState::Ready(discovery);
                     if let Some(workflow) = self.cheat_workflow.as_mut()
                         && workflow.selected_profile_id.is_none()
                     {
@@ -2027,7 +2092,8 @@ impl ArchiveFsApp {
                         ActivityOutcome::Failed,
                         format!("RetroArch profile discovery failed: {message}"),
                     ));
-                    self.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Error(message);
+                    self.emulator_readiness.retroarch_profiles =
+                        RetroArchProfilesState::Error(message);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {

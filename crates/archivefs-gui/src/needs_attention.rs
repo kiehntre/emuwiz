@@ -181,7 +181,7 @@ impl ArchiveFsApp {
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
         {
             let mut snapshot = self.needs_attention.stored.clone();
-            if let Some(outcome) = self.doctor_scan.displayed() {
+            if let Some(outcome) = self.doctor_repair.doctor_scan.displayed() {
                 snapshot.merge(doctor_attention(
                     &outcome.scan,
                     outcome.finished_at_unix_seconds,
