@@ -143,6 +143,7 @@ use archivefs_core::patch_manager::{
 use collection_discovery_page::*;
 mod activity_history;
 mod administration_pages;
+mod app_overlays;
 mod app_pages;
 mod app_polling;
 mod app_shell;
@@ -4670,48 +4671,7 @@ impl ArchiveFsApp {
             None => {}
         }
 
-        if self.ui_mode == GuiMode::AdvancedView
-            && let Some(ActivityPanelAction::ShowRelatedArchive(path)) = show_activity_panel(
-                context,
-                &mut self.history,
-                &mut self.show_activity,
-                &mut self.clipboard,
-            )
-        {
-            self.navigate_to_library_tab(LibraryTab::Archives);
-            self.archive_context.select_only(path);
-        }
-
-        if self.show_about {
-            let mount_root = match &self.state {
-                LoadState::Ready(data) => Some(data.mount_root.as_path()),
-                _ => None,
-            };
-            show_about_window(
-                context,
-                &mut self.show_about,
-                &self.database_state,
-                &self.doctor_repair.diagnostics,
-                mount_root,
-                &mut self.clipboard,
-            );
-        }
-
-        if self.show_skipped_files {
-            let summary = match &self.database_state {
-                DatabaseState::Ready {
-                    last_scan_summary: Some(summary),
-                    ..
-                } => Some(summary),
-                _ => None,
-            };
-            show_skipped_files_window(
-                context,
-                &mut self.show_skipped_files,
-                summary,
-                &mut self.skipped_files_filter,
-            );
-        }
+        app_overlays::show_global_overlays(self, context);
 
         let app_pages::PageDispatchOutcome {
             retry,
