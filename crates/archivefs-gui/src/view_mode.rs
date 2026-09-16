@@ -1,91 +1,11 @@
+//! The GUI's view mode: Gamer View or Advanced View.
+//!
+//! One enum, one default, one on-disk preference. `GuiMode` is the identity
+//! the running application switches on; `gui_mode.txt` is the only place it
+//! is persisted, holding the stable lower-case values `gamer` and
+//! `advanced`.
+
 use std::path::PathBuf;
-use std::{fmt, str::FromStr};
-
-/// The two supported GUI experiences. Rendering and navigation deliberately
-/// live elsewhere; this type is only the stable mode identity.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum ViewMode {
-    #[default]
-    Gamer,
-    Advanced,
-}
-
-impl ViewMode {
-    pub const ALL: [Self; 2] = [Self::Gamer, Self::Advanced];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Gamer => "Gamer View",
-            Self::Advanced => "Advanced View",
-        }
-    }
-
-    /// Stable lower-case value suitable for eframe or config persistence.
-    pub const fn persisted(self) -> &'static str {
-        match self {
-            Self::Gamer => "gamer",
-            Self::Advanced => "advanced",
-        }
-    }
-
-    pub fn from_persisted(value: &str) -> Option<Self> {
-        value.parse().ok()
-    }
-}
-
-impl fmt::Display for ViewMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.label())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParseViewModeError;
-
-impl fmt::Display for ParseViewModeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expected 'gamer' or 'advanced'")
-    }
-}
-
-impl std::error::Error for ParseViewModeError {}
-
-impl FromStr for ViewMode {
-    type Err = ParseViewModeError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "gamer" => Ok(Self::Gamer),
-            "advanced" => Ok(Self::Advanced),
-            _ => Err(ParseViewModeError),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn defaults_to_gamer_view() {
-        assert_eq!(ViewMode::default(), ViewMode::Gamer);
-    }
-
-    #[test]
-    fn labels_are_plain_and_distinct() {
-        assert_eq!(ViewMode::Gamer.label(), "Gamer View");
-        assert_eq!(ViewMode::Advanced.label(), "Advanced View");
-    }
-
-    #[test]
-    fn persisted_values_round_trip() {
-        for mode in ViewMode::ALL {
-            assert_eq!(ViewMode::from_persisted(mode.persisted()), Some(mode));
-        }
-        assert_eq!(ViewMode::from_persisted("Gamer View"), None);
-        assert_eq!(ViewMode::from_persisted("unknown"), None);
-    }
-}
 
 /// Decision 5 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): exactly these two
 /// modes, no alternate labels. `GamerView` is the unconditional default
@@ -103,18 +23,18 @@ pub(crate) enum GuiMode {
 /// specifically to avoid coupling unrelated persistence together. Mode is
 /// a GUI-layer-only concept (never read by `archivefs-core` or the CLI),
 /// so it lives in the GUI crate rather than in core.
-pub(crate) fn gui_mode_config_path() -> Option<PathBuf> {
+fn gui_mode_config_path() -> Option<PathBuf> {
     archivefs_core::app_dirs::config_path("gui_mode.txt").ok()
 }
 
-pub(crate) fn parse_gui_mode(contents: &str) -> GuiMode {
+fn parse_gui_mode(contents: &str) -> GuiMode {
     match contents.trim() {
         "advanced" => GuiMode::AdvancedView,
         _ => GuiMode::GamerView,
     }
 }
 
-pub(crate) fn gui_mode_file_contents(mode: GuiMode) -> &'static str {
+fn gui_mode_file_contents(mode: GuiMode) -> &'static str {
     match mode {
         GuiMode::GamerView => "gamer",
         GuiMode::AdvancedView => "advanced",
@@ -141,4 +61,47 @@ pub(crate) fn save_gui_mode(mode: GuiMode) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, gui_mode_file_contents(mode));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_gamer_view() {
+        assert_eq!(GuiMode::default(), GuiMode::GamerView);
+    }
+
+    #[test]
+    fn persisted_values_round_trip() {
+        for mode in [GuiMode::GamerView, GuiMode::AdvancedView] {
+            assert_eq!(parse_gui_mode(gui_mode_file_contents(mode)), mode);
+        }
+        assert_eq!(gui_mode_file_contents(GuiMode::GamerView), "gamer");
+        assert_eq!(gui_mode_file_contents(GuiMode::AdvancedView), "advanced");
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored_when_reading_the_file() {
+        assert_eq!(parse_gui_mode("  advanced\n"), GuiMode::AdvancedView);
+        assert_eq!(parse_gui_mode("\tgamer  "), GuiMode::GamerView);
+    }
+
+    #[test]
+    fn anything_unrecognised_means_nothing_chosen_yet_not_an_error() {
+        // Deliberately lenient, unlike a strict parser: an empty, damaged or
+        // future-written file must fall back to the unconditional default
+        // rather than fail the launch. Display labels are not accepted as
+        // persisted values.
+        for contents in [
+            "",
+            "   ",
+            "unknown",
+            "Advanced View",
+            "Gamer View",
+            "ADVANCED",
+        ] {
+            assert_eq!(parse_gui_mode(contents), GuiMode::GamerView);
+        }
+    }
 }

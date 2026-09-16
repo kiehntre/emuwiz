@@ -8,13 +8,17 @@ view's screens, navigation, or actions.
 
 ### `view_mode`
 
-- `ViewMode::{Gamer, Advanced}` is the stable mode identity.
-- `ViewMode::label()` supplies plain display labels.
-- `ViewMode::persisted()` and `ViewMode::from_persisted()` provide stable
-  lower-case persistence values. The current GUI does not persist its view, so
-  this module does not add storage wiring.
-- `ViewMode::ALL`, `Display`, and `FromStr` support future controls without
-  prescribing their layout.
+This milestone added a preparatory `ViewMode::{Gamer, Advanced}` model with
+`label()`, `persisted()`/`from_persisted()`, `ALL`, `Display` and `FromStr`,
+and deliberately no storage wiring.
+
+**Superseded.** The navigation reset that followed shipped `GuiMode` -
+`GamerView`/`AdvancedView` - with the real mode switching and a real
+`gui_mode.txt` preference file, and nothing ever adopted `ViewMode`. The two
+sat side by side in this module until `ViewMode` was removed; `GuiMode` is now
+the single mode identity. The persisted values are unchanged (`gamer` /
+`advanced`), and the display labels live with the controls that show them
+(`navigation::GAMER_MENU_ADVANCED_LABEL`).
 
 ### `status_wording`
 

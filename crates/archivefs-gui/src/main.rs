@@ -348,7 +348,7 @@ use status_wording::{
 pub(crate) mod tape_analysis_page;
 #[allow(dead_code)]
 mod ui;
-pub mod view_mode;
+mod view_mode;
 use view_mode::{GuiMode, load_gui_mode, save_gui_mode};
 
 use crate::romm_config::{
