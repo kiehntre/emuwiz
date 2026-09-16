@@ -990,3 +990,41 @@ pub(crate) fn run_source_action(
         } => remove_source_folder_default(path, *keep_catalogue).map(SourceActionOutcome::Removed),
     }
 }
+
+pub(crate) struct RunningMissingRemoval {
+    pub(crate) requested_paths: usize,
+    pub(crate) receiver: Receiver<Result<MissingArchiveRemovalResult, String>>,
+}
+
+pub(crate) fn apply_missing_removal(
+    archive_paths: &[PathBuf],
+) -> archivefs_core::Result<MissingArchiveRemovalResult> {
+    let database_path = default_database_path()?;
+    apply_missing_removal_at(&database_path, archive_paths)
+}
+
+pub(crate) fn apply_missing_removal_at(
+    database_path: &Path,
+    archive_paths: &[PathBuf],
+) -> archivefs_core::Result<MissingArchiveRemovalResult> {
+    if !database_path.exists() {
+        return Err(ArchiveFsError::Database(format!(
+            "library database does not exist at {}",
+            database_path.display()
+        )));
+    }
+    let mut database = Database::open_or_create(database_path)?;
+    let mut ids = Vec::with_capacity(archive_paths.len());
+    for path in archive_paths {
+        let archive_id = database
+            .find_archive_id_by_absolute_path(path)?
+            .ok_or_else(|| {
+                ArchiveFsError::Database(format!(
+                    "no archive found with exact stored path {}; nothing was removed",
+                    path.display()
+                ))
+            })?;
+        ids.push(archive_id);
+    }
+    database.remove_missing_archives(&ids)
+}

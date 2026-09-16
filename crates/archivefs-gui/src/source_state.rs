@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use archivefs_core::{SourceAvailability, SourceFolderView};
+use archivefs_core::{PersistedArchive, SourceAvailability, SourceFolderView};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceStateView {
@@ -91,5 +91,90 @@ mod tests {
         assert!(view.catalogue_available);
         assert_eq!(view.sources[0].id, Some(7));
         assert_eq!(view.sources[0].last_archive_count, Some(12));
+    }
+}
+
+/// A source's actual platform state, derived purely from the archives the
+/// snapshot already has catalogued for it (`PersistedArchive::platform`,
+/// matched by `PersistedArchive::source_folder_id == SourceFolderView::id`),
+/// never a new query, rescan, persisted field, or schema change. This is
+/// ground truth from the same data the Library page already shows, not a
+/// guess: if every catalogued archive under a source agrees on one
+/// platform, that is the source's platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourcePlatformState {
+    /// This source has no catalogued archives yet (never scanned, or
+    /// scanned and found nothing).
+    NotYetKnown,
+    /// Archives exist, but none resolved a platform.
+    Unknown,
+    /// Every catalogued archive agrees on this one platform.
+    Single(String),
+    /// Every catalogued archive resolved a platform, but not to the same
+    /// one - `usize` is the number of distinct platforms found.
+    Mixed(usize),
+    /// Some archives resolved a platform and some did not.
+    Partial { known: i64, unknown: i64 },
+}
+
+/// Computes [`SourcePlatformState`] for one source from the snapshot's full
+/// archive list - an `O(archives)` scan per source, over data already
+/// loaded in memory (never a filesystem rescan; see the type's own doc
+/// comment for why no new persistence is needed).
+pub(crate) fn source_platform_state(
+    view: &SourceFolderView,
+    archives: &[PersistedArchive],
+) -> SourcePlatformState {
+    let Some(source_id) = view.id else {
+        return SourcePlatformState::NotYetKnown;
+    };
+    let mut resolved: Vec<&str> = Vec::new();
+    let mut unresolved: i64 = 0;
+    for archive in archives {
+        if archive.source_folder_id != source_id {
+            continue;
+        }
+        match archive.platform.as_deref() {
+            Some(platform) => resolved.push(platform),
+            None => unresolved += 1,
+        }
+    }
+    if resolved.is_empty() && unresolved == 0 {
+        return SourcePlatformState::NotYetKnown;
+    }
+    if resolved.is_empty() {
+        return SourcePlatformState::Unknown;
+    }
+    if unresolved > 0 {
+        return SourcePlatformState::Partial {
+            known: resolved.len() as i64,
+            unknown: unresolved,
+        };
+    }
+    let mut distinct = resolved;
+    distinct.sort_unstable();
+    distinct.dedup();
+    match distinct.as_slice() {
+        [single] => SourcePlatformState::Single((*single).to_string()),
+        many => SourcePlatformState::Mixed(many.len()),
+    }
+}
+
+/// Simple, human-facing wording for [`SourcePlatformState`] - deliberately
+/// avoids "unclassified", "heuristic", and "detected automatically"; a real
+/// platform name is shown whenever the catalogued archives actually agree
+/// on one. Deliberately just the *value*, with no "Platform:" prefix of
+/// its own - the caller (the source card's facts grid) already supplies
+/// that as the row's own label column, so prefixing it here as well would
+/// render as the literal duplicate "Platform: Platform: X".
+pub(crate) fn source_platform_value_label(state: &SourcePlatformState) -> String {
+    match state {
+        SourcePlatformState::NotYetKnown => "not yet known".to_string(),
+        SourcePlatformState::Unknown => "Unknown".to_string(),
+        SourcePlatformState::Single(platform) => platform.clone(),
+        SourcePlatformState::Mixed(count) => format!("Mixed ({count} platforms)"),
+        SourcePlatformState::Partial { known, unknown } => {
+            format!("Partial ({known} known, {unknown} unknown)")
+        }
     }
 }

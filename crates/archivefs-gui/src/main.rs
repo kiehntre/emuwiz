@@ -331,6 +331,7 @@ mod selected_evidence_ui_state;
 use selected_evidence_pipeline::*;
 pub mod selection_guard;
 mod source_state;
+use source_state::{source_platform_state, source_platform_value_label};
 mod sources_page;
 pub mod status_wording;
 use status_wording::{
@@ -588,11 +589,6 @@ use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 use sources_ui_state::SourcesUiState;
 use artwork_media_state::ArtworkMediaState;
-
-struct RunningMissingRemoval {
-    requested_paths: usize,
-    receiver: Receiver<Result<MissingArchiveRemovalResult, String>>,
-}
 
 ///
 /// Projects the already-loaded catalogue into the small collection summary
@@ -871,124 +867,6 @@ pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Resu
         });
     }
     Ok(())
-}
-
-fn apply_missing_removal(
-    archive_paths: &[PathBuf],
-) -> archivefs_core::Result<MissingArchiveRemovalResult> {
-    let database_path = default_database_path()?;
-    apply_missing_removal_at(&database_path, archive_paths)
-}
-
-fn apply_missing_removal_at(
-    database_path: &Path,
-    archive_paths: &[PathBuf],
-) -> archivefs_core::Result<MissingArchiveRemovalResult> {
-    if !database_path.exists() {
-        return Err(ArchiveFsError::Database(format!(
-            "library database does not exist at {}",
-            database_path.display()
-        )));
-    }
-    let mut database = Database::open_or_create(database_path)?;
-    let mut ids = Vec::with_capacity(archive_paths.len());
-    for path in archive_paths {
-        let archive_id = database
-            .find_archive_id_by_absolute_path(path)?
-            .ok_or_else(|| {
-                ArchiveFsError::Database(format!(
-                    "no archive found with exact stored path {}; nothing was removed",
-                    path.display()
-                ))
-            })?;
-        ids.push(archive_id);
-    }
-    database.remove_missing_archives(&ids)
-}
-
-/// A source's actual platform state, derived purely from the archives the
-/// snapshot already has catalogued for it (`PersistedArchive::platform`,
-/// matched by `PersistedArchive::source_folder_id == SourceFolderView::id`),
-/// never a new query, rescan, persisted field, or schema change. This is
-/// ground truth from the same data the Library page already shows, not a
-/// guess: if every catalogued archive under a source agrees on one
-/// platform, that is the source's platform.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SourcePlatformState {
-    /// This source has no catalogued archives yet (never scanned, or
-    /// scanned and found nothing).
-    NotYetKnown,
-    /// Archives exist, but none resolved a platform.
-    Unknown,
-    /// Every catalogued archive agrees on this one platform.
-    Single(String),
-    /// Every catalogued archive resolved a platform, but not to the same
-    /// one - `usize` is the number of distinct platforms found.
-    Mixed(usize),
-    /// Some archives resolved a platform and some did not.
-    Partial { known: i64, unknown: i64 },
-}
-
-/// Computes [`SourcePlatformState`] for one source from the snapshot's full
-/// archive list - an `O(archives)` scan per source, over data already
-/// loaded in memory (never a filesystem rescan; see the type's own doc
-/// comment for why no new persistence is needed).
-fn source_platform_state(
-    view: &SourceFolderView,
-    archives: &[PersistedArchive],
-) -> SourcePlatformState {
-    let Some(source_id) = view.id else {
-        return SourcePlatformState::NotYetKnown;
-    };
-    let mut resolved: Vec<&str> = Vec::new();
-    let mut unresolved: i64 = 0;
-    for archive in archives {
-        if archive.source_folder_id != source_id {
-            continue;
-        }
-        match archive.platform.as_deref() {
-            Some(platform) => resolved.push(platform),
-            None => unresolved += 1,
-        }
-    }
-    if resolved.is_empty() && unresolved == 0 {
-        return SourcePlatformState::NotYetKnown;
-    }
-    if resolved.is_empty() {
-        return SourcePlatformState::Unknown;
-    }
-    if unresolved > 0 {
-        return SourcePlatformState::Partial {
-            known: resolved.len() as i64,
-            unknown: unresolved,
-        };
-    }
-    let mut distinct = resolved;
-    distinct.sort_unstable();
-    distinct.dedup();
-    match distinct.as_slice() {
-        [single] => SourcePlatformState::Single((*single).to_string()),
-        many => SourcePlatformState::Mixed(many.len()),
-    }
-}
-
-/// Simple, human-facing wording for [`SourcePlatformState`] - deliberately
-/// avoids "unclassified", "heuristic", and "detected automatically"; a real
-/// platform name is shown whenever the catalogued archives actually agree
-/// on one. Deliberately just the *value*, with no "Platform:" prefix of
-/// its own - the caller (the source card's facts grid) already supplies
-/// that as the row's own label column, so prefixing it here as well would
-/// render as the literal duplicate "Platform: Platform: X".
-fn source_platform_value_label(state: &SourcePlatformState) -> String {
-    match state {
-        SourcePlatformState::NotYetKnown => "not yet known".to_string(),
-        SourcePlatformState::Unknown => "Unknown".to_string(),
-        SourcePlatformState::Single(platform) => platform.clone(),
-        SourcePlatformState::Mixed(count) => format!("Mixed ({count} platforms)"),
-        SourcePlatformState::Partial { known, unknown } => {
-            format!("Partial ({known} known, {unknown} unknown)")
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

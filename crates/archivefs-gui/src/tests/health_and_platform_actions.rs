@@ -14,6 +14,7 @@
 //! Predominant theme observed in this slice: health dashboard, platform alias/bulk actions.
 
 use super::*;
+use crate::source_state::SourcePlatformState;
 use archivefs_core::ArchiveKind;
 
 #[test]
