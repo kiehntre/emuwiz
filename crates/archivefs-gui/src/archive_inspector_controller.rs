@@ -500,3 +500,242 @@ impl ArchiveFsApp {
         archivefs_core::prepared_member_path(mount_path, &candidate.member_name).ok()
     }
 }
+
+pub(crate) fn show_archive_inspector_panel(
+    ui: &mut egui::Ui,
+    state: &mut ArchiveInspectorState,
+    clipboard: &mut dyn ClipboardBackend,
+) -> bool {
+    let close = widgets::show_tools_overlay_header(ui, "Archive Inspector");
+    ui.horizontal(|ui| {
+        ui.label("Archive:");
+        let path_text = state.archive_path.display().to_string();
+        ui.add(egui::Label::new(&path_text).selectable(true).wrap());
+        if ui.small_button("Copy").clicked() {
+            let _ = clipboard.set_text(path_text.clone());
+        }
+    });
+    ui.add_space(4.0);
+
+    match &state.status {
+        ArchiveInspectorStatus::Loading { .. } => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Inspecting archive - this runs in the background.");
+            });
+            return close;
+        }
+        ArchiveInspectorStatus::Error(message) => {
+            ui.colored_label(ui.visuals().error_fg_color, message);
+            return close;
+        }
+        ArchiveInspectorStatus::Ready(_) => {}
+    }
+    let ArchiveInspectorStatus::Ready(report) = &state.status else {
+        unreachable!("every other status already returned above");
+    };
+
+    if report.truncated {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "Showing the first {} of {} entries - this view is incomplete. Use a more \
+                 specific search to find a particular entry.",
+                report.entries.len(),
+                report.total_entries_in_archive
+            ),
+        );
+        ui.add_space(2.0);
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        for classification in InspectorEntryClassification::ALL {
+            let count = report
+                .entries
+                .iter()
+                .filter(|entry| entry.classification == classification)
+                .count();
+            summary_value(ui, classification.label(), count);
+        }
+    });
+    ui.separator();
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Search path:");
+        show_text_edit_with_context_menu(ui, &mut state.search, clipboard, |text_edit| {
+            text_edit
+                .id_salt("archivefs_inspector_search")
+                .desired_width(260.0)
+        });
+        ui.label("Classification:");
+        egui::ComboBox::from_id_salt("inspector_classification_filter")
+            .selected_text(
+                state
+                    .classification_filter
+                    .map(InspectorEntryClassification::label)
+                    .unwrap_or("All"),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut state.classification_filter, None, "All");
+                for classification in InspectorEntryClassification::ALL {
+                    ui.selectable_value(
+                        &mut state.classification_filter,
+                        Some(classification),
+                        classification.label(),
+                    );
+                }
+            });
+        ui.label("Sort by:");
+        egui::ComboBox::from_id_salt("inspector_sort_field")
+            .selected_text(state.sort_field.to_string())
+            .show_ui(ui, |ui| {
+                for field in [
+                    InspectorSortField::Path,
+                    InspectorSortField::Size,
+                    InspectorSortField::Classification,
+                ] {
+                    ui.selectable_value(&mut state.sort_field, field, field.to_string());
+                }
+            });
+        ui.checkbox(&mut state.sort_ascending, "Ascending");
+    });
+
+    let visible = visible_inspector_entry_indices(
+        &report.entries,
+        &state.search,
+        state.classification_filter,
+        state.sort_field,
+        state.sort_ascending,
+    );
+    ui.horizontal_wrapped(|ui| {
+        summary_value(ui, "Entries shown", visible.len());
+        summary_value(ui, "Total entries", report.entries.len());
+    });
+    ui.separator();
+
+    if report.entries.is_empty() {
+        ui.label("This archive has no entries.");
+        return close;
+    }
+    if visible.is_empty() {
+        ui.label("No entries match the current search/filter.");
+        return close;
+    }
+
+    let row_height = ui
+        .text_style_height(&egui::TextStyle::Body)
+        .max(ui.spacing().interact_size.y);
+    let spacing = ui.spacing().item_spacing.x;
+
+    ui.strong("Entries");
+    egui::ScrollArea::horizontal()
+        .id_salt("inspector_entries_horizontal")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let start_of_frame_width = state.path_column_width;
+            ui.set_min_width(start_of_frame_width + spacing + INSPECTOR_DETAILS_COLUMN_WIDTH);
+
+            let mut path_header_rect = None;
+            ui.horizontal(|ui| {
+                let response = ui.add_sized(
+                    [start_of_frame_width, row_height],
+                    egui::Label::new(egui::RichText::new("Path").strong()),
+                );
+                path_header_rect = Some(response.rect);
+                ui.add_sized(
+                    [INSPECTOR_DETAILS_COLUMN_WIDTH, row_height],
+                    egui::Label::new(egui::RichText::new("Details").strong()),
+                );
+            });
+            if let Some(path_header_rect) = path_header_rect {
+                let handle_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        path_header_rect.right() - COLUMN_RESIZE_HANDLE_WIDTH,
+                        path_header_rect.top(),
+                    ),
+                    egui::vec2(COLUMN_RESIZE_HANDLE_WIDTH, path_header_rect.height()),
+                );
+                show_column_resize_handle(
+                    ui,
+                    egui::Id::new("inspector_path_column_resize"),
+                    handle_rect,
+                    &mut state.path_column_width,
+                );
+            }
+            ui.separator();
+
+            // Re-read after the resize handle, which may have just
+            // changed `state.path_column_width` this very frame - the
+            // rows below must always paint with *this* frame's width,
+            // never a one-frame-stale copy (matches the Library table's
+            // identical fix in `show_loaded_data`).
+            let widths = [state.path_column_width, INSPECTOR_DETAILS_COLUMN_WIDTH];
+
+            let body_height = ui.available_height().max(row_height);
+            egui::ScrollArea::vertical()
+                .id_salt("inspector_entries_vertical")
+                .max_height(body_height)
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, visible.len(), |ui, row_range| {
+                    for visible_index in row_range {
+                        let entry_index = visible[visible_index];
+                        let entry = &report.entries[entry_index];
+                        let selected = state.selected_entry.as_deref() == Some(entry.name.as_str());
+                        let response = show_inspector_row(ui, entry, row_height, selected, &widths);
+                        if response.clicked() {
+                            state.selected_entry = Some(entry.name.clone());
+                        }
+                    }
+                });
+        });
+
+    let Some(selected_name) = state.selected_entry.clone() else {
+        ui.label("Select an entry to view its details.");
+        return close;
+    };
+    let Some(selected_entry) = report
+        .entries
+        .iter()
+        .find(|entry| entry.name == selected_name)
+    else {
+        return close;
+    };
+
+    ui.separator();
+    ui.strong("Selected entry");
+    egui::Grid::new("inspector_selected_entry_details")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            detail_row_with_copy(ui, "Path", &selected_entry.name, clipboard);
+            detail_row(
+                ui,
+                "Type",
+                match selected_entry.kind {
+                    InspectorEntryKind::File => "File",
+                    InspectorEntryKind::Directory => "Directory",
+                },
+            );
+            detail_row(ui, "Classification", selected_entry.classification.label());
+            detail_row(
+                ui,
+                "Uncompressed size",
+                &format_size(Some(selected_entry.uncompressed_size)),
+            );
+            detail_row(
+                ui,
+                "Compressed size",
+                &format_size(selected_entry.compressed_size),
+            );
+            detail_row(
+                ui,
+                "Compression method",
+                selected_entry
+                    .compression_method
+                    .as_deref()
+                    .unwrap_or("Unknown"),
+            );
+        });
+
+    close
+}
