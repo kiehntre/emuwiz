@@ -2707,3 +2707,72 @@ pub(crate) fn compute_scroll_offset_for_focus(
 pub(crate) fn keyboard_shortcuts_blocked_by_focus(ctx: &egui::Context) -> bool {
     ctx.memory(|memory| memory.focused().is_some()) || egui::Popup::is_any_open(ctx)
 }
+
+pub(crate) const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
+
+pub(crate) const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
+
+pub(crate) const MIN_RESIZABLE_COLUMN_WIDTH: f32 = 160.0;
+
+/// An upper bound purely to stop a single wild drag gesture from producing
+/// an absurd column width - not a meaningful design constraint otherwise;
+/// horizontal scrolling (see `show_loaded_data`'s outer
+/// `egui::ScrollArea::horizontal`) is what actually accommodates a wide
+/// column, not this cap.
+pub(crate) const MAX_RESIZABLE_COLUMN_WIDTH: f32 = 2400.0;
+
+/// How much of a resizable column's own trailing edge is reserved for its
+/// drag handle (see `show_header_row`) - deliberately taken out of the
+/// column's own width rather than added on top, so a header button and its
+/// handle never occupy overlapping screen space (and therefore never
+/// compete for the same click/drag).
+pub(crate) const COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
+
+/// The Library table's two user-resizable column widths - Platform and
+/// State are not part of this (see `COLUMN_WIDTHS`'s doc comment); they
+/// stay fixed. Lives on `ArchiveFsApp` for the app's whole session, so a
+/// resize survives navigating away from and back to the Library page
+/// exactly like every other Library-page display preference already does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LibraryColumnWidths {
+    pub(crate) archive_path: f32,
+    pub(crate) mount_path: f32,
+}
+
+impl Default for LibraryColumnWidths {
+    fn default() -> Self {
+        Self {
+            archive_path: COLUMN_WIDTHS[2],
+            mount_path: COLUMN_WIDTHS[3],
+        }
+    }
+}
+
+impl LibraryColumnWidths {
+    /// The full four-column widths array in the same `[Platform, State,
+    /// Archive path, Mount path]` order every rendering function already
+    /// expects - the one place Platform/State's fixed widths and the two
+    /// resizable ones are combined.
+    pub(crate) fn as_array(&self) -> [f32; 4] {
+        [
+            COLUMN_WIDTHS[0],
+            COLUMN_WIDTHS[1],
+            self.archive_path,
+            self.mount_path,
+        ]
+    }
+}
+
+pub(crate) fn responsive_library_column_widths(
+    available_width: f32,
+    spacing: f32,
+) -> LibraryColumnWidths {
+    let fixed = COLUMN_WIDTHS[0] + COLUMN_WIDTHS[1] + spacing * 3.0;
+    let path_space = (available_width - fixed).max(520.0);
+    LibraryColumnWidths {
+        archive_path: (path_space * 0.46).max(240.0),
+        mount_path: (path_space * 0.54).max(280.0),
+    }
+}
+
+pub(crate) const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";

@@ -893,3 +893,46 @@ pub(crate) enum ToolsOverlay {
     /// Emulator Setup page methods rather than one fixed renderer.
     Onboarding,
 }
+
+/// The unified Library shell's chrome: the shared "Library" heading and
+/// the five-tab selector, rendered identically regardless of which tab is
+/// selected. Content dispatch (`match self.library_tab { ... }`) stays in
+/// `ArchiveFsApp::update`'s central-panel closure, since each arm needs
+/// direct `&mut self` field access the existing per-page renderers
+/// already require (`self.health_duplicate_ui.health_filters`, `self.health_duplicate_ui.duplicate_filters`,
+/// `self.library_views`, ...) - bundling all of that into this function's
+/// parameters would mean exactly the giant parameter-heavy universal
+/// renderer this milestone was asked to avoid. Broken out on its own so
+/// the chrome itself - which tabs render, in which order, with which
+/// labels, and that a click returns the right `LibraryTab` - is directly
+/// testable without going through a full `eframe::App::update` call.
+pub(crate) fn show_library_shell_header(
+    ui: &mut egui::Ui,
+    current_tab: LibraryTab,
+) -> Option<LibraryTab> {
+    widgets::page_header_with_icon(
+        ui,
+        crate::ui::icons::GAMES,
+        "My Games",
+        "Browse and manage your game library.",
+    );
+    let tab_options: [(LibraryTab, &str); 5] = [
+        (
+            LibraryTab::Archives,
+            library_tab_label(LibraryTab::Archives),
+        ),
+        (LibraryTab::Health, library_tab_label(LibraryTab::Health)),
+        (
+            LibraryTab::Duplicates,
+            library_tab_label(LibraryTab::Duplicates),
+        ),
+        (LibraryTab::Views, library_tab_label(LibraryTab::Views)),
+        (
+            LibraryTab::RecentlyFound,
+            library_tab_label(LibraryTab::RecentlyFound),
+        ),
+    ];
+    let clicked = widgets::tab_row(ui, &tab_options, current_tab);
+    ui.add_space(8.0);
+    clicked
+}

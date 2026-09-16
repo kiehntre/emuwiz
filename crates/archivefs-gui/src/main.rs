@@ -236,8 +236,8 @@ use navigation::{
     main_view_for_home_card, main_view_for_library_tab, main_view_for_problems_repair_tab,
     main_view_for_sources_tab, main_view_title, main_view_uses_page_scroll, nav_overlay,
     nav_quick_rename, nav_romm, nav_view, navigation_destination_enabled,
-    navigation_destination_selected, problems_repair_tab_for_main_view, show_primary_navigation,
-    sources_tab_for_main_view, sources_tab_label,
+    navigation_destination_selected, problems_repair_tab_for_main_view, show_library_shell_header,
+    show_primary_navigation, sources_tab_for_main_view, sources_tab_label,
 };
 mod selected_game_panel;
 use selected_game_panel::*;
@@ -397,65 +397,6 @@ use ui::platform_artwork::{
     platform_asset_category, platform_asset_id,
 };
 use ui::{components as widgets, layout as ui_layout, theme};
-const COLUMN_WIDTHS: [f32; 4] = [120.0, 120.0, 440.0, 520.0];
-const COLUMN_HEADERS: [&str; 4] = ["Platform", "State", "Archive path", "Mount path"];
-const MIN_RESIZABLE_COLUMN_WIDTH: f32 = 160.0;
-/// An upper bound purely to stop a single wild drag gesture from producing
-/// an absurd column width - not a meaningful design constraint otherwise;
-/// horizontal scrolling (see `show_loaded_data`'s outer
-/// `egui::ScrollArea::horizontal`) is what actually accommodates a wide
-/// column, not this cap.
-const MAX_RESIZABLE_COLUMN_WIDTH: f32 = 2400.0;
-/// How much of a resizable column's own trailing edge is reserved for its
-/// drag handle (see `show_header_row`) - deliberately taken out of the
-/// column's own width rather than added on top, so a header button and its
-/// handle never occupy overlapping screen space (and therefore never
-/// compete for the same click/drag).
-const COLUMN_RESIZE_HANDLE_WIDTH: f32 = 8.0;
-/// The Library table's two user-resizable column widths - Platform and
-/// State are not part of this (see `COLUMN_WIDTHS`'s doc comment); they
-/// stay fixed. Lives on `ArchiveFsApp` for the app's whole session, so a
-/// resize survives navigating away from and back to the Library page
-/// exactly like every other Library-page display preference already does.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct LibraryColumnWidths {
-    archive_path: f32,
-    mount_path: f32,
-}
-
-impl Default for LibraryColumnWidths {
-    fn default() -> Self {
-        Self {
-            archive_path: COLUMN_WIDTHS[2],
-            mount_path: COLUMN_WIDTHS[3],
-        }
-    }
-}
-
-impl LibraryColumnWidths {
-    /// The full four-column widths array in the same `[Platform, State,
-    /// Archive path, Mount path]` order every rendering function already
-    /// expects - the one place Platform/State's fixed widths and the two
-    /// resizable ones are combined.
-    fn as_array(&self) -> [f32; 4] {
-        [
-            COLUMN_WIDTHS[0],
-            COLUMN_WIDTHS[1],
-            self.archive_path,
-            self.mount_path,
-        ]
-    }
-}
-
-fn responsive_library_column_widths(available_width: f32, spacing: f32) -> LibraryColumnWidths {
-    let fixed = COLUMN_WIDTHS[0] + COLUMN_WIDTHS[1] + spacing * 3.0;
-    let path_space = (available_width - fixed).max(520.0);
-    LibraryColumnWidths {
-        archive_path: (path_space * 0.46).max(240.0),
-        mount_path: (path_space * 0.54).max(280.0),
-    }
-}
-
 const HEALTH_METRIC_MIN_WIDTH: f32 = 148.0;
 const HEALTH_METRIC_HEIGHT: f32 = 58.0;
 fn responsive_card_columns(
@@ -471,7 +412,6 @@ fn responsive_card_columns(
         .clamp(1, item_count)
 }
 
-const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
 fn gui_version_line() -> String {
     format!("emuwiz {}", env!("CARGO_PKG_VERSION"))
 }
@@ -935,46 +875,6 @@ fn home_library_snapshot(snapshot: &CachedLibrarySnapshot) -> home_page::HomeLib
         platforms,
         romm_media_coverage: None,
     }
-}
-
-/// The unified Library shell's chrome: the shared "Library" heading and
-/// the five-tab selector, rendered identically regardless of which tab is
-/// selected. Content dispatch (`match self.library_tab { ... }`) stays in
-/// `ArchiveFsApp::update`'s central-panel closure, since each arm needs
-/// direct `&mut self` field access the existing per-page renderers
-/// already require (`self.health_duplicate_ui.health_filters`, `self.health_duplicate_ui.duplicate_filters`,
-/// `self.library_views`, ...) - bundling all of that into this function's
-/// parameters would mean exactly the giant parameter-heavy universal
-/// renderer this milestone was asked to avoid. Broken out on its own so
-/// the chrome itself - which tabs render, in which order, with which
-/// labels, and that a click returns the right `LibraryTab` - is directly
-/// testable without going through a full `eframe::App::update` call.
-fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Option<LibraryTab> {
-    widgets::page_header_with_icon(
-        ui,
-        crate::ui::icons::GAMES,
-        "My Games",
-        "Browse and manage your game library.",
-    );
-    let tab_options: [(LibraryTab, &str); 5] = [
-        (
-            LibraryTab::Archives,
-            library_tab_label(LibraryTab::Archives),
-        ),
-        (LibraryTab::Health, library_tab_label(LibraryTab::Health)),
-        (
-            LibraryTab::Duplicates,
-            library_tab_label(LibraryTab::Duplicates),
-        ),
-        (LibraryTab::Views, library_tab_label(LibraryTab::Views)),
-        (
-            LibraryTab::RecentlyFound,
-            library_tab_label(LibraryTab::RecentlyFound),
-        ),
-    ];
-    let clicked = widgets::tab_row(ui, &tab_options, current_tab);
-    ui.add_space(8.0);
-    clicked
 }
 
 /// Whether the RetroArch cheat-database status should be (re)loaded for the
