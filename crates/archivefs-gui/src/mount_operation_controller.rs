@@ -171,15 +171,15 @@ impl ArchiveFsApp {
 
         let (sender, receiver) = mpsc::channel();
         let (progress_sender, progress_receiver) = mpsc::channel();
-        self.confirm_mount_all = None;
-        self.confirm_unmount_all = None;
-        self.confirm_unmount_selected = None;
-        self.focus_mount_all_cancel = false;
-        self.confirm_unmount = None;
-        self.confirm_lazy_unmount = None;
-        self.confirm_lazy_unmount_final = None;
-        self.focus_lazy_cancel = false;
-        self.focus_final_lazy_cancel = false;
+        self.mount_ui.confirm_mount_all = None;
+        self.mount_ui.confirm_unmount_all = None;
+        self.mount_ui.confirm_unmount_selected = None;
+        self.mount_ui.focus_mount_all_cancel = false;
+        self.mount_ui.confirm_unmount = None;
+        self.mount_ui.confirm_lazy_unmount = None;
+        self.mount_ui.confirm_lazy_unmount_final = None;
+        self.mount_ui.focus_lazy_cancel = false;
+        self.mount_ui.focus_final_lazy_cancel = false;
         self.feedback = None;
         self.history.record(HistoryEntry::new(
             ActivityAction::from(action),
@@ -192,7 +192,7 @@ impl ArchiveFsApp {
                 ArchiveAction::Remount => "Remount started.",
             },
         ));
-        self.operation = Some(RunningOperation {
+        self.mount_ui.operation = Some(RunningOperation {
             action,
             archive_path: archive_path.clone(),
             receiver,
@@ -208,6 +208,7 @@ impl ArchiveFsApp {
 
     fn record_pending_operation_progress(&mut self) {
         let progress = self
+            .mount_ui
             .operation
             .as_ref()
             .map(|operation| operation.progress_receiver.try_iter().collect::<Vec<_>>())
@@ -224,7 +225,7 @@ impl ArchiveFsApp {
     pub(crate) fn poll_operation(&mut self, context: &egui::Context) {
         self.record_pending_operation_progress();
 
-        let result = self.operation.as_ref().and_then(|operation| {
+        let result = self.mount_ui.operation.as_ref().and_then(|operation| {
             let result = match operation.receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
@@ -241,7 +242,7 @@ impl ArchiveFsApp {
         }
 
         if let Some((action, archive_path, result)) = result {
-            self.operation = None;
+            self.mount_ui.operation = None;
             match result {
                 Ok(success) => {
                     self.history.record(HistoryEntry::new(
@@ -266,8 +267,8 @@ impl ArchiveFsApp {
                     });
                     match action {
                         ArchiveAction::Unmount | ArchiveAction::LazyUnmount => {
-                            self.lazy_unmount_offers.remove(&archive_path);
-                            self.remount_offers.insert(archive_path.clone());
+                            self.mount_ui.lazy_unmount_offers.remove(&archive_path);
+                            self.mount_ui.remount_offers.insert(archive_path.clone());
                             self.history.record(HistoryEntry::new(
                                 ActivityAction::Remount,
                                 Some(archive_path),
@@ -276,7 +277,7 @@ impl ArchiveFsApp {
                             ));
                         }
                         ArchiveAction::Remount => {
-                            self.remount_offers.remove(&archive_path);
+                            self.mount_ui.remount_offers.remove(&archive_path);
                         }
                         ArchiveAction::Mount => {}
                     }
@@ -297,7 +298,7 @@ impl ArchiveFsApp {
                         activity_message,
                     ));
                     if normal_unmount_recovery {
-                        self.lazy_unmount_offers.insert(archive_path.clone());
+                        self.mount_ui.lazy_unmount_offers.insert(archive_path.clone());
                         self.history.record(HistoryEntry::new(
                             ActivityAction::LazyUnmount,
                             Some(archive_path),

@@ -2055,7 +2055,7 @@ fn cached_health_issues_refreshes_when_recovery_offers_change() {
     let mut app = app_with_health_state(vec![record], Vec::new());
     assert!(app.cached_health_issues().is_empty());
 
-    app.remount_offers.insert(PathBuf::from("/roms/b.zip"));
+    app.mount_ui.remount_offers.insert(PathBuf::from("/roms/b.zip"));
     let issues = app.cached_health_issues();
 
     assert_eq!(

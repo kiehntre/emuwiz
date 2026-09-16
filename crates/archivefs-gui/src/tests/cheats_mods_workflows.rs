@@ -967,7 +967,7 @@ fn dolphin_code_picker_renders_the_already_enabled_distinction_and_toggle_action
 #[test]
 fn route_change_drops_stale_pcsx2_result_and_preserves_archive_state() {
     let mut app = app_with_cheats_mods_context();
-    app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+    app.mount_ui.mount_queue.push(PathBuf::from("/roms/queued.zip"));
     let workflow = app.cheat_workflow.as_mut().unwrap();
     workflow.platform = Some("PS2".to_string());
     workflow.adapter = CheatEmulatorAdapter::Pcsx2;
@@ -1011,7 +1011,7 @@ fn route_change_drops_stale_pcsx2_result_and_preserves_archive_state() {
         app.cheat_workflow.as_ref().unwrap().pcsx2_inventory,
         CheatStepResource::NotLoaded
     ));
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
     assert_eq!(
         app.archive_context.focused,
         Some(PathBuf::from("/roms/a.zip"))
@@ -1176,7 +1176,7 @@ fn persisted_wbfs_identity_seeds_cheats_workspace_after_restart() {
 #[test]
 fn preview_result_is_rejected_after_profile_source_or_page_changes() {
     let mut app = app_with_cheats_mods_context();
-    app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+    app.mount_ui.mount_queue.push(PathBuf::from("/roms/queued.zip"));
     let workflow = app.cheat_workflow.as_mut().unwrap();
     let old_key = cheat_preview_key(workflow);
     let (sender, receiver) = mpsc::channel();
@@ -1231,7 +1231,7 @@ fn preview_result_is_rejected_after_profile_source_or_page_changes() {
         app.cheat_workflow.as_ref().unwrap().preview,
         CheatStepResource::NotLoaded
     ));
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
     assert_eq!(
         app.archive_context.focused,
         Some(PathBuf::from("/roms/a.zip"))
@@ -2376,13 +2376,13 @@ fn ps2_archive_context_defaults_to_pcsx2_without_queue_or_mount_mutation() {
     if let LoadState::Ready(data) = &mut app.state {
         data.records.push(ps2);
     }
-    app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+    app.mount_ui.mount_queue.push(PathBuf::from("/roms/queued.zip"));
     app.archive_context.focused = Some(PathBuf::from("/roms/other.zip"));
     assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.zip")));
     let workflow = app.cheat_workflow.as_ref().unwrap();
     assert_eq!(workflow.adapter, CheatEmulatorAdapter::Pcsx2);
     assert_eq!(workflow.archive_path, PathBuf::from("/roms/game.zip"));
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
     assert_eq!(
         app.archive_context.focused,
         Some(PathBuf::from("/roms/other.zip"))
@@ -2826,7 +2826,7 @@ fn preview_only_safety_message_is_preserved() {
 #[test]
 fn stale_catalogue_result_is_rejected_without_touching_library_state() {
     let mut app = app_for_operation_tests();
-    app.mount_queue.push(PathBuf::from("/roms/queued.zip"));
+    app.mount_ui.mount_queue.push(PathBuf::from("/roms/queued.zip"));
     app.archive_context.focused = Some(PathBuf::from("/roms/Alien 3.md"));
     let (sender, receiver) = mpsc::channel();
     sender
@@ -2849,7 +2849,7 @@ fn stale_catalogue_result_is_rejected_without_touching_library_state() {
     app.poll_catalogue_manager(&egui::Context::default());
     assert!(app.catalogue_bsfree_ui.catalogue_retrieval.is_none());
     assert!(app.catalogue_bsfree_ui.catalogue_last_result.is_none());
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
     assert_eq!(
         app.archive_context.focused,
         Some(PathBuf::from("/roms/Alien 3.md"))
@@ -3069,7 +3069,7 @@ fn cheats_mods_navigation_and_reconciliation_track_selection_without_touching_th
     }
     app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
-    app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+    app.mount_ui.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
     app.retroarch_profiles =
         RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
 
@@ -3079,7 +3079,7 @@ fn cheats_mods_navigation_and_reconciliation_track_selection_without_touching_th
         Some(Path::new("/roms/a.zip"))
     );
     assert_eq!(app.archive_context.selected.len(), 1);
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
 
     // Matching selection: the full-page workflow stays available.
     app.reconcile_cheats_mods_context(&ctx);
@@ -3113,7 +3113,7 @@ fn cheats_mods_navigation_and_reconciliation_track_selection_without_touching_th
         1,
         "selected_archives is untouched by reconciliation - only the explicit clear/select paths update it"
     );
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
 }
 
 #[test]
@@ -3466,7 +3466,7 @@ fn explicit_cheat_archive_choice_changes_only_workspace_context() {
     }
     app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
-    app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+    app.mount_ui.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
 
     assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip")));
     {
@@ -3487,7 +3487,7 @@ fn explicit_cheat_archive_choice_changes_only_workspace_context() {
         Some(Path::new("/roms/a.zip"))
     );
     assert_eq!(app.archive_context.selected.len(), 1);
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
     let LoadState::Ready(data) = &app.state else {
         panic!("test fixture must remain ready");
     };
@@ -3648,7 +3648,7 @@ fn loose_rom_context_menu_has_no_mount_action_but_keeps_cheats_mods() {
 #[test]
 fn returning_to_cheats_mods_preserves_completed_workflow_state_and_queue() {
     let mut app = app_with_cheats_mods_context();
-    app.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
+    app.mount_ui.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
     app.cheat_workflow.as_mut().unwrap().source_fetch = CheatStepResource::Ready(
         cheat_fetch_result_for("source-a", CheatSourceFetchStatus::OfflineReused),
     );
@@ -3664,7 +3664,7 @@ fn returning_to_cheats_mods_preserves_completed_workflow_state_and_queue() {
         app.cheat_workflow.as_ref().unwrap().source_fetch,
         CheatStepResource::Ready(_)
     ));
-    assert_eq!(app.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
+    assert_eq!(app.mount_ui.mount_queue, vec![PathBuf::from("/roms/queued.zip")]);
     assert_eq!(app.view, MainView::CheatsMods);
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
 }

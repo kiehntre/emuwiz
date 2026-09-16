@@ -1661,7 +1661,7 @@ fn mount_all_setup_failure_is_terminal_and_truthful() {
 fn mount_all_setup_failure_records_failed_activity_and_feedback() {
     let mut app = app_for_operation_tests();
     let (sender, receiver) = mpsc::channel();
-    app.mount_all = Some(RunningMountAll {
+    app.mount_ui.mount_all = Some(RunningMountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: MountAllProgress {
@@ -1691,7 +1691,7 @@ fn mount_all_setup_failure_records_failed_activity_and_feedback() {
             && entry.outcome == ActivityOutcome::Failed
             && entry.message.contains("configuration could not be loaded")
     }));
-    let result = app.mount_all_result.as_ref().unwrap();
+    let result = app.mount_ui.mount_all_result.as_ref().unwrap();
     assert_eq!(result.unattempted, 4);
     assert!(result.skipped.is_empty());
 }
@@ -1762,7 +1762,7 @@ fn selected_record_lookup_uses_the_exact_archive_path() {
 fn mount_all_is_rejected_while_an_individual_operation_is_active() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.operation = Some(RunningOperation {
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Mount,
         archive_path: PathBuf::from("/roms/Active.zip"),
         receiver,
@@ -1773,7 +1773,7 @@ fn mount_all_is_rejected_while_an_individual_operation_is_active() {
         egui::Context::default(),
         vec![mount_all_item("Pending", "Pending")],
     ));
-    assert!(app.mount_all.is_none());
+    assert!(app.mount_ui.mount_all.is_none());
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::MountAll && entry.outcome == ActivityOutcome::Rejected
     }));
@@ -1783,7 +1783,7 @@ fn mount_all_is_rejected_while_an_individual_operation_is_active() {
 fn individual_actions_are_unavailable_during_mount_all() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.mount_all = Some(RunningMountAll {
+    app.mount_ui.mount_all = Some(RunningMountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: MountAllProgress {
@@ -1813,7 +1813,7 @@ fn mount_all_stop_request_is_recorded_and_signalled() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
-    app.mount_all = Some(RunningMountAll {
+    app.mount_ui.mount_all = Some(RunningMountAll {
         receiver,
         stop: Arc::clone(&stop),
         progress: MountAllProgress {
@@ -1825,7 +1825,7 @@ fn mount_all_stop_request_is_recorded_and_signalled() {
     app.request_mount_all_stop();
 
     assert!(stop.load(Ordering::Acquire));
-    assert!(app.mount_all.as_ref().unwrap().progress.stop_requested);
+    assert!(app.mount_ui.mount_all.as_ref().unwrap().progress.stop_requested);
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::MountAll
             && entry.outcome == ActivityOutcome::Cancelled
@@ -1846,7 +1846,7 @@ fn mount_all_activity_records_batch_and_archive_outcomes() {
         ActivityOutcome::Started,
         "Mount All started.",
     ));
-    app.mount_all = Some(RunningMountAll {
+    app.mount_ui.mount_all = Some(RunningMountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: MountAllProgress {
@@ -1894,7 +1894,7 @@ fn mount_all_activity_records_batch_and_archive_outcomes() {
 
     app.poll_mount_all(&egui::Context::default());
 
-    assert!(app.mount_all.is_none());
+    assert!(app.mount_ui.mount_all.is_none());
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::MountAll && entry.outcome == ActivityOutcome::Completed
     }));
@@ -1917,7 +1917,7 @@ fn mount_all_activity_records_batch_and_archive_outcomes() {
 fn start_operation_rejects_a_second_operation_without_replacing_the_receiver() {
     let mut app = app_for_operation_tests();
     let (sender, receiver) = mpsc::channel();
-    app.operation = Some(RunningOperation {
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Mount,
         archive_path: PathBuf::from("/roms/Alpha.zip"),
         receiver,
@@ -1930,7 +1930,7 @@ fn start_operation_rejects_a_second_operation_without_replacing_the_receiver() {
         PathBuf::from("/roms/Beta.7z"),
         true,
     ));
-    assert_eq!(app.operation.as_ref().unwrap().action, ArchiveAction::Mount);
+    assert_eq!(app.mount_ui.operation.as_ref().unwrap().action, ArchiveAction::Mount);
 
     sender
         .send(Ok(OperationSuccess {
@@ -1940,6 +1940,7 @@ fn start_operation_rejects_a_second_operation_without_replacing_the_receiver() {
         }))
         .unwrap();
     let result = app
+        .mount_ui
         .operation
         .as_ref()
         .unwrap()
@@ -1965,7 +1966,7 @@ fn start_operation_rejects_a_second_operation_without_replacing_the_receiver() {
 #[test]
 fn starting_an_operation_clears_pending_unmount_confirmation() {
     let mut app = app_for_operation_tests();
-    app.confirm_unmount = Some(PathBuf::from("/roms/Alpha.zip"));
+    app.mount_ui.confirm_unmount = Some(PathBuf::from("/roms/Alpha.zip"));
 
     assert!(app.start_operation_with_worker(
         egui::Context::default(),
@@ -1980,8 +1981,8 @@ fn starting_an_operation_clears_pending_unmount_confirmation() {
             })
         },
     ));
-    assert!(app.confirm_unmount.is_none());
-    assert!(app.operation.is_some());
+    assert!(app.mount_ui.confirm_unmount.is_none());
+    assert!(app.mount_ui.operation.is_some());
 }
 
 #[test]
@@ -2143,7 +2144,7 @@ fn cleanup_started_progress_is_recorded_before_the_final_result() {
     let mount_path = PathBuf::from("/mount/Game");
     let (result_sender, result_receiver) = mpsc::channel();
     let (progress_sender, progress_receiver) = mpsc::channel();
-    app.operation = Some(RunningOperation {
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Unmount,
         archive_path: archive_path.clone(),
         receiver: result_receiver,
@@ -2155,7 +2156,7 @@ fn cleanup_started_progress_is_recorded_before_the_final_result() {
         .unwrap();
     app.poll_operation(&egui::Context::default());
 
-    assert!(app.operation.is_some());
+    assert!(app.mount_ui.operation.is_some());
     let latest = app.history.entries().next().unwrap();
     assert_eq!(latest.action, ActivityAction::Cleanup);
     assert_eq!(latest.outcome, ActivityOutcome::Started);
@@ -2194,7 +2195,7 @@ fn cleanup_progress_is_not_lost_when_the_final_result_is_already_ready() {
     let mount_path = PathBuf::from("/mount/Game");
     let (result_sender, result_receiver) = mpsc::channel();
     let (progress_sender, progress_receiver) = mpsc::channel();
-    app.operation = Some(RunningOperation {
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Unmount,
         archive_path,
         receiver: result_receiver,
@@ -2329,7 +2330,7 @@ fn normal_unmount_failure_offers_lazy_recovery_and_records_activity() {
     let mut app = app_for_operation_tests();
     let archive_path = PathBuf::from("/roms/Game.zip");
     let (sender, receiver) = mpsc::channel();
-    app.operation = Some(RunningOperation {
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Unmount,
         archive_path: archive_path.clone(),
         receiver,
@@ -2344,7 +2345,7 @@ fn normal_unmount_failure_offers_lazy_recovery_and_records_activity() {
 
     app.poll_operation(&egui::Context::default());
 
-    assert!(app.lazy_unmount_offers.contains(&archive_path));
+    assert!(app.mount_ui.lazy_unmount_offers.contains(&archive_path));
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::Unmount
             && entry.outcome == ActivityOutcome::Failed
@@ -2370,8 +2371,8 @@ fn successful_lazy_unmount_with_cleanup_failure_still_offers_remount() {
     let archive_path = PathBuf::from("/roms/Game.zip");
     let mount_path = PathBuf::from("/mount/Game");
     let (sender, receiver) = mpsc::channel();
-    app.lazy_unmount_offers.insert(archive_path.clone());
-    app.operation = Some(RunningOperation {
+    app.mount_ui.lazy_unmount_offers.insert(archive_path.clone());
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::LazyUnmount,
         archive_path: archive_path.clone(),
         receiver,
@@ -2390,8 +2391,8 @@ fn successful_lazy_unmount_with_cleanup_failure_still_offers_remount() {
 
     app.poll_operation(&egui::Context::default());
 
-    assert!(app.remount_offers.contains(&archive_path));
-    assert!(!app.lazy_unmount_offers.contains(&archive_path));
+    assert!(app.mount_ui.remount_offers.contains(&archive_path));
+    assert!(!app.mount_ui.lazy_unmount_offers.contains(&archive_path));
     assert!(app.feedback.as_ref().unwrap().succeeded);
     assert!(
         !app.feedback
@@ -2419,9 +2420,9 @@ fn successful_remount_clears_offer_and_records_completion() {
     let archive_path = PathBuf::from("/roms/Game.zip");
     let other_archive = PathBuf::from("/roms/Other.zip");
     let (sender, receiver) = mpsc::channel();
-    app.remount_offers.insert(archive_path.clone());
-    app.remount_offers.insert(other_archive.clone());
-    app.operation = Some(RunningOperation {
+    app.mount_ui.remount_offers.insert(archive_path.clone());
+    app.mount_ui.remount_offers.insert(other_archive.clone());
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Remount,
         archive_path: archive_path.clone(),
         receiver,
@@ -2437,8 +2438,8 @@ fn successful_remount_clears_offer_and_records_completion() {
 
     app.poll_operation(&egui::Context::default());
 
-    assert!(!app.remount_offers.contains(&archive_path));
-    assert!(app.remount_offers.contains(&other_archive));
+    assert!(!app.mount_ui.remount_offers.contains(&archive_path));
+    assert!(app.mount_ui.remount_offers.contains(&other_archive));
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::Remount && entry.outcome == ActivityOutcome::Completed
     }));
@@ -2449,7 +2450,7 @@ fn successful_normal_unmount_offers_remount() {
     let mut app = app_for_operation_tests();
     let archive_path = PathBuf::from("/roms/Game.zip");
     let (sender, receiver) = mpsc::channel();
-    app.operation = Some(RunningOperation {
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Unmount,
         archive_path: archive_path.clone(),
         receiver,
@@ -2465,7 +2466,7 @@ fn successful_normal_unmount_offers_remount() {
 
     app.poll_operation(&egui::Context::default());
 
-    assert!(app.remount_offers.contains(&archive_path));
+    assert!(app.mount_ui.remount_offers.contains(&archive_path));
 }
 
 #[test]
@@ -2473,8 +2474,8 @@ fn failed_remount_preserves_offer_and_records_failure() {
     let mut app = app_for_operation_tests();
     let archive_path = PathBuf::from("/roms/Game.zip");
     let (sender, receiver) = mpsc::channel();
-    app.remount_offers.insert(archive_path.clone());
-    app.operation = Some(RunningOperation {
+    app.mount_ui.remount_offers.insert(archive_path.clone());
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Remount,
         archive_path: archive_path.clone(),
         receiver,
@@ -2489,7 +2490,7 @@ fn failed_remount_preserves_offer_and_records_failure() {
 
     app.poll_operation(&egui::Context::default());
 
-    assert!(app.remount_offers.contains(&archive_path));
+    assert!(app.mount_ui.remount_offers.contains(&archive_path));
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::Remount
             && entry.outcome == ActivityOutcome::Failed
@@ -2503,8 +2504,8 @@ fn mounting_another_archive_preserves_existing_remount_offer() {
     let offered_archive = PathBuf::from("/roms/Game.zip");
     let mounted_archive = PathBuf::from("/roms/Other.zip");
     let (sender, receiver) = mpsc::channel();
-    app.remount_offers.insert(offered_archive.clone());
-    app.operation = Some(RunningOperation {
+    app.mount_ui.remount_offers.insert(offered_archive.clone());
+    app.mount_ui.operation = Some(RunningOperation {
         action: ArchiveAction::Mount,
         archive_path: mounted_archive,
         receiver,
@@ -2520,7 +2521,7 @@ fn mounting_another_archive_preserves_existing_remount_offer() {
 
     app.poll_operation(&egui::Context::default());
 
-    assert!(app.remount_offers.contains(&offered_archive));
+    assert!(app.mount_ui.remount_offers.contains(&offered_archive));
 }
 
 #[test]
@@ -2712,7 +2713,7 @@ fn unmount_all_setup_failure_is_terminal_and_truthful() {
 fn unmount_all_marks_the_app_busy_and_blocks_individual_actions() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.unmount_all = Some(RunningUnmountAll {
+    app.mount_ui.unmount_all = Some(RunningUnmountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: UnmountAllProgress::default(),
@@ -2728,7 +2729,7 @@ fn unmount_all_activity_records_batch_archive_cleanup_and_recovery_lifecycle() {
     let item = unmount_all_item("Game");
     let failed = unmount_all_item("Busy");
     let (sender, receiver) = mpsc::channel();
-    app.unmount_all = Some(RunningUnmountAll {
+    app.mount_ui.unmount_all = Some(RunningUnmountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: UnmountAllProgress {
@@ -2789,7 +2790,7 @@ fn unmount_all_activity_records_batch_archive_cleanup_and_recovery_lifecycle() {
     assert!(app.history.entries().any(|entry| {
         entry.action == ActivityAction::UnmountAll && entry.outcome == ActivityOutcome::Completed
     }));
-    assert!(app.lazy_unmount_offers.contains(&failed.archive_path));
+    assert!(app.mount_ui.lazy_unmount_offers.contains(&failed.archive_path));
 }
 
 #[test]
@@ -2797,9 +2798,9 @@ fn successful_batch_unmount_clears_only_its_previous_lazy_offer() {
     let mut app = app_for_operation_tests();
     let item = unmount_all_item("Game");
     let other = PathBuf::from("/roms/Other.zip");
-    app.lazy_unmount_offers = HashSet::from([item.archive_path.clone(), other.clone()]);
+    app.mount_ui.lazy_unmount_offers = HashSet::from([item.archive_path.clone(), other.clone()]);
     let (sender, receiver) = mpsc::channel();
-    app.unmount_all = Some(RunningUnmountAll {
+    app.mount_ui.unmount_all = Some(RunningUnmountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: UnmountAllProgress::default(),
@@ -2810,12 +2811,12 @@ fn successful_batch_unmount_clears_only_its_previous_lazy_offer() {
 
     app.poll_unmount_all(&egui::Context::default());
 
-    assert!(!app.lazy_unmount_offers.contains(&item.archive_path));
-    assert!(app.lazy_unmount_offers.contains(&other));
+    assert!(!app.mount_ui.lazy_unmount_offers.contains(&item.archive_path));
+    assert!(app.mount_ui.lazy_unmount_offers.contains(&other));
     let mounted_again = record("/roms/Game.zip", MountState::Mounted);
     assert!(!lazy_unmount_available(
         &mounted_again,
-        &app.lazy_unmount_offers,
+        &app.mount_ui.lazy_unmount_offers,
         false,
     ));
 }
@@ -2825,9 +2826,9 @@ fn no_longer_mounted_batch_skip_clears_only_its_previous_lazy_offer() {
     let mut app = app_for_operation_tests();
     let item = unmount_all_item("Game");
     let other = PathBuf::from("/roms/Other.zip");
-    app.lazy_unmount_offers = HashSet::from([item.archive_path.clone(), other.clone()]);
+    app.mount_ui.lazy_unmount_offers = HashSet::from([item.archive_path.clone(), other.clone()]);
     let (sender, receiver) = mpsc::channel();
-    app.unmount_all = Some(RunningUnmountAll {
+    app.mount_ui.unmount_all = Some(RunningUnmountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: UnmountAllProgress::default(),
@@ -2841,8 +2842,8 @@ fn no_longer_mounted_batch_skip_clears_only_its_previous_lazy_offer() {
 
     app.poll_unmount_all(&egui::Context::default());
 
-    assert!(!app.lazy_unmount_offers.contains(&item.archive_path));
-    assert!(app.lazy_unmount_offers.contains(&other));
+    assert!(!app.mount_ui.lazy_unmount_offers.contains(&item.archive_path));
+    assert!(app.mount_ui.lazy_unmount_offers.contains(&other));
 }
 
 #[test]
@@ -2850,7 +2851,7 @@ fn failed_normal_batch_unmount_retains_its_exact_lazy_offer() {
     let mut app = app_for_operation_tests();
     let item = unmount_all_item("Busy");
     let (sender, receiver) = mpsc::channel();
-    app.unmount_all = Some(RunningUnmountAll {
+    app.mount_ui.unmount_all = Some(RunningUnmountAll {
         receiver,
         stop: Arc::new(AtomicBool::new(false)),
         progress: UnmountAllProgress::default(),
@@ -2865,7 +2866,7 @@ fn failed_normal_batch_unmount_retains_its_exact_lazy_offer() {
 
     app.poll_unmount_all(&egui::Context::default());
 
-    assert!(app.lazy_unmount_offers.contains(&item.archive_path));
+    assert!(app.mount_ui.lazy_unmount_offers.contains(&item.archive_path));
 }
 
 #[test]

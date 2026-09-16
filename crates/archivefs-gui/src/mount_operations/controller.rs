@@ -28,15 +28,15 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        self.confirm_mount_all = None;
-        self.confirm_unmount_all = None;
-        self.confirm_unmount_selected = None;
-        self.focus_mount_all_cancel = false;
-        self.confirm_unmount = None;
-        self.confirm_lazy_unmount = None;
-        self.confirm_lazy_unmount_final = None;
-        self.mount_all_result = None;
-        self.unmount_all_result = None;
+        self.mount_ui.confirm_mount_all = None;
+        self.mount_ui.confirm_unmount_all = None;
+        self.mount_ui.confirm_unmount_selected = None;
+        self.mount_ui.focus_mount_all_cancel = false;
+        self.mount_ui.confirm_unmount = None;
+        self.mount_ui.confirm_lazy_unmount = None;
+        self.mount_ui.confirm_lazy_unmount_final = None;
+        self.mount_ui.mount_all_result = None;
+        self.mount_ui.unmount_all_result = None;
         self.feedback = None;
         self.history.record(HistoryEntry::new(
             ActivityAction::MountAll,
@@ -44,7 +44,7 @@ impl ArchiveFsApp {
             ActivityOutcome::Started,
             format!("Mount All started for {total} pending archives."),
         ));
-        self.mount_all = Some(RunningMountAll {
+        self.mount_ui.mount_all = Some(RunningMountAll {
             receiver,
             stop,
             progress: MountAllProgress {
@@ -122,7 +122,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn request_mount_all_stop(&mut self) {
-        let Some(batch) = self.mount_all.as_mut() else {
+        let Some(batch) = self.mount_ui.mount_all.as_mut() else {
             return;
         };
         if batch.progress.stop_requested {
@@ -141,7 +141,7 @@ impl ArchiveFsApp {
     pub(crate) fn poll_mount_all(&mut self, context: &egui::Context) {
         let mut disconnected = false;
         let mut events = Vec::new();
-        if let Some(batch) = self.mount_all.as_ref() {
+        if let Some(batch) = self.mount_ui.mount_all.as_ref() {
             loop {
                 match batch.receiver.try_recv() {
                     Ok(event) => events.push(event),
@@ -156,7 +156,7 @@ impl ArchiveFsApp {
 
         let mut finished = None;
         for event in events {
-            let Some(batch) = self.mount_all.as_mut() else {
+            let Some(batch) = self.mount_ui.mount_all.as_mut() else {
                 break;
             };
             match event {
@@ -241,12 +241,12 @@ impl ArchiveFsApp {
                 more_information: None,
             });
             let should_refresh = result.setup_failure.is_none();
-            self.mount_all_result = Some(result);
-            self.mount_all = None;
+            self.mount_ui.mount_all_result = Some(result);
+            self.mount_ui.mount_all = None;
             if should_refresh {
                 self.refresh(context);
             }
-        } else if disconnected && self.mount_all.is_some() {
+        } else if disconnected && self.mount_ui.mount_all.is_some() {
             let message = "Mount All background worker stopped unexpectedly.".to_string();
             self.history.record(HistoryEntry::new(
                 ActivityAction::MountAll,
@@ -261,7 +261,7 @@ impl ArchiveFsApp {
                 warning: None,
                 more_information: None,
             });
-            self.mount_all = None;
+            self.mount_ui.mount_all = None;
             self.refresh(context);
         }
     }
@@ -294,14 +294,14 @@ impl ArchiveFsApp {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        self.confirm_mount_all = None;
-        self.confirm_unmount_all = None;
-        self.confirm_unmount_selected = None;
-        self.confirm_unmount = None;
-        self.confirm_lazy_unmount = None;
-        self.confirm_lazy_unmount_final = None;
-        self.unmount_all_result = None;
-        self.mount_all_result = None;
+        self.mount_ui.confirm_mount_all = None;
+        self.mount_ui.confirm_unmount_all = None;
+        self.mount_ui.confirm_unmount_selected = None;
+        self.mount_ui.confirm_unmount = None;
+        self.mount_ui.confirm_lazy_unmount = None;
+        self.mount_ui.confirm_lazy_unmount_final = None;
+        self.mount_ui.unmount_all_result = None;
+        self.mount_ui.mount_all_result = None;
         self.feedback = None;
         self.history.record(HistoryEntry::new(
             ActivityAction::UnmountAll,
@@ -309,7 +309,7 @@ impl ArchiveFsApp {
             ActivityOutcome::Started,
             format!("Unmount All started for {total} mounted archives."),
         ));
-        self.unmount_all = Some(RunningUnmountAll {
+        self.mount_ui.unmount_all = Some(RunningUnmountAll {
             receiver,
             stop,
             progress: UnmountAllProgress {
@@ -365,7 +365,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn request_unmount_all_stop(&mut self) {
-        let Some(batch) = self.unmount_all.as_mut() else {
+        let Some(batch) = self.mount_ui.unmount_all.as_mut() else {
             return;
         };
         if batch.progress.stop_requested {
@@ -384,7 +384,7 @@ impl ArchiveFsApp {
     pub(crate) fn poll_unmount_all(&mut self, context: &egui::Context) {
         let mut events = Vec::new();
         let mut disconnected = false;
-        if let Some(batch) = self.unmount_all.as_ref() {
+        if let Some(batch) = self.mount_ui.unmount_all.as_ref() {
             loop {
                 match batch.receiver.try_recv() {
                     Ok(event) => events.push(event),
@@ -398,7 +398,7 @@ impl ArchiveFsApp {
         }
         let mut finished = None;
         for event in events {
-            let Some(batch) = self.unmount_all.as_mut() else {
+            let Some(batch) = self.mount_ui.unmount_all.as_mut() else {
                 break;
             };
             match event {
@@ -416,7 +416,7 @@ impl ArchiveFsApp {
                 UnmountAllEvent::ArchiveCompleted(item) => {
                     batch.progress.successful += 1;
                     set_lazy_unmount_offer(
-                        &mut self.lazy_unmount_offers,
+                        &mut self.mount_ui.lazy_unmount_offers,
                         &item.archive_path,
                         false,
                     );
@@ -435,7 +435,7 @@ impl ArchiveFsApp {
                     batch.progress.failed += 1;
                     if offer_lazy_unmount {
                         set_lazy_unmount_offer(
-                            &mut self.lazy_unmount_offers,
+                            &mut self.mount_ui.lazy_unmount_offers,
                             &item.archive_path,
                             true,
                         );
@@ -456,7 +456,7 @@ impl ArchiveFsApp {
                 UnmountAllEvent::ArchiveSkipped { item, reason } => {
                     batch.progress.skipped += 1;
                     set_lazy_unmount_offer(
-                        &mut self.lazy_unmount_offers,
+                        &mut self.mount_ui.lazy_unmount_offers,
                         &item.archive_path,
                         false,
                     );
@@ -519,12 +519,12 @@ impl ArchiveFsApp {
                 warning: None,
                 more_information: None,
             });
-            self.unmount_all_result = Some(result);
-            self.unmount_all = None;
+            self.mount_ui.unmount_all_result = Some(result);
+            self.mount_ui.unmount_all = None;
             if !setup_failed {
                 self.refresh(context);
             }
-        } else if disconnected && self.unmount_all.is_some() {
+        } else if disconnected && self.mount_ui.unmount_all.is_some() {
             let message = "Unmount All background worker stopped unexpectedly.".to_string();
             self.history.record(HistoryEntry::new(
                 ActivityAction::UnmountAll,
@@ -539,7 +539,7 @@ impl ArchiveFsApp {
                 warning: None,
                 more_information: None,
             });
-            self.unmount_all = None;
+            self.mount_ui.unmount_all = None;
             self.refresh(context);
         }
     }

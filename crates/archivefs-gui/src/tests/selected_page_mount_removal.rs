@@ -37,7 +37,7 @@ fn app_with_one_pending_archive_queued() -> ArchiveFsApp {
         data.records
             .push(record("/roms/Queued Game.zip", MountState::Pending));
     }
-    app.mount_queue.push(path.clone());
+    app.mount_ui.mount_queue.push(path.clone());
     app.archive_context.select_only(path);
     app
 }
@@ -148,7 +148,7 @@ fn mount_queue_confirmation_still_works_on_the_mount_page() {
     let mut app = app_with_one_pending_archive_queued();
     app.ui_mode = GuiMode::AdvancedView;
     app.view = MainView::Mount;
-    app.confirm_mount_queue = true;
+    app.mount_ui.confirm_mount_queue = true;
 
     let output = render_app(&mut app);
 
@@ -173,7 +173,7 @@ fn confirming_the_mount_queue_still_starts_the_real_batch_engine() {
     app.handle_mount_page_action(&ctx, Some(MountPageAction::MountQueue));
 
     assert!(
-        app.mount_all.is_some(),
+        app.mount_ui.mount_all.is_some(),
         "MountQueue must still drive the existing start_mount_all engine, unmodified"
     );
 }

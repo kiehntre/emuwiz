@@ -263,6 +263,7 @@ pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod local_mod_package_page;
 mod mount_operation_controller;
+mod mount_ui_state;
 mod mount_operations;
 #[allow(dead_code)]
 pub(crate) mod museum_page;
@@ -1186,6 +1187,7 @@ use mount_operation_controller::{
 };
 use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
 use health_duplicate_ui_state::HealthDuplicateUiState;
+use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 
 #[derive(Debug)]
@@ -1937,22 +1939,7 @@ struct ArchiveFsApp {
     /// Mount, and Cheats & Mods. Mount state remains derived from live
     /// records and is intentionally not stored here.
     archive_context: ArchiveContext,
-    operation: Option<RunningOperation>,
-    mount_all: Option<RunningMountAll>,
-    unmount_all: Option<RunningUnmountAll>,
-    confirm_mount_all: Option<MountAllConfirmation>,
-    focus_mount_all_cancel: bool,
-    mount_all_result: Option<MountAllResult>,
-    mount_queue: Vec<PathBuf>,
-    /// The Mount page's free-text filter (name/platform/path substring).
-    mount_search: String,
-    /// Whether the Mount page's inline mount-the-queue confirmation is
-    /// showing - the Mount page's counterpart of `MountAllConfirmation`.
-    confirm_mount_queue: bool,
-    /// The Active Mounts page's pending unmount confirmation (the
-    /// archive path awaiting "Unmount now"), cleared automatically when
-    /// that archive stops being mounted.
-    active_mounts_confirm_unmount: Option<PathBuf>,
+    mount_ui: MountUiState,
     /// The History & Logs page's filter/sort state.
     history_filters: HistoryLogFilters,
     shared_history: SharedHistoryState,
@@ -2074,25 +2061,8 @@ struct ArchiveFsApp {
     /// A different archive requires confirmation when fetched catalogue
     /// state would otherwise be discarded.
     confirm_cheat_archive_change: Option<PathBuf>,
-    confirm_unmount_all: Option<UnmountAllConfirmation>,
-    focus_unmount_all_cancel: bool,
-    /// The Library row context menu's "Unmount selected" confirmation -
-    /// see `UnmountSelectedConfirmation`'s doc comment for why this is a
-    /// marker with no captured item list, exactly like
-    /// `UnmountAllConfirmation`.
-    confirm_unmount_selected: Option<UnmountSelectedConfirmation>,
-    focus_unmount_selected_cancel: bool,
-    unmount_all_result: Option<UnmountAllResult>,
     feedback: Option<ActionFeedback>,
-    confirm_unmount: Option<PathBuf>,
-    confirm_lazy_unmount: Option<PathBuf>,
-    confirm_lazy_unmount_final: Option<PathBuf>,
-    focus_lazy_cancel: bool,
-    focus_final_lazy_cancel: bool,
-    lazy_unmount_offers: HashSet<PathBuf>,
-    remount_offers: HashSet<PathBuf>,
     history: OperationHistory,
-    cleanup_after_unmount: bool,
     diagnostics: DiagnosticsState,
     /// Set once this session has seen a diagnostics report where the
     /// config file was confirmed present and readable. Lets the Setup
@@ -2361,16 +2331,11 @@ struct ArchiveFsApp {
     gamer_view_screen: GamerViewScreen,
     /// The typed count for Mount All's >25-item confirmation gate - see
     /// `bulk_action_confirm_enabled`. Cleared whenever the dialog closes.
-    mount_all_typed_count: String,
-    unmount_all_typed_count: String,
     missing_removal_typed_count: String,
     /// Row-context-menu "Mount selected" (audit finding: this previously
     /// dispatched with no confirmation at all, unlike "Unmount selected").
     /// The exact paths are re-derived fresh from the live snapshot at
     /// confirm time, never trusted from when the dialog opened.
-    confirm_mount_selected: Option<Vec<PathBuf>>,
-    focus_mount_selected_cancel: bool,
-    mount_selected_typed_count: String,
     /// Bulk platform assignment/clear (audit finding: this previously
     /// dispatched instantly with no confirmation at all, from both the
     /// selection action bar and the row context menu).
@@ -2507,9 +2472,9 @@ const FILE_PICKER_DISCONNECTED_MESSAGE: &str =
 
 impl ArchiveFsApp {
     fn is_busy(&self) -> bool {
-        self.operation.is_some()
-            || self.mount_all.is_some()
-            || self.unmount_all.is_some()
+        self.mount_ui.operation.is_some()
+            || self.mount_ui.mount_all.is_some()
+            || self.mount_ui.unmount_all.is_some()
             || self.setup_action.is_some()
     }
 
@@ -2552,16 +2517,7 @@ impl ArchiveFsApp {
             dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
             archive_context: ArchiveContext::default(),
             library_ui: LibraryUiState::default(),
-            operation: None,
-            mount_all: None,
-            unmount_all: None,
-            confirm_mount_all: None,
-            focus_mount_all_cancel: false,
-            mount_all_result: None,
-            mount_queue: Vec::new(),
-            mount_search: String::new(),
-            confirm_mount_queue: false,
-            active_mounts_confirm_unmount: None,
+            mount_ui: MountUiState::default(),
             history_filters: HistoryLogFilters::default(),
             shared_history: SharedHistoryState::NotLoaded,
             shared_history_operation: None,
@@ -2600,21 +2556,8 @@ impl ArchiveFsApp {
             launch_amiga_whdload: launch_readiness_page::AmigaWHDLoadLaunchState::default(),
             cheat_archive_picker: None,
             confirm_cheat_archive_change: None,
-            confirm_unmount_all: None,
-            focus_unmount_all_cancel: false,
-            confirm_unmount_selected: None,
-            focus_unmount_selected_cancel: false,
-            unmount_all_result: None,
             feedback: None,
-            confirm_unmount: None,
-            confirm_lazy_unmount: None,
-            confirm_lazy_unmount_final: None,
-            focus_lazy_cancel: false,
-            focus_final_lazy_cancel: false,
-            lazy_unmount_offers: HashSet::new(),
-            remount_offers: HashSet::new(),
             history,
-            cleanup_after_unmount: false,
             diagnostics: start_diagnostics(context.clone(), generation),
             config_previously_confirmed: false,
             onboarding_state: onboarding::load_onboarding_state(),
@@ -2672,12 +2615,7 @@ impl ArchiveFsApp {
             archive_preparation_generation: RefreshGeneration::INITIAL,
             ui_mode: load_gui_mode(),
             gamer_view_screen: GamerViewScreen::default(),
-            mount_all_typed_count: String::new(),
-            unmount_all_typed_count: String::new(),
             missing_removal_typed_count: String::new(),
-            confirm_mount_selected: None,
-            focus_mount_selected_cancel: false,
-            mount_selected_typed_count: String::new(),
             confirm_bulk_platform_action: None,
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
@@ -3132,8 +3070,8 @@ impl ArchiveFsApp {
 
         let cache_is_fresh = self.health_duplicate_ui.health_report_cache.as_ref().is_some_and(|cache| {
             cache.key == key
-                && cache.lazy_unmount_offers == self.lazy_unmount_offers
-                && cache.remount_offers == self.remount_offers
+                && cache.lazy_unmount_offers == self.mount_ui.lazy_unmount_offers
+                && cache.remount_offers == self.mount_ui.remount_offers
         });
 
         if !cache_is_fresh {
@@ -3145,15 +3083,15 @@ impl ArchiveFsApp {
                 (Some(records), Some(snapshot)) => build_health_issues(
                     records,
                     snapshot,
-                    &self.lazy_unmount_offers,
-                    &self.remount_offers,
+                    &self.mount_ui.lazy_unmount_offers,
+                    &self.mount_ui.remount_offers,
                 ),
                 _ => Vec::new(),
             };
             self.health_duplicate_ui.health_report_cache = Some(HealthReportCache {
                 key,
-                lazy_unmount_offers: self.lazy_unmount_offers.clone(),
-                remount_offers: self.remount_offers.clone(),
+                lazy_unmount_offers: self.mount_ui.lazy_unmount_offers.clone(),
+                remount_offers: self.mount_ui.remount_offers.clone(),
                 issues,
             });
         }
@@ -4289,7 +4227,7 @@ impl ArchiveFsApp {
             Some(MountPageAction::MountQueue) => {
                 let items = match &self.state {
                     LoadState::Ready(data) => {
-                        let eligible = queued_pending_paths(&self.mount_queue, &data.records);
+                        let eligible = queued_pending_paths(&self.mount_ui.mount_queue, &data.records);
                         mount_all_items_for_paths(&data.records, &eligible)
                     }
                     _ => Vec::new(),
@@ -5453,7 +5391,7 @@ impl ArchiveFsApp {
                             screen: &mut self.gamer_view_screen,
                             busy: archive_actions_blocked,
                             block_reason: archive_action_block_reason,
-                            cleanup_after_unmount: self.cleanup_after_unmount,
+                            cleanup_after_unmount: self.mount_ui.cleanup_after_unmount,
                             cheat_workflow: self.cheat_workflow.as_ref(),
                             feedback: self.feedback.as_ref(),
                             scan_review_available: self.gamer_view_scan_review_available,
@@ -5622,11 +5560,11 @@ impl ArchiveFsApp {
                     );
                     ui.separator();
                 }
-                if let Some(batch) = self.mount_all.as_ref() {
+                if let Some(batch) = self.mount_ui.mount_all.as_ref() {
                     stop_mount_all = show_mount_all_progress(ui, &batch.progress);
                     ui.separator();
                 }
-                if let Some(batch) = self.unmount_all.as_ref() {
+                if let Some(batch) = self.mount_ui.unmount_all.as_ref() {
                     stop_unmount_all = show_unmount_all_progress(ui, &batch.progress);
                     ui.separator();
                 }
@@ -6438,12 +6376,12 @@ impl ArchiveFsApp {
                     let action = show_mount_page(
                         ui,
                         live,
-                        self.mount_all_result.as_ref(),
+                        self.mount_ui.mount_all_result.as_ref(),
                         MountPageViewState {
-                            queue: &mut self.mount_queue,
-                            search: &mut self.mount_search,
+                            queue: &mut self.mount_ui.mount_queue,
+                            search: &mut self.mount_ui.mount_search,
                             platform: &mut self.library_ui.library_filters.platform,
-                            confirm: &mut self.confirm_mount_queue,
+                            confirm: &mut self.mount_ui.confirm_mount_queue,
                             busy: archive_actions_blocked,
                             block_reason: archive_action_block_reason,
                         },
@@ -6471,8 +6409,8 @@ impl ArchiveFsApp {
                     let action = show_active_mounts_page(
                         ui,
                         live_records,
-                        &mut self.active_mounts_confirm_unmount,
-                        &mut self.cleanup_after_unmount,
+                        &mut self.mount_ui.active_mounts_confirm_unmount,
+                        &mut self.mount_ui.cleanup_after_unmount,
                         self.feedback.as_ref(),
                         archive_actions_blocked,
                     );
@@ -6482,7 +6420,7 @@ impl ArchiveFsApp {
                                 Some(AppOperationRequest::Archive(OperationRequest {
                                     action: ArchiveAction::Unmount,
                                     archive_path,
-                                    cleanup_after_unmount: self.cleanup_after_unmount,
+                                    cleanup_after_unmount: self.mount_ui.cleanup_after_unmount,
                                 }));
                         }
                         Some(ActiveMountsPageAction::OpenInLibrary(path)) => {
@@ -7010,38 +6948,39 @@ impl ArchiveFsApp {
                                 filter: &mut self.library_ui.filter,
                                 filtered_rows: &mut self.library_ui.filtered_rows,
                                 selected_archive: &mut self.archive_context.focused,
-                                operation: self.operation.as_ref(),
+                                operation: self.mount_ui.operation.as_ref(),
                                 busy: archive_actions_blocked,
                                 block_reason: archive_action_block_reason,
                                 action_readiness_debug_lines: &action_readiness_debug_lines,
                                 feedback: self.feedback.as_ref(),
-                                confirm_unmount: &mut self.confirm_unmount,
-                                confirm_lazy_unmount: &mut self.confirm_lazy_unmount,
-                                confirm_lazy_unmount_final: &mut self.confirm_lazy_unmount_final,
-                                confirm_mount_all: &mut self.confirm_mount_all,
-                                focus_mount_all_cancel: &mut self.focus_mount_all_cancel,
-                                mount_all_typed_count: &mut self.mount_all_typed_count,
-                                confirm_unmount_all: &mut self.confirm_unmount_all,
-                                focus_unmount_all_cancel: &mut self.focus_unmount_all_cancel,
-                                unmount_all_typed_count: &mut self.unmount_all_typed_count,
-                                confirm_unmount_selected: &mut self.confirm_unmount_selected,
+                                confirm_unmount: &mut self.mount_ui.confirm_unmount,
+                                confirm_lazy_unmount: &mut self.mount_ui.confirm_lazy_unmount,
+                                confirm_lazy_unmount_final: &mut self.mount_ui.confirm_lazy_unmount_final,
+                                confirm_mount_all: &mut self.mount_ui.confirm_mount_all,
+                                focus_mount_all_cancel: &mut self.mount_ui.focus_mount_all_cancel,
+                                mount_all_typed_count: &mut self.mount_ui.mount_all_typed_count,
+                                confirm_unmount_all: &mut self.mount_ui.confirm_unmount_all,
+                                focus_unmount_all_cancel: &mut self.mount_ui.focus_unmount_all_cancel,
+                                unmount_all_typed_count: &mut self.mount_ui.unmount_all_typed_count,
+                                confirm_unmount_selected: &mut self.mount_ui.confirm_unmount_selected,
                                 focus_unmount_selected_cancel: &mut self
+                                    .mount_ui
                                     .focus_unmount_selected_cancel,
-                                confirm_mount_selected: &mut self.confirm_mount_selected,
-                                focus_mount_selected_cancel: &mut self.focus_mount_selected_cancel,
-                                mount_selected_typed_count: &mut self.mount_selected_typed_count,
+                                confirm_mount_selected: &mut self.mount_ui.confirm_mount_selected,
+                                focus_mount_selected_cancel: &mut self.mount_ui.focus_mount_selected_cancel,
+                                mount_selected_typed_count: &mut self.mount_ui.mount_selected_typed_count,
                                 confirm_bulk_platform_action: &mut self
                                     .confirm_bulk_platform_action,
                                 focus_bulk_platform_cancel: &mut self.focus_bulk_platform_cancel,
                                 bulk_platform_action_typed_count: &mut self
                                     .bulk_platform_action_typed_count,
-                                focus_lazy_cancel: &mut self.focus_lazy_cancel,
-                                focus_final_lazy_cancel: &mut self.focus_final_lazy_cancel,
-                                lazy_unmount_offers: &self.lazy_unmount_offers,
-                                remount_offers: &self.remount_offers,
-                                cleanup_after_unmount: &mut self.cleanup_after_unmount,
-                                mount_all_result: self.mount_all_result.as_ref(),
-                                unmount_all_result: self.unmount_all_result.as_ref(),
+                                focus_lazy_cancel: &mut self.mount_ui.focus_lazy_cancel,
+                                focus_final_lazy_cancel: &mut self.mount_ui.focus_final_lazy_cancel,
+                                lazy_unmount_offers: &self.mount_ui.lazy_unmount_offers,
+                                remount_offers: &self.mount_ui.remount_offers,
+                                cleanup_after_unmount: &mut self.mount_ui.cleanup_after_unmount,
+                                mount_all_result: self.mount_ui.mount_all_result.as_ref(),
+                                unmount_all_result: self.mount_ui.unmount_all_result.as_ref(),
                                 history: &mut self.history,
                                 cached: self.database_state.snapshot(),
                                 library_filters: &mut self.library_ui.library_filters,
