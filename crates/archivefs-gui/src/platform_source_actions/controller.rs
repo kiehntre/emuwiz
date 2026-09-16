@@ -568,6 +568,127 @@ impl ArchiveFsApp {
             }
         }
     }
+
+    pub(crate) fn missing_removal_action_available(&self) -> bool {
+        self.library_ui.missing_removal.is_none()
+            && self.library_ui.platform_action.is_none()
+            && self.library_ui.bulk_platform_action.is_none()
+            && self.library_ui.alias_action.is_none()
+            && self.sources_ui.source_action.is_none()
+            && self.library_view_action.is_none()
+            && matches!(self.database_state, DatabaseState::Ready { .. })
+    }
+
+    pub(crate) fn missing_removal_unavailable_reason(&self) -> Option<String> {
+        match &self.database_state {
+            DatabaseState::Loading { .. } => Some(
+                "Catalogue is still loading. Removal will be available when loading completes."
+                    .to_string(),
+            ),
+            DatabaseState::Outdated { .. } => Some(
+                "Catalogue data needs to be refreshed before stale entries can be removed."
+                    .to_string(),
+            ),
+            DatabaseState::Error { message, .. } => Some(message.clone()),
+            DatabaseState::NotCreated { .. } => Some(
+                "Catalogue is not available yet. Create or load the catalogue before removing stale entries."
+                    .to_string(),
+            ),
+            DatabaseState::Ready { .. } => {
+                if self.library_ui.missing_removal.is_some()
+                    || self.library_ui.platform_action.is_some()
+                    || self.library_ui.bulk_platform_action.is_some()
+                    || self.library_ui.alias_action.is_some()
+                    || self.sources_ui.source_action.is_some()
+                    || self.library_view_action.is_some()
+                {
+                    Some("Another catalogue operation is currently running.".to_string())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub(crate) fn start_missing_removal(
+        &mut self,
+        context: egui::Context,
+        archive_paths: Vec<PathBuf>,
+    ) {
+        if !self.missing_removal_action_available() || archive_paths.is_empty() {
+            return;
+        }
+        let requested_paths = archive_paths.len();
+        let (sender, receiver) = mpsc::channel();
+        self.library_ui.missing_removal = Some(RunningMissingRemoval {
+            requested_paths,
+            receiver,
+        });
+        thread::spawn(move || {
+            let result = apply_missing_removal(&archive_paths).map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    pub(crate) fn poll_missing_removal(&mut self, context: &egui::Context) {
+        let result = self
+            .library_ui
+            .missing_removal
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.requested_paths, result))
+            });
+        let Some((requested_paths, result)) = result else {
+            return;
+        };
+        self.library_ui.missing_removal = None;
+        match result {
+            Ok(result) => {
+                let message = format!(
+                    "Removed {} missing catalogue entr{}. No archive files were deleted.",
+                    result.removed,
+                    if result.removed == 1 { "y" } else { "ies" }
+                );
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CatalogueCleanup,
+                    None,
+                    ActivityOutcome::Completed,
+                    message.clone(),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+                self.start_database_action(context.clone(), false);
+            }
+            Err(message) => {
+                self.history.record(HistoryEntry::new(
+                    ActivityAction::CatalogueCleanup,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!(
+                        "Could not remove {requested_paths} selected missing catalogue entr{}: {message}",
+                        if requested_paths == 1 { "y" } else { "ies" }
+                    ),
+                ));
+                self.feedback = Some(ActionFeedback {
+                    succeeded: false,
+                    message,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+            }
+        }
+    }
 }
 
 /// Opens the default library database and applies one `PlatformAction`
