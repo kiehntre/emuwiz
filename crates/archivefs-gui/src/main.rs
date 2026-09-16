@@ -219,7 +219,8 @@ mod navigation;
 #[allow(unused_imports)]
 use navigation::{
     ADVANCED_NAV_GROUPS, GAMER_MENU_ADD_FOLDER_LABEL, GAMER_MENU_ADVANCED_LABEL, GAMER_MENU_LABEL,
-    GAMER_MENU_SCAN_LABEL, GAMER_MENU_SETUP_LABEL, NavClick, NavEntry, NavGroup,
+    GAMER_MENU_SCAN_LABEL, GAMER_MENU_SETUP_LABEL, LibraryTab, MainView, NavClick, NavEntry,
+    NavGroup, ProblemsRepairTab, SourcesTab, ToolsOverlay,
     PRIMARY_NAVIGATION_DESTINATIONS, TOOLS_MENU_WORKFLOWS, library_tab_for_main_view,
     library_tab_label, main_view_content_width, main_view_for_home_card, main_view_for_library_tab,
     main_view_for_problems_repair_tab, main_view_for_sources_tab, main_view_title,
@@ -1266,201 +1267,6 @@ struct RunningMissingRemoval {
     receiver: Receiver<Result<MissingArchiveRemovalResult, String>>,
 }
 
-/// Every top-level destination the app can show. `Health`, `Duplicates`,
-/// and `LibraryViews` are **compatibility dispatch keys**, not separate
-/// sidebar destinations any more (see `LibraryTab`): they exist purely so
-/// `self.view` (still the single source of truth for what actually
-/// renders) can name which Library tab is active without a second,
-/// parallel field. Each maps 1:1 to a `LibraryTab` via
-/// `library_tab_for_main_view`/`main_view_for_library_tab`.
-///
-/// Kept as real enum variants (Library IA migration Phase 3 decision,
-/// evidence in docs/GUI_SIMPLIFICATION.md's "Library IA migration -
-/// Phase 3" section) rather than removed and replaced with `LibraryTab`
-/// alone: production code still keys the shell's content dispatch off
-/// `self.view` matching them (`library_tab_for_main_view`,
-/// `main_view_title`, `main_view_content_width`,
-/// `main_view_uses_page_scroll` all still need an exhaustive `MainView`
-/// match), and 50+ existing tests across three milestones construct or
-/// compare against these three variants directly. No persisted,
-/// external, or CLI state depends on them - the only reasons to keep
-/// them are internal (production dispatch + test surface), not
-/// backward-compatibility with anything outside this process.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) enum MainView {
-    #[default]
-    Home,
-    NeedsAttention,
-    Library,
-    /// Read-only view over already-gathered Ready-to-Play projections.
-    ReadyToPlay,
-    RecentlyFound,
-    Health,
-    Duplicates,
-    Sources,
-    /// Collection Discovery's content, dispatched as the "Discovery" tab of
-    /// the consolidated Sources destination - see `sources_tab_for_main_view`.
-    /// Was previously `ToolsOverlay::CollectionDiscovery`, a completely
-    /// separate rendering mechanism reached only from its own now-removed
-    /// sidebar row; folding it into `MainView` lets it share Sources' tab
-    /// chrome like `DatSources`/`CheatSources` already do. The underlying
-    /// renderer (`collection_discovery_page::show_collection_discovery_panel`)
-    /// is unchanged.
-    SourcesDiscovery,
-    LibraryViews,
-    Mount,
-    Selected,
-    CheatsMods,
-    /// The registered cheat sources: which are consulted, in what order, and
-    /// for which platforms. Its own destination rather than a section of
-    /// Cheats & Mods, because it is configuration that outlives any one
-    /// archive being worked on.
-    CheatSources,
-    /// Canonical organisation: planning and (only after explicit approval)
-    /// applying moves of identified games into a configured master ROM root.
-    CanonicalOrganisation,
-    /// Read-only frontend publisher projections over the existing Playing
-    /// Library / 1G1R plan. This destination has no execution path.
-    PublisherProfiles,
-    /// Evidence-backed filename cleanup for one chosen library folder. This
-    /// is a task-oriented entry point over the existing DAT audit, rename
-    /// plan, review, and journalled apply flow; DAT Sources remains the
-    /// advanced catalogue-management page.
-    IdentifyRename,
-    /// Repair Review: preview-only review of a saved whole-library repair
-    /// plan. Loads a `LibraryRepairPlan` produced by the CLI's
-    /// `repair scan --plan-out` contract and shows its proposals. Nothing is
-    /// applied from this page.
-    RepairReview,
-    /// Repair History: recent rename transactions journaled through the
-    /// Repair Center (and any other flow sharing the same journal
-    /// directory), with reverify status and safe undo when the core proves
-    /// a transaction is reversible.
-    //
-    // Still routed and rendered (every `MainView` match handles it) and
-    // exercised by the navigation tests, but since the 0.8.1 consolidation
-    // it is reached as a tab within Problems & Repair rather than assigned
-    // as a top-level `view`, so production code no longer constructs it
-    // directly.
-    #[allow(dead_code)]
-    RepairHistory,
-    /// Duplicate Finder: a DAT-independent duplicate/equivalent-content scan
-    /// (`archivefs_core::repair::exact_duplicate`, plus the N64 and optical
-    /// equivalent scanners) with evidence-backed canonical-copy selection and
-    /// multi-file (CUE/GDI/M3U) protection, quarantined through the same
-    /// transaction/journal/rollback engine every other repair flow already
-    /// uses.
-    ///
-    /// Since 0.8.1's "core workflows directly discoverable" pass this is a
-    /// first-class destination with its own sidebar and top-menu entry
-    /// ("Duplicate Finder") - it is no longer routed through
-    /// `ProblemsRepairTab::Repair` (`problems_repair_tab_for_main_view` no
-    /// longer maps it), so arriving here never shows Repair Review / Repair
-    /// History framing. Deliberately a separate destination from
-    /// `MainView::Duplicates` (a read-only Library-tab duplicate viewer over
-    /// a different, DAT-relative notion of "duplicate") - the two are
-    /// unrelated and never share state.
-    ExactDuplicateReview,
-    /// Disc Conversion: verified CUE/BIN -> CHD conversion
-    /// (`optical_conversion_page` over `archivefs_core::repair`'s
-    /// `build_chd_conversion_plan` / `execute_chd_conversion` /
-    /// `rollback_chd_conversion`). A first-class destination with its own
-    /// sidebar and top-menu entry - the user never has to conceptually enter
-    /// "Repair" to convert a disc image. Reuses the exact same
-    /// `OpticalConversionPageState` and backend the Repair tab used before.
-    DiscConversion,
-    /// Read-only catalogue-backed storage usage and future conversion analysis.
-    StorageHealth,
-    /// Read-only presentation of bounded tape analysis for the selected game.
-    TapeInspector,
-    /// Emulator Setup: the read-only emulator readiness / profile check.
-    /// Renders `doctor_page::show_doctor_page` over the shared
-    /// `ArchiveFsApp::doctor_scan` - the same engine and state the Problems &
-    /// Repair -> Diagnostics tab uses (no second scan, no divergent state) -
-    /// but presented as a dedicated, clearly-named destination so emulator
-    /// setup is discoverable without going through "Problems & Repair". The
-    /// Doctor scan's "Emulators" and "Emulator profiles" categories carry the
-    /// per-emulator rows.
-    EmulatorSetup,
-    /// Read-only inventory of installed emulator versions and channels.
-    EmulatorInventory,
-    /// Read-only master BIOS inventory and emulator projection planner.
-    BiosProjection,
-    /// Curated, read-only collection view backed by the loaded catalogue and
-    /// existing evidence/artwork state.
-    Museum,
-    /// Library View History: a read-only view of the durable, append-only
-    /// Library View apply/remove history
-    /// (`archivefs_core::library_view_history`), re-read from disk on every
-    /// visit/refresh. Deliberately distinct from `HistoryLogs`, which shows
-    /// the in-memory `OperationHistory` recent-activity log that does not
-    /// survive a restart - this page never touches that log.
-    LibraryViewHistory,
-    /// The registered DAT catalogues: which local DAT files and folders
-    /// EmuWiz can check a library against. Its own destination for the
-    /// same reason Cheat Sources is: it is configuration that outlives any
-    /// one archive being worked on.
-    DatSources,
-    /// Read-only presentation of the existing media-set topology and swap
-    /// plan. This page derives only from the loaded catalogue snapshot.
-    MediaSets,
-    ActiveMounts,
-    /// The consolidated "Problems & Repair" destination: one sidebar entry
-    /// over Overview/Diagnostics/Repair tabs - see `problems_repair_page`'s
-    /// module doc. `Doctor`/`RepairReview`/`RepairHistory` below remain the
-    /// actual rendering destinations each tab lands on (their own engines
-    /// are untouched); `Problems` itself renders only the Overview tab and
-    /// the shared tab chrome. `problems_repair_tab_for_main_view` is the
-    /// `LibraryTab`-style projection tying all four together.
-    Problems,
-    Doctor,
-    HistoryLogs,
-    Settings,
-    About,
-}
-
-/// The five lenses onto Library data, now visibly unified as tabs of one
-/// Library page (see docs/GUI_SIMPLIFICATION.md's "Library IA migration"
-/// section) even though each still has its own `MainView` variant and
-/// render function underneath, retained for compatibility - see
-/// `ArchiveFsApp::update`'s central-panel dispatch, where all five are
-/// rendered from one block instead of five separate ones. `Archives`
-/// corresponds to `MainView::Library` (the archive table); `Views`
-/// corresponds to `MainView::LibraryViews` (saved library views) - named
-/// differently from its `MainView` variant because "Library Views" would
-/// read twice as "Library" now that it is a tab labelled "Library".
-///
-/// # Synchronization rule
-///
-/// `ArchiveFsApp::view` (`MainView`) remains the single source of truth
-/// for which underlying render function actually runs - unchanged.
-/// `ArchiveFsApp::library_tab` (`LibraryTab`) is a *derived* projection of
-/// it: once per frame, before anything renders,
-/// `library_tab_for_main_view(self.view)` is consulted, and if `self.view`
-/// is one of the five Library-related destinations, `self.library_tab` is
-/// set to match. If `self.view` is anything else (Mount, Settings, ...),
-/// `self.library_tab` is left untouched, so it keeps remembering the last
-/// Library tab visited. The unified Library shell then reads
-/// `self.library_tab` to decide which tab's content to render.
-///
-/// This makes every existing way of navigating to a Library destination -
-/// the sidebar's single "Library" button, or any of the ~11 scattered
-/// `self.view = MainView::X` assignments elsewhere in the app - a correct
-/// "legacy route" into the right `LibraryTab` automatically, with no call
-/// site needing to know `LibraryTab` exists. The only sanctioned way to
-/// write `library_tab` going the other direction (choosing a tab and
-/// having `view` follow) is `ArchiveFsApp::navigate_to_library_tab`,
-/// which the shell's `tab_row` calls.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-enum LibraryTab {
-    #[default]
-    Archives,
-    Health,
-    Duplicates,
-    Views,
-    RecentlyFound,
-}
-
 /// Compresses `DoctorScanState` into the `home_page::SetupCheckSummary` the
 /// Home "Set up emulators" card shows. The card's action opens Problems &
 /// Repair -> Diagnostics, which renders this exact `doctor_scan` state, so
@@ -1542,36 +1348,6 @@ fn home_library_snapshot(snapshot: &CachedLibrarySnapshot) -> home_page::HomeLib
     }
 }
 
-/// The three tabs of the consolidated "Problems & Repair" destination -
-/// see `MainView::Problems`'s doc comment and `problems_repair_page`'s
-/// module doc. Mirrors `LibraryTab` exactly: `ArchiveFsApp::view` remains
-/// the single source of truth for which underlying render function runs;
-/// `ArchiveFsApp::problems_repair_tab` is a *derived* projection of it via
-/// `problems_repair_tab_for_main_view`, reconciled once per frame
-/// (`reconcile_problems_repair_tab`) exactly like `reconcile_library_tab`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-enum ProblemsRepairTab {
-    #[default]
-    Overview,
-    Diagnostics,
-    Repair,
-}
-
-/// The four tabs of the consolidated "Sources" destination - see
-/// `MainView::Sources`'s sibling variants below and `sources_page`'s module
-/// doc. Mirrors `LibraryTab`/`ProblemsRepairTab` exactly: `ArchiveFsApp::view`
-/// remains the single source of truth; `ArchiveFsApp::sources_tab` is a
-/// *derived* projection of it via `sources_tab_for_main_view`, reconciled
-/// once per frame (`reconcile_sources_tab`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-enum SourcesTab {
-    #[default]
-    Libraries,
-    Dats,
-    Cheats,
-    Discovery,
-}
-
 /// The unified Library shell's chrome: the shared "Library" heading and
 /// the five-tab selector, rendered identically regardless of which tab is
 /// selected. Content dispatch (`match self.library_tab { ... }`) stays in
@@ -1610,22 +1386,6 @@ fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Opti
     let clicked = widgets::tab_row(ui, &tab_options, current_tab);
     ui.add_space(8.0);
     clicked
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ToolsOverlay {
-    #[default]
-    None,
-    Diagnostics,
-    PlatformAliases,
-    DatabaseStatus,
-    DoctorChecks,
-    ArchiveInspector,
-    /// First-run onboarding (`onboarding.rs`): a thin step tracker that
-    /// takes over the central panel exactly like `Diagnostics` does, but
-    /// dispatches its body per-step to the real Sources/DAT Sources/
-    /// Emulator Setup page methods rather than one fixed renderer.
-    Onboarding,
 }
 
 /// Whether the RetroArch cheat-database status should be (re)loaded for the
