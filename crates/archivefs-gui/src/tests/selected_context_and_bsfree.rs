@@ -2422,19 +2422,20 @@ fn bsfree_gui_result_shows_count_and_rollback_after_success() {
 
 #[test]
 fn bsfree_gui_apply_and_rollback_reuse_the_shared_backend() {
-    // The dispatch match arm stays in `main.rs`; the workflow methods it
-    // routes to (`start_bsfree_gamecube_install_preview`,
+    // The dispatch match arm stays in the central-panel dispatch
+    // (`app_pages.rs` since the page-dispatch extraction); the workflow
+    // methods it routes to (`start_bsfree_gamecube_install_preview`,
     // `update_pcsx2_cheat_selection`, `start_cheat_apply`,
     // `start_cheat_install_rollback`) live in
     // `cheats_mods::controller` since the Cheats & Mods extraction.
-    let source = include_str!("../main.rs");
+    let source = include_str!("../app_pages.rs");
     let controller = include_str!("../cheats_mods/controller.rs");
     let dispatch = source
         .split("Some(CheatWorkflowAction::InstallSelectedBsFreeGameCube) =>")
         .nth(1)
         .unwrap();
     assert!(
-        dispatch.contains("self.start_bsfree_gamecube_install_preview()"),
+        dispatch.contains("app.start_bsfree_gamecube_install_preview()"),
         "Install routes through the BSFree install-preview path"
     );
     let preview = controller
