@@ -5,6 +5,7 @@
 //! the shared `app_for_operation_tests()` fixture.
 
 use super::*;
+use crate::app::GuiConfigSnapshot;
 
 fn app_with_no_source() -> ArchiveFsApp {
     let mut app = app_for_operation_tests();

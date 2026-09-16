@@ -824,3 +824,135 @@ impl eframe::App for ArchiveFsApp {
         self.update(ui.ctx(), frame);
     }
 }
+
+/// The one GUI-owned EmuWiz configuration snapshot.
+///
+/// Rendering is deliberately unable to load this from disk. A failed deliberate
+/// reload keeps the last usable value, while retaining an actionable error for the
+/// configuration UI.
+#[derive(Clone, Debug)]
+pub(crate) struct GuiConfigSnapshot {
+    pub(crate) current: Option<Config>,
+    pub(crate) last_error: Option<String>,
+    pub(crate) load_attempts: u64,
+    pub(crate) loader: fn() -> Result<Config, String>,
+}
+
+impl GuiConfigSnapshot {
+    pub(crate) fn load_with(loader: fn() -> Result<Config, String>) -> Self {
+        match loader() {
+            Ok(config) => Self {
+                current: Some(config),
+                last_error: None,
+                load_attempts: 1,
+                loader,
+            },
+            Err(error) => Self {
+                current: None,
+                last_error: Some(error),
+                load_attempts: 1,
+                loader,
+            },
+        }
+    }
+
+    pub(crate) fn load_default() -> Self {
+        Self::load_with(load_default_gui_config)
+    }
+
+    pub(crate) fn reload_with(
+        &mut self,
+        loader: fn() -> Result<Config, String>,
+    ) -> Result<(), String> {
+        self.load_attempts = self.load_attempts.wrapping_add(1);
+        match loader() {
+            Ok(config) => {
+                self.current = Some(config);
+                self.last_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn reload_default(&mut self) -> Result<(), String> {
+        self.reload_with(self.loader)
+    }
+
+    pub(crate) fn source_roots(&self) -> Result<&[PathBuf], String> {
+        self.current
+            .as_ref()
+            .map(|config| config.source_folders.as_slice())
+            .ok_or_else(|| {
+                self.last_error
+                    .clone()
+                    .unwrap_or_else(|| "EmuWiz configuration has not been loaded yet.".to_string())
+            })
+    }
+}
+
+pub(crate) fn load_default_gui_config() -> Result<Config, String> {
+    Config::load_default().map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+pub(crate) enum AppOperationRequest {
+    Archive(OperationRequest),
+    MountAll(Vec<MountAllItem>),
+    UnmountAll {
+        items: Vec<UnmountAllItem>,
+        cleanup_after_unmount: bool,
+    },
+    PlatformAssignment {
+        archive_path: PathBuf,
+        action: PlatformAction,
+    },
+    BulkPlatformAssignment {
+        archive_paths: Vec<PathBuf>,
+        kind: BulkPlatformActionKind,
+    },
+    RemoveMissing(Vec<PathBuf>),
+    /// The moved-library "fix it here" card's navigation-only actions. None
+    /// of these change catalogue rows, source configuration, or the
+    /// filesystem themselves: they route the user to the existing explicit
+    /// flow (`SourcesTab::Libraries` folder editor, `SourceAction::ScanAll`,
+    /// missing-only review mode). The card's own "Clean up confirmed missing
+    /// entries" button does not use this enum - it opens the existing
+    /// `confirm_remove_missing` dialog directly, so the typed-count gate and
+    /// explicit confirmation are unchanged.
+    UpdateGameFolder,
+    FullRescan,
+    ReviewMissingGames,
+    InspectArchive(PathBuf),
+    /// Navigates to the Library Views page with this archive as the
+    /// "Show in Library View preview" focus - see
+    /// `ArchiveFsApp::library_view_focus_archive`'s doc comment. Never
+    /// starts a Preview itself: it only helps the user find what a
+    /// *previously run* preview already said about this archive, since
+    /// jumping pages must never bypass Preview's own safety gate.
+    ShowInLibraryViews(PathBuf),
+    /// Opens the first-class Cheats & Mods workspace for this exact
+    /// archive - see `ArchiveFsApp::open_cheats_mods_workspace`.
+    OpenCheatsMods(PathBuf),
+    /// Navigates to the existing Verify Games (DAT Sources) page - the
+    /// selected-game DAT check section's own "Verify Games" call to
+    /// action. Never starts an audit itself; it only opens the real,
+    /// existing workflow that does.
+    OpenDatSources,
+}
+
+pub(crate) struct ActionFeedback {
+    pub(crate) succeeded: bool,
+    pub(crate) message: String,
+    pub(crate) cleanup: Option<CleanupFeedback>,
+    pub(crate) warning: Option<String>,
+    pub(crate) more_information: Option<String>,
+}
+
+pub(crate) struct CleanupFeedback {
+    pub(crate) succeeded: bool,
+    pub(crate) message: String,
+}

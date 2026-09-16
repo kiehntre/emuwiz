@@ -42,6 +42,7 @@
 //! pass rather than risk misplacing a production function.
 
 #[cfg(test)]
+use crate::app::GuiConfigSnapshot;
 use archivefs_core::game_identity::inspect_game_identity;
 
 #[cfg(test)]
