@@ -144,6 +144,7 @@ use collection_discovery_page::*;
 mod activity_history;
 mod administration_pages;
 mod archive_inspector_controller;
+mod artwork_media_state;
 mod catalogue_bsfree_ui_state;
 mod cheats_mods;
 mod cheats_mods_preview;
@@ -328,7 +329,6 @@ use activity_history::{
 use administration_pages::*;
 use sources_page::*;
 
-use crate::platform_artwork_manager::PlatformArtworkManager;
 use archivefs_core::{
     ArchiveFsError, ArchiveHealthInput, ArchiveMountSession, ArchivePresence, ArchiveRecord,
     ArchiveSnapshot, ArchiveStats, ArchiveStatus, ArchiveUnmountSession,
@@ -1194,6 +1194,7 @@ use mount_operation_controller::{
 use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 use sources_ui_state::SourcesUiState;
+use artwork_media_state::ArtworkMediaState;
 
 #[derive(Debug)]
 enum BsFreeManagerState {
@@ -2238,27 +2239,18 @@ struct ArchiveFsApp {
     bulk_platform_action_typed_count: String,
     /// EmuWiz-owned, upgrade-stable custom artwork directory. `None` is
     /// possible only when the operating-system data root cannot be resolved.
-    custom_platform_artwork_directory: Option<PathBuf>,
     /// Decoded local artwork and failed-decode fingerprints for this
     /// session. It is invalidated by directory or file-metadata changes.
-    platform_artwork_cache: PlatformArtworkCache,
-    platform_artwork_manager: PlatformArtworkManagerState,
-    platform_artwork: PlatformArtworkManager,
     /// RomM cover artwork for the Gamer View game list: what has been asked
     /// for, what has been answered, and which library generation those
     /// answers belong to. Holds no thread of its own - see `gamer_cover_worker`.
-    gamer_covers: crate::gamer_artwork::GamerCoverCache,
     /// Selected-Details RomM screenshots, sharing the cover worker and
     /// ArtworkCache security path while remaining separate from cover slots.
-    gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache,
     /// The thread that resolves those covers, started on the first frame that
     /// actually draws the list so a session that never opens Gamer View never
     /// Museum's own navigation state (grid vs. one platform's detail view) -
     /// see `museum_page`'s own module doc.
-    museum_page: museum_page::MuseumPageState,
-    museum_hero: museum_page::MuseumHeroState,
     /// opens the catalogue. `None` until then.
-    gamer_cover_worker: Option<crate::gamer_artwork::CoverWorker>,
     /// Whether a cover worker may be started at all. Always true in the running
     /// application.
     ///
@@ -2268,29 +2260,22 @@ struct ArchiveFsApp {
     /// also made cover tests racy: the worker answered the very rows the test
     /// was driving by hand, so a reply could overwrite the slot under test
     /// between one frame and the next.
-    gamer_cover_worker_allowed: bool,
     /// The `config_identity` the cover cache's answers were resolved against.
     /// A change means the same path may now be a different archive, so every
     /// answer is discarded - see `GamerCoverCache::library_changed`.
-    gamer_cover_library: Option<ConfigIdentity>,
     /// Enrichment (synopsis/genre/players/rating/release year) for the
     /// currently selected/featured Gamer View game, if any was found. Holds
     /// at most one game's worth of data - see
     /// `crate::game_metadata::GameMetadataWorker`.
-    selected_game_metadata: Option<(PathBuf, crate::game_metadata::GameMetadataResult)>,
     /// The thread that resolves enrichment lookups, started lazily like
     /// `gamer_cover_worker`. `None` until Gamer View first needs it.
-    game_metadata_worker: Option<crate::game_metadata::GameMetadataWorker>,
     /// Mirrors `gamer_cover_worker_allowed`: tests set this false so a
     /// `cargo test` run never opens the real per-user identity cache.
-    game_metadata_worker_allowed: bool,
     /// The Gamer View browsing rail's A-Z jump strip index - see
     /// [`crate::gamer_view::AlphaJumpIndex`]. Persisted here (like
     /// `gamer_covers`) because it caches a sort/bucket rebuild across
     /// frames, rebuilding only when the visible result set changes.
-    gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex,
-    es_de_media: crate::es_de_media_state::EsDeMediaState,
-    launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState,
+    artwork_media: ArtworkMediaState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2465,29 +2450,7 @@ impl ArchiveFsApp {
             confirm_bulk_platform_action: None,
             focus_bulk_platform_cancel: false,
             bulk_platform_action_typed_count: String::new(),
-            custom_platform_artwork_directory:
-                archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
-            platform_artwork_cache: PlatformArtworkCache::default(),
-            platform_artwork_manager: PlatformArtworkManagerState::default(),
-            platform_artwork: PlatformArtworkManager::new(
-                archivefs_core::platform_artwork::default_platform_artwork_root().ok(),
-                open_folder_in_file_manager,
-            ),
-            museum_page: museum_page::MuseumPageState::default(),
-            museum_hero: museum_page::MuseumHeroState::default(),
-
-            gamer_covers: crate::gamer_artwork::GamerCoverCache::default(),
-            gamer_screenshots: crate::gamer_artwork::GamerScreenshotCache::default(),
-            gamer_cover_worker: None,
-            gamer_cover_worker_allowed: true,
-            gamer_cover_library: None,
-            selected_game_metadata: None,
-            game_metadata_worker: None,
-            game_metadata_worker_allowed: true,
-            gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
-            es_de_media: crate::es_de_media_state::EsDeMediaState::default(),
-            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(
-            ),
+            artwork_media: ArtworkMediaState::new(),
         }
     }
 
@@ -3124,20 +3087,20 @@ impl ArchiveFsApp {
     /// nothing here re-implements source management, DAT handling, cheat
     /// provisioning, or collection discovery.
     fn show_sources_page(&mut self, context: &egui::Context, ui: &mut egui::Ui, tab: SourcesTab) {
-        self.es_de_media.start(context.clone());
-        if self.es_de_media.poll() {
-            self.gamer_covers.identity_refreshed();
-            self.gamer_screenshots.identity_refreshed();
-            if let Some(worker) = self.gamer_cover_worker.as_ref() {
-                worker.update_esde(self.es_de_media.snapshot().cloned());
+        self.artwork_media.es_de_media.start(context.clone());
+        if self.artwork_media.es_de_media.poll() {
+            self.artwork_media.gamer_covers.identity_refreshed();
+            self.artwork_media.gamer_screenshots.identity_refreshed();
+            if let Some(worker) = self.artwork_media.gamer_cover_worker.as_ref() {
+                worker.update_esde(self.artwork_media.es_de_media.snapshot().cloned());
             }
         }
-        self.launchbox_local_media.start(context.clone());
-        if self.launchbox_local_media.poll() {
-            self.gamer_covers.identity_refreshed();
-            self.gamer_screenshots.identity_refreshed();
-            if let Some(worker) = self.gamer_cover_worker.as_ref() {
-                worker.update_launchbox(self.launchbox_local_media.snapshot().cloned());
+        self.artwork_media.launchbox_local_media.start(context.clone());
+        if self.artwork_media.launchbox_local_media.poll() {
+            self.artwork_media.gamer_covers.identity_refreshed();
+            self.artwork_media.gamer_screenshots.identity_refreshed();
+            if let Some(worker) = self.artwork_media.gamer_cover_worker.as_ref() {
+                worker.update_launchbox(self.artwork_media.launchbox_local_media.snapshot().cloned());
             }
         }
         if let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
@@ -3151,15 +3114,15 @@ impl ArchiveFsApp {
                 if let Some(action) = sources_page::show_sources_discovery_tab(
                     ui,
                     &self.database_state,
-                    &self.es_de_media,
-                    &self.launchbox_local_media,
+                    &self.artwork_media.es_de_media,
+                    &self.artwork_media.launchbox_local_media,
                 ) {
                     match action {
                         sources_page::LocalProviderRefreshAction::EsDe => {
-                            self.es_de_media.refresh(context.clone());
+                            self.artwork_media.es_de_media.refresh(context.clone());
                         }
                         sources_page::LocalProviderRefreshAction::LaunchBoxLocal => {
-                            self.launchbox_local_media.refresh(context.clone());
+                            self.artwork_media.launchbox_local_media.refresh(context.clone());
                         }
                     }
                 }
@@ -4374,11 +4337,11 @@ impl ArchiveFsApp {
         context: egui::Context,
         action: PlatformArtworkManagerAction,
     ) {
-        if self.platform_artwork_manager.task.is_some() {
+        if self.artwork_media.platform_artwork_manager.task.is_some() {
             return;
         }
-        let Some(root) = self.custom_platform_artwork_directory.clone() else {
-            self.platform_artwork_manager.message = Some((
+        let Some(root) = self.artwork_media.custom_platform_artwork_directory.clone() else {
+            self.artwork_media.platform_artwork_manager.message = Some((
                 false,
                 "EmuWiz could not resolve its local data directory.".to_owned(),
             ));
@@ -4389,12 +4352,12 @@ impl ArchiveFsApp {
                 .map_err(ArchiveFsError::from)
                 .and_then(|()| open_folder_in_file_manager(&root))
             {
-                self.platform_artwork_manager.message = Some((false, error.to_string()));
+                self.artwork_media.platform_artwork_manager.message = Some((false, error.to_string()));
             }
             return;
         }
-        let preview = self.platform_artwork_manager.bulk_preview.clone();
-        let replace = self.platform_artwork_manager.replace_existing;
+        let preview = self.artwork_media.platform_artwork_manager.bulk_preview.clone();
+        let replace = self.artwork_media.platform_artwork_manager.replace_existing;
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             use archivefs_core::platform_artwork as artwork;
@@ -4460,37 +4423,37 @@ impl ArchiveFsApp {
             let _ = sender.send(result);
             context.request_repaint();
         });
-        self.platform_artwork_manager.task = Some(receiver);
+        self.artwork_media.platform_artwork_manager.task = Some(receiver);
     }
 
     fn poll_platform_artwork_task(&mut self, context: &egui::Context) {
-        let Some(receiver) = &self.platform_artwork_manager.task else {
+        let Some(receiver) = &self.artwork_media.platform_artwork_manager.task else {
             return;
         };
         let Ok(result) = receiver.try_recv() else {
             return;
         };
-        self.platform_artwork_manager.task = None;
+        self.artwork_media.platform_artwork_manager.task = None;
         match result {
             PlatformArtworkTaskResult::Status(result) => match result {
                 Ok(status) => {
-                    self.platform_artwork_manager.status = Some(status);
+                    self.artwork_media.platform_artwork_manager.status = Some(status);
                 }
-                Err(error) => self.platform_artwork_manager.message = Some((false, error)),
+                Err(error) => self.artwork_media.platform_artwork_manager.message = Some((false, error)),
             },
             PlatformArtworkTaskResult::BulkPreview(result) => match result {
                 Ok(preview) => {
-                    self.platform_artwork_manager.bulk_preview = Some(preview);
-                    self.platform_artwork_manager.message = Some((
+                    self.artwork_media.platform_artwork_manager.bulk_preview = Some(preview);
+                    self.artwork_media.platform_artwork_manager.message = Some((
                         true,
                         "Folder preview complete; nothing was written.".to_owned(),
                     ));
                 }
-                Err(error) => self.platform_artwork_manager.message = Some((false, error)),
+                Err(error) => self.artwork_media.platform_artwork_manager.message = Some((false, error)),
             },
             PlatformArtworkTaskResult::Mutation(result) => {
-                self.platform_artwork_cache.clear();
-                self.platform_artwork_manager.message = Some(match result {
+                self.artwork_media.platform_artwork_cache.clear();
+                self.artwork_media.platform_artwork_manager.message = Some(match result {
                     Ok(message) => (true, message),
                     Err(error) => (false, error),
                 });
@@ -5175,12 +5138,12 @@ impl ArchiveFsApp {
                 // unreachable while `ui_mode` is `GamerView`, since
                 // nothing in this mode's UI ever sets `self.view` to one.
                 if self.ui_mode == GuiMode::GamerView && self.view != MainView::CheatsMods {
-                    self.es_de_media.start(ui.ctx().clone());
-                    if self.es_de_media.poll() {
-                        self.gamer_covers.identity_refreshed();
-                        self.gamer_screenshots.identity_refreshed();
-                        if let Some(worker) = self.gamer_cover_worker.as_ref() {
-                            worker.update_esde(self.es_de_media.snapshot().cloned());
+                    self.artwork_media.es_de_media.start(ui.ctx().clone());
+                    if self.artwork_media.es_de_media.poll() {
+                        self.artwork_media.gamer_covers.identity_refreshed();
+                        self.artwork_media.gamer_screenshots.identity_refreshed();
+                        if let Some(worker) = self.artwork_media.gamer_cover_worker.as_ref() {
+                            worker.update_esde(self.artwork_media.es_de_media.snapshot().cloned());
                         }
                     }
                     if let Some(path) = self.archive_context.focused.clone() {
@@ -5217,22 +5180,22 @@ impl ArchiveFsApp {
                     // visible without changing what any of them is, so covers
                     // already loaded stay loaded and are not fetched twice.
                     let library = data.map(|data| data.config_identity.clone());
-                    if self.gamer_cover_library != library {
-                        self.gamer_cover_library = library;
-                        self.gamer_covers.library_changed();
-                        self.gamer_screenshots.library_changed();
+                    if self.artwork_media.gamer_cover_library != library {
+                        self.artwork_media.gamer_cover_library = library;
+                        self.artwork_media.gamer_covers.library_changed();
+                        self.artwork_media.gamer_screenshots.library_changed();
                     }
                     // Answers first, so a cover that arrived since the last frame
                     // is drawn in this one. Anything from a superseded generation
                     // is dropped inside `absorb`.
-                    if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                    if let Some(worker) = self.artwork_media.gamer_cover_worker.as_ref() {
                         for update in worker.drain_delivery() {
-                            self.gamer_covers.absorb_delivery(&update);
-                            self.gamer_screenshots.absorb_delivery(&update);
+                            self.artwork_media.gamer_covers.absorb_delivery(&update);
+                            self.artwork_media.gamer_screenshots.absorb_delivery(&update);
                         }
                         for reply in worker.drain() {
-                            if !self.gamer_covers.absorb(ui.ctx(), reply.clone()) {
-                                self.gamer_screenshots.absorb(ui.ctx(), reply);
+                            if !self.artwork_media.gamer_covers.absorb(ui.ctx(), reply.clone()) {
+                                self.artwork_media.gamer_screenshots.absorb(ui.ctx(), reply);
                             }
                         }
                     }
@@ -5242,27 +5205,29 @@ impl ArchiveFsApp {
                     // answers first, same as covers above, then a request only
                     // when the focused game actually changed - never once per
                     // frame, and never for a row that merely scrolled into view.
-                    if let Some(worker) = self.game_metadata_worker.as_mut() {
+                    if let Some(worker) = self.artwork_media.game_metadata_worker.as_mut() {
                         for reply in worker.poll() {
-                            self.selected_game_metadata = Some((reply.local_path, reply.result));
+                            self.artwork_media.selected_game_metadata = Some((reply.local_path, reply.result));
                         }
                     }
                     let focused_archive = self.archive_context.focused.clone();
                     let metadata_is_stale = self
+                        .artwork_media
                         .selected_game_metadata
                         .as_ref()
                         .map(|(path, _)| path)
                         != focused_archive.as_ref();
                     if metadata_is_stale
                         && let Some(path) = focused_archive.as_ref()
-                        && self.game_metadata_worker_allowed
+                        && self.artwork_media.game_metadata_worker_allowed
                     {
-                        let worker = self.game_metadata_worker.get_or_insert_with(|| {
+                        let worker = self.artwork_media.game_metadata_worker.get_or_insert_with(|| {
                             crate::game_metadata::GameMetadataWorker::start(ui.ctx().clone())
                         });
                         worker.request(path);
                     }
                     let game_metadata = self
+                        .artwork_media
                         .selected_game_metadata
                         .as_ref()
                         .filter(|(path, _)| Some(path) == focused_archive.as_ref())
@@ -5301,10 +5266,10 @@ impl ArchiveFsApp {
                             cheat_workflow: self.cheat_workflow.as_ref(),
                             feedback: self.feedback.as_ref(),
                             scan_review_available: self.gamer_view_scan_review_available,
-                            artwork_directory: self.custom_platform_artwork_directory.as_deref(),
-                            artwork_cache: &mut self.platform_artwork_cache,
-                            covers: &mut self.gamer_covers,
-                            screenshots: &mut self.gamer_screenshots,
+                            artwork_directory: self.artwork_media.custom_platform_artwork_directory.as_deref(),
+                            artwork_cache: &mut self.artwork_media.platform_artwork_cache,
+                            covers: &mut self.artwork_media.gamer_covers,
+                            screenshots: &mut self.artwork_media.gamer_screenshots,
                             cover_requests: &mut cover_requests,
                             screenshot_requests: &mut screenshot_requests,
                             game_metadata,
@@ -5317,7 +5282,7 @@ impl ArchiveFsApp {
                             dolphin_launch_state: &mut self.launch_dolphin,
                             pcsx2_launch_state: &mut self.launch_pcsx2,
                             standalone_launch_state: &mut self.launch_standalone,
-                            alpha_jump: &mut self.gamer_alpha_jump,
+                            alpha_jump: &mut self.artwork_media.gamer_alpha_jump,
                         },
                     );
                     // Started only once the list has actually asked for something,
@@ -5325,17 +5290,17 @@ impl ArchiveFsApp {
                     // catalogue, and an empty or unfiltered-to-nothing list starts
                     // no thread at all.
                     if (!cover_requests.is_empty() || !screenshot_requests.is_empty())
-                        && self.gamer_cover_worker_allowed
+                        && self.artwork_media.gamer_cover_worker_allowed
                     {
-                        let worker = self.gamer_cover_worker.get_or_insert_with(|| {
+                        let worker = self.artwork_media.gamer_cover_worker.get_or_insert_with(|| {
                             crate::gamer_artwork::CoverWorker::start(
                                 ui.ctx().clone(),
                                 self.gui_config.source_roots().ok().map(<[PathBuf]>::to_vec),
-                                self.es_de_media.snapshot().cloned(),
-                                self.launchbox_local_media.snapshot().cloned(),
+                                self.artwork_media.es_de_media.snapshot().cloned(),
+                                self.artwork_media.launchbox_local_media.snapshot().cloned(),
                             )
                         });
-                        let generation = self.gamer_covers.generation();
+                        let generation = self.artwork_media.gamer_covers.generation();
                         for job in cover_requests {
                             worker.request(generation, job);
                         }
@@ -5436,8 +5401,8 @@ impl ArchiveFsApp {
                         // non-exhaustive and force a redundant fallback arm.
                         #[allow(clippy::collapsible_match)]
                         Some(GamerViewAction::RefreshGameInformation) => {
-                            if self.game_metadata_worker_allowed {
-                                let worker = self.game_metadata_worker.get_or_insert_with(|| {
+                            if self.artwork_media.game_metadata_worker_allowed {
+                                let worker = self.artwork_media.game_metadata_worker.get_or_insert_with(|| {
                                     crate::game_metadata::GameMetadataWorker::start(
                                         context.clone(),
                                     )
@@ -5448,7 +5413,7 @@ impl ArchiveFsApp {
                                 // this re-request on the same worker channel)
                                 // finishes and answers it - never stale data
                                 // presented as freshly refreshed.
-                                self.selected_game_metadata = None;
+                                self.artwork_media.selected_game_metadata = None;
                                 if let Some(path) = &self.archive_context.focused {
                                     worker.request(path);
                                 }
@@ -5478,40 +5443,40 @@ impl ArchiveFsApp {
                 if self.view == MainView::Museum {
                     let library = self.database_state.snapshot().map(home_library_snapshot);
                     let selected_game = self.museum_selected_game();
-                    let mut artwork = self.platform_artwork.render_assets();
-                    if let Some(worker) = self.gamer_cover_worker.as_ref() {
+                    let mut artwork = self.artwork_media.platform_artwork.render_assets();
+                    if let Some(worker) = self.artwork_media.gamer_cover_worker.as_ref() {
                         for update in worker.drain_delivery() {
-                            self.gamer_covers.absorb_delivery(&update);
-                            self.gamer_screenshots.absorb_delivery(&update);
+                            self.artwork_media.gamer_covers.absorb_delivery(&update);
+                            self.artwork_media.gamer_screenshots.absorb_delivery(&update);
                         }
                         for reply in worker.drain() {
-                            if !self.gamer_covers.absorb(ui.ctx(), reply.clone()) {
-                                self.gamer_screenshots.absorb(ui.ctx(), reply);
+                            if !self.artwork_media.gamer_covers.absorb(ui.ctx(), reply.clone()) {
+                                self.artwork_media.gamer_screenshots.absorb(ui.ctx(), reply);
                             }
                         }
                     }
                     let mut screenshot_requests = Vec::new();
                     let action = museum_page::show_with_selected_game_and_artwork_with_hero(
                         ui,
-                        &mut self.museum_hero,
-                        &mut self.museum_page,
+                        &mut self.artwork_media.museum_hero,
+                        &mut self.artwork_media.museum_page,
                         library.as_ref(),
                         selected_game.as_ref(),
-                        Some(&self.gamer_covers),
-                        Some(&mut self.gamer_screenshots),
+                        Some(&self.artwork_media.gamer_covers),
+                        Some(&mut self.artwork_media.gamer_screenshots),
                         Some(&mut artwork),
                         &mut screenshot_requests,
                     );
-                    if !screenshot_requests.is_empty() && self.gamer_cover_worker_allowed {
-                        let worker = self.gamer_cover_worker.get_or_insert_with(|| {
+                    if !screenshot_requests.is_empty() && self.artwork_media.gamer_cover_worker_allowed {
+                        let worker = self.artwork_media.gamer_cover_worker.get_or_insert_with(|| {
                             crate::gamer_artwork::CoverWorker::start(
                                 ui.ctx().clone(),
                                 self.gui_config.source_roots().ok().map(<[PathBuf]>::to_vec),
-                                self.es_de_media.snapshot().cloned(),
-                                self.launchbox_local_media.snapshot().cloned(),
+                                self.artwork_media.es_de_media.snapshot().cloned(),
+                                self.artwork_media.launchbox_local_media.snapshot().cloned(),
                             )
                         });
-                        let generation = self.gamer_covers.generation();
+                        let generation = self.artwork_media.gamer_covers.generation();
                         for job in screenshot_requests {
                             worker.request(generation, job);
                         }
@@ -6550,8 +6515,8 @@ impl ArchiveFsApp {
                 }
 
                 if self.view == MainView::Settings {
-                    if self.platform_artwork_manager.status.is_none()
-                        && self.platform_artwork_manager.task.is_none()
+                    if self.artwork_media.platform_artwork_manager.status.is_none()
+                        && self.artwork_media.platform_artwork_manager.task.is_none()
                     {
                         self.start_platform_artwork_task(
                             context.clone(),
@@ -6570,9 +6535,9 @@ impl ArchiveFsApp {
                         mount_root,
                         busy,
                         &mut self.clipboard,
-                        self.custom_platform_artwork_directory.as_deref(),
-                        &mut self.platform_artwork_cache,
-                        &mut self.platform_artwork_manager,
+                        self.artwork_media.custom_platform_artwork_directory.as_deref(),
+                        &mut self.artwork_media.platform_artwork_cache,
+                        &mut self.artwork_media.platform_artwork_manager,
                     );
                     match action {
                         Some(SettingsPageAction::OpenConfigFolder) => {

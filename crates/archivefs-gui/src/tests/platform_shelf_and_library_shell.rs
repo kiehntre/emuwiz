@@ -3358,7 +3358,7 @@ fn custom_artwork_preserves_platform_filtering_and_selected_game_state() {
     )));
     app.library_ui.library_filters.platform = Some("GameCube".to_string());
     app.archive_context.select_only(selected_path.clone());
-    app.custom_platform_artwork_directory = Some(temp.clone());
+    app.artwork_media.custom_platform_artwork_directory = Some(temp.clone());
 
     let context = egui::Context::default();
     let mut frame = eframe::Frame::_new_kittest();
@@ -3381,7 +3381,7 @@ fn custom_artwork_preserves_platform_filtering_and_selected_game_state() {
         app.archive_context.focused.as_deref(),
         Some(selected_path.as_path())
     );
-    assert!(app.platform_artwork_cache.entries.contains_key("gamecube"));
+    assert!(app.artwork_media.platform_artwork_cache.entries.contains_key("gamecube"));
     let _ = std::fs::remove_dir_all(&temp);
 }
 

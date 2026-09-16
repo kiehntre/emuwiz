@@ -314,9 +314,9 @@ impl ArchiveFsApp {
             // unchanged record costs no decode, but the placeholder is drawn until
             // the refreshed catalogue confirms the record, so a path whose provider
             // id moved cannot show the old cover even for one frame.
-            self.gamer_covers.identity_refreshed();
-            self.gamer_screenshots.library_changed();
-            if let Some(worker) = self.gamer_cover_worker.as_ref() {
+            self.artwork_media.gamer_covers.identity_refreshed();
+            self.artwork_media.gamer_screenshots.library_changed();
+            if let Some(worker) = self.artwork_media.gamer_cover_worker.as_ref() {
                 worker.reindex();
             }
             // The same worker may have enriched platform metadata in the

@@ -709,10 +709,10 @@ mod romm_dispatch_tests {
         let context = egui::Context::default();
         app.romm_ui.snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
         let (sender, _progress, generation) = install_running(&mut app, operation);
-        let before = app.gamer_covers.generation();
+        let before = app.artwork_media.gamer_covers.generation();
         sender.send((generation, outcome)).expect("send");
         app.poll_romm_operation(&context);
-        let after = app.gamer_covers.generation();
+        let after = app.artwork_media.gamer_covers.generation();
         (app, before, after)
     }
 

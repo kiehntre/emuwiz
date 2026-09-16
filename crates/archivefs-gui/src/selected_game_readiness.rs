@@ -76,10 +76,10 @@ impl ArchiveFsApp {
             romm,
             emulator,
             cover_available: Some(matches!(
-                self.gamer_covers.slot_for(path, None),
+                self.artwork_media.gamer_covers.slot_for(path, None),
                 Some(crate::gamer_artwork::CoverSlot::Ready { .. })
             )),
-            screenshot_count: self.gamer_screenshots.screenshot_count(path),
+            screenshot_count: self.artwork_media.gamer_screenshots.screenshot_count(path),
             video_available: None,
         });
         media.unwrap_or_default()
@@ -196,7 +196,7 @@ impl ArchiveFsApp {
             facts,
             evidence_highlights,
             feature_view,
-            screenshot_count: self.gamer_screenshots.screenshot_count(path),
+            screenshot_count: self.artwork_media.gamer_screenshots.screenshot_count(path),
             video_available,
             dat_verified: matches!(
                 &self.selected_evidence_ui.selected_evidence,

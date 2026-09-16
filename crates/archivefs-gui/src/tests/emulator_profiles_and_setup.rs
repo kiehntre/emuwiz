@@ -135,9 +135,9 @@ fn non_empty_gamer_view_scan_button_returns_the_shared_scan_request() {
                         feedback: None,
                         scan_review_available: false,
                         artwork_directory: None,
-                        artwork_cache: &mut app.platform_artwork_cache,
-                        covers: &mut app.gamer_covers,
-                        screenshots: &mut app.gamer_screenshots,
+                        artwork_cache: &mut app.artwork_media.platform_artwork_cache,
+                        covers: &mut app.artwork_media.gamer_covers,
+                        screenshots: &mut app.artwork_media.gamer_screenshots,
                         cover_requests: &mut cover_requests,
                         screenshot_requests: &mut screenshot_requests,
                         game_metadata: None,
@@ -150,7 +150,7 @@ fn non_empty_gamer_view_scan_button_returns_the_shared_scan_request() {
                         dolphin_launch_state: &mut app.launch_dolphin,
                         pcsx2_launch_state: &mut app.launch_pcsx2,
                         standalone_launch_state: &mut app.launch_standalone,
-                        alpha_jump: &mut app.gamer_alpha_jump,
+                        alpha_jump: &mut app.artwork_media.gamer_alpha_jump,
                     },
                 );
             });
@@ -239,9 +239,9 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
                         feedback: None,
                         scan_review_available: false,
                         artwork_directory: None,
-                        artwork_cache: &mut app.platform_artwork_cache,
-                        covers: &mut app.gamer_covers,
-                        screenshots: &mut app.gamer_screenshots,
+                        artwork_cache: &mut app.artwork_media.platform_artwork_cache,
+                        covers: &mut app.artwork_media.gamer_covers,
+                        screenshots: &mut app.artwork_media.gamer_screenshots,
                         cover_requests: &mut cover_requests,
                         screenshot_requests: &mut screenshot_requests,
                         game_metadata: None,
@@ -254,7 +254,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
                         dolphin_launch_state: &mut app.launch_dolphin,
                         pcsx2_launch_state: &mut app.launch_pcsx2,
                         standalone_launch_state: &mut app.launch_standalone,
-                        alpha_jump: &mut app.gamer_alpha_jump,
+                        alpha_jump: &mut app.artwork_media.gamer_alpha_jump,
                     },
                 );
             });
@@ -350,9 +350,9 @@ fn render_gamer_card_with_launch_state(
                     feedback: None,
                     scan_review_available: false,
                     artwork_directory: None,
-                    artwork_cache: &mut app.platform_artwork_cache,
-                    covers: &mut app.gamer_covers,
-                    screenshots: &mut app.gamer_screenshots,
+                    artwork_cache: &mut app.artwork_media.platform_artwork_cache,
+                    covers: &mut app.artwork_media.gamer_covers,
+                    screenshots: &mut app.artwork_media.gamer_screenshots,
                     cover_requests: &mut cover_requests,
                     screenshot_requests: &mut screenshot_requests,
                     game_metadata: None,
@@ -365,7 +365,7 @@ fn render_gamer_card_with_launch_state(
                     dolphin_launch_state: &mut app.launch_dolphin,
                     pcsx2_launch_state: &mut app.launch_pcsx2,
                     standalone_launch_state: &mut app.launch_standalone,
-                    alpha_jump: &mut app.gamer_alpha_jump,
+                    alpha_jump: &mut app.artwork_media.gamer_alpha_jump,
                 },
             );
         });
@@ -575,9 +575,9 @@ fn gamer_view_no_safe_emulator_action_runs_emulator_check() {
                         feedback: None,
                         scan_review_available: false,
                         artwork_directory: None,
-                        artwork_cache: &mut app.platform_artwork_cache,
-                        covers: &mut app.gamer_covers,
-                        screenshots: &mut app.gamer_screenshots,
+                        artwork_cache: &mut app.artwork_media.platform_artwork_cache,
+                        covers: &mut app.artwork_media.gamer_covers,
+                        screenshots: &mut app.artwork_media.gamer_screenshots,
                         cover_requests: &mut cover_requests,
                         screenshot_requests: &mut screenshot_requests,
                         game_metadata: None,
@@ -590,7 +590,7 @@ fn gamer_view_no_safe_emulator_action_runs_emulator_check() {
                         dolphin_launch_state: &mut app.launch_dolphin,
                         pcsx2_launch_state: &mut app.launch_pcsx2,
                         standalone_launch_state: &mut app.launch_standalone,
-                        alpha_jump: &mut app.gamer_alpha_jump,
+                        alpha_jump: &mut app.artwork_media.gamer_alpha_jump,
                     },
                 );
             });
@@ -973,9 +973,9 @@ fn gamer_view_renders_without_a_romm_catalogue_and_contacts_nothing() {
         "the list must still draw when no cover is available"
     );
     assert!(
-        app.gamer_covers.tracked() <= crate::gamer_artwork::MAX_TRACKED_COVERS,
+        app.artwork_media.gamer_covers.tracked() <= crate::gamer_artwork::MAX_TRACKED_COVERS,
         "rendering pushed the cover cache past its bound, held {}",
-        app.gamer_covers.tracked()
+        app.artwork_media.gamer_covers.tracked()
     );
 }
 
@@ -990,7 +990,7 @@ fn an_empty_gamer_view_starts_no_cover_worker_at_all() {
     // whether the worker starts, so suppressing it would prove nothing. It
     // is safe here precisely because an empty list must never reach the
     // start site - if that regressed, this test starts a thread and fails.
-    app.gamer_cover_worker_allowed = true;
+    app.artwork_media.gamer_cover_worker_allowed = true;
     app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", Vec::new())));
     app.ui_mode = GuiMode::GamerView;
     app.view = MainView::Library;
@@ -1009,11 +1009,11 @@ fn an_empty_gamer_view_starts_no_cover_worker_at_all() {
     }
 
     assert!(
-        app.gamer_cover_worker.is_none(),
+        app.artwork_media.gamer_cover_worker.is_none(),
         "an empty library started a cover worker, so opening the page alone \
              would open the catalogue and could reach the network"
     );
-    assert_eq!(app.gamer_covers.tracked(), 0);
+    assert_eq!(app.artwork_media.gamer_covers.tracked(), 0);
 }
 
 #[test]
