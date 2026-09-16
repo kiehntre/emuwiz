@@ -13,6 +13,11 @@
 //!
 //! Predominant theme observed in this slice: mount/unmount, missing-file cleanup, and activity/history recording.
 
+use archivefs_core::{
+    CUSTOM_FOLDER_ALIAS_SOURCE, DAT_ROMM_AGREEMENT_SOURCE, ROMM_PLATFORM_SOURCE,
+    VERIFIED_DAT_PLATFORM_SOURCE,
+};
+
 use super::*;
 
 #[test]
