@@ -19,6 +19,8 @@ use archivefs_core::emulator_environment::retroarch::CoreInfoFinding;
 use archivefs_core::launch::retroarch_platform_candidate;
 use archivefs_core::patch_manager::RetroArchCheatSetupDiscovery;
 
+#[cfg(test)]
+use crate::emulator_setup::save_retroarch_core_directory_override_at;
 use crate::ui::components::StatusTone;
 
 /// The stable diagnostic code the core layer emits when an EmuWiz
@@ -541,4 +543,90 @@ mod tests {
             "the launch planner must naturally see the override's Game Boy core"
         );
     }
+}
+
+/// The GUI-only file that persists an explicit RetroArch core-directory
+/// override, as one plain path line. A sibling of `gui_mode.txt` under the
+/// EmuWiz config directory - not part of `config.toml`, so no parser or
+/// schema change, and an install that has never set one simply has no
+/// file. Reading is fully injectable (`_at`) for tests.
+pub(crate) fn retroarch_core_directory_override_path() -> Option<PathBuf> {
+    archivefs_core::app_dirs::config_path("retroarch_core_directory_override.txt").ok()
+}
+
+/// Reads the override from an explicit file path. A missing/unreadable
+/// file, or one that is empty or only whitespace, is `None` (automatic
+/// discovery). The stored path is taken verbatim - it is the user's
+/// explicit choice, never canonicalised here.
+pub(crate) fn load_retroarch_core_directory_override_at(path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// The default-location counterparts, used by the running app.
+pub(crate) fn load_retroarch_core_directory_override() -> Option<PathBuf> {
+    retroarch_core_directory_override_path()
+        .as_deref()
+        .and_then(load_retroarch_core_directory_override_at)
+}
+
+#[test]
+pub(crate) fn a_missing_core_directory_override_file_loads_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    assert!(!path.exists());
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+pub(crate) fn an_empty_or_whitespace_core_directory_override_file_loads_as_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    std::fs::write(&path, "   \n\t").unwrap();
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+}
+
+#[test]
+pub(crate) fn a_core_directory_override_round_trips_through_save_and_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("nested/retroarch_core_directory_override.txt");
+    let chosen = PathBuf::from("/opt/libretro/cores");
+    save_retroarch_core_directory_override_at(&path, Some(chosen.as_path()));
+    assert!(path.exists(), "save must create the file (and any parent)");
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(chosen)
+    );
+}
+
+#[test]
+pub(crate) fn clearing_a_core_directory_override_removes_the_file_and_next_load_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    save_retroarch_core_directory_override_at(
+        &path,
+        Some(PathBuf::from("/opt/libretro/cores").as_path()),
+    );
+    assert!(path.exists());
+    save_retroarch_core_directory_override_at(&path, None);
+    assert!(!path.exists(), "clearing must remove the file");
+    assert_eq!(load_retroarch_core_directory_override_at(&path), None);
+    // Clearing an already-absent file is a harmless no-op.
+    save_retroarch_core_directory_override_at(&path, None);
+    assert!(!path.exists());
+}
+
+#[test]
+pub(crate) fn a_persisted_core_directory_override_survives_a_second_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retroarch_core_directory_override.txt");
+    save_retroarch_core_directory_override_at(&path, Some(Path::new("/first/cores")));
+    save_retroarch_core_directory_override_at(&path, Some(Path::new("/second/cores")));
+    assert_eq!(
+        load_retroarch_core_directory_override_at(&path),
+        Some(PathBuf::from("/second/cores"))
+    );
 }
