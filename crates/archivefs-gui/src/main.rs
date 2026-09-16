@@ -146,6 +146,7 @@ mod administration_pages;
 mod app_overlays;
 mod app_pages;
 mod app_polling;
+mod app_reactions;
 mod app_shell;
 mod archive_inspector_controller;
 mod artwork_media_state;
@@ -4607,69 +4608,7 @@ impl ArchiveFsApp {
                 source_actions_available: !busy && self.source_action_available(),
             },
         );
-        match navigation_request {
-            Some(app_shell::ShellRequest::Navigate(NavClick::View(view))) => {
-                self.navigate_to_main_view(view);
-                if view == MainView::DiscConversion {
-                    self.optical_conversion_page.get_or_insert_with(
-                        optical_conversion_page::OpticalConversionPageState::default,
-                    );
-                }
-            }
-            Some(app_shell::ShellRequest::Navigate(NavClick::QuickRename)) => {
-                self.sources_ui.quick_rename_mode = true;
-                self.navigate_to_main_view(MainView::IdentifyRename);
-            }
-            Some(app_shell::ShellRequest::Navigate(NavClick::Overlay(overlay))) => {
-                self.tools_overlay = overlay;
-                if overlay == ToolsOverlay::Diagnostics {
-                    self.refresh_diagnostics(context);
-                }
-            }
-            Some(app_shell::ShellRequest::Navigate(NavClick::Romm)) => {
-                self.navigate_to_sources_tab(SourcesTab::Libraries);
-            }
-            Some(app_shell::ShellRequest::ScanLibrary) => {
-                self.start_database_action(context.clone(), true);
-            }
-            Some(app_shell::ShellRequest::RefreshDatabase) => {
-                self.start_database_action(context.clone(), false);
-            }
-            Some(app_shell::ShellRequest::RefreshView) => self.refresh(context),
-            Some(app_shell::ShellRequest::SelectAllVisible) => {
-                self.select_all_visible_requested = true;
-            }
-            Some(app_shell::ShellRequest::ClearSelection) => self.archive_context.clear_selection(),
-            Some(app_shell::ShellRequest::ToggleActivity) => {
-                self.show_activity = !self.show_activity;
-            }
-            Some(app_shell::ShellRequest::ShowAbout) => self.show_about = true,
-            Some(app_shell::ShellRequest::ReturnToGamerView) => {
-                self.ui_mode = GuiMode::GamerView;
-                self.view = MainView::Library;
-                self.tools_overlay = ToolsOverlay::None;
-                save_gui_mode(self.ui_mode);
-            }
-            Some(app_shell::ShellRequest::GamerAddFolder(folder)) => {
-                self.gamer_view_scan_review_available = false;
-                self.start_source_action(context.clone(), SourceAction::Add(folder));
-            }
-            Some(app_shell::ShellRequest::GamerScan) => {
-                self.gamer_view_scan_review_available = false;
-                self.gamer_view_scan_pending_review = true;
-                self.start_source_action(context.clone(), SourceAction::ScanAll);
-            }
-            Some(app_shell::ShellRequest::GamerSetup) => {
-                self.ui_mode = GuiMode::AdvancedView;
-                save_gui_mode(self.ui_mode);
-                self.navigate_to_main_view(MainView::EmulatorSetup);
-            }
-            Some(app_shell::ShellRequest::GamerAdvanced) => {
-                self.switch_to_advanced_view_at_home();
-                save_gui_mode(self.ui_mode);
-            }
-            None => {}
-        }
+        app_reactions::apply_shell_request(self, context, navigation_request);
 
         app_overlays::show_global_overlays(self, context);
 
