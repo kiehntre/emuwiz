@@ -14,6 +14,10 @@
 //! Predominant theme observed in this slice: platform shelf/library shell rendering, artwork, Gamer/Advanced view controls.
 
 use super::*;
+use crate::bulk_confirmation::{
+    BULK_ACTION_TYPED_CONFIRMATION_THRESHOLD, bulk_action_confirm_enabled,
+    bulk_action_requires_typed_count, bulk_action_typed_count_matches,
+};
 use crate::ui::platform_artwork::*;
 
 #[test]
