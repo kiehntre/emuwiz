@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::{fmt, str::FromStr};
 
 /// The two supported GUI experiences. Rendering and navigation deliberately
@@ -84,4 +85,60 @@ mod tests {
         assert_eq!(ViewMode::from_persisted("Gamer View"), None);
         assert_eq!(ViewMode::from_persisted("unknown"), None);
     }
+}
+
+/// Decision 5 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): exactly these two
+/// modes, no alternate labels. `GamerView` is the unconditional default
+/// for a fresh profile/first launch (decision matches §1.1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GuiMode {
+    #[default]
+    GamerView,
+    AdvancedView,
+}
+
+/// A dedicated on-disk preference file, following the same precedent the
+/// design (§1.1) points to: `~/.config/archivefs/emulator_profiles.toml`
+/// is its own small file rather than a new `Config`/`config.toml` field,
+/// specifically to avoid coupling unrelated persistence together. Mode is
+/// a GUI-layer-only concept (never read by `archivefs-core` or the CLI),
+/// so it lives in the GUI crate rather than in core.
+pub(crate) fn gui_mode_config_path() -> Option<PathBuf> {
+    archivefs_core::app_dirs::config_path("gui_mode.txt").ok()
+}
+
+pub(crate) fn parse_gui_mode(contents: &str) -> GuiMode {
+    match contents.trim() {
+        "advanced" => GuiMode::AdvancedView,
+        _ => GuiMode::GamerView,
+    }
+}
+
+pub(crate) fn gui_mode_file_contents(mode: GuiMode) -> &'static str {
+    match mode {
+        GuiMode::GamerView => "gamer",
+        GuiMode::AdvancedView => "advanced",
+    }
+}
+
+/// A missing or unreadable file means "nothing chosen yet" - falls back
+/// to the unconditional default (`GamerView`), never an error.
+pub(crate) fn load_gui_mode() -> GuiMode {
+    gui_mode_config_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|contents| parse_gui_mode(&contents))
+        .unwrap_or_default()
+}
+
+/// Best-effort: a failure to persist the chosen mode (e.g. a read-only
+/// home directory) never blocks the mode switch itself from taking
+/// effect for the rest of the session - it just won't survive a restart.
+pub(crate) fn save_gui_mode(mode: GuiMode) {
+    let Some(path) = gui_mode_config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, gui_mode_file_contents(mode));
 }
