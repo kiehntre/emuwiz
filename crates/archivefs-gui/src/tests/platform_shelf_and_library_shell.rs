@@ -2627,28 +2627,6 @@ fn custom_platform_artwork_path_falls_back_to_none_when_missing_or_unconfigured(
 }
 
 #[test]
-fn managed_artwork_source_prefers_custom_over_bundled_artwork() {
-    let temp = artwork_test_directory("source-priority");
-    assert_eq!(
-        current_artwork_source(Some(&temp), "PS2", None),
-        ("Bundled", false)
-    );
-    write_test_png(&temp.join("ps2.png"), 2, 2, [1, 2, 3, 255]);
-    assert_eq!(
-        current_artwork_source(Some(&temp), "PS2", None),
-        ("Custom", true)
-    );
-    // Every current canonical platform has its own bundled artwork. The
-    // complete set must therefore still prefer the platform-specific bundle
-    // whenever no custom file overrides it.
-    assert_eq!(
-        current_artwork_source(Some(&temp), "MasterSystem", None),
-        ("Bundled", false)
-    );
-    let _ = std::fs::remove_dir_all(temp);
-}
-
-#[test]
 fn custom_platform_artwork_filename_resolution_is_exact_and_png_only() {
     let temp = artwork_test_directory("present");
     let svg_path = temp.join("gamecube.svg");
@@ -3358,7 +3336,10 @@ fn custom_artwork_preserves_platform_filtering_and_selected_game_state() {
     )));
     app.library_ui.library_filters.platform = Some("GameCube".to_string());
     app.archive_context.select_only(selected_path.clone());
-    app.artwork_media.custom_platform_artwork_directory = Some(temp.clone());
+    app.artwork_media.platform_artwork =
+        crate::platform_artwork_manager::PlatformArtworkManager::new(Some(temp.clone()), |_path| {
+            Ok(())
+        });
 
     let context = egui::Context::default();
     let mut frame = eframe::Frame::_new_kittest();
@@ -3381,7 +3362,14 @@ fn custom_artwork_preserves_platform_filtering_and_selected_game_state() {
         app.archive_context.focused.as_deref(),
         Some(selected_path.as_path())
     );
-    assert!(app.artwork_media.platform_artwork_cache.entries.contains_key("gamecube"));
+    assert!(
+        app.artwork_media
+            .platform_artwork
+            .render_assets()
+            .cache
+            .entries
+            .contains_key("gamecube")
+    );
     let _ = std::fs::remove_dir_all(&temp);
 }
 

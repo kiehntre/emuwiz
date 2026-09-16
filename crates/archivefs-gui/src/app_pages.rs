@@ -293,6 +293,7 @@ pub(crate) fn show_pages(
                         .unwrap_or((false, None, None));
                 let member_choices = member_choices_owned.as_deref();
                 let preparation_message = preparation_message_owned.as_deref();
+                let artwork = app.artwork_media.platform_artwork.render_assets();
                 let gamer_action = show_gamer_view(
                     ui,
                     data,
@@ -307,8 +308,8 @@ pub(crate) fn show_pages(
                         cheat_workflow: app.cheat_workflow.as_ref(),
                         feedback: app.feedback.as_ref(),
                         scan_review_available: app.gamer_view_scan_review_available,
-                        artwork_directory: app.artwork_media.custom_platform_artwork_directory.as_deref(),
-                        artwork_cache: &mut app.artwork_media.platform_artwork_cache,
+                        artwork_directory: artwork.directory,
+                        artwork_cache: artwork.cache,
                         covers: &mut app.artwork_media.gamer_covers,
                         screenshots: &mut app.artwork_media.gamer_screenshots,
                         cover_requests: &mut cover_requests,
@@ -1556,14 +1557,7 @@ pub(crate) fn show_pages(
             }
 
             if app.view == MainView::Settings {
-                if app.artwork_media.platform_artwork_manager.status.is_none()
-                    && app.artwork_media.platform_artwork_manager.task.is_none()
-                {
-                    app.start_platform_artwork_task(
-                        context.clone(),
-                        PlatformArtworkManagerAction::Rescan,
-                    );
-                }
+                app.artwork_media.platform_artwork.prepare_settings(context);
                 let mount_root = match &app.state {
                     LoadState::Ready(data) => Some(data.mount_root.as_path()),
                     _ => None,
@@ -1576,9 +1570,7 @@ pub(crate) fn show_pages(
                     mount_root,
                     busy,
                     &mut app.clipboard,
-                    app.artwork_media.custom_platform_artwork_directory.as_deref(),
-                    &mut app.artwork_media.platform_artwork_cache,
-                    &mut app.artwork_media.platform_artwork_manager,
+                    &mut app.artwork_media.platform_artwork,
                 );
                 match action {
                     Some(SettingsPageAction::OpenConfigFolder) => {
@@ -1598,7 +1590,9 @@ pub(crate) fn show_pages(
                         app.restart_onboarding();
                     }
                     Some(SettingsPageAction::PlatformArtwork(action)) => {
-                        app.start_platform_artwork_task(context.clone(), action);
+                        app.artwork_media
+                            .platform_artwork
+                            .dispatch(context.clone(), action);
                     }
                     None => {}
                 }

@@ -1166,9 +1166,6 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         focus_bulk_platform_cancel: false,
         bulk_platform_action_typed_count: String::new(),
         artwork_media: ArtworkMediaState {
-            custom_platform_artwork_directory: None,
-            platform_artwork_cache: PlatformArtworkCache::default(),
-            platform_artwork_manager: PlatformArtworkManagerState::default(),
             platform_artwork: crate::platform_artwork_manager::PlatformArtworkManager::new(
                 None,
                 |_path| Ok(()),

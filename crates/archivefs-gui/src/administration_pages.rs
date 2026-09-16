@@ -2278,9 +2278,7 @@ pub(super) fn show_settings_page(
     mount_root: Option<&Path>,
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
-    custom_artwork_directory: Option<&Path>,
-    artwork_cache: &mut PlatformArtworkCache,
-    artwork_manager: &mut PlatformArtworkManagerState,
+    artwork: &mut PlatformArtworkManager,
 ) -> Option<SettingsPageAction> {
     let mut action = None;
     widgets::page_header_with_icon(
@@ -2566,13 +2564,12 @@ pub(super) fn show_settings_page(
              off the UI thread and never overwrite the selected original.",
         ),
     );
-    show_platform_artwork_manager(
-        ui,
-        custom_artwork_directory,
-        artwork_cache,
-        artwork_manager,
-        &mut action,
-    );
+    // The artwork session owns its own directory, cache, drafts and worker;
+    // Settings only adapts the domain action it returns into its own action
+    // type, so the feature module never learns about `SettingsPageAction`.
+    if let Some(artwork_action) = artwork.show(ui) {
+        action = Some(SettingsPageAction::PlatformArtwork(artwork_action));
+    }
 
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(ui, "6. More settings coming later", None);
