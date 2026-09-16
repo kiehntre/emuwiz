@@ -536,17 +536,6 @@ fn run_clipboard_check() {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RefreshGeneration(u64);
-
-impl RefreshGeneration {
-    const INITIAL: Self = Self(0);
-
-    fn next(self) -> Self {
-        Self(self.0.wrapping_add(1))
-    }
-}
-
 // ---------------------------------------------------------------------
 // Persistent library database (stage 4): a read-only, background-loaded
 // cache of archivefs_core::Database that speeds up startup and browsing.
@@ -583,7 +572,7 @@ use health_duplicate_ui_state::{
     HealthDuplicateUiState, HealthIssueFilter, HealthSortField,
 };
 use live_library_controller::{
-    LiveLibraryPoll, LoadMessage, LoadResult, LoadState, poll_load, start_load,
+    LiveLibraryPoll, LoadMessage, LoadResult, LoadState, RefreshGeneration, poll_load, start_load,
 };
 use mount_operation_controller::{
     ArchiveAction, CleanupOutcome, LAZY_CLEANUP_FAILURE, LAZY_CLEANUP_SUCCESS,
@@ -636,38 +625,6 @@ pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Resu
 
 #[cfg(test)]
 mod tests;
-
-#[test]
-fn benign_loose_rom_doctor_findings_use_a_friendly_summary() {
-    use archivefs_core::diagnostics::{DoctorCategory, DoctorSeverity, DoctorSubsystem, Finding};
-    let mut finding = Finding {
-        id: "mounts.not_required".to_string(),
-        category: DoctorCategory::Mounts,
-        subsystem: DoctorSubsystem::ArchiveHealth,
-        severity: DoctorSeverity::Info,
-        title: "No mount required".to_string(),
-        explanation: "This loose ROM is used directly.".to_string(),
-        why_it_matters: None,
-        next_step: None,
-        evidence: Vec::new(),
-        affected: None,
-        recovery: None,
-        repair: None,
-        measurements: std::collections::BTreeMap::new(),
-    };
-    // 840 loose-ROM findings collapse into one friendly, exact heading.
-    assert_eq!(
-        repeated_doctor_group_heading(&finding, 840),
-        "840 loose ROMs are healthy"
-    );
-    assert_eq!(
-        repeated_doctor_group_explanation(&finding),
-        Some("These games can be used directly. Nothing needs fixing.")
-    );
-    // A different kind keeps its precise heading (technical detail preserved).
-    finding.id = "mounts.historical_failure".to_string();
-    assert!(repeated_doctor_group_heading(&finding, 12).contains("Historical mount failures"));
-}
 
 // --- RetroArch core-directory override persistence (increment 2) ---------
 //

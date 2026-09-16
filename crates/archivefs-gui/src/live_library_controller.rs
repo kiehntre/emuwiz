@@ -11,9 +11,7 @@ use eframe::egui;
 
 use crate::database_load::CachedLibrarySnapshot;
 
-use super::{
-    build_display_rows, load_read_only_snapshot_default, ArchiveRow, LoadedData, RefreshGeneration,
-};
+use super::{ArchiveRow, LoadedData, build_display_rows, load_read_only_snapshot_default};
 
 pub(crate) type LoadResult = Result<LoadedData, String>;
 pub(crate) type LoadMessage = (RefreshGeneration, LoadResult);
@@ -112,4 +110,15 @@ fn load_data() -> LoadResult {
     load_read_only_snapshot_default()
         .map(LoadedData::from_snapshot)
         .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RefreshGeneration(pub(crate) u64);
+
+impl RefreshGeneration {
+    pub(crate) const INITIAL: Self = Self(0);
+
+    pub(crate) fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
 }
