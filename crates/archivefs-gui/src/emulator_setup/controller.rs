@@ -2104,6 +2104,95 @@ impl ArchiveFsApp {
             }
         }
     }
+
+    /// Looks up the remembered profile id for an adapter key (`"dolphin"`
+    /// or `"xenia"`), if any.
+    pub(crate) fn remembered_profile_id(&self, adapter: &str) -> Option<String> {
+        remembered_profile_for(
+            &self.emulator_readiness.remembered_emulator_profiles,
+            adapter,
+        )
+        .filter(|profile| adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root))
+        .map(|profile| profile.profile_id.clone())
+    }
+
+    /// Looks up the remembered profile's root directory for an adapter
+    /// key - used to seed the explicit-root text field so a remembered
+    /// portable/explicit profile is rediscovered without the user typing
+    /// it again every session.
+    pub(crate) fn remembered_profile_root(&self, adapter: &str) -> Option<PathBuf> {
+        remembered_profile_for(
+            &self.emulator_readiness.remembered_emulator_profiles,
+            adapter,
+        )
+        .filter(|profile| adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root))
+        .map(|profile| profile.root.clone())
+    }
+
+    /// Persists `profile_id`/`root` as the remembered profile for
+    /// `adapter`, updating the in-memory cache immediately so the rest of
+    /// the session sees it without a reload. The write is a small local
+    /// file (atomic rename) - failures are non-fatal and only recorded in
+    /// the Activity Log, never surfaced as a blocking error, since the
+    /// session-level selection already succeeded regardless of whether it
+    /// could be remembered for next time.
+    pub(crate) fn persist_remembered_profile(
+        &mut self,
+        adapter: &str,
+        profile_id: &str,
+        root: &Path,
+    ) {
+        let already_current = remembered_profile_for(
+            &self.emulator_readiness.remembered_emulator_profiles,
+            adapter,
+        )
+        .is_some_and(|profile| profile.profile_id == profile_id && profile.root == root);
+        if already_current {
+            return;
+        }
+        // The real on-disk write is skipped under `cargo test`: it would
+        // otherwise write to the developer's actual
+        // `~/.config/archivefs/emulator_profiles.toml` every time a test
+        // drives profile discovery to a resolved selection, exactly the
+        // kind of real-filesystem side effect the rest of this test suite
+        // never has (config-mutating core functions are only ever called
+        // from the real app entry point, never from GUI unit tests). The
+        // in-memory cache is still updated unconditionally, so selection
+        // and chooser behavior remain fully testable.
+        #[cfg(not(test))]
+        let write_result = archivefs_core::patch_manager::remember_emulator_profile_default(
+            adapter, profile_id, root,
+        );
+        #[cfg(test)]
+        let write_result: Result<(), ArchiveFsError> = Ok(());
+        match write_result {
+            Ok(()) => {
+                self.emulator_readiness
+                    .remembered_emulator_profiles
+                    .retain(|profile| profile.adapter != adapter);
+                self.emulator_readiness.remembered_emulator_profiles.push(
+                    RememberedEmulatorProfile {
+                        adapter: adapter.to_string(),
+                        profile_id: profile_id.to_string(),
+                        root: root.to_path_buf(),
+                    },
+                );
+            }
+            Err(error) => {
+                let action = if adapter == "xenia" {
+                    ActivityAction::XeniaProfileScan
+                } else {
+                    ActivityAction::DolphinProfileScan
+                };
+                self.history.record(HistoryEntry::new(
+                    action,
+                    None,
+                    ActivityOutcome::Failed,
+                    format!("Could not remember the chosen {adapter} profile: {error}"),
+                ));
+            }
+        }
+    }
 }
 
 /// The bridge from the persisted DAT source registry
