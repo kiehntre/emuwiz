@@ -143,6 +143,7 @@ use archivefs_core::patch_manager::{
 use collection_discovery_page::*;
 mod activity_history;
 mod administration_pages;
+mod app_shell;
 mod archive_inspector_controller;
 mod artwork_media_state;
 mod catalogue_bsfree_ui_state;
@@ -1446,7 +1447,7 @@ struct HealthReportCache {
 /// them are internal (production dispatch + test surface), not
 /// backward-compatibility with anything outside this process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-enum MainView {
+pub(crate) enum MainView {
     #[default]
     Home,
     NeedsAttention,
@@ -1772,7 +1773,7 @@ fn show_library_shell_header(ui: &mut egui::Ui, current_tab: LibraryTab) -> Opti
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ToolsOverlay {
+pub(crate) enum ToolsOverlay {
     #[default]
     None,
     Diagnostics,
@@ -4670,298 +4671,81 @@ impl ArchiveFsApp {
 
         let has_database = self.database_state.snapshot().is_some();
 
-        let mut navigation_request = None;
-        if self.ui_mode == GuiMode::AdvancedView {
-            egui::TopBottomPanel::top("menu_bar").show(context, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(main_view_title(self.view)).strong());
-                    ui.separator();
-                    ui.menu_button("File", |ui| {
-                        if ui.button("Quit").clicked() {
-                            context.send_viewport_cmd(egui::ViewportCommand::Close);
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Library", |ui| {
-                        if ui
-                            .add_enabled(
-                                !loading && !busy,
-                                egui::Button::new("Scan library"),
-                            )
-                            .on_hover_text("Scan your configured source folders for new and changed files.")
-                            .clicked()
-                        {
-                            self.start_database_action(context.clone(), true);
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new("Refresh database status"),
-                            )
-                            .on_hover_text(
-                                "Re-read the catalogue database status without rescanning your folders.",
-                            )
-                            .clicked()
-                        {
-                            self.start_database_action(context.clone(), false);
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .button("Select all visible")
-                            .on_hover_text("Select every archive currently shown in the Library.")
-                            .clicked()
-                        {
-                            self.select_all_visible_requested = true;
-                            ui.close();
-                        }
-                        if ui
-                            .add_enabled(
-                                !self.archive_context.selected.is_empty(),
-                                egui::Button::new("Clear selection"),
-                            )
-                            .on_hover_text("Deselect every selected archive.")
-                            .clicked()
-                        {
-                            self.archive_context.clear_selection();
-                            ui.close();
-                        }
-                        ui.separator();
-                        if ui
-                            .add_enabled(
-                                !loading && !busy,
-                                egui::Button::new("Refresh"),
-                            )
-                            .on_hover_text(
-                                "Refresh EmuWiz's current view of your files without running a full scan.",
-                            )
-                            .clicked()
-                        {
-                            self.refresh(context);
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Sources", |ui| {
-                        if ui.button("Open Sources page").clicked() {
-                            self.view = MainView::Sources;
-                            self.tools_overlay = ToolsOverlay::None;
-                            ui.close();
-                        }
-                        if ui
-                            .button("RomM")
-                            .on_hover_text(
-                                "Connect EmuWiz to your RomM server and browse its records \
-                                 (Sources -> Libraries).",
-                            )
-                            .clicked()
-                        {
-                            self.navigate_to_sources_tab(SourcesTab::Libraries);
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Tools", |ui| {
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new("Diagnostics"),
-                            )
-                            .on_hover_text(
-                                "Check configuration, mount root and source-folder health.",
-                            )
-                            .clicked()
-                        {
-                            self.tools_overlay = ToolsOverlay::Diagnostics;
-                            self.refresh_diagnostics(context);
-                            ui.close();
-                        }
-                        if ui
-                            .button("Doctor checks")
-                            .on_hover_text("Run the read-only Doctor scan of this EmuWiz installation.")
-                            .clicked()
-                        {
-                            self.tools_overlay = ToolsOverlay::DoctorChecks;
-                            ui.close();
-                        }
-                        if ui
-                            .button("Platform Aliases")
-                            .on_hover_text("Review the folder and filename aliases EmuWiz uses to recognise platforms.")
-                            .clicked()
-                        {
-                            self.tools_overlay = ToolsOverlay::PlatformAliases;
-                            ui.close();
-                        }
-                        if ui
-                            .button("Database Status")
-                            .on_hover_text("Inspect the catalogue database and its health.")
-                            .clicked()
-                        {
-                            self.tools_overlay = ToolsOverlay::DatabaseStatus;
-                            ui.close();
-                        }
-                        // Collection Discovery moved to the Sources group of
-                        // the grouped sidebar (docs/GUI_NAVIGATION_RESET_
-                        // DESIGN.md §3.2, Phase 2) - it lives naturally next
-                        // to Sources/DAT Sources now rather than in this
-                        // generic Tools menu; see `ADVANCED_NAV_GROUPS`.
-                        ui.separator();
-                        // Major workflows, also on the sidebar and Home -
-                        // exposed here so they never depend on returning to
-                        // Home to be found. Rendered from `TOOLS_MENU_WORKFLOWS`
-                        // so the label and destination a test asserts are the
-                        // exact ones this menu uses; every route converges on
-                        // the same `MainView` (see
-                        // `major_workflows_are_reachable_from_home_sidebar_and_top_menu`).
-                        for (label, hover, target) in TOOLS_MENU_WORKFLOWS {
-                            if ui.button(label).on_hover_text(hover).clicked() {
-                                self.navigate_to_main_view(target);
-                                if target == MainView::DiscConversion {
-                                    self.optical_conversion_page.get_or_insert_with(
-                                        optical_conversion_page::OpticalConversionPageState::default,
-                                    );
-                                }
-                                ui.close();
-                            }
-                        }
-                        ui.separator();
-                        let activity_label = if self.show_activity {
-                            "Hide Activity"
-                        } else {
-                            "Show Activity"
-                        };
-                        if ui
-                            .button(activity_label)
-                            .on_hover_text("Show or hide the recent-activity panel.")
-                            .clicked()
-                        {
-                            self.show_activity = !self.show_activity;
-                            ui.close();
-                        }
-                    });
-                    ui.menu_button("Help", |ui| {
-                        if ui.button("About EmuWiz").clicked() {
-                            self.show_about = true;
-                            ui.close();
-                        }
-                    });
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if loading || busy {
-                            ui.spinner();
-                        }
-                        // Decision 7 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9):
-                        // a clear, always-visible way back - never gear-hidden,
-                        // never buried.
-                        if ui
-                            .button("Return to Gamer View")
-                            .on_hover_text("Switch back to the simple, one-screen view.")
-                            .clicked()
-                        {
-                            self.ui_mode = GuiMode::GamerView;
-                            self.view = MainView::Library;
-                            self.tools_overlay = ToolsOverlay::None;
-                            save_gui_mode(self.ui_mode);
-                        }
-                    });
-                });
-            });
-
-            egui::SidePanel::left("app_navigation")
-                .resizable(false)
-                .exact_width(218.0)
-                .show(context, |ui| {
-                    ui.add_space(14.0);
-                    navigation_request =
-                        show_primary_navigation(ui, self.view, self.tools_overlay, has_database);
-                });
-        } else {
-            // Decision 6 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): reached
-            // through a small gear menu, not a permanent top-level control.
-            egui::TopBottomPanel::top("gamer_top_bar").show(context, |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if loading || busy {
-                            ui.spinner();
-                        }
-                        ui.menu_button(GAMER_MENU_LABEL, |ui| {
-                            let source_actions_available = !busy && self.source_action_available();
-                            if ui
-                                .add_enabled(
-                                    source_actions_available,
-                                    egui::Button::new(GAMER_MENU_ADD_FOLDER_LABEL),
-                                )
-                                .on_hover_text(
-                                    "Choose another folder for EmuWiz to scan for games.",
-                                )
-                                .clicked()
-                            {
-                                if let Some(folder) = rfd::FileDialog::new()
-                                    .set_title("Choose another games folder")
-                                    .pick_folder()
-                                {
-                                    self.gamer_view_scan_review_available = false;
-                                    self.start_source_action(
-                                        context.clone(),
-                                        SourceAction::Add(folder),
-                                    );
-                                }
-                                ui.close();
-                            }
-                            if ui
-                                .add_enabled(
-                                    source_actions_available,
-                                    egui::Button::new(GAMER_MENU_SCAN_LABEL),
-                                )
-                                .on_hover_text(
-                                    "Look through all enabled game folders for new and changed games.",
-                                )
-                                .clicked()
-                            {
-                                self.gamer_view_scan_review_available = false;
-                                self.gamer_view_scan_pending_review = true;
-                                self.start_source_action(context.clone(), SourceAction::ScanAll);
-                                ui.close();
-                            }
-                            ui.separator();
-                            if ui
-                                .button(GAMER_MENU_SETUP_LABEL)
-                                .on_hover_text("Check emulator setup and launch readiness.")
-                                .clicked()
-                            {
-                                self.ui_mode = GuiMode::AdvancedView;
-                                save_gui_mode(self.ui_mode);
-                                self.navigate_to_main_view(MainView::EmulatorSetup);
-                                ui.close();
-                            }
-                            if ui.button(GAMER_MENU_ADVANCED_LABEL).clicked() {
-                                self.switch_to_advanced_view_at_home();
-                                save_gui_mode(self.ui_mode);
-                                ui.close();
-                            }
-                        });
-                    });
-                });
-            });
-        }
+        let navigation_request = app_shell::show_shell(
+            context,
+            app_shell::ShellInputs {
+                advanced_view: self.ui_mode == GuiMode::AdvancedView,
+                view: self.view,
+                tools_overlay: self.tools_overlay,
+                loading,
+                busy,
+                has_database,
+                selection_count: self.archive_context.selected.len(),
+                show_activity: self.show_activity,
+                source_actions_available: !busy && self.source_action_available(),
+            },
+        );
         match navigation_request {
-            Some(NavClick::View(view)) => {
+            Some(app_shell::ShellRequest::Navigate(NavClick::View(view))) => {
                 self.navigate_to_main_view(view);
-                // Disc Conversion's dispatch lazily creates its page state,
-                // but seed it here too so the page is populated the instant
-                // the sidebar entry is clicked - the same thing Home's card
-                // and the top menu do.
                 if view == MainView::DiscConversion {
                     self.optical_conversion_page.get_or_insert_with(
                         optical_conversion_page::OpticalConversionPageState::default,
                     );
                 }
             }
-            Some(NavClick::QuickRename) => {
+            Some(app_shell::ShellRequest::Navigate(NavClick::QuickRename)) => {
                 self.sources_ui.quick_rename_mode = true;
                 self.navigate_to_main_view(MainView::IdentifyRename);
             }
-            Some(NavClick::Overlay(overlay)) => self.tools_overlay = overlay,
-            Some(NavClick::Romm) => self.navigate_to_sources_tab(SourcesTab::Libraries),
+            Some(app_shell::ShellRequest::Navigate(NavClick::Overlay(overlay))) => {
+                self.tools_overlay = overlay;
+                if overlay == ToolsOverlay::Diagnostics {
+                    self.refresh_diagnostics(context);
+                }
+            }
+            Some(app_shell::ShellRequest::Navigate(NavClick::Romm)) => {
+                self.navigate_to_sources_tab(SourcesTab::Libraries);
+            }
+            Some(app_shell::ShellRequest::ScanLibrary) => {
+                self.start_database_action(context.clone(), true);
+            }
+            Some(app_shell::ShellRequest::RefreshDatabase) => {
+                self.start_database_action(context.clone(), false);
+            }
+            Some(app_shell::ShellRequest::RefreshView) => self.refresh(context),
+            Some(app_shell::ShellRequest::SelectAllVisible) => {
+                self.select_all_visible_requested = true;
+            }
+            Some(app_shell::ShellRequest::ClearSelection) => self.archive_context.clear_selection(),
+            Some(app_shell::ShellRequest::ToggleActivity) => {
+                self.show_activity = !self.show_activity;
+            }
+            Some(app_shell::ShellRequest::ShowAbout) => self.show_about = true,
+            Some(app_shell::ShellRequest::ReturnToGamerView) => {
+                self.ui_mode = GuiMode::GamerView;
+                self.view = MainView::Library;
+                self.tools_overlay = ToolsOverlay::None;
+                save_gui_mode(self.ui_mode);
+            }
+            Some(app_shell::ShellRequest::GamerAddFolder(folder)) => {
+                self.gamer_view_scan_review_available = false;
+                self.start_source_action(context.clone(), SourceAction::Add(folder));
+            }
+            Some(app_shell::ShellRequest::GamerScan) => {
+                self.gamer_view_scan_review_available = false;
+                self.gamer_view_scan_pending_review = true;
+                self.start_source_action(context.clone(), SourceAction::ScanAll);
+            }
+            Some(app_shell::ShellRequest::GamerSetup) => {
+                self.ui_mode = GuiMode::AdvancedView;
+                save_gui_mode(self.ui_mode);
+                self.navigate_to_main_view(MainView::EmulatorSetup);
+            }
+            Some(app_shell::ShellRequest::GamerAdvanced) => {
+                self.switch_to_advanced_view_at_home();
+                save_gui_mode(self.ui_mode);
+            }
             None => {}
         }
 
