@@ -45,7 +45,7 @@
 //! on `ArchiveFsApp` (same pattern as Parts 1-5) and the small bridge call
 //! sites (inside `show_game_details`) that route into these methods.
 
-mod controller;
+pub(crate) mod controller;
 mod state;
 
 pub(crate) use state::*;

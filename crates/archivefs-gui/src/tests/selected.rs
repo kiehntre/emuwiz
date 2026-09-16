@@ -2,6 +2,7 @@
 //! registry-backed No-Intro gatherer's focused wiring coverage.
 
 use super::*;
+use crate::selected_evidence_pipeline::controller::gather_selected_evidence_with_registry_at;
 
 // -- GUI Batch A closeout: registry-backed No-Intro wiring -----------
 //
