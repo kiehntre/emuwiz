@@ -1172,7 +1172,8 @@ fn gather_selected_evidence_with_registry_at_and_platform(
 
 use archive_inspector_controller::{
     ArchiveInspectorState, ArchiveInspectorStatus, ArchivePreparationState,
-    DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH, InspectorSortField, show_archive_inspector_panel,
+    DEFAULT_INSPECTOR_PATH_COLUMN_WIDTH, INSPECTOR_DETAILS_COLUMN_WIDTH, InspectorSortField,
+    show_archive_inspector_panel, show_inspector_row, visible_inspector_entry_indices,
 };
 use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
 use database_load::{
@@ -1815,143 +1816,6 @@ fn format_database_upgrade_success(
     )
 }
 
-const INSPECTOR_DETAILS_COLUMN_WIDTH: f32 = 300.0;
-
-/// Whether one entry matches the Archive Inspector's current search text
-/// (case-insensitive substring against its exact stored name) and
-/// classification filter - pure, so it is directly testable without
-/// rendering anything, mirroring `health_issue_matches`'s existing
-/// convention in this file.
-fn inspector_entry_matches(
-    entry: &InspectorEntry,
-    search_lower: &str,
-    classification_filter: Option<InspectorEntryClassification>,
-) -> bool {
-    if let Some(filter) = classification_filter
-        && entry.classification != filter
-    {
-        return false;
-    }
-    search_lower.is_empty() || entry.name.to_lowercase().contains(search_lower)
-}
-
-/// Filters and sorts the already-inspected entry list without ever
-/// mutating it - `entries` is only ever read here, exactly like
-/// `visible_health_issue_indices` reads its own `issues` slice.
-fn visible_inspector_entry_indices(
-    entries: &[InspectorEntry],
-    search: &str,
-    classification_filter: Option<InspectorEntryClassification>,
-    sort_field: InspectorSortField,
-    sort_ascending: bool,
-) -> Vec<usize> {
-    let search_lower = search.trim().to_lowercase();
-    let mut indices: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(index, entry)| {
-            inspector_entry_matches(entry, &search_lower, classification_filter).then_some(index)
-        })
-        .collect();
-    indices.sort_by(|&left, &right| {
-        let (left_entry, right_entry) = (&entries[left], &entries[right]);
-        let ordering = match sort_field {
-            InspectorSortField::Path => left_entry.name.cmp(&right_entry.name),
-            InspectorSortField::Size => left_entry
-                .uncompressed_size
-                .cmp(&right_entry.uncompressed_size),
-            InspectorSortField::Classification => {
-                left_entry.classification.cmp(&right_entry.classification)
-            }
-        }
-        .then_with(|| left_entry.name.cmp(&right_entry.name));
-        if sort_ascending {
-            ordering
-        } else {
-            ordering.reverse()
-        }
-    });
-    indices
-}
-fn inspector_entry_details_text(entry: &InspectorEntry) -> String {
-    match entry.kind {
-        InspectorEntryKind::Directory => "Directory".to_string(),
-        InspectorEntryKind::File => format!(
-            "{} \u{2014} {} \u{2014} compressed {} \u{2014} {}",
-            entry.classification.label(),
-            format_size(Some(entry.uncompressed_size)),
-            format_size(entry.compressed_size),
-            entry.compression_method.as_deref().unwrap_or("Unknown"),
-        ),
-    }
-}
-
-/// Renders one Archive Inspector entry row - the same technique
-/// `show_data_row` uses for the Library table (a single `Sense::click()`
-/// region with `Painter`-painted cell text, never a child widget inside
-/// that region), generalised to two columns via the same now-slice-based
-/// `cell_index_at`/`hovered_cell_full_text` helpers the Library table
-/// itself uses. Selection here is single (`selected: bool`, no
-/// multi-select/Ctrl-click) - "Selecting one entry shows its complete
-/// details" never needed the Library table's fuller multi-select model.
-fn show_inspector_row(
-    ui: &mut egui::Ui,
-    entry: &InspectorEntry,
-    row_height: f32,
-    selected: bool,
-    widths: &[f32],
-) -> egui::Response {
-    let spacing = ui.spacing().item_spacing.x;
-    let width = widths.iter().sum::<f32>() + spacing * (widths.len().saturating_sub(1) as f32);
-    let (_, rect) = ui.allocate_space(egui::vec2(width, row_height));
-    let row_id = egui::Id::new("inspector_row").with(&entry.name);
-    let mut response = ui.interact(rect, row_id, egui::Sense::click());
-
-    let visuals = ui.visuals();
-    if selected {
-        ui.painter()
-            .rect_filled(rect, 0.0, visuals.selection.bg_fill);
-    } else if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 0.0, visuals.widgets.hovered.weak_bg_fill);
-    }
-
-    let details_text = inspector_entry_details_text(entry);
-    let cells: [&str; 2] = [entry.name.as_str(), details_text.as_str()];
-    let font_id = egui::TextStyle::Body.resolve(ui.style());
-    let color = ui.visuals().text_color();
-    let mut x = rect.left();
-    for (text, column_width) in cells.iter().zip(widths.iter().copied()) {
-        let cell_rect = egui::Rect::from_min_size(
-            egui::pos2(x, rect.top()),
-            egui::vec2(column_width, row_height),
-        );
-        ui.painter().with_clip_rect(cell_rect).text(
-            egui::pos2(x + 2.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            *text,
-            font_id.clone(),
-            color,
-        );
-        x += column_width + spacing;
-    }
-
-    let pointer_x = response.hover_pos().map(|pos| pos.x);
-    if let Some(full_text) =
-        hovered_cell_full_text(pointer_x, rect.left(), &cells, widths, spacing, |text| {
-            ui.fonts_mut(|fonts| {
-                fonts
-                    .layout_no_wrap(text.to_string(), font_id.clone(), color)
-                    .size()
-                    .x
-            })
-        })
-    {
-        response = response.on_hover_text(full_text.to_string());
-    }
-
-    response
-}
 /// A source's actual platform state, derived purely from the archives the
 /// snapshot already has catalogued for it (`PersistedArchive::platform`,
 /// matched by `PersistedArchive::source_folder_id == SourceFolderView::id`),
