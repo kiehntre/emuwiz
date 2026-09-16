@@ -110,7 +110,15 @@ use crate::dat_coverage_panel::{
     show_coverage_section,
 };
 use crate::repair_history_page::presentation::{self, Tier};
+// The page adapters moved here from `main.rs` still spell their own page's
+// items `dat_sources_page::…`; keeping that name in scope leaves the moved
+// bodies byte-for-byte identical to what `main.rs` ran.
+use crate::dat_sources_page;
 use crate::ui::{components as widgets, theme};
+use crate::{
+    ActivityAction, ActivityOutcome, ArchiveFsApp, Config, HistoryEntry, MainView,
+    database_state_path,
+};
 
 mod save_result;
 use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
@@ -12885,6 +12893,138 @@ fn show_kept_but_not_understood(ui: &mut egui::Ui, view: &DatSourcesPageView) {
             });
         }
     });
+}
+
+
+impl ArchiveFsApp {
+    /// Draws the DAT Sources page and applies whatever it asked for.
+    ///
+    /// Loaded on first visit rather than at startup, for the same reason Cheat
+    /// Sources is. A path that cannot be resolved (no `HOME`) is reported in
+    /// place instead of failing the whole page.
+    ///
+    /// The library folders offered as audit targets, and the trusted roots the
+    /// hashing policy uses, both come from the same `Config` the rest of the
+    /// build reads. A missing or unreadable config is not fatal here: it means
+    /// no folders are offered and no symlink may be followed, which are the
+    /// safe answers rather than an error the user cannot act on from this page.
+    pub(crate) fn show_dat_sources_page(&mut self, ui: &mut egui::Ui) {
+        self.show_dat_sources_page_mode(ui, false);
+    }
+
+    /// Shares loading, background-job polling, action dispatch, and history
+    /// recording between the advanced catalogue page and the task-oriented
+    /// Identify & Rename workflow. The two views deliberately use the same
+    /// state and core actions; neither gets a private rename implementation.
+    pub(crate) fn show_identify_rename_page(&mut self, ui: &mut egui::Ui) {
+        self.show_dat_sources_page_mode(ui, true);
+    }
+
+    pub(crate) fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
+        if !identify_rename {
+            self.sources_ui.dat_authority
+                .show(ui, database_state_path(&self.database_state));
+        }
+        if self.sources_ui.dat_sources_page.is_none() {
+            let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
+                Ok(path) => path,
+                Err(error) => {
+                    widgets::banner(
+                        ui,
+                        "Registry location unknown",
+                        &format!(
+                            "{error}. DAT sources cannot be read or saved without a home \
+                             directory."
+                        ),
+                        widgets::StatusTone::Blocked,
+                    );
+                    return;
+                }
+            };
+            let config = Config::load_default().ok();
+            let library_folders = config
+                .as_ref()
+                .map(|config| config.source_folders.clone())
+                .unwrap_or_default();
+            let trusted = config
+                .as_ref()
+                .map(archivefs_core::safe_read::TrustedRoots::from_config)
+                .unwrap_or_else(archivefs_core::safe_read::TrustedRoots::none);
+            self.sources_ui.dat_sources_page = Some(
+                dat_sources_page::DatSourcesPageState::load(path, library_folders, trusted)
+                    .with_database_path(database_state_path(&self.database_state)),
+            );
+        }
+
+        let Some(page) = self.sources_ui.dat_sources_page.as_mut() else {
+            return;
+        };
+        // Drained before the view is built, so the view stays a pure function
+        // of state. A running job repaints continuously; an idle page does not.
+        let dat_changed = page.poll();
+        if dat_changed {
+            self.sources_ui.dat_authority.invalidate();
+            self.needs_attention.invalidate();
+        }
+        if dat_changed || page.is_busy() {
+            ui.ctx().request_repaint();
+        }
+        let view = page.view_with_romm_summary(self.romm_ui.verify_summary);
+        let action = if identify_rename {
+            if self.sources_ui.quick_rename_mode {
+                dat_sources_page::show_quick_rename_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
+            } else {
+                dat_sources_page::show_identify_rename_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
+            }
+        } else {
+            dat_sources_page::show_dat_sources_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
+        };
+        if let Some(action) = action {
+            let open_dat_sources = matches!(
+                action,
+                dat_sources_page::DatSourcesPageAction::OpenDatSources
+            );
+            let open_advanced = matches!(
+                action,
+                dat_sources_page::DatSourcesPageAction::OpenAdvancedIdentifyRename
+            );
+            self.sources_ui.dat_authority.invalidate();
+            self.needs_attention.invalidate();
+            if matches!(action, dat_sources_page::DatSourcesPageAction::Revert) {
+                self.sources_ui.dat_sources_ui.clear();
+            }
+            page.apply(action);
+            if open_dat_sources {
+                self.sources_ui.quick_rename_mode = false;
+                self.view = MainView::DatSources;
+            } else if open_advanced {
+                self.sources_ui.quick_rename_mode = false;
+            }
+        }
+        // Surface apply/rollback outcomes into History & Logs, without private
+        // paths (the journal keeps those, never the general log).
+        for record in page.drain_history_records() {
+            let entry = match record.action {
+                dat_sources_page::RenameHistoryAction::Apply => HistoryEntry::new(
+                    ActivityAction::DatRenameApply,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!("{}: {}", record.transaction_id, record.message),
+                ),
+                dat_sources_page::RenameHistoryAction::Rollback => HistoryEntry::new(
+                    ActivityAction::DatRenameRollback,
+                    None,
+                    ActivityOutcome::Completed,
+                    format!("{}: {}", record.transaction_id, record.message),
+                ),
+            };
+            self.history.record(entry);
+        }
+        let reload_enriched_catalogue = page.take_identity_enrichment_completed();
+        if reload_enriched_catalogue {
+            self.start_database_action(ui.ctx().clone(), false);
+        }
+    }
 }
 
 #[cfg(test)]
