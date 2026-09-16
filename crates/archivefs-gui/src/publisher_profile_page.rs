@@ -21,7 +21,12 @@ use archivefs_core::publisher_profile::{
 };
 use eframe::egui;
 
+// The page adapter moved here from `main.rs` still spells this page's own
+// items by module name; keeping that name in scope leaves the moved body
+// byte-for-byte identical to what `main.rs` ran.
+use crate::publisher_profile_page;
 use crate::ui::{components as widgets, theme};
+use crate::{ArchiveFsApp, MainView};
 
 /// Which result bucket the user is currently filtering to - task section
 /// 19's exact filter list, plus "All".
@@ -834,3 +839,26 @@ pub(crate) fn show_publisher_profile_page(
 
 #[cfg(test)]
 mod tests;
+
+impl ArchiveFsApp {
+    /// Draws the read-only publisher projection page. The source is only the
+    /// already-built Playing Library plan from Library Organisation; this
+    /// page never scans or re-elects games itself.
+    pub(crate) fn show_publisher_profile_page(&mut self, ui: &mut egui::Ui) {
+        let source_plan = self
+            .rom_organisation_page
+            .as_ref()
+            .and_then(|page| page.playing_library.plan().cloned());
+        let page = self
+            .publisher_profile_page
+            .get_or_insert_with(publisher_profile_page::PublisherProfilePageState::default);
+        page.set_source_plan(source_plan);
+        if let Some(action) = publisher_profile_page::show_publisher_profile_page(ui, page) {
+            match action {
+                publisher_profile_page::PublisherProfilePageAction::OpenLibraryOrganisation => {
+                    self.navigate_to_main_view(MainView::CanonicalOrganisation)
+                }
+            }
+        }
+    }
+}

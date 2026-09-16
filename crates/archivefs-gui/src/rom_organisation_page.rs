@@ -28,6 +28,11 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::playing_library_page::PlayingLibraryDestination;
+// The page adapter moved here from `main.rs` still spells this page's own
+// items by module name; keeping that name in scope leaves the moved body
+// byte-for-byte identical to what `main.rs` ran.
+use crate::ArchiveFsApp;
+use crate::rom_organisation_page;
 use crate::ui::{components as widgets, theme};
 
 /// The page's authoritative state.
@@ -2158,5 +2163,29 @@ mod tests {
             assert!(layout.columns <= previous);
             previous = layout.columns;
         }
+    }
+}
+
+impl ArchiveFsApp {
+    /// Executes the reviewed repair. The only path that mutates.
+    ///
+    /// Every safety gate lives in `execute_doctor_repair`, which re-resolves
+    /// the finding against live state; nothing here trusts the review's
+    /// captured path. Afterwards only the affected finding's own check is
+    /// re-run (inside the executor), never the whole scan, and exactly one
+    /// History entry is recorded whatever the result.
+    /// Draws the Cheat Sources page and applies whatever it asked for.
+    ///
+    /// The state is loaded on first visit rather than at startup: opening the
+    /// GUI should not read a preferences file for a page nobody has looked
+    /// at. A path that cannot even be resolved (no `HOME`) is reported in
+    /// place instead of failing the whole page, since every other part of the
+    /// GUI still works without it.
+    /// Draws the Canonical Organisation page, loading its state lazily.
+    pub(crate) fn show_rom_organisation_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .rom_organisation_page
+            .get_or_insert_with(rom_organisation_page::RomOrganisationPageState::load);
+        rom_organisation_page::show_rom_organisation_page(ui, page);
     }
 }

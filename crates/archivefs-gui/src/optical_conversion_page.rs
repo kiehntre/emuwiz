@@ -6,6 +6,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
+// The page adapter moved here from `main.rs` still spells this page's own
+// items by module name; keeping that name in scope leaves the moved body
+// byte-for-byte identical to what `main.rs` ran.
+use crate::ArchiveFsApp;
+use crate::optical_conversion_page;
+use crate::selected_evidence_page;
 use crate::ui::{components as widgets, theme};
 use archivefs_core::repair::{
     ChdConversionError, ChdConversionPlan, ChdConversionResult, ChdConversionSourceMode,
@@ -1812,5 +1818,29 @@ mod tests {
         let capability = supported_capability_for_extension(Some("cue")).unwrap();
         assert_eq!(capability.source_format, "CUE/BIN");
         assert_eq!(capability.target_format, "CHD");
+    }
+}
+
+impl ArchiveFsApp {
+    pub(crate) fn show_optical_conversion_page(&mut self, ui: &mut egui::Ui) {
+        let selected_context = self.archive_context.focused.as_ref().map(|path| {
+            let platform = match &self.selected_evidence_ui.selected_evidence {
+                selected_evidence_page::SelectedEvidenceState::Ready { report, .. }
+                    if report.path == *path =>
+                {
+                    report.identity.platform.map(str::to_string)
+                }
+                _ => None,
+            };
+            optical_conversion_page::SelectedConversionContext {
+                path: path.clone(),
+                platform,
+            }
+        });
+        let page = self
+            .optical_conversion_page
+            .get_or_insert_with(optical_conversion_page::OpticalConversionPageState::default);
+        page.set_selected_context(selected_context);
+        optical_conversion_page::show_optical_conversion_page(ui, page);
     }
 }

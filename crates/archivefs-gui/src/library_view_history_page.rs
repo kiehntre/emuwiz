@@ -25,6 +25,11 @@ use archivefs_core::{
 };
 use eframe::egui;
 
+// The page adapter moved here from `main.rs` still spells this page's own
+// items by module name; keeping that name in scope leaves the moved body
+// byte-for-byte identical to what `main.rs` ran.
+use crate::ArchiveFsApp;
+use crate::library_view_history_page;
 use crate::ui::{components as widgets, theme};
 
 /// Matches the `100` already used by `library_views`' own tests over this
@@ -265,3 +270,12 @@ fn detail_label(ui: &mut egui::Ui, label: &str, value: &str) {
 
 #[cfg(test)]
 mod tests;
+
+impl ArchiveFsApp {
+    pub(crate) fn show_library_view_history_page(&mut self, ui: &mut egui::Ui) {
+        let page = self
+            .library_view_history_page
+            .get_or_insert_with(library_view_history_page::LibraryViewHistoryPageState::load);
+        library_view_history_page::show_library_view_history_page(ui, page);
+    }
+}
