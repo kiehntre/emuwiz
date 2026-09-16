@@ -2698,120 +2698,19 @@ impl ArchiveFsApp {
     }
 
     fn poll_database_load(&mut self, _context: &egui::Context) {
-        let message = match &self.database_state {
-            DatabaseState::Loading {
-                generation,
-                receiver,
-                ..
-            } => match receiver.try_recv() {
-                Ok(message) => Some(message),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some((
-                    *generation,
-                    Err(DatabaseLoadError::Failed {
-                        message: "background database loader stopped unexpectedly".to_string(),
-                    }),
-                )),
-            },
-            DatabaseState::NotCreated { .. }
-            | DatabaseState::Ready { .. }
-            | DatabaseState::Outdated { .. }
-            | DatabaseState::Error { .. } => None,
-        };
-
-        let Some((generation, result)) = message else {
-            return;
-        };
-        // Two independent staleness checks, mirroring poll_load exactly:
-        // (1) is this even the current database generation, and (2) does
-        // the state we are about to replace still agree it is Loading at
-        // that same generation (it could have been replaced by a newer
-        // start_database_action call between the channel send and this
-        // poll). Either mismatch means this message is from a previous
-        // generation and must be ignored, never merged into current state.
-        if generation != self.database_generation {
-            return;
-        }
-        let (previous, worker) = match std::mem::replace(
+        let Some(settled) = database_load::poll_database_load(
             &mut self.database_state,
-            DatabaseState::Error {
-                message: "database load result pending".to_string(),
-                previous: None,
-            },
-        ) {
-            DatabaseState::Loading {
-                generation: state_generation,
-                previous,
-                worker,
-                ..
-            } if state_generation == generation => (previous, worker),
-            other => {
-                self.database_state = other;
-                return;
-            }
+            self.database_generation,
+            &mut self.sources_ui.pending_source_scan_summary,
+        ) else {
+            return;
         };
-        if let Some(worker) = worker {
-            let _ = worker.join();
+        if let Some(entry) = settled.history {
+            self.history.record(entry);
         }
-
-        // Consumed unconditionally, whatever `result` turns out to be below:
-        // a pending Sources-page scan summary is only ever valid for the
-        // very next reload completion, never a later one (requirement:
-        // never invent a state transition - if this reload doesn't land in
-        // `Ready`, there is no `last_scan_summary` to attach it to, so it
-        // is simply dropped rather than held over).
-        let pending_source_scan_summary = self.sources_ui.pending_source_scan_summary.take();
-        self.database_state = match result {
-            Ok(DatabaseOutcome::Loaded(snapshot)) => DatabaseState::Ready {
-                snapshot: Box::new(snapshot),
-                last_scan_summary: pending_source_scan_summary,
-            },
-            Ok(DatabaseOutcome::Scanned {
-                snapshot,
-                scan_summary,
-                upgrade,
-            }) => {
-                let activity = match &upgrade {
-                    Some(report) => format_database_upgrade_success(report, &scan_summary),
-                    None => format_scan_activity(&scan_summary),
-                };
-                self.history.record(HistoryEntry::new(
-                    ActivityAction::LibraryDatabase,
-                    None,
-                    ActivityOutcome::Completed,
-                    activity.clone(),
-                ));
-                if upgrade.is_some() {
-                    self.feedback = Some(ActionFeedback {
-                        succeeded: true,
-                        message: activity,
-                        cleanup: None,
-                        warning: None,
-                        more_information: None,
-                    });
-                }
-                DatabaseState::Ready {
-                    snapshot: Box::new(snapshot),
-                    last_scan_summary: Some(scan_summary),
-                }
-            }
-            Err(DatabaseLoadError::NotCreated { database_path }) => {
-                DatabaseState::NotCreated { database_path }
-            }
-            Err(DatabaseLoadError::Outdated { health }) => {
-                DatabaseState::Outdated { health, previous }
-            }
-            Err(DatabaseLoadError::Failed { message }) => {
-                self.history.record(HistoryEntry::new(
-                    ActivityAction::LibraryDatabase,
-                    None,
-                    ActivityOutcome::Failed,
-                    message.clone(),
-                ));
-                DatabaseState::Error { message, previous }
-            }
-        };
-
+        if let Some(feedback) = settled.feedback {
+            self.feedback = Some(feedback);
+        }
         let duplicate_report = self
             .database_state
             .snapshot()

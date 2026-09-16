@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 use archivefs_core::{
@@ -11,9 +11,11 @@ use archivefs_core::{
 use eframe::egui;
 
 use super::{
-    LibraryDatIdentitySummary, build_source_folder_views, catalogue_filename_duplicates,
-    check_database_health, default_config_path, default_database_path, latest_schema_version,
-    load_source_folder_configs_from, scan_and_persist, upgrade_library_database,
+    ActionFeedback, ActivityAction, ActivityOutcome, HistoryEntry, LibraryDatIdentitySummary,
+    build_source_folder_views, catalogue_filename_duplicates, check_database_health,
+    default_config_path, default_database_path, format_database_upgrade_success,
+    format_scan_activity, latest_schema_version, load_source_folder_configs_from, scan_and_persist,
+    upgrade_library_database,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,4 +394,144 @@ pub(crate) fn load_snapshot_from(
         duplicate_report,
         source_views,
     })
+}
+
+/// What a finished database load settled, for the application to apply.
+///
+/// [`poll_database_load`] owns the database state machine itself - the
+/// receiver, both staleness checks, the worker join and the state install.
+/// It deliberately does not touch the app-global sinks; the entries it would
+/// have written to them come back here instead, so the ordering and the
+/// wording stay with the code that knows the outcome.
+pub(crate) struct DatabaseLoadSettled {
+    pub(crate) history: Option<HistoryEntry>,
+    pub(crate) feedback: Option<ActionFeedback>,
+}
+
+/// Drain a finished database load into `database_state`.
+///
+/// Returns `None` while nothing has arrived, and also when the message that
+/// arrived belongs to a superseded generation - in that case nothing at all
+/// is applied, including `pending_source_scan_summary`, which is consumed
+/// only once this load is committed to landing.
+pub(crate) fn poll_database_load(
+    database_state: &mut DatabaseState,
+    database_generation: DatabaseGeneration,
+    pending_source_scan_summary: &mut Option<ScanPersistSummary>,
+) -> Option<DatabaseLoadSettled> {
+    let message = match &*database_state {
+        DatabaseState::Loading {
+            generation,
+            receiver,
+            ..
+        } => match receiver.try_recv() {
+            Ok(message) => Some(message),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some((
+                *generation,
+                Err(DatabaseLoadError::Failed {
+                    message: "background database loader stopped unexpectedly".to_string(),
+                }),
+            )),
+        },
+        DatabaseState::NotCreated { .. }
+        | DatabaseState::Ready { .. }
+        | DatabaseState::Outdated { .. }
+        | DatabaseState::Error { .. } => None,
+    };
+
+    let Some((generation, result)) = message else {
+        return None;
+    };
+    // Two independent staleness checks, mirroring poll_load exactly:
+    // (1) is this even the current database generation, and (2) does
+    // the state we are about to replace still agree it is Loading at
+    // that same generation (it could have been replaced by a newer
+    // start_database_action call between the channel send and this
+    // poll). Either mismatch means this message is from a previous
+    // generation and must be ignored, never merged into current state.
+    if generation != database_generation {
+        return None;
+    }
+    let (previous, worker) = match std::mem::replace(
+        database_state,
+        DatabaseState::Error {
+            message: "database load result pending".to_string(),
+            previous: None,
+        },
+    ) {
+        DatabaseState::Loading {
+            generation: state_generation,
+            previous,
+            worker,
+            ..
+        } if state_generation == generation => (previous, worker),
+        other => {
+            *database_state = other;
+            return None;
+        }
+    };
+    if let Some(worker) = worker {
+        let _ = worker.join();
+    }
+
+    // Consumed unconditionally, whatever `result` turns out to be below:
+    // a pending Sources-page scan summary is only ever valid for the
+    // very next reload completion, never a later one (requirement:
+    // never invent a state transition - if this reload doesn't land in
+    // `Ready`, there is no `last_scan_summary` to attach it to, so it
+    // is simply dropped rather than held over).
+    let pending_source_scan_summary = pending_source_scan_summary.take();
+    let mut history = None;
+    let mut feedback = None;
+    *database_state = match result {
+        Ok(DatabaseOutcome::Loaded(snapshot)) => DatabaseState::Ready {
+            snapshot: Box::new(snapshot),
+            last_scan_summary: pending_source_scan_summary,
+        },
+        Ok(DatabaseOutcome::Scanned {
+            snapshot,
+            scan_summary,
+            upgrade,
+        }) => {
+            let activity = match &upgrade {
+                Some(report) => format_database_upgrade_success(report, &scan_summary),
+                None => format_scan_activity(&scan_summary),
+            };
+            history = Some(HistoryEntry::new(
+                ActivityAction::LibraryDatabase,
+                None,
+                ActivityOutcome::Completed,
+                activity.clone(),
+            ));
+            if upgrade.is_some() {
+                feedback = Some(ActionFeedback {
+                    succeeded: true,
+                    message: activity,
+                    cleanup: None,
+                    warning: None,
+                    more_information: None,
+                });
+            }
+            DatabaseState::Ready {
+                snapshot: Box::new(snapshot),
+                last_scan_summary: Some(scan_summary),
+            }
+        }
+        Err(DatabaseLoadError::NotCreated { database_path }) => {
+            DatabaseState::NotCreated { database_path }
+        }
+        Err(DatabaseLoadError::Outdated { health }) => DatabaseState::Outdated { health, previous },
+        Err(DatabaseLoadError::Failed { message }) => {
+            history = Some(HistoryEntry::new(
+                ActivityAction::LibraryDatabase,
+                None,
+                ActivityOutcome::Failed,
+                message.clone(),
+            ));
+            DatabaseState::Error { message, previous }
+        }
+    };
+
+    Some(DatabaseLoadSettled { history, feedback })
 }
