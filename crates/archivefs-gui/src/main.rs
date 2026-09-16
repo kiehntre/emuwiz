@@ -143,6 +143,7 @@ use archivefs_core::patch_manager::{
 use collection_discovery_page::*;
 mod activity_history;
 mod administration_pages;
+mod app_frame;
 mod app_overlays;
 mod app_pages;
 mod app_polling;
@@ -4473,42 +4474,15 @@ impl ArchiveFsApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         app_polling::poll_and_reconcile(self, context);
         app_polling::start_view_gated_work(self, context);
-        let loading = matches!(self.state, LoadState::Loading { .. });
-        let diagnostics_loading = matches!(
-            self.doctor_repair.diagnostics,
-            DiagnosticsState::Loading { .. }
-        );
-        let busy = self.is_busy();
-        let actions_safe = latest_generation_actions_safe(
-            self.refresh_generation,
-            self.snapshot_generation,
-            self.snapshot_stale,
-            snapshot_identity(&self.state),
-            &self.doctor_repair.diagnostics,
-        );
-        let archive_actions_blocked = busy || !actions_safe;
-        let archive_action_block_reason = archive_action_block_reason(
+        let app_frame::FrameReadiness {
+            loading,
             busy,
-            self.refresh_generation,
-            self.snapshot_generation,
-            self.snapshot_stale,
-            snapshot_identity(&self.state),
-            &self.doctor_repair.diagnostics,
-        );
-        let action_readiness_debug_lines = action_readiness_debug_lines(
-            busy,
-            self.refresh_generation,
-            self.snapshot_generation,
-            self.snapshot_stale,
-            snapshot_identity(&self.state),
-            &self.doctor_repair.diagnostics,
-        );
-        let missing_removal_available = self.missing_removal_action_available();
-        if loading || diagnostics_loading || busy {
-            context.request_repaint_after(std::time::Duration::from_millis(100));
-        }
-
-        let has_database = self.database_state.snapshot().is_some();
+            has_database,
+            archive_actions_blocked,
+            archive_action_block_reason,
+            action_readiness_debug_lines,
+            missing_removal_available,
+        } = app_frame::frame_readiness(self, context);
 
         let navigation_request = app_shell::show_shell(
             context,
