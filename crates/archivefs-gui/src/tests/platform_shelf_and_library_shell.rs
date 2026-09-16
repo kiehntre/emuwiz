@@ -614,7 +614,7 @@ fn gamer_menu_keeps_everyday_actions_visible_and_names_the_menu() {
 
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::GamerView;
-    app.retroarch_profiles = RetroArchProfilesState::Error("test".to_string());
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Error("test".to_string());
     if let LoadState::Ready(data) = &mut app.state {
         data.records
             .push(record("/roms/another-game.zip", MountState::Pending));

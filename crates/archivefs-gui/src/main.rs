@@ -162,6 +162,7 @@ mod cheatbase_page;
 mod bios_projection_page;
 mod emulator_download_page;
 mod emulator_setup;
+mod emulator_readiness_state;
 use emulator_setup::*;
 mod emulator_inventory_page;
 mod emulator_setup_overrides;
@@ -1187,6 +1188,7 @@ use mount_operation_controller::{
 };
 use catalogue_bsfree_ui_state::CatalogueBsFreeUiState;
 use health_duplicate_ui_state::HealthDuplicateUiState;
+use emulator_readiness_state::EmulatorReadinessState;
 use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 
@@ -1948,85 +1950,10 @@ struct ArchiveFsApp {
     database_restore_plan: Option<archivefs_core::DatabaseRestorePlan>,
     database_restore_confirmation: String,
     database_restore_feedback: Option<String>,
-    /// The Settings page's RetroArch profile discovery state. Never
-    /// scanned automatically - filesystem probing only happens on an
-    /// explicit "Scan/Rescan Profiles" click.
-    retroarch_profiles: RetroArchProfilesState,
-    /// An explicit EmuWiz override for the RetroArch core directory,
-    /// persisted GUI-only (see `retroarch_core_directory_override_path`).
-    /// `None` = automatic discovery from `retroarch.cfg`. When `Some`, it
-    /// is passed straight to
-    /// `discover_retroarch_cheat_setup_profiles_with_core_directory_override`
-    /// in `start_retroarch_profile_scan`; the GUI does not re-implement any
-    /// core resolution.
-    retroarch_core_directory_override: Option<PathBuf>,
-    /// A directory the user picked in Emulator Setup's "Choose core folder"
-    /// that failed the pre-persist check (missing, or not a directory). It
-    /// is *not* persisted and does not change the active core folder; the
-    /// card shows a plain "folder not usable" message until the next pick,
-    /// rescan, or reset clears it. `None` the rest of the time.
-    retroarch_core_folder_rejected_pick: Option<PathBuf>,
-    /// One-shot: which Emulator Setup repair card to scroll into view on the
-    /// next render of that page. Set by `open_emulator_setup_for` when the
-    /// user arrived via a repair action (Gamer View `NeedsSetup`), consumed
-    /// with `take()` on the first frame so later frames and manual
-    /// scrolling are untouched. `None` for sidebar/Home navigation.
-    emulator_setup_focus: Option<EmulatorSetupFocus>,
-    /// Local presentation state for the candidate-first Emulator Setup page.
-    emulator_setup_page: emulator_setup_page::EmulatorSetupPageState,
-    /// Read-only installed emulator version/channel inventory.
-    emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState,
-    /// Read-only master BIOS inventory and projection planning.
-    bios_projection_page: bios_projection_page::BiosProjectionPageState,
-    /// Read-only presentation of the core Ready-to-Play projection.
-    ready_to_play_page: ready_to_play_page::ReadyToPlayPageState,
-    /// GUI-only per-emulator executable/configuration-folder overrides for
-    /// Emulator Setup remediation controls; see
-    /// `emulator_setup_overrides` for exactly which adapter/kind pairs are
-    /// supported and how each is persisted.
-    emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides,
+    emulator_readiness: EmulatorReadinessState,
     /// The Tape Inspector library browser's persisted search/platform/format
     /// filter state, retained across page re-renders.
     tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState,
-    /// Read-only PCSX2 profile discovery shared by every PS2 archive
-    /// context. Inventory results remain archive-bound inside
-    /// `CheatWorkflowState`.
-    pcsx2_profiles: Pcsx2ProfilesState,
-    /// Read-only Dolphin profile discovery shared by GameCube and Wii archives.
-    dolphin_profiles: DolphinProfilesState,
-    /// Modern-model Dolphin profile discovery Launch Readiness uses to
-    /// build a native launch binding - see [`DolphinLocalProfilesState`]'s
-    /// own doc comment for why this is a separate scan from
-    /// `dolphin_profiles`. Triggered automatically once the Selected page
-    /// is shown, mirroring the existing Dolphin-Cheats-workflow auto-scan.
-    dolphin_local_profiles: DolphinLocalProfilesState,
-    /// PCSX2 profile discovery Launch Readiness uses to build a native
-    /// launch binding - a separate scan from `pcsx2_profiles` for the same
-    /// reason [`DolphinLocalProfilesState`] is separate from
-    /// `dolphin_profiles`: this one retains the discovery `roots`
-    /// ([`resolve_pcsx2_native_launch_binding`] needs them) and is
-    /// triggered automatically once the Selected page is shown, rather
-    /// than only when the Cheats & Mods PCSX2 workflow is active like
-    /// `pcsx2_profiles` is.
-    pcsx2_launch_profiles: Pcsx2LaunchProfilesState,
-    /// Read-only Flycast profile discovery shared by Dreamcast Launch
-    /// Readiness. This is deliberately separate from the core launch
-    /// preflight: the page may report a missing executable/configuration,
-    /// while core revalidates both again before any spawn.
-    flycast_profiles: FlycastProfilesState,
-    /// PS2 firmware/BIOS evidence resolved from the user's registered DAT
-    /// sources - see [`pcsx2_firmware_evidence_from_registry`]. Loaded
-    /// once in the background, the same way `pcsx2_launch_profiles` and
-    /// `dolphin_local_profiles` are; never re-parsed on the UI thread and
-    /// never re-parsed per frame.
-    pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState,
-    /// Explicit-directory-only Xenia Canary profile discovery.
-    xenia_profiles: XeniaProfilesState,
-    /// Per-emulator remembered profile choices, loaded once at startup
-    /// from `~/.config/archivefs/emulator_profiles.toml`. Kept in memory
-    /// and updated in place whenever a new choice is persisted, so this
-    /// never needs to be reloaded from disk during the session.
-    remembered_emulator_profiles: Vec<RememberedEmulatorProfile>,
     /// The full-page Cheats & Mods workspace's current archive and
     /// trusted-catalogue state. It survives ordinary page navigation so
     /// returning to the same exact archive does not discard a completed
@@ -2086,24 +2013,6 @@ struct ArchiveFsApp {
     /// reloads the application.
     doctor_scan: DoctorScanState,
     doctor_scan_generation: RefreshGeneration,
-    /// Emulator Adapter Batch B: the read-only RPCS3 environment/status
-    /// panel on the Selected page - see `rpcs3_page`'s own module doc.
-    /// Starts `Idle`; loading is always an explicit action, never
-    /// automatic.
-    rpcs3_status: rpcs3_page::Rpcs3State,
-    rpcs3_status_generation: u64,
-    /// PCSX2 GUI Integration Batch H2: the read-only PCSX2
-    /// environment/status panel on the Selected page - see `pcsx2_page`'s
-    /// own module doc. Starts `Idle`; loading is always an explicit
-    /// action, never automatic.
-    pcsx2_status: pcsx2_page::Pcsx2StatusState,
-    pcsx2_status_generation: u64,
-    /// Which selected-archive path `pcsx2_status` was loaded (or is
-    /// loading) for. Compared against the currently focused archive on
-    /// every render of the Selected page so that switching the selected
-    /// ROM invalidates a stale/in-flight result rather than showing it
-    /// against the wrong title.
-    pcsx2_status_archive_path: Option<PathBuf>,
     /// The Cheat Sources page, loaded lazily the first time it is opened so
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
@@ -2525,26 +2434,9 @@ impl ArchiveFsApp {
             database_restore_plan: None,
             database_restore_confirmation: String::new(),
             database_restore_feedback: None,
-            retroarch_profiles: RetroArchProfilesState::NotScanned,
-            retroarch_core_directory_override: load_retroarch_core_directory_override(),
-            retroarch_core_folder_rejected_pick: None,
-            emulator_setup_focus: None,
-            emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
-            emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState::default(),
-            bios_projection_page: bios_projection_page::BiosProjectionPageState::default(),
-            ready_to_play_page: ready_to_play_page::ReadyToPlayPageState::default(),
+            emulator_readiness: EmulatorReadinessState::new(),
             storage_health_page: storage_health_page::StorageHealthPageState::default(),
-            emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::load(),
             tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
-            pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
-            dolphin_profiles: DolphinProfilesState::NotScanned,
-            dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
-            pcsx2_launch_profiles: Pcsx2LaunchProfilesState::NotScanned,
-            flycast_profiles: FlycastProfilesState::NotScanned,
-            pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
-            xenia_profiles: XeniaProfilesState::NotScanned,
-            remembered_emulator_profiles: load_remembered_emulator_profiles_default()
-                .unwrap_or_default(),
             cheat_workflow: None,
             user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState::default(),
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
@@ -2564,11 +2456,6 @@ impl ArchiveFsApp {
             onboarding_auto_open_checked: false,
             doctor_scan: DoctorScanState::NotRun,
             doctor_scan_generation: RefreshGeneration::INITIAL,
-            rpcs3_status: rpcs3_page::Rpcs3State::Idle,
-            rpcs3_status_generation: 0,
-            pcsx2_status: pcsx2_page::Pcsx2StatusState::Idle,
-            pcsx2_status_generation: 0,
-            pcsx2_status_archive_path: None,
             doctor_selected_finding: None,
             doctor_repair_review: None,
             doctor_repair_result: None,
@@ -4325,7 +4212,7 @@ impl ArchiveFsApp {
     /// Looks up the remembered profile id for an adapter key (`"dolphin"`
     /// or `"xenia"`), if any.
     fn remembered_profile_id(&self, adapter: &str) -> Option<String> {
-        remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+        remembered_profile_for(&self.emulator_readiness.remembered_emulator_profiles, adapter)
             .filter(|profile| {
                 adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root)
             })
@@ -4337,7 +4224,7 @@ impl ArchiveFsApp {
     /// portable/explicit profile is rediscovered without the user typing
     /// it again every session.
     fn remembered_profile_root(&self, adapter: &str) -> Option<PathBuf> {
-        remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+        remembered_profile_for(&self.emulator_readiness.remembered_emulator_profiles, adapter)
             .filter(|profile| {
                 adapter != "dolphin" || !is_dolphin_standard_fallback_root(&profile.root)
             })
@@ -4352,7 +4239,7 @@ impl ArchiveFsApp {
     /// session-level selection already succeeded regardless of whether it
     /// could be remembered for next time.
     fn persist_remembered_profile(&mut self, adapter: &str, profile_id: &str, root: &Path) {
-        let already_current = remembered_profile_for(&self.remembered_emulator_profiles, adapter)
+        let already_current = remembered_profile_for(&self.emulator_readiness.remembered_emulator_profiles, adapter)
             .is_some_and(|profile| profile.profile_id == profile_id && profile.root == root);
         if already_current {
             return;
@@ -4374,9 +4261,9 @@ impl ArchiveFsApp {
         let write_result: Result<(), ArchiveFsError> = Ok(());
         match write_result {
             Ok(()) => {
-                self.remembered_emulator_profiles
+                self.emulator_readiness.remembered_emulator_profiles
                     .retain(|profile| profile.adapter != adapter);
-                self.remembered_emulator_profiles
+                self.emulator_readiness.remembered_emulator_profiles
                     .push(RememberedEmulatorProfile {
                         adapter: adapter.to_string(),
                         profile_id: profile_id.to_string(),
@@ -4718,7 +4605,7 @@ impl ArchiveFsApp {
                     && workflow.selected_dolphin_profile_id.is_some()
                     && matches!(workflow.dolphin_inventory, CheatStepResource::NotLoaded)
             })
-            && matches!(self.dolphin_profiles, DolphinProfilesState::Ready(_))
+            && matches!(self.emulator_readiness.dolphin_profiles, DolphinProfilesState::Ready(_))
         {
             self.start_dolphin_inventory(context.clone());
         }
@@ -5295,7 +5182,7 @@ impl ArchiveFsApp {
                         }
                     }
                     self.maybe_start_selected_evidence_enrichment(context);
-                    if matches!(self.retroarch_profiles, RetroArchProfilesState::NotScanned) {
+                    if matches!(self.emulator_readiness.retroarch_profiles, RetroArchProfilesState::NotScanned) {
                         self.start_retroarch_profile_scan(context.clone());
                     }
                     let data = match &self.state {
@@ -5829,27 +5716,27 @@ impl ArchiveFsApp {
                         .as_ref()
                         .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::RetroArch)
                         .map(|workflow| {
-                            local_cheat_install_context(workflow, &self.retroarch_profiles)
+                            local_cheat_install_context(workflow, &self.emulator_readiness.retroarch_profiles)
                         });
                     let local_pcsx2_install_context = self
                         .cheat_workflow
                         .as_ref()
                         .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2)
                         .and_then(|workflow| {
-                            local_pcsx2_install_context(workflow, &self.pcsx2_profiles)
+                            local_pcsx2_install_context(workflow, &self.emulator_readiness.pcsx2_profiles)
                         });
                     let local_dolphin_install_context = self
                         .cheat_workflow
                         .as_ref()
                         .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::Dolphin)
                         .and_then(|workflow| {
-                            local_dolphin_install_context(workflow, &self.dolphin_profiles)
+                            local_dolphin_install_context(workflow, &self.emulator_readiness.dolphin_profiles)
                         });
                     let local_xenia_install_context = self
                         .cheat_workflow
                         .as_ref()
                         .filter(|workflow| workflow.adapter == CheatEmulatorAdapter::Xenia)
-                        .map(|workflow| local_xenia_install_context(workflow, &self.xenia_profiles));
+                        .map(|workflow| local_xenia_install_context(workflow, &self.emulator_readiness.xenia_profiles));
                     let (action, catalogue_action, dolphin_catalogue_action, bsfree_action, cheatbase_action) = ui_layout::page(
                         ui,
                         ui_layout::ContentWidth::Wide,
@@ -5913,10 +5800,10 @@ impl ArchiveFsApp {
                             let action = show_cheats_mods_page(
                                 ui,
                                 self.cheat_workflow.as_mut(),
-                                &self.retroarch_profiles,
-                                &self.pcsx2_profiles,
-                                &self.dolphin_profiles,
-                                &self.xenia_profiles,
+                                &self.emulator_readiness.retroarch_profiles,
+                                &self.emulator_readiness.pcsx2_profiles,
+                                &self.emulator_readiness.dolphin_profiles,
+                                &self.emulator_readiness.xenia_profiles,
                                 live,
                                 self.database_state.snapshot(),
                                 &self.history,
@@ -6550,8 +6437,8 @@ impl ArchiveFsApp {
                         })
                         .into_iter()
                         .collect();
-                    self.ready_to_play_page.set_results(results);
-                    self.ready_to_play_page.show(ui);
+                    self.emulator_readiness.ready_to_play_page.set_results(results);
+                    self.emulator_readiness.ready_to_play_page.show(ui);
                     return;
                 }
 
@@ -6559,12 +6446,12 @@ impl ArchiveFsApp {
                     let emulator_running = self.launch_dolphin.is_active()
                         || self.launch_pcsx2.is_active()
                         || self.launch_standalone.is_active();
-                    self.emulator_inventory_page.show(ui, emulator_running);
+                    self.emulator_readiness.emulator_inventory_page.show(ui, emulator_running);
                     return;
                 }
 
                 if self.view == MainView::BiosProjection {
-                    self.bios_projection_page.show(ui);
+                    self.emulator_readiness.bios_projection_page.show(ui);
                     return;
                 }
 
@@ -6658,7 +6545,7 @@ impl ArchiveFsApp {
                         ui,
                         &self.database_state,
                         &self.diagnostics,
-                        &self.retroarch_profiles,
+                        &self.emulator_readiness.retroarch_profiles,
                         mount_root,
                         busy,
                         &mut self.clipboard,
@@ -6916,6 +6803,7 @@ impl ArchiveFsApp {
                                                         block_reason: None,
                                                         platform_busy: false,
                                                         retroarch_profiles: &self
+                                                            .emulator_readiness
                                                             .retroarch_profiles,
                                                         library_views_configured: false,
                                                         library_view_last_plan: None,
@@ -6987,7 +6875,7 @@ impl ArchiveFsApp {
                                 platform_choice: &mut self.library_ui.platform_choice,
                                 platform_custom_text: &mut self.library_ui.platform_custom_text,
                                 platform_busy: self.library_ui.platform_action.is_some(),
-                                retroarch_profiles: &self.retroarch_profiles,
+                                retroarch_profiles: &self.emulator_readiness.retroarch_profiles,
                                 selected_evidence: &self.selected_evidence_ui.selected_evidence,
                                 selected_archives: &mut self.archive_context.selected,
                                 bulk_platform_choice: &mut self.library_ui.bulk_platform_choice,

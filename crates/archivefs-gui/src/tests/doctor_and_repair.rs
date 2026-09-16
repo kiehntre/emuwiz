@@ -77,10 +77,10 @@ fn cheats_mods_page_routes_retroarch_to_shared_preview_without_stale_wording() {
             let _ = show_cheats_mods_page(
                 ui,
                 app.cheat_workflow.as_mut(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
-                &app.xenia_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
+                &app.emulator_readiness.xenia_profiles,
                 None,
                 None,
                 &history,
@@ -126,9 +126,9 @@ fn cheats_mods_workspace_keeps_lifecycle_states_visibly_separate() {
             show_cheats_mods_workflow_states(
                 ui,
                 app.cheat_workflow.as_ref(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
             );
         });
     });
@@ -156,7 +156,7 @@ fn pcsx2_workflow_states_render_every_row_through_the_shared_status_rows_compone
     let workflow = app.cheat_workflow.as_mut().unwrap();
     workflow.adapter = CheatEmulatorAdapter::Pcsx2;
     workflow.selected_pcsx2_profile_id = Some("pcsx2-native-test".to_string());
-    app.pcsx2_profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+    app.emulator_readiness.pcsx2_profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
         profiles: vec![pcsx2_profile_fixture()],
         warnings: Vec::new(),
         complete: true,
@@ -167,9 +167,9 @@ fn pcsx2_workflow_states_render_every_row_through_the_shared_status_rows_compone
             show_cheats_mods_workflow_states(
                 ui,
                 app.cheat_workflow.as_ref(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
             );
         });
     });
@@ -198,7 +198,7 @@ fn dolphin_workflow_states_render_every_row_through_the_shared_status_rows_compo
     let workflow = app.cheat_workflow.as_mut().unwrap();
     workflow.adapter = CheatEmulatorAdapter::Dolphin;
     workflow.selected_dolphin_profile_id = Some("dolphin-native-test".to_string());
-    app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
         profiles: vec![dolphin_profile_fixture()],
         warnings: Vec::new(),
         complete: true,
@@ -209,9 +209,9 @@ fn dolphin_workflow_states_render_every_row_through_the_shared_status_rows_compo
             show_cheats_mods_workflow_states(
                 ui,
                 app.cheat_workflow.as_ref(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
             );
         });
     });
@@ -2357,7 +2357,7 @@ fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.doctor_scan = DoctorScanState::NotRun;
-    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
@@ -2374,7 +2374,7 @@ fn emulator_setup_summary_starts_the_shared_doctor_scan() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.doctor_scan = DoctorScanState::NotRun;
-    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     app.view = MainView::EmulatorSetup;
 
     let ctx = egui::Context::default();
@@ -2441,7 +2441,7 @@ fn emulator_setup_candidates_are_visible_without_running_doctor() {
     let mut app = app_for_operation_tests();
     app.ui_mode = GuiMode::AdvancedView;
     app.doctor_scan = DoctorScanState::NotRun;
-    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
@@ -2483,17 +2483,17 @@ fn emulator_setup_app_ready() -> ArchiveFsApp {
     app.view = MainView::EmulatorSetup;
     // Pre-seed a finished scan so rendering never spawns a real discovery
     // thread; the empty environment yields zero usable cores.
-    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(Vec::new()));
     // Exercise the current candidate-first page with a bounded real filter,
     // so the independent RetroArch setup card remains in the rendered frame.
-    app.emulator_setup_page.platform_filter = "SNES".to_string();
+    app.emulator_readiness.emulator_setup_page.platform_filter = "SNES".to_string();
     app
 }
 
 #[test]
 fn retroarch_card_keeps_folder_mode_technical_and_shows_recovery_actions() {
     let mut app = emulator_setup_app_ready();
-    assert!(app.retroarch_core_directory_override.is_none());
+    assert!(app.emulator_readiness.retroarch_core_directory_override.is_none());
 
     let output = render_problems_repair_app(&mut app);
     assert!(!rendered_text_contains(&output, "Automatic core folder"));
@@ -2515,7 +2515,7 @@ fn retroarch_card_keeps_folder_mode_technical_and_shows_recovery_actions() {
 #[test]
 fn retroarch_failure_leads_with_try_again_then_choose_folder() {
     let mut app = emulator_setup_app_ready();
-    app.retroarch_profiles =
+    app.emulator_readiness.retroarch_profiles =
         RetroArchProfilesState::Error("permission denied for /usr/lib/libretro".to_string());
 
     let output = render_problems_repair_app(&mut app);
@@ -2533,7 +2533,7 @@ fn retroarch_failure_leads_with_try_again_then_choose_folder() {
 #[test]
 fn retroarch_core_folder_card_shows_custom_mode_and_reset_when_an_override_is_active() {
     let mut app = emulator_setup_app_ready();
-    app.retroarch_core_directory_override = Some(PathBuf::from("/custom/libretro/cores"));
+    app.emulator_readiness.retroarch_core_directory_override = Some(PathBuf::from("/custom/libretro/cores"));
 
     let output = render_problems_repair_app(&mut app);
     assert!(!rendered_text_contains(&output, "Custom core folder"));
@@ -2549,8 +2549,8 @@ fn choosing_an_unusable_core_folder_is_reported_and_never_persisted() {
     app.apply_picked_retroarch_core_folder(missing.clone(), egui::Context::default());
 
     // Nothing was saved: the active folder is still automatic.
-    assert!(app.retroarch_core_directory_override.is_none());
-    assert_eq!(app.retroarch_core_folder_rejected_pick, Some(missing));
+    assert!(app.emulator_readiness.retroarch_core_directory_override.is_none());
+    assert_eq!(app.emulator_readiness.retroarch_core_folder_rejected_pick, Some(missing));
 
     let output = render_problems_repair_app(&mut app);
     assert!(rendered_text_contains(&output, "Folder not usable"));
@@ -2565,7 +2565,7 @@ fn check_again_routes_through_the_one_existing_profile_scan_lane() {
     // discovery path exists in the GUI.
     app.start_retroarch_profile_scan(egui::Context::default());
     assert!(matches!(
-        app.retroarch_profiles,
+        app.emulator_readiness.retroarch_profiles,
         RetroArchProfilesState::Scanning { .. }
     ));
 }
@@ -2630,14 +2630,14 @@ fn open_emulator_setup_for_navigates_selects_and_records_retroarch_focus() {
 
     let mut app = app_for_operation_tests();
     let path = PathBuf::from("/roms/journey-4-game.gb");
-    assert!(app.emulator_setup_focus.is_none());
+    assert!(app.emulator_readiness.emulator_setup_focus.is_none());
 
     app.open_emulator_setup_for(path.clone(), EmulatorSetupFocus::RetroArch);
 
     assert_eq!(app.view, MainView::EmulatorSetup);
     assert_eq!(app.archive_context.focused.as_deref(), Some(path.as_path()));
     assert_eq!(
-        app.emulator_setup_focus,
+        app.emulator_readiness.emulator_setup_focus,
         Some(EmulatorSetupFocus::RetroArch)
     );
     assert_eq!(app.ui_mode, GuiMode::AdvancedView);
@@ -2648,12 +2648,12 @@ fn open_emulator_setup_for_navigates_selects_and_records_retroarch_focus() {
 #[test]
 fn emulator_setup_first_render_consumes_the_retroarch_focus() {
     let mut app = emulator_setup_app_ready();
-    app.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+    app.emulator_readiness.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
 
     let output = render_problems_repair_app(&mut app);
 
     // Exactly one frame acts on the hint.
-    assert!(app.emulator_setup_focus.is_none());
+    assert!(app.emulator_readiness.emulator_setup_focus.is_none());
     // The RetroArch repair card is present on the page the hint targeted.
     assert!(rendered_text_contains(&output, "RetroArch"));
     assert!(rendered_text_contains(&output, "Check again"));
@@ -2666,16 +2666,16 @@ fn emulator_setup_first_render_consumes_the_retroarch_focus() {
 #[test]
 fn emulator_setup_focus_is_one_shot_and_later_frames_do_not_re_target() {
     let mut app = emulator_setup_app_ready();
-    app.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+    app.emulator_readiness.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
 
     let _ = render_problems_repair_app(&mut app);
-    assert!(app.emulator_setup_focus.is_none());
+    assert!(app.emulator_readiness.emulator_setup_focus.is_none());
 
     // Subsequent frames: the hint stays consumed, nothing re-arms it, and
     // the page keeps rendering normally (no snap-back / no panic).
     for _ in 0..3 {
         let output = render_problems_repair_app(&mut app);
-        assert!(app.emulator_setup_focus.is_none());
+        assert!(app.emulator_readiness.emulator_setup_focus.is_none());
         assert!(rendered_text_contains(&output, "RetroArch"));
         assert!(!rendered_text_contains(&output, "Automatic core folder"));
     }
@@ -2685,11 +2685,11 @@ fn emulator_setup_focus_is_one_shot_and_later_frames_do_not_re_target() {
 fn normal_emulator_setup_navigation_leaves_focus_none() {
     let mut app = emulator_setup_app_ready();
     // Arrived via sidebar/Home: no repair-action hint was set.
-    assert!(app.emulator_setup_focus.is_none());
+    assert!(app.emulator_readiness.emulator_setup_focus.is_none());
 
     let output = render_problems_repair_app(&mut app);
 
-    assert!(app.emulator_setup_focus.is_none());
+    assert!(app.emulator_readiness.emulator_setup_focus.is_none());
     assert!(!rendered_text_contains(&output, "Automatic core folder"));
     assert!(rendered_text_contains(&output, "Check again"));
 }
@@ -2697,7 +2697,7 @@ fn normal_emulator_setup_navigation_leaves_focus_none() {
 #[test]
 fn focused_navigation_keeps_retroarch_technical_details_collapsed() {
     let mut app = emulator_setup_app_ready();
-    app.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+    app.emulator_readiness.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
 
     let output = render_problems_repair_app(&mut app);
 
@@ -2718,7 +2718,7 @@ fn retroarch_readiness_is_identical_with_and_without_focus() {
     let out_without = render_problems_repair_app(&mut without_focus);
 
     let mut with_focus = emulator_setup_app_ready();
-    with_focus.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
+    with_focus.emulator_readiness.emulator_setup_focus = Some(EmulatorSetupFocus::RetroArch);
     let out_with = render_problems_repair_app(&mut with_focus);
 
     // Same readiness wording either way.
@@ -2731,10 +2731,10 @@ fn retroarch_readiness_is_identical_with_and_without_focus() {
         "Scanning RetroArch cores"
     ));
     assert!(matches!(
-        with_focus.retroarch_profiles,
+        with_focus.emulator_readiness.retroarch_profiles,
         RetroArchProfilesState::Ready(_)
     ));
-    assert!(with_focus.emulator_setup_focus.is_none());
+    assert!(with_focus.emulator_readiness.emulator_setup_focus.is_none());
 }
 
 #[test]

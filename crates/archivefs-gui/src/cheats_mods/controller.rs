@@ -523,7 +523,7 @@ impl ArchiveFsApp {
             platform: platform.clone(),
             adapter,
         });
-        let selected_profile_id = match &self.retroarch_profiles {
+        let selected_profile_id = match &self.emulator_readiness.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => {
                 let eligible = eligible_profile_ids(discovery);
                 if let Some(previous) =
@@ -538,7 +538,7 @@ impl ArchiveFsApp {
             }
             _ => None,
         };
-        let selected_pcsx2_profile_id = match &self.pcsx2_profiles {
+        let selected_pcsx2_profile_id = match &self.emulator_readiness.pcsx2_profiles {
             Pcsx2ProfilesState::Ready(discovery) => {
                 let eligible = eligible_pcsx2_profile_ids(discovery);
                 if let Some(previous) = previous_pcsx2_profile_id
@@ -553,7 +553,7 @@ impl ArchiveFsApp {
             }
             _ => None,
         };
-        let (selected_dolphin_profile_id, dolphin_profile_selection) = match &self.dolphin_profiles
+        let (selected_dolphin_profile_id, dolphin_profile_selection) = match &self.emulator_readiness.dolphin_profiles
         {
             DolphinProfilesState::Ready(discovery) => {
                 let selection =
@@ -567,7 +567,7 @@ impl ArchiveFsApp {
             }
             _ => (None, None),
         };
-        let (selected_xenia_profile_id, xenia_profile_selection) = match &self.xenia_profiles {
+        let (selected_xenia_profile_id, xenia_profile_selection) = match &self.emulator_readiness.xenia_profiles {
             XeniaProfilesState::Ready(discovery) => {
                 let candidates = xenia_profile_candidates(discovery);
                 let selection = select_emulator_profile(
@@ -691,7 +691,7 @@ impl ArchiveFsApp {
             .as_ref()
             .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Pcsx2)
             && matches!(
-                self.pcsx2_profiles,
+                self.emulator_readiness.pcsx2_profiles,
                 Pcsx2ProfilesState::NotScanned | Pcsx2ProfilesState::Error(_)
             )
         {
@@ -704,7 +704,7 @@ impl ArchiveFsApp {
         {
             self.seed_explicit_root_from_remembered_profile("dolphin");
             if matches!(
-                self.dolphin_profiles,
+                self.emulator_readiness.dolphin_profiles,
                 DolphinProfilesState::NotScanned | DolphinProfilesState::Error(_)
             ) {
                 self.start_dolphin_profile_scan(context.clone());
@@ -716,7 +716,7 @@ impl ArchiveFsApp {
             .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Xenia)
         {
             self.seed_explicit_root_from_remembered_profile("xenia");
-            if matches!(self.xenia_profiles, XeniaProfilesState::NotScanned) {
+            if matches!(self.emulator_readiness.xenia_profiles, XeniaProfilesState::NotScanned) {
                 self.start_xenia_profile_scan();
             }
         }
@@ -781,9 +781,9 @@ impl ArchiveFsApp {
         let Some((key, work)) = self.cheat_workflow.as_ref().and_then(|workflow| {
             build_cheat_preview_request(
                 workflow,
-                &self.retroarch_profiles,
-                &self.pcsx2_profiles,
-                &self.dolphin_profiles,
+                &self.emulator_readiness.retroarch_profiles,
+                &self.emulator_readiness.pcsx2_profiles,
+                &self.emulator_readiness.dolphin_profiles,
             )
         }) else {
             return;
@@ -875,7 +875,7 @@ impl ArchiveFsApp {
             return;
         }
         let archive_path = workflow.archive_path.clone();
-        let outcome = build_cheat_candidate_request(workflow, &self.retroarch_profiles);
+        let outcome = build_cheat_candidate_request(workflow, &self.emulator_readiness.retroarch_profiles);
         match outcome {
             Ok((key, catalogue_root, archive)) => {
                 let worker_key = key.clone();
@@ -1257,7 +1257,7 @@ impl ArchiveFsApp {
         };
         let key = cheat_preview_key(workflow);
         let archive_path = workflow.archive_path.clone();
-        let configuration_path = match &self.dolphin_profiles {
+        let configuration_path = match &self.emulator_readiness.dolphin_profiles {
             DolphinProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -1443,7 +1443,7 @@ impl ArchiveFsApp {
             }
             workflow.xenia_profile_selection = Some(selection);
         }
-        self.xenia_profiles = XeniaProfilesState::Ready(discovery);
+        self.emulator_readiness.xenia_profiles = XeniaProfilesState::Ready(discovery);
         if let Some((profile_id, root)) = to_persist {
             self.persist_remembered_profile("xenia", &profile_id, &root);
         }
@@ -1549,7 +1549,7 @@ impl ArchiveFsApp {
         };
         let key = cheat_preview_key(workflow);
         let archive_path = workflow.archive_path.clone();
-        let configuration_path = match &self.xenia_profiles {
+        let configuration_path = match &self.emulator_readiness.xenia_profiles {
             XeniaProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -1682,7 +1682,7 @@ impl ArchiveFsApp {
             return;
         };
         let Some(destination_root) =
-            selected_retroarch_cheat_root(workflow, &self.retroarch_profiles)
+            selected_retroarch_cheat_root(workflow, &self.emulator_readiness.retroarch_profiles)
         else {
             return;
         };
@@ -2409,7 +2409,7 @@ impl ArchiveFsApp {
         self.confirm_cheat_archive_change = None;
         self.cheat_archive_picker = None;
         let needs_profile_scan = matches!(
-            self.retroarch_profiles,
+            self.emulator_readiness.retroarch_profiles,
             RetroArchProfilesState::NotScanned | RetroArchProfilesState::Error(_)
         );
         self.archive_context.select_only(archive_path.clone());
@@ -2445,7 +2445,7 @@ impl ArchiveFsApp {
         let Some(profile_id) = workflow.selected_profile_id.clone() else {
             return;
         };
-        let destination = match &self.retroarch_profiles {
+        let destination = match &self.emulator_readiness.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -3427,7 +3427,7 @@ impl ArchiveFsApp {
     pub(crate) fn gamecube_gamehacking_profile(&self) -> Option<DolphinProfile> {
         let workflow = self.cheat_workflow.as_ref()?;
         let profile_id = workflow.selected_dolphin_profile_id.as_ref()?;
-        let DolphinProfilesState::Ready(discovery) = &self.dolphin_profiles else {
+        let DolphinProfilesState::Ready(discovery) = &self.emulator_readiness.dolphin_profiles else {
             return None;
         };
         discovery
@@ -4295,7 +4295,7 @@ impl ArchiveFsApp {
         let Some(profile_id) = workflow.selected_pcsx2_profile_id.clone() else {
             return;
         };
-        let profile = match &self.pcsx2_profiles {
+        let profile = match &self.emulator_readiness.pcsx2_profiles {
             Pcsx2ProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -4439,7 +4439,7 @@ impl ArchiveFsApp {
         let Some(profile_id) = workflow.selected_pcsx2_profile_id.clone() else {
             return;
         };
-        let profile = match &self.pcsx2_profiles {
+        let profile = match &self.emulator_readiness.pcsx2_profiles {
             Pcsx2ProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -4497,7 +4497,7 @@ impl ArchiveFsApp {
         let Some(profile_id) = workflow.selected_dolphin_profile_id.clone() else {
             return;
         };
-        let profile = match &self.dolphin_profiles {
+        let profile = match &self.emulator_readiness.dolphin_profiles {
             DolphinProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -4602,7 +4602,7 @@ impl ArchiveFsApp {
     pub(crate) fn poll_cheat_workflow(&mut self, context: &egui::Context) {
         let identity_page_is_current = self.view == MainView::CheatsMods;
         let mut automatic_candidate: Option<String> = None;
-        let dolphin_profile_paths: HashMap<String, PathBuf> = match &self.dolphin_profiles {
+        let dolphin_profile_paths: HashMap<String, PathBuf> = match &self.emulator_readiness.dolphin_profiles {
             DolphinProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -5534,7 +5534,7 @@ impl ArchiveFsApp {
         let Some(profile_id) = workflow.dolphin_profile_choice.clone() else {
             return;
         };
-        let root = match &self.dolphin_profiles {
+        let root = match &self.emulator_readiness.dolphin_profiles {
             DolphinProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()
@@ -5554,7 +5554,7 @@ impl ArchiveFsApp {
             profile_id: profile_id.clone(),
             reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::ExplicitChoice,
         });
-        if let DolphinProfilesState::Ready(discovery) = &self.dolphin_profiles {
+        if let DolphinProfilesState::Ready(discovery) = &self.emulator_readiness.dolphin_profiles {
             reconcile_dolphin_provider_selection(workflow, discovery);
         }
         if let Some(root) = root {
@@ -5570,7 +5570,7 @@ impl ArchiveFsApp {
         let Some(profile_id) = workflow.xenia_profile_choice.clone() else {
             return;
         };
-        let root = match &self.xenia_profiles {
+        let root = match &self.emulator_readiness.xenia_profiles {
             XeniaProfilesState::Ready(discovery) => discovery
                 .profiles
                 .iter()

@@ -476,7 +476,7 @@ fn choosing_a_dolphin_profile_in_the_chooser_remembers_it_and_reaches_auto_selec
             },
         ],
     });
-    app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
         profiles: vec![profile_a, profile_b],
         warnings: Vec::new(),
         complete: true,
@@ -511,7 +511,7 @@ fn choosing_a_dolphin_profile_in_the_chooser_remembers_it_and_reaches_auto_selec
         Some(EmulatorProfileSelection::Auto { .. })
     ));
     assert_eq!(
-        remembered_profile_for(&app.remembered_emulator_profiles, "dolphin")
+        remembered_profile_for(&app.emulator_readiness.remembered_emulator_profiles, "dolphin")
             .unwrap()
             .profile_id,
         "profile-b"
@@ -535,7 +535,7 @@ fn gamecube_provider_codes_render_without_a_preexisting_ini_or_retroarch_control
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let workflow = app.cheat_workflow.as_mut().unwrap();
-            let _ = show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+            let _ = show_dolphin_workflow(ui, workflow, &app.emulator_readiness.dolphin_profiles, &mut clipboard);
         });
     });
     for expected in [
@@ -587,7 +587,7 @@ fn individual_provider_selection_invalidates_preview_and_rendering_never_fetches
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let workflow = app.cheat_workflow.as_mut().unwrap();
-                let _ = show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+                let _ = show_dolphin_workflow(ui, workflow, &app.emulator_readiness.dolphin_profiles, &mut clipboard);
             });
         });
         assert!(matches!(
@@ -641,7 +641,7 @@ fn external_gecko_provider_is_not_offered_for_wii() {
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let workflow = app.cheat_workflow.as_mut().unwrap();
-            let _ = show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+            let _ = show_dolphin_workflow(ui, workflow, &app.emulator_readiness.dolphin_profiles, &mut clipboard);
         });
     });
     assert!(rendered_text_contains(
@@ -714,10 +714,10 @@ fn dolphin_candidate_match_opens_a_real_matched_file_with_its_own_gecko_codes() 
             let _ = show_cheats_mods_page(
                 ui,
                 app.cheat_workflow.as_mut(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
-                &app.xenia_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
+                &app.emulator_readiness.xenia_profiles,
                 None,
                 None,
                 &history,
@@ -3031,7 +3031,7 @@ fn cheats_mods_context_preselects_only_a_single_eligible_profile() {
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
 
     // Two eligible profiles: no silent choice.
-    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
         cheat_profile("native-user", true),
         cheat_profile("flatpak-user", true),
     ]));
@@ -3042,7 +3042,7 @@ fn cheats_mods_context_preselects_only_a_single_eligible_profile() {
     assert_eq!(app.tools_overlay, ToolsOverlay::None);
 
     // Exactly one eligible profile: preselected (the CLI's rule).
-    app.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::Ready(cheat_discovery(vec![
         cheat_profile("native-user", true),
         cheat_profile("blocked-profile", false),
     ]));
@@ -3070,7 +3070,7 @@ fn cheats_mods_navigation_and_reconciliation_track_selection_without_touching_th
     app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
     app.mount_ui.mount_queue = vec![PathBuf::from("/roms/queued.zip")];
-    app.retroarch_profiles =
+    app.emulator_readiness.retroarch_profiles =
         RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
 
     app.prepare_cheats_mods_workspace(PathBuf::from("/roms/a.zip"));
@@ -3177,7 +3177,7 @@ fn one_library_selection_is_the_same_context_on_selected_and_cheats_mods() {
                 SelectedPageViewState {
                     selected_archive: app.archive_context.focused.as_deref(),
                     selected_count: app.archive_context.selected.len(),
-                    retroarch_profiles: &app.retroarch_profiles,
+                    retroarch_profiles: &app.emulator_readiness.retroarch_profiles,
                     busy: false,
                     block_reason: None,
                 },

@@ -2389,7 +2389,7 @@ fn bsfree_gui_result_shows_count_and_rollback_after_success() {
         std::process::id()
     ));
     let mut app = dolphin_workflow_with_matched_identity(&directory, "GLME01");
-    let profile = match &app.dolphin_profiles {
+    let profile = match &app.emulator_readiness.dolphin_profiles {
         DolphinProfilesState::Ready(discovery) => {
             discovery.profiles.first().expect("fixture profile").clone()
         }

@@ -1192,7 +1192,7 @@ fn find_matching_cheat_files_button_registers_a_real_pointer_click() {
 /// return silently with no state change - the dead click.
 fn app_with_unfetched_trusted_catalogue() -> ArchiveFsApp {
     let mut app = app_with_cheats_mods_context();
-    app.retroarch_profiles =
+    app.emulator_readiness.retroarch_profiles =
         RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
     let workflow = app.cheat_workflow.as_mut().unwrap();
     workflow.adapter = CheatEmulatorAdapter::RetroArch;
@@ -1326,10 +1326,10 @@ fn the_blocked_state_renders_as_visibly_different_from_a_worker_failure() {
             let _ = show_cheats_mods_page(
                 ui,
                 app.cheat_workflow.as_mut(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
-                &app.xenia_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
+                &app.emulator_readiness.xenia_profiles,
                 None,
                 None,
                 &history,
@@ -1688,10 +1688,10 @@ fn workflow_diagnostics_are_collapsed_so_the_primary_action_is_not_buried() {
             let _ = show_cheats_mods_page(
                 ui,
                 app.cheat_workflow.as_mut(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
-                &app.xenia_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
+                &app.emulator_readiness.xenia_profiles,
                 None,
                 None,
                 &history,
@@ -1759,7 +1759,7 @@ fn history_logs_final_entry_is_reachable_at_maximum_scroll() {
 fn pcsx2_workflow_with_verified_identity_and_selected_cheat(profile: Pcsx2Profile) -> ArchiveFsApp {
     let mut app = app_with_cheats_mods_context();
     let profile_id = profile.profile_id.clone();
-    app.pcsx2_profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
+    app.emulator_readiness.pcsx2_profiles = Pcsx2ProfilesState::Ready(Pcsx2ProfileDiscovery {
         profiles: vec![profile],
         warnings: Vec::new(),
         complete: true,
@@ -1901,7 +1901,7 @@ fn install_selected_pcsx2_surfaces_build_preview_failure_visibly_and_records_his
     // And it must render as a banner in the GUI itself, not just the log.
     let ArchiveFsApp {
         cheat_workflow,
-        pcsx2_profiles,
+        emulator_readiness: EmulatorReadinessState { pcsx2_profiles, .. },
         ..
     } = &mut app;
     let workflow = cheat_workflow.as_mut().unwrap();
@@ -2437,13 +2437,13 @@ fn pcsx2_apply_and_rollback_leave_other_emulator_profile_state_untouched() {
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let mut app = pcsx2_workflow_reviewed_for_apply(&directory);
-    app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
         profiles: vec![dolphin_profile_fixture()],
         warnings: Vec::new(),
         complete: true,
     });
-    app.xenia_profiles = XeniaProfilesState::NotScanned;
-    app.retroarch_profiles = RetroArchProfilesState::NotScanned;
+    app.emulator_readiness.xenia_profiles = XeniaProfilesState::NotScanned;
+    app.emulator_readiness.retroarch_profiles = RetroArchProfilesState::NotScanned;
 
     let workflow = app.cheat_workflow.as_ref().unwrap();
     let CheatTransactionState::Review { plan, .. } = &workflow.transaction else {
@@ -2477,16 +2477,16 @@ fn pcsx2_apply_and_rollback_leave_other_emulator_profile_state_untouched() {
         );
     }
 
-    match &app.dolphin_profiles {
+    match &app.emulator_readiness.dolphin_profiles {
         DolphinProfilesState::Ready(discovery) => {
             assert_eq!(discovery.profiles.len(), 1);
             assert_eq!(discovery.profiles[0].profile_id, "dolphin-native-test");
         }
         _ => panic!("unrelated Dolphin profile state must be untouched by a PCSX2 apply"),
     }
-    assert!(matches!(app.xenia_profiles, XeniaProfilesState::NotScanned));
+    assert!(matches!(app.emulator_readiness.xenia_profiles, XeniaProfilesState::NotScanned));
     assert!(matches!(
-        app.retroarch_profiles,
+        app.emulator_readiness.retroarch_profiles,
         RetroArchProfilesState::NotScanned
     ));
 
@@ -2682,7 +2682,7 @@ fn speculative_or_only_valid_fallback_is_never_labelled_running() {
 /// without touching the filesystem.
 fn drive_dolphin_profile_scan(app: &mut ArchiveFsApp, profiles: Vec<DolphinProfile>) {
     let (sender, receiver) = mpsc::channel();
-    app.dolphin_profiles = DolphinProfilesState::Scanning { receiver };
+    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Scanning { receiver };
     let discovery = DolphinProfileDiscovery {
         profiles,
         warnings: Vec::new(),
@@ -2752,7 +2752,7 @@ fn dolphin_provider_result_is_reconciled_when_profile_scan_finishes_second() {
 fn poll_dolphin_profiles_does_not_hide_multiple_stopped_profiles_behind_memory() {
     let mut app = app_with_cheats_mods_context();
     app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
-    app.remembered_emulator_profiles
+    app.emulator_readiness.remembered_emulator_profiles
         .push(RememberedEmulatorProfile {
             adapter: "dolphin".to_string(),
             profile_id: "second".to_string(),
@@ -2796,7 +2796,7 @@ fn poll_dolphin_profiles_requires_a_choice_with_multiple_valid_profiles_and_noth
 fn poll_dolphin_profiles_ignores_stale_memory_when_one_credible_profile_exists() {
     let mut app = app_with_cheats_mods_context();
     app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
-    app.remembered_emulator_profiles
+    app.emulator_readiness.remembered_emulator_profiles
         .push(RememberedEmulatorProfile {
             adapter: "dolphin".to_string(),
             profile_id: "vanished".to_string(),
@@ -2840,7 +2840,7 @@ fn poll_dolphin_profiles_does_not_guess_portable_when_dolphin_is_stopped() {
 fn poll_dolphin_profiles_active_runtime_wins_over_remembered_installed_profile() {
     let mut app = app_with_cheats_mods_context();
     app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Dolphin;
-    app.remembered_emulator_profiles
+    app.emulator_readiness.remembered_emulator_profiles
         .push(RememberedEmulatorProfile {
             adapter: "dolphin".to_string(),
             profile_id: "installed".to_string(),
@@ -2869,7 +2869,7 @@ fn seeding_explicit_root_never_overwrites_a_value_the_user_already_typed() {
         workflow.adapter = CheatEmulatorAdapter::Dolphin;
         workflow.dolphin_explicit_root = "/typed/by/user".to_string();
     }
-    app.remembered_emulator_profiles
+    app.emulator_readiness.remembered_emulator_profiles
         .push(RememberedEmulatorProfile {
             adapter: "dolphin".to_string(),
             profile_id: "remembered".to_string(),
@@ -2886,7 +2886,7 @@ fn seeding_explicit_root_never_overwrites_a_value_the_user_already_typed() {
 fn seeding_explicit_root_from_a_remembered_profile_fills_an_empty_field() {
     let mut app = app_with_cheats_mods_context();
     app.cheat_workflow.as_mut().unwrap().adapter = CheatEmulatorAdapter::Xenia;
-    app.remembered_emulator_profiles
+    app.emulator_readiness.remembered_emulator_profiles
         .push(RememberedEmulatorProfile {
             adapter: "xenia".to_string(),
             profile_id: "remembered".to_string(),
@@ -2951,7 +2951,7 @@ fn opening_a_new_beginner_game_reuses_ready_profile_state_consistently() {
         gamecube.identity.platform = Some("GameCube".to_string());
         data.records.push(gamecube);
     }
-    app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
         profiles: vec![dolphin_profile_fixture()],
         warnings: Vec::new(),
         complete: true,
@@ -2983,7 +2983,7 @@ fn opening_a_new_beginner_game_reuses_ready_profile_state_consistently() {
         xbox.identity.platform = Some("Xbox360".to_string());
         data.records.push(xbox);
     }
-    app.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+    app.emulator_readiness.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
         profiles: vec![xenia_profile_fixture(&temp)],
         warnings: Vec::new(),
         complete: true,
@@ -3020,10 +3020,10 @@ fn gamecube_page_renders_dolphin_without_retroarch_content() {
             let _ = show_cheats_mods_page(
                 ui,
                 app.cheat_workflow.as_mut(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
-                &app.xenia_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
+                &app.emulator_readiness.xenia_profiles,
                 None,
                 None,
                 &history,
@@ -3053,10 +3053,10 @@ fn cheats_mods_page_renders_the_new_hierarchy_headings() {
             let _ = show_cheats_mods_page(
                 ui,
                 app.cheat_workflow.as_mut(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
-                &app.xenia_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
+                &app.emulator_readiness.xenia_profiles,
                 None,
                 None,
                 &history,
@@ -3100,10 +3100,10 @@ fn shared_preview_only_renders_for_the_retroarch_adapter_and_after_profile_selec
             let _ = show_cheats_mods_page(
                 ui,
                 app.cheat_workflow.as_mut(),
-                &app.retroarch_profiles,
-                &app.pcsx2_profiles,
-                &app.dolphin_profiles,
-                &app.xenia_profiles,
+                &app.emulator_readiness.retroarch_profiles,
+                &app.emulator_readiness.pcsx2_profiles,
+                &app.emulator_readiness.dolphin_profiles,
+                &app.emulator_readiness.xenia_profiles,
                 None,
                 None,
                 &history,
@@ -3139,10 +3139,10 @@ fn shared_preview_only_renders_for_the_retroarch_adapter_and_after_profile_selec
                 let _ = show_cheats_mods_page(
                     ui,
                     app.cheat_workflow.as_mut(),
-                    &app.retroarch_profiles,
-                    &app.pcsx2_profiles,
-                    &app.dolphin_profiles,
-                    &app.xenia_profiles,
+                    &app.emulator_readiness.retroarch_profiles,
+                    &app.emulator_readiness.pcsx2_profiles,
+                    &app.emulator_readiness.dolphin_profiles,
+                    &app.emulator_readiness.xenia_profiles,
                     None,
                     None,
                     &history,
@@ -3335,7 +3335,7 @@ fn xenia_workflow_with_matched_identity(
     title_id: &str,
 ) -> ArchiveFsApp {
     let mut app = app_with_cheats_mods_context();
-    app.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+    app.emulator_readiness.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
         profiles: vec![xenia_profile_fixture(directory)],
         warnings: Vec::new(),
         complete: true,
@@ -3550,7 +3550,7 @@ fn xenia_workflow_ready_for_beginner_install(directory: &Path) -> ArchiveFsApp {
         profile_id: "xenia-explicit-test".to_string(),
         reason: archivefs_core::patch_manager::EmulatorProfileSelectReason::OnlyValidProfile,
     });
-    app.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
+    app.emulator_readiness.xenia_profiles = XeniaProfilesState::Ready(XeniaProfileDiscovery {
         profiles: vec![xenia_profile_fixture(directory)],
         warnings: Vec::new(),
         complete: true,
@@ -3564,7 +3564,7 @@ fn render_xenia_workflow(app: &mut ArchiveFsApp) -> egui::FullOutput {
     ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let workflow = app.cheat_workflow.as_mut().unwrap();
-            let _ = show_xenia_workflow(ui, workflow, &app.xenia_profiles, &mut clipboard);
+            let _ = show_xenia_workflow(ui, workflow, &app.emulator_readiness.xenia_profiles, &mut clipboard);
         });
     })
 }
@@ -3963,10 +3963,10 @@ fn beginner_candidate_is_visible_without_scrolling_on_a_small_viewport() {
                     let _ = show_cheats_mods_page(
                         ui,
                         app.cheat_workflow.as_mut(),
-                        &app.retroarch_profiles,
-                        &app.pcsx2_profiles,
-                        &app.dolphin_profiles,
-                        &app.xenia_profiles,
+                        &app.emulator_readiness.retroarch_profiles,
+                        &app.emulator_readiness.pcsx2_profiles,
+                        &app.emulator_readiness.dolphin_profiles,
+                        &app.emulator_readiness.xenia_profiles,
                         None,
                         None,
                         &history,
@@ -4222,7 +4222,7 @@ fn selected_page_launch_readiness_receives_the_real_discovered_dolphin_profile_n
             .any(|profile| profile.profile_id == profile_id && profile.eligible),
         "fixture profile must be discovered and eligible"
     );
-    app.dolphin_local_profiles =
+    app.emulator_readiness.dolphin_local_profiles =
         DolphinLocalProfilesState::Ready(DolphinLocalProfilesReady { discovery, roots });
 
     let live = match &app.state {
@@ -4315,12 +4315,12 @@ fn selected_page_pcsx2_readiness_requires_matching_firmware_evidence_and_threads
         panic!("fixture must retain its verified PS2 identity report");
     }
     app.selected_evidence_ui.selected_evidence = ready_selected_evidence_state(&content);
-    app.pcsx2_launch_profiles =
+    app.emulator_readiness.pcsx2_launch_profiles =
         Pcsx2LaunchProfilesState::Ready(Pcsx2LaunchProfilesReady { discovery, roots });
 
     // An installed BIOS alone is never enough: absent authoritative records
     // must surface as non-verified firmware and therefore never strict Ready.
-    app.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(Vec::new());
+    app.emulator_readiness.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(Vec::new());
     let live = match &app.state {
         LoadState::Ready(data) => Some(data.as_ref()),
         _ => None,
@@ -4362,7 +4362,7 @@ fn selected_page_pcsx2_readiness_requires_matching_firmware_evidence_and_threads
         sha1: "a9993e364706816aba3e25717850c26c9cd0d89d".to_string(),
         dat_version: Some("test-revision".to_string()),
     };
-    app.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(vec![evidence.clone()]);
+    app.emulator_readiness.pcsx2_firmware_evidence = Pcsx2FirmwareEvidenceState::Ready(vec![evidence.clone()]);
     let live = match &app.state {
         LoadState::Ready(data) => Some(data.as_ref()),
         _ => None,

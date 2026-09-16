@@ -546,7 +546,7 @@ fn app_with_cheats_mods_context() -> ArchiveFsApp {
     }
     app.archive_context.focused = Some(PathBuf::from("/roms/a.zip"));
     app.archive_context.selected = [PathBuf::from("/roms/a.zip")].into_iter().collect();
-    app.retroarch_profiles =
+    app.emulator_readiness.retroarch_profiles =
         RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
     app.cheat_workflow = Some(CheatWorkflowState {
         archive_path: PathBuf::from("/roms/a.zip"),
@@ -712,7 +712,7 @@ fn dolphin_workflow_with_matched_identity(
         game_settings_state: DolphinSettingsDirectoryState::Missing,
         ..dolphin_profile_fixture()
     };
-    app.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
+    app.emulator_readiness.dolphin_profiles = DolphinProfilesState::Ready(DolphinProfileDiscovery {
         profiles: vec![profile],
         warnings: Vec::new(),
         complete: true,
@@ -850,7 +850,7 @@ fn render_dolphin_workflow(app: &mut ArchiveFsApp) -> egui::FullOutput {
     ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let workflow = app.cheat_workflow.as_mut().unwrap();
-            let _ = show_dolphin_workflow(ui, workflow, &app.dolphin_profiles, &mut clipboard);
+            let _ = show_dolphin_workflow(ui, workflow, &app.emulator_readiness.dolphin_profiles, &mut clipboard);
         });
     })
 }
@@ -1063,24 +1063,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         shared_rollback: SharedRollbackState::Idle,
         onboarding_state: onboarding::OnboardingState::NotStarted,
         onboarding_auto_open_checked: false,
-        retroarch_profiles: RetroArchProfilesState::NotScanned,
-        retroarch_core_directory_override: None,
-        retroarch_core_folder_rejected_pick: None,
-        emulator_setup_focus: None,
-        emulator_setup_page: emulator_setup_page::EmulatorSetupPageState::default(),
-        emulator_inventory_page: emulator_inventory_page::EmulatorInventoryPageState::default(),
-        bios_projection_page: bios_projection_page::BiosProjectionPageState::default(),
-        ready_to_play_page: ready_to_play_page::ReadyToPlayPageState::default(),
-        emulator_setup_overrides: emulator_setup_overrides::EmulatorPathOverrides::default(),
+        emulator_readiness: EmulatorReadinessState::default(),
         tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
-        pcsx2_profiles: Pcsx2ProfilesState::NotScanned,
-        dolphin_profiles: DolphinProfilesState::NotScanned,
-        dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
-        pcsx2_launch_profiles: Pcsx2LaunchProfilesState::NotScanned,
-        flycast_profiles: FlycastProfilesState::NotScanned,
-        pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
-        xenia_profiles: XeniaProfilesState::NotScanned,
-        remembered_emulator_profiles: Vec::new(),
         cheat_workflow: None,
         dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
         launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
@@ -1143,11 +1127,6 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         }),
         romm_ui: RommUiState::default(),
         selected_evidence_ui: SelectedEvidenceUiState::default(),
-        rpcs3_status: rpcs3_page::Rpcs3State::Idle,
-        rpcs3_status_generation: 0,
-        pcsx2_status: pcsx2_page::Pcsx2StatusState::Idle,
-        pcsx2_status_generation: 0,
-        pcsx2_status_archive_path: None,
         sources_add_dialog: None,
         gamer_view_pending_first_scan: None,
         gamer_view_scan_review_available: false,

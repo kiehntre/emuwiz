@@ -240,7 +240,7 @@ impl ArchiveFsApp {
         self.archive_context.select_only(archive_path);
         self.ui_mode = GuiMode::AdvancedView;
         save_gui_mode(self.ui_mode);
-        self.emulator_setup_focus = Some(focus);
+        self.emulator_readiness.emulator_setup_focus = Some(focus);
         self.navigate_to_main_view(MainView::EmulatorSetup);
     }
 
@@ -275,24 +275,24 @@ impl ArchiveFsApp {
         }
         self.maybe_start_selected_evidence_enrichment(context);
         if matches!(
-            self.dolphin_local_profiles,
+            self.emulator_readiness.dolphin_local_profiles,
             DolphinLocalProfilesState::NotScanned
         ) {
             self.start_dolphin_local_profile_scan(context.clone());
         }
         if matches!(
-            self.pcsx2_launch_profiles,
+            self.emulator_readiness.pcsx2_launch_profiles,
             Pcsx2LaunchProfilesState::NotScanned
         ) {
             self.start_pcsx2_launch_profile_scan(context.clone());
         }
         if matches!(
-            self.pcsx2_firmware_evidence,
+            self.emulator_readiness.pcsx2_firmware_evidence,
             Pcsx2FirmwareEvidenceState::NotLoaded
         ) {
             self.start_pcsx2_firmware_evidence_load(context.clone());
         }
-        if matches!(self.flycast_profiles, FlycastProfilesState::NotScanned) {
+        if matches!(self.emulator_readiness.flycast_profiles, FlycastProfilesState::NotScanned) {
             self.start_flycast_profile_scan(context.clone());
         }
         if matches!(
@@ -311,7 +311,7 @@ impl ArchiveFsApp {
             SelectedPageViewState {
                 selected_archive: self.archive_context.focused.as_deref(),
                 selected_count: self.archive_context.selected.len(),
-                retroarch_profiles: &self.retroarch_profiles,
+                retroarch_profiles: &self.emulator_readiness.retroarch_profiles,
                 busy: archive_actions_blocked,
                 block_reason: archive_action_block_reason,
             },
@@ -349,7 +349,7 @@ impl ArchiveFsApp {
         let scummvm_candidate_count = live_for_launch_readiness
             .map(|data| identity_sources_page::scummvm_candidates_from_rows(&data.rows).len())
             .unwrap_or(0);
-        match &self.flycast_profiles {
+        match &self.emulator_readiness.flycast_profiles {
             FlycastProfilesState::Scanning { .. } => {
                 ui.label("Checking Flycast installation and Dreamcast BIOS readiness…");
             }
@@ -424,7 +424,7 @@ impl ArchiveFsApp {
             ui,
             self.ui_mode == GuiMode::AdvancedView,
             None,
-            &self.rpcs3_status,
+            &self.emulator_readiness.rpcs3_status,
         );
         self.handle_rpcs3_action(context, rpcs3_action);
         ui.add_space(crate::ui::theme::SECTION_GAP);
@@ -439,7 +439,7 @@ impl ArchiveFsApp {
             ui,
             self.ui_mode == GuiMode::AdvancedView,
             verified_ps2_serial.as_deref(),
-            &self.pcsx2_status,
+            &self.emulator_readiness.pcsx2_status,
         );
         self.handle_pcsx2_action(context, pcsx2_action);
         Some(action).flatten()

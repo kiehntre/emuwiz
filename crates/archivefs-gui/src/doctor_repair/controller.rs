@@ -15,7 +15,7 @@ impl ArchiveFsApp {
     pub(crate) fn start_doctor_scan(&mut self, context: egui::Context) {
         let generation = self.doctor_scan_generation.next();
         self.doctor_scan_generation = generation;
-        let emulator_overrides = self.emulator_setup_overrides.clone();
+        let emulator_overrides = self.emulator_readiness.emulator_setup_overrides.clone();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let _ = sender.send((generation, gather_doctor_inputs(&emulator_overrides)));
@@ -125,7 +125,7 @@ impl ArchiveFsApp {
                 "The library has not finished loading, so the archive-scan and mount-status checks were not available.",
             ),
         };
-        let retroarch = match &self.retroarch_profiles {
+        let retroarch = match &self.emulator_readiness.retroarch_profiles {
             RetroArchProfilesState::Ready(discovery) => Gathered::Ready(&discovery.environment),
             RetroArchProfilesState::Error(message) => Gathered::Failed(message.clone()),
             RetroArchProfilesState::NotScanned | RetroArchProfilesState::Scanning { .. } => {

@@ -204,15 +204,15 @@ fn selected_still_triggers_dolphin_pcsx2_profile_and_firmware_scans() {
     app.ui_mode = GuiMode::AdvancedView;
     app.view = MainView::Selected;
     assert!(matches!(
-        app.dolphin_local_profiles,
+        app.emulator_readiness.dolphin_local_profiles,
         DolphinLocalProfilesState::NotScanned
     ));
     assert!(matches!(
-        app.pcsx2_launch_profiles,
+        app.emulator_readiness.pcsx2_launch_profiles,
         Pcsx2LaunchProfilesState::NotScanned
     ));
     assert!(matches!(
-        app.pcsx2_firmware_evidence,
+        app.emulator_readiness.pcsx2_firmware_evidence,
         Pcsx2FirmwareEvidenceState::NotLoaded
     ));
 
@@ -220,21 +220,21 @@ fn selected_still_triggers_dolphin_pcsx2_profile_and_firmware_scans() {
 
     assert!(
         matches!(
-            app.dolphin_local_profiles,
+            app.emulator_readiness.dolphin_local_profiles,
             DolphinLocalProfilesState::Scanning { .. }
         ),
         "visiting Selected must still start the Dolphin profile scan"
     );
     assert!(
         matches!(
-            app.pcsx2_launch_profiles,
+            app.emulator_readiness.pcsx2_launch_profiles,
             Pcsx2LaunchProfilesState::Scanning { .. }
         ),
         "visiting Selected must still start the PCSX2 profile scan"
     );
     assert!(
         matches!(
-            app.pcsx2_firmware_evidence,
+            app.emulator_readiness.pcsx2_firmware_evidence,
             Pcsx2FirmwareEvidenceState::Loading { .. }
         ),
         "visiting Selected must still start loading PCSX2 firmware evidence"
