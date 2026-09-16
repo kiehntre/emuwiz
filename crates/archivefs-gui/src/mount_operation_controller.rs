@@ -475,3 +475,17 @@ pub(crate) fn cleanup_completed_message(mount_path: &Path, removed_count: usize)
         if removed_count == 1 { "y" } else { "ies" }
     )
 }
+
+pub(crate) const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "EmuWiz could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
+
+pub(crate) const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
+
+pub(crate) const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
+
+pub(crate) const LAZY_UNMOUNT_SUCCESS: &str = "Lazy unmount completed.\n\nThe mount is no longer visible. Some applications may still hold references to files that were open before the unmount. Close and reopen those applications before remounting.";
+
+pub(crate) const LAZY_CLEANUP_SUCCESS: &str = "Empty mount directories were cleaned safely.";
+
+pub(crate) const LAZY_CLEANUP_FAILURE: &str = "The mount was detached successfully, but EmuWiz could not remove one or more empty directories. No non-empty directory was removed.";
+
+pub(crate) const REMOUNT_GUIDANCE: &str = "Make sure applications that used the previous mount have been closed. Remounting while an application still holds the old mount may cause confusing or stale file access.";

@@ -468,14 +468,6 @@ fn responsive_card_columns(
 }
 
 const SEARCH_FILTER_TEXT_EDIT_ID: &str = "archivefs_library_search_filter";
-const NORMAL_UNMOUNT_FAILURE_SUMMARY: &str = "EmuWiz could not unmount this archive normally.\n\nA program may still be using files from this mount, or this may indicate that the mount is not responding correctly.";
-const NORMAL_UNMOUNT_RECOVERY_GUIDANCE: &str = "Before using Lazy Unmount:\n\n1. Close any emulator, file manager, terminal, media player, or other application that may be using this mount.\n2. Wait a few seconds.\n3. Try Normal Unmount again.\n\nUse Lazy Unmount only when the mount will not release normally.";
-const LAZY_UNMOUNT_WARNING: &str = "Lazy Unmount removes the mount from the visible filesystem immediately, even if a program still has files open.\n\nThis can interrupt applications using the mount and may cause unsaved work or incomplete file operations to be lost.\n\nClose applications using this mount before continuing.\n\nUse this only when Normal Unmount repeatedly fails.";
-const LAZY_UNMOUNT_SUCCESS: &str = "Lazy unmount completed.\n\nThe mount is no longer visible. Some applications may still hold references to files that were open before the unmount. Close and reopen those applications before remounting.";
-const LAZY_CLEANUP_SUCCESS: &str = "Empty mount directories were cleaned safely.";
-const LAZY_CLEANUP_FAILURE: &str = "The mount was detached successfully, but EmuWiz could not remove one or more empty directories. No non-empty directory was removed.";
-const REMOUNT_GUIDANCE: &str = "Make sure applications that used the previous mount have been closed. Remounting while an application still holds the old mount may cause confusing or stale file access.";
-
 fn gui_version_line() -> String {
     format!("emuwiz {}", env!("CARGO_PKG_VERSION"))
 }
@@ -1191,10 +1183,12 @@ use live_library_controller::{
     LiveLibraryPoll, LoadMessage, LoadResult, LoadState, poll_load, start_load,
 };
 use mount_operation_controller::{
-    ArchiveAction, CleanupOutcome, OperationFailure, OperationProgress, OperationRequest,
-    OperationResult, OperationSuccess, RunningOperation, cleanup_completed_message,
-    perform_archive_action, record_cleanup_finished_activity, record_cleanup_started_activity,
-    run_unmount_with_cleanup,
+    ArchiveAction, CleanupOutcome, LAZY_CLEANUP_FAILURE, LAZY_CLEANUP_SUCCESS,
+    LAZY_UNMOUNT_SUCCESS, LAZY_UNMOUNT_WARNING, NORMAL_UNMOUNT_FAILURE_SUMMARY,
+    NORMAL_UNMOUNT_RECOVERY_GUIDANCE, OperationFailure, OperationProgress, OperationRequest,
+    OperationResult, OperationSuccess, REMOUNT_GUIDANCE, RunningOperation,
+    cleanup_completed_message, perform_archive_action, record_cleanup_finished_activity,
+    record_cleanup_started_activity, run_unmount_with_cleanup,
 };
 use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
