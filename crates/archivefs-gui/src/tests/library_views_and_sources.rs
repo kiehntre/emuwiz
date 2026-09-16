@@ -40,9 +40,9 @@ fn gamer_add_success_queues_the_existing_scan_one_action_for_the_exact_folder() 
 fn gamer_add_failure_clears_pending_scan_and_keeps_backend_error_in_details() {
     let mut app = app_for_operation_tests();
     let games = PathBuf::from("/games/first-folder");
-    app.gamer_view_pending_first_scan = Some(games.clone());
+    app.sources_ui.gamer_view_pending_first_scan = Some(games.clone());
     let (sender, receiver) = mpsc::channel();
-    app.source_action = Some(RunningSourceAction {
+    app.sources_ui.source_action = Some(RunningSourceAction {
         action: SourceAction::Add(games),
         receiver,
         worker: None,
@@ -52,9 +52,9 @@ fn gamer_add_failure_clears_pending_scan_and_keeps_backend_error_in_details() {
 
     app.poll_source_action(&egui::Context::default());
 
-    assert!(app.source_action.is_none());
+    assert!(app.sources_ui.source_action.is_none());
     assert!(
-        app.gamer_view_pending_first_scan.is_none(),
+        app.sources_ui.gamer_view_pending_first_scan.is_none(),
         "a failed add must not leave any scan queued"
     );
     let feedback = app.feedback.as_ref().expect("visible failure feedback");
@@ -82,7 +82,7 @@ fn sources_page_scan_populates_the_sources_last_scan_banner_state() {
         scanning: false,
     };
     let (source_sender, source_receiver) = mpsc::channel();
-    app.source_action = Some(RunningSourceAction {
+    app.sources_ui.source_action = Some(RunningSourceAction {
         action: SourceAction::ScanOne(PathBuf::from("/roms/c128")),
         receiver: source_receiver,
         worker: None,
@@ -102,6 +102,7 @@ fn sources_page_scan_populates_the_sources_last_scan_banner_state() {
     app.poll_source_action(&egui::Context::default());
 
     let last_scan = app
+        .sources_ui
         .sources_last_scan
         .as_ref()
         .expect("expected sources_last_scan to be populated");
@@ -126,7 +127,7 @@ fn sources_page_scan_all_enabled_populates_the_all_enabled_scope() {
         scanning: false,
     };
     let (source_sender, source_receiver) = mpsc::channel();
-    app.source_action = Some(RunningSourceAction {
+    app.sources_ui.source_action = Some(RunningSourceAction {
         action: SourceAction::ScanAll,
         receiver: source_receiver,
         worker: None,
@@ -139,7 +140,7 @@ fn sources_page_scan_all_enabled_populates_the_all_enabled_scope() {
     app.poll_source_action(&egui::Context::default());
 
     assert_eq!(
-        app.sources_last_scan
+        app.sources_ui.sources_last_scan
             .as_ref()
             .map(|last_scan| &last_scan.scope),
         Some(&SourcesScanScope::AllEnabled)
@@ -158,7 +159,7 @@ fn sources_page_scan_result_inspect_reuses_the_shared_skipped_files_window() {
     // tested when a full `ctx.run` click simulation would be more
     // fragile than informative.
     let mut app = app_for_operation_tests();
-    app.sources_last_scan = Some(SourcesLastScan {
+    app.sources_ui.sources_last_scan = Some(SourcesLastScan {
         scope: SourcesScanScope::One(PathBuf::from("/roms")),
         archives_found: 5,
         skipped_total: 1,
@@ -687,14 +688,14 @@ fn sources_page_actions_are_reachable_via_real_clicks() {
 fn sources_dialog_state_survives_navigating_away_and_back() {
     let mut app = app_for_operation_tests();
     app.view = MainView::Sources;
-    app.sources_add_dialog = Some(SourcesAddDialogState::default());
+    app.sources_ui.sources_add_dialog = Some(SourcesAddDialogState::default());
 
     app.view = MainView::Settings;
     app.reconcile_library_tab();
     app.view = MainView::Sources;
 
     assert!(
-        app.sources_add_dialog.is_some(),
+        app.sources_ui.sources_add_dialog.is_some(),
         "navigating away from Sources and back must not discard an in-progress Add Folder dialog"
     );
 }
@@ -958,7 +959,7 @@ fn source_action_available_requires_no_running_action_or_database_load() {
     assert!(app.source_action_available());
 
     let (_sender, receiver) = mpsc::channel();
-    app.source_action = Some(RunningSourceAction {
+    app.sources_ui.source_action = Some(RunningSourceAction {
         action: SourceAction::ScanAll,
         receiver,
         worker: None,
@@ -970,7 +971,7 @@ fn source_action_available_requires_no_running_action_or_database_load() {
     assert!(!app.alias_action_available());
     assert!(!app.platform_action_available());
     assert!(!app.missing_removal_action_available());
-    app.source_action = None;
+    app.sources_ui.source_action = None;
 
     let (_sender, receiver) = mpsc::channel();
     app.database_state = DatabaseState::Loading {
@@ -987,12 +988,12 @@ fn source_action_available_requires_no_running_action_or_database_load() {
 fn start_source_action_does_not_start_a_second_concurrent_action() {
     let mut app = app_for_operation_tests();
     let (_sender, receiver) = mpsc::channel();
-    app.source_action = Some(RunningSourceAction {
+    app.sources_ui.source_action = Some(RunningSourceAction {
         action: SourceAction::ScanAll,
         receiver,
         worker: None,
     });
-    let first_action = app.source_action.as_ref().unwrap().action.clone();
+    let first_action = app.sources_ui.source_action.as_ref().unwrap().action.clone();
 
     // Seed the running action directly: calling start_source_action
     // here would launch the production ScanAll worker against the
@@ -1001,7 +1002,7 @@ fn start_source_action_does_not_start_a_second_concurrent_action() {
         egui::Context::default(),
         SourceAction::Add(PathBuf::from("/mnt/games/roms")),
     );
-    assert_eq!(app.source_action.as_ref().unwrap().action, first_action);
+    assert_eq!(app.sources_ui.source_action.as_ref().unwrap().action, first_action);
 }
 
 #[test]
@@ -3925,12 +3926,12 @@ fn sources_dats_tab_still_renders_dat_controls() {
     // state) - the same `load_with_transaction_dir` seam
     // `dat_sources_page::tests`'s own `Fixture` already uses for exactly
     // this reason. Without this, `show_dat_sources_page_mode`'s
-    // `if self.dat_sources_page.is_none()` branch calls the real `load`
+    // `if self.sources_ui.dat_sources_page.is_none()` branch calls the real `load`
     // on first render.
     let temp = tempfile::tempdir().unwrap();
     let journal = temp.path().join("journal");
     std::fs::create_dir_all(&journal).unwrap();
-    app.dat_sources_page = Some(
+    app.sources_ui.dat_sources_page = Some(
         dat_sources_page::DatSourcesPageState::load_with_transaction_dir(
             temp.path().join("dat_sources.toml"),
             Vec::new(),

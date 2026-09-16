@@ -15,7 +15,7 @@ impl ArchiveFsApp {
             && self.library_ui.bulk_platform_action.is_none()
             && self.library_ui.alias_action.is_none()
             && self.library_ui.missing_removal.is_none()
-            && self.source_action.is_none()
+            && self.sources_ui.source_action.is_none()
             && self.library_view_action.is_none()
             && !self.database_state.is_loading()
     }
@@ -259,7 +259,7 @@ impl ArchiveFsApp {
             && self.library_ui.platform_action.is_none()
             && self.library_ui.bulk_platform_action.is_none()
             && self.library_ui.missing_removal.is_none()
-            && self.source_action.is_none()
+            && self.sources_ui.source_action.is_none()
             && self.library_view_action.is_none()
             && !self.database_state.is_loading()
     }
@@ -370,7 +370,7 @@ impl ArchiveFsApp {
     /// already running (and vice versa via the other `*_available`
     /// checks, once updated).
     pub(crate) fn source_action_available(&self) -> bool {
-        self.source_action.is_none()
+        self.sources_ui.source_action.is_none()
             && self.library_ui.alias_action.is_none()
             && self.library_ui.platform_action.is_none()
             && self.library_ui.bulk_platform_action.is_none()
@@ -390,7 +390,7 @@ impl ArchiveFsApp {
             ActivityOutcome::Started,
             source_action_started_message(&action),
         ));
-        self.source_action = Some(RunningSourceAction {
+        self.sources_ui.source_action = Some(RunningSourceAction {
             action: action.clone(),
             receiver,
             worker: None,
@@ -400,7 +400,7 @@ impl ArchiveFsApp {
             let _ = sender.send(result);
             context.request_repaint();
         });
-        self.source_action.as_mut().unwrap().worker = Some(worker);
+        self.sources_ui.source_action.as_mut().unwrap().worker = Some(worker);
     }
 
     /// Mirrors `poll_alias_action`: on success, refreshes only the cached
@@ -411,7 +411,7 @@ impl ArchiveFsApp {
     /// snapshot's pointer identity, and a source action always produces a
     /// new snapshot `Box`).
     pub(crate) fn poll_source_action(&mut self, context: &egui::Context) {
-        let result = self.source_action.as_ref().and_then(|running| {
+        let result = self.sources_ui.source_action.as_ref().and_then(|running| {
             running
                 .receiver
                 .try_recv()
@@ -422,6 +422,7 @@ impl ArchiveFsApp {
             return;
         };
         let worker = self
+            .sources_ui
             .source_action
             .take()
             .and_then(|mut running| running.worker.take());
@@ -431,7 +432,7 @@ impl ArchiveFsApp {
         let log_category = source_action_log_category(&action);
         let path = source_action_path(&action);
         let gamer_scan_pending =
-            self.gamer_view_scan_pending_review || self.gamer_view_pending_first_scan.is_some();
+            self.gamer_view_scan_pending_review || self.sources_ui.gamer_view_pending_first_scan.is_some();
         match result {
             Ok(outcome) => {
                 let message = source_action_success_message(&outcome);
@@ -458,7 +459,7 @@ impl ArchiveFsApp {
                     more_information: None,
                 });
                 if matches!(outcome, SourceActionOutcome::Added(_)) {
-                    self.sources_add_dialog = None;
+                    self.sources_ui.sources_add_dialog = None;
                 }
                 // Gamer View's "Add games" chains straight into a scan of
                 // the exact folder just added - see
@@ -476,7 +477,7 @@ impl ArchiveFsApp {
                 // "Scan complete: N source(s)... N archive(s)...".
                 if let SourceActionOutcome::Added(added) = &outcome
                     && let Some(scan_action) = gamer_first_scan_after_add(
-                        self.gamer_view_pending_first_scan.as_deref(),
+                        self.sources_ui.gamer_view_pending_first_scan.as_deref(),
                         added,
                     )
                 {
@@ -491,7 +492,7 @@ impl ArchiveFsApp {
                 } else if let SourceActionOutcome::Scanned(summary) = &outcome
                     && gamer_scan_pending
                 {
-                    self.gamer_view_pending_first_scan = None;
+                    self.sources_ui.gamer_view_pending_first_scan = None;
                     self.gamer_view_scan_pending_review = false;
                     self.gamer_view_scan_review_available = gamer_view_scan_needs_review(summary);
                     self.feedback = Some(ActionFeedback {
@@ -503,7 +504,7 @@ impl ArchiveFsApp {
                     });
                 }
                 if matches!(action, SourceAction::Remove { .. }) {
-                    self.sources_remove_dialog = None;
+                    self.sources_ui.sources_remove_dialog = None;
                 }
                 // Carry this scan's skip detail into the plain snapshot
                 // reload triggered below, so Database Status -> Skipped
@@ -511,7 +512,7 @@ impl ArchiveFsApp {
                 // Database Status -> Scan library run. Any other source
                 // action clears it, so a stale summary can never attach to
                 // an unrelated later reload.
-                self.pending_source_scan_summary = match &outcome {
+                self.sources_ui.pending_source_scan_summary = match &outcome {
                     SourceActionOutcome::Scanned(summary) => Some(summary.clone()),
                     _ => None,
                 };
@@ -522,7 +523,7 @@ impl ArchiveFsApp {
                         }
                         _ => SourcesScanScope::AllEnabled,
                     };
-                    self.sources_last_scan = Some(SourcesLastScan {
+                    self.sources_ui.sources_last_scan = Some(SourcesLastScan {
                         scope,
                         archives_found: summary.counts.archives_seen,
                         skipped_total: summary.skipped_files_total(),
@@ -535,7 +536,7 @@ impl ArchiveFsApp {
                 let gamer_add_failed = matches!(
                     &action,
                     SourceAction::Add(candidate)
-                        if self.gamer_view_pending_first_scan.as_deref()
+                        if self.sources_ui.gamer_view_pending_first_scan.as_deref()
                             == Some(candidate.as_path())
                 );
                 if self.gamer_view_scan_pending_review {
@@ -545,7 +546,7 @@ impl ArchiveFsApp {
                     // A failed add must never leave a stale pending path that
                     // could relabel a later unrelated scan as this folder's
                     // first scan. No scan is queued from the error branch.
-                    self.gamer_view_pending_first_scan = None;
+                    self.sources_ui.gamer_view_pending_first_scan = None;
                 }
                 self.history.record(HistoryEntry::new(
                     log_category,

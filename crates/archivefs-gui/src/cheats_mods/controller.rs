@@ -2,10 +2,10 @@ use crate::*;
 
 impl ArchiveFsApp {
     pub(crate) fn show_cheat_sources_page(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
-        if self.cheat_sources_page.is_none() {
+        if self.sources_ui.cheat_sources_page.is_none() {
             match archivefs_core::patch_manager::default_cheat_sources_config_path() {
                 Ok(path) => {
-                    self.cheat_sources_page =
+                    self.sources_ui.cheat_sources_page =
                         Some(cheat_sources_page::CheatSourcesPageState::load(
                             path,
                             archivefs_core::patch_manager::default_cheat_source_data_root(),
@@ -26,14 +26,14 @@ impl ArchiveFsApp {
             }
         }
 
-        let Some(page) = self.cheat_sources_page.as_mut() else {
+        let Some(page) = self.sources_ui.cheat_sources_page.as_mut() else {
             return;
         };
         let view = page.view();
         let action = cheat_sources_page::show_cheat_sources_page(
             ui,
             &view,
-            &mut self.cheat_sources_ui,
+            &mut self.sources_ui.cheat_sources_ui,
             self.ui_mode == GuiMode::GamerView,
         );
         if let Some(action) = action {
@@ -41,7 +41,7 @@ impl ArchiveFsApp {
             // leaving a typed priority behind after "Discard changes" would
             // show a value that is no longer anywhere in the state.
             if matches!(action, cheat_sources_page::CheatSourcesPageAction::Revert) {
-                self.cheat_sources_ui.clear();
+                self.sources_ui.cheat_sources_ui.clear();
             }
             page.apply(action);
         }

@@ -246,7 +246,7 @@ impl ArchiveFsApp {
                 item.provenance = "Current non-stale LibraryRepairPlan".into();
                 snapshot.insert(item);
             }
-            if let Some(Ok(data)) = &self.dat_authority.data {
+            if let Some(Ok(data)) = &self.sources_ui.dat_authority.data {
                 append_dat_attention(&mut snapshot, data);
                 snapshot.source_rows += (data.collections.len() + data.authorities.len()) as u64;
             }

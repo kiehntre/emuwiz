@@ -1329,7 +1329,7 @@ fn drive_sources_scan_through_to_ready(
     };
 
     let (source_sender, source_receiver) = mpsc::channel();
-    app.source_action = Some(RunningSourceAction {
+    app.sources_ui.source_action = Some(RunningSourceAction {
         action: SourceAction::ScanAll,
         receiver: source_receiver,
         worker: None,
@@ -1378,7 +1378,7 @@ fn sources_page_scan_with_skipped_files_populates_last_scan_summary() {
     }
     // Consumed exactly once: it must never leak into a later, unrelated
     // reload.
-    assert!(app.pending_source_scan_summary.is_none());
+    assert!(app.sources_ui.pending_source_scan_summary.is_none());
 }
 
 #[test]
@@ -1460,7 +1460,7 @@ fn plain_reloads_unrelated_to_a_sources_scan_still_leave_last_scan_summary_none(
         previous: None,
         scanning: false,
     };
-    assert!(app.pending_source_scan_summary.is_none());
+    assert!(app.sources_ui.pending_source_scan_summary.is_none());
     let snapshot = cached_snapshot(Vec::new());
     sender
         .send((generation, Ok(DatabaseOutcome::Loaded(snapshot))))
@@ -1485,7 +1485,7 @@ fn the_database_status_scan_library_path_still_populates_last_scan_summary_direc
     let mut app = app_for_operation_tests();
     let generation = DatabaseGeneration::INITIAL.next();
     app.database_generation = generation;
-    app.pending_source_scan_summary = None;
+    app.sources_ui.pending_source_scan_summary = None;
     let (sender, receiver) = mpsc::channel::<DatabaseMessage>();
     app.database_state = DatabaseState::Loading {
         generation,

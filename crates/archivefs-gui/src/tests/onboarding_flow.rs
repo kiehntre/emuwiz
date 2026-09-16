@@ -155,7 +155,7 @@ fn the_dat_step_count_matches_the_real_dat_sources_page_count_never_a_duplicate_
     // `dat_sources_page` is deliberately left unloaded by the shared
     // fixture (matches its own doc comment) - the count must reflect that
     // truthfully as 0, never a fabricated "not configured" vs "0" split.
-    assert!(app.dat_sources_page.is_none());
+    assert!(app.sources_ui.dat_sources_page.is_none());
     assert_eq!(app.onboarding_dat_source_count(), 0);
 }
 
@@ -179,7 +179,7 @@ fn run_again_resets_only_onboarding_progress_and_touches_nothing_else() {
     let mut app = app_for_operation_tests();
     app.doctor_repair.onboarding_state = onboarding::OnboardingState::Completed;
     let source_folders_before = app.gui_config.source_roots().map(<[_]>::to_vec);
-    let dat_page_was_none_before = app.dat_sources_page.is_none();
+    let dat_page_was_none_before = app.sources_ui.dat_sources_page.is_none();
 
     app.restart_onboarding();
 
@@ -195,7 +195,7 @@ fn run_again_resets_only_onboarding_progress_and_touches_nothing_else() {
         "run-again must never mutate configured source folders"
     );
     assert_eq!(
-        app.dat_sources_page.is_none(),
+        app.sources_ui.dat_sources_page.is_none(),
         dat_page_was_none_before,
         "run-again must never mutate DAT source registration state"
     );

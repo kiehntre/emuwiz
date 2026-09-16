@@ -195,6 +195,7 @@ mod library_ui_state;
 use library_ui_state::LibraryUiState;
 mod database_load;
 mod doctor_repair_state;
+mod sources_ui_state;
 mod live_library_controller;
 mod setup_controller;
 #[allow(unused_imports)]
@@ -1192,6 +1193,7 @@ use mount_operation_controller::{
 };
 use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
+use sources_ui_state::SourcesUiState;
 
 #[derive(Debug)]
 enum BsFreeManagerState {
@@ -2014,7 +2016,6 @@ struct ArchiveFsApp {
     /// The Cheat Sources page, loaded lazily the first time it is opened so
     /// that starting the GUI never reads the preferences file for a page the
     /// user has not visited.
-    cheat_sources_page: Option<cheat_sources_page::CheatSourcesPageState>,
     /// Read-only review of core-produced duplicate/conflict reports.
     cheat_reconciliation_review: cheat_reconciliation_review::CheatReconciliationReviewState,
     /// The browse-only CheatBase panel embedded in Cheats & Mods. Its setup,
@@ -2048,16 +2049,11 @@ struct ArchiveFsApp {
     /// Unsubmitted Cheat Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy - see
     /// `CheatSourcesPageUi`.
-    cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi,
     /// The DAT Sources page, loaded lazily on first visit for the same reason
     /// Cheat Sources is: starting the GUI should not read a registry file for
     /// a page nobody has opened.
-    dat_sources_page: Option<dat_sources_page::DatSourcesPageState>,
-    media_sets_page: media_sets_page::MediaSetsPageState,
-    quick_rename_mode: bool,
     /// Unsubmitted DAT Sources text and disclosure state. Held here rather
     /// than in the page state because none of it is policy.
-    dat_sources_ui: dat_sources_page::DatSourcesPageUi,
     /// The finding whose evidence panel is open, by stable finding id.
 
     /// The repair awaiting confirmation, if any.
@@ -2075,7 +2071,6 @@ struct ArchiveFsApp {
     database_state: DatabaseState,
     database_generation: DatabaseGeneration,
     needs_attention: needs_attention::AttentionWorkspace,
-    dat_authority: dat_authority_dashboard::DashboardState,
     /// A `ScanPersistSummary` from a just-completed Sources-page scan
     /// (`SourceActionOutcome::Scanned`), waiting to be carried into the
     /// `DatabaseState::Ready.last_scan_summary` produced by the plain
@@ -2084,12 +2079,10 @@ struct ArchiveFsApp {
     /// its own). Consumed (taken) by the very next `poll_database_load`
     /// completion regardless of its outcome, so a summary can never attach
     /// to an unrelated, later reload.
-    pending_source_scan_summary: Option<ScanPersistSummary>,
     /// The Sources page's persistent echo of its most recent scan result
     /// (see [`SourcesLastScan`]) - unlike `pending_source_scan_summary`
     /// above, this is never consumed/cleared by a reload; it stays visible
     /// on the Sources page until superseded by a newer Sources-page scan.
-    sources_last_scan: Option<SourcesLastScan>,
     health_duplicate_ui: HealthDuplicateUiState,
     /// The real OS clipboard backing every text field's context menu -
     /// see `NativeClipboard`'s doc comment for why this is kept for the
@@ -2138,15 +2131,12 @@ struct ArchiveFsApp {
     /// The Sources page's currently running background action, if any -
     /// mirrors `alias_action` exactly, including the "one writer at a
     /// time" convention `source_action_available` enforces.
-    source_action: Option<RunningSourceAction>,
     /// A folder picked for the temporary preparation root but not yet
     /// applied. Picking or cancelling never writes config.toml.
-    mount_root_draft: Option<PathBuf>,
     /// The visible outcome of the most recent "Apply folder" for the
     /// temporary preparation root, rendered in the Sources -> Libraries
     /// mount-root card. Set from the background `SetupAction::SetMountRoot`
     /// result; cleared when a new apply starts.
-    mount_root_feedback: Option<sources_page::MountRootFeedback>,
     catalogue_bsfree_ui: CatalogueBsFreeUiState,
     /// Loaded once for GUI use. RomM rendering and cached browsing borrow this
     /// snapshot instead of reading `config.toml` on every frame.
@@ -2157,7 +2147,6 @@ struct ArchiveFsApp {
     selected_evidence_ui: SelectedEvidenceUiState,
     /// The "Add Folder" dialog's open/closed state and its own fields -
     /// see `SourcesAddDialogState`.
-    sources_add_dialog: Option<SourcesAddDialogState>,
     /// Set when Gamer View's first-run "Add games" action dispatches a
     /// `SourceAction::Add` for this exact path - so the resulting
     /// `SourceActionOutcome::Added` knows to immediately chain a
@@ -2167,7 +2156,6 @@ struct ArchiveFsApp {
     /// leaving a newly-added, never-scanned source silently empty. Cleared
     /// once the chained scan is started, so a normal Advanced View Sources
     /// page "Add" never chains an unwanted scan.
-    gamer_view_pending_first_scan: Option<PathBuf>,
     /// Set when a scan requested from Gamer View finishes with existing
     /// skipped/ambiguous/failed detail that the user can review in Sources ->
     /// Discovery. This is presentation state only; the scan itself is still
@@ -2179,7 +2167,7 @@ struct ArchiveFsApp {
     gamer_view_scan_pending_review: bool,
     /// The Remove-source confirmation dialog's open/closed state - see
     /// `SourcesRemoveDialogState`.
-    sources_remove_dialog: Option<SourcesRemoveDialogState>,
+    sources_ui: SourcesUiState,
     /// Every configured Library View - loaded at startup and refreshed
     /// after every add/edit/enable/disable/remove action completes (see
     /// `reload_library_views`). Independent of `database_state`'s cached
@@ -2401,10 +2389,6 @@ impl ArchiveFsApp {
             database_state: start_database_load(context.clone(), database_generation, None, false),
             database_generation,
             needs_attention: needs_attention::AttentionWorkspace::default(),
-            dat_authority: dat_authority_dashboard::DashboardState::default(),
-            pending_source_scan_summary: None,
-            sources_last_scan: None,
-            cheat_sources_page: None,
             cheat_reconciliation_review:
                 cheat_reconciliation_review::CheatReconciliationReviewState::default(),
             cheatbase_page: cheatbase_page::CheatBasePageState::default(),
@@ -2416,11 +2400,7 @@ impl ArchiveFsApp {
             exact_duplicate_review_page: None,
             optical_conversion_page: None,
             library_view_history_page: None,
-            cheat_sources_ui: cheat_sources_page::CheatSourcesPageUi::default(),
-            dat_sources_page: None,
-            media_sets_page: media_sets_page::MediaSetsPageState::default(),
-            quick_rename_mode: false,
-            dat_sources_ui: dat_sources_page::DatSourcesPageUi::default(),
+            sources_ui: SourcesUiState::default(),
             archive_context: ArchiveContext::default(),
             library_ui: LibraryUiState::default(),
             mount_ui: MountUiState::default(),
@@ -2462,18 +2442,12 @@ impl ArchiveFsApp {
             show_skipped_files: false,
             skipped_files_filter: None,
             select_all_visible_requested: false,
-            source_action: None,
-            mount_root_draft: None,
-            mount_root_feedback: None,
             catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
             gui_config,
             romm_ui: RommUiState::default(),
             selected_evidence_ui: SelectedEvidenceUiState::default(),
-            sources_add_dialog: None,
-            gamer_view_pending_first_scan: None,
             gamer_view_scan_review_available: false,
             gamer_view_scan_pending_review: false,
-            sources_remove_dialog: None,
             library_views: load_library_view_configs_default().unwrap_or_default(),
             library_view_action: None,
             library_view_last_plan: None,
@@ -2817,7 +2791,7 @@ impl ArchiveFsApp {
         // never invent a state transition - if this reload doesn't land in
         // `Ready`, there is no `last_scan_summary` to attach it to, so it
         // is simply dropped rather than held over).
-        let pending_source_scan_summary = self.pending_source_scan_summary.take();
+        let pending_source_scan_summary = self.sources_ui.pending_source_scan_summary.take();
         self.database_state = match result {
             Ok(DatabaseOutcome::Loaded(snapshot)) => DatabaseState::Ready {
                 snapshot: Box::new(snapshot),
@@ -3042,14 +3016,14 @@ impl ArchiveFsApp {
 
     fn start_setup_action(&mut self, context: egui::Context, action: SetupAction) {
         if self.is_busy()
-            || (matches!(&action, SetupAction::SetMountRoot(_)) && self.source_action.is_some())
+            || (matches!(&action, SetupAction::SetMountRoot(_)) && self.sources_ui.source_action.is_some())
         {
             return;
         }
         if matches!(&action, SetupAction::SetMountRoot(_)) {
             // The previous outcome is no longer current the moment a new
             // apply begins.
-            self.mount_root_feedback = None;
+            self.sources_ui.mount_root_feedback = None;
         }
         let started_message = match &action {
             SetupAction::CreateStarterConfig => "Creating starter config.",
@@ -3223,7 +3197,7 @@ impl ArchiveFsApp {
             );
             ui.add_space(theme::SECTION_GAP);
 
-            if let Some(last_scan) = &self.sources_last_scan
+            if let Some(last_scan) = &self.sources_ui.sources_last_scan
                 && show_sources_last_scan_banner(ui, last_scan)
             {
                 self.show_skipped_files = true;
@@ -3237,14 +3211,14 @@ impl ArchiveFsApp {
                 archives,
                 mount_root,
                 source_state.catalogue_available,
-                self.source_action.is_some(),
-                &mut self.mount_root_draft,
+                self.sources_ui.source_action.is_some(),
+                &mut self.sources_ui.mount_root_draft,
                 self.setup_action.is_some()
-                    || self.source_action.is_some()
+                    || self.sources_ui.source_action.is_some()
                     || self.database_state.is_loading(),
-                self.mount_root_feedback.as_ref(),
-                &mut self.sources_add_dialog,
-                &mut self.sources_remove_dialog,
+                self.sources_ui.mount_root_feedback.as_ref(),
+                &mut self.sources_ui.sources_add_dialog,
+                &mut self.sources_ui.sources_remove_dialog,
                 &mut self.clipboard,
             )
         });
@@ -3444,10 +3418,10 @@ impl ArchiveFsApp {
 
     fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
         if !identify_rename {
-            self.dat_authority
+            self.sources_ui.dat_authority
                 .show(ui, database_state_path(&self.database_state));
         }
-        if self.dat_sources_page.is_none() {
+        if self.sources_ui.dat_sources_page.is_none() {
             let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
                 Ok(path) => path,
                 Err(error) => {
@@ -3472,20 +3446,20 @@ impl ArchiveFsApp {
                 .as_ref()
                 .map(archivefs_core::safe_read::TrustedRoots::from_config)
                 .unwrap_or_else(archivefs_core::safe_read::TrustedRoots::none);
-            self.dat_sources_page = Some(
+            self.sources_ui.dat_sources_page = Some(
                 dat_sources_page::DatSourcesPageState::load(path, library_folders, trusted)
                     .with_database_path(database_state_path(&self.database_state)),
             );
         }
 
-        let Some(page) = self.dat_sources_page.as_mut() else {
+        let Some(page) = self.sources_ui.dat_sources_page.as_mut() else {
             return;
         };
         // Drained before the view is built, so the view stays a pure function
         // of state. A running job repaints continuously; an idle page does not.
         let dat_changed = page.poll();
         if dat_changed {
-            self.dat_authority.invalidate();
+            self.sources_ui.dat_authority.invalidate();
             self.needs_attention.invalidate();
         }
         if dat_changed || page.is_busy() {
@@ -3493,13 +3467,13 @@ impl ArchiveFsApp {
         }
         let view = page.view_with_romm_summary(self.romm_ui.verify_summary);
         let action = if identify_rename {
-            if self.quick_rename_mode {
-                dat_sources_page::show_quick_rename_page(ui, &view, &mut self.dat_sources_ui)
+            if self.sources_ui.quick_rename_mode {
+                dat_sources_page::show_quick_rename_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
             } else {
-                dat_sources_page::show_identify_rename_page(ui, &view, &mut self.dat_sources_ui)
+                dat_sources_page::show_identify_rename_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
             }
         } else {
-            dat_sources_page::show_dat_sources_page(ui, &view, &mut self.dat_sources_ui)
+            dat_sources_page::show_dat_sources_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
         };
         if let Some(action) = action {
             let open_dat_sources = matches!(
@@ -3510,17 +3484,17 @@ impl ArchiveFsApp {
                 action,
                 dat_sources_page::DatSourcesPageAction::OpenAdvancedIdentifyRename
             );
-            self.dat_authority.invalidate();
+            self.sources_ui.dat_authority.invalidate();
             self.needs_attention.invalidate();
             if matches!(action, dat_sources_page::DatSourcesPageAction::Revert) {
-                self.dat_sources_ui.clear();
+                self.sources_ui.dat_sources_ui.clear();
             }
             page.apply(action);
             if open_dat_sources {
-                self.quick_rename_mode = false;
+                self.sources_ui.quick_rename_mode = false;
                 self.view = MainView::DatSources;
             } else if open_advanced {
-                self.quick_rename_mode = false;
+                self.sources_ui.quick_rename_mode = false;
             }
         }
         // Surface apply/rollback outcomes into History & Logs, without private
@@ -3583,13 +3557,13 @@ impl ArchiveFsApp {
                         more_information: None,
                     });
                     if matches!(&action, SetupAction::SetMountRoot(_)) {
-                        self.mount_root_feedback = Some(sources_page::MountRootFeedback {
+                        self.sources_ui.mount_root_feedback = Some(sources_page::MountRootFeedback {
                             succeeded: true,
                             summary: message,
                             detail: None,
                             warning: reload_warning,
                         });
-                        self.mount_root_draft = None;
+                        self.sources_ui.mount_root_draft = None;
                         self.refresh(context);
                     } else if action != SetupAction::OpenConfigFolder {
                         self.refresh_diagnostics(context);
@@ -3615,7 +3589,7 @@ impl ArchiveFsApp {
                         message.clone(),
                     ));
                     if matches!(&action, SetupAction::SetMountRoot(_)) {
-                        self.mount_root_feedback = Some(sources_page::MountRootFeedback {
+                        self.sources_ui.mount_root_feedback = Some(sources_page::MountRootFeedback {
                             succeeded: false,
                             summary: feedback_message.clone(),
                             detail: Some(message.clone()),
@@ -3863,7 +3837,7 @@ impl ArchiveFsApp {
     /// (Preview/Apply reads the same database a scan writes to).
     fn library_view_action_available(&self) -> bool {
         self.library_view_action.is_none()
-            && self.source_action.is_none()
+            && self.sources_ui.source_action.is_none()
             && self.library_ui.alias_action.is_none()
             && self.library_ui.platform_action.is_none()
             && self.library_ui.bulk_platform_action.is_none()
@@ -4008,7 +3982,7 @@ impl ArchiveFsApp {
             && self.library_ui.platform_action.is_none()
             && self.library_ui.bulk_platform_action.is_none()
             && self.library_ui.alias_action.is_none()
-            && self.source_action.is_none()
+            && self.sources_ui.source_action.is_none()
             && self.library_view_action.is_none()
             && matches!(self.database_state, DatabaseState::Ready { .. })
     }
@@ -4033,7 +4007,7 @@ impl ArchiveFsApp {
                     || self.library_ui.platform_action.is_some()
                     || self.library_ui.bulk_platform_action.is_some()
                     || self.library_ui.alias_action.is_some()
-                    || self.source_action.is_some()
+                    || self.sources_ui.source_action.is_some()
                     || self.library_view_action.is_some()
                 {
                     Some("Another catalogue operation is currently running.".to_string())
@@ -4386,7 +4360,7 @@ impl Drop for ArchiveFsApp {
         {
             let _ = worker.join();
         }
-        if let Some(mut action) = self.source_action.take()
+        if let Some(mut action) = self.sources_ui.source_action.take()
             && let Some(worker) = action.worker.take()
         {
             let _ = worker.join();
@@ -4562,7 +4536,7 @@ impl ArchiveFsApp {
         }
         self.poll_load(context);
         self.poll_database_load(context);
-        if self.dat_authority.tick(
+        if self.sources_ui.dat_authority.tick(
             self.database_generation.0,
             database_state_path(&self.database_state),
             matches!(self.view, MainView::DatSources | MainView::NeedsAttention)
@@ -5020,7 +4994,7 @@ impl ArchiveFsApp {
                 }
             }
             Some(NavClick::QuickRename) => {
-                self.quick_rename_mode = true;
+                self.sources_ui.quick_rename_mode = true;
                 self.navigate_to_main_view(MainView::IdentifyRename);
             }
             Some(NavClick::Overlay(overlay)) => self.tools_overlay = overlay,
@@ -5429,7 +5403,7 @@ impl ArchiveFsApp {
                             self.start_cheat_install_rollback(context.clone());
                         }
                         Some(GamerViewAction::AddGamesFolder(folder)) => {
-                            self.gamer_view_pending_first_scan = Some(folder.clone());
+                            self.sources_ui.gamer_view_pending_first_scan = Some(folder.clone());
                             self.start_source_action(context.clone(), SourceAction::Add(folder));
                         }
                         Some(GamerViewAction::ReviewScan) => {
@@ -5587,10 +5561,12 @@ impl ArchiveFsApp {
                     // on first visit - `None` here means "not visited yet
                     // this session", not "not configured".
                     let cheat_sources_enabled_count = self
+                        .sources_ui
                         .cheat_sources_page
                         .as_ref()
                         .map(|page| page.enabled_source_count());
                     let dat_sources_registered_count = self
+                        .sources_ui
                         .dat_sources_page
                         .as_ref()
                         .map(|page| page.registered_source_count());
@@ -5611,7 +5587,7 @@ impl ArchiveFsApp {
                     };
                     let home_view = home_page::build_home_view(&home_inputs);
                     if let Some(card) = home_page::show_home_page(ui, &home_view) {
-                        self.quick_rename_mode = card == home_page::HomeCard::QuickRename;
+                        self.sources_ui.quick_rename_mode = card == home_page::HomeCard::QuickRename;
                         self.navigate_to_home_card(card);
                     }
                 }
@@ -5653,10 +5629,10 @@ impl ArchiveFsApp {
 
                 if self.view == MainView::MediaSets {
                     if let Some(snapshot) = self.database_state.snapshot() {
-                        self.media_sets_page
+                        self.sources_ui.media_sets_page
                             .refresh(&snapshot.archives, self.database_generation.0);
                     }
-                    media_sets_page::show_media_sets_page(ui, &mut self.media_sets_page);
+                    media_sets_page::show_media_sets_page(ui, &mut self.sources_ui.media_sets_page);
                     return;
                 }
 
@@ -7095,7 +7071,7 @@ impl ArchiveFsApp {
                     self.open_cheats_mods_workspace(context, archive_path);
                 }
                 AppOperationRequest::OpenDatSources => {
-                    self.quick_rename_mode = false;
+                    self.sources_ui.quick_rename_mode = false;
                     self.view = MainView::DatSources;
                 }
             }

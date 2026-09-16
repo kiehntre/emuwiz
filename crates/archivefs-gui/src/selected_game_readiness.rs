@@ -337,10 +337,10 @@ impl ArchiveFsApp {
             .map(Path::to_path_buf)
         {
             if let Some(snapshot) = self.database_state.snapshot() {
-                self.media_sets_page
+                self.sources_ui.media_sets_page
                     .refresh(&snapshot.archives, self.database_generation.0);
             }
-            if media_sets_page::show_selected_item_link(ui, &self.media_sets_page, &path) {
+            if media_sets_page::show_selected_item_link(ui, &self.sources_ui.media_sets_page, &path) {
                 self.navigate_to_main_view(MainView::MediaSets);
             }
             ui.add_space(crate::ui::theme::SECTION_GAP);

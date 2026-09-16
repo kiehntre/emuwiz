@@ -293,7 +293,7 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn onboarding_dat_source_count(&self) -> usize {
-        self.dat_sources_page
+        self.sources_ui.dat_sources_page
             .as_ref()
             .map(|page| page.registered_source_count())
             .unwrap_or(0)
