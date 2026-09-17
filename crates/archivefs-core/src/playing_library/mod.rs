@@ -49,7 +49,8 @@ pub use model::{
     RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber, UnresolvedGroup,
 };
 pub use output_profile::{
-    LibraryOutputProfile, LibraryOutputProjection, project_generic_playing_library,
+    LibraryOutputOwnership, LibraryOutputProfile, LibraryOutputProjection,
+    inspect_library_output_ownership, project_generic_playing_library,
 };
 pub use retrodeck_projection::{
     RetroDeckProjectedGame, RetroDeckProjectionPlan, RetroDeckVisibility,

@@ -40,7 +40,8 @@ use archivefs_core::playing_library::{
     build_playing_library_plan, build_playing_library_transaction, build_retrodeck_projection,
     build_retrodeck_projection_transaction, build_romm_projection_transaction,
     build_romm_projection_with_visibility, match_loose_files_against_dat,
-    project_generic_playing_library, LibraryOutputProfile, LibraryOutputProjection,
+    inspect_library_output_ownership, project_generic_playing_library, LibraryOutputProfile,
+    LibraryOutputProjection,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -478,18 +479,20 @@ impl PlayingLibraryPageState {
                             return;
                         }
                     };
-                    self.output_projection = Some(LibraryOutputProjection::from_plan(
+                    self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
                         LibraryOutputProfile::Generic,
                         destination_root.to_path_buf(),
                         &plan,
                         generic_mapping_explanation(self.dat_platform_identity.as_ref()),
+                        &inspect_library_output_ownership(&plan, &self.journal_dir),
                     ));
                 } else if self.destination == PlayingLibraryDestination::EsDe {
-                    self.output_projection = Some(LibraryOutputProjection::from_plan(
+                    self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
                         LibraryOutputProfile::EsDe,
                         destination_root,
                         &plan,
                         Vec::new(),
+                        &inspect_library_output_ownership(&plan, &self.journal_dir),
                     ));
                 }
                 self.plan = Some(plan);
@@ -543,11 +546,12 @@ impl PlayingLibraryPageState {
                             return;
                         }
                     };
-                    self.output_projection = Some(LibraryOutputProjection::from_plan(
+                    self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
                         LibraryOutputProfile::Generic,
                         destination_root.to_path_buf(),
                         &plan,
                         generic_mapping_explanation(self.dat_platform_identity.as_ref()),
+                        &inspect_library_output_ownership(&plan, &self.journal_dir),
                     ));
                 }
                 self.plan = Some(plan);
@@ -598,11 +602,15 @@ impl PlayingLibraryPageState {
             visibility,
         ) {
             Ok(projection) => {
-                self.output_projection = Some(LibraryOutputProjection::from_plan(
+                self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
                     LibraryOutputProfile::Romm,
                     projection.destination_root.clone(),
                     &projection.playing_library_plan,
                     Vec::new(),
+                    &inspect_library_output_ownership(
+                        &projection.playing_library_plan,
+                        &self.journal_dir,
+                    ),
                 ));
                 self.romm_projection = Some(projection);
             }
@@ -655,11 +663,15 @@ impl PlayingLibraryPageState {
         };
         match build_retrodeck_projection(plan, identity, destination, visibility, &profile) {
             Ok(projection) => {
-                self.output_projection = Some(LibraryOutputProjection::from_plan(
+                self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
                     LibraryOutputProfile::RetroDeck,
                     projection.destination_root.clone(),
                     &projection.playing_library_plan,
                     Vec::new(),
+                    &inspect_library_output_ownership(
+                        &projection.playing_library_plan,
+                        &self.journal_dir,
+                    ),
                 ));
                 self.retrodeck_projection = Some(projection);
             }
@@ -1595,6 +1607,11 @@ fn show_output_projection_summary(
                 "Stale owned entries: {} (explicit cleanup required)",
                 projection.stale_owned_entries.len()
             ));
+            widgets::technical_details(ui, "playing_library_stale_owned_entries", |ui| {
+                for path in &projection.stale_owned_entries {
+                    ui.label(path.display().to_string());
+                }
+            });
         }
         match projection.profile {
             LibraryOutputProfile::Generic => {

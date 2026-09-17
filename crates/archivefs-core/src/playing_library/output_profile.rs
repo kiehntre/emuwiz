@@ -9,6 +9,11 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use crate::dat::identity::{DatPlatformConfidence, DatPlatformIdentity};
+use crate::dat::rename_apply::journal::list_journals;
+use crate::dat::rename_apply::model::{EntryState, TransactionOperation, TransactionState};
+use crate::library_views::{
+    classify_library_view_object, LibraryViewObjectClassification, LibraryViewObjectKind,
+};
 
 use super::{DestinationConflict, ElectedGame, LinkedLibraryOperation, PlayingLibraryPlan};
 
@@ -52,6 +57,15 @@ pub struct LibraryOutputProjection {
     pub operation_count: usize,
 }
 
+/// Read-only ownership facts obtained from the existing rename journals and
+/// the shared Library View object classifier. This is deliberately not stored
+/// in the projection or persisted separately.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryOutputOwnership {
+    pub already_correct: usize,
+    pub stale_owned_entries: Vec<PathBuf>,
+}
+
 impl LibraryOutputProjection {
     pub fn from_plan(
         profile: LibraryOutputProfile,
@@ -83,6 +97,130 @@ impl LibraryOutputProjection {
             stale_owned_entries: Vec::new(),
             sample_paths,
         }
+    }
+
+    pub fn from_plan_with_ownership(
+        profile: LibraryOutputProfile,
+        destination_root: PathBuf,
+        plan: &PlayingLibraryPlan,
+        unresolved_mappings: Vec<String>,
+        ownership: &LibraryOutputOwnership,
+    ) -> Self {
+        let mut projection = Self::from_plan(profile, destination_root, plan, unresolved_mappings);
+        let owned_correct = plan
+            .operations
+            .iter()
+            .filter(|operation| {
+                classify_library_view_object(
+                    &operation.destination_path,
+                    LibraryViewObjectKind::Symlink,
+                    Some(&operation.source_path),
+                    true,
+                ) == LibraryViewObjectClassification::OwnedCorrect
+            })
+            .count();
+        projection.already_correct = ownership.already_correct.max(owned_correct);
+        projection.stale_owned_entries = ownership.stale_owned_entries.clone();
+        projection.planned_links = plan
+            .operations
+            .iter()
+            .filter(|operation| {
+                classify_library_view_object(
+                    &operation.destination_path,
+                    LibraryViewObjectKind::Symlink,
+                    Some(&operation.source_path),
+                    true,
+                ) != LibraryViewObjectClassification::OwnedCorrect
+            })
+            .cloned()
+            .collect();
+        projection.operation_count = projection.planned_links.len();
+        projection.planned_directories = projection
+            .planned_links
+            .iter()
+            .filter_map(|operation| operation.destination_path.parent().map(Path::to_path_buf))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        projection.sample_paths = projection
+            .planned_links
+            .iter()
+            .take(5)
+            .map(|operation| operation.destination_path.clone())
+            .collect();
+        projection
+    }
+}
+
+/// Reads the existing journal ownership records and classifies their current
+/// filesystem objects. A transaction is considered an ownership record only
+/// for applied symlink entries whose journal uses this exact destination root;
+/// foreign files and links have no journal record and are never reported as
+/// stale-owned. No journal or filesystem write occurs.
+pub fn inspect_library_output_ownership(
+    plan: &PlayingLibraryPlan,
+    journal_dir: &Path,
+) -> LibraryOutputOwnership {
+    let root = &plan.destination_root;
+    let root_text = root.to_string_lossy();
+    let mut owned_links = std::collections::BTreeMap::<PathBuf, PathBuf>::new();
+    let (transactions, _) = list_journals(journal_dir);
+    for transaction in transactions {
+        if transaction.source_scan_root != root_text
+            || transaction.state == TransactionState::RolledBack
+        {
+            continue;
+        }
+        for entry in transaction.entries {
+            if entry.state != EntryState::Applied || !entry.destination_path.starts_with(root) {
+                continue;
+            }
+            if let TransactionOperation::CreateSymlink {
+                expected_target, ..
+            } = entry.operation
+            {
+                owned_links.insert(entry.destination_path, expected_target);
+            }
+        }
+    }
+
+    let desired: BTreeSet<PathBuf> = plan
+        .operations
+        .iter()
+        .map(|operation| operation.destination_path.clone())
+        .collect();
+    let already_correct = plan
+        .operations
+        .iter()
+        .filter(|operation| {
+            classify_library_view_object(
+                &operation.destination_path,
+                LibraryViewObjectKind::Symlink,
+                Some(&operation.source_path),
+                owned_links.contains_key(&operation.destination_path),
+            ) == LibraryViewObjectClassification::OwnedCorrect
+        })
+        .count();
+    let stale_owned_entries = owned_links
+        .into_iter()
+        .filter(|(path, _expected_target)| !desired.contains(path))
+        .filter_map(|(path, expected_target)| {
+            matches!(
+                classify_library_view_object(
+                    &path,
+                    LibraryViewObjectKind::Symlink,
+                    Some(&expected_target),
+                    true,
+                ),
+                LibraryViewObjectClassification::OwnedCorrect
+                    | LibraryViewObjectClassification::OwnedStale
+            )
+            .then_some(path)
+        })
+        .collect();
+    LibraryOutputOwnership {
+        already_correct,
+        stale_owned_entries,
     }
 }
 
@@ -189,11 +327,17 @@ fn project_operation(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::dat::identity::DatPlatformConfidence;
+    use crate::dat::rename_apply::journal::write_journal;
+    use crate::dat::rename_apply::model::{EntryState, TransactionState};
+    use crate::playing_library::build_playing_library_transaction;
     use crate::playing_library::{
         CandidateEvidenceSummary, ElectionExplanation, PlayingLibraryPolicy,
     };
+    use tempfile::tempdir;
 
     fn identity(platform: &str) -> DatPlatformIdentity {
         DatPlatformIdentity::Resolved {
@@ -292,5 +436,84 @@ mod tests {
             assert_eq!(projection.planned_links, plan.operations);
             assert_eq!(projection.sample_paths.len(), 1);
         }
+    }
+
+    fn applied_journal_fixture() -> (tempfile::TempDir, PlayingLibraryPlan, PathBuf) {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        let destination_root = temp.path().join("output");
+        let journal_dir = temp.path().join("journal");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        fs::write(source_root.join("Game With Spaces.zip"), b"source").unwrap();
+        let mut plan = plan(&source_root);
+        plan.destination_root = destination_root.clone();
+        plan.operations[0].destination_path = destination_root.join("Game With Spaces.zip");
+        plan.elected_games[0].launcher_operation = plan.operations[0].clone();
+        fs::create_dir_all(plan.operations[0].destination_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(
+            &plan.operations[0].source_path,
+            &plan.operations[0].destination_path,
+        )
+        .unwrap();
+        let mut transaction = build_playing_library_transaction(&plan, 1).unwrap();
+        transaction.state = TransactionState::Applied;
+        transaction.entries[0].state = EntryState::Applied;
+        write_journal(&journal_dir, &transaction).unwrap();
+        (temp, plan, journal_dir)
+    }
+
+    #[test]
+    fn ownership_scan_reuses_applied_journal_and_shared_classifier() {
+        let (_temp, plan, journal_dir) = applied_journal_fixture();
+        let ownership = inspect_library_output_ownership(&plan, &journal_dir);
+        assert_eq!(ownership.already_correct, 1);
+        assert!(ownership.stale_owned_entries.is_empty());
+
+        let projection = LibraryOutputProjection::from_plan_with_ownership(
+            LibraryOutputProfile::Generic,
+            plan.destination_root.clone(),
+            &plan,
+            Vec::new(),
+            &ownership,
+        );
+        assert_eq!(projection.already_correct, 1);
+        assert!(projection.planned_links.is_empty());
+        assert_eq!(projection.operation_count, 0);
+    }
+
+    #[test]
+    fn ownership_scan_reports_only_existing_managed_stale_links() {
+        let (_temp, plan, journal_dir) = applied_journal_fixture();
+        let mut current = plan.clone();
+        current.operations.clear();
+        current.elected_games.clear();
+        let ownership = inspect_library_output_ownership(&current, &journal_dir);
+        assert_eq!(
+            ownership.stale_owned_entries,
+            vec![plan.operations[0].destination_path.clone()]
+        );
+
+        fs::remove_file(&plan.operations[0].destination_path).unwrap();
+        let missing = inspect_library_output_ownership(&current, &journal_dir);
+        assert!(missing.stale_owned_entries.is_empty());
+    }
+
+    #[test]
+    fn foreign_real_file_is_never_reported_as_owned() {
+        let temp = tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        let destination_root = temp.path().join("output");
+        let journal_dir = temp.path().join("journal");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        fs::write(source_root.join("Game With Spaces.zip"), b"source").unwrap();
+        let mut plan = plan(&source_root);
+        plan.destination_root = destination_root.clone();
+        plan.operations[0].destination_path = destination_root.join("Game With Spaces.zip");
+        fs::write(&plan.operations[0].destination_path, b"foreign").unwrap();
+        let ownership = inspect_library_output_ownership(&plan, &journal_dir);
+        assert_eq!(ownership.already_correct, 0);
+        assert!(ownership.stale_owned_entries.is_empty());
     }
 }
