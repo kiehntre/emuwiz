@@ -74,6 +74,7 @@ pub mod handheld_profiles;
 pub mod managed;
 pub mod native_profiles;
 pub mod profiles;
+pub mod remaining_profiles;
 pub mod rmg_sameboy;
 pub mod repair;
 pub mod runner;

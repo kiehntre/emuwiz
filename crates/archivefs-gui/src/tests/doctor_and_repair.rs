@@ -3174,6 +3174,7 @@ fn a_superseded_doctor_run_is_discarded_rather_than_shown() {
                 xenia_readiness: Gathered::NotLoaded("stale"),
                 ppsspp_readiness: Gathered::NotLoaded("stale"),
                 rpcs3_readiness: Gathered::NotLoaded("stale"),
+                remaining_profiles: Gathered::NotLoaded("stale"),
                 managed_entries: Gathered::NotLoaded("stale"),
             },
         ))
@@ -3218,6 +3219,7 @@ fn a_current_doctor_run_completes_and_records_when_it_finished() {
                 xenia_readiness: Gathered::NotLoaded("not gathered"),
                 ppsspp_readiness: Gathered::NotLoaded("not gathered"),
                 rpcs3_readiness: Gathered::NotLoaded("not gathered"),
+                remaining_profiles: Gathered::NotLoaded("not gathered"),
                 managed_entries: Gathered::NotLoaded("not gathered"),
             },
         ))

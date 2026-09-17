@@ -1730,7 +1730,7 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // Storage, filesystem mount state, emulator profiles, Linux installation
     // evidence, arcade emulator/DAT version compatibility,
     // Azahar/Cemu, melonDS/mGBA, DeSmuME/Mesen, RMG/SameBoy, and xemu/Xenia/PPSSPP/RPCS3
-    // launch readiness, managed entries, and the verified-identity fact cache
+    // launch readiness, remaining native profiles, managed entries, and the verified-identity fact cache
     // are not gathered by this test, so they
     // must appear as unavailable alongside the snapshot, setup and
     // RetroArch subsystems - never as passes. All four launch readiness
@@ -1738,7 +1738,7 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // "not gathered" wording, so they count as separate entries here.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        18,
+        19,
         "{:?}",
         scan.coverage
     );

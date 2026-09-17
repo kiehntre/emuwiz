@@ -37,6 +37,7 @@ pub(crate) struct DoctorGathered {
     pub(crate) xenia_readiness: Gathered<Vec<XeniaReadinessAssessment>>,
     pub(crate) ppsspp_readiness: Gathered<Vec<PpssppReadinessAssessment>>,
     pub(crate) rpcs3_readiness: Gathered<Vec<Rpcs3ReadinessAssessment>>,
+    pub(crate) remaining_profiles: Gathered<Vec<archivefs_core::diagnostics::Finding>>,
     pub(crate) managed_entries: Gathered<ManagedEntryScan>,
 }
 

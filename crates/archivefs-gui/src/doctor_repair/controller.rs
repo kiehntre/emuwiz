@@ -111,6 +111,9 @@ impl ArchiveFsApp {
                             rpcs3_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            remaining_profiles: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             managed_entries: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -201,6 +204,7 @@ impl ArchiveFsApp {
             xenia_readiness: borrowed(&gathered.xenia_readiness, |value| value.as_slice()),
             ppsspp_readiness: borrowed(&gathered.ppsspp_readiness, |value| value.as_slice()),
             rpcs3_readiness: borrowed(&gathered.rpcs3_readiness, |value| value.as_slice()),
+            remaining_profiles: borrowed(&gathered.remaining_profiles, |value| value.as_slice()),
             managed_entries: borrowed(&gathered.managed_entries, |value| value),
             // The verified-identity fact cache is not gathered by the GUI
             // Doctor worker yet; a later typed consumer will supply it.
@@ -683,6 +687,9 @@ pub(crate) fn gather_doctor_inputs(
     let rmg_sameboy_readiness = Gathered::Ready(
         archivefs_core::diagnostics::rmg_sameboy::discover_rmg_sameboy_readiness(),
     );
+    let remaining_profiles = Gathered::Ready(
+        archivefs_core::diagnostics::remaining_profiles::findings_from_remaining_profiles(),
+    );
 
     DoctorGathered {
         mount_root_safety: match &config {
@@ -740,6 +747,7 @@ pub(crate) fn gather_doctor_inputs(
         xenia_readiness,
         ppsspp_readiness,
         rpcs3_readiness,
+        remaining_profiles,
         managed_entries: match &transactions {
             Gathered::Ready(history) => {
                 Gathered::Ready(scan_managed_entries(history, &managed_targets))

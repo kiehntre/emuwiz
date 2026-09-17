@@ -160,6 +160,7 @@ pub struct DoctorScanInputs<'a> {
     pub ppsspp_readiness: Gathered<&'a [PpssppReadinessAssessment]>,
     /// From `profiles::assess_rpcs3_readiness`.
     pub rpcs3_readiness: Gathered<&'a [Rpcs3ReadinessAssessment]>,
+    pub remaining_profiles: Gathered<&'a [Finding]>,
     /// From `managed::scan_managed_entries`.
     pub managed_entries: Gathered<&'a ManagedEntryScan>,
     /// Per-archive persisted verified-identity facts, each already paired
@@ -227,6 +228,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             rpcs3_readiness: Gathered::NotLoaded(
                 "RPCS3 launch readiness has not been checked in this session.",
+            ),
+            remaining_profiles: Gathered::NotLoaded(
+                "Remaining emulator readiness has not been checked in this session.",
             ),
             managed_entries: Gathered::NotLoaded(
                 "EmuWiz-managed cheat entries have not been scanned yet.",
@@ -607,6 +611,12 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::EmulatorProfiles,
         DoctorSubsystem::EmulatorReadiness,
         |assessments: &&[Rpcs3ReadinessAssessment]| findings_from_rpcs3_readiness(assessments)
+    );
+    subsystem!(
+        inputs.remaining_profiles,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |findings: &&[Finding]| findings.to_vec()
     );
     subsystem!(
         inputs.managed_entries,
