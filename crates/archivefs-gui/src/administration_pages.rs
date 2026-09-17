@@ -3973,93 +3973,101 @@ pub(super) fn show_health_dashboard_panel(
     egui::ScrollArea::vertical()
         .id_salt("health_issue_list")
         .max_height(220.0)
-        .show(ui, |ui| {
-            for &index in &visible {
-                let issue = &issues[index];
-                let selected = selected_issue.as_ref() == Some(&issue.path);
-                let label_text = format!(
-                    "{} — {} — {} — {}",
-                    issue.path.display(),
-                    issue.platform.as_deref().unwrap_or("Unknown"),
-                    issue.category.label(),
-                    issue.reason
-                );
-                // Path + platform + category + reason combined can easily
-                // exceed the list's width - `.truncate()` keeps the row
-                // itself from stretching the page, and the hover tooltip
-                // (this list previously had none at all) always carries
-                // every field in full.
-                let response = ui
-                    .add(egui::Button::selectable(selected, &label_text).truncate())
-                    .on_hover_text(&label_text);
-                if response.clicked() {
-                    *selected_issue = Some(issue.path.clone());
+        .show_rows(
+            ui,
+            ui.spacing().interact_size.y,
+            visible.len(),
+            |ui, row_range| {
+                for row in row_range {
+                    let index = visible[row];
+                    let issue = &issues[index];
+                    let selected = selected_issue.as_ref() == Some(&issue.path);
+                    let label_text = format!(
+                        "{} — {} — {} — {}",
+                        issue.path.display(),
+                        issue.platform.as_deref().unwrap_or("Unknown"),
+                        issue.category.label(),
+                        issue.reason
+                    );
+                    // Path + platform + category + reason combined can easily
+                    // exceed the list's width - `.truncate()` keeps the row
+                    // itself from stretching the page, and the hover tooltip
+                    // (this list previously had none at all) always carries
+                    // every field in full.
+                    let response = ui
+                        .add(egui::Button::selectable(selected, &label_text).truncate())
+                        .on_hover_text(&label_text);
+                    if response.clicked() {
+                        *selected_issue = Some(issue.path.clone());
+                    }
+                    // Requirement: "Do not invent retry actions for issues
+                    // that have no safe retry" - reuses `issue.recovery_action`
+                    // exactly as computed by `build_health_issues`/rendered by
+                    // the "Selected health issue" panel below, never a second
+                    // guess at what is safe to retry.
+                    response.context_menu(|ui| {
+                        if ui.button("Show archive in Library").clicked() {
+                            action = Some(HealthDashboardAction::ViewInLibrary(issue.path.clone()));
+                            ui.close();
+                        }
+                        let inspectable = is_inspectable(&issue.path);
+                        if ui
+                            .add_enabled(inspectable, egui::Button::new("Inspect contents"))
+                            .clicked()
+                        {
+                            action = Some(HealthDashboardAction::Inspect(issue.path.clone()));
+                            ui.close();
+                        }
+                        if ui.button("Copy archive path").clicked() {
+                            let _ = clipboard.set_text(issue.path.display().to_string());
+                            ui.close();
+                        }
+                        if ui.button("Copy issue reason").clicked() {
+                            let _ = clipboard.set_text(issue.reason.clone());
+                            ui.close();
+                        }
+                        match issue.recovery_action {
+                            Some(RecoveryAction::RetryMount) => {
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("Retry mount"))
+                                    .clicked()
+                                {
+                                    action =
+                                        Some(HealthDashboardAction::Archive(OperationRequest {
+                                            action: ArchiveAction::Mount,
+                                            archive_path: issue.path.clone(),
+                                            cleanup_after_unmount: false,
+                                        }));
+                                    ui.close();
+                                }
+                            }
+                            Some(RecoveryAction::Remount) => {
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("Remount"))
+                                    .clicked()
+                                {
+                                    action =
+                                        Some(HealthDashboardAction::Archive(OperationRequest {
+                                            action: ArchiveAction::Remount,
+                                            archive_path: issue.path.clone(),
+                                            cleanup_after_unmount: false,
+                                        }));
+                                    ui.close();
+                                }
+                            }
+                            Some(RecoveryAction::LazyUnmount) | None => {}
+                        }
+                        ui.separator();
+                        if ui.button("Filter by this issue type").clicked() {
+                            action = Some(HealthDashboardAction::FilterByCategory(
+                                health_issue_filter_for_category(issue.category),
+                            ));
+                            ui.close();
+                        }
+                    });
                 }
-                // Requirement: "Do not invent retry actions for issues
-                // that have no safe retry" - reuses `issue.recovery_action`
-                // exactly as computed by `build_health_issues`/rendered by
-                // the "Selected health issue" panel below, never a second
-                // guess at what is safe to retry.
-                response.context_menu(|ui| {
-                    if ui.button("Show archive in Library").clicked() {
-                        action = Some(HealthDashboardAction::ViewInLibrary(issue.path.clone()));
-                        ui.close();
-                    }
-                    let inspectable = is_inspectable(&issue.path);
-                    if ui
-                        .add_enabled(inspectable, egui::Button::new("Inspect contents"))
-                        .clicked()
-                    {
-                        action = Some(HealthDashboardAction::Inspect(issue.path.clone()));
-                        ui.close();
-                    }
-                    if ui.button("Copy archive path").clicked() {
-                        let _ = clipboard.set_text(issue.path.display().to_string());
-                        ui.close();
-                    }
-                    if ui.button("Copy issue reason").clicked() {
-                        let _ = clipboard.set_text(issue.reason.clone());
-                        ui.close();
-                    }
-                    match issue.recovery_action {
-                        Some(RecoveryAction::RetryMount) => {
-                            if ui
-                                .add_enabled(!busy, egui::Button::new("Retry mount"))
-                                .clicked()
-                            {
-                                action = Some(HealthDashboardAction::Archive(OperationRequest {
-                                    action: ArchiveAction::Mount,
-                                    archive_path: issue.path.clone(),
-                                    cleanup_after_unmount: false,
-                                }));
-                                ui.close();
-                            }
-                        }
-                        Some(RecoveryAction::Remount) => {
-                            if ui
-                                .add_enabled(!busy, egui::Button::new("Remount"))
-                                .clicked()
-                            {
-                                action = Some(HealthDashboardAction::Archive(OperationRequest {
-                                    action: ArchiveAction::Remount,
-                                    archive_path: issue.path.clone(),
-                                    cleanup_after_unmount: false,
-                                }));
-                                ui.close();
-                            }
-                        }
-                        Some(RecoveryAction::LazyUnmount) | None => {}
-                    }
-                    ui.separator();
-                    if ui.button("Filter by this issue type").clicked() {
-                        action = Some(HealthDashboardAction::FilterByCategory(
-                            health_issue_filter_for_category(issue.category),
-                        ));
-                        ui.close();
-                    }
-                });
-            }
-        });
+            },
+        );
 
     let Some(issue) = selected_issue.as_ref().and_then(|selected| {
         visible
