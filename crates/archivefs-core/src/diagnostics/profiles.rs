@@ -44,6 +44,7 @@ use super::{
 use crate::emulator_environment::EncodedPath;
 use crate::launch::readiness::{FirmwareReadiness, rpcs3_firmware_readiness};
 use crate::patch_manager::{
+    AzaharDiscoveryRoots, AzaharEvidenceState, CemuKeysState, CemuMlcState,
     DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DuckStationProfileDiscovery,
     DuckStationProfileDiscoveryRoots, EmulatorProfileSelection, Pcsx2ProfileDiscovery,
     Pcsx2ProfileDiscoveryRoots, PpssppInstallationType, PpssppLaunchBlocker,
@@ -52,8 +53,9 @@ use crate::patch_manager::{
     Rpcs3ProfileDiscoveryRoots, XemuGameRequest, XemuInstallationType, XemuLaunchBlocker,
     XemuLaunchBlockerKind, XemuProfileDiscovery, XemuProfileDiscoveryRoots, XemuSystemFileState,
     XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaProfileDiscovery, XeniaProfileDiscoveryRoots,
+    CemuProfileDiscoveryRoots, discover_azahar_executable, discover_azahar_profile,
     discover_dolphin_profiles, discover_duckstation_profiles, discover_pcsx2_profiles,
-    discover_ppsspp_profiles, discover_rpcs3_profiles, discover_xemu_profiles,
+    discover_cemu_profiles, discover_ppsspp_profiles, discover_rpcs3_profiles, discover_xemu_profiles,
     discover_xenia_profiles, inspect_rpcs3_game, inspect_xemu_game,
     resolve_ppsspp_native_launch_binding, resolve_rpcs3_native_launch_binding,
     resolve_xemu_native_launch_binding, resolve_xenia_launch_binding, select_dolphin_profile,
@@ -79,6 +81,128 @@ pub struct LinuxEmulatorInstallationEvidence {
     pub executable: Option<EncodedPath>,
     pub profile: Option<EncodedPath>,
     pub detail: String,
+}
+
+/// Adapter-specific, read-only Doctor evidence for Azahar and Cemu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AzaharCemuReadiness {
+    pub adapter: String,
+    pub executable: Option<EncodedPath>,
+    pub version: Option<String>,
+    pub profile: Option<EncodedPath>,
+    pub ready: bool,
+    pub blockers: Vec<String>,
+    pub evidence: Vec<String>,
+    pub remediation: String,
+}
+
+pub fn discover_azahar_cemu_readiness() -> Vec<AzaharCemuReadiness> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    let azahar_roots = AzaharDiscoveryRoots {
+        explicit_executable: None,
+        path: env::var_os("PATH"),
+        config_root: Some(home.join(".config/azahar")),
+    };
+    if let Some(executable) = discover_azahar_executable(&azahar_roots) {
+        let profile = discover_azahar_profile(&azahar_roots, executable);
+        let blocked = matches!(
+            profile.config_state,
+            AzaharEvidenceState::Unreadable | AzaharEvidenceState::Oversized
+        );
+        let state = match profile.config_state {
+            AzaharEvidenceState::Present => "configuration readable",
+            AzaharEvidenceState::Absent => "configuration not created yet",
+            AzaharEvidenceState::Unreadable => "configuration unreadable",
+            AzaharEvidenceState::Oversized => "configuration is too large",
+            AzaharEvidenceState::Unknown => "configuration state unknown",
+        };
+        result.push(AzaharCemuReadiness {
+            adapter: "Azahar".into(),
+            executable: Some(EncodedPath::from_path(&profile.executable)),
+            version: None,
+            profile: profile.config.as_deref().map(EncodedPath::from_path),
+            ready: !blocked,
+            blockers: if blocked {
+                vec![format!("Azahar {state}")]
+            } else {
+                Vec::new()
+            },
+            evidence: vec![format!("Configuration: {state}"), "Selected-title system-data and content checks remain adapter preflight checks.".into()],
+            remediation: if blocked {
+                "Repair or recreate Azahar's configuration, then run Doctor again.".into()
+            } else {
+                "Azahar's selected 3DSX title must still pass launch preflight.".into()
+            },
+        });
+    } else {
+        result.push(AzaharCemuReadiness {
+            adapter: "Azahar".into(), executable: None, version: None, profile: None,
+            ready: false, blockers: vec!["Azahar executable was not found".into()], evidence: Vec::new(),
+            remediation: "Install Azahar or select an executable in Emulator Setup.".into(),
+        });
+    }
+    if let Ok(roots) = CemuProfileDiscoveryRoots::from_environment() {
+        let discovery = discover_cemu_profiles(&roots);
+        if discovery.profiles.is_empty() {
+            result.push(AzaharCemuReadiness {
+                adapter: "Cemu".into(), executable: None, version: None, profile: None,
+                ready: false, blockers: vec!["Cemu executable/profile was not found".into()], evidence: Vec::new(),
+                remediation: "Install Cemu or select its profile in Emulator Setup.".into(),
+            });
+        }
+        for profile in discovery.profiles {
+            let executable = profile.executable_candidates.first();
+            let mlc = profile.config.as_ref().map(|config| config.mlc.state);
+            let mut blockers = profile.blocker.clone().into_iter().collect::<Vec<_>>();
+            if !matches!(mlc, Some(CemuMlcState::Present)) {
+                blockers.push(format!("Cemu MLC is {}", cemu_mlc_label(mlc)));
+            }
+            let keys = match profile.keys.state {
+                CemuKeysState::PresentUnverified => "present (contents unverified)",
+                CemuKeysState::NotConfigured => "not configured; some titles may require it",
+                CemuKeysState::Unreadable => "unreadable",
+            };
+            result.push(AzaharCemuReadiness {
+                adapter: "Cemu".into(), executable: executable.map(|item| EncodedPath::from_path(&item.path)),
+                version: executable.and_then(|item| item.version.clone()),
+                profile: Some(EncodedPath::from_path(&profile.configuration_path)),
+                ready: profile.eligible && blockers.is_empty(), blockers,
+                evidence: vec![format!("Keys: {keys}"), format!("MLC: {}", cemu_mlc_label(mlc))],
+                remediation: "Fix the reported Cemu profile/MLC state; keys are required only when selected-title preflight says so.".into(),
+            });
+        }
+    }
+    result
+}
+
+fn cemu_mlc_label(state: Option<CemuMlcState>) -> &'static str {
+    match state {
+        Some(CemuMlcState::Present) => "present",
+        Some(CemuMlcState::Missing) => "missing",
+        Some(CemuMlcState::NotConfigured) => "not configured",
+        Some(CemuMlcState::NotADirectory) => "not a directory",
+        None => "not inspected",
+    }
+}
+
+pub fn findings_from_azahar_cemu_readiness(entries: &[AzaharCemuReadiness]) -> Vec<Finding> {
+    entries.iter().map(|entry| {
+        let (severity, title, explanation) = if entry.ready {
+            (DoctorSeverity::Info, format!("{} profile inspected", entry.adapter), format!("{} has a usable discovered profile; selected-game launch readiness is checked by adapter preflight.", entry.adapter))
+        } else {
+            (DoctorSeverity::Warning, format!("{} needs setup", entry.adapter), entry.blockers.first().cloned().unwrap_or_else(|| "readiness is not established".into()))
+        };
+        let mut finding = Finding::new(format!("emulator_profile.{}_readiness", entry.adapter.to_ascii_lowercase()), DoctorCategory::EmulatorProfiles, DoctorSubsystem::EmulatorReadiness, severity, title, explanation)
+            .with_evidence(entry.evidence.clone())
+            .with_guidance("EmuWiz only reports inspected evidence and does not change emulator files.", entry.remediation.clone());
+        if let Some(executable) = &entry.executable { finding = finding.with_evidence([format!("Executable: {}", executable.display)]); }
+        if let Some(version) = &entry.version { finding = finding.with_evidence([format!("Version: {version}")]); }
+        if let Some(profile) = &entry.profile { finding = finding.with_evidence([format!("Profile/config: {}", profile.display)]); }
+        finding
+    }).collect()
 }
 
 fn safe_executable(path: &Path) -> bool {
@@ -4381,5 +4505,31 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.path == executable)
         }),);
+    }
+
+    #[test]
+    fn azahar_doctor_projection_never_overstates_incomplete_configuration() {
+        let entries = findings_from_azahar_cemu_readiness(&[AzaharCemuReadiness {
+            adapter: "Azahar".into(), executable: None, version: None, profile: None,
+            ready: false, blockers: vec!["Azahar configuration unreadable".into()],
+            evidence: Vec::new(), remediation: "Repair the configuration.".into(),
+        }]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].severity, DoctorSeverity::Warning);
+        assert!(entries[0].title.contains("needs setup"));
+        assert!(entries[0].explanation.contains("unreadable"));
+    }
+
+    #[test]
+    fn cemu_doctor_projection_keeps_keys_conditional_and_mlc_visible() {
+        let entries = findings_from_azahar_cemu_readiness(&[AzaharCemuReadiness {
+            adapter: "Cemu".into(), executable: None, version: Some("2.0".into()), profile: None,
+            ready: false, blockers: vec!["Cemu MLC is missing".into()],
+            evidence: vec!["Keys: not configured; some titles may require it".into()],
+            remediation: "Configure the MLC.".into(),
+        }]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].explanation.contains("MLC"));
+        assert!(entries[0].evidence.iter().any(|line| line.contains("some titles may require it")));
     }
 }

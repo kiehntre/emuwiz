@@ -84,6 +84,9 @@ impl ArchiveFsApp {
                             linux_emulator_installations: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            azahar_cemu_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             arcade_dat_version: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -166,6 +169,10 @@ impl ArchiveFsApp {
             emulator_profiles: borrowed(&gathered.emulator_profiles, |value| value),
             linux_emulator_installations: borrowed(
                 &gathered.linux_emulator_installations,
+                |value| value.as_slice(),
+            ),
+            azahar_cemu_readiness: borrowed(
+                &gathered.azahar_cemu_readiness,
                 |value| value.as_slice(),
             ),
             arcade_dat_version: borrowed(&gathered.arcade_dat_version, |value| value.as_slice()),
@@ -643,6 +650,9 @@ pub(crate) fn gather_doctor_inputs(
         ),
     );
     let linux_emulator_installations = Gathered::Ready(installations);
+    let azahar_cemu_readiness = Gathered::Ready(
+        archivefs_core::diagnostics::profiles::discover_azahar_cemu_readiness(),
+    );
 
     DoctorGathered {
         mount_root_safety: match &config {
@@ -691,6 +701,7 @@ pub(crate) fn gather_doctor_inputs(
         ))),
         emulator_profiles: Gathered::Ready(profile_report),
         linux_emulator_installations,
+        azahar_cemu_readiness,
         arcade_dat_version,
         xemu_readiness,
         xenia_readiness,

@@ -36,9 +36,9 @@ use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
 use super::profiles::{
-    LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment, ProfileAssessmentReport,
+    AzaharCemuReadiness, LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment, ProfileAssessmentReport,
     Rpcs3ReadinessAssessment, XemuReadinessAssessment, XeniaReadinessAssessment,
-    findings_from_emulator_profiles, findings_from_linux_emulator_installations,
+    findings_from_azahar_cemu_readiness, findings_from_emulator_profiles, findings_from_linux_emulator_installations,
     findings_from_ppsspp_readiness, findings_from_rpcs3_readiness, findings_from_xemu_readiness,
     findings_from_xenia_readiness, not_checked_from_emulator_profiles,
 };
@@ -134,6 +134,7 @@ pub struct DoctorScanInputs<'a> {
     pub emulator_profiles: Gathered<&'a ProfileAssessmentReport>,
     /// Bounded installation-form evidence gathered outside this pure runner.
     pub linux_emulator_installations: Gathered<&'a [LinuxEmulatorInstallationEvidence]>,
+    pub azahar_cemu_readiness: Gathered<&'a [AzaharCemuReadiness]>,
     /// From `arcade_dat_version::arcade_dat_version_readiness` - advisory
     /// MAME / FBNeo emulator-vs-DAT version compatibility, assembled outside
     /// this pure runner from the installation evidence and configured arcade
@@ -187,6 +188,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             linux_emulator_installations: Gathered::NotLoaded(
                 "Linux emulator installation evidence has not been gathered in this session.",
+            ),
+            azahar_cemu_readiness: Gathered::NotLoaded(
+                "Azahar and Cemu readiness has not been checked in this session.",
             ),
             arcade_dat_version: Gathered::NotLoaded(
                 "Arcade emulator / DAT version compatibility has not been assembled in this session.",
@@ -528,6 +532,12 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         |evidence: &&[LinuxEmulatorInstallationEvidence]| {
             findings_from_linux_emulator_installations(evidence)
         }
+    );
+    subsystem!(
+        inputs.azahar_cemu_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |entries: &&[AzaharCemuReadiness]| findings_from_azahar_cemu_readiness(entries)
     );
     subsystem!(
         inputs.arcade_dat_version,

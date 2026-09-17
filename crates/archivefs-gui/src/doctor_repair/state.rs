@@ -23,6 +23,8 @@ pub(crate) struct DoctorGathered {
     pub(crate) storage: Gathered<StorageAssessment>,
     pub(crate) emulator_profiles: Gathered<ProfileAssessmentReport>,
     pub(crate) linux_emulator_installations: Gathered<Vec<LinuxEmulatorInstallationEvidence>>,
+    pub(crate) azahar_cemu_readiness:
+        Gathered<Vec<archivefs_core::diagnostics::profiles::AzaharCemuReadiness>>,
     pub(crate) arcade_dat_version:
         Gathered<Vec<archivefs_core::diagnostics::arcade_dat_version::ArcadeEmulatorDatReadiness>>,
     pub(crate) xemu_readiness: Gathered<Vec<XemuReadinessAssessment>>,

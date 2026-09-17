@@ -4849,6 +4849,9 @@ fn gather_doctor_scan() -> DoctorScan {
         linux_emulator_installations: Gathered::NotLoaded(
             "Linux emulator installation evidence has not been gathered in this CLI session.",
         ),
+        azahar_cemu_readiness: Gathered::NotLoaded(
+            "Azahar and Cemu readiness has not been checked in this CLI session.",
+        ),
         // Arcade emulator / DAT version compatibility is assembled from that
         // installation evidence, so it is likewise not gathered by the
         // diagnostics-only CLI Doctor scan.
