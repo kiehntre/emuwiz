@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::mod_package::{
-    LocalModPackagePlan, LocalModPackageRequest, SelectedGameForMod,
+    LocalModPackagePlan, LocalModPackageRequest, ModCompatibilityState, SelectedGameForMod,
     build_local_mod_package_transaction_plan, inspect_local_mod_package,
 };
 use archivefs_core::patch_manager::{
@@ -158,6 +158,28 @@ fn rollback_presentation(status: SharedApplyStatus) -> StatusPresentation {
     }
 }
 
+fn compatibility_presentation(
+    state: ModCompatibilityState,
+) -> (&'static str, widgets::StatusTone, &'static str) {
+    match state {
+        ModCompatibilityState::Compatible => (
+            "Ready to apply",
+            widgets::StatusTone::Success,
+            "The package matches the selected game's verified identity.",
+        ),
+        ModCompatibilityState::Incompatible => (
+            "Not available for this game",
+            widgets::StatusTone::Blocked,
+            "The package identity does not match the selected game.",
+        ),
+        ModCompatibilityState::Unknown => (
+            "Needs game identity",
+            widgets::StatusTone::Warning,
+            "EmuWiz cannot safely verify which game this package targets.",
+        ),
+    }
+}
+
 /// Whether an apply result actually changed at least one game file that a
 /// rollback could restore. `AlreadyInstalled` is deliberately excluded (the
 /// file was already in place, so there is nothing to undo), as is a result
@@ -240,6 +262,14 @@ pub fn show_local_mod_package_panel(
         Stage::Planned(plan) => show_plan(ui, state, plan, archive_path, identity, &game_root),
         Stage::Confirm(plan) => {
             widgets::card(ui, |ui| {
+                ui.label("Original game: unchanged");
+                ui.label("Only the confirmed files below will be changed.");
+                for entry in plan.entries.iter().take(12) {
+                    ui.label(format!(
+                        "Planned: {}",
+                        entry.destination_relative_path.display
+                    ));
+                }
                 ui.label(format!(
                     "Apply {}? Nothing is written until you confirm.",
                     plan.entries.len()
@@ -406,20 +436,30 @@ fn show_plan(
 ) {
     widgets::card(ui, |ui| {
         if let Some(package) = plan.package.as_ref() {
-            ui.label(format!("{} {}", package.title, package.version));
+            ui.heading(format!("{} {}", package.title, package.version));
         }
+        let (compatibility, tone, explanation) =
+            compatibility_presentation(plan.compatibility.state);
+        widgets::status_badge(ui, compatibility, tone);
+        ui.label(explanation);
         for blocker in &plan.blockers {
             widgets::banner(
                 ui,
-                "Cannot apply this mod",
+                "Cannot apply this mod — needs review",
                 &blocker.detail,
                 widgets::StatusTone::Blocked,
             );
         }
         for conflict in &plan.conflicts {
-            ui.label(format!("Conflict: {}", conflict.detail));
+            widgets::banner(
+                ui,
+                "Conflict detected",
+                &conflict.detail,
+                widgets::StatusTone::Warning,
+            );
         }
         if plan.blockers.is_empty() && plan.conflicts.is_empty() {
+            ui.label("Original game: unchanged until you confirm apply.");
             ui.label(format!(
                 "{} file(s) will be added or replaced below {}.",
                 plan.operations.len(),
@@ -427,8 +467,13 @@ fn show_plan(
             ));
             for operation in plan.operations.iter().take(12) {
                 ui.label(format!(
-                    "{:?}: {}",
-                    operation.kind,
+                    "{}: {}",
+                    match operation.kind {
+                        archivefs_core::mod_package::ModOperationKind::CreateFile => "Add",
+                        archivefs_core::mod_package::ModOperationKind::ReplaceFile => "Replace",
+                        archivefs_core::mod_package::ModOperationKind::PatchFile => "Patch",
+                        archivefs_core::mod_package::ModOperationKind::DeleteFile => "Delete",
+                    },
                     operation.destination_path.display()
                 ));
             }
@@ -620,6 +665,9 @@ mod tests {
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(&output, "Review and apply mod"));
+        assert!(text_contains(&output, "Ready to apply"));
+        assert!(text_contains(&output, "Original game: unchanged"));
+        assert!(text_contains(&output, "game.bin"));
         assert!(!text_contains(&output, "Cannot apply this mod"));
         // Rendering the preview writes nothing.
         assert_eq!(fs::read(archive).unwrap(), b"original");
