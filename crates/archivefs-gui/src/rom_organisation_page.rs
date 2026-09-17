@@ -1148,7 +1148,7 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     }
 }
 
-const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 3] = [
+const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 4] = [
     (
         "Build RomM library",
         "Build a RomM-ready playing library using the reviewed platform folders.",
@@ -1156,8 +1156,13 @@ const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 3] = 
     ),
     (
         "Build ES-DE library",
-        "Build a library arranged for ES-DE system folders.",
+        "Build a linked library and optionally publish its existing ES-DE gamelist.",
         PlayingLibraryDestination::EsDe,
+    ),
+    (
+        "Build RetroDECK library",
+        "Build a RetroDECK-ready linked library using the reviewed ES-DE system folders.",
+        PlayingLibraryDestination::RetroDeck,
     ),
     (
         "Build generic playing library",

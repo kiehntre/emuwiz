@@ -68,6 +68,10 @@ pub(crate) enum PlayingLibraryDestination {
     Generic,
     Romm,
     EsDe,
+    /// RetroDECK uses its own ES-DE-compatible filesystem root and sandbox
+    /// visibility contract. It is deliberately separate from ES-DE
+    /// gamelist publication, which remains an explicit follow-up action.
+    RetroDeck,
 }
 
 /// The page's authoritative state.
@@ -1227,6 +1231,7 @@ pub(crate) fn show_playing_library_page(
         PlayingLibraryDestination::Generic => "Build Generic Playing Library (1G1R)",
         PlayingLibraryDestination::Romm => "Build RomM Library (1G1R)",
         PlayingLibraryDestination::EsDe => "Build ES-DE Library (1G1R)",
+        PlayingLibraryDestination::RetroDeck => "Build RetroDECK Library (1G1R)",
     };
     widgets::section_header(ui, title, None);
     ui.label(
@@ -1245,6 +1250,9 @@ pub(crate) fn show_playing_library_page(
         }
         PlayingLibraryDestination::EsDe => {
             "The existing ES-DE mapping supplies the reviewed system folder automatically."
+        }
+        PlayingLibraryDestination::RetroDeck => {
+            "The existing ES-DE system mapping supplies RetroDECK's reviewed ROM folder."
         }
     };
     ui.label(egui::RichText::new(destination_help).color(theme::muted(ui)));
@@ -1298,6 +1306,7 @@ pub(crate) fn show_playing_library_page(
             PlayingLibraryDestination::Generic => "Playing Library destination",
             PlayingLibraryDestination::Romm => "RomM library destination root",
             PlayingLibraryDestination::EsDe => "ES-DE library destination root",
+            PlayingLibraryDestination::RetroDeck => "RetroDECK library destination root",
         };
         ui.label(egui::RichText::new(destination_label).strong());
         ui.horizontal_wrapped(|ui| {
@@ -1314,6 +1323,7 @@ pub(crate) fn show_playing_library_page(
                         }
                         PlayingLibraryDestination::Romm => "Choose RomM Library Folder",
                         PlayingLibraryDestination::EsDe => "Choose ES-DE Library Folder",
+                        PlayingLibraryDestination::RetroDeck => "Choose RetroDECK Library Folder",
                     })
                     .pick_folder()
             {
@@ -1414,7 +1424,13 @@ pub(crate) fn show_playing_library_page(
         if matches!(state.destination, PlayingLibraryDestination::Romm) {
             show_romm_projection_summary(ui, state, &mut action);
         }
-        if matches!(state.destination, PlayingLibraryDestination::EsDe) {
+        // Keep the historical ES-DE choice wired to the same safe
+        // RetroDECK filesystem projection for compatibility with existing
+        // saved workflows; RetroDECK now also has an explicit profile card.
+        if matches!(
+            state.destination,
+            PlayingLibraryDestination::EsDe | PlayingLibraryDestination::RetroDeck
+        ) {
             show_retrodeck_projection_summary(ui, state, &mut action);
         }
     }
