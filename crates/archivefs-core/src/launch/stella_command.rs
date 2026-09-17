@@ -40,6 +40,19 @@ use crate::patch_manager::{StellaLaunchBlocker, StellaNativeLaunchBinding};
 /// The only platform this native launch slice supports.
 pub const STELLA_SUPPORTED_PLATFORM_ID: &str = "Atari2600";
 
+/// Readiness derived from the same command plan used by native launch.
+///
+/// Stella is executable-only in EmuWiz: it has no modeled first-run config or
+/// firmware prerequisite.  The only setup-class blocker is an unavailable
+/// native binding; identity, content, and candidate blockers remain hard
+/// launch blockers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StellaReadiness {
+    Ready,
+    NeedsSetup,
+    Blocked,
+}
+
 /// The only direct content extension this slice supports (lowercase, no
 /// dot) - matches `crate::platform::PLATFORMS`'s Atari 2600
 /// `strong_extensions` exactly (`&["a26"]`). The registry's Atari 2600
@@ -71,6 +84,32 @@ pub struct StellaCommandSelection {
 pub struct StellaCommandPlan {
     pub command: Option<StellaCommand>,
     pub blockers: Vec<LaunchBlocker>,
+}
+
+impl StellaCommandPlan {
+    /// Return the deterministic first blocker selected by command planning.
+    pub fn first_blocker(&self) -> Option<&LaunchBlocker> {
+        self.blockers.first()
+    }
+}
+
+fn is_setup_blocker(kind: LaunchBlockerKind) -> bool {
+    matches!(kind, LaunchBlockerKind::StellaBindingUnavailable)
+}
+
+/// Classify Stella readiness without duplicating launch-plan rules.
+pub fn classify_stella_readiness(plan: &StellaCommandPlan) -> StellaReadiness {
+    if plan.blockers.is_empty() {
+        StellaReadiness::Ready
+    } else if plan
+        .blockers
+        .iter()
+        .all(|blocker| is_setup_blocker(blocker.kind))
+    {
+        StellaReadiness::NeedsSetup
+    } else {
+        StellaReadiness::Blocked
+    }
 }
 
 fn block(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker {
@@ -275,6 +314,8 @@ mod tests {
         let path = "/roms/Pitfall.a26";
         let plan =
             build_stella_command_plan(&id("Atari2600"), &candidate(path, "stella"), &binding());
+        assert_eq!(classify_stella_readiness(&plan), StellaReadiness::Ready);
+        assert!(plan.first_blocker().is_none());
         let command = plan.command.expect("command");
         assert_eq!(command.arguments, vec![OsString::from(path)]);
         assert_eq!(command.executable, PathBuf::from("/usr/bin/stella"));
@@ -327,6 +368,7 @@ mod tests {
                     .any(|b| b.kind == LaunchBlockerKind::StellaContentFormatUnsupported),
                 "{path}"
             );
+            assert_eq!(classify_stella_readiness(&plan), StellaReadiness::Blocked);
         }
     }
 
@@ -362,6 +404,14 @@ mod tests {
             plan.blockers
                 .iter()
                 .any(|b| b.kind == LaunchBlockerKind::StellaBindingUnavailable)
+        );
+        assert_eq!(
+            classify_stella_readiness(&plan),
+            StellaReadiness::NeedsSetup
+        );
+        assert_eq!(
+            plan.first_blocker().map(|b| b.kind),
+            Some(LaunchBlockerKind::StellaBindingUnavailable)
         );
     }
 

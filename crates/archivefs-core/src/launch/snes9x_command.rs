@@ -20,6 +20,19 @@ use std::path::{Path, PathBuf};
 /// touch - EmuWiz's SNES identity is `.sfc`/`.smc` SNES/SFC cartridges only.
 pub const SNES9X_SUPPORTED_PLATFORM_IDS: &[&str] = &["SNES"];
 
+/// Readiness derived from the same command plan used by native launch.
+///
+/// Snes9x is executable-only in EmuWiz: there is no setup/configuration or
+/// firmware prerequisite to manufacture here.  The only setup-class blocker
+/// is an unavailable native binding; all content, identity, and candidate
+/// blockers remain hard launch blockers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Snes9xReadiness {
+    Ready,
+    NeedsSetup,
+    Blocked,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snes9xCommand {
     pub executable: PathBuf,
@@ -40,6 +53,32 @@ pub struct Snes9xCommandSelection {
 pub struct Snes9xCommandPlan {
     pub command: Option<Snes9xCommand>,
     pub blockers: Vec<LaunchBlocker>,
+}
+
+impl Snes9xCommandPlan {
+    /// Return the deterministic first blocker selected by command planning.
+    pub fn first_blocker(&self) -> Option<&LaunchBlocker> {
+        self.blockers.first()
+    }
+}
+
+fn is_setup_blocker(kind: LaunchBlockerKind) -> bool {
+    matches!(kind, LaunchBlockerKind::Snes9xBindingUnavailable)
+}
+
+/// Classify Snes9x readiness without duplicating launch-plan rules.
+pub fn classify_snes9x_readiness(plan: &Snes9xCommandPlan) -> Snes9xReadiness {
+    if plan.blockers.is_empty() {
+        Snes9xReadiness::Ready
+    } else if plan
+        .blockers
+        .iter()
+        .all(|blocker| is_setup_blocker(blocker.kind))
+    {
+        Snes9xReadiness::NeedsSetup
+    } else {
+        Snes9xReadiness::Blocked
+    }
 }
 
 fn block(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker {
@@ -221,6 +260,8 @@ mod tests {
         for path in ["/roms/Chrono Trigger.sfc", "/roms/Super Metroid.smc"] {
             let plan =
                 build_snes9x_command_plan(&id("SNES"), &candidate(path, "snes9x"), &binding());
+            assert_eq!(classify_snes9x_readiness(&plan), Snes9xReadiness::Ready);
+            assert!(plan.first_blocker().is_none());
             let command = plan.command.expect("command");
             assert_eq!(command.executable, PathBuf::from("/opt/snes9x-gtk"));
             assert_eq!(command.arguments, vec![OsString::from(path)]);
@@ -257,6 +298,7 @@ mod tests {
                     .any(|b| b.kind == LaunchBlockerKind::Snes9xContentFormatUnsupported),
                 "{path}"
             );
+            assert_eq!(classify_snes9x_readiness(&plan), Snes9xReadiness::Blocked);
         }
     }
 
@@ -289,6 +331,14 @@ mod tests {
             plan.blockers
                 .iter()
                 .any(|b| b.kind == LaunchBlockerKind::Snes9xBindingUnavailable)
+        );
+        assert_eq!(
+            classify_snes9x_readiness(&plan),
+            Snes9xReadiness::NeedsSetup
+        );
+        assert_eq!(
+            plan.first_blocker().map(|b| b.kind),
+            Some(LaunchBlockerKind::Snes9xBindingUnavailable)
         );
     }
 

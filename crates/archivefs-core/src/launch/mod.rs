@@ -436,7 +436,7 @@ pub use scummvm_execution::{
 };
 pub use snes9x_command::{
     SNES9X_SUPPORTED_PLATFORM_IDS, Snes9xCommand, Snes9xCommandPlan, Snes9xCommandSelection,
-    build_snes9x_command_plan,
+    Snes9xReadiness, build_snes9x_command_plan, classify_snes9x_readiness,
 };
 pub use snes9x_execution::{
     Snes9xLaunchPreflightError, Snes9xLaunchPreflightErrorKind, Snes9xLaunchRequest,
@@ -444,7 +444,7 @@ pub use snes9x_execution::{
 };
 pub use stella_command::{
     STELLA_SUPPORTED_PLATFORM_ID, StellaCommand, StellaCommandPlan, StellaCommandSelection,
-    build_stella_command_plan,
+    StellaReadiness, build_stella_command_plan, classify_stella_readiness,
 };
 pub use stella_execution::{
     StellaLaunchPreflightError, StellaLaunchPreflightErrorKind, StellaLaunchRequest,
