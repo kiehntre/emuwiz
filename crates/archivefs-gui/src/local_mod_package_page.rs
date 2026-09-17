@@ -21,7 +21,11 @@ use archivefs_core::patch_manager::{
     execute_shared_apply, execute_shared_rollback, generate_shared_operation_id,
     preview_shared_rollback,
 };
-use archivefs_core::rom_hack_catalogue::import_local_rom_hack_catalogue;
+use archivefs_core::rom_hack_catalogue::{
+    CatalogueField, RomHackCatalogueImportPreview, RomHackCatalogueMapping,
+    commit_local_rom_hack_catalogue, inspect_local_rom_hack_catalogue,
+    inspect_local_rom_hack_catalogue_member,
+};
 use archivefs_core::standalone_patch::{
     HeaderAdjustment, MAX_APPLY_BYTES, PatchCompatibility, StandalonePatchApplyPlan,
     StandalonePatchApplyResult, StandalonePatchInspection, StandalonePatchMatch,
@@ -65,7 +69,10 @@ struct StandalonePatchPageState {
     applying: Option<Receiver<Result<StandalonePatchApplyResult, String>>>,
     applied: Option<StandalonePatchApplyResult>,
     failure: Option<String>,
-    catalogue_picker: Option<Receiver<Result<Vec<ModCatalogueRecord>, String>>>,
+    catalogue_picker: Option<Receiver<Result<RomHackCatalogueImportPreview, String>>>,
+    catalogue_commit: Option<Receiver<Result<Vec<ModCatalogueRecord>, String>>>,
+    catalogue_preview: Option<RomHackCatalogueImportPreview>,
+    catalogue_mapping: RomHackCatalogueMapping,
     catalogue_records: Vec<ModCatalogueRecord>,
     catalogue_selected: Option<usize>,
     catalogue_action: Option<Receiver<Result<ModCatalogueRecord, String>>>,
@@ -176,9 +183,8 @@ fn poll_standalone(state: &mut StandalonePatchPageState) -> bool {
     }
     if let Some(receiver) = state.catalogue_picker.take() {
         match receiver.try_recv() {
-            Ok(Ok(records)) => {
-                state.catalogue_records = records;
-                state.catalogue_selected = None;
+            Ok(Ok(preview)) => {
+                state.catalogue_preview = Some(preview);
                 state.failure = None;
                 changed = true;
             }
@@ -189,6 +195,25 @@ fn poll_standalone(state: &mut StandalonePatchPageState) -> bool {
             Err(TryRecvError::Empty) => state.catalogue_picker = Some(receiver),
             Err(TryRecvError::Disconnected) => {
                 state.failure = Some("The catalogue import worker stopped early.".into());
+                changed = true;
+            }
+        }
+    }
+    if let Some(receiver) = state.catalogue_commit.take() {
+        match receiver.try_recv() {
+            Ok(Ok(records)) => {
+                state.catalogue_records = records;
+                state.catalogue_selected = None;
+                state.failure = None;
+                changed = true;
+            }
+            Ok(Err(error)) => {
+                state.failure = Some(error);
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => state.catalogue_commit = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                state.failure = Some("The catalogue commit worker stopped early.".into());
                 changed = true;
             }
         }
@@ -338,7 +363,39 @@ fn begin_catalogue_import(state: &mut StandalonePatchPageState) {
                 .add_filter("ROM-hack catalogue", &["json", "zip"])
                 .pick_file()
                 .ok_or_else(|| "No catalogue selected.".to_string())?;
-            let records = import_local_rom_hack_catalogue(&path).map_err(|e| e.to_string())?;
+            inspect_local_rom_hack_catalogue(&path).map_err(|e| e.to_string())
+        })();
+        let _ = sender.send(result);
+    });
+    state.catalogue_picker = Some(receiver);
+}
+
+fn begin_catalogue_member_inspection(
+    state: &mut StandalonePatchPageState,
+    path: PathBuf,
+    member: String,
+) {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(
+            inspect_local_rom_hack_catalogue_member(path, &member).map_err(|e| e.to_string()),
+        );
+    });
+    state.catalogue_picker = Some(receiver);
+}
+
+fn commit_catalogue_import(state: &mut StandalonePatchPageState) {
+    let Some(preview) = state.catalogue_preview.take() else {
+        return;
+    };
+    let path = preview.source_path.clone();
+    let member = preview.selected_member.clone();
+    let mapping = state.catalogue_mapping.clone();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let records = commit_local_rom_hack_catalogue(&path, member.as_deref(), &mapping)
+                .map_err(|e| e.to_string())?;
             let database_path =
                 archivefs_core::default_database_path().map_err(|e| e.to_string())?;
             let mut database = archivefs_core::Database::open_or_create(database_path)
@@ -353,7 +410,7 @@ fn begin_catalogue_import(state: &mut StandalonePatchPageState) {
         })();
         let _ = sender.send(result);
     });
-    state.catalogue_picker = Some(receiver);
+    state.catalogue_commit = Some(receiver);
 }
 
 fn associate_selected_patch(
@@ -542,7 +599,155 @@ fn show_rom_hack_catalogue(
             begin_catalogue_import(state);
         }
         if state.catalogue_picker.is_some() {
-            ui.label("Importing catalogue metadata locally…");
+            ui.label("Inspecting catalogue metadata locally…");
+        }
+        if let Some(preview) = state.catalogue_preview.clone() {
+            ui.separator();
+            ui.heading("Import preview");
+            ui.label(format!(
+                "Detected format: {:?} · shape: {:?}",
+                preview.input_format, preview.shape
+            ));
+            ui.label(format!(
+                "Records detected: {} · valid: {} · rejected: {}",
+                preview.records_detected,
+                preview.records_valid,
+                preview.rejected.len()
+            ));
+            ui.label(format!(
+                "Mapped fields: {} · ignored fields: {}",
+                preview.mapped_fields.len(),
+                preview.ignored_fields.len()
+            ));
+            if !preview.mapped_fields.is_empty() {
+                ui.small(
+                    preview
+                        .mapped_fields
+                        .iter()
+                        .map(|(field, path)| format!("{} ← {path}", field.label()))
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                );
+            }
+            if !preview.ignored_fields.is_empty() {
+                ui.small(format!(
+                    "Ignored fields: {}",
+                    preview.ignored_fields.join(", ")
+                ));
+            }
+            if !preview.duplicate_record_ids.is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Duplicate record IDs will be handled idempotently.",
+                );
+            }
+            if !preview.missing_identity.is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Some records have no checksum identity and remain browse-only.",
+                );
+            }
+            if !preview.rejected.is_empty() {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!(
+                        "Rejected records: {}",
+                        preview
+                            .rejected
+                            .iter()
+                            .map(|r| format!("#{} ({})", r.index + 1, r.reason))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+            if !preview.candidates.is_empty() {
+                ui.label("ZIP catalogue candidates:");
+                for candidate in &preview.candidates {
+                    let selected =
+                        preview.selected_member.as_deref() == Some(candidate.member_name.as_str());
+                    if ui
+                        .selectable_label(
+                            selected,
+                            format!(
+                                "{} · score {} · {} records",
+                                candidate.member_name, candidate.score, candidate.records
+                            ),
+                        )
+                        .clicked()
+                    {
+                        begin_catalogue_member_inspection(
+                            state,
+                            preview.source_path.clone(),
+                            candidate.member_name.clone(),
+                        );
+                    }
+                }
+            }
+            ui.label(format!(
+                "Sample records: {}",
+                preview
+                    .sample_records
+                    .iter()
+                    .map(|r| r.display_title.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            let zip_member_missing = preview.input_format
+                == archivefs_core::rom_hack_catalogue::LocalCatalogueInputFormat::Zip
+                && preview.selected_member.is_none();
+            let mapping_resolves = !zip_member_missing
+                && (!preview.requires_mapping
+                    || state
+                        .catalogue_mapping
+                        .paths
+                        .contains_key(&CatalogueField::HackTitle));
+            if preview.requires_mapping {
+                ui.colored_label(egui::Color32::YELLOW, "This import needs an explicit ZIP member or unambiguous field mapping; no database write is available yet.");
+                ui.label("Adjust mapping (temporary for this import session):");
+                for field in [
+                    CatalogueField::HackTitle,
+                    CatalogueField::BaseGameTitle,
+                    CatalogueField::Platform,
+                    CatalogueField::Author,
+                    CatalogueField::Version,
+                    CatalogueField::PatchFormat,
+                    CatalogueField::Crc32,
+                    CatalogueField::Sha1,
+                    CatalogueField::Sha256,
+                    CatalogueField::SourceSize,
+                    CatalogueField::Region,
+                    CatalogueField::Revision,
+                    CatalogueField::HeaderExpectation,
+                    CatalogueField::ReleaseDate,
+                    CatalogueField::SourceRecordId,
+                ] {
+                    let mut path = state
+                        .catalogue_mapping
+                        .paths
+                        .get(&field)
+                        .cloned()
+                        .unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label(field.label());
+                        if ui.text_edit_singleline(&mut path).changed() {
+                            if path.trim().is_empty() {
+                                state.catalogue_mapping.paths.remove(&field);
+                            } else {
+                                state.catalogue_mapping.paths.insert(field, path.clone());
+                            }
+                        }
+                    });
+                }
+            }
+            let import_enabled = mapping_resolves
+                && state.catalogue_picker.is_none()
+                && state.catalogue_commit.is_none();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(import_enabled, egui::Button::new("Import")).clicked() { commit_catalogue_import(state); }
+                if ui.button("Adjust mapping").clicked() { state.failure = Some("Automatic mapping is conservative. Select a catalogue with one unambiguous alias per field, or use the core import mapping API for an explicit field path.".into()); }
+                if ui.button("Cancel").clicked() { state.catalogue_preview = None; state.failure = None; }
+            });
         }
         if merged.is_empty() {
             ui.label("No ROM-hack metadata is installed locally.");
