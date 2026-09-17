@@ -8015,6 +8015,7 @@ mod tests {
                 source_page_url: "https://example.invalid/mod".into(),
                 schema_version: None,
                 imported_at: Some("2026-09-17T00:00:00Z".into()),
+                snapshot_sha256: None,
             },
             display_title: "Synthetic provider mod".into(),
             author: None,
@@ -8035,6 +8036,7 @@ mod tests {
                 author_or_uploader: None,
                 note: None,
             },
+            rom_hack: None,
         }
     }
 

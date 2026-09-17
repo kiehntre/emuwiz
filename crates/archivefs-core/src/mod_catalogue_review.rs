@@ -493,6 +493,7 @@ mod tests {
                 source_page_url: "https://example.invalid/record-1".into(),
                 schema_version: None,
                 imported_at: None,
+                snapshot_sha256: None,
             },
             display_title: "Fixture mod".into(),
             author: Some("Fixture author".into()),
@@ -521,6 +522,7 @@ mod tests {
                 author_or_uploader: Some("fixture-uploader".into()),
                 note: Some("synthetic".into()),
             },
+            rom_hack: None,
         }
     }
 

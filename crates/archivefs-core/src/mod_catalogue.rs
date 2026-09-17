@@ -33,6 +33,8 @@ pub struct ModCatalogueProvider {
     pub source_page_url: String,
     pub schema_version: Option<String>,
     pub imported_at: Option<String>,
+    #[serde(default)]
+    pub snapshot_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,6 +179,31 @@ pub struct ModCatalogueRecord {
     pub destination_intent: ModDestinationIntent,
     pub instructions: Option<String>,
     pub provenance: ModCatalogueProvenance,
+    #[serde(default)]
+    pub rom_hack: Option<RomHackCatalogueMetadata>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RomHackHeaderExpectation {
+    Headered,
+    Headerless,
+    Either,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RomHackCatalogueMetadata {
+    pub base_game_title: Option<String>,
+    pub release_date: Option<String>,
+    pub patch_format: Option<String>,
+    pub required_base_crc32: Option<u32>,
+    #[serde(default)]
+    pub required_base_hashes: Vec<ModCatalogueHash>,
+    pub required_base_size: Option<u64>,
+    pub header_expectation: Option<RomHackHeaderExpectation>,
+    #[serde(default)]
+    pub local_patch_path: Option<PathBuf>,
+    pub associated_patch_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,6 +238,68 @@ impl ModCatalogueRecord {
             "declared_revision",
             self.declared_revision.as_deref(),
         );
+        if let Some(rom_hack) = &self.rom_hack {
+            bounded_optional(
+                &mut errors,
+                "rom_hack.base_game_title",
+                rom_hack.base_game_title.as_deref(),
+            );
+            bounded_optional(
+                &mut errors,
+                "rom_hack.release_date",
+                rom_hack.release_date.as_deref(),
+            );
+            bounded_optional(
+                &mut errors,
+                "rom_hack.patch_format",
+                rom_hack.patch_format.as_deref(),
+            );
+            if let Some(crc32) = rom_hack.required_base_crc32
+                && crc32 == 0
+            {
+                errors.push(error(
+                    "rom_hack.required_base_crc32",
+                    "CRC32 must not be zero",
+                ));
+            }
+            if rom_hack.required_base_hashes.len() > MAX_CATALOGUE_IDENTITIES {
+                errors.push(error(
+                    "rom_hack.required_base_hashes",
+                    "hash count exceeds the catalogue bound",
+                ));
+            }
+            for hash in &rom_hack.required_base_hashes {
+                if !valid_hash_value(&hash.algorithm, &hash.value) {
+                    errors.push(error(
+                        "rom_hack.required_base_hashes",
+                        "unsupported algorithm or invalid digest",
+                    ));
+                }
+            }
+            if let Some(path) = &rom_hack.local_patch_path
+                && path.as_os_str().len() > MAX_CATALOGUE_TEXT_BYTES
+            {
+                errors.push(error(
+                    "rom_hack.local_patch_path",
+                    "path exceeds the catalogue bound",
+                ));
+            }
+            bounded_optional(
+                &mut errors,
+                "rom_hack.associated_patch_sha256",
+                rom_hack.associated_patch_sha256.as_deref(),
+            );
+            if rom_hack
+                .associated_patch_sha256
+                .as_deref()
+                .is_some_and(|hash| !valid_hash_value(&ModCatalogueHashAlgorithm::Sha256, hash))
+            {
+                errors.push(error(
+                    "rom_hack.associated_patch_sha256",
+                    "SHA-256 digest is malformed",
+                ));
+            }
+        }
         if let Some(instructions) = self.instructions.as_deref()
             && instructions.len() > MAX_CATALOGUE_INSTRUCTIONS_BYTES
         {
@@ -596,6 +685,7 @@ mod tests {
                 source_page_url: "https://example.invalid/mod/record-1".into(),
                 schema_version: None,
                 imported_at: None,
+                snapshot_sha256: None,
             },
             display_title: "Synthetic mod".into(),
             author: None,
@@ -634,6 +724,7 @@ mod tests {
                 author_or_uploader: None,
                 note: Some("metadata fixture".into()),
             },
+            rom_hack: None,
         }
     }
 

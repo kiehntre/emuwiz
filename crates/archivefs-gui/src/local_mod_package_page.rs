@@ -21,6 +21,7 @@ use archivefs_core::patch_manager::{
     execute_shared_apply, execute_shared_rollback, generate_shared_operation_id,
     preview_shared_rollback,
 };
+use archivefs_core::rom_hack_catalogue::import_local_rom_hack_catalogue;
 use archivefs_core::standalone_patch::{
     HeaderAdjustment, MAX_APPLY_BYTES, PatchCompatibility, StandalonePatchApplyPlan,
     StandalonePatchApplyResult, StandalonePatchInspection, StandalonePatchMatch,
@@ -64,6 +65,10 @@ struct StandalonePatchPageState {
     applying: Option<Receiver<Result<StandalonePatchApplyResult, String>>>,
     applied: Option<StandalonePatchApplyResult>,
     failure: Option<String>,
+    catalogue_picker: Option<Receiver<Result<Vec<ModCatalogueRecord>, String>>>,
+    catalogue_records: Vec<ModCatalogueRecord>,
+    catalogue_selected: Option<usize>,
+    catalogue_action: Option<Receiver<Result<ModCatalogueRecord, String>>>,
 }
 
 struct StandalonePatchCandidate {
@@ -165,6 +170,50 @@ fn poll_standalone(state: &mut StandalonePatchPageState) -> bool {
             Err(TryRecvError::Empty) => state.applying = Some(receiver),
             Err(TryRecvError::Disconnected) => {
                 state.failure = Some("The patch apply worker stopped early.".into());
+                changed = true;
+            }
+        }
+    }
+    if let Some(receiver) = state.catalogue_picker.take() {
+        match receiver.try_recv() {
+            Ok(Ok(records)) => {
+                state.catalogue_records = records;
+                state.catalogue_selected = None;
+                state.failure = None;
+                changed = true;
+            }
+            Ok(Err(error)) => {
+                state.failure = Some(error);
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => state.catalogue_picker = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                state.failure = Some("The catalogue import worker stopped early.".into());
+                changed = true;
+            }
+        }
+    }
+    if let Some(receiver) = state.catalogue_action.take() {
+        match receiver.try_recv() {
+            Ok(Ok(record)) => {
+                if let Some(existing) = state.catalogue_records.iter_mut().find(|item| {
+                    item.provider.name == record.provider.name
+                        && item.provider.record_id == record.provider.record_id
+                }) {
+                    *existing = record;
+                } else {
+                    state.catalogue_records.push(record);
+                }
+                state.failure = None;
+                changed = true;
+            }
+            Ok(Err(error)) => {
+                state.failure = Some(error);
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => state.catalogue_action = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                state.failure = Some("The catalogue association worker stopped early.".into());
                 changed = true;
             }
         }
@@ -281,11 +330,341 @@ fn begin_patch_pick(
     state.picker = Some(receiver);
 }
 
+fn begin_catalogue_import(state: &mut StandalonePatchPageState) {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let path = rfd::FileDialog::new()
+                .add_filter("ROM-hack catalogue", &["json", "zip"])
+                .pick_file()
+                .ok_or_else(|| "No catalogue selected.".to_string())?;
+            let records = import_local_rom_hack_catalogue(&path).map_err(|e| e.to_string())?;
+            let database_path =
+                archivefs_core::default_database_path().map_err(|e| e.to_string())?;
+            let mut database = archivefs_core::Database::open_or_create(database_path)
+                .map_err(|e| e.to_string())?;
+            for record in &records {
+                database
+                    .upsert_mod_catalogue_record(record)
+                    .map_err(|e| e.to_string())?;
+            }
+            database.close().map_err(|e| e.to_string())?;
+            Ok(records)
+        })();
+        let _ = sender.send(result);
+    });
+    state.catalogue_picker = Some(receiver);
+}
+
+fn associate_selected_patch(
+    state: &mut StandalonePatchPageState,
+    record: &ModCatalogueRecord,
+    patch_path: PathBuf,
+    patch_sha256: String,
+) {
+    let mut updated = record.clone();
+    let Some(metadata) = updated.rom_hack.as_mut() else {
+        return;
+    };
+    metadata.local_patch_path = Some(patch_path);
+    metadata.associated_patch_sha256 = Some(patch_sha256);
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let database_path =
+                archivefs_core::default_database_path().map_err(|e| e.to_string())?;
+            let mut database = archivefs_core::Database::open_or_create(database_path)
+                .map_err(|e| e.to_string())?;
+            database
+                .upsert_mod_catalogue_record(&updated)
+                .map_err(|e| e.to_string())?;
+            database.close().map_err(|e| e.to_string())?;
+            Ok(updated)
+        })();
+        let _ = sender.send(result);
+    });
+    state.catalogue_action = Some(receiver);
+}
+
+fn catalogue_records_for_view(
+    base: &[ModCatalogueRecord],
+    imported: &[ModCatalogueRecord],
+) -> Vec<ModCatalogueRecord> {
+    let mut records = base.to_vec();
+    for record in imported {
+        if let Some(existing) = records.iter_mut().find(|item| {
+            item.provider.name == record.provider.name
+                && item.provider.record_id == record.provider.record_id
+        }) {
+            *existing = record.clone();
+        } else {
+            records.push(record.clone());
+        }
+    }
+    records.sort_by(|left, right| {
+        left.display_title
+            .cmp(&right.display_title)
+            .then_with(|| left.provider.name.cmp(&right.provider.name))
+            .then_with(|| left.provider.record_id.cmp(&right.provider.record_id))
+    });
+    records
+}
+
+fn rom_hack_compatibility(
+    record: &ModCatalogueRecord,
+    identity: &GameIdentityReport,
+    base: Option<(u64, u32, &str)>,
+) -> (&'static str, widgets::StatusTone, String) {
+    let Some(metadata) = record.rom_hack.as_ref() else {
+        return (
+            "Browse-only metadata",
+            widgets::StatusTone::Info,
+            "This catalogue entry has no ROM-hack identity fields.".into(),
+        );
+    };
+    if let Some(platform) = record.platform
+        && canonical_platform_identity(platform) != identity.platform
+    {
+        return (
+            "Incompatible revision",
+            widgets::StatusTone::Blocked,
+            "The catalogue platform does not match this game.".into(),
+        );
+    }
+    let Some((size, crc, sha)) = base else {
+        return (
+            "Unknown compatibility",
+            widgets::StatusTone::Warning,
+            "The selected ROM could not be hashed for comparison.".into(),
+        );
+    };
+    if metadata
+        .required_base_size
+        .is_some_and(|expected| expected != size)
+    {
+        return (
+            "Incompatible revision",
+            widgets::StatusTone::Blocked,
+            "The required ROM size differs from the selected ROM.".into(),
+        );
+    }
+    if metadata
+        .required_base_crc32
+        .is_some_and(|expected| expected != crc)
+    {
+        return (
+            "Incompatible revision",
+            widgets::StatusTone::Blocked,
+            "The required ROM CRC32 differs from the selected ROM.".into(),
+        );
+    }
+    let sha256_hashes: Vec<_> = metadata
+        .required_base_hashes
+        .iter()
+        .filter(|hash| {
+            matches!(
+                hash.algorithm,
+                archivefs_core::mod_catalogue::ModCatalogueHashAlgorithm::Sha256
+            )
+        })
+        .collect();
+    if sha256_hashes.iter().any(|hash| {
+        matches!(
+            hash.algorithm,
+            archivefs_core::mod_catalogue::ModCatalogueHashAlgorithm::Sha256
+        ) && hash.value.eq_ignore_ascii_case(sha)
+    }) {
+        return (
+            "Exact match",
+            widgets::StatusTone::Success,
+            "The selected ROM SHA-256 exactly matches the catalogue.".into(),
+        );
+    }
+    if !sha256_hashes.is_empty() {
+        return (
+            "Incompatible revision",
+            widgets::StatusTone::Blocked,
+            "The required ROM SHA-256 differs from the selected ROM.".into(),
+        );
+    }
+    if metadata.required_base_crc32.is_some() && metadata.required_base_size.is_some() {
+        return (
+            "Exact match",
+            widgets::StatusTone::Success,
+            "The selected ROM CRC32 and size exactly match the catalogue.".into(),
+        );
+    }
+    (
+        "Unknown compatibility",
+        widgets::StatusTone::Warning,
+        "This entry matches only title/platform metadata; it remains browse-only until the patch itself is verified.".into(),
+    )
+}
+
+fn canonical_platform_identity(
+    platform: archivefs_core::mod_package::ModCanonicalPlatform,
+) -> archivefs_core::game_identity::IdentityPlatform {
+    use archivefs_core::game_identity::IdentityPlatform;
+    use archivefs_core::mod_package::ModCanonicalPlatform;
+    match platform {
+        ModCanonicalPlatform::PlayStation3 => IdentityPlatform::PlayStation3,
+        ModCanonicalPlatform::PlayStation2 => IdentityPlatform::PlayStation2,
+        ModCanonicalPlatform::GameCube => IdentityPlatform::GameCube,
+        ModCanonicalPlatform::Wii => IdentityPlatform::Wii,
+        ModCanonicalPlatform::MegaDrive => IdentityPlatform::MegaDrive,
+        ModCanonicalPlatform::Snes => IdentityPlatform::Snes,
+        ModCanonicalPlatform::Xbox360 => IdentityPlatform::Xbox360,
+    }
+}
+
+fn show_rom_hack_catalogue(
+    ui: &mut egui::Ui,
+    state: &mut StandalonePatchPageState,
+    archive_path: &std::path::Path,
+    identity: &GameIdentityReport,
+    records: &[ModCatalogueRecord],
+) {
+    let merged = catalogue_records_for_view(records, &state.catalogue_records);
+    let facts = base_facts(archive_path).ok();
+    widgets::card(ui, |ui| {
+        ui.heading("ROM Hacks catalogue");
+        ui.label(
+            "Metadata imported from a local file only. Catalogue entries never download patches.",
+        );
+        if widgets::action_button(
+            ui,
+            "Import local ROM-hack catalogue",
+            widgets::ActionStyle::Secondary,
+            state.catalogue_picker.is_none(),
+        )
+        .clicked()
+        {
+            begin_catalogue_import(state);
+        }
+        if state.catalogue_picker.is_some() {
+            ui.label("Importing catalogue metadata locally…");
+        }
+        if merged.is_empty() {
+            ui.label("No ROM-hack metadata is installed locally.");
+            return;
+        }
+        ui.heading("Known hacks");
+        for (index, record) in merged.iter().enumerate() {
+            let (label, tone, reason) = rom_hack_compatibility(
+                record,
+                identity,
+                facts
+                    .as_ref()
+                    .map(|(size, crc, sha)| (*size, *crc, sha.as_str())),
+            );
+            if ui
+                .selectable_label(
+                    state.catalogue_selected == Some(index),
+                    format!(
+                        "{} {} — {label}",
+                        record.display_title,
+                        record.version.as_deref().unwrap_or("")
+                    ),
+                )
+                .clicked()
+            {
+                state.catalogue_selected = Some(index);
+            }
+            ui.small(format!(
+                "{} · {} · {}",
+                record.author.as_deref().unwrap_or("Author unknown"),
+                record
+                    .rom_hack
+                    .as_ref()
+                    .and_then(|m| m.patch_format.as_deref())
+                    .unwrap_or("format unknown"),
+                reason
+            ));
+            if tone == widgets::StatusTone::Blocked {
+                ui.small("Incompatible revisions remain visible for reference.");
+            }
+        }
+        if let Some(index) = state.catalogue_selected.and_then(|index| merged.get(index)) {
+            let (label, tone, reason) = rom_hack_compatibility(
+                index,
+                identity,
+                facts
+                    .as_ref()
+                    .map(|(size, crc, sha)| (*size, *crc, sha.as_str())),
+            );
+            widgets::status_badge(ui, label, tone);
+            ui.label(reason);
+            if let Some(metadata) = index.rom_hack.as_ref() {
+                ui.label(format!(
+                    "Base game: {}",
+                    metadata.base_game_title.as_deref().unwrap_or("Unknown")
+                ));
+                ui.label(format!(
+                    "Expected revision: {}",
+                    index.declared_revision.as_deref().unwrap_or("Unknown")
+                ));
+                ui.label(format!(
+                    "Patch format: {}",
+                    metadata.patch_format.as_deref().unwrap_or("Unknown")
+                ));
+                ui.label(format!(
+                    "Release date: {}",
+                    metadata.release_date.as_deref().unwrap_or("Unknown")
+                ));
+                ui.label(format!(
+                    "Header expectation: {}",
+                    match metadata.header_expectation {
+                        Some(archivefs_core::mod_catalogue::RomHackHeaderExpectation::Headered) => {
+                            "headered"
+                        }
+                        Some(
+                            archivefs_core::mod_catalogue::RomHackHeaderExpectation::Headerless,
+                        ) => {
+                            "headerless"
+                        }
+                        Some(archivefs_core::mod_catalogue::RomHackHeaderExpectation::Either) => {
+                            "either"
+                        }
+                        None => "not specified",
+                    }
+                ));
+                ui.label(if metadata.local_patch_path.is_some() {
+                    "Local patch payload is associated."
+                } else {
+                    "Known hack — patch file is not installed locally."
+                });
+                if metadata.local_patch_path.is_none() {
+                    ui.label(
+                        "Choose a local patch above, then associate it here after inspection.",
+                    );
+                    let selected_patch =
+                        state.candidates.get(state.selected).and_then(|candidate| {
+                            (candidate.inspection.state
+                                == archivefs_core::standalone_patch::PatchInspectionState::Valid)
+                                .then(|| {
+                                    (
+                                        candidate.inspection.path.clone(),
+                                        candidate.inspection.patch_sha256.clone(),
+                                    )
+                                })
+                        });
+                    if let Some((patch_path, patch_sha256)) = selected_patch
+                        && ui.button("Associate selected local patch").clicked()
+                    {
+                        associate_selected_patch(state, index, patch_path, patch_sha256);
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn show_standalone_patch_panel(
     ui: &mut egui::Ui,
     state: &mut StandalonePatchPageState,
     archive_path: &std::path::Path,
     identity: &GameIdentityReport,
+    catalogue_records: &[ModCatalogueRecord],
 ) {
     widgets::section_header(
         ui,
@@ -294,6 +673,7 @@ fn show_standalone_patch_panel(
             "Choose a local patch and preview a new derived ROM. Your original ROM is never changed.",
         ),
     );
+    show_rom_hack_catalogue(ui, state, archive_path, identity, catalogue_records);
     widgets::card(ui, |ui| {
         ui.heading("Base ROM");
         ui.label(archive_path.display().to_string());
@@ -640,6 +1020,10 @@ fn show_provider_catalogue_candidates(
     identity: &GameIdentityReport,
     records: &[ModCatalogueRecord],
 ) {
+    let records: Vec<_> = records
+        .iter()
+        .filter(|record| record.rom_hack.is_none())
+        .collect();
     if records.is_empty() {
         return;
     }
@@ -648,7 +1032,7 @@ fn show_provider_catalogue_candidates(
     widgets::card(ui, |ui| {
         ui.heading("Catalogue mod candidates");
         ui.label("These records were imported from a provider catalogue. They are browse-only until a matching package is available locally.");
-        let mut order: Vec<_> = records.iter().collect();
+        let mut order: Vec<_> = records.clone();
         order.sort_by(|left, right| {
             catalogue_candidate_label(right, identity)
                 .cmp(catalogue_candidate_label(left, identity))
@@ -749,7 +1133,13 @@ pub fn show_local_mod_package_panel_with_catalogue(
         "Ordinary game mods",
         Some("Choose a local mod folder. EmuWiz previews every file before anything changes."),
     );
-    show_standalone_patch_panel(ui, &mut state.standalone, archive_path, identity);
+    show_standalone_patch_panel(
+        ui,
+        &mut state.standalone,
+        archive_path,
+        identity,
+        catalogue_records,
+    );
     show_provider_catalogue_candidates(ui, state, identity, catalogue_records);
     if state.provider_selection.is_some() {
         return;
@@ -1211,6 +1601,7 @@ mod tests {
                 source_page_url: "https://example.invalid/mod/record-1".into(),
                 schema_version: None,
                 imported_at: None,
+                snapshot_sha256: None,
             },
             display_title: "Catalogue-only translation".into(),
             author: None,
@@ -1234,6 +1625,7 @@ mod tests {
                 author_or_uploader: None,
                 note: None,
             },
+            rom_hack: None,
         }
     }
 

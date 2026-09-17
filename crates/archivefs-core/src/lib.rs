@@ -536,6 +536,8 @@ pub mod mod_package;
 
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
+/// Bounded import of user-supplied local ROM-hack metadata.
+pub mod rom_hack_catalogue;
 
 /// Pure review projection for provider-neutral catalogue records.
 pub mod mod_catalogue_review;
