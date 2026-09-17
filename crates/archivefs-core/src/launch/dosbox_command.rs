@@ -264,6 +264,82 @@ impl DosBoxConfigStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DosBoxReadinessEvidence {
+    pub executable: Option<PathBuf>,
+    pub version: Option<String>,
+    pub variant: Option<DosBoxVariant>,
+    pub config_path: Option<PathBuf>,
+    pub config_readable: bool,
+    pub autoexec_command_lines: usize,
+    pub ready: bool,
+    pub first_blocker: Option<String>,
+}
+
+/// Read-only setup assessment shared with DOSBox launch discovery. The
+/// `[autoexec]` section is inspected structurally only; none of its commands
+/// are interpreted or executed.
+pub fn assess_dosbox_readiness(
+    executable: Option<&Path>,
+    variant_id: &str,
+    game_directory: Option<&Path>,
+) -> DosBoxReadinessEvidence {
+    let variant = dosbox_variant_from_id(variant_id);
+    let first_blocker = if variant.is_none() {
+        Some(DosBoxBindingRefusal::VariantUnsupported(variant_id.into()).detail())
+    } else if executable.is_none() {
+        Some("no DOSBox Staging executable was found".into())
+    } else {
+        None
+    };
+    let (config_path, config_readable, autoexec_command_lines, config_blocker) =
+        match game_directory {
+            Some(directory) => match discover_dosbox_config(directory, &TrustedRoots::none()) {
+                DosBoxConfigStatus::Verified {
+                    config_path,
+                    autoexec_command_lines,
+                } => (Some(config_path), true, autoexec_command_lines, None),
+                DosBoxConfigStatus::Missing => {
+                    (None, false, 0, Some("dosbox.conf is missing".into()))
+                }
+                DosBoxConfigStatus::Malformed(detail) => (
+                    None,
+                    false,
+                    0,
+                    Some(format!("dosbox.conf is unreadable or malformed: {detail}")),
+                ),
+                DosBoxConfigStatus::ValidNoAutoexec => (
+                    None,
+                    true,
+                    0,
+                    Some("dosbox.conf has no [autoexec] section".into()),
+                ),
+            },
+            None => (None, false, 0, None),
+        };
+    let binding_blocker = match (executable, variant) {
+        (Some(path), Some(variant)) => resolve_dosbox_native_launch_binding_at(path, variant)
+            .err()
+            .map(|refusal| refusal.detail()),
+        _ => None,
+    };
+    let first_blocker = first_blocker.or(config_blocker).or(binding_blocker);
+    DosBoxReadinessEvidence {
+        executable: executable.map(Path::to_path_buf),
+        version: None,
+        variant,
+        config_path,
+        config_readable,
+        autoexec_command_lines,
+        ready: first_blocker.is_none() && game_directory.is_some(),
+        first_blocker: first_blocker.or_else(|| {
+            game_directory
+                .is_none()
+                .then(|| "DOS game directory was not inspected".into())
+        }),
+    }
+}
+
 /// Pure mapping from an already-run [`DosboxConfigInspection`] to a
 /// [`DosBoxConfigStatus`], given the path that was inspected. A seam so the
 /// planner never does I/O.

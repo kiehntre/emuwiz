@@ -35,6 +35,39 @@ fn write_executable(path: &Path) {
     }
 }
 
+#[test]
+fn staging_readiness_reports_precise_variant_and_structural_autoexec_only() {
+    let dir = scratch_dir("readiness");
+    let executable = dir.join("dosbox-staging");
+    write_executable(&executable);
+    std::fs::write(
+        dir.join("dosbox.conf"),
+        b"[dosbox]\nmemsize=16\n[autoexec]\ntouch SHOULD_NOT_EXIST\n",
+    )
+    .unwrap();
+    let evidence = assess_dosbox_readiness(Some(&executable), "dosbox-staging", Some(&dir));
+    assert!(evidence.ready);
+    assert_eq!(evidence.variant, Some(DosBoxVariant::Staging));
+    assert_eq!(evidence.autoexec_command_lines, 1);
+    assert!(!dir.join("SHOULD_NOT_EXIST").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn staging_readiness_distinguishes_unsupported_implementation() {
+    let dir = scratch_dir("unsupported");
+    let evidence = assess_dosbox_readiness(None, "dosbox-x", Some(&dir));
+    assert!(!evidence.ready);
+    assert!(
+        evidence
+            .first_blocker
+            .as_deref()
+            .unwrap()
+            .contains("not a supported DOSBox variant")
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn ok_binding(variant: DosBoxVariant) -> Result<DosBoxNativeLaunchBinding, DosBoxBindingRefusal> {
     Ok(DosBoxNativeLaunchBinding {
         executable: PathBuf::from(match variant {

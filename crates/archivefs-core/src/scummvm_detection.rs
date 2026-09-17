@@ -308,6 +308,125 @@ pub enum ScummVmCompatibility {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScummVmReadinessBlockerKind {
+    ExecutableMissing,
+    DetectorUnavailable,
+    DetectorFailed,
+    InvalidGameFolder,
+    IdentityUnresolved,
+    UnsupportedGame,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScummVmReadinessEvidence {
+    pub executable: Option<PathBuf>,
+    pub version: Option<String>,
+    pub detector_available: bool,
+    pub game_folder: Option<PathBuf>,
+    pub detected_game: Option<ScummVmDetectedGame>,
+    pub blocker_kind: Option<ScummVmReadinessBlockerKind>,
+    pub first_blocker: Option<String>,
+    pub ready: bool,
+}
+
+/// Reuses the detector and executable checks used by ScummVM launch
+/// preflight. Detection keeps using its isolated temporary configuration and
+/// never creates persistent ScummVM state.
+pub fn assess_scummvm_readiness(
+    executable: Option<&Path>,
+    game_folder: Option<&Path>,
+) -> ScummVmReadinessEvidence {
+    let Some(executable) = executable else {
+        return ScummVmReadinessEvidence {
+            executable: None,
+            version: None,
+            detector_available: false,
+            game_folder: game_folder.map(Path::to_path_buf),
+            detected_game: None,
+            blocker_kind: Some(ScummVmReadinessBlockerKind::ExecutableMissing),
+            first_blocker: Some("ScummVM executable is unavailable or unsafe".into()),
+            ready: false,
+        };
+    };
+    let binding =
+        crate::launch::scummvm_command::resolve_scummvm_native_launch_binding_at(executable);
+    if let Err(detail) = binding {
+        return ScummVmReadinessEvidence {
+            executable: Some(executable.to_path_buf()),
+            version: None,
+            detector_available: false,
+            game_folder: game_folder.map(Path::to_path_buf),
+            detected_game: None,
+            blocker_kind: Some(ScummVmReadinessBlockerKind::ExecutableMissing),
+            first_blocker: Some(detail),
+            ready: false,
+        };
+    }
+    let version = scummvm_version(executable);
+    let Some(game_folder) = game_folder else {
+        return ScummVmReadinessEvidence {
+            executable: Some(executable.to_path_buf()),
+            version,
+            detector_available: true,
+            game_folder: None,
+            detected_game: None,
+            blocker_kind: None,
+            first_blocker: None,
+            ready: true,
+        };
+    };
+    match detect_scummvm_directory_with_executable(game_folder, executable) {
+        Ok(detected_game) => ScummVmReadinessEvidence {
+            executable: Some(executable.to_path_buf()),
+            version,
+            detector_available: true,
+            game_folder: Some(game_folder.to_path_buf()),
+            detected_game: Some(detected_game),
+            blocker_kind: None,
+            first_blocker: None,
+            ready: true,
+        },
+        Err(error) => {
+            let (blocker_kind, detail) = match &error {
+                ScummVmDetectionError::InvalidRoot(_)
+                | ScummVmDetectionError::UnsafeEntry(_)
+                | ScummVmDetectionError::TooManyEntries => (
+                    ScummVmReadinessBlockerKind::InvalidGameFolder,
+                    error.to_string(),
+                ),
+                ScummVmDetectionError::DetectorUnavailable => (
+                    ScummVmReadinessBlockerKind::DetectorUnavailable,
+                    error.to_string(),
+                ),
+                ScummVmDetectionError::DetectorFailed(_)
+                | ScummVmDetectionError::MalformedOutput(_) => (
+                    ScummVmReadinessBlockerKind::DetectorFailed,
+                    error.to_string(),
+                ),
+                ScummVmDetectionError::Ambiguous(_) => (
+                    ScummVmReadinessBlockerKind::IdentityUnresolved,
+                    error.to_string(),
+                ),
+                ScummVmDetectionError::NoMatch => (
+                    ScummVmReadinessBlockerKind::UnsupportedGame,
+                    error.to_string(),
+                ),
+            };
+            ScummVmReadinessEvidence {
+                executable: Some(executable.to_path_buf()),
+                version,
+                detector_available: true,
+                game_folder: Some(game_folder.to_path_buf()),
+                detected_game: None,
+                blocker_kind: Some(blocker_kind),
+                first_blocker: Some(detail),
+                ready: false,
+            }
+        }
+    }
+}
+
 /// Resolves the local executable and, if one exists, asks it for its own
 /// version - see [`ScummVmCompatibility`]'s own doc for the shape and why
 /// it stops there.
@@ -1226,6 +1345,43 @@ mod tests {
             ScummVmCompatibility::Installed { version, .. } => assert_eq!(version, None),
             ScummVmCompatibility::NotInstalled => panic!("executable was provided directly"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_reuses_detector_and_reports_version_without_persistent_config() {
+        let root = tempfile::tempdir().unwrap();
+        let game = root.path().join("game with spaces");
+        fs::create_dir(&game).unwrap();
+        fs::write(game.join("resource.dat"), b"fixture").unwrap();
+        let detector = write_fixture(
+            root.path(),
+            "scummvm",
+            b"#!/bin/sh\nprintf 'ScummVM 2.8.1\\n'\nprintf 'Game ID: scumm:monkey\\n'\n",
+        );
+        let before: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let evidence = assess_scummvm_readiness(Some(&detector), Some(&game));
+        assert!(evidence.ready);
+        assert_eq!(evidence.version.as_deref(), Some("ScummVM 2.8.1"));
+        assert_eq!(evidence.detected_game.as_ref().unwrap().game_id, "monkey");
+        let after: Vec<_> = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn readiness_orders_missing_executable_before_game_evidence() {
+        let evidence = assess_scummvm_readiness(None, Some(Path::new("../unsafe")));
+        assert_eq!(
+            evidence.blocker_kind,
+            Some(ScummVmReadinessBlockerKind::ExecutableMissing)
+        );
+        assert!(!evidence.ready);
     }
 
     #[test]
