@@ -341,6 +341,79 @@ pub struct HatariGameInspection {
     pub selected_game: HatariSelectedGame,
 }
 
+/// Read-only, adapter-local readiness evidence assembled from one discovered
+/// profile and its fresh inspection. This is deliberately not a Doctor model:
+/// it preserves Hatari's executable, configuration, machine, TOS, and media
+/// facts so later consumers can serialize or present them without rebuilding
+/// Hatari-specific rules.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HatariReadinessEvidence {
+    pub profile_id: String,
+    pub executable: Option<HatariExecutable>,
+    pub config_path: PathBuf,
+    pub config_present: bool,
+    pub config_readable: bool,
+    pub machine: HatariMachineSettings,
+    pub tos: HatariTosRom,
+    pub media_representations: Vec<HatariFloppyRepresentation>,
+    pub ready: bool,
+    pub ready_with_warnings: bool,
+    pub first_blocker: Option<String>,
+}
+
+/// Projects the existing Hatari inspection facts onto a conservative setup
+/// readiness result. The ordering mirrors the launch command's authoritative
+/// checks: profile, executable binding, configuration, machine model, then
+/// TOS. Selected identity/media path checks remain launch-preflight checks and
+/// are intentionally not inferred here.
+pub fn assess_hatari_readiness(
+    profile: &HatariProfile,
+    inspection: &HatariGameInspection,
+) -> HatariReadinessEvidence {
+    let executable = profile.executable_candidates.first().cloned();
+    let first_blocker = if !profile.eligible {
+        Some("Hatari profile configuration is missing or not a regular file".into())
+    } else if profile.executable_candidates.is_empty() {
+        Some("no Hatari executable was discovered".into())
+    } else if profile.executable_candidates.len() != 1 {
+        Some("more than one Hatari executable remains possible".into())
+    } else if !is_executable(profile.executable_candidates[0].path.as_path()) {
+        Some("Hatari executable is not executable".into())
+    } else if !inspection.config.readable {
+        Some("Hatari configuration is not safely readable".into())
+    } else if inspection.config.machine.model == HatariMachineModel::Unknown {
+        Some("Hatari machine model is not configured or could not be read".into())
+    } else {
+        match inspection.health.tos.health {
+            HatariTosHealth::Verified | HatariTosHealth::PresentUnverified => None,
+            HatariTosHealth::Missing => Some("configured Hatari TOS image is missing".into()),
+            HatariTosHealth::NotConfigured | HatariTosHealth::Unreadable => {
+                Some("Hatari TOS image is not safely available".into())
+            }
+        }
+    };
+    let ready = first_blocker.is_none();
+    HatariReadinessEvidence {
+        profile_id: profile.profile_id.clone(),
+        executable,
+        config_path: profile.config_path.clone(),
+        config_present: inspection.config.exists,
+        config_readable: inspection.config.readable,
+        machine: inspection.config.machine.clone(),
+        tos: inspection.health.tos.clone(),
+        media_representations: inspection
+            .config
+            .floppies
+            .iter()
+            .map(|floppy| floppy.representation)
+            .collect(),
+        ready,
+        ready_with_warnings: ready
+            && inspection.health.tos.health == HatariTosHealth::PresentUnverified,
+        first_blocker,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Candidate {
     kind: HatariInstallationType,
@@ -1003,6 +1076,22 @@ fn is_regular(path: &Path) -> bool {
         .map(|m| m.file_type().is_file())
         .unwrap_or(false)
 }
+fn is_executable(path: &Path) -> bool {
+    if !is_regular(path) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
 fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|m| m.file_type().is_dir())
@@ -1021,6 +1110,9 @@ fn path_state(path: Option<&Path>) -> HatariPathState {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     fn roots(tree: &TempDir) -> HatariProfileDiscoveryRoots {
         HatariProfileDiscoveryRoots {
             home: tree.path().join("home"),
@@ -1037,6 +1129,15 @@ mod tests {
     fn write(path: &Path, contents: &[u8]) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+    fn executable(path: &Path) {
+        write(path, b"hatari");
+        #[cfg(unix)]
+        {
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+        }
     }
     fn profile(config: PathBuf) -> HatariProfile {
         HatariProfile {
@@ -1358,5 +1459,124 @@ mod tests {
         assert_eq!(discovered.profiles.len(), 1);
         assert!(!discovered.profiles[0].eligible);
         assert!(discovered.profiles[0].executable_candidates.is_empty());
+    }
+
+    #[test]
+    fn readiness_retains_executable_machine_tos_and_media_evidence() {
+        let t = TempDir::new().unwrap();
+        let config = t.path().join("hatari.cfg");
+        let tos = t.path().join("tos.img");
+        let media = t.path().join("disk.stx");
+        let exe = t.path().join("hatari");
+        executable(&exe);
+        write(&tos, b"synthetic tos");
+        write(&media, b"synthetic disk");
+        write(
+            &config,
+            format!(
+                "[System]\nnModelType=1\n[ROM]\nszTosImageFileName={}\n[Floppy]\nszDiskAFileName={}\n",
+                tos.display(),
+                media.display()
+            )
+            .as_bytes(),
+        );
+        let profile = HatariProfile {
+            profile_id: "test".into(),
+            installation_type: HatariInstallationType::Explicit,
+            config_path: config.clone(),
+            provenance: "test",
+            eligible: true,
+            executable_candidates: vec![HatariExecutable {
+                path: exe,
+                installation_type: HatariInstallationType::Explicit,
+                version: Some("2.5.1".into()),
+            }],
+        };
+        let inspection = inspect_hatari_game(
+            &profile,
+            &request("AtariST", HatariIdentityState::Verified),
+            &[],
+        );
+        let evidence = assess_hatari_readiness(&profile, &inspection);
+        assert!(evidence.ready);
+        assert!(evidence.ready_with_warnings);
+        assert_eq!(evidence.machine.model, HatariMachineModel::Ste);
+        assert_eq!(evidence.tos.health, HatariTosHealth::PresentUnverified);
+        assert_eq!(evidence.media_representations, vec![HatariFloppyRepresentation::Stx, HatariFloppyRepresentation::Unknown]);
+        assert_eq!(evidence.executable.as_ref().unwrap().version.as_deref(), Some("2.5.1"));
+    }
+
+    #[test]
+    fn readiness_orders_missing_tos_after_valid_config_and_machine() {
+        let t = TempDir::new().unwrap();
+        let config = t.path().join("hatari.cfg");
+        let exe = t.path().join("hatari");
+        executable(&exe);
+        write(&config, b"[System]\nnModelType=0\n[ROM]\nszTosImageFileName=/missing/tos.img\n");
+        let profile = HatariProfile {
+            profile_id: "test".into(),
+            installation_type: HatariInstallationType::Explicit,
+            config_path: config.clone(),
+            provenance: "test",
+            eligible: true,
+            executable_candidates: vec![HatariExecutable {
+                path: exe,
+                installation_type: HatariInstallationType::Explicit,
+                version: None,
+            }],
+        };
+        let inspection = inspect_hatari_game(
+            &profile,
+            &request("AtariST", HatariIdentityState::Verified),
+            &[],
+        );
+        let evidence = assess_hatari_readiness(&profile, &inspection);
+        assert!(!evidence.ready);
+        assert_eq!(evidence.first_blocker.as_deref(), Some("configured Hatari TOS image is missing"));
+    }
+
+    #[test]
+    fn readiness_refuses_unknown_machine_before_claiming_tos_ready() {
+        let t = TempDir::new().unwrap();
+        let config = t.path().join("hatari.cfg");
+        let exe = t.path().join("hatari");
+        executable(&exe);
+        write(&config, b"[ROM]\nszTosImageFileName=/missing/tos.img\n");
+        let profile = HatariProfile {
+            profile_id: "test".into(),
+            installation_type: HatariInstallationType::Explicit,
+            config_path: config.clone(),
+            provenance: "test",
+            eligible: true,
+            executable_candidates: vec![HatariExecutable {
+                path: exe,
+                installation_type: HatariInstallationType::Explicit,
+                version: None,
+            }],
+        };
+        let inspection = inspect_hatari_game(
+            &profile,
+            &request("AtariST", HatariIdentityState::Verified),
+            &[],
+        );
+        let evidence = assess_hatari_readiness(&profile, &inspection);
+        assert_eq!(evidence.machine.model, HatariMachineModel::Unknown);
+        assert_eq!(evidence.first_blocker.as_deref(), Some("Hatari machine model is not configured or could not be read"));
+    }
+
+    #[test]
+    fn readiness_assessment_does_not_write_config_or_media() {
+        let t = TempDir::new().unwrap();
+        let config = t.path().join("hatari.cfg");
+        let before = b"[System]\nnModelType=0\n";
+        write(&config, before);
+        let profile = profile(config.clone());
+        let inspection = inspect_hatari_game(
+            &profile,
+            &request("AtariST", HatariIdentityState::Verified),
+            &[],
+        );
+        let _ = assess_hatari_readiness(&profile, &inspection);
+        assert_eq!(fs::read(config).unwrap(), before);
     }
 }

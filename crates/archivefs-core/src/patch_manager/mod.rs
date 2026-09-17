@@ -558,10 +558,10 @@ pub use hatari_local::{
     HatariGameInspection, HatariHealth, HatariIdentityAssociation, HatariIdentityState,
     HatariInputSettings, HatariInspectionWarning, HatariInstallationType, HatariMachineModel,
     HatariMachineSettings, HatariPathState, HatariProfile, HatariProfileDiscovery,
-    HatariProfileDiscoveryRoots, HatariSaveStateInventory, HatariSelectedGame,
+    HatariProfileDiscoveryRoots, HatariReadinessEvidence, HatariSaveStateInventory, HatariSelectedGame,
     HatariSelectedGameRequest, HatariStorage, HatariStorageMechanism, HatariTosHealth,
     HatariTosReference, HatariTosRom, HatariVideoSettings, discover_hatari_profiles,
-    inspect_hatari_game, parse_hatari_version,
+    assess_hatari_readiness, inspect_hatari_game, parse_hatari_version,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
