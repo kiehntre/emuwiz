@@ -305,7 +305,8 @@ pub use input_projection::{
     project_xenia_launch_input,
 };
 pub use integration::{
-    DiscoveredStandaloneProfile, LaunchPlanResults, build_launch_plan_from_results,
+    DiscoveredStandaloneProfile, LaunchPlanResults, azahar_profile_eligible,
+    build_launch_plan_from_results, melonds_firmware_readiness,
 };
 pub use mame_command::{
     MAME_SUPPORTED_PLATFORM_IDS, MameCommand, MameCommandPlan, build_mame_command_plan,

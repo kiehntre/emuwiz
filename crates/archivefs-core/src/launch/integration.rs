@@ -424,6 +424,38 @@ fn authorized<T>(projection: LaunchInputProjection<T>) -> bool {
     matches!(projection, LaunchInputProjection::Authorized(_))
 }
 
+/// Projects the adapter-owned melonDS firmware evidence into the generic
+/// launch planner value. DS direct boot does not require external firmware;
+/// external firmware boot remains blocked when any required image is missing.
+pub fn melonds_firmware_readiness(
+    firmware: &crate::patch_manager::MelonDsFirmwareEvidence,
+) -> FirmwareReadiness {
+    match firmware.mode {
+        crate::patch_manager::MelonDsFirmwareMode::DirectBoot => FirmwareReadiness::NotRequired,
+        crate::patch_manager::MelonDsFirmwareMode::ExternalFirmwareBoot => {
+            if [firmware.bios7, firmware.bios9, firmware.firmware]
+                .contains(&MelonDsFirmwareState::Missing)
+            {
+                FirmwareReadiness::Missing
+            } else {
+                FirmwareReadiness::PresentUnverified
+            }
+        }
+        crate::patch_manager::MelonDsFirmwareMode::Unknown => FirmwareReadiness::Unknown,
+    }
+}
+
+/// Azahar exposes executable/config evidence rather than a full profile
+/// object. Keep its conservative eligibility rule in one projection helper so
+/// GUI planning and the shared integration seam cannot drift.
+pub fn azahar_profile_eligible(profile: &crate::patch_manager::AzaharProfile) -> bool {
+    !matches!(
+        profile.config_state,
+        crate::patch_manager::AzaharEvidenceState::Unreadable
+            | crate::patch_manager::AzaharEvidenceState::Oversized
+    )
+}
+
 fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneProfileInput> {
     input
         .standalone_profiles
@@ -478,33 +510,12 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
             DiscoveredStandaloneProfile::MelonDs { profile }
                 if authorized(project_melonds_launch_input(input.verified_identity_facts)) =>
             {
-                let firmware = match profile.firmware.mode {
-                    crate::patch_manager::MelonDsFirmwareMode::DirectBoot => {
-                        FirmwareReadiness::NotRequired
-                    }
-                    crate::patch_manager::MelonDsFirmwareMode::ExternalFirmwareBoot => {
-                        if [
-                            profile.firmware.bios7,
-                            profile.firmware.bios9,
-                            profile.firmware.firmware,
-                        ]
-                        .contains(&MelonDsFirmwareState::Missing)
-                        {
-                            FirmwareReadiness::Missing
-                        } else {
-                            FirmwareReadiness::PresentUnverified
-                        }
-                    }
-                    crate::patch_manager::MelonDsFirmwareMode::Unknown => {
-                        FirmwareReadiness::Unknown
-                    }
-                };
                 Some(StandaloneProfileInput {
                     adapter_id: "melonds",
                     profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
-                    firmware,
+                    firmware: melonds_firmware_readiness(&profile.firmware),
                 })
             }
             DiscoveredStandaloneProfile::Desmume { profile }
@@ -721,16 +732,11 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                 // existing-but-broken config blocks eligibility, never a
                 // config that was simply never written yet - the same rule
                 // every profile-having adapter in this file already applies.
-                let eligible = !matches!(
-                    profile.config_state,
-                    crate::patch_manager::AzaharEvidenceState::Unreadable
-                        | crate::patch_manager::AzaharEvidenceState::Oversized
-                );
                 Some(StandaloneProfileInput {
                     adapter_id: "azahar",
                     profile_id: format!("azahar:{}", profile.executable.display()),
                     profile_path: profile.config.clone(),
-                    eligible,
+                    eligible: azahar_profile_eligible(profile),
                     firmware: FirmwareReadiness::NotRequired,
                 })
             }

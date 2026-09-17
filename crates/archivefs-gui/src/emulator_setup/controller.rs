@@ -1317,6 +1317,77 @@ impl ArchiveFsApp {
                 }
             }));
         }
+        if let Ok(roots) =
+            archivefs_core::patch_manager::CemuProfileDiscoveryRoots::from_environment()
+        {
+            let discovery = archivefs_core::patch_manager::discover_cemu_profiles(&roots);
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "cemu",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    // Cemu's MLC, keys, title layout, and executable checks
+                    // remain authoritative in its adapter preflight.
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }
+            }));
+        }
+        if let Ok(roots) =
+            archivefs_core::patch_manager::MelonDsProfileDiscoveryRoots::from_environment()
+        {
+            let discovery = archivefs_core::patch_manager::discover_melonds_profiles(&roots);
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "melonds",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: Some(profile.configuration_path.clone()),
+                    eligible: profile.eligible,
+                    firmware: archivefs_core::launch::melonds_firmware_readiness(
+                        &profile.firmware,
+                    ),
+                }
+            }));
+        }
+        if let Ok(roots) =
+            archivefs_core::patch_manager::MgbaProfileDiscoveryRoots::from_environment()
+        {
+            let discovery = archivefs_core::patch_manager::discover_mgba_profiles(&roots);
+            standalone_profiles.extend(discovery.profiles.iter().map(|profile| {
+                archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "mgba",
+                    profile_id: profile.profile_id.clone(),
+                    profile_path: profile.config_path.clone(),
+                    eligible: profile.eligible,
+                    // A BIOS is optional for ordinary GBA/GB/GBC launch;
+                    // mGBA's own preflight retains any configured BIOS
+                    // evidence without turning absence into a blocker.
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                }
+            }));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let roots = archivefs_core::patch_manager::AzaharDiscoveryRoots {
+                explicit_executable: None,
+                path: std::env::var_os("PATH"),
+                config_root: Some(PathBuf::from(home).join(".config/azahar")),
+            };
+            if let Some(executable) =
+                archivefs_core::patch_manager::discover_azahar_executable(&roots)
+            {
+                let profile = archivefs_core::patch_manager::discover_azahar_profile(
+                    &roots,
+                    executable,
+                );
+                standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "azahar",
+                    profile_id: format!("azahar:{}", profile.executable.display()),
+                    profile_path: profile.config.clone(),
+                    eligible: archivefs_core::launch::azahar_profile_eligible(&profile),
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                });
+            }
+        }
         if let XeniaProfilesState::Ready(discovery) = &self.emulator_readiness.xenia_profiles {
             let (title_id, media_id) = game_identity_report
                 .map(|report| {
