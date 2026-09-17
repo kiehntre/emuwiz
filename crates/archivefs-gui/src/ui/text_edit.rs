@@ -2,8 +2,8 @@
 //!
 //! egui has no synchronous clipboard hook a context-menu item can call, so
 //! these helpers apply the edit themselves against the field's own char
-//! ranges, using the same `TextBuffer` trait egui's built-in Ctrl+X/C/V uses
-//! - they can never disagree with it about UTF-8 boundaries. The clipboard
+//! ranges, using the same `TextBuffer` trait egui's built-in Ctrl+X/C/V uses,
+//! so they can never disagree with it about UTF-8 boundaries. The clipboard
 //! itself stays behind `ClipboardBackend`, so tests drive the whole menu
 //! without an OS clipboard.
 

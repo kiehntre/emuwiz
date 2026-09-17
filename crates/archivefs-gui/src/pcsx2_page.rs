@@ -451,7 +451,9 @@ enum ExportDialogState {
 
 #[derive(Clone)]
 enum PsuExportDialogState {
-    Confirm(Ps2PsuExportPlan),
+    /// Boxed: this plan dwarfs the other variants and the whole value is
+    /// cloned out of egui's temp store on every frame the dialog is open.
+    Confirm(Box<Ps2PsuExportPlan>),
     Success(Ps2PsuExportResult),
     Refused(String),
 }
@@ -841,7 +843,7 @@ fn show_memory_card_contents(
                                         .save_file();
                                     if let Some(destination) = destination {
                                         let _ = match plan_ps2_psu_export(card, directory, &destination) {
-                                            Ok(plan) => ui.data_mut(|data| data.insert_temp(psu_export_dialog_id(), PsuExportDialogState::Confirm(plan))),
+                                            Ok(plan) => ui.data_mut(|data| data.insert_temp(psu_export_dialog_id(), PsuExportDialogState::Confirm(Box::new(plan)))),
                                             Err(error) => ui.data_mut(|data| data.insert_temp(psu_export_dialog_id(), PsuExportDialogState::Refused(psu_export_error_message(&error)))),
                                         };
                                     }

@@ -650,9 +650,12 @@ pub fn plan_for_emulator(inventory: &BiosMasterInventory, emulator: &str) -> Bio
         } else {
             None
         };
-        let match_status = if requirement.method == BiosProjectionMethod::NoBiosRequired {
-            BiosMatchStatus::Unknown
-        } else if candidates.is_empty() && requirement.expected_filenames.is_empty() {
+        // `Unknown` for two separate reasons, checked in this order: the
+        // system needs no BIOS at all, or nothing was found and nothing was
+        // expected. Both mean "nothing to report", never "missing".
+        let match_status = if requirement.method == BiosProjectionMethod::NoBiosRequired
+            || (candidates.is_empty() && requirement.expected_filenames.is_empty())
+        {
             BiosMatchStatus::Unknown
         } else if candidates.is_empty() {
             BiosMatchStatus::Missing

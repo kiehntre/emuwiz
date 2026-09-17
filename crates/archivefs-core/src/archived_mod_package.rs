@@ -221,10 +221,10 @@ fn inspect_zip_patches(
     Ok(())
 }
 
-fn read_readme_hints(
-    path: &Path,
-    plan: &ArchivePlan,
-) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+/// Title, version and author hints read from a package README, in that order.
+type ReadmeHints = (Option<String>, Option<String>, Option<String>);
+
+fn read_readme_hints(path: &Path, plan: &ArchivePlan) -> Result<ReadmeHints, String> {
     if plan.format != ArchiveFormat::Zip {
         return Ok((None, None, None));
     }

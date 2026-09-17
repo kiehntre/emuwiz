@@ -440,9 +440,7 @@ pub(crate) fn poll_database_load(
         | DatabaseState::Error { .. } => None,
     };
 
-    let Some((generation, result)) = message else {
-        return None;
-    };
+    let (generation, result) = message?;
     // Two independent staleness checks, mirroring poll_load exactly:
     // (1) is this even the current database generation, and (2) does
     // the state we are about to replace still agree it is Loading at

@@ -269,9 +269,10 @@ pub fn plan_staged_update(
     } else if !matches!(
         installation.installation_type,
         InstallationType::AppImage | InstallationType::Portable | InstallationType::Managed
-    ) {
-        UpdateExecutionEligibility::UnsupportedInstallType
-    } else if installation.update_capability != UpdateCapability::PortableManaged {
+    ) || installation.update_capability != UpdateCapability::PortableManaged
+    {
+        // Unsupported for either reason: the install kind cannot be updated
+        // in place, or this installation is not the portable/managed one.
         UpdateExecutionEligibility::UnsupportedInstallType
     } else if installation.version.is_none() {
         UpdateExecutionEligibility::VersionUnknown

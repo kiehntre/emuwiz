@@ -52,9 +52,7 @@ pub(crate) fn poll_load(
         LoadState::Ready(_) | LoadState::Error(_) => None,
     };
 
-    let Some((generation, result)) = result else {
-        return None;
-    };
+    let (generation, result) = result?;
     if generation != current_generation {
         return None;
     }

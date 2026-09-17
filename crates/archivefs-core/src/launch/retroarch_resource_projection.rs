@@ -125,6 +125,10 @@ fn config_quote(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
+// Ten parameters because this is the field-by-field constructor for a
+// ten-field `LaunchResourceGrant`; the usual remedy - pass a struct - would
+// mean passing the very struct it exists to build.
+#[allow(clippy::too_many_arguments)]
 fn grant(
     launch_id: &str,
     role: LaunchResourceRole,

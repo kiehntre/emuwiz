@@ -216,12 +216,17 @@ pub fn download_mod_payload(
     }
 }
 
+/// What a completed staging download reports back, in order: payload sha256,
+/// bytes written, final URL after redirects, the redirect chain, the hosts
+/// contacted, and the server's declared content length when it gave one.
+type StagedDownload = (String, u64, String, Vec<String>, Vec<String>, Option<u64>);
+
 fn download_to_staging(
     request: &ModDownloadRequest,
     backend: &dyn ModDownloadBackend,
     output: &mut File,
     temporary: &Path,
-) -> Result<(String, u64, String, Vec<String>, Vec<String>, Option<u64>), ModDownloadFailure> {
+) -> Result<StagedDownload, ModDownloadFailure> {
     let mut current = request.policy_input.payload_url.clone();
     let mut visited = HashSet::from([current.clone()]);
     let mut redirects = Vec::new();

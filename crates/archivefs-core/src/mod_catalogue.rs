@@ -385,11 +385,12 @@ pub fn assess_catalogue_compatibility(
             result.matching_identity = Some((*declaration).clone());
             if declaration.kind == ModIdentityKind::XexMediaId || !requires_media {
                 result.state = ModCompatibilityState::Compatible;
-                result.strength = if requires_media {
-                    ModCatalogueMatchStrength::Strong
-                } else {
-                    ModCatalogueMatchStrength::Strong
-                };
+                // Both arms of the original `if requires_media` returned
+                // `Strong`, so this is exactly what it evaluated to. Whether
+                // the `else` was meant to be `Weak` - as the Title-ID-only
+                // path below uses - is a behaviour question, deliberately
+                // left alone here.
+                result.strength = ModCatalogueMatchStrength::Strong;
                 result.reasons.push(format!(
                     "verified native {} matches catalogue declaration",
                     declaration.kind.identity_kind()
