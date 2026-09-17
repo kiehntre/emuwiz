@@ -16,6 +16,18 @@ use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind};
 
 pub const FBNEO_SUPPORTED_PLATFORM_ID: &str = "Arcade";
 
+/// Readiness derived from the native FBNeo command plan.
+///
+/// FBNeo has no global BIOS gate. The plan remains the launch authority for
+/// verified FBNeo DAT identity, completeness, dependencies, platform, and
+/// content; DAT/version detail remains in the shared arcade evidence model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FbneoReadiness {
+    Ready,
+    NeedsSetup,
+    Blocked,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FbneoIdentityEvidence {
     /// A local DAT explicitly identified itself as FBNeo. The DAT's
@@ -49,6 +61,32 @@ pub struct FbneoCommand {
 pub struct FbneoCommandPlan {
     pub command: Option<FbneoCommand>,
     pub blockers: Vec<LaunchBlocker>,
+}
+
+impl FbneoCommandPlan {
+    /// Return the deterministic first blocker selected by command planning.
+    pub fn first_blocker(&self) -> Option<&LaunchBlocker> {
+        self.blockers.first()
+    }
+}
+
+fn is_setup_blocker(kind: LaunchBlockerKind) -> bool {
+    matches!(kind, LaunchBlockerKind::FbneoEmulatorUnavailable)
+}
+
+/// Classify FBNeo readiness without duplicating command-plan rules.
+pub fn classify_fbneo_readiness(plan: &FbneoCommandPlan) -> FbneoReadiness {
+    if plan.blockers.is_empty() {
+        FbneoReadiness::Ready
+    } else if plan
+        .blockers
+        .iter()
+        .all(|blocker| is_setup_blocker(blocker.kind))
+    {
+        FbneoReadiness::NeedsSetup
+    } else {
+        FbneoReadiness::Blocked
+    }
 }
 
 fn blocker(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker {

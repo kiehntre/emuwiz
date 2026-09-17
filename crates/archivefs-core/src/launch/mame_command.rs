@@ -17,6 +17,19 @@ use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind};
 /// included because it is a separate optical-media platform.
 pub const MAME_SUPPORTED_PLATFORM_IDS: &[&str] = &["Arcade", "NeoGeo"];
 
+/// Readiness derived from the native MAME command plan.
+///
+/// The plan remains the launch authority for set identity, completeness,
+/// dependencies, platform, content, and search-path evidence. DAT/version
+/// detail is retained separately by `ArcadeEmulatorDatReadiness` and is not
+/// collapsed into an executable-only boolean here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MameReadiness {
+    Ready,
+    NeedsSetup,
+    Blocked,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MameCommand {
     pub executable: PathBuf,
@@ -32,6 +45,35 @@ pub struct MameCommand {
 pub struct MameCommandPlan {
     pub command: Option<MameCommand>,
     pub blockers: Vec<LaunchBlocker>,
+}
+
+impl MameCommandPlan {
+    /// Return the deterministic first blocker selected by command planning.
+    pub fn first_blocker(&self) -> Option<&LaunchBlocker> {
+        self.blockers.first()
+    }
+}
+
+fn is_setup_blocker(kind: LaunchBlockerKind) -> bool {
+    matches!(
+        kind,
+        LaunchBlockerKind::MameEmulatorUnavailable | LaunchBlockerKind::MameSearchPathUnconfigured
+    )
+}
+
+/// Classify MAME readiness without duplicating command-plan rules.
+pub fn classify_mame_readiness(plan: &MameCommandPlan) -> MameReadiness {
+    if plan.blockers.is_empty() {
+        MameReadiness::Ready
+    } else if plan
+        .blockers
+        .iter()
+        .all(|blocker| is_setup_blocker(blocker.kind))
+    {
+        MameReadiness::NeedsSetup
+    } else {
+        MameReadiness::Blocked
+    }
 }
 
 fn blocked(blockers: Vec<LaunchBlocker>) -> MameCommandPlan {

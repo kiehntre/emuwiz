@@ -48,8 +48,13 @@ fn trusted_fbneo_dat_identity_plans_native_driver_argument() {
         &evidence("sf2"),
         Some(std::path::Path::new("/opt/FinalBurn Neo/fbneo")),
     );
-    let command = plan.command.expect("trusted FBNeo evidence should plan");
+    let command = plan
+        .command
+        .as_ref()
+        .expect("trusted FBNeo evidence should plan");
     assert!(plan.blockers.is_empty());
+    assert_eq!(classify_fbneo_readiness(&plan), FbneoReadiness::Ready);
+    assert!(plan.first_blocker().is_none());
     assert_eq!(command.arguments, vec![OsString::from("sf2")]);
     assert_eq!(
         command.selected_content,
@@ -74,6 +79,7 @@ fn mame_only_identity_does_not_authorize_fbneo() {
             .iter()
             .any(|blocker| { blocker.kind == LaunchBlockerKind::FbneoCompatibilityUnavailable })
     );
+    assert_eq!(classify_fbneo_readiness(&plan), FbneoReadiness::Blocked);
 }
 
 #[test]
@@ -129,5 +135,20 @@ fn unrelated_platform_and_missing_executable_are_blocked() {
         plan.blockers
             .iter()
             .any(|b| b.kind == LaunchBlockerKind::FbneoEmulatorUnavailable)
+    );
+    assert_eq!(classify_fbneo_readiness(&plan), FbneoReadiness::Blocked);
+    assert_eq!(
+        plan.first_blocker().map(|blocker| blocker.kind),
+        Some(LaunchBlockerKind::FbneoPlatformMismatch)
+    );
+}
+
+#[test]
+fn missing_core_with_other_evidence_needs_setup() {
+    let plan = build_fbneo_command_plan(&identity("sf2"), &evidence("sf2"), None);
+    assert_eq!(classify_fbneo_readiness(&plan), FbneoReadiness::NeedsSetup);
+    assert_eq!(
+        plan.first_blocker().map(|blocker| blocker.kind),
+        Some(LaunchBlockerKind::FbneoEmulatorUnavailable)
     );
 }

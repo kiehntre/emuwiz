@@ -45,8 +45,13 @@ fn complete_set_plans_one_native_set_name_argument() {
         Some(std::path::Path::new("/usr/bin/mame")),
         true,
     );
-    let command = plan.command.expect("complete MAME set should plan");
+    let command = plan
+        .command
+        .as_ref()
+        .expect("complete MAME set should plan");
     assert!(plan.blockers.is_empty());
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::Ready);
+    assert!(plan.first_blocker().is_none());
     assert_eq!(command.arguments, vec![OsString::from("pacman")]);
 }
 
@@ -78,6 +83,10 @@ fn set_and_dependency_verdicts_block_without_fallback() {
             .iter()
             .any(|b| b.kind == LaunchBlockerKind::MameSetVerdictUnavailable)
     );
+    assert_eq!(
+        classify_mame_readiness(&unavailable),
+        MameReadiness::Blocked
+    );
 }
 
 #[test]
@@ -99,6 +108,7 @@ fn identity_mismatch_and_unconfigured_search_path_block() {
             .iter()
             .any(|b| b.kind == LaunchBlockerKind::MameSearchPathUnconfigured)
     );
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::Blocked);
 }
 
 #[test]
@@ -114,6 +124,26 @@ fn no_identity_or_executable_never_becomes_ready() {
         plan.blockers
             .iter()
             .any(|b| b.kind == LaunchBlockerKind::MameEmulatorUnavailable)
+    );
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::Blocked);
+    assert_eq!(
+        plan.first_blocker().map(|blocker| blocker.kind),
+        Some(LaunchBlockerKind::IdentityUnresolved)
+    );
+}
+
+#[test]
+fn missing_executable_with_other_evidence_needs_setup() {
+    let plan = build_mame_command_plan(
+        &identity("pacman"),
+        &[resolution("pacman", SetState::Complete)],
+        None,
+        true,
+    );
+    assert_eq!(classify_mame_readiness(&plan), MameReadiness::NeedsSetup);
+    assert_eq!(
+        plan.first_blocker().map(|blocker| blocker.kind),
+        Some(LaunchBlockerKind::MameEmulatorUnavailable)
     );
 }
 
