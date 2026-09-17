@@ -47,6 +47,16 @@ pub enum PatchCompatibility {
     Unknown,
 }
 
+/// A representation change that is safe only when the caller has established
+/// the platform rule for it.  This is deliberately explicit in the plan and
+/// provenance; headers are never silently removed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderAdjustment {
+    None,
+    Strip512ByteCopierHeader,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StandalonePatchInspection {
     pub path: PathBuf,
@@ -81,6 +91,7 @@ pub struct DerivedPatchPlan {
     pub expected_source_size: Option<u64>,
     pub expected_output_size: Option<u64>,
     pub expected_output_crc32: Option<u32>,
+    pub header_adjustment: HeaderAdjustment,
     pub overwrite_existing: bool,
     pub confirmation_required: bool,
     pub warnings: Vec<String>,
@@ -106,7 +117,12 @@ pub struct DerivedPatchProvenance {
     pub patch_path: PathBuf,
     pub patch_sha256: String,
     pub format: StandalonePatchFormat,
+    pub output_path: PathBuf,
     pub output_sha256: String,
+    pub expected_source_crc32: Option<u32>,
+    pub expected_output_crc32: Option<u32>,
+    pub header_adjustment: HeaderAdjustment,
+    pub applied_at_unix_seconds: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,49 +183,94 @@ pub fn match_patch_source(
     base_bytes: Option<&[u8]>,
     title_or_region: bool,
 ) -> StandalonePatchMatch {
+    match_patch_source_with_header(inspection, base_bytes, title_or_region, false).0
+}
+
+/// Match a patch while optionally considering the one supported copier-header
+/// rule.  The caller must prove that the platform permits this rule; this
+/// function never infers that from a filename or title.
+pub fn match_patch_source_with_header(
+    inspection: &StandalonePatchInspection,
+    base_bytes: Option<&[u8]>,
+    title_or_region: bool,
+    allow_512_byte_copier_header: bool,
+) -> (StandalonePatchMatch, HeaderAdjustment) {
     if !matches!(inspection.state, PatchInspectionState::Valid) {
-        return StandalonePatchMatch {
-            compatibility: PatchCompatibility::Unknown,
-            reason: "patch is not structurally valid".into(),
-        };
+        return (
+            StandalonePatchMatch {
+                compatibility: PatchCompatibility::Unknown,
+                reason: "patch is not structurally valid".into(),
+            },
+            HeaderAdjustment::None,
+        );
     }
     if let Some(bytes) = base_bytes {
         if inspection
             .source_size
             .is_some_and(|size| size != bytes.len() as u64)
         {
-            return StandalonePatchMatch {
-                compatibility: PatchCompatibility::Incompatible,
-                reason: "base size differs from patch source size".into(),
-            };
+            if allow_512_byte_copier_header
+                && bytes.len() >= 512
+                && inspection.source_size == Some((bytes.len() - 512) as u64)
+            {
+                let normalized = &bytes[512..];
+                if inspection
+                    .source_crc32
+                    .is_some_and(|expected| crc32(normalized) == expected)
+                {
+                    return (StandalonePatchMatch {
+                        compatibility: PatchCompatibility::Compatible,
+                        reason: "patch expects a headerless source; the selected ROM has a 512-byte copier header".into(),
+                    }, HeaderAdjustment::Strip512ByteCopierHeader);
+                }
+            }
+            return (
+                StandalonePatchMatch {
+                    compatibility: PatchCompatibility::Incompatible,
+                    reason: "base size differs from patch source size".into(),
+                },
+                HeaderAdjustment::None,
+            );
         }
         if let Some(expected) = inspection.source_crc32 {
             if crc32(bytes) != expected {
-                return StandalonePatchMatch {
-                    compatibility: PatchCompatibility::Incompatible,
-                    reason: "base CRC32 differs from patch source checksum".into(),
-                };
+                return (
+                    StandalonePatchMatch {
+                        compatibility: PatchCompatibility::Incompatible,
+                        reason: "base CRC32 differs from patch source checksum".into(),
+                    },
+                    HeaderAdjustment::None,
+                );
             }
-            return StandalonePatchMatch {
-                compatibility: PatchCompatibility::Compatible,
-                reason: "base size and embedded source checksum match".into(),
-            };
+            return (
+                StandalonePatchMatch {
+                    compatibility: PatchCompatibility::Compatible,
+                    reason: "base size and embedded source checksum match".into(),
+                },
+                HeaderAdjustment::None,
+            );
         }
     }
     if inspection.source_size.is_none() && inspection.source_crc32.is_none() {
-        return StandalonePatchMatch {
-            compatibility: if title_or_region {
-                PatchCompatibility::ReviewRequired
-            } else {
-                PatchCompatibility::Unknown
+        return (
+            StandalonePatchMatch {
+                compatibility: if title_or_region {
+                    PatchCompatibility::ReviewRequired
+                } else {
+                    PatchCompatibility::Unknown
+                },
+                reason: "format does not contain source identity".into(),
             },
-            reason: "format does not contain source identity".into(),
-        };
+            HeaderAdjustment::None,
+        );
     }
-    StandalonePatchMatch {
-        compatibility: PatchCompatibility::ReviewRequired,
-        reason: "source checksum must be compared with the selected base bytes".into(),
-    }
+    (
+        StandalonePatchMatch {
+            compatibility: PatchCompatibility::ReviewRequired,
+            reason: "source checksum must be compared with the selected base bytes".into(),
+        },
+        HeaderAdjustment::None,
+    )
 }
 
 pub fn build_derived_patch_plan(
@@ -250,6 +311,7 @@ pub fn build_derived_patch_plan(
         expected_source_size: inspection.source_size,
         expected_output_size: inspection.target_size,
         expected_output_crc32: inspection.target_crc32,
+        header_adjustment: HeaderAdjustment::None,
         overwrite_existing: false,
         confirmation_required: true,
         warnings: inspection.warnings.clone(),
@@ -261,6 +323,22 @@ pub fn build_standalone_patch_apply_plan(
     base_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     approved_output_root: impl AsRef<Path>,
+) -> Result<StandalonePatchApplyPlan, StandalonePatchError> {
+    build_standalone_patch_apply_plan_with_header(
+        inspection,
+        base_path,
+        output_path,
+        approved_output_root,
+        HeaderAdjustment::None,
+    )
+}
+
+pub fn build_standalone_patch_apply_plan_with_header(
+    inspection: &StandalonePatchInspection,
+    base_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    approved_output_root: impl AsRef<Path>,
+    header_adjustment: HeaderAdjustment,
 ) -> Result<StandalonePatchApplyPlan, StandalonePatchError> {
     if !matches!(
         inspection.format,
@@ -274,13 +352,32 @@ pub fn build_standalone_patch_apply_plan(
     if base.len() as u64 > MAX_APPLY_BYTES {
         return Err(StandalonePatchError::TooLarge);
     }
-    let plan = build_derived_patch_plan(
+    let base_sha256 = hex_digest(&base);
+    let patch_input = match header_adjustment {
+        HeaderAdjustment::None => base.as_slice(),
+        HeaderAdjustment::Strip512ByteCopierHeader => base.get(512..).ok_or_else(|| {
+            StandalonePatchError::UnsafeOutput(
+                "selected ROM has no complete 512-byte header".into(),
+            )
+        })?,
+    };
+    if inspection.source_size != Some(patch_input.len() as u64)
+        || inspection
+            .source_crc32
+            .is_some_and(|expected| crc32(patch_input) != expected)
+    {
+        return Err(StandalonePatchError::Malformed(
+            "selected base does not match the reviewed patch source".into(),
+        ));
+    }
+    let mut plan = build_derived_patch_plan(
         inspection,
         base_path,
         output_path,
         approved_output_root,
-        Some(hex_digest(&base)),
+        Some(base_sha256),
     )?;
+    plan.header_adjustment = header_adjustment;
     Ok(StandalonePatchApplyPlan { reviewed: plan })
 }
 
@@ -306,18 +403,24 @@ pub fn apply_standalone_patch(
     }
     let patch =
         fs::read(&plan.reviewed.patch_path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    let patch_input = match plan.reviewed.header_adjustment {
+        HeaderAdjustment::None => base.as_slice(),
+        HeaderAdjustment::Strip512ByteCopierHeader => base.get(512..).ok_or_else(|| {
+            StandalonePatchError::Malformed("selected base has no complete 512-byte header".into())
+        })?,
+    };
     if inspection
         .source_crc32
-        .is_some_and(|expected| crc32(&base) != expected)
+        .is_some_and(|expected| crc32(patch_input) != expected)
     {
         return Err(StandalonePatchError::Malformed(
             "base CRC differs from reviewed patch source checksum".into(),
         ));
     }
     let output = match inspection.format {
-        StandalonePatchFormat::Ips => apply_ips(&base, &patch)?,
-        StandalonePatchFormat::Bps => apply_bps(&base, &patch)?,
-        StandalonePatchFormat::Ups => apply_ups(&base, &patch)?,
+        StandalonePatchFormat::Ips => apply_ips(patch_input, &patch)?,
+        StandalonePatchFormat::Bps => apply_bps(patch_input, &patch)?,
+        StandalonePatchFormat::Ups => apply_ups(patch_input, &patch)?,
         _ => {
             return Err(StandalonePatchError::Unsupported(
                 "format is inspection-only".into(),
@@ -356,8 +459,43 @@ pub fn apply_standalone_patch(
             "destination is unavailable or unsafe".into(),
         ));
     }
+    let provenance = DerivedPatchProvenance {
+        base_path: plan.reviewed.base_path.clone(),
+        base_sha256: base_hash,
+        patch_path: plan.reviewed.patch_path.clone(),
+        patch_sha256: plan.reviewed.patch_sha256.clone(),
+        format: inspection.format,
+        output_path: plan.reviewed.output_path.clone(),
+        output_sha256: output_hash.clone(),
+        expected_source_crc32: inspection.source_crc32,
+        expected_output_crc32: inspection.target_crc32,
+        header_adjustment: plan.reviewed.header_adjustment,
+        applied_at_unix_seconds: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs()),
+    };
+    let provenance_path = plan.reviewed.output_path.with_file_name(format!(
+        "{}.emuwiz-patch.json",
+        plan.reviewed
+            .output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("patched-rom")
+    ));
+    if provenance_path.exists() {
+        return Err(StandalonePatchError::UnsafeOutput(
+            "provenance destination already exists; overwrite is disabled".into(),
+        ));
+    }
+    let provenance_json = serde_json::to_vec_pretty(&provenance)
+        .map_err(|error| StandalonePatchError::Io(error.to_string()))?;
     let stage = parent.join(format!(
         ".emuwiz-derived-{}-{}",
+        std::process::id(),
+        patch.len()
+    ));
+    let provenance_stage = parent.join(format!(
+        ".emuwiz-derived-provenance-{}-{}",
         std::process::id(),
         patch.len()
     ));
@@ -372,27 +510,37 @@ pub fn apply_standalone_patch(
             .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
         file.sync_all()
             .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        let mut provenance_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&provenance_stage)
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        provenance_file
+            .write_all(&provenance_json)
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        provenance_file
+            .sync_all()
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
         fs::hard_link(&stage, &plan.reviewed.output_path)
             .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        fs::hard_link(&provenance_stage, &provenance_path)
+            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
         fs::remove_file(&stage).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+        fs::remove_file(&provenance_stage).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
         Ok(())
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&stage);
+        let _ = fs::remove_file(&provenance_stage);
+        let _ = fs::remove_file(&plan.reviewed.output_path);
+        let _ = fs::remove_file(&provenance_path);
         return Err(error);
     }
     Ok(StandalonePatchApplyResult {
         output_path: plan.reviewed.output_path.clone(),
         output_size: output.len() as u64,
         output_sha256: output_hash.clone(),
-        provenance: DerivedPatchProvenance {
-            base_path: plan.reviewed.base_path.clone(),
-            base_sha256: base_hash,
-            patch_path: plan.reviewed.patch_path.clone(),
-            patch_sha256: plan.reviewed.patch_sha256.clone(),
-            format: inspection.format,
-            output_sha256: output_hash,
-        },
+        provenance,
     })
 }
 
@@ -1218,5 +1366,83 @@ mod tests {
             inspect_standalone_patch(p).unwrap().format,
             StandalonePatchFormat::Ppf
         );
+    }
+
+    #[test]
+    fn copier_header_match_requires_platform_rule_and_exact_normalized_crc() {
+        let base = [0u8; 512]
+            .into_iter()
+            .chain([1u8, 2, 3])
+            .collect::<Vec<_>>();
+        let inspection = StandalonePatchInspection {
+            path: PathBuf::from("patch.bps"),
+            format: StandalonePatchFormat::Bps,
+            state: PatchInspectionState::Valid,
+            patch_size: 1,
+            patch_sha256: "patch".into(),
+            source_size: Some(3),
+            target_size: Some(3),
+            source_crc32: Some(crc32(&[1, 2, 3])),
+            target_crc32: None,
+            patch_crc32: None,
+            metadata: None,
+            warnings: Vec::new(),
+            error: None,
+        };
+        let (matching, adjustment) =
+            match_patch_source_with_header(&inspection, Some(&base), false, true);
+        assert_eq!(matching.compatibility, PatchCompatibility::Compatible);
+        assert_eq!(adjustment, HeaderAdjustment::Strip512ByteCopierHeader);
+        let (matching, adjustment) =
+            match_patch_source_with_header(&inspection, Some(&base), false, false);
+        assert_eq!(matching.compatibility, PatchCompatibility::Incompatible);
+        assert_eq!(adjustment, HeaderAdjustment::None);
+    }
+
+    #[test]
+    fn header_transform_applies_to_derived_output_and_keeps_source_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_path = temp.path().join("base with header.sfc");
+        let output_path = temp.path().join("patched.sfc");
+        let base = [0xabu8; 512]
+            .into_iter()
+            .chain([1u8, 2, 3])
+            .collect::<Vec<_>>();
+        fs::write(&base_path, &base).unwrap();
+        let mut patch = b"BPS1".to_vec();
+        patch.extend(var(3));
+        patch.extend(var(3));
+        patch.extend(var(0));
+        let mut body = action(1, 1);
+        body.push(b'z');
+        body.extend(action(0, 2));
+        patch.extend(body);
+        patch.extend(crc32(&[1, 2, 3]).to_le_bytes());
+        patch.extend(crc32(b"z\x02\x03").to_le_bytes());
+        let patch_crc = crc32(&patch);
+        patch.extend(patch_crc.to_le_bytes());
+        let patch_path = temp.path().join("patch with spaces.bps");
+        fs::write(&patch_path, patch).unwrap();
+        let inspection = inspect_standalone_patch(&patch_path).unwrap();
+        let plan = build_standalone_patch_apply_plan_with_header(
+            &inspection,
+            &base_path,
+            &output_path,
+            temp.path(),
+            HeaderAdjustment::Strip512ByteCopierHeader,
+        )
+        .unwrap();
+        let result = apply_standalone_patch(&plan).unwrap();
+        assert_eq!(fs::read(&base_path).unwrap(), base);
+        assert_eq!(fs::read(&output_path).unwrap(), [b'z', 2, 3]);
+        assert_eq!(
+            result.provenance.header_adjustment,
+            HeaderAdjustment::Strip512ByteCopierHeader
+        );
+        assert_eq!(result.provenance.base_path, base_path);
+        assert_eq!(result.provenance.patch_path, patch_path);
+        assert_eq!(result.provenance.output_path, output_path);
+        assert!(temp.path().join("patched.sfc.emuwiz-patch.json").is_file());
+        assert!(result.provenance.applied_at_unix_seconds > 0);
     }
 }

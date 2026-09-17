@@ -21,6 +21,12 @@ use archivefs_core::patch_manager::{
     execute_shared_apply, execute_shared_rollback, generate_shared_operation_id,
     preview_shared_rollback,
 };
+use archivefs_core::standalone_patch::{
+    HeaderAdjustment, MAX_APPLY_BYTES, PatchCompatibility, StandalonePatchApplyPlan,
+    StandalonePatchApplyResult, StandalonePatchInspection, StandalonePatchMatch,
+    apply_standalone_patch, build_standalone_patch_apply_plan_with_header,
+    inspect_standalone_patch, match_patch_source_with_header,
+};
 use eframe::egui;
 
 use crate::ui::components as widgets;
@@ -47,6 +53,25 @@ pub struct LocalModPackagePageState {
     key: Option<(PathBuf, PathBuf)>,
     stage: Option<Stage>,
     provider_selection: Option<(String, String)>,
+    standalone: StandalonePatchPageState,
+}
+
+#[derive(Default)]
+struct StandalonePatchPageState {
+    picker: Option<Receiver<Result<StandalonePatchCandidate, String>>>,
+    candidates: Vec<StandalonePatchCandidate>,
+    selected: usize,
+    applying: Option<Receiver<Result<StandalonePatchApplyResult, String>>>,
+    applied: Option<StandalonePatchApplyResult>,
+    failure: Option<String>,
+}
+
+struct StandalonePatchCandidate {
+    inspection: StandalonePatchInspection,
+    matching: StandalonePatchMatch,
+    adjustment: HeaderAdjustment,
+    plan: Option<StandalonePatchApplyPlan>,
+    plan_error: Option<String>,
 }
 
 impl LocalModPackagePageState {
@@ -54,12 +79,14 @@ impl LocalModPackagePageState {
         matches!(
             self.stage,
             Some(Stage::Pick(..) | Stage::Applying(_, _) | Stage::RollingBack(_))
-        )
+        ) || self.standalone.picker.is_some()
+            || self.standalone.applying.is_some()
     }
 
     pub fn poll(&mut self) -> bool {
+        let mut changed = poll_standalone(&mut self.standalone);
         let Some(stage) = self.stage.take() else {
-            return false;
+            return changed;
         };
         match stage {
             Stage::Pick(receiver, selected_game, mut package_roots) => match receiver.try_recv() {
@@ -97,8 +124,339 @@ impl LocalModPackagePageState {
             },
             other => self.stage = Some(other),
         }
-        true
+        changed = true;
+        changed
     }
+}
+
+fn poll_standalone(state: &mut StandalonePatchPageState) -> bool {
+    let mut changed = false;
+    if let Some(receiver) = state.picker.take() {
+        match receiver.try_recv() {
+            Ok(Ok(candidate)) => {
+                state.candidates.push(candidate);
+                state.selected = state.candidates.len().saturating_sub(1);
+                state.applied = None;
+                state.failure = None;
+                changed = true;
+            }
+            Ok(Err(error)) => {
+                state.failure = Some(error);
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => state.picker = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                state.failure = Some("The patch inspection worker stopped early.".into());
+                changed = true;
+            }
+        }
+    }
+    if let Some(receiver) = state.applying.take() {
+        match receiver.try_recv() {
+            Ok(Ok(result)) => {
+                state.applied = Some(result);
+                state.failure = None;
+                changed = true;
+            }
+            Ok(Err(error)) => {
+                state.failure = Some(error);
+                changed = true;
+            }
+            Err(TryRecvError::Empty) => state.applying = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                state.failure = Some("The patch apply worker stopped early.".into());
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+fn patch_candidate_rank(candidate: &StandalonePatchCandidate) -> u8 {
+    if candidate.plan.is_some() {
+        return if candidate.adjustment == HeaderAdjustment::None {
+            0
+        } else {
+            1
+        };
+    }
+    match candidate.matching.compatibility {
+        PatchCompatibility::ReviewRequired | PatchCompatibility::Unknown => 2,
+        PatchCompatibility::Incompatible => 3,
+        PatchCompatibility::Compatible => 3,
+    }
+}
+
+fn base_facts(path: &std::path::Path) -> Result<(u64, u32, String), String> {
+    let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_APPLY_BYTES {
+        return Err("The selected ROM is larger than the safe apply limit.".into());
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(&bytes);
+    let sha = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok((bytes.len() as u64, crc32(&bytes), sha))
+}
+
+fn begin_patch_pick(
+    state: &mut StandalonePatchPageState,
+    archive_path: &std::path::Path,
+    platform: archivefs_core::game_identity::IdentityPlatform,
+) {
+    let base_path = archive_path.to_path_buf();
+    let allow_header = platform == archivefs_core::game_identity::IdentityPlatform::Snes;
+    let output_root = archive_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let output_stem = archive_path
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "patched-rom".into());
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
+        let result = (|| {
+            let inspection = inspect_standalone_patch(&path).map_err(|error| error.to_string())?;
+            let base = std::fs::read(&base_path).map_err(|error| error.to_string())?;
+            if base.len() as u64 > MAX_APPLY_BYTES {
+                return Err("The selected ROM is larger than the safe apply limit.".into());
+            }
+            let (matching, adjustment) =
+                match_patch_source_with_header(&inspection, Some(&base), false, allow_header);
+            let extension = base_path
+                .extension()
+                .map(|value| format!(".{}", value.to_string_lossy()))
+                .unwrap_or_default();
+            let output = output_root.join(format!("{output_stem}.patched{extension}"));
+            let plan = if matches!(matching.compatibility, PatchCompatibility::Compatible) {
+                match build_standalone_patch_apply_plan_with_header(
+                    &inspection,
+                    &base_path,
+                    output,
+                    output_root,
+                    adjustment,
+                ) {
+                    Ok(plan) => Some(plan),
+                    Err(error) => {
+                        return Ok(StandalonePatchCandidate {
+                            inspection,
+                            matching,
+                            adjustment,
+                            plan: None,
+                            plan_error: Some(error.to_string()),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+            Ok(StandalonePatchCandidate {
+                inspection,
+                matching,
+                adjustment,
+                plan,
+                plan_error: None,
+            })
+        })();
+        let _ = sender.send(result);
+    });
+    state.picker = Some(receiver);
+}
+
+fn show_standalone_patch_panel(
+    ui: &mut egui::Ui,
+    state: &mut StandalonePatchPageState,
+    archive_path: &std::path::Path,
+    identity: &GameIdentityReport,
+) {
+    widgets::section_header(
+        ui,
+        "Standalone ROM patches",
+        Some(
+            "Choose a local patch and preview a new derived ROM. Your original ROM is never changed.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.heading("Base ROM");
+        ui.label(archive_path.display().to_string());
+        match base_facts(archive_path) {
+            Ok((size, crc, sha)) => {
+                ui.label(format!(
+                    "Platform: {:?} · Size: {size} bytes · CRC32: {crc:08X}",
+                    identity.platform
+                ));
+                ui.small(format!("SHA-256: {sha}"));
+            }
+            Err(error) => widgets::banner(
+                ui,
+                "Base ROM unavailable",
+                &error,
+                widgets::StatusTone::Blocked,
+            ),
+        }
+        if widgets::action_button(
+            ui,
+            "Choose local patch file",
+            widgets::ActionStyle::Secondary,
+            state.picker.is_none(),
+        )
+        .clicked()
+        {
+            begin_patch_pick(state, archive_path, identity.platform);
+        }
+        if state.picker.is_some() {
+            ui.label("Inspecting patch read-only…");
+        }
+        if let Some(error) = state.failure.as_ref() {
+            widgets::banner(
+                ui,
+                "Patch workflow stopped",
+                error,
+                widgets::StatusTone::Blocked,
+            );
+        }
+    });
+    if state.candidates.is_empty() {
+        return;
+    }
+    let mut order: Vec<_> = (0..state.candidates.len()).collect();
+    order.sort_by_key(|index| {
+        (
+            patch_candidate_rank(&state.candidates[*index]),
+            state.candidates[*index].inspection.path.clone(),
+        )
+    });
+    state.selected = state.selected.min(state.candidates.len() - 1);
+    widgets::card(ui, |ui| {
+        ui.heading("Local patch candidates");
+        ui.label("Candidates remain visible, including patches that cannot safely apply.");
+        for index in order {
+            let candidate = &state.candidates[index];
+            let label = match candidate.matching.compatibility {
+                PatchCompatibility::Compatible
+                    if candidate.adjustment == HeaderAdjustment::None =>
+                {
+                    "Exact match"
+                }
+                PatchCompatibility::Compatible => "Compatible after explicit header adjustment",
+                PatchCompatibility::Incompatible => "Incompatible",
+                PatchCompatibility::ReviewRequired => "Possible match — needs review",
+                PatchCompatibility::Unknown => "Unknown compatibility",
+            };
+            if ui
+                .selectable_label(
+                    index == state.selected,
+                    format!("{} — {label}", candidate.inspection.path.display()),
+                )
+                .clicked()
+            {
+                state.selected = index;
+                state.applied = None;
+            }
+        }
+    });
+    let candidate = &state.candidates[state.selected];
+    widgets::card(ui, |ui| {
+        ui.heading("Patch preview");
+        ui.label(format!("Patch: {}", candidate.inspection.path.display()));
+        ui.label(format!(
+            "Format: {:?} · Size: {} bytes",
+            candidate.inspection.format, candidate.inspection.patch_size
+        ));
+        ui.small(format!(
+            "Patch SHA-256: {}",
+            candidate.inspection.patch_sha256
+        ));
+        if let Some(source) = candidate.inspection.source_crc32 {
+            ui.label(format!("Expected source CRC32: {source:08X}"));
+        }
+        if let Some(target) = candidate.inspection.target_crc32 {
+            ui.label(format!("Expected output CRC32: {target:08X}"));
+        }
+        let (headline, tone) = match candidate.matching.compatibility {
+            PatchCompatibility::Compatible if candidate.adjustment == HeaderAdjustment::None => {
+                ("Exact match", widgets::StatusTone::Success)
+            }
+            PatchCompatibility::Compatible => {
+                ("Header adjustment required", widgets::StatusTone::Warning)
+            }
+            PatchCompatibility::Incompatible => ("Incompatible", widgets::StatusTone::Blocked),
+            PatchCompatibility::ReviewRequired => ("Possible match", widgets::StatusTone::Warning),
+            PatchCompatibility::Unknown => ("Unknown", widgets::StatusTone::Warning),
+        };
+        widgets::status_badge(ui, headline, tone);
+        ui.label(&candidate.matching.reason);
+        ui.label(match candidate.adjustment {
+            HeaderAdjustment::None => "Transformation: none".to_string(),
+            HeaderAdjustment::Strip512ByteCopierHeader => {
+                "Transformation: strip 512-byte copier header for patch input".to_string()
+            }
+        });
+        if let Some(plan) = candidate.plan.as_ref() {
+            ui.label(format!("Output: {}", plan.reviewed.output_path.display()));
+            ui.label("Source modified: NO");
+            if state.applying.is_none()
+                && state.applied.is_none()
+                && widgets::action_button(
+                    ui,
+                    "Create derived patched ROM",
+                    widgets::ActionStyle::Primary,
+                    true,
+                )
+                .clicked()
+            {
+                let (sender, receiver) = mpsc::channel();
+                let worker_plan = plan.clone();
+                std::thread::spawn(move || {
+                    let result =
+                        apply_standalone_patch(&worker_plan).map_err(|error| error.to_string());
+                    let _ = sender.send(result);
+                });
+                state.applying = Some(receiver);
+            }
+        } else if let Some(error) = candidate.plan_error.as_ref() {
+            widgets::banner(
+                ui,
+                "Cannot apply this patch",
+                error,
+                widgets::StatusTone::Blocked,
+            );
+        } else {
+            widgets::banner(
+                ui,
+                "Cannot safely apply this patch",
+                "The selected patch is inspectable, but its source identity is not an exact safe match.",
+                widgets::StatusTone::Blocked,
+            );
+        }
+        if state.applying.is_some() {
+            ui.label("Applying to a new derived file…");
+        }
+        if let Some(result) = state.applied.as_ref() {
+            widgets::status_badge(ui, "Derived ROM created", widgets::StatusTone::Success);
+            ui.label(format!("Output: {}", result.output_path.display()));
+            ui.label(format!("Output SHA-256: {}", result.output_sha256));
+            ui.label("The original ROM was not changed. Provenance was recorded with the result.");
+        }
+    });
 }
 
 fn now() -> u64 {
@@ -384,12 +742,14 @@ pub fn show_local_mod_package_panel_with_catalogue(
         state.key = Some(key);
         state.stage = None;
         state.provider_selection = None;
+        state.standalone = StandalonePatchPageState::default();
     }
     widgets::section_header(
         ui,
         "Ordinary game mods",
         Some("Choose a local mod folder. EmuWiz previews every file before anything changes."),
     );
+    show_standalone_patch_panel(ui, &mut state.standalone, archive_path, identity);
     show_provider_catalogue_candidates(ui, state, identity, catalogue_records);
     if state.provider_selection.is_some() {
         return;
@@ -982,6 +1342,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Candidates(inspection, 1)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(&output, "Local mod candidates"));
@@ -1029,6 +1390,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Planned(plan)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(&output, "Review and apply mod"));
@@ -1055,6 +1417,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Planned(plan)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(&output, "Cannot apply this mod"));
@@ -1076,6 +1439,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Confirm(transaction)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(
@@ -1131,6 +1495,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Applied(result)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(&output, "Undo this mod"));
@@ -1217,6 +1582,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Applied(result)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(&output, "Mod installed"));
@@ -1259,6 +1625,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Applied(result)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(text_contains(&output, "Mod was not applied"));
@@ -1317,6 +1684,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::Applied(result)),
+            ..Default::default()
         };
         let output = render(&mut state, &archive, Some(&id));
         assert!(!text_contains(&output, "Mod installed"));
@@ -1360,6 +1728,7 @@ mod tests {
             key: Some((archive.clone(), game_root.clone())),
             provider_selection: None,
             stage: Some(Stage::RollingBack(receiver)),
+            ..Default::default()
         };
         assert!(state.poll());
         assert!(
@@ -1389,6 +1758,7 @@ mod tests {
                 key: Some((archive.clone(), game_root.clone())),
                 provider_selection: None,
                 stage: Some(Stage::RolledBack(status)),
+                ..Default::default()
             };
             let output = render(&mut state, &archive, Some(&id));
             assert!(!text_contains(&output, "Mod removed"));
@@ -1409,6 +1779,7 @@ mod tests {
             key: None,
             provider_selection: None,
             stage: Some(Stage::RollingBack(receiver)),
+            ..Default::default()
         };
         assert!(state.poll());
         assert!(matches!(state.stage, Some(Stage::Failed(_))));
