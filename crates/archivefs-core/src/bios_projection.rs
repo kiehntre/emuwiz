@@ -745,6 +745,45 @@ pub fn plan_for_emulator(inventory: &BiosMasterInventory, emulator: &str) -> Bio
     }
 }
 
+/// Bind an otherwise review-only plan to a caller-approved emulator target
+/// root.  Discovery never guesses an emulator path; the user (or a future
+/// profile adapter) must supply this root explicitly.  The selected source's
+/// own filename is retained as the link name, so no BIOS identity is invented
+/// by the binding step.
+pub fn bind_plan_to_target_root(
+    plan: &BiosProjectionPlan,
+    target_root: &Path,
+) -> Result<BiosProjectionPlan, BiosProjectionApplyError> {
+    if !target_root.is_absolute() {
+        return Err(BiosProjectionApplyError::UnsafeTarget(
+            target_root.to_path_buf(),
+        ));
+    }
+    let mut bound = plan.clone();
+    for (index, action) in bound.actions.iter_mut().enumerate() {
+        let BiosProjectionAction::CreateFileLink { source, target } = action else {
+            continue;
+        };
+        let Some(Some(evidence)) = bound.matches.get(index) else {
+            continue;
+        };
+        let Some(filename) = evidence.relative_path.file_name() else {
+            return Err(BiosProjectionApplyError::StalePlan(format!(
+                "{} has no source filename",
+                bound.requirements[index].name
+            )));
+        };
+        let target_path = target_root.join(filename);
+        target.path = Some(target_path.clone());
+        target.description = format!("{} ({})", target.description, target_path.display());
+        target.current_state = inspect_link_target(&target_path, &bound.master_root.join(source));
+        if let Some(requirement) = bound.requirements.get_mut(index) {
+            requirement.target = target.clone();
+        }
+    }
+    Ok(bound)
+}
+
 /// Apply only explicit immutable file/directory-link actions. The approved
 /// root and typed confirmation are mandatory; no implicit emulator path is
 /// ever selected. Direct config paths and writable state are refused.
@@ -757,6 +796,13 @@ pub fn apply_plan(
         return Err(BiosProjectionApplyError::ConfirmationRequired);
     }
     if !approved_target_root.is_absolute() {
+        return Err(BiosProjectionApplyError::UnsafeTarget(
+            approved_target_root.to_path_buf(),
+        ));
+    }
+    let target_metadata = fs::symlink_metadata(approved_target_root)
+        .map_err(|_| BiosProjectionApplyError::UnsafeTarget(approved_target_root.to_path_buf()))?;
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
         return Err(BiosProjectionApplyError::UnsafeTarget(
             approved_target_root.to_path_buf(),
         ));
@@ -882,6 +928,20 @@ pub fn apply_plan(
         return Err(BiosProjectionApplyError::NoEligibleItems);
     }
     Ok(transaction)
+}
+
+fn inspect_link_target(path: &Path, source: &Path) -> BiosTargetState {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => match fs::read_link(path) {
+            Ok(actual) if actual == source => BiosTargetState::ExistingCorrectLink,
+            Ok(_) => BiosTargetState::ExistingWrongLink,
+            Err(_) => BiosTargetState::Unknown,
+        },
+        Ok(metadata) if metadata.is_file() => BiosTargetState::ExistingRegularFile,
+        Ok(_) => BiosTargetState::UnsafeSpecialFile,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BiosTargetState::Missing,
+        Err(_) => BiosTargetState::Unknown,
+    }
 }
 
 pub fn rollback_plan(
@@ -1117,6 +1177,34 @@ mod tests {
             BiosTargetState::ExistingRegularFile
         );
         assert_eq!(fs::read(&file_path).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_an_explicit_target_root_keeps_apply_source_preserving() {
+        let dir = tempdir().unwrap();
+        file(dir.path(), "scph1001.bin", b"bios");
+        let inventory = inspect_master_root(dir.path()).unwrap();
+        let plan = plan_for_emulator(&inventory, "DuckStation");
+        let target_root = dir.path().join("duckstation-bios");
+        fs::create_dir(&target_root).unwrap();
+        let bound = bind_plan_to_target_root(&plan, &target_root).unwrap();
+        assert_eq!(
+            bound.requirements[0].target.path.as_deref(),
+            Some(target_root.join("scph1001.bin").as_path())
+        );
+        assert_eq!(
+            bound.requirements[0].target.current_state,
+            BiosTargetState::Missing
+        );
+        let transaction = apply_plan(
+            &bound,
+            &target_root,
+            &apply_confirmation(bound.requirements.len()),
+        )
+        .unwrap();
+        assert_eq!(transaction.applied.len(), 1);
+        assert_eq!(fs::read(dir.path().join("scph1001.bin")).unwrap(), b"bios");
     }
 
     #[cfg(unix)]
