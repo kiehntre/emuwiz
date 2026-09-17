@@ -4855,6 +4855,9 @@ fn gather_doctor_scan() -> DoctorScan {
         melonds_mgba_readiness: Gathered::NotLoaded(
             "melonDS and mGBA readiness has not been checked in this CLI session.",
         ),
+        desmume_mesen_readiness: Gathered::NotLoaded(
+            "DeSmuME and Mesen readiness has not been checked in this CLI session.",
+        ),
         // Arcade emulator / DAT version compatibility is assembled from that
         // installation evidence, so it is likewise not gathered by the
         // diagnostics-only CLI Doctor scan.

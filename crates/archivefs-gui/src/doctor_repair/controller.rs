@@ -90,6 +90,9 @@ impl ArchiveFsApp {
                             melonds_mgba_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            desmume_mesen_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             arcade_dat_version: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -180,6 +183,10 @@ impl ArchiveFsApp {
             ),
             melonds_mgba_readiness: borrowed(
                 &gathered.melonds_mgba_readiness,
+                |value| value.as_slice(),
+            ),
+            desmume_mesen_readiness: borrowed(
+                &gathered.desmume_mesen_readiness,
                 |value| value.as_slice(),
             ),
             arcade_dat_version: borrowed(&gathered.arcade_dat_version, |value| value.as_slice()),
@@ -663,6 +670,9 @@ pub(crate) fn gather_doctor_inputs(
     let melonds_mgba_readiness = Gathered::Ready(
         archivefs_core::diagnostics::handheld_profiles::discover_melonds_mgba_readiness(),
     );
+    let desmume_mesen_readiness = Gathered::Ready(
+        archivefs_core::diagnostics::native_profiles::discover_desmume_mesen_readiness(),
+    );
 
     DoctorGathered {
         mount_root_safety: match &config {
@@ -713,6 +723,7 @@ pub(crate) fn gather_doctor_inputs(
         linux_emulator_installations,
         azahar_cemu_readiness,
         melonds_mgba_readiness,
+        desmume_mesen_readiness,
         arcade_dat_version,
         xemu_readiness,
         xenia_readiness,

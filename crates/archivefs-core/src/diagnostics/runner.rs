@@ -38,6 +38,9 @@ use super::handheld_profiles::{
 use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
+use super::native_profiles::{
+    DesmumeMesenReadiness, findings_from_desmume_mesen_readiness,
+};
 use super::profiles::{
     AzaharCemuReadiness, LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment, ProfileAssessmentReport,
     Rpcs3ReadinessAssessment, XemuReadinessAssessment, XeniaReadinessAssessment,
@@ -139,6 +142,7 @@ pub struct DoctorScanInputs<'a> {
     pub linux_emulator_installations: Gathered<&'a [LinuxEmulatorInstallationEvidence]>,
     pub azahar_cemu_readiness: Gathered<&'a [AzaharCemuReadiness]>,
     pub melonds_mgba_readiness: Gathered<&'a [MelonDsMgbaReadiness]>,
+    pub desmume_mesen_readiness: Gathered<&'a [DesmumeMesenReadiness]>,
     /// From `arcade_dat_version::arcade_dat_version_readiness` - advisory
     /// MAME / FBNeo emulator-vs-DAT version compatibility, assembled outside
     /// this pure runner from the installation evidence and configured arcade
@@ -198,6 +202,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             melonds_mgba_readiness: Gathered::NotLoaded(
                 "melonDS and mGBA readiness has not been checked in this session.",
+            ),
+            desmume_mesen_readiness: Gathered::NotLoaded(
+                "DeSmuME and Mesen readiness has not been checked in this session.",
             ),
             arcade_dat_version: Gathered::NotLoaded(
                 "Arcade emulator / DAT version compatibility has not been assembled in this session.",
@@ -551,6 +558,12 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::EmulatorProfiles,
         DoctorSubsystem::EmulatorReadiness,
         |entries: &&[MelonDsMgbaReadiness]| findings_from_melonds_mgba_readiness(entries)
+    );
+    subsystem!(
+        inputs.desmume_mesen_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |entries: &&[DesmumeMesenReadiness]| findings_from_desmume_mesen_readiness(entries)
     );
     subsystem!(
         inputs.arcade_dat_version,

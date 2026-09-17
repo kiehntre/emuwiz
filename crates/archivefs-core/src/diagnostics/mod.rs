@@ -72,6 +72,7 @@ pub mod arcade_version_probe;
 pub mod environment;
 pub mod handheld_profiles;
 pub mod managed;
+pub mod native_profiles;
 pub mod profiles;
 pub mod repair;
 pub mod runner;

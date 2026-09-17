@@ -27,6 +27,8 @@ pub(crate) struct DoctorGathered {
         Gathered<Vec<archivefs_core::diagnostics::profiles::AzaharCemuReadiness>>,
     pub(crate) melonds_mgba_readiness:
         Gathered<Vec<archivefs_core::diagnostics::handheld_profiles::MelonDsMgbaReadiness>>,
+    pub(crate) desmume_mesen_readiness:
+        Gathered<Vec<archivefs_core::diagnostics::native_profiles::DesmumeMesenReadiness>>,
     pub(crate) arcade_dat_version:
         Gathered<Vec<archivefs_core::diagnostics::arcade_dat_version::ArcadeEmulatorDatReadiness>>,
     pub(crate) xemu_readiness: Gathered<Vec<XemuReadinessAssessment>>,
