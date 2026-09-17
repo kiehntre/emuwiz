@@ -85,9 +85,7 @@ use crate::launch::integration::{
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef, LaunchTarget,
 };
-use crate::launch::process_spawn::{
-    self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
-};
+use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
 use crate::patch_manager::{
     DuckStationGameRequest, DuckStationProfileDiscoveryRoots, DuckStationUserDirectoryMode,
@@ -697,11 +695,7 @@ pub fn spawn_duckstation(
     command: DuckStationCommand,
 ) -> Result<LaunchedDuckStationProcess, DuckStationLaunchSpawnError> {
     let facts = command_facts(&command);
-    let prepared = PreparedProcessCommand {
-        executable: command.executable,
-        arguments: command.arguments,
-        working_directory: command.working_directory,
-    };
+    let prepared = command.command_spec();
     let watched = process_spawn::spawn_watched_process(&prepared)
         .map_err(DuckStationLaunchSpawnError::Spawn)?;
     Ok(LaunchedDuckStationProcess {

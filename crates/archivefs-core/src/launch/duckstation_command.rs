@@ -53,6 +53,7 @@ use std::path::PathBuf;
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchCandidate, LaunchContainerKind, LaunchTarget,
 };
+use crate::launch::process_spawn::LaunchCommandSpec;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 use crate::patch_manager::{
     DuckStationLaunchBlocker, DuckStationNativeLaunchBinding, DuckStationUserDirectoryMode,
@@ -77,6 +78,18 @@ pub struct DuckStationCommand {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub selection: DuckStationCommandSelection,
+}
+
+impl DuckStationCommand {
+    /// Projects the already-built argv into the generic process command shape
+    /// used by preview and spawning. This does not revalidate or perform I/O.
+    pub fn command_spec(&self) -> LaunchCommandSpec {
+        LaunchCommandSpec {
+            executable: self.executable.clone(),
+            arguments: self.arguments.clone(),
+            working_directory: self.working_directory.clone(),
+        }
+    }
 }
 
 /// The facts that produced the command's argv - profile/binding, platform,

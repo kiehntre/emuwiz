@@ -27,6 +27,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
+use crate::launch::process_spawn::LaunchCommandSpec;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind};
 use crate::patch_manager::{
     DolphinLaunchBlocker, DolphinNativeLaunchBinding, DolphinUserDirectoryMode,
@@ -49,6 +50,18 @@ pub struct DolphinCommand {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub selection: DolphinCommandSelection,
+}
+
+impl DolphinCommand {
+    /// Projects the already-built argv into the generic process command shape
+    /// used by preview and spawning. This does not revalidate or perform I/O.
+    pub fn command_spec(&self) -> LaunchCommandSpec {
+        LaunchCommandSpec {
+            executable: self.executable.clone(),
+            arguments: self.arguments.clone(),
+            working_directory: self.working_directory.clone(),
+        }
+    }
 }
 
 /// The facts that produced the command's argv - profile/binding, platform,

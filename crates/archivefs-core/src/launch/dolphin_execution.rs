@@ -51,9 +51,7 @@ use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef,
     LaunchTarget, StandaloneProfileInput, build_launch_plan,
 };
-use crate::launch::process_spawn::{
-    self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
-};
+use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
 use crate::launch::readiness::{FirmwareReadiness, LaunchReadiness};
 use crate::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinUserDirectoryMode, discover_dolphin_local_profiles,
@@ -602,11 +600,7 @@ pub fn spawn_dolphin(
     command: DolphinCommand,
 ) -> Result<LaunchedDolphinProcess, DolphinLaunchSpawnError> {
     let facts = command_facts(&command);
-    let prepared = PreparedProcessCommand {
-        executable: command.executable,
-        arguments: command.arguments,
-        working_directory: command.working_directory,
-    };
+    let prepared = command.command_spec();
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(DolphinLaunchSpawnError::Spawn)?;
     Ok(LaunchedDolphinProcess {

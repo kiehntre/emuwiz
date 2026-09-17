@@ -77,6 +77,18 @@ fn default_native_produces_exact_argv() {
     );
     assert_eq!(command.selection.platform_id, "PSX");
     assert_eq!(command.selection.verified_ps1_serial, "SLUS-12345");
+    assert_eq!(
+        command.command_spec(),
+        crate::launch::process_spawn::LaunchCommandSpec {
+            executable: PathBuf::from("/usr/bin/duckstation-qt"),
+            arguments: vec![
+                OsString::from("-batch"),
+                OsString::from("--"),
+                OsString::from("/games/Final Fantasy VII.iso"),
+            ],
+            working_directory: None,
+        }
+    );
 }
 
 #[test]

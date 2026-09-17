@@ -52,8 +52,9 @@ use archivefs_core::launch::{
     LaunchedRpcs3Process, LaunchedXemuProcess, LaunchedXeniaProcess, PpssppLaunchExecutionError,
     PpssppLaunchRequest, Rpcs3LaunchExecutionError, Rpcs3LaunchRequest, WHDLoadLaunchInput,
     XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
-    build_amiberry_whdload_command_plan, build_fsuae_whdload_command_plan,
-    build_pcsx2_command_plan, build_retroarch_command_plan, preflight_and_launch_amiga_whdload,
+    build_amiberry_whdload_command_plan, build_dolphin_command_plan,
+    build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
+    build_retroarch_command_plan, preflight_and_launch_amiga_whdload,
     preflight_and_launch_duckstation, preflight_and_launch_ppsspp, preflight_and_launch_rpcs3,
     preflight_and_launch_xemu, preflight_and_launch_xenia,
 };
@@ -1858,7 +1859,9 @@ fn show_launch_recipe(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
     retroarch: Option<&RetroArchLaunchContext>,
+    dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
+    duckstation: Option<&DuckStationLaunchContext>,
 ) {
     let (emulator, profile) = target_labels(&candidate.target);
     let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
@@ -1868,7 +1871,7 @@ fn show_launch_recipe(
         .as_deref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "No runnable game file has been resolved".into());
-    let command = launch_command_preview(plan, candidate, retroarch, pcsx2);
+    let command = launch_command_preview(plan, candidate, retroarch, dolphin, pcsx2, duckstation);
     let readiness = readiness_label_and_tone(candidate.readiness);
 
     widgets::card(ui, |ui| {
@@ -1933,7 +1936,9 @@ fn launch_command_preview(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
     retroarch: Option<&RetroArchLaunchContext>,
+    dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
+    duckstation: Option<&DuckStationLaunchContext>,
 ) -> Option<LaunchCommandSpec> {
     let identity = preview_identity(plan);
     match &candidate.target {
@@ -1947,6 +1952,18 @@ fn launch_command_preview(
             profile_id,
             ..
         } => match *adapter_id {
+            "dolphin" => {
+                let context = dolphin?;
+                let profile = context
+                    .discovery
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)?;
+                let binding = resolve_dolphin_native_launch_binding(profile, &context.roots);
+                build_dolphin_command_plan(&identity, candidate, &binding)
+                    .command
+                    .map(|command| command.command_spec())
+            }
             "pcsx2" => {
                 let context = pcsx2?;
                 let serial = context.verified_ps2_serial.as_deref();
@@ -1959,6 +1976,27 @@ fn launch_command_preview(
                 build_pcsx2_command_plan(&identity, serial, candidate, &binding)
                     .command
                     .map(|command| command.command_spec())
+            }
+            "duckstation" => {
+                let context = duckstation?;
+                let profile = context
+                    .discovery
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)?;
+                let binding =
+                    archivefs_core::patch_manager::resolve_duckstation_native_launch_binding(
+                        profile,
+                        &context.roots,
+                    );
+                build_duckstation_command_plan(
+                    &identity,
+                    context.verified_ps1_serial.as_deref(),
+                    candidate,
+                    &binding,
+                )
+                .command
+                .map(|command| command.command_spec())
             }
             _ => None,
         },
@@ -2513,7 +2551,7 @@ fn show_candidate(
             .color(theme::muted(ui)),
         );
 
-        show_launch_recipe(ui, plan, candidate, retroarch, pcsx2);
+        show_launch_recipe(ui, plan, candidate, retroarch, dolphin, pcsx2, duckstation);
 
         open_doctor = show_firmware_summary(ui, candidate);
 

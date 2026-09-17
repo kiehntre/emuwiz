@@ -87,6 +87,17 @@ fn default_native_produces_exact_argv() {
     );
     assert_eq!(command.selection.platform_id, "GameCube");
     assert_eq!(command.selection.game_id, "GALE01");
+    assert_eq!(
+        command.command_spec(),
+        crate::launch::process_spawn::LaunchCommandSpec {
+            executable: PathBuf::from("/usr/bin/dolphin-emu"),
+            arguments: vec![
+                OsString::from("-e"),
+                OsString::from("/games/Wind Waker.iso")
+            ],
+            working_directory: None,
+        }
+    );
 }
 
 #[test]
