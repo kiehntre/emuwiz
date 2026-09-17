@@ -1846,6 +1846,55 @@ fn preference_label(preference: CandidatePreference) -> &'static str {
     }
 }
 
+/// Draws the human-facing recipe for the exact candidate already present in
+/// the shared launch plan.  This is deliberately a projection, not a second
+/// command builder: adapter preflight still owns executable discovery,
+/// identity revalidation, and the final argv used to spawn a process.
+fn show_launch_recipe(ui: &mut egui::Ui, plan: &LaunchPlan, candidate: &LaunchCandidate) {
+    let (emulator, profile) = target_labels(&candidate.target);
+    let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
+    let input = candidate
+        .content
+        .resolved_path
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "No runnable game file has been resolved".into());
+    let arguments = match &candidate.target {
+        LaunchTarget::RetroArchCore { core_stem, .. } => {
+            format!("-L {core_stem} <game path>")
+        }
+        LaunchTarget::Standalone { .. } => "<adapter-specific arguments> <game path>".into(),
+    };
+    let readiness = readiness_label_and_tone(candidate.readiness);
+
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Launch recipe").strong());
+        detail_label(ui, "System", system);
+        detail_label(ui, "Emulator", &emulator);
+        detail_label(ui, "Profile", &profile);
+        detail_label(ui, "Game file", &input);
+        detail_label(ui, "Arguments", &arguments);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Readiness").strong());
+            widgets::status_badge(ui, readiness.0, readiness.1);
+        });
+        if candidate.firmware != FirmwareReadiness::NotRequired {
+            let firmware = firmware_summary(candidate.firmware, &candidate.blockers);
+            detail_label(ui, "Firmware", firmware.status);
+        }
+        if let Some(blocker) = candidate.blockers.first() {
+            detail_label(ui, "Why", &blocker.detail);
+        }
+        ui.label(
+            egui::RichText::new(
+                "The selected adapter builds and rechecks the final executable command when you launch.",
+            )
+            .small()
+            .color(theme::muted(ui)),
+        );
+    });
+}
+
 /// Plain-language firmware presentation, projected solely from the existing
 /// shared readiness value and the existing launch blockers. It deliberately
 /// does not derive a requirement from an emulator name, a filename, or a
@@ -2393,6 +2442,8 @@ fn show_candidate(
             .small()
             .color(theme::muted(ui)),
         );
+
+        show_launch_recipe(ui, plan, candidate);
 
         open_doctor = show_firmware_summary(ui, candidate);
 

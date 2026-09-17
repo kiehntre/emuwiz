@@ -834,6 +834,42 @@ fn section_heading_and_subtitle_render() {
     ));
 }
 
+#[test]
+fn launch_recipe_uses_the_shared_candidate_and_plain_language() {
+    let output = render(&plan_input(plan_with(vec![ready_candidate()])));
+    assert!(rendered_text_contains(&output, "Launch recipe"));
+    assert!(rendered_text_contains(&output, "System"));
+    assert!(rendered_text_contains(&output, "PSX"));
+    assert!(rendered_text_contains(&output, "Game file"));
+    assert!(rendered_text_contains(&output, "/library/Game.bin"));
+    assert!(rendered_text_contains(
+        &output,
+        "-L mednafen_psx_hw <game path>"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "rechecks the final executable command"
+    ));
+}
+
+#[test]
+fn launch_recipe_keeps_unresolved_content_blocked_and_explains_why() {
+    let mut candidate = ready_candidate();
+    candidate.content = unresolved_archive_content();
+    candidate.readiness = LaunchReadiness::Blocked;
+    candidate.blockers.push(LaunchBlocker::new(
+        LaunchBlockerKind::ContentNotResolved,
+        "content is inside a container that has not been mounted, so no runnable path exists yet",
+    ));
+    let output = render(&plan_input(plan_with(vec![candidate])));
+    assert!(rendered_text_contains(
+        &output,
+        "No runnable game file has been resolved"
+    ));
+    assert!(rendered_text_contains(&output, "Why"));
+    assert!(rendered_text_contains(&output, "Blocked"));
+}
+
 // --- Launch RetroArch button eligibility ------------------------------------
 
 #[test]
