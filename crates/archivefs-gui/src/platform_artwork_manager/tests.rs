@@ -116,6 +116,29 @@ fn missing_unknown_artwork_keeps_glyph_and_feature_diagnostics() {
 }
 
 #[test]
+fn settings_artwork_decodes_only_visible_platform_cards() {
+    let mut manager = session(None);
+    let context = egui::Context::default();
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 500.0),
+            )),
+            ..egui::RawInput::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                let _ = manager.show(ui);
+            });
+        },
+    );
+
+    assert!(!manager.cache.bundled_entries.is_empty());
+    assert!(manager.cache.bundled_entries.len() < archivefs_core::platform::PLATFORMS.len());
+}
+
+#[test]
 fn dragon_coco_unknown_fallback_is_preserved_not_silently_remapped() {
     assert_eq!(
         platform_asset_category("Dragon / Tandy CoCo"),

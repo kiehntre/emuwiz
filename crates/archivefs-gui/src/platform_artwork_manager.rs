@@ -588,19 +588,26 @@ fn show_platform_artwork_manager(
             ui.horizontal(|ui| {
                 let (response, _) =
                     ui.allocate_painter(egui::vec2(72.0, 72.0), egui::Sense::hover());
-                let asset_id = canonical_platform_asset_id(platform.id);
-                paint_platform_artwork_at(
-                    ui,
-                    artwork_cache,
-                    root,
-                    PlatformArtworkPaint {
-                        center: response.rect.center(),
-                        size: 64.0,
-                        color: ui.visuals().text_color().gamma_multiply(0.8),
-                        asset_id: &asset_id,
-                        fallback_asset_id: platform_asset_category(platform.id).asset_id(),
-                    },
-                );
+                // Bundled images are decoded lazily. Settings can contain
+                // many platform cards, but only cards inside the current
+                // clipped viewport can contribute pixels to this frame.
+                // Off-screen cards keep their layout and load their image on
+                // the frame in which they become visible.
+                if ui.is_rect_visible(response.rect) {
+                    let asset_id = canonical_platform_asset_id(platform.id);
+                    paint_platform_artwork_at(
+                        ui,
+                        artwork_cache,
+                        root,
+                        PlatformArtworkPaint {
+                            center: response.rect.center(),
+                            size: 64.0,
+                            color: ui.visuals().text_color().gamma_multiply(0.8),
+                            asset_id: &asset_id,
+                            fallback_asset_id: platform_asset_category(platform.id).asset_id(),
+                        },
+                    );
+                }
                 ui.vertical(|ui| {
                     ui.heading(platform.display_name);
                     ui.label(format!("Canonical ID: {}", platform.id));
