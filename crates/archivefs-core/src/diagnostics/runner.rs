@@ -53,6 +53,10 @@ use super::profiles::{
     findings_from_xenia_readiness, not_checked_from_emulator_profiles,
 };
 use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
+use super::scummvm_dosbox::{
+    DosBoxStagingDoctorReadiness, ScummVmDoctorReadiness, findings_from_dosbox_staging_readiness,
+    findings_from_scummvm_readiness,
+};
 use super::verified_identity::{ArchiveIdentityFactStatus, findings_from_verified_identity_facts};
 use super::{
     CoverageStatus, DEFERRED_CHECKS, DeferredCheck, DoctorCategory, DoctorSeverity,
@@ -154,6 +158,8 @@ pub struct DoctorScanInputs<'a> {
     /// DAT catalogue versions.
     pub arcade_dat_version: Gathered<&'a [ArcadeEmulatorDatReadiness]>,
     pub arcade_readiness: Gathered<&'a [ArcadeReadiness]>,
+    pub scummvm_readiness: Gathered<&'a ScummVmDoctorReadiness>,
+    pub dosbox_staging_readiness: Gathered<&'a DosBoxStagingDoctorReadiness>,
     /// From `profiles::assess_xemu_readiness`.
     pub xemu_readiness: Gathered<&'a [XemuReadinessAssessment]>,
     /// From `profiles::assess_xenia_readiness`.
@@ -221,6 +227,12 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             arcade_readiness: Gathered::NotLoaded(
                 "MAME and FBNeo launch readiness has not been checked in this session.",
+            ),
+            scummvm_readiness: Gathered::NotLoaded(
+                "ScummVM readiness has not been checked in this session.",
+            ),
+            dosbox_staging_readiness: Gathered::NotLoaded(
+                "DOSBox Staging readiness has not been checked in this session.",
             ),
             xemu_readiness: Gathered::NotLoaded(
                 "xemu launch readiness has not been checked in this session.",
@@ -598,6 +610,20 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::Emulators,
         DoctorSubsystem::EmulatorReadiness,
         |readiness: &&[ArcadeReadiness]| findings_from_arcade_readiness(readiness)
+    );
+    subsystem!(
+        inputs.scummvm_readiness,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&ScummVmDoctorReadiness| findings_from_scummvm_readiness(readiness)
+    );
+    subsystem!(
+        inputs.dosbox_staging_readiness,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&DosBoxStagingDoctorReadiness| {
+            findings_from_dosbox_staging_readiness(readiness)
+        }
     );
     subsystem!(
         inputs.xemu_readiness,

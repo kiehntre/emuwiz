@@ -1738,7 +1738,7 @@ fn a_complete_gather_and_scan_leaves_the_entire_data_directory_unchanged() {
     // "not gathered" wording, so they count as separate entries here.
     assert_eq!(
         scan.unavailable_subsystems().len(),
-        20,
+        22,
         "{:?}",
         scan.coverage
     );

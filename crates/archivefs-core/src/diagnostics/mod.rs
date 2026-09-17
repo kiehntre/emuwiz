@@ -79,6 +79,7 @@ pub mod remaining_profiles;
 pub mod rmg_sameboy;
 pub mod repair;
 pub mod runner;
+pub mod scummvm_dosbox;
 pub mod verified_identity;
 
 #[cfg(test)]

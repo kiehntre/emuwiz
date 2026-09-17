@@ -35,6 +35,10 @@ pub(crate) struct DoctorGathered {
         Gathered<Vec<archivefs_core::diagnostics::arcade_dat_version::ArcadeEmulatorDatReadiness>>,
     pub(crate) arcade_readiness:
         Gathered<Vec<archivefs_core::diagnostics::arcade_profiles::ArcadeReadiness>>,
+    pub(crate) scummvm_readiness:
+        Gathered<archivefs_core::diagnostics::scummvm_dosbox::ScummVmDoctorReadiness>,
+    pub(crate) dosbox_staging_readiness:
+        Gathered<archivefs_core::diagnostics::scummvm_dosbox::DosBoxStagingDoctorReadiness>,
     pub(crate) xemu_readiness: Gathered<Vec<XemuReadinessAssessment>>,
     pub(crate) xenia_readiness: Gathered<Vec<XeniaReadinessAssessment>>,
     pub(crate) ppsspp_readiness: Gathered<Vec<PpssppReadinessAssessment>>,

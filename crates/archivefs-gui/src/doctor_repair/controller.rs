@@ -102,6 +102,12 @@ impl ArchiveFsApp {
                             arcade_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            scummvm_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
+                            dosbox_staging_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             xemu_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -204,6 +210,8 @@ impl ArchiveFsApp {
             ),
             arcade_dat_version: borrowed(&gathered.arcade_dat_version, |value| value.as_slice()),
             arcade_readiness: borrowed(&gathered.arcade_readiness, |value| value.as_slice()),
+            scummvm_readiness: borrowed(&gathered.scummvm_readiness, |value| value),
+            dosbox_staging_readiness: borrowed(&gathered.dosbox_staging_readiness, |value| value),
             xemu_readiness: borrowed(&gathered.xemu_readiness, |value| value.as_slice()),
             xenia_readiness: borrowed(&gathered.xenia_readiness, |value| value.as_slice()),
             ppsspp_readiness: borrowed(&gathered.ppsspp_readiness, |value| value.as_slice()),
@@ -687,6 +695,12 @@ pub(crate) fn gather_doctor_inputs(
             },
         ),
     );
+    let (scummvm_readiness, dosbox_staging_readiness) =
+        archivefs_core::diagnostics::scummvm_dosbox::discover_scummvm_dosbox_readiness(
+            &installations,
+        );
+    let scummvm_readiness = Gathered::Ready(scummvm_readiness);
+    let dosbox_staging_readiness = Gathered::Ready(dosbox_staging_readiness);
     let linux_emulator_installations = Gathered::Ready(installations);
     let azahar_cemu_readiness = Gathered::Ready(
         archivefs_core::diagnostics::profiles::discover_azahar_cemu_readiness(),
@@ -757,6 +771,8 @@ pub(crate) fn gather_doctor_inputs(
         rmg_sameboy_readiness,
         arcade_dat_version,
         arcade_readiness,
+        scummvm_readiness,
+        dosbox_staging_readiness,
         xemu_readiness,
         xenia_readiness,
         ppsspp_readiness,
