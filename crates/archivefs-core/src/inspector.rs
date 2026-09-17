@@ -299,7 +299,25 @@ pub fn inspect_archive_with_limit(
     if !is_inspectable(path) {
         return Err(InspectorError::UnsupportedFormat(path.to_path_buf()));
     }
+    inspect_zip_archive_with_limit(path, limit)
+}
 
+/// The same read-only listing as [`inspect_archive_with_limit`], for a caller
+/// that has *already* established the file is a ZIP by some means other than
+/// its name.
+///
+/// [`is_inspectable`] is filename-only on purpose - it is the cheap, pure
+/// predicate the GUI uses to decide whether to offer "Inspect contents", and
+/// it must never touch the filesystem. That makes it the wrong gate for a
+/// content-addressed file, which has no extension to read: the downloaded-mod
+/// cache stores payloads under their digest, so a perfectly good ZIP would be
+/// refused by name after its signature had already identified it. Callers that
+/// have their own format evidence use this entry point; everything else keeps
+/// the filename gate.
+pub fn inspect_zip_archive_with_limit(
+    path: &Path,
+    limit: usize,
+) -> Result<InspectorReport, InspectorError> {
     let file = File::open(path).map_err(|source| classify_open_error(path, source))?;
     // `ZipArchive::new` reads and parses the whole central directory up
     // front - every entry's metadata (name, sizes, compression method,
@@ -831,6 +849,39 @@ mod tests {
         let error = inspect_archive(&path).unwrap_err();
         assert_eq!(error, InspectorError::Encrypted(path.clone()));
         assert!(error.to_string().contains("encrypted"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_extensionless_zip_is_refused_by_name_but_listed_when_the_format_is_known() {
+        // The two halves of the split: the filename gate still refuses, so the
+        // GUI predicate and `inspect_archive` behave exactly as before, while a
+        // caller holding its own format evidence can still read the archive.
+        // Content-addressed downloads have no extension to read.
+        let dir = temp_dir("extensionless");
+        let named = write_test_zip(
+            &dir,
+            "package.zip",
+            &[FixtureEntry {
+                name: "README.txt",
+                content: b"fixture\n",
+                method: CompressionMethod::Stored,
+            }],
+        );
+        let unnamed = dir.join("sha256-object");
+        fs::copy(&named, &unnamed).unwrap();
+
+        assert!(!is_inspectable(&unnamed));
+        assert_eq!(
+            inspect_archive(&unnamed).unwrap_err(),
+            InspectorError::UnsupportedFormat(unnamed.clone())
+        );
+
+        let by_name = inspect_archive(&named).unwrap();
+        let by_format = inspect_zip_archive_with_limit(&unnamed, INSPECTOR_ENTRY_LIMIT).unwrap();
+        assert_eq!(by_format.entries.len(), by_name.entries.len());
+        assert!(!by_format.entries.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
     }

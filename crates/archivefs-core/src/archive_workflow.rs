@@ -239,7 +239,13 @@ pub fn inspect_archive_plan(source: &Path, destination: &Path) -> Result<Archive
     if format != ArchiveFormat::Zip {
         return inspect_external_archive_plan(source, destination, format, size.len());
     }
-    let report = crate::inspect_archive(source).map_err(|e| e.to_string())?;
+    // `classify_archive` above already settled the format, by extension or by
+    // signature. Re-deriving it from the filename inside the inspector would
+    // reject a ZIP that arrived without one - which is exactly how every
+    // content-addressed downloaded mod payload is stored.
+    let report =
+        crate::inspector::inspect_zip_archive_with_limit(source, crate::INSPECTOR_ENTRY_LIMIT)
+            .map_err(|e| e.to_string())?;
     if report.truncated || report.total_entries_in_archive > MAX_ENTRIES {
         return Err("archive contains too many entries".into());
     }
