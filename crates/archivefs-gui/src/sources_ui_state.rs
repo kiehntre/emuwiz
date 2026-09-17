@@ -4,7 +4,9 @@ use crate::dat_authority_dashboard::DashboardState;
 use crate::dat_sources_page::{DatSourcesPageState, DatSourcesPageUi};
 use crate::media_sets_page::MediaSetsPageState;
 use crate::platform_source_actions::{RunningSourceAction, SourcesLastScan};
-use crate::source_controller::{SourcesAddDialogState, SourcesRemoveDialogState};
+use crate::source_controller::{
+    SourcesAddDialogState, SourcesRemoveDialogState, SourcesRoleDialogState,
+};
 use crate::sources_page::MountRootFeedback;
 use crate::{ScanPersistSummary, cheat_sources_page};
 
@@ -24,6 +26,7 @@ pub(crate) struct SourcesUiState {
     pub(crate) mount_root_feedback: Option<MountRootFeedback>,
     pub(crate) sources_add_dialog: Option<SourcesAddDialogState>,
     pub(crate) sources_remove_dialog: Option<SourcesRemoveDialogState>,
+    pub(crate) sources_role_dialog: Option<SourcesRoleDialogState>,
     pub(crate) dat_authority: DashboardState,
     pub(crate) pending_source_scan_summary: Option<ScanPersistSummary>,
     pub(crate) sources_last_scan: Option<SourcesLastScan>,

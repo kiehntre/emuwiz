@@ -85,6 +85,7 @@ pub(crate) enum SourceAction {
     ScanOne(PathBuf),
     ScanAll,
     AssignPlatform { path: PathBuf, platform: String },
+    SetRole { path: PathBuf, role: SourceRole },
     Remove { path: PathBuf, keep_catalogue: bool },
 }
 
@@ -102,6 +103,7 @@ pub(crate) enum SourceActionOutcome {
         platform: String,
         scan: ScanPersistSummary,
     },
+    RoleAssigned { role: SourceRole },
     Removed(RemoveSourceFolderOutcome),
 }
 

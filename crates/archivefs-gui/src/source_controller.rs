@@ -10,6 +10,8 @@
 
 use std::path::PathBuf;
 
+use archivefs_core::SourceRole;
+
 #[allow(unused_imports)]
 pub(crate) use crate::platform_source_actions::{
     RunningSourceAction, SourceAction, SourceActionOutcome, SourcesLastScan, SourcesScanScope,
@@ -32,4 +34,13 @@ pub(crate) struct SourcesRemoveDialogState {
     pub(crate) path: PathBuf,
     pub(crate) last_archive_count: Option<i64>,
     pub(crate) keep_catalogue: bool,
+}
+
+/// Pending role selection for one source. The persisted role remains the
+/// source view's `role` until the user explicitly saves this draft.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourcesRoleDialogState {
+    pub(crate) path: PathBuf,
+    pub(crate) original: SourceRole,
+    pub(crate) pending: SourceRole,
 }

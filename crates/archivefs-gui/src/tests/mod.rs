@@ -1057,6 +1057,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             mount_root_feedback: None,
             sources_add_dialog: None,
             sources_remove_dialog: None,
+            sources_role_dialog: None,
             dat_authority: dat_authority_dashboard::DashboardState::default(),
             pending_source_scan_summary: None,
             sources_last_scan: None,

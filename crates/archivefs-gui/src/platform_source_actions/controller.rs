@@ -842,6 +842,7 @@ pub(crate) fn source_action_log_category(action: &SourceAction) -> ActivityActio
         SourceAction::ScanOne(_) | SourceAction::ScanAll | SourceAction::AssignPlatform { .. } => {
             ActivityAction::SourceScan
         }
+        SourceAction::SetRole { .. } => ActivityAction::SourceScan,
         SourceAction::Remove { .. } => ActivityAction::SourceRemoved,
     }
 }
@@ -852,6 +853,7 @@ pub(crate) fn source_action_path(action: &SourceAction) -> Option<PathBuf> {
         | SourceAction::SetEnabled { path, .. }
         | SourceAction::ScanOne(path)
         | SourceAction::AssignPlatform { path, .. }
+        | SourceAction::SetRole { path, .. }
         | SourceAction::Remove { path, .. } => Some(path.clone()),
         SourceAction::ScanAll => None,
     }
@@ -874,6 +876,9 @@ pub(crate) fn source_action_started_message(action: &SourceAction) -> String {
             "Assigning {platform} to source '{}' and rescanning compatible entries.",
             path.display()
         ),
+        SourceAction::SetRole { path, role } => {
+            format!("Saving {} role for source '{}'.", role.label(), path.display())
+        }
         SourceAction::Remove {
             path,
             keep_catalogue: true,
@@ -930,6 +935,10 @@ pub(crate) fn source_action_success_message(outcome: &SourceActionOutcome) -> St
             scan.counts.archives_seen,
             scan.platform_assignment_warnings.len()
         ),
+        SourceActionOutcome::RoleAssigned { role } => format!(
+            "Source role saved as {}. No files were changed and no scan was started.",
+            role.label()
+        ),
         SourceActionOutcome::Removed(outcome) => match outcome.catalogue_rows_removed {
             Some(count) => format!(
                 "Source removed: {}. {count} catalogue row(s) removed.",
@@ -984,6 +993,8 @@ pub(crate) fn run_source_action(
                 }
             })
         }
+        SourceAction::SetRole { path, role } => set_source_role_default(path, *role)
+            .map(|()| SourceActionOutcome::RoleAssigned { role: *role }),
         SourceAction::Remove {
             path,
             keep_catalogue,

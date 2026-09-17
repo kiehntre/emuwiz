@@ -3229,6 +3229,38 @@ pub fn list_source_folder_views_at(
     Ok(build_source_folder_views(&sources, &records))
 }
 
+/// Persists the explicit role for one configured source. Role changes are
+/// metadata-only: they never scan, move, rename, or otherwise touch the
+/// source folder. The next explicit scan uses the persisted role's existing
+/// routing policy.
+pub fn set_source_role_at(
+    config_path: &Path,
+    database_path: &Path,
+    target: &Path,
+    role: SourceRole,
+) -> Result<()> {
+    let sources = load_source_folder_configs_from(config_path)?;
+    if !sources.iter().any(|source| source.path == target) {
+        return Err(ArchiveFsError::Config(format!(
+            "source folder {} is not configured",
+            target.display()
+        )));
+    }
+    let mut database = Database::open_or_create(database_path)?;
+    let paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    database.register_source_folders(&paths)?;
+    database.set_source_role(target, role)
+}
+
+pub fn set_source_role_default(target: &Path, role: SourceRole) -> Result<()> {
+    set_source_role_at(
+        &default_config_path()?,
+        &default_database_path()?,
+        target,
+        role,
+    )
+}
+
 /// Saves an explicit platform default for a configured source. The returned
 /// count is the number of currently visible Unknown rows that a subsequent
 /// rescan may safely recover; callers must show it before invoking this

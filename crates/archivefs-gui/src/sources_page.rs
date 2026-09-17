@@ -144,6 +144,8 @@ pub(super) enum SourcesPageAction {
         path: PathBuf,
         platform: String,
     },
+    EditRole(PathBuf),
+    SaveRole { path: PathBuf, role: SourceRole },
     SetEnabled {
         path: PathBuf,
         enabled: bool,
@@ -1251,6 +1253,61 @@ pub(super) fn game_source_status(
     }
 }
 
+pub(super) fn source_role_explanation(role: SourceRole) -> &'static str {
+    match role {
+        SourceRole::Games => "Scan this folder for playable game files.",
+        SourceRole::ArcadeRomset => "Use this folder for arcade ROMset and dependency analysis.",
+        SourceRole::BiosFirmware => "Use files here when checking emulator BIOS and firmware requirements.",
+        SourceRole::SaveData => "Treat this folder as save data, not game content.",
+        SourceRole::MemoryCards => "Treat this folder as memory-card data for Save Vault.",
+        SourceRole::EmulatorConfig => "Use this folder for emulator configuration files.",
+        SourceRole::DatMetadata => "Use this folder for DAT and catalogue metadata.",
+        SourceRole::ArtworkMedia => "Use this folder for artwork and media associated with games.",
+        SourceRole::IncomingUnsorted => "Review this folder as incoming content before organising it.",
+        SourceRole::GenericFiles => "Inspect this folder as general game-related files.",
+        SourceRole::Ignored => "Do not scan or use this source. Ignored is not the same as hidden.",
+        SourceRole::Unknown => "EmuWiz does not know how this source should be used yet and will not guess.",
+    }
+}
+
+pub(super) fn source_role_choices() -> [SourceRole; 12] {
+    [
+        SourceRole::Games,
+        SourceRole::ArcadeRomset,
+        SourceRole::BiosFirmware,
+        SourceRole::SaveData,
+        SourceRole::MemoryCards,
+        SourceRole::EmulatorConfig,
+        SourceRole::DatMetadata,
+        SourceRole::ArtworkMedia,
+        SourceRole::IncomingUnsorted,
+        SourceRole::GenericFiles,
+        SourceRole::Ignored,
+        SourceRole::Unknown,
+    ]
+}
+
+pub(super) fn source_role_effects(role: SourceRole) -> (String, String, String) {
+    let disposition = format!("Game scanning: {}", match role.game_scan_disposition() {
+        archivefs_core::GameScanDisposition::ScanGames => "eligible",
+        archivefs_core::GameScanDisposition::ScanArcade => "arcade analysis",
+        archivefs_core::GameScanDisposition::ScanUnsorted => "review only",
+        archivefs_core::GameScanDisposition::SkipNonGame => "stopped",
+        archivefs_core::GameScanDisposition::SkipIgnored => "disabled",
+        archivefs_core::GameScanDisposition::SkipUnknown => "not started (unknown role)",
+    });
+    let route = format!("Subsystem: {}", role.subsystem_route().label());
+    let visibility = format!("Library: {}", match archivefs_core::library_visibility::visibility_for_source_role(role).visibility {
+        archivefs_core::library_visibility::LibraryVisibility::Visible => "visible",
+        archivefs_core::library_visibility::LibraryVisibility::HiddenByDefault => "hidden by default",
+        archivefs_core::library_visibility::LibraryVisibility::DependencyOnly => "dependency-only",
+        archivefs_core::library_visibility::LibraryVisibility::NotLibraryContent => "not library content",
+        archivefs_core::library_visibility::LibraryVisibility::UserHidden => "hidden by user",
+        archivefs_core::library_visibility::LibraryVisibility::AdvancedOnly => "advanced-only",
+    });
+    (disposition, route, visibility)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(super) fn show_sources_page(
@@ -1303,6 +1360,30 @@ pub(super) fn show_sources_page_with_mount_root(
     mount_root_feedback: Option<&MountRootFeedback>,
     add_dialog: &mut Option<SourcesAddDialogState>,
     remove_dialog: &mut Option<SourcesRemoveDialogState>,
+    clipboard: &mut dyn ClipboardBackend,
+) -> Option<SourcesPageAction> {
+    let mut role_dialog = None;
+    show_sources_page_with_mount_root_and_role(
+        ui, sources, archives, mount_root, catalogue_available, busy,
+        mount_root_draft, mount_root_busy, mount_root_feedback, add_dialog,
+        remove_dialog, &mut role_dialog, clipboard,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn show_sources_page_with_mount_root_and_role(
+    ui: &mut egui::Ui,
+    sources: &[SourceFolderView],
+    archives: &[PersistedArchive],
+    mount_root: Option<&Path>,
+    catalogue_available: bool,
+    busy: bool,
+    mount_root_draft: &mut Option<PathBuf>,
+    mount_root_busy: bool,
+    mount_root_feedback: Option<&MountRootFeedback>,
+    add_dialog: &mut Option<SourcesAddDialogState>,
+    remove_dialog: &mut Option<SourcesRemoveDialogState>,
+    role_dialog: &mut Option<SourcesRoleDialogState>,
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<SourcesPageAction> {
     let mut action = None;
@@ -1406,6 +1487,9 @@ pub(super) fn show_sources_page_with_mount_root(
                                 ui.weak("Role:");
                                 ui.label(view.role.label());
                                 ui.end_row();
+                                ui.weak("What this means:");
+                                ui.label(source_role_explanation(view.role));
+                                ui.end_row();
                                 ui.weak("Last scan:");
                                 ui.label(view.last_scan_at.as_deref().unwrap_or("Not scanned yet"));
                                 ui.end_row();
@@ -1437,6 +1521,9 @@ pub(super) fn show_sources_page_with_mount_root(
                             }
                             if widgets::action_button(ui, "View scan details", widgets::ActionStyle::Secondary, true).clicked() {
                                 action = Some(SourcesPageAction::ViewScanDetails);
+                            }
+                            if widgets::action_button(ui, "Change role", widgets::ActionStyle::Quiet, !busy).clicked() {
+                                action = Some(SourcesPageAction::EditRole(view.path.clone()));
                             }
                             if view.enabled
                                 && widgets::action_button(ui, "Disable", widgets::ActionStyle::Quiet, !busy).clicked()
@@ -1687,6 +1774,52 @@ pub(super) fn show_sources_page_with_mount_root(
             *remove_dialog = None;
         } else if let Some(current) = remove_dialog.as_mut() {
             current.keep_catalogue = keep_catalogue;
+        }
+    }
+
+    if let Some(dialog) = role_dialog.as_mut() {
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Change source role")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                ui.label("Choose what this folder is for. This changes saved source metadata only: no files move and no scan starts automatically.");
+                ui.add_space(4.0);
+                ui.strong(dialog.path.display().to_string());
+                ui.label(format!("Saved role: {}", dialog.original.label()));
+                egui::ComboBox::from_id_salt(("source_role", &dialog.path))
+                    .selected_text(dialog.pending.label())
+                    .show_ui(ui, |ui| {
+                        for role in source_role_choices() {
+                            ui.selectable_value(&mut dialog.pending, role, role.label());
+                        }
+                    });
+                ui.label(source_role_explanation(dialog.pending));
+                let (scan, route, visibility) = source_role_effects(dialog.pending);
+                ui.small(scan);
+                ui.small(route);
+                ui.small(visibility);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!busy, egui::Button::new("Save role")).clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save {
+            action = Some(SourcesPageAction::SaveRole {
+                path: dialog.path.clone(),
+                role: dialog.pending,
+            });
+            *role_dialog = None;
+        } else if cancel || !open {
+            *role_dialog = None;
         }
     }
 
@@ -2758,7 +2891,7 @@ impl ArchiveFsApp {
             }
             ui.add_space(theme::SECTION_GAP);
 
-            show_sources_page_with_mount_root(
+            show_sources_page_with_mount_root_and_role(
                 ui,
                 sources,
                 archives,
@@ -2772,6 +2905,7 @@ impl ArchiveFsApp {
                 self.sources_ui.mount_root_feedback.as_ref(),
                 &mut self.sources_ui.sources_add_dialog,
                 &mut self.sources_ui.sources_remove_dialog,
+                &mut self.sources_ui.sources_role_dialog,
                 &mut self.clipboard,
             )
         });
@@ -2796,6 +2930,21 @@ impl ArchiveFsApp {
                     self.start_source_action(
                         context.clone(),
                         SourceAction::AssignPlatform { path, platform },
+                    );
+                }
+                SourcesPageAction::EditRole(path) => {
+                    if let Some(source) = sources.iter().find(|source| source.path == path) {
+                        self.sources_ui.sources_role_dialog = Some(SourcesRoleDialogState {
+                            path,
+                            original: source.role,
+                            pending: source.role,
+                        });
+                    }
+                }
+                SourcesPageAction::SaveRole { path, role } => {
+                    self.start_source_action(
+                        context.clone(),
+                        SourceAction::SetRole { path, role },
                     );
                 }
                 SourcesPageAction::SetEnabled { path, enabled } => {
@@ -2958,5 +3107,30 @@ mod layout_tests {
         assert_eq!(sources_content_width(1_100.0), theme::CONTENT_MAX_WIDTH);
         assert_eq!(sources_content_width(1_440.0), theme::CONTENT_MAX_WIDTH);
         assert_eq!(sources_content_width(1_920.0), theme::CONTENT_MAX_WIDTH);
+    }
+
+    #[test]
+    fn source_roles_have_plain_language_and_authoritative_effects() {
+        assert!(source_role_explanation(SourceRole::Games).contains("playable game"));
+        assert!(source_role_explanation(SourceRole::BiosFirmware).contains("BIOS"));
+        assert!(source_role_explanation(SourceRole::Unknown).contains("will not guess"));
+        assert!(source_role_explanation(SourceRole::Ignored).contains("not the same as hidden"));
+        assert_eq!(source_role_choices().len(), 12);
+
+        let (scan, route, visibility) = source_role_effects(SourceRole::BiosFirmware);
+        assert!(scan.contains("stopped"));
+        assert!(route.contains("BIOS / Firmware"));
+        assert!(visibility.contains("not library content"));
+    }
+
+    #[test]
+    fn role_preview_uses_the_same_core_routing_for_games_and_saves() {
+        let (games_scan, games_route, _) = source_role_effects(SourceRole::Games);
+        assert!(games_scan.contains("eligible"));
+        assert!(games_route.contains("Game Discovery"));
+
+        let (save_scan, save_route, _) = source_role_effects(SourceRole::SaveData);
+        assert!(save_scan.contains("stopped"));
+        assert!(save_route.contains("Save Vault"));
     }
 }

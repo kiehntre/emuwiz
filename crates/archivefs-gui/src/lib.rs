@@ -262,7 +262,7 @@ mod selected_game_readiness;
 use dat_identity_panel::*;
 mod source_controller;
 #[allow(unused_imports)]
-use source_controller::{SourcesAddDialogState, SourcesRemoveDialogState};
+use source_controller::{SourcesAddDialogState, SourcesRemoveDialogState, SourcesRoleDialogState};
 pub(crate) mod bulk_confirmation;
 use bulk_confirmation::show_bulk_action_typed_count_gate;
 pub(crate) mod cheat_sources_page;
@@ -389,7 +389,8 @@ use archivefs_core::{
     MissingArchiveRemovalResult, MountOneOutcome, MountState, PersistedArchive, PlatformAlias,
     PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction,
     RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
-    SourceAvailability, SourceFolderConfig, SourceFolderView, SourceHealthIssue, UnmountOneOutcome,
+    SourceAvailability, SourceFolderConfig, SourceFolderView, SourceHealthIssue, SourceRole,
+    UnmountOneOutcome,
     add_source_folder_default, assign_source_platform_default, build_source_folder_views,
     canonical_platform_names, catalogue_filename_duplicates, check_archive_index_freshness,
     check_database_health, classify_archive_health, cleanup_selected_mount_tree,
@@ -401,7 +402,8 @@ use archivefs_core::{
     pending_schema_migration_versions, persisted_archive_has_unknown_platform,
     plan_stale_mount_directories, read_archive_index, remount_one_archive_path,
     remove_source_folder_default, scan_all_enabled_sources_default, scan_and_persist,
-    scan_source_folder_default, set_source_folder_enabled_default, source_health_issues,
+    scan_source_folder_default, set_source_folder_enabled_default, set_source_role_default,
+    source_health_issues,
     unmount_one_archive_path, upgrade_library_database, validate_library_view_destination,
     validate_new_source_folder,
 };
