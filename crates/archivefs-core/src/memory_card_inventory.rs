@@ -474,6 +474,8 @@ pub fn apply_ps2_psu_export(
                 &file.entry,
                 false,
             )?;
+        }
+        for file in &plan.files {
             let mut remaining = file.declared_size_bytes;
             for &cluster in &file.chain_health.clusters {
                 if remaining == 0 {
@@ -2250,8 +2252,27 @@ mod tests {
         assert_eq!(result.file_count, 2);
         assert_eq!(result.output_bytes, 5 * 512 + 2048);
         let output = fs::read(destination).unwrap();
+        assert_eq!(output.len(), 5 * 512 + 2048);
+        // Every directory entry precedes every payload: the entry table is
+        // root + "." + ".." + one entry per file, and only then the data pages.
+        assert_eq!(&output[0x40..0x40 + 16], b"BASLUS-00001TEST");
+        assert_eq!(&output[512 + 0x40..512 + 0x40 + 1], b".");
+        assert_eq!(&output[1024 + 0x40..1024 + 0x40 + 2], b"..");
+        assert_eq!(&output[1536 + 0x40..1536 + 0x40 + 8], b"icon.sys");
+        assert_eq!(
+            u32::from_le_bytes(output[1536 + 4..1536 + 8].try_into().unwrap()),
+            1500
+        );
+        assert_eq!(&output[2048 + 0x40..2048 + 0x40 + 9], b"empty.bin");
+        assert_eq!(
+            u32::from_le_bytes(output[2048 + 4..2048 + 8].try_into().unwrap()),
+            0
+        );
+        // The fragmented file spans clusters 3 and 5 and is padded to a whole
+        // 1024-byte logical page; the zero-length file contributes no payload.
         assert_eq!(&output[2560..2560 + 1024], &[0x5a; 1024]);
         assert_eq!(&output[2560 + 1024..2560 + 1500], &[0x6b; 476]);
+        assert_eq!(&output[2560 + 1500..], &[0; 548]);
     }
 
     #[test]
