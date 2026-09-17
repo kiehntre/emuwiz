@@ -31,7 +31,7 @@
 //! generation check) - see the RPCS3 panel (`rpcs3_page.rs`) for the
 //! identical pattern this module mirrors.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
 use archivefs_core::memory_card_inventory::{
@@ -142,6 +142,38 @@ pub(crate) enum Pcsx2StatusAction {
     /// Load (or reload) PCSX2 status. The only action this panel ever
     /// asks for - there is no mutating action in this vocabulary.
     Load,
+    ChooseMemoryCard,
+    UsePcsx2MemoryCard,
+}
+
+#[derive(Default)]
+pub(crate) struct Pcsx2SaveVaultState {
+    pub(crate) manual_path: Option<PathBuf>,
+    pub(crate) source: Pcsx2SaveCardSource,
+    pub(crate) manual_inventory: Option<Result<MemoryCardInventory, String>>,
+    pub(crate) manual_loading: Option<Receiver<Result<MemoryCardInventory, String>>>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pcsx2SaveCardSource {
+    #[default]
+    Pcsx2,
+    Manual,
+}
+
+const SAVED_PS2_CARD_PATH: &str = "pcsx2_save_vault_card.txt";
+
+pub(crate) fn load_saved_ps2_card_path() -> Option<PathBuf> {
+    let path = archivefs_core::app_dirs::config_path(SAVED_PS2_CARD_PATH).ok()?;
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| PathBuf::from(value))
+}
+
+pub(crate) fn save_saved_ps2_card_path(path: &Path) {
+    if let Ok(config_path) = archivefs_core::app_dirs::config_path(SAVED_PS2_CARD_PATH) {
+        let _ = std::fs::write(config_path, path.to_string_lossy().as_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -177,11 +209,29 @@ fn bios_label(status: Pcsx2BiosVerification) -> (&'static str, widgets::StatusTo
 /// must already be authoritative (or `None`) - this panel never derives
 /// either. Returns an action the caller should perform; drawing itself
 /// never mutates anything.
+#[cfg(test)]
 pub(crate) fn show_pcsx2_panel(
     ui: &mut egui::Ui,
     advanced_mode: bool,
     verified_ps2_serial: Option<&str>,
     state: &Pcsx2StatusState,
+) -> Option<Pcsx2StatusAction> {
+    let mut save_vault = Pcsx2SaveVaultState::default();
+    show_pcsx2_panel_with_save_vault(
+        ui,
+        advanced_mode,
+        verified_ps2_serial,
+        state,
+        &mut save_vault,
+    )
+}
+
+pub(crate) fn show_pcsx2_panel_with_save_vault(
+    ui: &mut egui::Ui,
+    advanced_mode: bool,
+    verified_ps2_serial: Option<&str>,
+    state: &Pcsx2StatusState,
+    save_vault: &mut Pcsx2SaveVaultState,
 ) -> Option<Pcsx2StatusAction> {
     let mut action = None;
     widgets::section_header(
@@ -208,10 +258,10 @@ pub(crate) fn show_pcsx2_panel(
             });
         }
         Pcsx2StatusState::Ready { outcome, .. } => {
-            if widgets::action_button(ui, "Refresh", widgets::ActionStyle::Quiet, true).clicked() {
-                action = Some(Pcsx2StatusAction::Load);
-            }
-            show_outcome(ui, advanced_mode, verified_ps2_serial, outcome);
+            let refresh =
+                widgets::action_button(ui, "Refresh", widgets::ActionStyle::Quiet, true).clicked();
+            action = show_outcome(ui, advanced_mode, verified_ps2_serial, outcome, save_vault)
+                .or_else(|| refresh.then_some(Pcsx2StatusAction::Load));
         }
     }
 
@@ -223,7 +273,8 @@ fn show_outcome(
     advanced_mode: bool,
     verified_ps2_serial: Option<&str>,
     outcome: &Pcsx2StatusOutcome,
-) {
+    save_vault: &mut Pcsx2SaveVaultState,
+) -> Option<Pcsx2StatusAction> {
     let Pcsx2StatusOutcome::Found {
         profile,
         inspection,
@@ -237,7 +288,7 @@ fn show_outcome(
              configured custom path).",
             None,
         );
-        return;
+        return None;
     };
 
     widgets::card(ui, |ui| {
@@ -299,7 +350,6 @@ fn show_outcome(
         }
 
         if !advanced_mode {
-            show_memory_card_contents(ui, false, memory_cards);
             return;
         }
         widgets::technical_details(
@@ -351,7 +401,75 @@ fn show_outcome(
             },
         );
     });
-    show_memory_card_contents(ui, advanced_mode, memory_cards);
+    show_save_vault(ui, advanced_mode, memory_cards, save_vault)
+}
+
+fn show_save_vault(
+    ui: &mut egui::Ui,
+    advanced_mode: bool,
+    pcsx2_cards: &[MemoryCardInventory],
+    save_vault: &mut Pcsx2SaveVaultState,
+) -> Option<Pcsx2StatusAction> {
+    let mut source_action = None;
+    widgets::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Save source:");
+            if ui
+                .selectable_label(
+                    save_vault.source == Pcsx2SaveCardSource::Pcsx2,
+                    "Current PCSX2 card",
+                )
+                .clicked()
+            {
+                source_action = Some(Pcsx2StatusAction::UsePcsx2MemoryCard);
+            }
+            if widgets::action_button(
+                ui,
+                "Choose another memory-card image…",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
+            {
+                source_action = Some(Pcsx2StatusAction::ChooseMemoryCard);
+            }
+        });
+        if let Some(path) = &save_vault.manual_path {
+            ui.label(format!("Last manually selected card: {}", path.display()));
+        }
+        match save_vault.source {
+            Pcsx2SaveCardSource::Pcsx2 => {
+                ui.label("Source origin: PCSX2 configuration (inspection only)");
+                show_memory_card_contents(ui, advanced_mode, pcsx2_cards);
+            }
+            Pcsx2SaveCardSource::Manual => {
+                let Some(path) = save_vault.manual_path.as_ref() else {
+                    ui.label("No manual memory-card image has been selected.");
+                    return;
+                };
+                ui.label("Source origin: Manual selection (inspection only)");
+                widgets::path_value(ui, "Selected card", path);
+                if save_vault.manual_loading.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Reading selected memory card…");
+                    });
+                } else if let Some(result) = &save_vault.manual_inventory {
+                    match result {
+                        Ok(card) => {
+                            show_memory_card_contents(ui, advanced_mode, std::slice::from_ref(card))
+                        }
+                        Err(error) => {
+                            widgets::empty_state(ui, "Memory card could not be read", error, None);
+                        }
+                    }
+                } else {
+                    ui.label("Selected card is waiting for inspection.");
+                }
+            }
+        }
+    });
+    source_action
 }
 
 fn memory_card_health(health: MemoryCardHealth) -> (&'static str, widgets::StatusTone) {
@@ -1258,6 +1376,36 @@ mod tests {
         assert!(rendered_text_contains(
             &output,
             "restore/import is not available yet"
+        ));
+    }
+
+    #[test]
+    fn save_vault_manual_source_is_distinct_and_fails_cleanly() {
+        let state = Pcsx2StatusState::Ready {
+            generation: 1,
+            outcome: found_outcome(empty_inspection()),
+        };
+        let mut save_vault = Pcsx2SaveVaultState {
+            manual_path: Some(PathBuf::from("/tmp/not-a-memory-card.ps2")),
+            source: Pcsx2SaveCardSource::Manual,
+            manual_inventory: Some(Err("unsupported memory-card format".to_string())),
+            manual_loading: None,
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_pcsx2_panel_with_save_vault(ui, false, None, &state, &mut save_vault);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Manual selection"));
+        assert!(rendered_text_contains(&output, "Selected card"));
+        assert!(rendered_text_contains(
+            &output,
+            "unsupported memory-card format"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "Choose another memory-card image"
         ));
     }
 

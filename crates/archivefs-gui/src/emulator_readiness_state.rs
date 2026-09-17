@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use crate::{
     DolphinLocalProfilesState, DolphinProfilesState, EmulatorSetupFocus, FlycastProfilesState,
     Pcsx2FirmwareEvidenceState, Pcsx2LaunchProfilesState, Pcsx2ProfilesState,
-    RememberedEmulatorProfile, RetroArchProfilesState, XeniaProfilesState,
-    bios_projection_page, emulator_inventory_page, emulator_setup_overrides,
-    emulator_setup_page, pcsx2_page, ready_to_play_page, rpcs3_page,
+    RememberedEmulatorProfile, RetroArchProfilesState, XeniaProfilesState, bios_projection_page,
+    emulator_inventory_page, emulator_setup_overrides, emulator_setup_page, pcsx2_page,
+    ready_to_play_page, rpcs3_page,
 };
 
 /// UI/session state for emulator setup, readiness, and environment projections.
@@ -34,6 +34,7 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) rpcs3_status: rpcs3_page::Rpcs3State,
     pub(crate) rpcs3_status_generation: u64,
     pub(crate) pcsx2_status: pcsx2_page::Pcsx2StatusState,
+    pub(crate) pcsx2_save_vault: pcsx2_page::Pcsx2SaveVaultState,
     pub(crate) pcsx2_status_generation: u64,
     pub(crate) pcsx2_status_archive_path: Option<PathBuf>,
 }
@@ -61,6 +62,10 @@ impl Default for EmulatorReadinessState {
             rpcs3_status: rpcs3_page::Rpcs3State::Idle,
             rpcs3_status_generation: 0,
             pcsx2_status: pcsx2_page::Pcsx2StatusState::Idle,
+            pcsx2_save_vault: pcsx2_page::Pcsx2SaveVaultState {
+                manual_path: pcsx2_page::load_saved_ps2_card_path(),
+                ..Default::default()
+            },
             pcsx2_status_generation: 0,
             pcsx2_status_archive_path: None,
         }
@@ -71,7 +76,8 @@ impl EmulatorReadinessState {
     pub(crate) fn new() -> Self {
         Self {
             retroarch_core_directory_override: crate::load_retroarch_core_directory_override(),
-            emulator_setup_overrides: crate::emulator_setup_overrides::EmulatorPathOverrides::load(),
+            emulator_setup_overrides: crate::emulator_setup_overrides::EmulatorPathOverrides::load(
+            ),
             remembered_emulator_profiles: crate::load_remembered_emulator_profiles_default()
                 .unwrap_or_default(),
             ..Self::default()

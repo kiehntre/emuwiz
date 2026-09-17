@@ -117,7 +117,20 @@ impl ArchiveFsApp {
         context: &egui::Context,
         action: Option<pcsx2_page::Pcsx2StatusAction>,
     ) {
-        if let Some(pcsx2_page::Pcsx2StatusAction::Load) = action {
+        if let Some(pcsx2_page::Pcsx2StatusAction::ChooseMemoryCard) = action {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose PS2 memory-card image to inspect")
+                .pick_file()
+            {
+                pcsx2_page::save_saved_ps2_card_path(&path);
+                self.start_pcsx2_manual_card_load(context.clone(), path);
+            }
+        } else if let Some(pcsx2_page::Pcsx2StatusAction::UsePcsx2MemoryCard) = action {
+            self.emulator_readiness.pcsx2_save_vault.source =
+                pcsx2_page::Pcsx2SaveCardSource::Pcsx2;
+            self.emulator_readiness.pcsx2_save_vault.manual_inventory = None;
+            self.emulator_readiness.pcsx2_save_vault.manual_loading = None;
+        } else if let Some(pcsx2_page::Pcsx2StatusAction::Load) = action {
             let identity = self
                 .cheat_workflow
                 .as_ref()
@@ -134,6 +147,37 @@ impl ArchiveFsApp {
                 verified_ps2_serial,
                 verified_executable_crc,
             );
+        }
+    }
+
+    pub(crate) fn start_pcsx2_manual_card_load(&mut self, context: egui::Context, path: PathBuf) {
+        let (sender, receiver) = mpsc::channel();
+        let inspection_path = path.clone();
+        self.emulator_readiness.pcsx2_save_vault.source = pcsx2_page::Pcsx2SaveCardSource::Manual;
+        self.emulator_readiness.pcsx2_save_vault.manual_path = Some(path);
+        self.emulator_readiness.pcsx2_save_vault.manual_inventory = None;
+        self.emulator_readiness.pcsx2_save_vault.manual_loading = Some(receiver);
+        thread::spawn(move || {
+            let result =
+                archivefs_core::memory_card_inventory::inspect_memory_card(&inspection_path)
+                    .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    pub(crate) fn poll_pcsx2_manual_card(&mut self) {
+        let Some(receiver) = self
+            .emulator_readiness
+            .pcsx2_save_vault
+            .manual_loading
+            .as_ref()
+        else {
+            return;
+        };
+        if let Ok(result) = receiver.try_recv() {
+            self.emulator_readiness.pcsx2_save_vault.manual_loading = None;
+            self.emulator_readiness.pcsx2_save_vault.manual_inventory = Some(result);
         }
     }
 

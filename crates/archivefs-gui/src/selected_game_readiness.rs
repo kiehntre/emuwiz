@@ -337,10 +337,12 @@ impl ArchiveFsApp {
             .map(Path::to_path_buf)
         {
             if let Some(snapshot) = self.database_state.snapshot() {
-                self.sources_ui.media_sets_page
+                self.sources_ui
+                    .media_sets_page
                     .refresh(&snapshot.archives, self.database_generation.0);
             }
-            if media_sets_page::show_selected_item_link(ui, &self.sources_ui.media_sets_page, &path) {
+            if media_sets_page::show_selected_item_link(ui, &self.sources_ui.media_sets_page, &path)
+            {
                 self.navigate_to_main_view(MainView::MediaSets);
             }
             ui.add_space(crate::ui::theme::SECTION_GAP);
@@ -438,11 +440,12 @@ impl ArchiveFsApp {
             .as_ref()
             .and_then(pcsx2_identity_for_workflow)
             .and_then(|id| id.serial);
-        let pcsx2_action = pcsx2_page::show_pcsx2_panel(
+        let pcsx2_action = pcsx2_page::show_pcsx2_panel_with_save_vault(
             ui,
             self.ui_mode == GuiMode::AdvancedView,
             verified_ps2_serial.as_deref(),
             &self.emulator_readiness.pcsx2_status,
+            &mut self.emulator_readiness.pcsx2_save_vault,
         );
         self.handle_pcsx2_action(context, pcsx2_action);
         Some(action).flatten()

@@ -62,6 +62,7 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.poll_doctor_scan();
     app.poll_rpcs3_status();
     app.poll_pcsx2_status();
+    app.poll_pcsx2_manual_card();
     app.poll_platform_action(context);
     app.poll_bulk_platform_action(context);
     app.poll_alias_action(context);
