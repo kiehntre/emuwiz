@@ -4852,6 +4852,9 @@ fn gather_doctor_scan() -> DoctorScan {
         azahar_cemu_readiness: Gathered::NotLoaded(
             "Azahar and Cemu readiness has not been checked in this CLI session.",
         ),
+        melonds_mgba_readiness: Gathered::NotLoaded(
+            "melonDS and mGBA readiness has not been checked in this CLI session.",
+        ),
         // Arcade emulator / DAT version compatibility is assembled from that
         // installation evidence, so it is likewise not gathered by the
         // diagnostics-only CLI Doctor scan.

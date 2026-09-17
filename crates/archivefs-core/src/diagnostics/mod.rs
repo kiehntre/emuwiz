@@ -70,6 +70,7 @@ use crate::{
 pub mod arcade_dat_version;
 pub mod arcade_version_probe;
 pub mod environment;
+pub mod handheld_profiles;
 pub mod managed;
 pub mod profiles;
 pub mod repair;

@@ -32,6 +32,9 @@ use super::environment::{
     FreeSpacePolicy, StorageAssessment, findings_from_free_space,
     findings_from_read_only_filesystems, not_checked_from_storage,
 };
+use super::handheld_profiles::{
+    MelonDsMgbaReadiness, findings_from_melonds_mgba_readiness,
+};
 use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
@@ -135,6 +138,7 @@ pub struct DoctorScanInputs<'a> {
     /// Bounded installation-form evidence gathered outside this pure runner.
     pub linux_emulator_installations: Gathered<&'a [LinuxEmulatorInstallationEvidence]>,
     pub azahar_cemu_readiness: Gathered<&'a [AzaharCemuReadiness]>,
+    pub melonds_mgba_readiness: Gathered<&'a [MelonDsMgbaReadiness]>,
     /// From `arcade_dat_version::arcade_dat_version_readiness` - advisory
     /// MAME / FBNeo emulator-vs-DAT version compatibility, assembled outside
     /// this pure runner from the installation evidence and configured arcade
@@ -191,6 +195,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             azahar_cemu_readiness: Gathered::NotLoaded(
                 "Azahar and Cemu readiness has not been checked in this session.",
+            ),
+            melonds_mgba_readiness: Gathered::NotLoaded(
+                "melonDS and mGBA readiness has not been checked in this session.",
             ),
             arcade_dat_version: Gathered::NotLoaded(
                 "Arcade emulator / DAT version compatibility has not been assembled in this session.",
@@ -538,6 +545,12 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::EmulatorProfiles,
         DoctorSubsystem::EmulatorReadiness,
         |entries: &&[AzaharCemuReadiness]| findings_from_azahar_cemu_readiness(entries)
+    );
+    subsystem!(
+        inputs.melonds_mgba_readiness,
+        DoctorCategory::EmulatorProfiles,
+        DoctorSubsystem::EmulatorReadiness,
+        |entries: &&[MelonDsMgbaReadiness]| findings_from_melonds_mgba_readiness(entries)
     );
     subsystem!(
         inputs.arcade_dat_version,
