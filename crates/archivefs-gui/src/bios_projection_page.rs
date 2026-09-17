@@ -5,12 +5,24 @@ use archivefs_core::bios_projection::{
     BiosProjectionStatus,
 };
 use eframe::egui;
+use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 
 struct BiosApplyDialog {
     plan: BiosProjectionPlan,
     target_root: PathBuf,
     confirmation: String,
+}
+
+struct BiosRollbackDialog {
+    transaction: bios_projection::BiosProjectionTransaction,
+}
+
+struct AppliedBiosSetup {
+    plan: BiosProjectionPlan,
+    transaction: bios_projection::BiosProjectionTransaction,
 }
 
 #[derive(Default)]
@@ -21,6 +33,9 @@ pub(crate) struct BiosProjectionPageState {
     error: Option<String>,
     feedback: Option<String>,
     apply_dialog: Option<BiosApplyDialog>,
+    rollback_dialog: Option<BiosRollbackDialog>,
+    applied_setup: Option<AppliedBiosSetup>,
+    doctor_refresh_requested: bool,
 }
 
 impl BiosProjectionPageState {
@@ -46,6 +61,16 @@ impl BiosProjectionPageState {
         }
         if let Some(feedback) = &self.feedback {
             ui.colored_label(egui::Color32::from_rgb(70, 150, 85), feedback);
+        }
+        if let Some(applied) = &self.applied_setup {
+            ui.separator();
+            ui.label(format!("Last BIOS setup: {}", applied.transaction.emulator));
+            if ui.button("Undo BIOS setup").clicked() {
+                self.rollback_dialog = Some(BiosRollbackDialog {
+                    transaction: applied.transaction.clone(),
+                });
+            }
+            ui.small("Undo removes only links created by this setup and never removes source BIOS files.");
         }
         let Some(result) = &self.result else {
             ui.separator();
@@ -107,7 +132,9 @@ impl BiosProjectionPageState {
                     });
                 }
                 if let Some(bound_plan) = &bound {
-                    if applyable(bound_plan) {
+                    if self.applied_setup.is_some() {
+                        ui.small("Undo the current BIOS setup before creating another one.");
+                    } else if applyable(bound_plan) {
                         if ui.button("Preview BIOS setup").clicked() {
                             requested_apply = Some(bound_plan.clone());
                         }
@@ -130,6 +157,11 @@ impl BiosProjectionPageState {
             });
         }
         self.show_apply_dialog(ui);
+        self.show_rollback_dialog(ui);
+    }
+
+    pub(crate) fn take_doctor_refresh_request(&mut self) -> bool {
+        std::mem::take(&mut self.doctor_refresh_requested)
     }
 
     fn inspect(&mut self) {
@@ -185,11 +217,27 @@ impl BiosProjectionPageState {
                             dialog.confirmation.trim(),
                         ) {
                             Ok(transaction) => {
-                                self.feedback = Some(format!(
-                                    "{} BIOS link(s) configured for {}. Source BIOS files were not changed.",
-                                    transaction.applied.len(),
-                                    transaction.emulator
-                                ));
+                                self.error = None;
+                                self.applied_setup = Some(AppliedBiosSetup {
+                                    plan: dialog.plan.clone(),
+                                    transaction: transaction.clone(),
+                                });
+                                self.doctor_refresh_requested = true;
+                                match verify_applied_setup(&dialog.plan, &transaction) {
+                                    Ok(()) => {
+                                        self.feedback = Some(format!(
+                                            "{} BIOS link(s) configured and verified for {}. Source BIOS files were not changed. Doctor is refreshing.",
+                                            transaction.applied.len(),
+                                            transaction.emulator
+                                        ));
+                                    }
+                                    Err(reason) => {
+                                        self.feedback = None;
+                                        self.error = Some(format!(
+                                            "Applied, verification failed: {reason}. Source BIOS files were not changed. Undo remains available."
+                                        ));
+                                    }
+                                }
                                 close = true;
                             }
                             Err(error) => self.error = Some(error.to_string()),
@@ -201,6 +249,150 @@ impl BiosProjectionPageState {
             self.apply_dialog = None;
         }
     }
+
+    fn show_rollback_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = &mut self.rollback_dialog else {
+            return;
+        };
+        let mut close = false;
+        egui::Window::new("Undo BIOS setup")
+            .collapsible(false)
+            .show(ui.ctx(), |ui| {
+                ui.label(format!("Emulator: {}", dialog.transaction.emulator));
+                ui.label("EmuWiz will remove only the BIOS links created by the last setup.");
+                ui.label("The master BIOS source will remain unchanged.");
+                for item in &dialog.transaction.applied {
+                    ui.label(format!("Remove: {}", item.target.display()));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Confirm undo").clicked() {
+                        match bios_projection::rollback_plan(&dialog.transaction) {
+                            Ok(()) => {
+                                let verification = verify_rollback(&dialog.transaction);
+                                self.doctor_refresh_requested = true;
+                                match verification {
+                                    Ok(()) => {
+                                        self.error = None;
+                                        self.applied_setup = None;
+                                        self.feedback = Some(
+                                            "BIOS setup was undone and verified. Doctor is refreshing; source BIOS files were not changed.".into(),
+                                        );
+                                    }
+                                    Err(reason) => {
+                                        self.feedback = Some(format!(
+                                            "Undo completed, but verification failed: {reason}."
+                                        ));
+                                    }
+                                }
+                                close = true;
+                            }
+                            Err(error) => {
+                                self.error = Some(format!(
+                                    "BIOS setup was not undone: {error}. No unsafe removal was attempted."
+                                ));
+                            }
+                        }
+                    }
+                });
+            });
+        if close {
+            self.rollback_dialog = None;
+        }
+    }
+}
+
+fn verify_applied_setup(
+    plan: &BiosProjectionPlan,
+    transaction: &bios_projection::BiosProjectionTransaction,
+) -> Result<(), String> {
+    for item in &transaction.applied {
+        let metadata = std::fs::symlink_metadata(&item.target)
+            .map_err(|error| format!("{} could not be checked: {error}", item.target.display()))?;
+        if !metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{} is no longer a symbolic link",
+                item.target.display()
+            ));
+        }
+        let actual = std::fs::read_link(&item.target)
+            .map_err(|error| format!("{} could not be read: {error}", item.target.display()))?;
+        if actual != item.source {
+            return Err(format!(
+                "{} points to an unexpected source",
+                item.target.display()
+            ));
+        }
+        if !std::fs::symlink_metadata(&item.source)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+        {
+            return Err(format!(
+                "{} is no longer a regular BIOS file",
+                item.source.display()
+            ));
+        }
+    }
+    if transaction.emulator != plan.emulator {
+        return Err("the applied emulator did not match the reviewed plan".into());
+    }
+    for item in &transaction.applied {
+        let Some((_, requirement)) = plan
+            .requirements
+            .iter()
+            .enumerate()
+            .find(|(_, requirement)| requirement.target.path.as_ref() == Some(&item.target))
+        else {
+            continue;
+        };
+        let expected = requirement.expected_sha256.as_ref().or_else(|| {
+            plan.requirements
+                .iter()
+                .position(|candidate| candidate.target.path.as_ref() == Some(&item.target))
+                .and_then(|index| plan.matches.get(index))
+                .and_then(|match_item| match_item.as_ref())
+                .and_then(|evidence| evidence.sha256.as_ref())
+        });
+        if let Some(expected) = expected {
+            let mut file = File::open(&item.source).map_err(|error| {
+                format!("{} could not be opened: {error}", item.source.display())
+            })?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer).map_err(|error| {
+                    format!("{} could not be hashed: {error}", item.source.display())
+                })?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let actual = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if &actual != expected {
+                return Err(format!(
+                    "{} no longer matches its expected BIOS identity",
+                    item.source.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_rollback(transaction: &bios_projection::BiosProjectionTransaction) -> Result<(), String> {
+    for item in &transaction.applied {
+        if std::fs::symlink_metadata(&item.target).is_ok() {
+            return Err(format!("{} still exists", item.target.display()));
+        }
+    }
+    Ok(())
 }
 
 fn applyable(plan: &BiosProjectionPlan) -> bool {
@@ -278,6 +470,11 @@ fn target_state_label(state: bios_projection::BiosTargetState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::bios_projection::{
+        BiosContentClass, BiosProjectionTarget, BiosRequirement, BiosTargetState,
+    };
+    use std::fs;
+    use tempfile::tempdir;
     #[test]
     fn labels_are_plain_language_and_non_mutating() {
         assert_eq!(
@@ -293,5 +490,72 @@ mod tests {
             target_state_label(bios_projection::BiosTargetState::ExistingCorrectLink)
                 .contains("configured")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applied_setup_verification_rejects_external_target_replacement() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("bios.bin");
+        let alternate = directory.path().join("other.bin");
+        let target = directory.path().join("target.bin");
+        fs::write(&source, b"bios").unwrap();
+        fs::write(&alternate, b"other").unwrap();
+        std::os::unix::fs::symlink(&source, &target).unwrap();
+        let plan = BiosProjectionPlan {
+            master_root: directory.path().to_path_buf(),
+            emulator: "Test Emulator".into(),
+            requirements: vec![BiosRequirement {
+                name: "Test BIOS".into(),
+                emulator: "Test Emulator".into(),
+                expected_filenames: vec!["bios.bin".into()],
+                expected_sha256: None,
+                target: BiosProjectionTarget {
+                    description: "target".into(),
+                    path: Some(target.clone()),
+                    current_state: BiosTargetState::ExistingCorrectLink,
+                },
+                content_class: BiosContentClass::ImmutableFirmware,
+                method: BiosProjectionMethod::SymlinkFile,
+            }],
+            matches: vec![None],
+            actions: vec![],
+            status: BiosProjectionStatus::AlreadyProjected,
+            warnings: vec![],
+        };
+        let transaction = bios_projection::BiosProjectionTransaction {
+            journal_id: "test".into(),
+            emulator: "Test Emulator".into(),
+            requirement_ids: vec!["Test BIOS".into()],
+            applied: vec![bios_projection::BiosAppliedItem {
+                source: source.clone(),
+                target: target.clone(),
+                method: BiosProjectionMethod::SymlinkFile,
+                pre_state: BiosTargetState::Missing,
+                post_state: BiosTargetState::ExistingCorrectLink,
+            }],
+            already_correct: vec![],
+        };
+        fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&alternate, &target).unwrap();
+        assert!(verify_applied_setup(&plan, &transaction).is_err());
+    }
+
+    #[test]
+    fn rollback_verification_requires_created_targets_to_be_gone() {
+        let transaction = bios_projection::BiosProjectionTransaction {
+            journal_id: "test".into(),
+            emulator: "Test Emulator".into(),
+            requirement_ids: vec![],
+            applied: vec![bios_projection::BiosAppliedItem {
+                source: PathBuf::from("/source/bios.bin"),
+                target: PathBuf::from("/target/bios.bin"),
+                method: BiosProjectionMethod::SymlinkFile,
+                pre_state: BiosTargetState::Missing,
+                post_state: BiosTargetState::ExistingCorrectLink,
+            }],
+            already_correct: vec![],
+        };
+        assert!(verify_rollback(&transaction).is_ok());
     }
 }

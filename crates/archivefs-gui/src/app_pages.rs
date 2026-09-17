@@ -1480,6 +1480,13 @@ pub(crate) fn show_pages(
 
             if app.view == MainView::BiosProjection {
                 app.emulator_readiness.bios_projection_page.show(ui);
+                if app
+                    .emulator_readiness
+                    .bios_projection_page
+                    .take_doctor_refresh_request()
+                {
+                    app.start_doctor_scan(context.clone());
+                }
                 return;
             }
 

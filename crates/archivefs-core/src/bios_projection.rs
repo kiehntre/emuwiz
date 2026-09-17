@@ -1239,6 +1239,40 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rollback_refuses_when_created_target_was_replaced() {
+        let dir = tempdir().unwrap();
+        file(dir.path(), "mcpx_1.0.bin", b"mcpx");
+        let target_root = dir.path().join("target");
+        fs::create_dir(&target_root).unwrap();
+        let source = dir.path().join("mcpx_1.0.bin");
+        let target = target_root.join("mcpx_1.0.bin");
+        std::os::unix::fs::symlink(&source, &target).unwrap();
+        let replacement = dir.path().join("replacement.bin");
+        file(dir.path(), "replacement.bin", b"replacement");
+        fs::remove_file(&target).unwrap();
+        std::os::unix::fs::symlink(&replacement, &target).unwrap();
+        let transaction = BiosProjectionTransaction {
+            journal_id: "bios-test".into(),
+            emulator: "Test".into(),
+            requirement_ids: vec![],
+            applied: vec![BiosAppliedItem {
+                source,
+                target: target.clone(),
+                method: BiosProjectionMethod::SymlinkFile,
+                pre_state: BiosTargetState::Missing,
+                post_state: BiosTargetState::ExistingCorrectLink,
+            }],
+            already_correct: vec![],
+        };
+        assert!(matches!(
+            rollback_plan(&transaction),
+            Err(BiosProjectionApplyError::TargetConflict(path)) if path == target
+        ));
+        assert!(target.is_symlink());
+    }
+
     #[test]
     fn writable_state_is_refused_before_any_target_change() {
         let dir = tempdir().unwrap();
