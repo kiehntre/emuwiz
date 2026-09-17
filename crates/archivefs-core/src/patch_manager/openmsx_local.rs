@@ -36,6 +36,22 @@ pub struct OpenMsxProfileDiscovery {
     pub complete: bool,
 }
 
+/// Adapter-local openMSX readiness evidence. openMSX has no configuration
+/// inspection in this adapter and no detected version source, so neither is
+/// represented as if it existed. Machine selection is the explicit typed
+/// command binding, not a guessed user configuration value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenMsxReadinessEvidence {
+    pub profile_id: String,
+    pub executable: Option<OpenMsxExecutable>,
+    pub version: Option<String>,
+    pub supported_systems: Vec<String>,
+    pub machine_bindings: Vec<(String, String)>,
+    pub config_inspected: bool,
+    pub ready: bool,
+    pub first_blocker: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OpenMsxProfileDiscoveryRoots {
     pub explicit_executables: Vec<PathBuf>,
@@ -110,6 +126,28 @@ pub fn discover_openmsx_profiles(roots: &OpenMsxProfileDiscoveryRoots) -> OpenMs
     }
 }
 
+pub fn assess_openmsx_readiness(profile: &OpenMsxProfile) -> OpenMsxReadinessEvidence {
+    let first_blocker = (!profile.eligible).then(|| {
+        profile
+            .blocker
+            .clone()
+            .unwrap_or_else(|| "openMSX profile is not eligible".into())
+    });
+    OpenMsxReadinessEvidence {
+        profile_id: profile.profile_id.clone(),
+        executable: profile.eligible.then(|| profile.executable.clone()),
+        version: None,
+        supported_systems: vec!["MSX".into(), "MSX2".into()],
+        machine_bindings: vec![
+            ("MSX".into(), "C-BIOS_MSX1".into()),
+            ("MSX2".into(), "C-BIOS_MSX2".into()),
+        ],
+        config_inspected: false,
+        ready: first_blocker.is_none(),
+        first_blocker,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,5 +183,42 @@ mod tests {
             path_env: None,
         });
         assert!(discovery.profiles.is_empty());
+    }
+
+    #[test]
+    fn readiness_exposes_both_explicit_cbios_machine_bindings_without_config_claims() {
+        let profile = OpenMsxProfile {
+            profile_id: "openmsx:/usr/bin/openmsx".into(),
+            installation_type: OpenMsxInstallationType::Native,
+            eligible: true,
+            blocker: None,
+            executable: OpenMsxExecutable {
+                path: "/usr/bin/openmsx".into(),
+                installation_type: OpenMsxInstallationType::Native,
+            },
+        };
+        let evidence = assess_openmsx_readiness(&profile);
+        assert!(evidence.ready);
+        assert_eq!(evidence.version, None);
+        assert!(!evidence.config_inspected);
+        assert_eq!(evidence.machine_bindings[0], ("MSX".into(), "C-BIOS_MSX1".into()));
+        assert_eq!(evidence.machine_bindings[1], ("MSX2".into(), "C-BIOS_MSX2".into()));
+    }
+
+    #[test]
+    fn readiness_reports_ineligible_profile_without_inventing_config_requirement() {
+        let evidence = assess_openmsx_readiness(&OpenMsxProfile {
+            profile_id: "openmsx:missing".into(),
+            installation_type: OpenMsxInstallationType::Explicit,
+            eligible: false,
+            blocker: Some("openMSX executable is unavailable".into()),
+            executable: OpenMsxExecutable {
+                path: "/missing/openmsx".into(),
+                installation_type: OpenMsxInstallationType::Explicit,
+            },
+        });
+        assert!(!evidence.ready);
+        assert_eq!(evidence.first_blocker.as_deref(), Some("openMSX executable is unavailable"));
+        assert!(!evidence.config_inspected);
     }
 }

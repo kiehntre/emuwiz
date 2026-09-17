@@ -604,7 +604,8 @@ pub use mgba_local::{
 };
 pub use openmsx_local::{
     OpenMsxExecutable, OpenMsxInstallationType, OpenMsxProfile, OpenMsxProfileDiscovery,
-    OpenMsxProfileDiscoveryRoots, discover_openmsx_profiles,
+    OpenMsxProfileDiscoveryRoots, OpenMsxReadinessEvidence, assess_openmsx_readiness,
+    discover_openmsx_profiles,
 };
 pub use pcengine_cd_firmware::{
     KNOWN_SYSTEM_CARDS, KnownSystemCard, MAX_SYSTEM_CARD_BYTES, MAX_SYSTEM_CARD_CANDIDATES,
@@ -796,7 +797,8 @@ pub use user_cheat_import::{
 pub use vice_local::{
     VICE_MAX_EXPLICIT_EXECUTABLES, ViceC64ExecutableKind, ViceExecutable, ViceInstallationType,
     ViceLaunchBlocker, ViceLaunchBlockerKind, ViceNativeLaunchBinding, ViceProfile,
-    ViceProfileDiscovery, ViceProfileDiscoveryRoots, discover_vice_profiles, parse_vice_version,
+    ViceProfileDiscovery, ViceProfileDiscoveryRoots, ViceReadinessEvidence,
+    assess_vice_readiness, discover_vice_profiles, parse_vice_version,
     resolve_vice_native_launch_binding,
 };
 pub use vita3k_local::{

@@ -59,6 +59,19 @@ pub struct ViceProfileDiscovery {
     pub complete: bool,
 }
 
+/// Adapter-local readiness evidence assembled from the same profile and
+/// binding resolver used by VICE launch preflight. This is not a Doctor model
+/// and deliberately contains no BIOS requirement: VICE's installed runtime
+/// owns its system files, which this adapter does not inspect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViceReadinessEvidence {
+    pub profile_id: String,
+    pub executable: Option<ViceExecutable>,
+    pub supported_system: String,
+    pub ready: bool,
+    pub first_blocker: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ViceProfileDiscoveryRoots {
     pub explicit_executables: Vec<PathBuf>,
@@ -155,6 +168,20 @@ pub fn discover_vice_profiles(roots: &ViceProfileDiscoveryRoots) -> ViceProfileD
             .map(|(p, kind)| profile(p, kind, &roots.known_version_outputs))
             .collect(),
         complete: true,
+    }
+}
+
+pub fn assess_vice_readiness(profile: &ViceProfile) -> ViceReadinessEvidence {
+    let binding_error = resolve_vice_native_launch_binding(profile)
+        .err()
+        .map(|error| error.detail);
+    let first_blocker = profile.blocker.clone().or(binding_error);
+    ViceReadinessEvidence {
+        profile_id: profile.profile_id.clone(),
+        executable: profile.executable.clone(),
+        supported_system: "Commodore 64".into(),
+        ready: first_blocker.is_none(),
+        first_blocker,
     }
 }
 
@@ -258,5 +285,43 @@ mod tests {
             .profiles[0]
                 .eligible
         );
+    }
+
+    #[test]
+    fn readiness_reuses_profile_binding_and_has_no_bios_blocker() {
+        let d = tempdir().unwrap();
+        let x64sc = d.path().join("x64sc");
+        fs::write(&x64sc, b"x").unwrap();
+        #[cfg(unix)]
+        mark_exec(&x64sc);
+        let profile = discover_vice_profiles(&ViceProfileDiscoveryRoots {
+            explicit_executables: vec![x64sc],
+            known_version_outputs: [(d.path().join("x64sc"), "VICE 3.8".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })
+        .profiles
+        .into_iter()
+        .next()
+        .unwrap();
+        let evidence = assess_vice_readiness(&profile);
+        assert!(evidence.ready);
+        assert_eq!(evidence.supported_system, "Commodore 64");
+        assert_eq!(evidence.executable.unwrap().version.as_deref(), Some("3.8"));
+        assert!(evidence.first_blocker.is_none());
+    }
+
+    #[test]
+    fn readiness_reports_missing_profile_binding_first() {
+        let evidence = assess_vice_readiness(&ViceProfile {
+            profile_id: "vice:explicit:/missing/x64".into(),
+            installation_type: ViceInstallationType::Explicit,
+            eligible: false,
+            blocker: Some("VICE executable is missing".into()),
+            executable: None,
+        });
+        assert!(!evidence.ready);
+        assert_eq!(evidence.first_blocker.as_deref(), Some("VICE executable is missing"));
     }
 }
