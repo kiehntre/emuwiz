@@ -28,6 +28,7 @@
 use serde::Serialize;
 
 use super::arcade_dat_version::{ArcadeEmulatorDatReadiness, findings_from_arcade_dat_version};
+use super::arcade_profiles::{ArcadeReadiness, findings_from_arcade_readiness};
 use super::environment::{
     FreeSpacePolicy, StorageAssessment, findings_from_free_space,
     findings_from_read_only_filesystems, not_checked_from_storage,
@@ -152,6 +153,7 @@ pub struct DoctorScanInputs<'a> {
     /// this pure runner from the installation evidence and configured arcade
     /// DAT catalogue versions.
     pub arcade_dat_version: Gathered<&'a [ArcadeEmulatorDatReadiness]>,
+    pub arcade_readiness: Gathered<&'a [ArcadeReadiness]>,
     /// From `profiles::assess_xemu_readiness`.
     pub xemu_readiness: Gathered<&'a [XemuReadinessAssessment]>,
     /// From `profiles::assess_xenia_readiness`.
@@ -216,6 +218,9 @@ impl<'a> DoctorScanInputs<'a> {
             ),
             arcade_dat_version: Gathered::NotLoaded(
                 "Arcade emulator / DAT version compatibility has not been assembled in this session.",
+            ),
+            arcade_readiness: Gathered::NotLoaded(
+                "MAME and FBNeo launch readiness has not been checked in this session.",
             ),
             xemu_readiness: Gathered::NotLoaded(
                 "xemu launch readiness has not been checked in this session.",
@@ -587,6 +592,12 @@ pub fn run_doctor_scan(inputs: &DoctorScanInputs<'_>) -> DoctorScan {
         DoctorCategory::Emulators,
         DoctorSubsystem::EmulatorReadiness,
         |readiness: &&[ArcadeEmulatorDatReadiness]| { findings_from_arcade_dat_version(readiness) }
+    );
+    subsystem!(
+        inputs.arcade_readiness,
+        DoctorCategory::Emulators,
+        DoctorSubsystem::EmulatorReadiness,
+        |readiness: &&[ArcadeReadiness]| findings_from_arcade_readiness(readiness)
     );
     subsystem!(
         inputs.xemu_readiness,

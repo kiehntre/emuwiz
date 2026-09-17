@@ -99,6 +99,9 @@ impl ArchiveFsApp {
                             arcade_dat_version: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
+                            arcade_readiness: Gathered::NotLoaded(
+                                "not gathered: the Doctor worker stopped",
+                            ),
                             xemu_readiness: Gathered::NotLoaded(
                                 "not gathered: the Doctor worker stopped",
                             ),
@@ -200,6 +203,7 @@ impl ArchiveFsApp {
                 |value| value.as_slice(),
             ),
             arcade_dat_version: borrowed(&gathered.arcade_dat_version, |value| value.as_slice()),
+            arcade_readiness: borrowed(&gathered.arcade_readiness, |value| value.as_slice()),
             xemu_readiness: borrowed(&gathered.xemu_readiness, |value| value.as_slice()),
             xenia_readiness: borrowed(&gathered.xenia_readiness, |value| value.as_slice()),
             ppsspp_readiness: borrowed(&gathered.ppsspp_readiness, |value| value.as_slice()),
@@ -674,6 +678,15 @@ pub(crate) fn gather_doctor_inputs(
             &arcade_version_outputs,
         ),
     );
+    let arcade_readiness = Gathered::Ready(
+        archivefs_core::diagnostics::arcade_profiles::discover_arcade_readiness(
+            &installations,
+            match &arcade_dat_version {
+                Gathered::Ready(readiness) => readiness,
+                Gathered::Failed(_) | Gathered::NotLoaded(_) => &[],
+            },
+        ),
+    );
     let linux_emulator_installations = Gathered::Ready(installations);
     let azahar_cemu_readiness = Gathered::Ready(
         archivefs_core::diagnostics::profiles::discover_azahar_cemu_readiness(),
@@ -743,6 +756,7 @@ pub(crate) fn gather_doctor_inputs(
         desmume_mesen_readiness,
         rmg_sameboy_readiness,
         arcade_dat_version,
+        arcade_readiness,
         xemu_readiness,
         xenia_readiness,
         ppsspp_readiness,
