@@ -114,6 +114,7 @@ pub mod platform_map;
 pub mod ppsspp_command;
 pub mod ppsspp_execution;
 pub mod process_spawn;
+pub use process_spawn::LaunchCommandSpec;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;

@@ -22,6 +22,7 @@ use crate::emulator_environment::retroarch::{
 };
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
 use crate::launch::platform_map::retroarch_platform_matches;
+use crate::launch::process_spawn::LaunchCommandSpec;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 
 /// The executable invocation data for a launch that has passed every
@@ -33,6 +34,18 @@ pub struct RetroArchCommand {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub selection: RetroArchCommandSelection,
+}
+
+impl RetroArchCommand {
+    /// Projects the already-built argv into the generic process command shape
+    /// used by preview and spawning. This does not revalidate or perform I/O.
+    pub fn command_spec(&self) -> LaunchCommandSpec {
+        LaunchCommandSpec {
+            executable: self.executable.clone(),
+            arguments: self.arguments.clone(),
+            working_directory: self.working_directory.clone(),
+        }
+    }
 }
 
 /// The inspected environment facts that selected the command's profile and
@@ -471,6 +484,18 @@ mod tests {
                 OsString::from("/retroarch/cores/genesis_plus_gx_libretro.so"),
                 OsString::from("/games/actual-title.cue"),
             ]
+        );
+        assert_eq!(
+            command.command_spec(),
+            crate::launch::process_spawn::LaunchCommandSpec {
+                executable: PathBuf::from("/usr/bin/retroarch"),
+                arguments: vec![
+                    OsString::from("-L"),
+                    OsString::from("/retroarch/cores/genesis_plus_gx_libretro.so"),
+                    OsString::from("/games/actual-title.cue"),
+                ],
+                working_directory: None,
+            }
         );
     }
 

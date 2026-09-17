@@ -62,9 +62,7 @@ use crate::launch::pcsx2_command::{
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef, LaunchTarget,
 };
-use crate::launch::process_spawn::{
-    self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
-};
+use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
 use crate::patch_manager::{
     Pcsx2GameRequest, Pcsx2ProfileDiscoveryRoots, Pcsx2UserDirectoryMode, discover_pcsx2_profiles,
@@ -664,11 +662,7 @@ impl LaunchedPcsx2Process {
 /// policy (stdin/stdout/stderr, environment, no timeout/kill).
 pub fn spawn_pcsx2(command: Pcsx2Command) -> Result<LaunchedPcsx2Process, Pcsx2LaunchSpawnError> {
     let facts = command_facts(&command);
-    let prepared = PreparedProcessCommand {
-        executable: command.executable,
-        arguments: command.arguments,
-        working_directory: command.working_directory,
-    };
+    let prepared = command.command_spec();
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(Pcsx2LaunchSpawnError::Spawn)?;
     Ok(LaunchedPcsx2Process {

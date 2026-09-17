@@ -89,6 +89,12 @@ pub struct PreparedProcessCommand {
     pub working_directory: Option<PathBuf>,
 }
 
+/// The exact structured command description shared by read-only preview and
+/// the executor. It is deliberately an alias of the executor's existing
+/// argv-shaped value: preview never stores one, and spawning still requires
+/// a freshly rebuilt value after preflight.
+pub type LaunchCommandSpec = PreparedProcessCommand;
+
 /// What the background watcher thread reports once the process has exited.
 #[derive(Debug)]
 pub struct ProcessExitReport {

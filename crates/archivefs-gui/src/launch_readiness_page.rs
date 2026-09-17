@@ -21,9 +21,9 @@
 //!
 //! # What this module is not
 //!
-//! - It never calls [`archivefs_core::launch::build_retroarch_command_plan`]
-//!   or any ES-DE export/write function itself - the exact argv always
-//!   comes from core's own fresh preflight, never reconstructed here.
+//! - It never calls any ES-DE export/write function. For RetroArch and PCSX2,
+//!   the read-only recipe uses the same typed command builders as preflight;
+//!   final launch still performs fresh revalidation and rebuilds the command.
 //! - It never resolves identity, mounts an archive, or guesses an inner
 //!   archive member - see the module doc comment on
 //!   [`archivefs_core::launch::evidence_bridge`] for where those honest
@@ -45,6 +45,7 @@ use archivefs_core::emulator_environment::retroarch::{
     AppImageIdentificationConfidence, DiscoveryEnvironment, ExecutableState, ProfileKind,
     ProfileRef, RetroArchEnvironmentReport,
 };
+use archivefs_core::launch::planning::{CanonicalIdentityStatus, ResolvedIdentity};
 use archivefs_core::launch::{
     AmigaWHDLoadLaunchError, DuckStationLaunchExecutionError, DuckStationLaunchRequest,
     LaunchedAmigaWHDLoadProcess, LaunchedDuckStationProcess, LaunchedPpssppProcess,
@@ -52,15 +53,15 @@ use archivefs_core::launch::{
     PpssppLaunchRequest, Rpcs3LaunchExecutionError, Rpcs3LaunchRequest, WHDLoadLaunchInput,
     XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
     build_amiberry_whdload_command_plan, build_fsuae_whdload_command_plan,
-    preflight_and_launch_amiga_whdload, preflight_and_launch_duckstation,
-    preflight_and_launch_ppsspp, preflight_and_launch_rpcs3, preflight_and_launch_xemu,
-    preflight_and_launch_xenia,
+    build_pcsx2_command_plan, build_retroarch_command_plan, preflight_and_launch_amiga_whdload,
+    preflight_and_launch_duckstation, preflight_and_launch_ppsspp, preflight_and_launch_rpcs3,
+    preflight_and_launch_xemu, preflight_and_launch_xenia,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
     DolphinLaunchExitReport, DolphinLaunchPreflightErrorKind, DolphinLaunchRequest,
     DolphinLaunchSpawnError, FirmwareReadiness, LaunchBlocker, LaunchBlockerKind, LaunchCandidate,
-    LaunchContainerKind, LaunchExecutionError, LaunchExitReport, LaunchPlan,
+    LaunchCommandSpec, LaunchContainerKind, LaunchExecutionError, LaunchExitReport, LaunchPlan,
     LaunchPreflightErrorKind, LaunchReadiness, LaunchSpawnError, LaunchTarget, LaunchWarning,
     LaunchWarningKind, LaunchedDolphinProcess, LaunchedPcsx2Process, LaunchedRetroArchProcess,
     PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError, Pcsx2LaunchExitReport,
@@ -226,6 +227,7 @@ pub(crate) enum LaunchReadinessPageAction {
 /// it is not a generic AppImage launcher.
 pub(crate) struct RetroArchLaunchContext {
     appimage_executables: Vec<(ProfileRef, PathBuf)>,
+    environment: RetroArchEnvironmentReport,
 }
 
 pub(crate) fn retroarch_launch_context(
@@ -251,6 +253,7 @@ pub(crate) fn retroarch_launch_context(
     }
     RetroArchLaunchContext {
         appimage_executables,
+        environment: environment.clone(),
     }
 }
 
@@ -1847,10 +1850,16 @@ fn preference_label(preference: CandidatePreference) -> &'static str {
 }
 
 /// Draws the human-facing recipe for the exact candidate already present in
-/// the shared launch plan.  This is deliberately a projection, not a second
-/// command builder: adapter preflight still owns executable discovery,
-/// identity revalidation, and the final argv used to spawn a process.
-fn show_launch_recipe(ui: &mut egui::Ui, plan: &LaunchPlan, candidate: &LaunchCandidate) {
+/// the shared launch plan. For RetroArch and PCSX2 this projects the same
+/// typed command builders used by preflight; adapter preflight still owns
+/// executable discovery, identity revalidation, and final launch authority.
+fn show_launch_recipe(
+    ui: &mut egui::Ui,
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+    pcsx2: Option<&Pcsx2LaunchContext>,
+) {
     let (emulator, profile) = target_labels(&candidate.target);
     let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
     let input = candidate
@@ -1859,12 +1868,7 @@ fn show_launch_recipe(ui: &mut egui::Ui, plan: &LaunchPlan, candidate: &LaunchCa
         .as_deref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "No runnable game file has been resolved".into());
-    let arguments = match &candidate.target {
-        LaunchTarget::RetroArchCore { core_stem, .. } => {
-            format!("-L {core_stem} <game path>")
-        }
-        LaunchTarget::Standalone { .. } => "<adapter-specific arguments> <game path>".into(),
-    };
+    let command = launch_command_preview(plan, candidate, retroarch, pcsx2);
     let readiness = readiness_label_and_tone(candidate.readiness);
 
     widgets::card(ui, |ui| {
@@ -1873,7 +1877,25 @@ fn show_launch_recipe(ui: &mut egui::Ui, plan: &LaunchPlan, candidate: &LaunchCa
         detail_label(ui, "Emulator", &emulator);
         detail_label(ui, "Profile", &profile);
         detail_label(ui, "Game file", &input);
-        detail_label(ui, "Arguments", &arguments);
+        if let Some(command) = &command {
+            detail_label(ui, "Executable", &command.executable.display().to_string());
+            detail_label(
+                ui,
+                "Working directory",
+                command
+                    .working_directory
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .as_deref()
+                    .unwrap_or("Inherited"),
+            );
+            ui.label(egui::RichText::new("Arguments").strong());
+            for (index, argument) in command.arguments.iter().enumerate() {
+                detail_label(ui, &format!("[{index}]"), &argument.to_string_lossy());
+            }
+        } else {
+            detail_label(ui, "Command", "Final command resolved at launch");
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Readiness").strong());
             widgets::status_badge(ui, readiness.0, readiness.1);
@@ -1887,12 +1909,60 @@ fn show_launch_recipe(ui: &mut egui::Ui, plan: &LaunchPlan, candidate: &LaunchCa
         }
         ui.label(
             egui::RichText::new(
-                "The selected adapter builds and rechecks the final executable command when you launch.",
+                "Preview only. EmuWiz rechecks this command immediately before launch.",
             )
             .small()
             .color(theme::muted(ui)),
         );
     });
+}
+
+fn preview_identity(plan: &LaunchPlan) -> CanonicalIdentityStatus {
+    match (&plan.platform_id, &plan.game_key) {
+        (Some(platform_id), Some(game_key)) => {
+            CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+                platform_id: platform_id.clone(),
+                game_key: game_key.clone(),
+            })
+        }
+        _ => CanonicalIdentityStatus::Unknown,
+    }
+}
+
+fn launch_command_preview(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+    retroarch: Option<&RetroArchLaunchContext>,
+    pcsx2: Option<&Pcsx2LaunchContext>,
+) -> Option<LaunchCommandSpec> {
+    let identity = preview_identity(plan);
+    match &candidate.target {
+        LaunchTarget::RetroArchCore { .. } => {
+            build_retroarch_command_plan(&identity, candidate, &retroarch?.environment)
+                .command
+                .map(|command| command.command_spec())
+        }
+        LaunchTarget::Standalone {
+            adapter_id,
+            profile_id,
+            ..
+        } => match *adapter_id {
+            "pcsx2" => {
+                let context = pcsx2?;
+                let serial = context.verified_ps2_serial.as_deref();
+                let profile = context
+                    .discovery
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)?;
+                let binding = resolve_pcsx2_native_launch_binding(profile, &context.roots);
+                build_pcsx2_command_plan(&identity, serial, candidate, &binding)
+                    .command
+                    .map(|command| command.command_spec())
+            }
+            _ => None,
+        },
+    }
 }
 
 /// Plain-language firmware presentation, projected solely from the existing
@@ -2443,7 +2513,7 @@ fn show_candidate(
             .color(theme::muted(ui)),
         );
 
-        show_launch_recipe(ui, plan, candidate);
+        show_launch_recipe(ui, plan, candidate, retroarch, pcsx2);
 
         open_doctor = show_firmware_summary(ui, candidate);
 

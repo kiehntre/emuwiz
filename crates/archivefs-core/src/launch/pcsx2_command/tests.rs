@@ -81,6 +81,14 @@ fn default_native_produces_exact_argv() {
     );
     assert_eq!(command.selection.platform_id, "PS2");
     assert_eq!(command.selection.verified_ps2_serial, "SLUS-12345");
+    assert_eq!(
+        command.command_spec(),
+        LaunchCommandSpec {
+            executable: PathBuf::from("/usr/bin/pcsx2-qt"),
+            arguments: vec![OsString::from("/games/Final Fantasy X.iso")],
+            working_directory: None,
+        }
+    );
 }
 
 #[test]

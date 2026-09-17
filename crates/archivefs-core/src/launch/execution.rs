@@ -50,7 +50,7 @@ use crate::launch::evidence_bridge::canonical_identity_from_game_report;
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentRef, LaunchTarget, build_launch_plan,
 };
-use crate::launch::process_spawn::{self, PreparedProcessCommand, WatchedProcess};
+use crate::launch::process_spawn::{self, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::retroarch_command::{RetroArchCommand, build_retroarch_command_plan};
 
@@ -724,11 +724,7 @@ pub fn spawn_retroarch(
     command: RetroArchCommand,
 ) -> Result<LaunchedRetroArchProcess, LaunchSpawnError> {
     let facts = command_facts(&command);
-    let prepared = PreparedProcessCommand {
-        executable: command.executable,
-        arguments: command.arguments,
-        working_directory: command.working_directory,
-    };
+    let prepared = command.command_spec();
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(LaunchSpawnError::Spawn)?;
     Ok(LaunchedRetroArchProcess {

@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use archivefs_core::dat::firmware_evidence::{FirmwareIdentityRecord, FirmwareSystem};
 use archivefs_core::dat::model::DatEcosystem;
-use archivefs_core::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
+use archivefs_core::emulator_environment::retroarch::{
+    ProfileKind, ProfileRef, ProfileScope, RetroArchEnvironmentReport,
+};
 use archivefs_core::identity_source::hashing::Crc32;
 use archivefs_core::launch::{
     DolphinCommand, DolphinCommandSelection, LaunchBlocker, LaunchBlockerKind, LaunchContainerKind,
@@ -844,11 +846,11 @@ fn launch_recipe_uses_the_shared_candidate_and_plain_language() {
     assert!(rendered_text_contains(&output, "/library/Game.bin"));
     assert!(rendered_text_contains(
         &output,
-        "-L mednafen_psx_hw <game path>"
+        "Final command resolved at launch"
     ));
     assert!(rendered_text_contains(
         &output,
-        "rechecks the final executable command"
+        "Preview only. EmuWiz rechecks this command immediately before launch."
     ));
 }
 
@@ -944,6 +946,11 @@ fn appimage_profile_candidate_needs_an_exact_executable_binding() {
             },
             PathBuf::from("/Applications/RetroArch.AppImage"),
         )],
+        environment: RetroArchEnvironmentReport {
+            format_version: 1,
+            profiles: Vec::new(),
+            diagnostics: Vec::new(),
+        },
     };
     let request = retroarch_launch_request(&plan, candidate, Some(&context))
         .expect("one exact verified AppImage binding enables this RetroArch request");
