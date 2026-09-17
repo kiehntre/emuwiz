@@ -7177,8 +7177,8 @@ pub fn pending_schema_migration_versions(current_version: i64) -> Result<Vec<i64
 }
 
 /// Scans every game-scan-eligible folder in `config.source_folders` with the
-/// existing [`ArchiveScanner`] (unmodified - one scan per folder, so a single
-/// unreachable folder cannot poison the whole run) and persists the
+/// [`ArchiveScanner`] (one scan per folder, so a single unreachable folder
+/// cannot poison the whole run) and persists the
 /// results into `database`: registers source folders, starts a
 /// `scan_runs` row, upserts each discovered archive with its observation
 /// and platform assignment, and - only for folders whose scan succeeded -
@@ -7312,6 +7312,28 @@ fn scan_and_persist_folders_transaction(
                 continue;
             }
         };
+        let discovery_complete = discovery.is_complete();
+        if !discovery_complete {
+            counts.errors_count += discovery.scan_errors_total as i64;
+            let detail = discovery
+                .scan_errors
+                .iter()
+                .map(|issue| format!("{}: {}", issue.path.display(), issue.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let detail = if discovery.scan_errors_truncated() {
+                format!("{detail}; additional scan errors were omitted")
+            } else {
+                detail
+            };
+            folder_errors.push((
+                folder.path.clone(),
+                format!(
+                    "scan completed with {} recoverable error(s): {detail}",
+                    discovery.scan_errors_total
+                ),
+            ));
+        }
         let discovery_ms = discovery_started.elapsed().as_millis();
         info!(
             "scan phases source={} traversal_ms={} candidate_ms={} stat_ms={} classification_ms={} directories={} files_statted={} candidates={} reused={} re_inspected={} missing_fingerprint={} stat_mismatch={} cache_version_mismatch={} deliberately_non_cacheable={} re_inspected_plain={} re_inspected_direct_images={} re_inspected_archives={} unsupported={} ambiguous={}",
@@ -7459,15 +7481,18 @@ fn scan_and_persist_folders_transaction(
 
         database.begin_folder_refresh()?;
         let db_write_started = std::time::Instant::now();
-        let fully_reused =
-            discovery.timings.re_inspected == 0 && non_archive_fingerprints.is_empty();
+        let fully_reused = discovery_complete
+            && discovery.timings.re_inspected == 0
+            && non_archive_fingerprints.is_empty();
         let persisted = if fully_reused {
             database
                 .reconcile_fully_reused_source(scan_run_id, folder, &archives)?
                 .map(Ok)
-                .unwrap_or_else(|| persist_one_folder(database, scan_run_id, folder, &archives))
+                .unwrap_or_else(|| {
+                    persist_one_folder(database, scan_run_id, folder, &archives, discovery_complete)
+                })
         } else {
-            persist_one_folder(database, scan_run_id, folder, &archives)
+            persist_one_folder(database, scan_run_id, folder, &archives, discovery_complete)
         };
         match persisted {
             Ok(folder_counts) => {
@@ -7487,12 +7512,27 @@ fn scan_and_persist_folders_transaction(
                 counts.archives_unchanged += folder_counts.archives_unchanged;
                 counts.archives_updated += folder_counts.archives_updated;
                 counts.archives_missing += folder_counts.archives_missing;
-                database.record_source_scan_result(
-                    folder.id,
-                    SourceScanStatus::Success,
-                    None,
-                    Some(archives.len() as i64),
-                )?;
+                if discovery_complete {
+                    database.record_source_scan_result(
+                        folder.id,
+                        SourceScanStatus::Success,
+                        None,
+                        Some(archives.len() as i64),
+                    )?;
+                } else {
+                    let message = folder_errors
+                        .iter()
+                        .rev()
+                        .find(|(path, _)| path == &folder.path)
+                        .map(|(_, message)| message.as_str())
+                        .unwrap_or("source scan completed partially");
+                    database.record_source_scan_result(
+                        folder.id,
+                        SourceScanStatus::Failed,
+                        Some(message),
+                        None,
+                    )?;
+                }
                 database.commit_folder_refresh()?;
                 let non_archive_writes = database
                     .persist_non_archive_fingerprints(folder.id, &non_archive_fingerprints)?;
@@ -7563,6 +7603,7 @@ fn persist_one_folder(
     scan_run_id: i64,
     folder: &RegisteredSourceFolder,
     archives: &[Archive],
+    complete: bool,
 ) -> Result<ScanRunCounts> {
     let mut counts = ScanRunCounts::default();
     let mut seen_archive_ids = Vec::with_capacity(archives.len());
@@ -7616,8 +7657,10 @@ fn persist_one_folder(
         }
     }
 
-    counts.archives_missing =
-        database.mark_unseen_archives_missing(scan_run_id, folder.id, &seen_archive_ids)?;
+    if complete {
+        counts.archives_missing =
+            database.mark_unseen_archives_missing(scan_run_id, folder.id, &seen_archive_ids)?;
+    }
 
     Ok(counts)
 }

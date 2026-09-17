@@ -5401,9 +5401,36 @@ pub struct ArchiveScanDiscovery {
     /// presenting it as complete.
     pub skipped_files: Vec<SkippedFile>,
     pub timings: ScanPhaseTimings,
-    /// Compact fingerprints for deterministic skipped files. This is bounded
-    /// by the scanner's entry limit and contains no file payload.
+    pub entries_seen: usize,
+    pub scan_errors: Vec<ScanError>,
+    pub scan_errors_total: usize,
+    /// Compact fingerprints for deterministic skipped files. This is retained
+    /// under a fixed memory bound and contains no file payload.
     pub non_archive_fingerprints: Vec<ScanFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+const MAX_RETAINED_SCAN_ERRORS: usize = 1024;
+const MAX_RETAINED_NON_ARCHIVE_FINGERPRINTS: usize = 16_384;
+
+impl ArchiveScanDiscovery {
+    fn record_scan_error(&mut self, path: PathBuf, message: impl Into<String>) {
+        self.scan_errors_total = self.scan_errors_total.saturating_add(1);
+        if self.scan_errors.len() < MAX_RETAINED_SCAN_ERRORS {
+            self.scan_errors.push(ScanError { path, message: message.into() });
+        }
+    }
+
+    pub fn is_complete(&self) -> bool { self.scan_errors_total == 0 }
+
+    pub fn scan_errors_truncated(&self) -> bool {
+        self.scan_errors_total > self.scan_errors.len()
+    }
 }
 
 impl ArchiveScanDiscovery {
@@ -5483,6 +5510,10 @@ impl<'a> ArchiveScanner<'a> {
                 &excluded_roots,
             )?;
         }
+        discovery.skipped_files.sort_by(|left, right| {
+            left.path.cmp(&right.path).then_with(|| left.reason.label().cmp(right.reason.label()))
+        });
+        discovery.non_archive_fingerprints.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         discovery
             .archives
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -5554,48 +5585,51 @@ impl<'a> ArchiveScanner<'a> {
         fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
         excluded_roots: &[PathBuf],
     ) -> Result<()> {
-        const MAX_SCAN_ENTRIES: usize = 250_000;
         const MAX_SCAN_DEPTH: usize = 128;
 
         let source_identity = validate_source_root(source_root)?;
         let mut directories = vec![(source.to_path_buf(), 0_usize)];
-        let mut entries_seen = 0_usize;
         while let Some((directory, depth)) = directories.pop() {
             discovery.timings.directories_visited += 1;
             let traversal_started = Instant::now();
-            let before = fs::symlink_metadata(&directory)
-                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
-            if before.file_type().is_symlink() || !before.is_dir() {
-                return Err(ArchiveFsError::Scanner(format!(
-                    "source directory changed or became unsafe during scan: {}",
-                    directory.display()
-                )));
-            }
-            let read_dir = fs::read_dir(&directory)
-                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
-            let mut entries = Vec::new();
-            for entry in read_dir {
-                entries_seen = entries_seen.checked_add(1).ok_or_else(|| {
-                    ArchiveFsError::Scanner("source entry count overflow".to_string())
-                })?;
-                if entries_seen > MAX_SCAN_ENTRIES {
-                    return Err(ArchiveFsError::Scanner(format!(
-                        "source scan exceeded the {MAX_SCAN_ENTRIES} entry limit at {}",
-                        directory.display()
-                    )));
+            let before = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                    continue;
                 }
-                entries.push(entry.map_err(|error| ArchiveFsError::io(directory.clone(), error))?);
+            };
+            if before.file_type().is_symlink() || !before.is_dir() {
+                discovery.record_scan_error(directory.clone(), format!("source directory changed or became unsafe during scan: {}", directory.display()));
+                continue;
             }
-            entries.sort_by_key(|entry| entry.path());
-
+            let read_dir = match fs::read_dir(&directory) {
+                Ok(read_dir) => read_dir,
+                Err(error) => {
+                    discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                    continue;
+                }
+            };
             let mut child_directories = Vec::new();
             discovery.timings.filesystem_traversal_ns += traversal_started.elapsed().as_nanos();
-            for entry in entries {
+            for entry in read_dir {
+                discovery.entries_seen = discovery.entries_seen.saturating_add(1);
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                        continue;
+                    }
+                };
                 let candidate_started = Instant::now();
                 let path = entry.path();
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        discovery.record_scan_error(path.clone(), ArchiveFsError::io(path.clone(), error).to_string());
+                        continue;
+                    }
+                };
                 if file_type.is_symlink() {
                     continue;
                 }
@@ -5619,10 +5653,8 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     if depth >= MAX_SCAN_DEPTH {
-                        return Err(ArchiveFsError::Scanner(format!(
-                            "source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}",
-                            path.display()
-                        )));
+                        discovery.record_scan_error(path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
+                        continue;
                     }
                     child_directories.push((path, depth + 1));
                 } else if file_type.is_file()
@@ -5635,10 +5667,8 @@ impl<'a> ArchiveScanner<'a> {
                     )
                 {
                     if archive.identity.size_bytes.is_none() {
-                        return Err(ArchiveFsError::Scanner(format!(
-                            "archive changed or became unreadable during scan: {}",
-                            path.display()
-                        )));
+                        discovery.record_scan_error(path.clone(), format!("archive changed or became unreadable during scan: {}", path.display()));
+                        continue;
                     }
                     debug!("discovered archive {}", archive.path.display());
                     discovery.archives.push(archive);
@@ -5675,7 +5705,8 @@ impl<'a> ArchiveScanner<'a> {
                             reason,
                         });
                     }
-                    if !self.non_archive_fingerprint_is_current(
+                    if discovery.non_archive_fingerprints.len() < MAX_RETAINED_NON_ARCHIVE_FINGERPRINTS
+                        && !self.non_archive_fingerprint_is_current(
                         &path,
                         source_root,
                         source_id,
@@ -5713,16 +5744,18 @@ impl<'a> ArchiveScanner<'a> {
                     }
                 }
             }
-            let after = fs::symlink_metadata(&directory)
-                .map_err(|error| ArchiveFsError::io(directory.clone(), error))?;
+            let after = match fs::symlink_metadata(&directory) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                    continue;
+                }
+            };
             if after.file_type().is_symlink()
                 || !after.is_dir()
                 || filesystem_identity(&before) != filesystem_identity(&after)
             {
-                return Err(ArchiveFsError::Scanner(format!(
-                    "source directory changed during scan: {}",
-                    directory.display()
-                )));
+                discovery.record_scan_error(directory.clone(), format!("source directory changed during scan: {}", directory.display()));
             }
             child_directories.reverse();
             directories.extend(child_directories);
@@ -12978,11 +13011,48 @@ mod tests {
             fs::create_dir(&directory).unwrap();
         }
 
-        let error = ArchiveScanner::new(&scanner_config(&root))
-            .scan_archives()
-            .unwrap_err();
+        let discovery = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives_with_summary()
+            .unwrap();
+        assert!(!discovery.is_complete());
+        assert!(discovery.scan_errors.iter().any(|error| error.message.contains("directory depth limit")));
+    }
 
-        assert!(error.to_string().contains("directory depth limit"));
+    #[test]
+    #[ignore = "resource-intensive regression for the former 250,000-entry ceiling"]
+    fn scanner_streams_a_directory_larger_than_the_former_global_limit() {
+        let root = test_root("scanner-large-directory");
+        fs::create_dir_all(&root).unwrap();
+        for index in 0..250_001 {
+            fs::write(root.join(format!("sidecar-{index:06}.txt")), b"").unwrap();
+        }
+        let discovery = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives_with_summary()
+            .unwrap();
+        assert!(discovery.is_complete());
+        assert_eq!(discovery.entries_seen, 250_001);
+        assert!(discovery.archives.is_empty());
+        assert!(discovery.non_archive_fingerprints.len() <= 16_384);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scanner_keeps_valid_siblings_when_one_subtree_hits_depth_bound() {
+        let root = test_root("scanner-partial-sibling");
+        let mut deep = root.join("deep");
+        fs::create_dir_all(&deep).unwrap();
+        for _ in 0..=128 {
+            deep.push("d");
+            fs::create_dir(&deep).unwrap();
+        }
+        fs::write(root.join("valid.zip"), b"valid").unwrap();
+        let discovery = ArchiveScanner::new(&scanner_config(&root))
+            .scan_archives_with_summary()
+            .unwrap();
+        assert!(!discovery.is_complete());
+        assert!(discovery.archives.iter().any(|archive| archive.path == root.join("valid.zip")));
+        assert!(discovery.scan_errors.iter().any(|error| error.message.contains("directory depth limit")));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
