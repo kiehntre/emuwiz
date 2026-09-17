@@ -677,6 +677,78 @@ fn show_advanced_readiness(ui: &mut egui::Ui, readiness: &ApplyReadinessInfo) {
     });
 }
 
+impl ArchiveFsApp {
+    /// GUI Batch C: starts (or refreshes) the read-only "Plan Preview" load
+    /// for the currently-ready selected-evidence report - see
+    /// `plan_preview_page`'s own module doc. Explicit only (a button
+    /// press); never called automatically. A no-op when the evidence
+    /// report is not `Ready` (nothing to plan for yet).
+    pub(crate) fn start_plan_preview_load(&mut self, context: egui::Context) {
+        let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
+            &self.selected_evidence_ui.selected_evidence
+        else {
+            return;
+        };
+        let source_path = report.path.clone();
+        let identity = report.identity_result.clone();
+        let identity_presentation = report.identity.clone();
+        let physical_hash = report.hashes.as_ref().map(|hashes| hashes.sha1.clone());
+
+        self.selected_evidence_ui.plan_preview_generation += 1;
+        let generation = self.selected_evidence_ui.plan_preview_generation;
+        let (sender, receiver) = mpsc::channel();
+        self.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Loading {
+            generation,
+            receiver,
+        };
+        thread::spawn(move || {
+            let master_root = Config::load_default()
+                .ok()
+                .and_then(|config| config.master_rom_root);
+            let outcome = plan_preview_page::gather_plan_preview(
+                &source_path,
+                &identity,
+                &identity_presentation,
+                physical_hash.as_deref(),
+                master_root.as_deref(),
+            );
+            let _ = sender.send((generation, outcome));
+            context.request_repaint();
+        });
+    }
+
+    /// GUI Batch C: applies the pure
+    /// [`plan_preview_page::PlanPreviewAction`] the panel returned this
+    /// frame - the only thing it can ever ask for, and read-only.
+    pub(crate) fn handle_plan_preview_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<plan_preview_page::PlanPreviewAction>,
+    ) {
+        if let Some(plan_preview_page::PlanPreviewAction::Load) = action {
+            self.start_plan_preview_load(context.clone());
+        }
+    }
+
+    /// GUI Batch C: drains a completed plan-preview load, discarding
+    /// anything whose generation is no longer current - the same
+    /// stale-result guard `poll_identity_sources` already uses.
+    pub(crate) fn poll_plan_preview(&mut self) {
+        if let plan_preview_page::PlanPreviewState::Loading {
+            generation,
+            receiver,
+        } = &self.selected_evidence_ui.plan_preview
+            && let Ok((message_generation, outcome)) = receiver.try_recv()
+            && message_generation == *generation
+        {
+            self.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Ready {
+                generation: message_generation,
+                outcome,
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,77 +1101,5 @@ mod tests {
                 let _ = show_plan_preview_panel(ui, false, Some(Path::new("game.gb")), &state);
             });
         });
-    }
-}
-
-impl ArchiveFsApp {
-    /// GUI Batch C: starts (or refreshes) the read-only "Plan Preview" load
-    /// for the currently-ready selected-evidence report - see
-    /// `plan_preview_page`'s own module doc. Explicit only (a button
-    /// press); never called automatically. A no-op when the evidence
-    /// report is not `Ready` (nothing to plan for yet).
-    pub(crate) fn start_plan_preview_load(&mut self, context: egui::Context) {
-        let selected_evidence_page::SelectedEvidenceState::Ready { report, .. } =
-            &self.selected_evidence_ui.selected_evidence
-        else {
-            return;
-        };
-        let source_path = report.path.clone();
-        let identity = report.identity_result.clone();
-        let identity_presentation = report.identity.clone();
-        let physical_hash = report.hashes.as_ref().map(|hashes| hashes.sha1.clone());
-
-        self.selected_evidence_ui.plan_preview_generation += 1;
-        let generation = self.selected_evidence_ui.plan_preview_generation;
-        let (sender, receiver) = mpsc::channel();
-        self.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Loading {
-            generation,
-            receiver,
-        };
-        thread::spawn(move || {
-            let master_root = Config::load_default()
-                .ok()
-                .and_then(|config| config.master_rom_root);
-            let outcome = plan_preview_page::gather_plan_preview(
-                &source_path,
-                &identity,
-                &identity_presentation,
-                physical_hash.as_deref(),
-                master_root.as_deref(),
-            );
-            let _ = sender.send((generation, outcome));
-            context.request_repaint();
-        });
-    }
-
-    /// GUI Batch C: applies the pure
-    /// [`plan_preview_page::PlanPreviewAction`] the panel returned this
-    /// frame - the only thing it can ever ask for, and read-only.
-    pub(crate) fn handle_plan_preview_action(
-        &mut self,
-        context: &egui::Context,
-        action: Option<plan_preview_page::PlanPreviewAction>,
-    ) {
-        if let Some(plan_preview_page::PlanPreviewAction::Load) = action {
-            self.start_plan_preview_load(context.clone());
-        }
-    }
-
-    /// GUI Batch C: drains a completed plan-preview load, discarding
-    /// anything whose generation is no longer current - the same
-    /// stale-result guard `poll_identity_sources` already uses.
-    pub(crate) fn poll_plan_preview(&mut self) {
-        if let plan_preview_page::PlanPreviewState::Loading {
-            generation,
-            receiver,
-        } = &self.selected_evidence_ui.plan_preview
-            && let Ok((message_generation, outcome)) = receiver.try_recv()
-            && message_generation == *generation
-        {
-            self.selected_evidence_ui.plan_preview = plan_preview_page::PlanPreviewState::Ready {
-                generation: message_generation,
-                outcome,
-            };
-        }
     }
 }

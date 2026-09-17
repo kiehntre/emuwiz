@@ -1,8 +1,8 @@
+use crate::RunningRommOperation;
 use crate::romm_browse::{BrowseState, StaleProgress};
 use crate::romm_config::{RommConfigDraft, RommPreviewSummary};
 use crate::romm_game::{GamePanelState, HashProgressView};
 use crate::romm_source::{RommCardState, RommSnapshot, VerifyRommSummary};
-use crate::RunningRommOperation;
 
 /// UI/session state for the RomM surface.
 ///
@@ -10,6 +10,7 @@ use crate::RunningRommOperation;
 /// bundle only groups the state those layers expose to the GUI. Shared GUI
 /// configuration remains on `ArchiveFsApp` because it is also consumed by
 /// non-RomM surfaces.
+#[derive(Default)]
 pub(crate) struct RommUiState {
     pub(crate) snapshot: Option<Box<RommSnapshot>>,
     pub(crate) verify_summary: Option<VerifyRommSummary>,
@@ -22,22 +23,4 @@ pub(crate) struct RommUiState {
     pub(crate) stale_progress: Option<StaleProgress>,
     pub(crate) game: GamePanelState,
     pub(crate) hash_progress: Option<HashProgressView>,
-}
-
-impl Default for RommUiState {
-    fn default() -> Self {
-        Self {
-            snapshot: None,
-            verify_summary: None,
-            operation: None,
-            generation: 0,
-            card: RommCardState::default(),
-            config_draft: None,
-            preview: None,
-            browse: None,
-            stale_progress: None,
-            game: GamePanelState::default(),
-            hash_progress: None,
-        }
-    }
 }

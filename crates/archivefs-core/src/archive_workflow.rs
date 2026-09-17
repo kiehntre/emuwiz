@@ -498,13 +498,12 @@ fn looks_like_multipart_archive(path: &Path) -> bool {
         return false;
     };
     let lower = name.to_ascii_lowercase();
-    if lower.ends_with(".rar") {
-        if let Some(part) = lower
+    if lower.ends_with(".rar")
+        && let Some(part) = lower
             .strip_suffix(".rar")
             .and_then(|stem| stem.rsplit_once(".part"))
-        {
-            return part.1.chars().all(|ch| ch.is_ascii_digit());
-        }
+    {
+        return part.1.chars().all(|ch| ch.is_ascii_digit());
     }
     lower.len() >= 4
         && !lower.ends_with(".rar")
@@ -703,10 +702,10 @@ pub fn extract_zip(plan: &ArchivePlan) -> Result<ArchiveOperationResult, String>
             let mut member = archive.by_index(index).map_err(|e| e.to_string())?;
             let relative =
                 validate_member_path(member.name()).map_err(|e| format!("unsafe member: {e:?}"))?;
-            if let Some(mode) = member.unix_mode() {
-                if mode & 0o170000 == 0o120000 {
-                    return Err("archive symlink member is unsupported".into());
-                }
+            if let Some(mode) = member.unix_mode()
+                && mode & 0o170000 == 0o120000
+            {
+                return Err("archive symlink member is unsupported".into());
             }
             let target =
                 confined(&stage, &relative).map_err(|e| format!("unsafe destination: {e:?}"))?;

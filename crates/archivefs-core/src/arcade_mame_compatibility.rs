@@ -211,7 +211,7 @@ pub struct MameCompletenessAlternativeSet {
 impl MameCompletenessAlternativeSet {
     pub fn new(alternatives: impl IntoIterator<Item = MameRequirementGroup>) -> Self {
         let mut alternatives: Vec<_> = alternatives.into_iter().collect();
-        alternatives.sort_by(|left, right| requirement_key(left).cmp(&requirement_key(right)));
+        alternatives.sort_by_key(requirement_key);
         alternatives.dedup();
         Self { alternatives }
     }

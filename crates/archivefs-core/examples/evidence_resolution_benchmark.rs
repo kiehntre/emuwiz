@@ -20,13 +20,17 @@ const SUBJECTS: usize = 100_000;
 
 fn claim(number: usize) -> EvidenceClaim {
     let subject = format!("synthetic-{}", number % SUBJECTS);
-    let value = if number % 1000 == 0 { "Saturn" } else { "PSX" };
+    let value = if number.is_multiple_of(1000) {
+        "Saturn"
+    } else {
+        "PSX"
+    };
     EvidenceClaim::new(
         format!("claim-{number}"),
         subject,
         ClaimProperty::Platform,
         EvidenceValue::Platform(value.to_string()),
-        if number % 2 == 0 {
+        if number.is_multiple_of(2) {
             EvidenceSource::NativeVerified
         } else {
             EvidenceSource::AuthorityVerified

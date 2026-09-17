@@ -73,12 +73,14 @@ pub fn recommend_arcade_emulator(
 ) -> ArcadeEmulatorRecommendation {
     let mame = state_from_mame(&summary.mame);
     let fbneo = state_from_fbneo(&summary.fbneo);
-    let mame_available = options
-        .mame_available
-        .unwrap_or_else(|| !matches!(summary.mame, ArcadeEmulatorCompatibility::NotInstalled));
-    let fbneo_available = options
-        .fbneo_available
-        .unwrap_or_else(|| !matches!(summary.fbneo, ArcadeEmulatorCompatibility::NotInstalled));
+    let mame_available = options.mame_available.unwrap_or(!matches!(
+        summary.mame,
+        ArcadeEmulatorCompatibility::NotInstalled
+    ));
+    let fbneo_available = options.fbneo_available.unwrap_or(!matches!(
+        summary.fbneo,
+        ArcadeEmulatorCompatibility::NotInstalled
+    ));
     let mut result = recommend_from_evidence(mame, fbneo, options);
 
     result.play_now = play_now(

@@ -391,14 +391,13 @@ pub fn enumerate_managed_installations(data_root: &Path) -> ManagedInstallInvent
                 manifest: Some(manifest),
             });
         }
-        if let Some(current_target) = current_target {
-            if !inventory
+        if let Some(current_target) = current_target
+            && !inventory
                 .entries
                 .iter()
                 .any(|entry| entry.install_root == current_target)
-            {
-                pointer_state = ManagedCurrentPointerState::MissingInstall;
-            }
+        {
+            pointer_state = ManagedCurrentPointerState::MissingInstall;
         }
         inventory.pointer_states.push((emulator_id, pointer_state));
     }

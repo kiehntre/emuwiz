@@ -739,7 +739,7 @@ mod tests {
         std::fs::write(&request.content_path, b"game").unwrap();
         std::fs::create_dir_all(&request.save_directory).unwrap();
         let plan = plan_retroarch_resource_grants(&request).unwrap();
-        let source_hash = std::fs::read(&request.bios_root.join("kick40068.A1200")).unwrap();
+        let source_hash = std::fs::read(request.bios_root.join("kick40068.A1200")).unwrap();
         let receipt = materialize_retroarch_resource_plan(&plan).unwrap();
         let link = plan.system_directory.join("kick40068.A1200");
         assert_eq!(
@@ -753,7 +753,7 @@ mod tests {
         assert!(!plan.launch_root.exists());
         assert!(request.save_directory.exists());
         assert_eq!(
-            std::fs::read(&request.bios_root.join("kick40068.A1200")).unwrap(),
+            std::fs::read(request.bios_root.join("kick40068.A1200")).unwrap(),
             source_hash
         );
         request.launch_id = "second".into();

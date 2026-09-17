@@ -1205,15 +1205,15 @@ fn assess_compatibility(
     if has_xex_title && has_xex_media {
         for required in xex_requirements {
             let verified = verified_identity_value(identity, required.kind.identity_kind());
-            if let Some(value) = verified {
-                if value != required.value {
-                    block(
-                        plan,
-                        ModPlanBlockerKind::GameIdentityMismatch,
-                        "selected game XEX identity does not match the package requirement",
-                    );
-                    return;
-                }
+            if let Some(value) = verified
+                && value != required.value
+            {
+                block(
+                    plan,
+                    ModPlanBlockerKind::GameIdentityMismatch,
+                    "selected game XEX identity does not match the package requirement",
+                );
+                return;
             }
         }
     }

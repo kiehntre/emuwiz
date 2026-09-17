@@ -335,12 +335,12 @@ pub fn apply_standalone_patch(
             "output size differs from patch declaration".into(),
         ));
     }
-    if let Some(crc) = inspection.target_crc32 {
-        if crc32(&output) != crc {
-            return Err(StandalonePatchError::Malformed(
-                "output CRC mismatch".into(),
-            ));
-        }
+    if let Some(crc) = inspection.target_crc32
+        && crc32(&output) != crc
+    {
+        return Err(StandalonePatchError::Malformed(
+            "output CRC mismatch".into(),
+        ));
     }
     let output_hash = hex_digest(&output);
     let parent = plan
@@ -715,10 +715,8 @@ fn parse_ips(b: &[u8]) -> (PatchInspectionState, Fields) {
     while p < b.len() {
         if b[p..].starts_with(b"EOF") {
             p += 3;
-            if p < b.len() {
-                if b.len() - p != 3 {
-                    return invalid(StandalonePatchFormat::Ips, "trailing bytes after IPS EOF");
-                }
+            if p < b.len() && b.len() - p != 3 {
+                return invalid(StandalonePatchFormat::Ips, "trailing bytes after IPS EOF");
             }
             return (PatchInspectionState::Valid, {
                 f.target_size = Some(max);
@@ -754,7 +752,7 @@ fn parse_ips(b: &[u8]) -> (PatchInspectionState, Fields) {
             }
             p += size as usize;
         }
-        max = max.max(offset.checked_add(length).unwrap_or(u64::MAX));
+        max = max.max(offset.saturating_add(length));
         if max > MAX_DECLARED_OUTPUT_BYTES {
             return invalid(StandalonePatchFormat::Ips, "output bound is excessive");
         }
@@ -822,7 +820,7 @@ fn parse_bps(b: &[u8]) -> (PatchInspectionState, Fields) {
             Ok(v) => v,
             Err(e) => return invalid(StandalonePatchFormat::Bps, e),
         };
-        let len = (a >> 2).checked_add(1).unwrap_or(u64::MAX);
+        let len = (a >> 2).saturating_add(1);
         if len > target.saturating_sub(output) {
             return invalid(StandalonePatchFormat::Bps, "operations exceed target size");
         }

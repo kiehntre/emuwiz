@@ -380,9 +380,7 @@ pub fn is_forbidden_resolved_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => unsafe_ipv4(address),
         IpAddr::V6(address) => {
-            address
-                .to_ipv4_mapped()
-                .is_some_and(|mapped| unsafe_ipv4(mapped))
+            address.to_ipv4_mapped().is_some_and(unsafe_ipv4)
                 || address.is_loopback()
                 || address.is_unspecified()
                 || address.is_unique_local()

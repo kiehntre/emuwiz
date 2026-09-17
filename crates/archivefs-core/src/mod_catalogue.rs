@@ -411,19 +411,18 @@ pub fn assess_catalogue_compatibility(
         && native
             .iter()
             .any(|item| item.kind == ModIdentityKind::XexTitleId)
+        && result.matching_identity.is_some()
     {
-        if result.matching_identity.is_some() {
-            result.state = ModCompatibilityState::Compatible;
-            result.strength = ModCatalogueMatchStrength::Weak;
-            result.warnings.push(
-                "Xbox Media ID evidence is incomplete; Title ID provides only weaker compatibility"
-                    .into(),
-            );
-            result
-                .reasons
-                .push("native Media ID was not verified".into());
-            return result;
-        }
+        result.state = ModCompatibilityState::Compatible;
+        result.strength = ModCatalogueMatchStrength::Weak;
+        result.warnings.push(
+            "Xbox Media ID evidence is incomplete; Title ID provides only weaker compatibility"
+                .into(),
+        );
+        result
+            .reasons
+            .push("native Media ID was not verified".into());
+        return result;
     }
     result
         .reasons

@@ -425,10 +425,10 @@ struct Candidate<'a> {
     stale: bool,
 }
 
-fn resolve_claims<'a>(
+fn resolve_claims(
     subject: &str,
     property: ClaimProperty,
-    claims: &'a [EvidenceClaim],
+    claims: &[EvidenceClaim],
 ) -> ResolutionResult {
     let mut ordered = claims
         .iter()
@@ -462,7 +462,7 @@ fn resolve_claims<'a>(
             stale: false,
         });
         candidate.rank = candidate.rank.max(rank);
-        candidate.stale |= claim_is_stale(&claim);
+        candidate.stale |= claim_is_stale(claim);
         if !candidate
             .claims
             .iter()

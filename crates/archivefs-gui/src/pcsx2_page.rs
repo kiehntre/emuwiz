@@ -1335,10 +1335,10 @@ mod tests {
             )
         });
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+            egui::CentralPanel::default().show(ctx, show_export_dialog);
         });
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+            egui::CentralPanel::default().show(ctx, show_export_dialog);
         });
         assert!(rendered_text_contains(&output, "Export refused"));
         assert!(rendered_text_contains(&output, "did not overwrite it"));
@@ -1377,10 +1377,10 @@ mod tests {
             )
         });
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+            egui::CentralPanel::default().show(ctx, show_export_dialog);
         });
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| show_export_dialog(ui));
+            egui::CentralPanel::default().show(ctx, show_export_dialog);
         });
         assert!(rendered_text_contains(&output, "File exported"));
         assert!(rendered_text_contains(&output, "Size: 0 bytes"));

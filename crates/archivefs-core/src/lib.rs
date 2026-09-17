@@ -5600,7 +5600,7 @@ impl<'a> ArchiveScanner<'a> {
                     continue;
                 }
                 if file_type.is_dir() {
-                    if excluded_roots.iter().any(|root| path == *root) {
+                    if excluded_roots.contains(&path) {
                         debug!(
                             "not descending into explicitly configured child source {}",
                             path.display()

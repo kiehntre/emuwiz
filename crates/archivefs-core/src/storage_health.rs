@@ -295,8 +295,8 @@ fn opportunity_for(
     match format {
         StorageFormatClass::Chd | StorageFormatClass::Rvz | StorageFormatClass::Wia
         | StorageFormatClass::Gcz | StorageFormatClass::Cso | StorageFormatClass::Zso
-        | StorageFormatClass::Pbp | StorageFormatClass::Archive => return (efficient(None), Vec::new()),
-        StorageFormatClass::Wbfs => return (
+        | StorageFormatClass::Pbp | StorageFormatClass::Archive => (efficient(None), Vec::new()),
+        StorageFormatClass::Wbfs => (
             StorageOpportunity {
                 kind: StorageOpportunityKind::DoNotConvert,
                 target_format: None,
@@ -310,7 +310,7 @@ fn opportunity_for(
             },
             vec![StorageWarning { code: "WBFS_PRESERVATION_REVIEW".into(), message: "WBFS handling is topology-sensitive and preservation-hostile without verified Wii evidence.".into() }],
         ),
-        StorageFormatClass::Cdi => return (
+        StorageFormatClass::Cdi => (
             StorageOpportunity {
                 kind: StorageOpportunityKind::UnsupportedFormat,
                 target_format: None,
@@ -460,13 +460,13 @@ fn metadata_for(
         } else {
             StorageObjectKind::OrdinaryFile
         };
-        return (
+        (
             kind,
             Some(metadata.len()),
             allocated,
             Some(metadata.dev()),
             Some(metadata.ino()),
-        );
+        )
     }
     #[cfg(not(unix))]
     (
@@ -483,7 +483,7 @@ pub fn analyze_storage_health(inputs: &[StorageHealthInput]) -> StorageHealthRep
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
     let mut items = Vec::with_capacity(sorted.len());
     for input in &sorted {
-        let format = format_for(&input);
+        let format = format_for(input);
         let (object_kind, observed_size, allocated, device, inode) = metadata_for(&input.path);
         let logical = input.logical_size_bytes.or(observed_size);
         let (mut opportunity, mut warnings) = opportunity_for(
@@ -656,8 +656,8 @@ mod tests {
     fn cue_multitrack_is_topology_sensitive() {
         let dir = tempdir().unwrap();
         let cue = dir.path().join("disc.cue");
-        fs::write(&dir.path().join("a.bin"), [0_u8; 4]).unwrap();
-        fs::write(&dir.path().join("b.bin"), [0_u8; 4]).unwrap();
+        fs::write(dir.path().join("a.bin"), [0_u8; 4]).unwrap();
+        fs::write(dir.path().join("b.bin"), [0_u8; 4]).unwrap();
         fs::write(&cue, "FILE \"a.bin\" BINARY\n TRACK 01 MODE1/2352\n INDEX 01 00:00:00\n FILE \"b.bin\" BINARY\n TRACK 02 AUDIO\n INDEX 01 00:00:00\n").unwrap();
         let report = analyze_storage_health(&[input(&cue, "PlayStation")]);
         assert!(report.items[0].opportunity.topology_sensitive);

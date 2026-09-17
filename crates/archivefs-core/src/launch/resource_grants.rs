@@ -125,14 +125,13 @@ impl LaunchResourceGrant {
             (LaunchPathKind::Source, self.source_path.as_ref()),
             (LaunchPathKind::Presented, self.presented_path.as_ref()),
         ] {
-            if let Some(path) = path {
-                if !path.is_absolute()
+            if let Some(path) = path
+                && (!path.is_absolute()
                     || path
                         .components()
-                        .any(|component| matches!(component, std::path::Component::ParentDir))
-                {
-                    return Err(LaunchResourceGrantError::UnsafePath(kind));
-                }
+                        .any(|component| matches!(component, std::path::Component::ParentDir)))
+            {
+                return Err(LaunchResourceGrantError::UnsafePath(kind));
             }
         }
 

@@ -451,7 +451,7 @@ pub fn apply_ps2_psu_export(
         return Err(Ps2PsuExportError::SourceChanged);
     }
     let mut temporary = create_export_temporary(&plan.destination).map_err(psu_error)?;
-    let result = (|| {
+    (|| {
         let file_count = plan.files.len();
         write_psu_entry(
             &mut temporary,
@@ -513,7 +513,7 @@ pub fn apply_ps2_psu_export(
                 "staged PSU length did not match the reviewed output size".into(),
             ));
         }
-        let output_sha256 = sha256_hex(&read_path(&temporary.path())?);
+        let output_sha256 = sha256_hex(&read_path(temporary.path())?);
         if sha256_hex(&read_source_card(&plan.source_card_path).map_err(psu_error)?)
             != plan.source_card_sha256
         {
@@ -548,8 +548,7 @@ pub fn apply_ps2_psu_export(
             source_card_sha256: plan.source_card_sha256.clone(),
             provenance: plan.provenance.clone(),
         })
-    })();
-    result
+    })()
 }
 
 fn psu_error(error: Ps2FileExportError) -> Ps2PsuExportError {
@@ -780,7 +779,7 @@ pub fn apply_ps2_file_export(
     }
 
     let mut temporary = create_export_temporary(&plan.destination)?;
-    let result = (|| {
+    (|| {
         let mut remaining = plan.declared_size_bytes as usize;
         let mut hasher = Sha256::new();
         for &cluster in &plan.chain {
@@ -833,8 +832,7 @@ pub fn apply_ps2_file_export(
             source_card_sha256: plan.source_card_sha256.clone(),
             provenance: plan.provenance.clone(),
         })
-    })();
-    result
+    })()
 }
 
 static EXPORT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1055,7 +1053,7 @@ fn inspect_ps1(path: &Path, bytes: &[u8]) -> MemoryCardInventory {
                 deleted: false,
                 warnings: entry_warnings,
             });
-        } else if matches!(kind, 0xA1 | 0xA2 | 0xA3) {
+        } else if matches!(kind, 0xA1..=0xA3) {
             entries.push(MemoryCardEntry {
                 slot: Some(slot as u32),
                 name: format!("deleted-slot-{slot}"),
@@ -1996,11 +1994,12 @@ mod tests {
         let inv = inspect_memory_card(&path).unwrap();
         let ps2 = inv.ps2_inventory.unwrap();
         let file = &ps2.save_directories[0].files[0];
-        assert!(file
-            .chain_health
-            .warnings
-            .iter()
-            .any(|warning| warning.kind == Ps2CorruptionKind::FatLoop));
+        assert!(
+            file.chain_health
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == Ps2CorruptionKind::FatLoop)
+        );
 
         let mut bytes = ps2_inventory_fixture();
         let file_entry_offset = (41 + 4) * 1024;
@@ -2008,11 +2007,12 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let inv = inspect_memory_card(&path).unwrap();
         let file = &inv.ps2_inventory.unwrap().save_directories[0].files[0];
-        assert!(file
-            .chain_health
-            .warnings
-            .iter()
-            .any(|warning| warning.kind == Ps2CorruptionKind::FileSizeExceedsChain));
+        assert!(
+            file.chain_health
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == Ps2CorruptionKind::FileSizeExceedsChain)
+        );
     }
 
     #[test]
@@ -2028,14 +2028,16 @@ mod tests {
         let inv = inspect_memory_card(&path).unwrap();
         let root = &inv.ps2_inventory.unwrap().root_entries[2];
         assert_eq!(root.raw_name, vec![0xff; PS2_NAME_BYTES]);
-        assert!(root
-            .warnings
-            .iter()
-            .any(|warning| warning.kind == Ps2CorruptionKind::InvalidFilename));
-        assert!(root
-            .warnings
-            .iter()
-            .any(|warning| warning.kind == Ps2CorruptionKind::InvalidTimestamp));
+        assert!(
+            root.warnings
+                .iter()
+                .any(|warning| warning.kind == Ps2CorruptionKind::InvalidFilename)
+        );
+        assert!(
+            root.warnings
+                .iter()
+                .any(|warning| warning.kind == Ps2CorruptionKind::InvalidTimestamp)
+        );
     }
 
     #[test]

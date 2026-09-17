@@ -694,6 +694,27 @@ fn has_casefold_sibling(parent: &Path, destination: &Path) -> bool {
         .any(|name| name == destination_name)
 }
 
+fn same_filesystem(source: &Path, destination_parent: &Path, fallback_root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(source_metadata) = std::fs::metadata(source) else {
+            return false;
+        };
+        let destination_metadata =
+            std::fs::metadata(destination_parent).or_else(|_| std::fs::metadata(fallback_root));
+        let Ok(destination_metadata) = destination_metadata else {
+            return false;
+        };
+        source_metadata.dev() == destination_metadata.dev()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (source, destination_parent, fallback_root);
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,26 +1287,5 @@ mod tests {
             Err(PublisherExecutionError::DestinationDirectoryMissing { .. })
         ));
         assert!(!destination.exists());
-    }
-}
-
-fn same_filesystem(source: &Path, destination_parent: &Path, fallback_root: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let Ok(source_metadata) = std::fs::metadata(source) else {
-            return false;
-        };
-        let destination_metadata =
-            std::fs::metadata(destination_parent).or_else(|_| std::fs::metadata(fallback_root));
-        let Ok(destination_metadata) = destination_metadata else {
-            return false;
-        };
-        source_metadata.dev() == destination_metadata.dev()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (source, destination_parent, fallback_root);
-        false
     }
 }

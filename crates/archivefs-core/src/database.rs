@@ -1709,9 +1709,10 @@ pub struct RegisteredSourceFolder {
 }
 
 /// The explicit subsystem role of a configured source folder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SourceRole {
+    #[default]
     Games,
     ArcadeRomset,
     BiosFirmware,
@@ -1777,12 +1778,6 @@ impl SourceSubsystemRoute {
             Self::None => "None",
             Self::Unknown => "Unknown",
         }
-    }
-}
-
-impl Default for SourceRole {
-    fn default() -> Self {
-        Self::Games
     }
 }
 

@@ -275,7 +275,7 @@ impl PublisherProfilePageState {
             self.execution_error = Some("The publisher preview is missing; preview again.".into());
             return;
         };
-        if PathBuf::from(self.destination_root.trim()) != plan.destination_root {
+        if *self.destination_root.trim() != plan.destination_root {
             self.execution_error = Some(
                 "Library changed since preview. Review the updated plan before applying.".into(),
             );
@@ -818,14 +818,16 @@ pub(crate) fn show_publisher_profile_page(
             }
         });
     }
-    if state.execution_transaction.is_none() {
-        if let Some(error) = &state.execution_error {
-            widgets::card(ui, |ui| {
-                ui.label(egui::RichText::new("Publishing unavailable").strong());
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
-                ui.label("Refresh the preview after correcting the issue. No destination changes were made.");
-            });
-        }
+    if state.execution_transaction.is_none()
+        && let Some(error) = &state.execution_error
+    {
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Publishing unavailable").strong());
+            ui.colored_label(egui::Color32::from_rgb(220, 80, 80), error);
+            ui.label(
+                "Refresh the preview after correcting the issue. No destination changes were made.",
+            );
+        });
     }
     if request_apply {
         state.apply();

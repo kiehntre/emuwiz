@@ -12,12 +12,12 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::archived_mod_package::{
-    inspect_archived_mod_package_for_game, ArchivedModCompatibility, ArchivedModPackageInspection,
+    ArchivedModCompatibility, ArchivedModPackageInspection, inspect_archived_mod_package_for_game,
 };
 use crate::mod_download_transport::ModDownloadResult;
 use crate::mod_package::SelectedGameForMod;
 use crate::standalone_patch::{
-    inspect_standalone_patch, match_patch_source, PatchCompatibility, StandalonePatchInspection,
+    PatchCompatibility, StandalonePatchInspection, inspect_standalone_patch, match_patch_source,
 };
 
 const SIGNATURE_BYTES: usize = 16;
@@ -119,14 +119,14 @@ pub fn inspect_downloaded_mod(
     let mut warnings = Vec::new();
     let mut blockers = Vec::new();
 
-    if let Some(declared) = request.provider_declared_format {
-        if !declared_format_matches(declared, classification) {
-            let message = format!(
-                "provider declared {declared}, but downloaded bytes classify as {classification:?}"
-            );
-            warnings.push(message.clone());
-            blockers.push("provider/byte format conflict requires review".into());
-        }
+    if let Some(declared) = request.provider_declared_format
+        && !declared_format_matches(declared, classification)
+    {
+        let message = format!(
+            "provider declared {declared}, but downloaded bytes classify as {classification:?}"
+        );
+        warnings.push(message.clone());
+        blockers.push("provider/byte format conflict requires review".into());
     }
 
     let (inspection, compatibility) = match classification {
@@ -295,6 +295,28 @@ fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+impl From<PatchCompatibility> for DownloadedModCompatibility {
+    fn from(value: PatchCompatibility) -> Self {
+        match value {
+            PatchCompatibility::Compatible => Self::Compatible,
+            PatchCompatibility::Incompatible => Self::Incompatible,
+            PatchCompatibility::ReviewRequired => Self::ReviewRequired,
+            PatchCompatibility::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<ArchivedModCompatibility> for DownloadedModCompatibility {
+    fn from(value: ArchivedModCompatibility) -> Self {
+        match value {
+            ArchivedModCompatibility::Compatible => Self::Compatible,
+            ArchivedModCompatibility::Incompatible => Self::Incompatible,
+            ArchivedModCompatibility::ReviewRequired => Self::ReviewRequired,
+            ArchivedModCompatibility::Unknown => Self::Unknown,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,27 +452,5 @@ mod tests {
         })
         .unwrap();
         assert_eq!(a, b);
-    }
-}
-
-impl From<PatchCompatibility> for DownloadedModCompatibility {
-    fn from(value: PatchCompatibility) -> Self {
-        match value {
-            PatchCompatibility::Compatible => Self::Compatible,
-            PatchCompatibility::Incompatible => Self::Incompatible,
-            PatchCompatibility::ReviewRequired => Self::ReviewRequired,
-            PatchCompatibility::Unknown => Self::Unknown,
-        }
-    }
-}
-
-impl From<ArchivedModCompatibility> for DownloadedModCompatibility {
-    fn from(value: ArchivedModCompatibility) -> Self {
-        match value {
-            ArchivedModCompatibility::Compatible => Self::Compatible,
-            ArchivedModCompatibility::Incompatible => Self::Incompatible,
-            ArchivedModCompatibility::ReviewRequired => Self::ReviewRequired,
-            ArchivedModCompatibility::Unknown => Self::Unknown,
-        }
     }
 }
