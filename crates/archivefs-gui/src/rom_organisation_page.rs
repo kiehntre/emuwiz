@@ -798,9 +798,27 @@ fn apply_playing_library_action(
     match action {
         PlayingLibraryPageAction::Preview => state.preview(),
         PlayingLibraryPageAction::SelectFamily(name) => state.select_family(name),
-        PlayingLibraryPageAction::RequestApply => state.request_apply(),
-        PlayingLibraryPageAction::CancelApply => state.cancel_apply(),
-        PlayingLibraryPageAction::ConfirmApply => state.confirm_apply(),
+        PlayingLibraryPageAction::RequestApply => match state.destination {
+            PlayingLibraryDestination::Romm => state.request_romm_apply(),
+            PlayingLibraryDestination::RetroDeck => state.request_retrodeck_apply(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                state.request_apply()
+            }
+        },
+        PlayingLibraryPageAction::CancelApply => match state.destination {
+            PlayingLibraryDestination::Romm => state.cancel_romm_apply(),
+            PlayingLibraryDestination::RetroDeck => state.cancel_retrodeck_apply(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                state.cancel_apply()
+            }
+        },
+        PlayingLibraryPageAction::ConfirmApply => match state.destination {
+            PlayingLibraryDestination::Romm => state.confirm_romm_apply(),
+            PlayingLibraryDestination::RetroDeck => state.confirm_retrodeck_apply(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                state.confirm_apply()
+            }
+        },
         PlayingLibraryPageAction::RollbackLast => state.rollback_last(),
         PlayingLibraryPageAction::SelectEsdePlatform(platform_id) => {
             state.select_esde_platform(Some(platform_id))
@@ -813,14 +831,8 @@ fn apply_playing_library_action(
         PlayingLibraryPageAction::CancelEsdeRecovery => state.cancel_esde_recovery(),
         PlayingLibraryPageAction::ConfirmEsdeRecovery => state.confirm_esde_recovery(),
         PlayingLibraryPageAction::PreviewRomm => state.preview_romm(),
-        PlayingLibraryPageAction::RequestRommApply => state.request_romm_apply(),
-        PlayingLibraryPageAction::CancelRommApply => state.cancel_romm_apply(),
-        PlayingLibraryPageAction::ConfirmRommApply => state.confirm_romm_apply(),
         PlayingLibraryPageAction::RollbackRomm => state.rollback_romm_last(),
         PlayingLibraryPageAction::PreviewRetroDeck => state.preview_retrodeck(),
-        PlayingLibraryPageAction::RequestRetroDeckApply => state.request_retrodeck_apply(),
-        PlayingLibraryPageAction::CancelRetroDeckApply => state.cancel_retrodeck_apply(),
-        PlayingLibraryPageAction::ConfirmRetroDeckApply => state.confirm_retrodeck_apply(),
         PlayingLibraryPageAction::RollbackRetroDeck => state.rollback_retrodeck(),
     }
 }

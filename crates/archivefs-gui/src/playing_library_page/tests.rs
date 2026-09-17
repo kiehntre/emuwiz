@@ -801,7 +801,7 @@ fn create_playing_library_uses_the_existing_linked_library_transaction_seam() {
     .unwrap();
     assert_eq!(on_disk.state, TransactionState::Applied);
 
-    let link = destination.join("europe.bin");
+    let link = destination.join("unknown/europe.bin");
     assert!(link.is_symlink());
     assert_eq!(std::fs::read_link(&link).unwrap(), original);
 }
@@ -832,7 +832,7 @@ fn successful_apply_creates_symlinks_only_nothing_else_under_destination() {
     state.confirm_apply();
     assert!(state.apply_error().is_none());
 
-    let entries: Vec<_> = std::fs::read_dir(&destination)
+    let entries: Vec<_> = std::fs::read_dir(destination.join("unknown"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect();
@@ -964,7 +964,7 @@ fn rollback_uses_the_existing_journal_backed_rollback_path() {
     state.request_apply();
     state.confirm_apply();
     assert!(state.apply_error().is_none());
-    let link = destination.join("europe.bin");
+    let link = destination.join("unknown/europe.bin");
     assert!(link.is_symlink());
 
     state.rollback_last();
@@ -1468,7 +1468,7 @@ mod esde {
 
         // The master ROM and its playing-library link, entirely unrelated
         // to ES-DE's own gamelist, are never touched by recovery.
-        let link = fixture.path("playing").join("europe.bin");
+        let link = fixture.path("playing").join("unknown/europe.bin");
         assert!(link.is_symlink());
         assert_eq!(
             std::fs::read(fixture.path("roms").join("europe.bin")).unwrap(),

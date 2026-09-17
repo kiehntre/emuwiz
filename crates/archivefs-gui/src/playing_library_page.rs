@@ -40,6 +40,7 @@ use archivefs_core::playing_library::{
     build_playing_library_plan, build_playing_library_transaction, build_retrodeck_projection,
     build_retrodeck_projection_transaction, build_romm_projection_transaction,
     build_romm_projection_with_visibility, match_loose_files_against_dat,
+    project_generic_playing_library, LibraryOutputProfile, LibraryOutputProjection,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -95,6 +96,7 @@ pub(crate) struct PlayingLibraryPageState {
     pub(crate) exclude_demo: bool,
     pub(crate) exclude_sample: bool,
     plan: Option<PlayingLibraryPlan>,
+    output_projection: Option<LibraryOutputProjection>,
     dat_platform_identity: Option<DatPlatformIdentity>,
     plan_generation: u64,
     error: Option<String>,
@@ -180,6 +182,7 @@ impl Default for PlayingLibraryPageState {
             exclude_demo: true,
             exclude_sample: true,
             plan: None,
+            output_projection: None,
             dat_platform_identity: None,
             plan_generation: 0,
             error: None,
@@ -326,6 +329,7 @@ impl PlayingLibraryPageState {
     pub(crate) fn set_destination(&mut self, destination: PlayingLibraryDestination) {
         self.destination = destination;
         self.plan = None;
+        self.output_projection = None;
         self.romm_projection = None;
         self.retrodeck_projection = None;
         self.romm_error = None;
@@ -403,6 +407,7 @@ impl PlayingLibraryPageState {
     /// nothing is written, moved, or created.
     pub(crate) fn preview(&mut self) {
         self.plan = None;
+        self.output_projection = None;
         self.dat_platform_identity = None;
         self.romm_projection = None;
         self.romm_error = None;
@@ -455,12 +460,38 @@ impl PlayingLibraryPageState {
 
         let request = resolved.playing_library_request(
             outcome_matches.matches,
-            destination_root,
+            destination_root.clone(),
             self.build_policy(),
         );
         match build_playing_library_plan(&request) {
             Ok(mut plan) => {
                 plan.rejected_launchers = outcome_matches.rejected_launchers;
+                if self.destination == PlayingLibraryDestination::Generic {
+                    plan = match project_generic_playing_library(
+                        &plan,
+                        self.dat_platform_identity.as_ref().expect("identity set above"),
+                        destination_root.to_path_buf(),
+                    ) {
+                        Ok(projected) => projected,
+                        Err(error) => {
+                            self.error = Some(error);
+                            return;
+                        }
+                    };
+                    self.output_projection = Some(LibraryOutputProjection::from_plan(
+                        LibraryOutputProfile::Generic,
+                        destination_root.to_path_buf(),
+                        &plan,
+                        generic_mapping_explanation(self.dat_platform_identity.as_ref()),
+                    ));
+                } else if self.destination == PlayingLibraryDestination::EsDe {
+                    self.output_projection = Some(LibraryOutputProjection::from_plan(
+                        LibraryOutputProfile::EsDe,
+                        destination_root,
+                        &plan,
+                        Vec::new(),
+                    ));
+                }
                 self.plan = Some(plan);
             }
             Err(error) => self.error = Some(error),
@@ -500,6 +531,25 @@ impl PlayingLibraryPageState {
         match build_playing_library_plan(&request) {
             Ok(mut plan) => {
                 plan.rejected_launchers = outcome_matches.rejected_launchers;
+                if self.destination == PlayingLibraryDestination::Generic {
+                    plan = match project_generic_playing_library(
+                        &plan,
+                        self.dat_platform_identity.as_ref().expect("identity set above"),
+                        destination_root.to_path_buf(),
+                    ) {
+                        Ok(projected) => projected,
+                        Err(error) => {
+                            self.error = Some(error);
+                            return;
+                        }
+                    };
+                    self.output_projection = Some(LibraryOutputProjection::from_plan(
+                        LibraryOutputProfile::Generic,
+                        destination_root.to_path_buf(),
+                        &plan,
+                        generic_mapping_explanation(self.dat_platform_identity.as_ref()),
+                    ));
+                }
                 self.plan = Some(plan);
             }
             Err(error) => self.error = Some(error),
@@ -547,7 +597,15 @@ impl PlayingLibraryPageState {
             PathBuf::from(self.destination_root_draft.trim()),
             visibility,
         ) {
-            Ok(projection) => self.romm_projection = Some(projection),
+            Ok(projection) => {
+                self.output_projection = Some(LibraryOutputProjection::from_plan(
+                    LibraryOutputProfile::Romm,
+                    projection.destination_root.clone(),
+                    &projection.playing_library_plan,
+                    Vec::new(),
+                ));
+                self.romm_projection = Some(projection);
+            }
             Err(error) => self.romm_error = Some(error),
         }
     }
@@ -596,7 +654,15 @@ impl PlayingLibraryPageState {
             return;
         };
         match build_retrodeck_projection(plan, identity, destination, visibility, &profile) {
-            Ok(projection) => self.retrodeck_projection = Some(projection),
+            Ok(projection) => {
+                self.output_projection = Some(LibraryOutputProjection::from_plan(
+                    LibraryOutputProfile::RetroDeck,
+                    projection.destination_root.clone(),
+                    &projection.playing_library_plan,
+                    Vec::new(),
+                ));
+                self.retrodeck_projection = Some(projection);
+            }
             Err(error) => self.retrodeck_error = Some(error),
         }
     }
@@ -1190,14 +1256,8 @@ pub(crate) enum PlayingLibraryPageAction {
     CancelEsdeRecovery,
     ConfirmEsdeRecovery,
     PreviewRomm,
-    RequestRommApply,
-    CancelRommApply,
-    ConfirmRommApply,
     RollbackRomm,
     PreviewRetroDeck,
-    RequestRetroDeckApply,
-    CancelRetroDeckApply,
-    ConfirmRetroDeckApply,
     RollbackRetroDeck,
 }
 
@@ -1416,10 +1476,13 @@ pub(crate) fn show_playing_library_page(
         );
     }
 
-    if let Some(plan) = state.plan() {
+    if let Some(plan) = state.plan().cloned() {
         ui.add_space(10.0);
         widgets::section_header(ui, "Apply", Some("Review the plan before creating links."));
-        show_preview_summary(ui, plan, state, &mut action);
+        if let Some(projection) = state.output_projection.clone() {
+            show_output_projection_summary(ui, &projection, state, &mut action);
+        }
+        show_preview_summary(ui, &plan, state, &mut action);
         ui.add_space(10.0);
         if matches!(state.destination, PlayingLibraryDestination::Romm) {
             show_romm_projection_summary(ui, state, &mut action);
@@ -1475,6 +1538,171 @@ pub(crate) fn show_playing_library_page(
     }
 
     action
+}
+
+/// Presents every output profile through one read-only summary model. The
+/// profile-specific cards below remain only for visibility acknowledgements,
+/// ES-DE publication, and rollback details that have no common equivalent.
+fn show_output_projection_summary(
+    ui: &mut egui::Ui,
+    projection: &LibraryOutputProjection,
+    state: &mut PlayingLibraryPageState,
+    action: &mut Option<PlayingLibraryPageAction>,
+) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(ui, "Output profile preview", None);
+        ui.label(format!("Profile: {}", projection.profile.label()));
+        ui.label(format!("Destination: {}", projection.destination_root.display()));
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("{} planned link(s)", projection.operation_count),
+                widgets::StatusTone::Info,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{} directory(ies)", projection.planned_directories.len()),
+                widgets::StatusTone::Info,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{} already correct", projection.already_correct),
+                widgets::StatusTone::Success,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{} conflict(s)", projection.conflicts.len()),
+                if projection.conflicts.is_empty() {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+        });
+        if !projection.unresolved_mappings.is_empty() {
+            ui.label(
+                egui::RichText::new("Some platform mappings need review.")
+                    .color(theme::WARNING),
+            );
+            for mapping in &projection.unresolved_mappings {
+                ui.label(format!("- {mapping}"));
+            }
+        }
+        if projection.stale_owned_entries.is_empty() {
+            ui.label("Stale owned entries: none reported by this preview.");
+        } else {
+            ui.label(format!(
+                "Stale owned entries: {} (explicit cleanup required)",
+                projection.stale_owned_entries.len()
+            ));
+        }
+        match projection.profile {
+            LibraryOutputProfile::Generic => {
+                ui.label("Layout: <destination>/<platform>/<game file>");
+            }
+            LibraryOutputProfile::Romm => {
+                if let Some(romm) = &state.romm_projection {
+                    ui.label(format!("RomM platform slug: {}", romm.romm_platform_slug));
+                }
+            }
+            LibraryOutputProfile::EsDe => {
+                ui.label("ES-DE system metadata remains an explicit publication step.");
+            }
+            LibraryOutputProfile::RetroDeck => {
+                if let Some(retrodeck) = &state.retrodeck_projection {
+                    ui.label(format!("RetroDECK ROM directory: {}", retrodeck.es_de_system));
+                }
+            }
+        }
+        if projection.sample_paths.is_empty() {
+            ui.label("Sample output paths: none");
+        } else {
+            widgets::technical_details(ui, "playing_library_output_sample_paths", |ui| {
+                for path in &projection.sample_paths {
+                    ui.label(path.display().to_string());
+                }
+            });
+        }
+        let pending = match projection.profile {
+            LibraryOutputProfile::Romm => state.romm_pending_apply,
+            LibraryOutputProfile::RetroDeck => state.retrodeck_pending_apply,
+            LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => {
+                state.pending_apply.is_some()
+            }
+        };
+        let applied = match projection.profile {
+            LibraryOutputProfile::Romm => state.romm_applied.is_some(),
+            LibraryOutputProfile::RetroDeck => state.retrodeck_applied.is_some(),
+            LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => {
+                state.applied.is_some()
+            }
+        };
+        if !pending && !applied && projection.operation_count > 0 && projection.conflicts.is_empty()
+        {
+            let visibility_ok = match projection.profile {
+                LibraryOutputProfile::Romm => state
+                    .romm_projection
+                    .as_ref()
+                    .is_some_and(|value| value.visibility.is_verified()),
+                LibraryOutputProfile::RetroDeck => state
+                    .retrodeck_projection
+                    .as_ref()
+                    .is_some_and(|value| value.visibility.is_verified()),
+                LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => true,
+            };
+            if widgets::action_button(
+                ui,
+                "Apply output profile",
+                widgets::ActionStyle::Primary,
+                visibility_ok,
+            )
+            .clicked()
+            {
+                *action = Some(PlayingLibraryPageAction::RequestApply);
+            }
+            if !visibility_ok {
+                ui.label(
+                    egui::RichText::new(
+                        "Apply is blocked until the profile's source visibility is explicitly verified.",
+                    )
+                    .color(theme::WARNING),
+                );
+            }
+        }
+        if pending {
+            let count = projection.operation_count;
+            if count > TYPED_CONFIRMATION_THRESHOLD {
+                let confirmation = match projection.profile {
+                    LibraryOutputProfile::Romm => &mut state.romm_confirm_text,
+                    LibraryOutputProfile::RetroDeck => &mut state.retrodeck_confirm_text,
+                    LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => {
+                        &mut state.confirm_text
+                    }
+                };
+                ui.label(format!(
+                    "Type \"{}\" to confirm:",
+                    playing_library_confirmation_phrase(count)
+                ));
+                ui.add(
+                    egui::TextEdit::singleline(confirmation)
+                        .desired_width(260.0)
+                        .hint_text(playing_library_confirmation_phrase(count)),
+                );
+            }
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(ui, "Confirm", widgets::ActionStyle::Destructive, true)
+                    .clicked()
+                {
+                    *action = Some(PlayingLibraryPageAction::ConfirmApply);
+                }
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                    .clicked()
+                {
+                    *action = Some(PlayingLibraryPageAction::CancelApply);
+                }
+            });
+        }
+    });
 }
 
 fn show_romm_projection_summary(
@@ -1573,48 +1801,6 @@ fn show_romm_projection_summary(
                 _ => {
                     ui.label("Link targets: no verified host/container mapping");
                 }
-            }
-            if !state.romm_pending_apply
-                && state.romm_applied.is_none()
-                && widgets::action_button(
-                    ui,
-                    "Create RomM Library",
-                    widgets::ActionStyle::Primary,
-                    projection.visibility.is_verified(),
-                )
-                .clicked()
-            {
-                *action = Some(PlayingLibraryPageAction::RequestRommApply);
-            }
-            if state.romm_pending_apply {
-                if projection.total_files > TYPED_CONFIRMATION_THRESHOLD {
-                    ui.label(format!(
-                        "Type \"{}\" to confirm:",
-                        playing_library_confirmation_phrase(projection.total_files)
-                    ));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.romm_confirm_text)
-                            .desired_width(260.0)
-                            .hint_text(playing_library_confirmation_phrase(projection.total_files)),
-                    );
-                }
-                ui.horizontal(|ui| {
-                    if widgets::action_button(
-                        ui,
-                        "Confirm",
-                        widgets::ActionStyle::Destructive,
-                        true,
-                    )
-                    .clicked()
-                    {
-                        *action = Some(PlayingLibraryPageAction::ConfirmRommApply);
-                    }
-                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
-                        .clicked()
-                    {
-                        *action = Some(PlayingLibraryPageAction::CancelRommApply);
-                    }
-                });
             }
             if let Some(transaction) = &state.romm_applied {
                 if transaction.state == TransactionState::RolledBack {
@@ -1734,39 +1920,6 @@ fn show_retrodeck_projection_summary(
             if !projection.visibility.is_verified() {
                 ui.label(egui::RichText::new("Apply is blocked until source and destination visibility is explicitly verified.").color(theme::WARNING));
             }
-            if !state.retrodeck_pending_apply
-                && state.retrodeck_applied.is_none()
-                && widgets::action_button(
-                    ui,
-                    "Create RetroDECK Library",
-                    widgets::ActionStyle::Primary,
-                    projection.visibility.is_verified(),
-                )
-                .clicked()
-            {
-                *action = Some(PlayingLibraryPageAction::RequestRetroDeckApply);
-            }
-            if state.retrodeck_pending_apply {
-                if projection.total_files > TYPED_CONFIRMATION_THRESHOLD {
-                    ui.label(format!(
-                        "Type \"{}\" to confirm:",
-                        playing_library_confirmation_phrase(projection.total_files)
-                    ));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.retrodeck_confirm_text)
-                            .desired_width(260.0),
-                    );
-                }
-                if widgets::action_button(ui, "Confirm", widgets::ActionStyle::Destructive, true)
-                    .clicked()
-                {
-                    *action = Some(PlayingLibraryPageAction::ConfirmRetroDeckApply);
-                }
-                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
-                {
-                    *action = Some(PlayingLibraryPageAction::CancelRetroDeckApply);
-                }
-            }
             if let Some(transaction) = &state.retrodeck_applied {
                 if transaction.state == TransactionState::RolledBack {
                     ui.label(
@@ -1846,6 +1999,25 @@ fn evidence_summary_line(evidence: &CandidateEvidenceSummary) -> String {
     format!("region: {region} - language: {language} - revision: {revision} - {relationship}")
 }
 
+fn generic_mapping_explanation(identity: Option<&DatPlatformIdentity>) -> Vec<String> {
+    match identity {
+        Some(DatPlatformIdentity::Resolved {
+            confidence: archivefs_core::dat::identity::DatPlatformConfidence::Strong,
+            ..
+        }) => Vec::new(),
+        Some(DatPlatformIdentity::Resolved { .. }) => {
+            vec!["platform evidence is not strong; using the explicit `unknown` folder".into()]
+        }
+        Some(DatPlatformIdentity::Unknown) => {
+            vec!["no platform identity was established; using the explicit `unknown` folder".into()]
+        }
+        Some(DatPlatformIdentity::Ambiguous { .. }) => {
+            vec!["platform identity is ambiguous; using the explicit `unknown` folder".into()]
+        }
+        None => vec!["platform identity was not available; using the explicit `unknown` folder".into()],
+    }
+}
+
 fn path_looks_missing(draft: &str, must_be_dir: bool) -> bool {
     let trimmed = draft.trim();
     if trimmed.is_empty() {
@@ -1918,15 +2090,6 @@ fn show_preview_summary(
                 )
                 .color(theme::WARNING),
             );
-        } else if widgets::action_button(
-            ui,
-            "Create Playing Library",
-            widgets::ActionStyle::Primary,
-            true,
-        )
-        .clicked()
-        {
-            *action = Some(PlayingLibraryPageAction::RequestApply);
         }
 
         if !plan.unresolved_groups.is_empty() {
@@ -2000,29 +2163,6 @@ fn show_preview_summary(
         }
     });
 
-    if let Some(count) = state.pending_apply {
-        widgets::card(ui, |ui| {
-            ui.label(format!("Create {count} link(s)?"));
-            if count > TYPED_CONFIRMATION_THRESHOLD {
-                ui.label(format!(
-                    "Type \"{}\" to confirm:",
-                    playing_library_confirmation_phrase(count)
-                ));
-                ui.label(egui::RichText::new(&state.confirm_text).monospace());
-            }
-            ui.horizontal_wrapped(|ui| {
-                if widgets::action_button(ui, "Confirm", widgets::ActionStyle::Destructive, true)
-                    .clicked()
-                {
-                    *action = Some(PlayingLibraryPageAction::ConfirmApply);
-                }
-                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked()
-                {
-                    *action = Some(PlayingLibraryPageAction::CancelApply);
-                }
-            });
-        });
-    }
 }
 
 /// The "Publish to ES-DE" section: choose a platform, preview, confirm,

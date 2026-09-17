@@ -27,6 +27,7 @@ pub mod apply_adapter;
 pub mod evidence;
 pub mod matching;
 pub mod model;
+pub mod output_profile;
 pub mod retrodeck_projection;
 pub mod romm_library_plan;
 pub mod romm_projection;
@@ -46,6 +47,9 @@ pub use model::{
     ElectedGame, ElectionExplanation, ExcludedCandidate, LinkedLibraryOperation,
     PlayingLibraryCandidate, PlayingLibraryPlan, PlayingLibraryPolicy, PlayingLibraryPolicyMode,
     RejectedCandidate, RejectedLauncher, ReleaseClass, RevisionNumber, UnresolvedGroup,
+};
+pub use output_profile::{
+    LibraryOutputProfile, LibraryOutputProjection, project_generic_playing_library,
 };
 pub use retrodeck_projection::{
     RetroDeckProjectedGame, RetroDeckProjectionPlan, RetroDeckVisibility,
