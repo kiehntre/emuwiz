@@ -480,10 +480,10 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
     let source = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
     let target = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
     let meta = read_var(patch, &mut p).map_err(|e| StandalonePatchError::Malformed(e.into()))?;
-    if source != base.len() as u64
-        || target > MAX_APPLY_BYTES
-        || meta as usize > end.saturating_sub(p)
-    {
+    let Some(remaining) = end.checked_sub(p) else {
+        return Err(StandalonePatchError::Malformed("BPS truncated".into()));
+    };
+    if source != base.len() as u64 || target > MAX_APPLY_BYTES || meta > remaining as u64 {
         return Err(StandalonePatchError::Malformed("BPS size mismatch".into()));
     }
     p += meta as usize;
@@ -498,7 +498,7 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
             as usize;
         match a & 3 {
             0 => {
-                if out.len() + n > base.len() {
+                if out.len().checked_add(n).is_none_or(|e| e > base.len()) {
                     return Err(StandalonePatchError::Malformed(
                         "BPS source read out of bounds".into(),
                     ));
@@ -506,7 +506,7 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
                 out.extend_from_slice(&base[out.len()..out.len() + n]);
             }
             1 => {
-                if p + n > end {
+                if p.checked_add(n).is_none_or(|next| next > end) {
                     return Err(StandalonePatchError::Malformed(
                         "BPS target read truncated".into(),
                     ));
@@ -535,6 +535,12 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
                     ));
                 }
                 out.extend_from_slice(&base[at..at + n]);
+                // The spec reads `source[sourceRelativeOffset++]` per byte,
+                // so the pointer ends `n` further on and the next record's
+                // delta is relative to there.
+                sr = sr.checked_add(n as i64).ok_or_else(|| {
+                    StandalonePatchError::Malformed("BPS source offset overflow".into())
+                })?;
             }
             3 => {
                 let v = read_var(patch, &mut p)
@@ -562,6 +568,10 @@ fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
                     })?;
                     out.push(x)
                 }
+                // As for SourceCopy: `target[targetRelativeOffset++]`.
+                tr = tr.checked_add(n as i64).ok_or_else(|| {
+                    StandalonePatchError::Malformed("BPS target offset overflow".into())
+                })?;
             }
             _ => unreachable!(),
         }
@@ -760,23 +770,41 @@ fn parse_ips(b: &[u8]) -> (PatchInspectionState, Fields) {
     invalid(StandalonePatchFormat::Ips, "missing IPS EOF")
 }
 
+/// The BPS/UPS variable-width integer.
+///
+/// Both formats use the same encoding, and it is not plain LEB128: the
+/// *last* byte is the one with bit 7 **set**, and every continuation adds the
+/// running multiplier back in, which is what makes the encoding bijective
+/// (`encode` decrements before emitting the next septet). Decoding it as
+/// LEB128 - stopping on a clear bit 7 and omitting the bias - silently reads
+/// the wrong value and the wrong number of bytes, which is how a well-formed
+/// patch could walk the cursor past the footer.
+///
+/// Patch files are untrusted input, so every step is checked and a malformed
+/// integer is an error rather than a wrap or a panic. Ten septets cover the
+/// whole u64 range.
 fn read_var(b: &[u8], p: &mut usize) -> Result<u64, &'static str> {
     let mut value = 0u64;
-    let mut shift = 0;
+    let mut multiplier = 1u64;
     for _ in 0..10 {
         let x = *b.get(*p).ok_or("truncated variable integer")?;
         *p += 1;
         value = value
             .checked_add(
-                ((x & 0x7f) as u64)
-                    .checked_shl(shift)
+                u64::from(x & 0x7f)
+                    .checked_mul(multiplier)
                     .ok_or("variable integer overflow")?,
             )
             .ok_or("variable integer overflow")?;
-        if x & 0x80 == 0 {
+        if x & 0x80 != 0 {
             return Ok(value);
-        };
-        shift += 7;
+        }
+        multiplier = multiplier
+            .checked_mul(0x80)
+            .ok_or("variable integer overflow")?;
+        value = value
+            .checked_add(multiplier)
+            .ok_or("variable integer overflow")?;
     }
     Err("variable integer too long")
 }
@@ -800,19 +828,23 @@ fn parse_bps(b: &[u8]) -> (PatchInspectionState, Fields) {
         Ok(v) => v,
         Err(e) => return invalid(StandalonePatchFormat::Bps, e),
     };
-    if target > MAX_DECLARED_OUTPUT_BYTES
-        || meta as usize > MAX_METADATA_BYTES
-        || meta as usize > end.saturating_sub(p)
-    {
+    // The three header integers can themselves run into or past the 12-byte
+    // footer on a malformed file, so establish how much room is actually
+    // left before any of it is used as a length.
+    let Some(remaining) = end.checked_sub(p) else {
+        return invalid(StandalonePatchFormat::Bps, "truncated BPS header");
+    };
+    if target > MAX_DECLARED_OUTPUT_BYTES || meta > MAX_METADATA_BYTES as u64 {
         return invalid(StandalonePatchFormat::Bps, "invalid size or metadata");
     }
-    if end - p < meta as usize {
+    if meta > remaining as u64 {
         return invalid(StandalonePatchFormat::Bps, "truncated metadata");
     }
-    if meta > 0 {
-        f.metadata = Some(String::from_utf8_lossy(&b[p..p + meta as usize]).into_owned());
+    let meta_len = meta as usize;
+    if meta_len > 0 {
+        f.metadata = Some(String::from_utf8_lossy(&b[p..p + meta_len]).into_owned());
     }
-    p += meta as usize;
+    p += meta_len;
     let mut output = 0u64;
     let mut records = 0;
     while p < end {
@@ -827,10 +859,13 @@ fn parse_bps(b: &[u8]) -> (PatchInspectionState, Fields) {
         match a & 3 {
             0 => {}
             1 => {
-                if p.checked_add(len as usize).is_none() || p + len as usize > end {
+                let Ok(len) = usize::try_from(len) else {
+                    return invalid(StandalonePatchFormat::Bps, "truncated target data");
+                };
+                if p.checked_add(len).is_none_or(|next| next > end) {
                     return invalid(StandalonePatchFormat::Bps, "truncated target data");
                 }
-                p += len as usize;
+                p += len;
             }
             2 | 3 => {
                 if read_var(b, &mut p).is_err() {
@@ -839,7 +874,10 @@ fn parse_bps(b: &[u8]) -> (PatchInspectionState, Fields) {
             }
             _ => unreachable!(),
         }
-        output += len;
+        let Some(next_output) = output.checked_add(len) else {
+            return invalid(StandalonePatchFormat::Bps, "operations exceed target size");
+        };
+        output = next_output;
         records += 1;
         if records > MAX_RECORDS {
             return invalid(StandalonePatchFormat::Bps, "too many records");
@@ -961,6 +999,9 @@ fn crc32(b: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use std::io::Write;
+    /// The reference BPS/UPS encoder from the format specification: septets
+    /// little-endian, bit 7 set on the *last* byte, and one subtracted before
+    /// each continuation. `read_var` is its exact inverse.
     fn var(mut n: u64) -> Vec<u8> {
         let mut o = Vec::new();
         loop {
@@ -995,8 +1036,131 @@ mod tests {
         (d, p)
     }
     #[test]
+    fn variable_width_integers_round_trip_the_reference_encoding() {
+        // The regression this pins: `read_var` used to decode these as
+        // LEB128 - terminating on a *clear* bit 7 and without the
+        // continuation bias - so it returned wrong values and consumed the
+        // wrong number of bytes for everything above 0.
+        for value in [
+            0u64,
+            1,
+            2,
+            126,
+            127,
+            128,
+            129,
+            255,
+            256,
+            16_383,
+            16_384,
+            1 << 20,
+            1 << 32,
+            u32::MAX as u64,
+        ] {
+            let encoded = var(value);
+            let mut cursor = 0usize;
+            assert_eq!(
+                read_var(&encoded, &mut cursor),
+                Ok(value),
+                "decoding {value} from {encoded:02x?}"
+            );
+            assert_eq!(cursor, encoded.len(), "cursor after decoding {value}");
+        }
+    }
+
+    #[test]
+    fn a_target_read_action_consumes_its_payload_byte() {
+        // The other minimal encoding: action word 1 is a TargetRead of one
+        // byte, which takes its output from the patch stream itself.
+        let mut body = var(1);
+        body.push(0x5a);
+        let (_d, p) = temp_file("x.bps", &bps(1, 1, &body));
+        let i = inspect_standalone_patch(p).unwrap();
+        assert_eq!(i.state, PatchInspectionState::Valid);
+        assert_eq!(i.target_size, Some(1));
+    }
+
+    #[test]
+    fn malformed_bps_never_panics_and_is_reported_invalid() {
+        // Each of these used to reach unchecked arithmetic once the header
+        // integers pushed the cursor past the 12-byte footer.
+        let cases: Vec<Vec<u8>> = vec![
+            // A TargetRead whose payload byte is missing.
+            bps(1, 1, &var(1)),
+            // Header integers that run into the footer: three continuation
+            // bytes with no terminator before the trailer.
+            {
+                let mut b = b"BPS1".to_vec();
+                b.extend([0x00, 0x00, 0x00, 0x00]);
+                b.extend([0u8; 12]);
+                b
+            },
+            // Metadata longer than the bytes that remain.
+            {
+                let mut b = b"BPS1".to_vec();
+                b.extend(var(1));
+                b.extend(var(1));
+                b.extend(var(64));
+                b.extend([0u8; 12]);
+                b
+            },
+            // Exactly the 16-byte minimum, all zeroes.
+            vec![0x42, 0x50, 0x53, 0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        for (index, bytes) in cases.into_iter().enumerate() {
+            let (_d, path) = temp_file("x.bps", &bytes);
+            let inspected = inspect_standalone_patch(path).unwrap();
+            assert_eq!(
+                inspected.state,
+                PatchInspectionState::Invalid,
+                "case {index} should be rejected, not accepted"
+            );
+        }
+    }
+
+    /// Builds a BPS action word: mode in the low two bits, `length - 1`
+    /// above them, exactly as the format specifies.
+    fn action(mode: u64, length: u64) -> Vec<u8> {
+        var(((length - 1) << 2) | mode)
+    }
+
+    #[test]
+    fn source_copy_advances_its_relative_offset_between_records() {
+        // Two consecutive SourceCopy records, each with a relative offset
+        // delta of zero. The spec advances the source pointer by the copied
+        // length, so the second record must continue where the first
+        // stopped; a pointer that never advances would copy the first two
+        // bytes twice.
+        let base = [1u8, 2, 3, 4];
+        let mut body = action(2, 2);
+        body.extend(var(0));
+        body.extend(action(2, 2));
+        body.extend(var(0));
+        let patch = bps(base.len() as u64, base.len() as u64, &body);
+        assert_eq!(apply_bps(&base, &patch).unwrap(), base);
+    }
+
+    #[test]
+    fn target_copy_advances_its_relative_offset_between_records() {
+        // Same rule for TargetCopy, reading from the output built so far.
+        // Two records with a zero delta each: the second must continue from
+        // where the first stopped, so the tail repeats the whole base rather
+        // than its first two bytes twice.
+        let base = [1u8, 2, 3, 4];
+        let mut body = action(0, 4);
+        body.extend(action(3, 2));
+        body.extend(var(0));
+        body.extend(action(3, 2));
+        body.extend(var(0));
+        let patch = bps(base.len() as u64, 8, &body);
+        assert_eq!(apply_bps(&base, &patch).unwrap(), [1, 2, 3, 4, 1, 2, 3, 4]);
+    }
+
+    #[test]
     fn valid_bps_and_hash() {
-        let body = var(1);
+        // Action word 0: SourceRead, length (0 >> 2) + 1 = 1, no payload -
+        // exactly the one output byte the declared target size calls for.
+        let body = var(0);
         let (_d, p) = temp_file("x.bps", &bps(1, 1, &body));
         let i = inspect_standalone_patch(p).unwrap();
         assert_eq!(i.format, StandalonePatchFormat::Bps);
@@ -1029,7 +1193,7 @@ mod tests {
     }
     #[test]
     fn plan_is_safe_and_deterministic() {
-        let body = var(1);
+        let body = var(0);
         let (_d, p) = temp_file("x.bps", &bps(1, 1, &body));
         let i = inspect_standalone_patch(&p).unwrap();
         let root = p.parent().unwrap();
