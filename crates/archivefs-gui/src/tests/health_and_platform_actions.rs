@@ -2682,6 +2682,7 @@ fn render_show_loaded_data_for_test(
     let mut library_source_filter = None;
     let mut library_column_widths = LibraryColumnWidths::default();
 
+    let merged_rows = build_display_rows(&data.records, &data.rows, None);
     let input = egui::RawInput {
         screen_rect: viewport_size.map(|size| egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
         ..egui::RawInput::default()
@@ -2692,6 +2693,7 @@ fn render_show_loaded_data_for_test(
                 ui,
                 data,
                 LoadedViewState {
+                    merged_rows: &merged_rows,
                     filter: &mut filter,
                     filtered_rows: &mut filtered_rows,
                     selected_archive: &mut selected_archive,
@@ -2866,12 +2868,14 @@ fn recently_found_tab_keeps_its_content_inside_the_library_shell() {
     let mut selected_archives = HashSet::new();
     let mut select_all_visible_requested = false;
 
+    let merged_rows = build_display_rows(&data.records, &data.rows, None);
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let _ = show_loaded_data(
                 ui,
                 &data,
                 LoadedViewState {
+                    merged_rows: &merged_rows,
                     filter: &mut filter,
                     filtered_rows: &mut filtered_rows,
                     selected_archive: &mut selected_archive,

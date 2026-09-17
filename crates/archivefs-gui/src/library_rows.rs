@@ -18,7 +18,10 @@ use archivefs_core::{
 };
 use eframe::egui;
 
-use crate::{CachedLibrarySnapshot, persisted_archive_has_unknown_platform};
+use crate::{
+    CachedLibrarySnapshot, DatabaseGeneration, RefreshGeneration,
+    persisted_archive_has_unknown_platform,
+};
 
 pub(crate) struct LoadedData {
     pub(crate) mount_root: PathBuf,
@@ -399,4 +402,79 @@ pub(crate) fn matching_row_indices(rows: &[ArchiveRow], filter: &str) -> Option<
             .filter_map(|(index, row)| row.matches(&normalized_filter).then_some(index))
             .collect(),
     )
+}
+
+/// Identifies the exact inputs [`build_display_rows`] reads, so the
+/// merged projection can be reused across frames instead of rebuilt for
+/// every repaint of the Library / Recently Found / Home renderer.
+///
+/// Pointer identity plus generations, following the precedent
+/// `HealthReportCacheKey` already sets in this crate. `LoadedData` and
+/// `CachedLibrarySnapshot` are only ever *replaced* wholesale
+/// (`live_library_controller::poll_load` and
+/// `database_load::poll_database_load` both assign a freshly boxed
+/// value; nothing mutates either in place), so a pointer change is a
+/// reliable "this was reloaded" signal. The generations are carried as
+/// well because a new box can land on the address the previous one just
+/// freed: every reload that could do that bumps `refresh_generation`,
+/// `snapshot_generation` or `database_generation` first, so the pair can
+/// never both repeat.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MergedDisplayRowsKey {
+    pub(crate) live_data_ptr: usize,
+    pub(crate) database_snapshot_ptr: Option<usize>,
+    pub(crate) refresh_generation: RefreshGeneration,
+    pub(crate) snapshot_generation: Option<RefreshGeneration>,
+    pub(crate) database_generation: DatabaseGeneration,
+}
+
+/// The merged live+cache row list [`build_display_rows`] produced for
+/// [`MergedDisplayRowsKey`].
+pub(crate) struct MergedDisplayRowsCache {
+    key: MergedDisplayRowsKey,
+    rows: Vec<ArchiveRow>,
+}
+
+impl MergedDisplayRowsCache {
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> &[ArchiveRow] {
+        &self.rows
+    }
+}
+
+/// Returns the merged display rows for `key`, rebuilding them only when
+/// the live snapshot or the database snapshot has actually been replaced
+/// since the last call.
+///
+/// Filters, sorting and selection are deliberately *not* part of the key:
+/// they are applied downstream, per frame, to the indices this list is
+/// addressed by (`matching_row_indices`, `LibraryRowFilters::matches`,
+/// `sort_visible_indices`), so a filter or sort change still takes effect
+/// on the very next frame without invalidating anything here.
+///
+/// One consequence is deliberate: the `path_exists` probe
+/// `ArchiveRow::from_cached` uses to tell `CachedUnavailable` from
+/// `CachedAwaitingValidation` is now sampled once per reload rather than
+/// once per repaint. Both are "the live scan has not confirmed this file"
+/// states - the authoritative missing flag comes from the database's
+/// `last_verified_missing_at`, not from this probe - and the live rows
+/// beside them are already a snapshot, so sampling it with them makes the
+/// page internally consistent instead of mixing two freshnesses.
+pub(crate) fn cached_display_rows<'cache>(
+    cache: &'cache mut Option<MergedDisplayRowsCache>,
+    key: MergedDisplayRowsKey,
+    records: &[ArchiveRecord],
+    live_rows: &[ArchiveRow],
+    cached: Option<&CachedLibrarySnapshot>,
+) -> &'cache [ArchiveRow] {
+    if !cache.as_ref().is_some_and(|entry| entry.key == key) {
+        *cache = Some(MergedDisplayRowsCache {
+            key,
+            rows: build_display_rows(records, live_rows, cached),
+        });
+    }
+    &cache
+        .as_ref()
+        .expect("the cache was just populated for this key")
+        .rows
 }

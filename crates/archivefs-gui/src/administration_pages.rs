@@ -4167,6 +4167,11 @@ pub(super) fn show_health_dashboard_panel(
 }
 
 pub(super) struct LoadedViewState<'a> {
+    /// The merged live+cache display rows for this frame, produced by
+    /// `cached_display_rows` so the page never rebuilds the projection
+    /// per repaint. Addressed by index by `filtered_rows` and by the
+    /// visible-index list the page derives from it.
+    pub(super) merged_rows: &'a [ArchiveRow],
     pub(super) filter: &'a mut String,
     pub(super) filtered_rows: &'a mut Option<Vec<usize>>,
     pub(super) selected_archive: &'a mut Option<PathBuf>,

@@ -1971,6 +1971,7 @@ impl RealLoadedDataHarness {
         let mut select_all_visible_requested = false;
         let mut library_source_filter = None;
 
+        let merged_rows = build_display_rows(&data.records, &data.rows, self.cached.as_ref());
         let mut panel_height = 0.0;
         self.requested_action = None;
         let output = ctx.run(input, |ctx| {
@@ -1979,6 +1980,7 @@ impl RealLoadedDataHarness {
                     ui,
                     data,
                     LoadedViewState {
+                        merged_rows: &merged_rows,
                         filter: &mut self.filter,
                         filtered_rows: &mut self.filtered_rows,
                         selected_archive: &mut self.archive_context.focused,

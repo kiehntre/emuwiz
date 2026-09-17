@@ -1207,6 +1207,7 @@ fn existing_global_unmount_all_confirmation_wording_is_unchanged() {
         ],
     );
 
+    let merged_rows = build_display_rows(&data.records, &data.rows, None);
     let ctx = egui::Context::default();
     let mut render = |ctx: &egui::Context| {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1214,6 +1215,7 @@ fn existing_global_unmount_all_confirmation_wording_is_unchanged() {
                 ui,
                 &data,
                 LoadedViewState {
+                    merged_rows: &merged_rows,
                     filter: &mut filter,
                     filtered_rows: &mut filtered_rows,
                     selected_archive: &mut selected_archive,

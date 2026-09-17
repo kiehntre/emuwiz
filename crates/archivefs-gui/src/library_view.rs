@@ -19,6 +19,7 @@ pub(crate) fn show_loaded_data(
     view_state: LoadedViewState<'_>,
 ) -> Option<AppOperationRequest> {
     let LoadedViewState {
+        merged_rows,
         filter,
         filtered_rows,
         selected_archive,
@@ -233,17 +234,15 @@ pub(crate) fn show_loaded_data(
         });
     }
 
-    // Merged rows are rebuilt fresh every frame (cheap for realistic
-    // library sizes, and always exactly consistent with the current
-    // self.state/self.database_state - see build_display_rows). Only the
-    // *cached* filtered_rows index list is invalidated on the discrete
-    // events that actually change this merge (poll_load, poll_database_load),
-    // not every frame - see ArchiveFsApp::poll_load/poll_database_load.
-    // Hoisted above every other use (including the "Selected archive"
-    // panel, which renders higher up the page than the library table
-    // itself) so the Source filter/owning-source display and the table
-    // below always agree on exactly one merged row list.
-    let merged_rows = build_display_rows(&data.records, &data.rows, cached);
+    // The merged live+cache row list, built by the caller through
+    // `cached_display_rows` so it is rebuilt only when the live or the
+    // database snapshot has actually been replaced, never once per
+    // repaint. Exactly one list is threaded through the whole page
+    // (including the "Selected archive" panel, which renders higher up
+    // than the library table itself), so the Source filter/owning-source
+    // display and the table below can never disagree. The *cached*
+    // filtered_rows index list keeps its own separate invalidation on
+    // poll_load/poll_database_load.
     let platform_counts = detected_platform_counts(
         merged_rows
             .iter()
@@ -390,7 +389,7 @@ pub(crate) fn show_loaded_data(
         .and_then(|archive| cached.and_then(|snapshot| snapshot.dat_identities.get(&archive.id)))
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let selected_source_path = selected_row_index(&merged_rows, selected_archive.as_deref())
+    let selected_source_path = selected_row_index(merged_rows, selected_archive.as_deref())
         .and_then(|index| merged_rows[index].source_path.as_deref());
     let selected_actions = if selected_archive.is_some() {
         egui::CollapsingHeader::new("Selected game")
@@ -1021,7 +1020,7 @@ pub(crate) fn show_loaded_data(
             }
         });
         if filter_changed {
-            *filtered_rows = matching_row_indices(&merged_rows, filter);
+            *filtered_rows = matching_row_indices(merged_rows, filter);
         }
 
         egui::CollapsingHeader::new("More filters")
@@ -1212,14 +1211,14 @@ pub(crate) fn show_loaded_data(
         })
         .collect();
     if let Some(field) = *sort_field {
-        sort_visible_indices(&merged_rows, &mut visible_indices, field, *sort_ascending);
+        sort_visible_indices(merged_rows, &mut visible_indices, field, *sort_ascending);
     }
     let visible_count = visible_indices.len();
 
-    show_selection_controls_row(ui, &merged_rows, &visible_indices, selected_archives);
+    show_selection_controls_row(ui, merged_rows, &visible_indices, selected_archives);
     ui.add_space(4.0);
     if *select_all_visible_requested {
-        *selected_archives = select_all_visible(&merged_rows, &visible_indices);
+        *selected_archives = select_all_visible(merged_rows, &visible_indices);
         *select_all_visible_requested = false;
     }
 
@@ -1240,7 +1239,7 @@ pub(crate) fn show_loaded_data(
             selected_archives.clear();
         }
         if select_all_pressed {
-            *selected_archives = select_all_visible(&merged_rows, &visible_indices);
+            *selected_archives = select_all_visible(merged_rows, &visible_indices);
         }
         if arrow_down_pressed || arrow_up_pressed {
             let direction = if arrow_down_pressed {
@@ -1249,7 +1248,7 @@ pub(crate) fn show_loaded_data(
                 ArrowDirection::Up
             };
             if let Some(new_focus) = next_focus_in_visible_order(
-                &merged_rows,
+                merged_rows,
                 &visible_indices,
                 selected_archive.as_deref(),
                 direction,
@@ -1272,7 +1271,7 @@ pub(crate) fn show_loaded_data(
         ui.spacing().interact_size.y,
     );
     let horizontal_spacing = ui.spacing().item_spacing.x;
-    let selected_index = selected_row_index(&merged_rows, selected_archive.as_deref());
+    let selected_index = selected_row_index(merged_rows, selected_archive.as_deref());
     let table_message = if recent_view && recent_scan.is_none() {
         Some(LibraryTableMessage::NoCompletedScan)
     } else if recent_scan.is_some_and(|recent| recent.archives.is_empty()) {
@@ -1380,7 +1379,7 @@ pub(crate) fn show_loaded_data(
                         |ui, row_range| {
                             let result = show_archive_rows(
                                 ui,
-                                &merged_rows,
+                                merged_rows,
                                 Some(&visible_indices),
                                 row_range,
                                 row_height,

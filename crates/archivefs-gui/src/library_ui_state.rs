@@ -1,6 +1,6 @@
 use crate::{
-    LibraryColumnWidths, LibraryRowFilters, RunningAliasAction, RunningBulkPlatformAction,
-    RunningMissingRemoval, RunningPlatformAction, SortField,
+    LibraryColumnWidths, LibraryRowFilters, MergedDisplayRowsCache, RunningAliasAction,
+    RunningBulkPlatformAction, RunningMissingRemoval, RunningPlatformAction, SortField,
 };
 
 /// UI state owned by the Library surface.
@@ -29,6 +29,9 @@ pub(crate) struct LibraryUiState {
     pub(crate) library_scroll_offset: f32,
     pub(crate) library_source_filter: Option<Option<std::path::PathBuf>>,
     pub(crate) library_column_widths: LibraryColumnWidths,
+    /// The merged live+cache display rows, reused between repaints - see
+    /// `cached_display_rows`.
+    pub(crate) merged_rows: Option<MergedDisplayRowsCache>,
 }
 
 impl Default for LibraryUiState {
@@ -53,6 +56,7 @@ impl Default for LibraryUiState {
             library_scroll_offset: 0.0,
             library_source_filter: None,
             library_column_widths: LibraryColumnWidths::default(),
+            merged_rows: None,
         }
     }
 }

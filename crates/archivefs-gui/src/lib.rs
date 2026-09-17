@@ -212,7 +212,8 @@ mod emulator_setup_focus;
 use emulator_setup_focus::*;
 mod library_rows;
 use library_rows::{
-    ArchiveRow, LibraryRowFilters, LoadedData, RowOrigin, build_display_rows, matching_row_indices,
+    ArchiveRow, LibraryRowFilters, LoadedData, MergedDisplayRowsCache, MergedDisplayRowsKey,
+    RowOrigin, build_display_rows, cached_display_rows, matching_row_indices,
 };
 mod library_view;
 use library_view::*;

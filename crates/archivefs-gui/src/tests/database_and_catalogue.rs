@@ -3204,3 +3204,258 @@ fn next_focus_in_visible_order_does_not_use_a_stale_index_after_filtering() {
     // (which would incorrectly land on c.zip).
     assert_eq!(next, Some(PathBuf::from("/roms/a.zip")));
 }
+
+// --- Merged display-row cache -----------------------------------------
+//
+// `cached_display_rows` is what keeps the Library / Recently Found / Home
+// renderer from rebuilding the whole merged live+cache projection on every
+// repaint. These tests pin both halves of that contract: it reuses the
+// previous result while its key is unchanged, and it rebuilds as soon as
+// either snapshot is replaced.
+
+fn merged_rows_key(
+    live: &LoadedData,
+    snapshot: Option<&CachedLibrarySnapshot>,
+    database_generation: DatabaseGeneration,
+) -> MergedDisplayRowsKey {
+    MergedDisplayRowsKey {
+        live_data_ptr: std::ptr::from_ref(live) as usize,
+        database_snapshot_ptr: snapshot.map(|snapshot| std::ptr::from_ref(snapshot) as usize),
+        refresh_generation: RefreshGeneration::INITIAL,
+        snapshot_generation: Some(RefreshGeneration::INITIAL),
+        database_generation,
+    }
+}
+
+/// Compares merged row lists by the identity that is actually on screen -
+/// `ArchiveRow` itself is a rendering value with no `PartialEq`/`Debug`.
+fn row_identities(rows: &[ArchiveRow]) -> Vec<(PathBuf, String)> {
+    rows.iter()
+        .map(|row| (row.path.clone(), row.state.clone()))
+        .collect()
+}
+
+fn loaded_data_for(paths: &[&str]) -> LoadedData {
+    let mut data = empty_loaded_data("/mount");
+    for path in paths {
+        let record = record(path, MountState::Pending);
+        data.rows.push(row_for(&record));
+        data.records.push(record);
+    }
+    data.stats.total_archives = data.records.len();
+    data
+}
+
+#[test]
+fn the_merged_row_cache_builds_the_same_projection_build_display_rows_would() {
+    let data = loaded_data_for(&["/roms/a.zip", "/roms/b.zip"]);
+    let snapshot = cached_snapshot(vec![persisted_archive(PathBuf::from("/roms/c.zip"), false)]);
+    let mut cache = None;
+
+    let rows = cached_display_rows(
+        &mut cache,
+        merged_rows_key(&data, Some(&snapshot), DatabaseGeneration::INITIAL),
+        &data.records,
+        &data.rows,
+        Some(&snapshot),
+    );
+
+    assert_eq!(
+        row_identities(rows),
+        row_identities(&build_display_rows(
+            &data.records,
+            &data.rows,
+            Some(&snapshot)
+        )),
+        "the cached projection must be exactly what an uncached build produces"
+    );
+    assert_eq!(rows.len(), 3, "two live rows plus the one cache-only row");
+}
+
+#[test]
+fn an_unchanged_key_reuses_the_cached_rows_instead_of_rebuilding_them() {
+    let data = loaded_data_for(&["/roms/a.zip"]);
+    let mut cache = None;
+    let key = merged_rows_key(&data, None, DatabaseGeneration::INITIAL);
+    let first = row_identities(cached_display_rows(
+        &mut cache,
+        key,
+        &data.records,
+        &data.rows,
+        None,
+    ));
+
+    // Deliberately different inputs under the *same* key: if the second
+    // call rebuilt, it would pick these up. Reusing the cache is the whole
+    // point, so the first result must come back unchanged.
+    let replaced = loaded_data_for(&["/roms/a.zip", "/roms/b.zip", "/roms/c.zip"]);
+    let second = cached_display_rows(&mut cache, key, &replaced.records, &replaced.rows, None);
+
+    assert_eq!(row_identities(second), first);
+    assert_eq!(second.len(), 1, "the cache was reused, not rebuilt");
+}
+
+#[test]
+fn replacing_the_live_snapshot_invalidates_the_merged_row_cache() {
+    let data = loaded_data_for(&["/roms/a.zip"]);
+    let mut cache = None;
+    let _ = cached_display_rows(
+        &mut cache,
+        merged_rows_key(&data, None, DatabaseGeneration::INITIAL),
+        &data.records,
+        &data.rows,
+        None,
+    );
+
+    let reloaded = loaded_data_for(&["/roms/a.zip", "/roms/b.zip"]);
+    let rows = cached_display_rows(
+        &mut cache,
+        merged_rows_key(&reloaded, None, DatabaseGeneration::INITIAL),
+        &reloaded.records,
+        &reloaded.rows,
+        None,
+    );
+
+    assert_eq!(rows.len(), 2, "a reloaded live snapshot must be picked up");
+}
+
+#[test]
+fn a_catalogue_generation_change_invalidates_the_merged_row_cache() {
+    let data = loaded_data_for(&["/roms/a.zip"]);
+    let before = cached_snapshot(Vec::new());
+    let mut cache = None;
+    let rows = cached_display_rows(
+        &mut cache,
+        merged_rows_key(&data, Some(&before), DatabaseGeneration::INITIAL),
+        &data.records,
+        &data.rows,
+        Some(&before),
+    );
+    assert_eq!(rows.len(), 1);
+
+    let after = cached_snapshot(vec![persisted_archive(PathBuf::from("/roms/z.zip"), false)]);
+    let rows = cached_display_rows(
+        &mut cache,
+        merged_rows_key(&data, Some(&after), DatabaseGeneration::INITIAL.next()),
+        &data.records,
+        &data.rows,
+        Some(&after),
+    );
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "a rescanned catalogue must add its new cache-only row"
+    );
+}
+
+#[test]
+fn an_empty_catalogue_caches_an_empty_projection_and_still_invalidates() {
+    let data = loaded_data_for(&[]);
+    let mut cache = None;
+    let rows = cached_display_rows(
+        &mut cache,
+        merged_rows_key(&data, None, DatabaseGeneration::INITIAL),
+        &data.records,
+        &data.rows,
+        None,
+    );
+    assert!(rows.is_empty());
+
+    let scanned = loaded_data_for(&["/roms/a.zip"]);
+    let rows = cached_display_rows(
+        &mut cache,
+        merged_rows_key(&scanned, None, DatabaseGeneration::INITIAL),
+        &scanned.records,
+        &scanned.rows,
+        None,
+    );
+    assert_eq!(rows.len(), 1, "the first scan must leave the empty state");
+}
+
+#[test]
+fn filter_and_sort_changes_are_applied_over_the_cached_rows_without_invalidating_them() {
+    // Filters and sorting are deliberately absent from the cache key: they
+    // are applied per frame to the *indices* into this list, so they take
+    // effect immediately without forcing the projection to be rebuilt.
+    let data = loaded_data_for(&["/roms/alpha.zip", "/roms/beta.zip"]);
+    let mut cache = None;
+    let key = merged_rows_key(&data, None, DatabaseGeneration::INITIAL);
+    let rows: Vec<ArchiveRow> =
+        cached_display_rows(&mut cache, key, &data.records, &data.rows, None).to_vec();
+
+    assert_eq!(matching_row_indices(&rows, "alpha"), Some(vec![0]));
+    assert_eq!(matching_row_indices(&rows, "beta"), Some(vec![1]));
+    assert_eq!(matching_row_indices(&rows, "zip"), Some(vec![0, 1]));
+
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    sort_visible_indices(&rows, &mut indices, SortField::ArchivePath, false);
+    assert_eq!(indices, vec![1, 0], "a sort flip reorders the same cache");
+
+    // And the cache really was never rebuilt across any of that.
+    let still_cached = cached_display_rows(&mut cache, key, &[], &[], None);
+    assert_eq!(row_identities(still_cached), row_identities(&rows));
+}
+
+#[test]
+fn switching_pages_and_back_leaves_no_stale_merged_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("a.zip");
+    std::fs::write(&archive, b"x").unwrap();
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    if let LoadState::Ready(data) = &mut app.state {
+        let record = record(archive.to_str().unwrap(), MountState::Pending);
+        data.rows.push(row_for(&record));
+        data.records.push(record);
+        data.stats.total_archives = 1;
+        data.stats.pending_count = 1;
+    }
+
+    let ctx = egui::Context::default();
+    let mut frame = eframe::Frame::_new_kittest();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1600.0, 1200.0),
+        )),
+        ..egui::RawInput::default()
+    };
+
+    app.view = MainView::Library;
+    let _ = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
+    assert!(
+        app.library_ui.merged_rows.is_some(),
+        "the Library page must populate the cache"
+    );
+
+    // Leave the page, replace the catalogue underneath, come back.
+    app.view = MainView::Sources;
+    let _ = ctx.run(input.clone(), |ctx| app.update(ctx, &mut frame));
+    let second = temp.path().join("b.zip");
+    std::fs::write(&second, b"x").unwrap();
+    let mut reloaded = empty_loaded_data(temp.path().to_str().unwrap());
+    for path in [&archive, &second] {
+        let record = record(path.to_str().unwrap(), MountState::Pending);
+        reloaded.rows.push(row_for(&record));
+        reloaded.records.push(record);
+    }
+    reloaded.stats.total_archives = 2;
+    reloaded.stats.pending_count = 2;
+    app.state = LoadState::Ready(Box::new(reloaded));
+    app.refresh_generation = app.refresh_generation.next();
+    app.snapshot_generation = Some(app.refresh_generation);
+
+    app.view = MainView::Library;
+    let _ = ctx.run(input, |ctx| app.update(ctx, &mut frame));
+    let rendered = app
+        .library_ui
+        .merged_rows
+        .as_ref()
+        .expect("the Library page repopulates the cache");
+    assert_eq!(
+        rendered.rows().len(),
+        2,
+        "returning to the Library must show the reloaded catalogue, not the stale one"
+    );
+}

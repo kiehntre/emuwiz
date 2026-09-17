@@ -1850,10 +1850,27 @@ pub(crate) fn show_pages(
                 LoadState::Ready(data) => {
                     let missing_removal_unavailable_reason =
                         app.missing_removal_unavailable_reason();
+                    let merged_rows = cached_display_rows(
+                        &mut app.library_ui.merged_rows,
+                        MergedDisplayRowsKey {
+                            live_data_ptr: std::ptr::from_ref(data.as_ref()) as usize,
+                            database_snapshot_ptr: app
+                                .database_state
+                                .snapshot()
+                                .map(|snapshot| std::ptr::from_ref(snapshot) as usize),
+                            refresh_generation: app.refresh_generation,
+                            snapshot_generation: app.snapshot_generation,
+                            database_generation: app.database_generation,
+                        },
+                        &data.records,
+                        &data.rows,
+                        app.database_state.snapshot(),
+                    );
                     requested_action = show_loaded_data(
                         ui,
                         data,
                         LoadedViewState {
+                            merged_rows,
                             filter: &mut app.library_ui.filter,
                             filtered_rows: &mut app.library_ui.filtered_rows,
                             selected_archive: &mut app.archive_context.focused,
