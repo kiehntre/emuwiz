@@ -4867,6 +4867,15 @@ fn gather_doctor_scan() -> DoctorScan {
         arcade_dat_version: Gathered::NotLoaded(
             "Arcade emulator / DAT version compatibility has not been assembled in this CLI session.",
         ),
+        arcade_readiness: Gathered::NotLoaded(
+            "MAME and FBNeo launch readiness has not been checked in this CLI session.",
+        ),
+        scummvm_readiness: Gathered::NotLoaded(
+            "ScummVM readiness has not been checked in this CLI session.",
+        ),
+        dosbox_staging_readiness: Gathered::NotLoaded(
+            "DOSBox Staging readiness has not been checked in this CLI session.",
+        ),
         // Emulator launch-readiness assessment walks discovered install
         // directories, which is a scan. Doctor never starts one from the
         // CLI (the same reason RetroArch discovery above is NotLoaded).
@@ -4881,6 +4890,9 @@ fn gather_doctor_scan() -> DoctorScan {
         ),
         rpcs3_readiness: Gathered::NotLoaded(
             "RPCS3 launch readiness has not been checked in this session.",
+        ),
+        remaining_profiles: Gathered::NotLoaded(
+            "Remaining emulator readiness has not been checked in this CLI session.",
         ),
         managed_entries: match &managed {
             Gathered::Ready(scan) => Gathered::Ready(scan),
