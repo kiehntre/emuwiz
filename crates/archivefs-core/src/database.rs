@@ -197,6 +197,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist an explicit source role without changing scan routing",
         sql: include_str!("migrations/0017_source_roles.sql"),
     },
+    Migration {
+        version: 18,
+        description: "persist validated provider-neutral mod catalogue records",
+        sql: include_str!("migrations/0018_mod_catalogue_records.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -3034,6 +3039,115 @@ impl Database {
             )));
         }
         Ok(())
+    }
+
+    /// Stores one validated provider catalogue record. The provider identity
+    /// and record id are the stable key; a later import replaces the metadata
+    /// for that exact record without creating a duplicate.
+    pub fn upsert_mod_catalogue_record(
+        &mut self,
+        record: &crate::mod_catalogue::ModCatalogueRecord,
+    ) -> Result<()> {
+        let record = record.clone().canonicalized();
+        record.validate().map_err(|errors| {
+            ArchiveFsError::Database(format!(
+                "mod catalogue record is not valid: {}",
+                errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        })?;
+        let url_contains_credentials = |value: &str| {
+            url::Url::parse(value)
+                .ok()
+                .is_some_and(|url| !url.username().is_empty() || url.password().is_some())
+        };
+        let credentials_in_metadata = url_contains_credentials(&record.provider.source_page_url)
+            || record
+                .provenance
+                .source_terms_url
+                .as_deref()
+                .is_some_and(url_contains_credentials)
+            || record
+                .payloads
+                .iter()
+                .any(|payload| payload.url.as_deref().is_some_and(url_contains_credentials));
+        if credentials_in_metadata {
+            return Err(ArchiveFsError::Database(
+                "mod catalogue records must not contain URL credentials".into(),
+            ));
+        }
+        let encoded = serde_json::to_string(&record).map_err(|error| {
+            ArchiveFsError::Database(format!("failed to serialize mod catalogue record: {error}"))
+        })?;
+        if encoded.len() > 512 * 1024 {
+            return Err(ArchiveFsError::Database(
+                "mod catalogue record exceeds the 512 KiB storage limit".into(),
+            ));
+        }
+        self.connection
+            .execute(
+                "INSERT INTO mod_catalogue_records
+                 (provider_name, provider_record_id, record_json, imported_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(provider_name, provider_record_id) DO UPDATE SET
+                 record_json = excluded.record_json, imported_at = excluded.imported_at",
+                params![
+                    record.provider.name,
+                    record.provider.record_id,
+                    encoded,
+                    record.provider.imported_at.as_deref().unwrap_or(""),
+                ],
+            )
+            .map_err(|error| db_error("failed to upsert mod catalogue record", error))?;
+        Ok(())
+    }
+
+    /// Lists persisted provider records in a stable, bounded order.
+    pub fn list_mod_catalogue_records(
+        &self,
+    ) -> Result<Vec<crate::mod_catalogue::ModCatalogueRecord>> {
+        const MAX_RECORDS: i64 = 4096;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT record_json FROM mod_catalogue_records
+                 ORDER BY provider_name ASC, provider_record_id ASC LIMIT ?1",
+            )
+            .map_err(|error| db_error("failed to prepare mod catalogue listing", error))?;
+        let rows = statement
+            .query_map([MAX_RECORDS], |row| row.get::<_, String>(0))
+            .map_err(|error| db_error("failed to query mod catalogue records", error))?;
+        rows.map(|row| {
+            let encoded =
+                row.map_err(|error| db_error("failed to read mod catalogue record", error))?;
+            serde_json::from_str(&encoded).map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "stored mod catalogue record is malformed: {error}"
+                ))
+            })
+        })
+        .collect()
+    }
+
+    /// Returns records that are not ruled out by the selected game's verified
+    /// platform/identity evidence. Compatibility remains a separate review
+    /// projection, so weak records remain review candidates rather than being
+    /// promoted to exact matches by this query.
+    pub fn list_mod_catalogue_records_for_game(
+        &self,
+        selected_game: &crate::mod_package::SelectedGameForMod,
+    ) -> Result<Vec<crate::mod_catalogue::ModCatalogueRecord>> {
+        let records = self.list_mod_catalogue_records()?;
+        Ok(records
+            .into_iter()
+            .filter(|record| {
+                crate::mod_catalogue::assess_catalogue_compatibility(record, selected_game).state
+                    != crate::mod_package::ModCompatibilityState::Incompatible
+            })
+            .collect())
     }
 
     /// Records the outcome of one source folder's scan attempt (success or
@@ -7890,6 +8004,60 @@ mod tests {
         }
     }
 
+    fn mod_catalogue_fixture(
+        provider: &str,
+        record_id: &str,
+    ) -> crate::mod_catalogue::ModCatalogueRecord {
+        crate::mod_catalogue::ModCatalogueRecord {
+            provider: crate::mod_catalogue::ModCatalogueProvider {
+                name: provider.into(),
+                record_id: record_id.into(),
+                source_page_url: "https://example.invalid/mod".into(),
+                schema_version: None,
+                imported_at: Some("2026-09-17T00:00:00Z".into()),
+            },
+            display_title: "Synthetic provider mod".into(),
+            author: None,
+            version: Some("1".into()),
+            description: Some("Synthetic metadata only".into()),
+            title_hint: None,
+            platform: None,
+            category: crate::mod_catalogue::ModCatalogueCategory::GameMod,
+            payloads: Vec::new(),
+            declared_identity: Vec::new(),
+            declared_region: None,
+            declared_revision: None,
+            destination_intent: crate::mod_catalogue::ModDestinationIntent::Unknown,
+            instructions: None,
+            provenance: crate::mod_catalogue::ModCatalogueProvenance {
+                source_terms_url: None,
+                licence: None,
+                author_or_uploader: None,
+                note: None,
+            },
+        }
+    }
+
+    #[test]
+    fn mod_catalogue_records_round_trip_and_upsert_by_provider_identity() {
+        let root = temp_dir("mod-catalogue-records");
+        let database_path = root.join("library.sqlite3");
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let first = mod_catalogue_fixture("provider-a", "same-id");
+        database.upsert_mod_catalogue_record(&first).unwrap();
+        database.upsert_mod_catalogue_record(&first).unwrap();
+        let second = mod_catalogue_fixture("provider-b", "same-id");
+        database.upsert_mod_catalogue_record(&second).unwrap();
+        assert_eq!(database.list_mod_catalogue_records().unwrap().len(), 2);
+        database.close().unwrap();
+
+        let database = Database::open_read_only(&database_path).unwrap();
+        let records = database.list_mod_catalogue_records().unwrap();
+        assert_eq!(records[0].provider.name, "provider-a");
+        assert_eq!(records[0].provider.record_id, "same-id");
+        assert_eq!(records[1].provider.name, "provider-b");
+    }
+
     fn find_archive<'a>(
         archives: &'a [PersistedArchive],
         relative_path: &str,
@@ -8037,17 +8205,17 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 17);
-        assert_eq!(report.applied_versions, vec![17]);
+        assert_eq!(report.to_version, 18);
+        assert_eq!(report.applied_versions, vec![17, 18]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 17);
+        assert_eq!(upgraded.schema_version().unwrap(), 18);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
-            pending_schema_migration_versions(17).unwrap(),
+            pending_schema_migration_versions(18).unwrap(),
             Vec::<i64>::new()
         );
 
@@ -8901,6 +9069,7 @@ mod tests {
                 "dat_set_audit_results",
                 "discovery_details",
                 "library_dat_identities",
+                "mod_catalogue_records",
                 "platform_aliases",
                 "platform_assignments",
                 "scan_fingerprints",
@@ -17002,7 +17171,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 17);
+            assert_eq!(latest_known_version(MIGRATIONS), 18);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

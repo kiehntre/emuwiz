@@ -7,6 +7,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::game_identity::GameIdentityReport;
+use archivefs_core::mod_catalogue::ModCatalogueRecord;
+use archivefs_core::mod_catalogue_review::review_catalogue_record;
 use archivefs_core::mod_package::{
     LocalModPackageCandidateInspection, LocalModPackagePlan, ModCompatibilityState,
     SelectedGameForMod, build_local_mod_package_transaction_plan,
@@ -44,6 +46,7 @@ enum Stage {
 pub struct LocalModPackagePageState {
     key: Option<(PathBuf, PathBuf)>,
     stage: Option<Stage>,
+    provider_selection: Option<(String, String)>,
 }
 
 impl LocalModPackagePageState {
@@ -251,11 +254,112 @@ fn has_restorable_changes(result: &SharedApplyResult) -> bool {
         })
 }
 
+fn catalogue_candidate_label(
+    record: &ModCatalogueRecord,
+    identity: &GameIdentityReport,
+) -> &'static str {
+    let selected = SelectedGameForMod {
+        game_root: identity
+            .archive_path
+            .parent()
+            .unwrap_or(identity.archive_path.as_path())
+            .to_path_buf(),
+        identity: identity.clone(),
+    };
+    match review_catalogue_record(record, &selected, None)
+        .compatibility
+        .state
+    {
+        ModCompatibilityState::Compatible => "Compatible catalogue match",
+        ModCompatibilityState::Incompatible => "Not for this game",
+        ModCompatibilityState::Unknown => "Needs review",
+    }
+}
+
+fn show_provider_catalogue_candidates(
+    ui: &mut egui::Ui,
+    state: &mut LocalModPackagePageState,
+    identity: &GameIdentityReport,
+    records: &[ModCatalogueRecord],
+) {
+    if records.is_empty() {
+        return;
+    }
+    let selected = state.provider_selection.as_ref();
+    let mut clicked = None;
+    widgets::card(ui, |ui| {
+        ui.heading("Catalogue mod candidates");
+        ui.label("These records were imported from a provider catalogue. They are browse-only until a matching package is available locally.");
+        let mut order: Vec<_> = records.iter().collect();
+        order.sort_by(|left, right| {
+            catalogue_candidate_label(right, identity)
+                .cmp(catalogue_candidate_label(left, identity))
+                .then_with(|| left.provider.name.cmp(&right.provider.name))
+                .then_with(|| left.provider.record_id.cmp(&right.provider.record_id))
+        });
+        for record in order {
+            let key = (
+                record.provider.name.clone(),
+                record.provider.record_id.clone(),
+            );
+            let label = format!(
+                "{} — {}",
+                record.display_title,
+                catalogue_candidate_label(record, identity)
+            );
+            if ui.selectable_label(selected == Some(&key), label).clicked() {
+                clicked = Some(key);
+            }
+            ui.small(format!(
+                "Provider: {} · Record: {}",
+                record.provider.name, record.provider.record_id
+            ));
+        }
+    });
+    if let Some(key) = clicked {
+        state.provider_selection = Some(key);
+        state.stage = None;
+    }
+    if let Some(key) = state.provider_selection.as_ref()
+        && let Some(record) = records
+            .iter()
+            .find(|record| record.provider.name == key.0 && record.provider.record_id == key.1)
+    {
+        widgets::card(ui, |ui| {
+            ui.heading(&record.display_title);
+            ui.label(format!("Provider: {}", record.provider.name));
+            ui.label(format!("Source: {}", record.provider.source_page_url));
+            ui.label("Catalogue record only — the package has not been downloaded.");
+            ui.label("Apply is unavailable until a local package is inspected and reviewed.");
+            if let Some(version) = &record.version {
+                ui.label(format!("Version: {version}"));
+            }
+            if let Some(description) = &record.description {
+                ui.label(description);
+            }
+            if ui.button("Clear catalogue selection").clicked() {
+                state.provider_selection = None;
+            }
+        });
+    }
+}
+
+#[allow(dead_code)]
 pub fn show_local_mod_package_panel(
     ui: &mut egui::Ui,
     state: &mut LocalModPackagePageState,
     archive_path: &std::path::Path,
     identity: Option<&GameIdentityReport>,
+) {
+    show_local_mod_package_panel_with_catalogue(ui, state, archive_path, identity, &[]);
+}
+
+pub fn show_local_mod_package_panel_with_catalogue(
+    ui: &mut egui::Ui,
+    state: &mut LocalModPackagePageState,
+    archive_path: &std::path::Path,
+    identity: Option<&GameIdentityReport>,
+    catalogue_records: &[ModCatalogueRecord],
 ) {
     let Some(identity) = identity else {
         widgets::section_header(ui, "Ordinary game mods", None);
@@ -279,12 +383,17 @@ pub fn show_local_mod_package_panel(
     if state.key.as_ref() != Some(&key) {
         state.key = Some(key);
         state.stage = None;
+        state.provider_selection = None;
     }
     widgets::section_header(
         ui,
         "Ordinary game mods",
         Some("Choose a local mod folder. EmuWiz previews every file before anything changes."),
     );
+    show_provider_catalogue_candidates(ui, state, identity, catalogue_records);
+    if state.provider_selection.is_some() {
+        return;
+    }
     if state.stage.is_none() {
         if widgets::action_button(
             ui,
@@ -734,6 +843,70 @@ mod tests {
         ctx.run(egui::RawInput::default(), draw)
     }
 
+    fn catalogue_fixture() -> ModCatalogueRecord {
+        ModCatalogueRecord {
+            provider: archivefs_core::mod_catalogue::ModCatalogueProvider {
+                name: "Synthetic provider".into(),
+                record_id: "record-1".into(),
+                source_page_url: "https://example.invalid/mod/record-1".into(),
+                schema_version: None,
+                imported_at: None,
+            },
+            display_title: "Catalogue-only translation".into(),
+            author: None,
+            version: Some("1.0".into()),
+            description: Some("Imported metadata".into()),
+            title_hint: None,
+            platform: None,
+            category: archivefs_core::mod_catalogue::ModCatalogueCategory::GameMod,
+            payloads: Vec::new(),
+            declared_identity: vec![archivefs_core::mod_catalogue::ModCatalogueIdentity {
+                kind: archivefs_core::mod_package::ModIdentityKind::LooseRomSha256,
+                value: "game-sha".into(),
+            }],
+            declared_region: None,
+            declared_revision: None,
+            destination_intent: archivefs_core::mod_catalogue::ModDestinationIntent::Unknown,
+            instructions: None,
+            provenance: archivefs_core::mod_catalogue::ModCatalogueProvenance {
+                source_terms_url: None,
+                licence: None,
+                author_or_uploader: None,
+                note: None,
+            },
+        }
+    }
+
+    #[test]
+    fn provider_record_renders_as_browse_only_candidate() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let archive = temp.path().join("game/game.bin");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::write(&archive, b"game").unwrap();
+        let id = identity(&archive);
+        let record = catalogue_fixture();
+        let mut state = LocalModPackagePageState {
+            key: Some((archive.clone(), archive.parent().unwrap().to_path_buf())),
+            provider_selection: Some(("Synthetic provider".into(), "record-1".into())),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_local_mod_package_panel_with_catalogue(
+                    ui,
+                    &mut state,
+                    &archive,
+                    Some(&id),
+                    std::slice::from_ref(&record),
+                );
+            });
+        });
+        assert!(text_contains(&output, "Catalogue-only translation"));
+        assert!(text_contains(&output, "package has not been downloaded"));
+        assert!(text_contains(&output, "Apply is unavailable"));
+    }
+
     fn text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         fn walk(shape: &egui::Shape, needle: &str) -> bool {
             match shape {
@@ -807,6 +980,7 @@ mod tests {
         };
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Candidates(inspection, 1)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -853,6 +1027,7 @@ mod tests {
 
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Planned(plan)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -878,6 +1053,7 @@ mod tests {
 
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Planned(plan)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -898,6 +1074,7 @@ mod tests {
 
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Confirm(transaction)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -952,6 +1129,7 @@ mod tests {
 
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Applied(result)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -1037,6 +1215,7 @@ mod tests {
 
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Applied(result)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -1078,6 +1257,7 @@ mod tests {
 
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Applied(result)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -1135,6 +1315,7 @@ mod tests {
 
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::Applied(result)),
         };
         let output = render(&mut state, &archive, Some(&id));
@@ -1177,6 +1358,7 @@ mod tests {
         sender.send(rollback).unwrap();
         let mut state = LocalModPackagePageState {
             key: Some((archive.clone(), game_root.clone())),
+            provider_selection: None,
             stage: Some(Stage::RollingBack(receiver)),
         };
         assert!(state.poll());
@@ -1205,6 +1387,7 @@ mod tests {
         for status in [SharedApplyStatus::PartialFailure, SharedApplyStatus::Failed] {
             let mut state = LocalModPackagePageState {
                 key: Some((archive.clone(), game_root.clone())),
+                provider_selection: None,
                 stage: Some(Stage::RolledBack(status)),
             };
             let output = render(&mut state, &archive, Some(&id));
@@ -1224,6 +1407,7 @@ mod tests {
         drop(sender);
         let mut state = LocalModPackagePageState {
             key: None,
+            provider_selection: None,
             stage: Some(Stage::RollingBack(receiver)),
         };
         assert!(state.poll());

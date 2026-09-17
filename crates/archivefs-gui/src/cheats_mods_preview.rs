@@ -1435,11 +1435,15 @@ pub(crate) fn show_cheats_mods_page(
         });
         ui.add_space(theme::SECTION_GAP);
         if active_section == EnhancementSection::Mods {
-            crate::local_mod_package_page::show_local_mod_package_panel(
+            let catalogue_records = cached
+                .map(|snapshot| snapshot.mod_catalogue_records.as_slice())
+                .unwrap_or(&[]);
+            crate::local_mod_package_page::show_local_mod_package_panel_with_catalogue(
                 ui,
                 local_mod_package,
                 &workflow.archive_path,
                 crate::ready_game_identity(workflow),
+                catalogue_records,
             );
             ui.add_space(theme::SECTION_GAP);
         }

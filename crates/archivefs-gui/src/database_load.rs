@@ -59,6 +59,9 @@ pub(crate) struct CachedLibrarySnapshot {
     /// source management is additive display data, not required for
     /// Library/Health/Duplicates to function.
     pub(crate) source_views: Vec<SourceFolderView>,
+    /// Provider-neutral mod records imported explicitly by a caller. This is
+    /// metadata only; records without local payload bytes remain browse-only.
+    pub(crate) mod_catalogue_records: Vec<archivefs_core::mod_catalogue::ModCatalogueRecord>,
 }
 
 // A one-shot value moved straight out of a worker channel
@@ -381,6 +384,7 @@ pub(crate) fn load_snapshot_from(
             build_source_folder_views(&sources, &records)
         })
         .unwrap_or_default();
+    let mod_catalogue_records = database.list_mod_catalogue_records().map_err(to_failed)?;
     Ok(CachedLibrarySnapshot {
         database_path: database_path.to_path_buf(),
         schema_version,
@@ -393,6 +397,7 @@ pub(crate) fn load_snapshot_from(
         platform_aliases,
         duplicate_report,
         source_views,
+        mod_catalogue_records,
     })
 }
 

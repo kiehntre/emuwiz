@@ -1424,6 +1424,7 @@ fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
         platform_aliases: Vec::new(),
         duplicate_report,
         source_views: Vec::new(),
+        mod_catalogue_records: Vec::new(),
     }
 }
 

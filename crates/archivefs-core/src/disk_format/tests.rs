@@ -1974,7 +1974,8 @@ fn a_mega_drive_rom_is_still_confirmed_from_its_header() {
 /// inventory), and 0012 (`migrations/0012_dat_expected_inventory_meta.sql`,
 /// expected-inventory metadata), 0013 (scan fingerprints), 0014 (ingestion
 /// fingerprint evidence), 0015 (discovery-detail reuse), 0016 (non-archive
-/// fingerprints), and 0017 (source roles) are already accounted for as legitimate
+/// fingerprints), 0017 (source roles), and 0018 (provider mod catalogue
+/// records) are already accounted for as legitimate
 /// unrelated additions.
 #[test]
 fn the_database_schema_and_migrations_are_unchanged() {
@@ -1982,9 +1983,9 @@ fn the_database_schema_and_migrations_are_unchanged() {
     assert_eq!(
         versions,
         vec![
-            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+            1_i64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
         ],
-        "migrations must remain exactly 0001 through 0017"
+        "migrations must remain contiguous and registered"
     );
 }
 
