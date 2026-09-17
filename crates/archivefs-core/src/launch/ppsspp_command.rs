@@ -14,6 +14,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
+use crate::launch::process_spawn::LaunchCommandSpec;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 use crate::patch_manager::{PpssppLaunchBlocker, PpssppNativeLaunchBinding};
 
@@ -25,6 +26,16 @@ pub struct PpssppCommand {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub selection: PpssppCommandSelection,
+}
+
+impl PpssppCommand {
+    pub fn command_spec(&self) -> LaunchCommandSpec {
+        LaunchCommandSpec {
+            executable: self.executable.clone(),
+            arguments: self.arguments.clone(),
+            working_directory: self.working_directory.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

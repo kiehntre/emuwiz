@@ -62,9 +62,7 @@ use crate::launch::integration::{
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef, LaunchTarget,
 };
-use crate::launch::process_spawn::{
-    self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
-};
+use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::rpcs3_command::{
     RPCS3_SUPPORTED_PLATFORM_ID, Rpcs3Command, build_rpcs3_command_plan,
@@ -665,11 +663,7 @@ impl LaunchedRpcs3Process {
 /// policy (stdin/stdout/stderr, environment, no timeout/kill).
 pub fn spawn_rpcs3(command: Rpcs3Command) -> Result<LaunchedRpcs3Process, Rpcs3LaunchSpawnError> {
     let facts = command_facts(&command);
-    let prepared = PreparedProcessCommand {
-        executable: command.executable,
-        arguments: command.arguments,
-        working_directory: command.working_directory,
-    };
+    let prepared = command.command_spec();
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(Rpcs3LaunchSpawnError::Spawn)?;
     Ok(LaunchedRpcs3Process {

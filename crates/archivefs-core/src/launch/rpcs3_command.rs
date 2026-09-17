@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
+use crate::launch::process_spawn::LaunchCommandSpec;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 use crate::patch_manager::{Rpcs3LaunchBinding, Rpcs3LaunchBlocker};
 
@@ -25,6 +26,16 @@ pub struct Rpcs3Command {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub selection: Rpcs3CommandSelection,
+}
+
+impl Rpcs3Command {
+    pub fn command_spec(&self) -> LaunchCommandSpec {
+        LaunchCommandSpec {
+            executable: self.executable.clone(),
+            arguments: self.arguments.clone(),
+            working_directory: self.working_directory.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

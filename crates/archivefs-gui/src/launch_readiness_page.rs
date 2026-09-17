@@ -54,9 +54,10 @@ use archivefs_core::launch::{
     XemuLaunchExecutionError, XemuLaunchRequest, XeniaLaunchExecutionError, XeniaLaunchRequest,
     build_amiberry_whdload_command_plan, build_dolphin_command_plan,
     build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
-    build_retroarch_command_plan, preflight_and_launch_amiga_whdload,
-    preflight_and_launch_duckstation, preflight_and_launch_ppsspp, preflight_and_launch_rpcs3,
-    preflight_and_launch_xemu, preflight_and_launch_xenia,
+    build_ppsspp_command_plan, build_retroarch_command_plan, build_rpcs3_command_plan,
+    preflight_and_launch_amiga_whdload, preflight_and_launch_duckstation,
+    preflight_and_launch_ppsspp, preflight_and_launch_rpcs3, preflight_and_launch_xemu,
+    preflight_and_launch_xenia,
 };
 use archivefs_core::launch::{
     CandidatePreference, DOLPHIN_SUPPORTED_PLATFORM_ID, DolphinLaunchExecutionError,
@@ -1854,6 +1855,7 @@ fn preference_label(preference: CandidatePreference) -> &'static str {
 /// the shared launch plan. For RetroArch and PCSX2 this projects the same
 /// typed command builders used by preflight; adapter preflight still owns
 /// executable discovery, identity revalidation, and final launch authority.
+#[allow(clippy::too_many_arguments)]
 fn show_launch_recipe(
     ui: &mut egui::Ui,
     plan: &LaunchPlan,
@@ -1862,6 +1864,8 @@ fn show_launch_recipe(
     dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
     duckstation: Option<&DuckStationLaunchContext>,
+    ppsspp: Option<&PpssppLaunchContext>,
+    rpcs3: Option<&Rpcs3LaunchContext>,
 ) {
     let (emulator, profile) = target_labels(&candidate.target);
     let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
@@ -1871,7 +1875,16 @@ fn show_launch_recipe(
         .as_deref()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "No runnable game file has been resolved".into());
-    let command = launch_command_preview(plan, candidate, retroarch, dolphin, pcsx2, duckstation);
+    let command = launch_command_preview(
+        plan,
+        candidate,
+        retroarch,
+        dolphin,
+        pcsx2,
+        duckstation,
+        ppsspp,
+        rpcs3,
+    );
     let readiness = readiness_label_and_tone(candidate.readiness);
 
     widgets::card(ui, |ui| {
@@ -1932,6 +1945,7 @@ fn preview_identity(plan: &LaunchPlan) -> CanonicalIdentityStatus {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_command_preview(
     plan: &LaunchPlan,
     candidate: &LaunchCandidate,
@@ -1939,6 +1953,8 @@ fn launch_command_preview(
     dolphin: Option<&DolphinLaunchContext>,
     pcsx2: Option<&Pcsx2LaunchContext>,
     duckstation: Option<&DuckStationLaunchContext>,
+    ppsspp: Option<&PpssppLaunchContext>,
+    rpcs3: Option<&Rpcs3LaunchContext>,
 ) -> Option<LaunchCommandSpec> {
     let identity = preview_identity(plan);
     match &candidate.target {
@@ -1997,6 +2013,34 @@ fn launch_command_preview(
                 )
                 .command
                 .map(|command| command.command_spec())
+            }
+            "ppsspp" => {
+                let context = ppsspp?;
+                let disc_id = context.verified_psp_disc_id.as_deref();
+                let profile = context
+                    .discovery
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)?;
+                let binding =
+                    archivefs_core::patch_manager::resolve_ppsspp_native_launch_binding(profile);
+                build_ppsspp_command_plan(&identity, disc_id, candidate, &binding)
+                    .command
+                    .map(|command| command.command_spec())
+            }
+            "rpcs3" => {
+                let context = rpcs3?;
+                let title_id = context.verified_ps3_title_id.as_deref();
+                let profile = context
+                    .discovery
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)?;
+                let binding =
+                    archivefs_core::patch_manager::resolve_rpcs3_native_launch_binding(profile);
+                build_rpcs3_command_plan(&identity, title_id, candidate, &binding)
+                    .command
+                    .map(|command| command.command_spec())
             }
             _ => None,
         },
@@ -2551,7 +2595,17 @@ fn show_candidate(
             .color(theme::muted(ui)),
         );
 
-        show_launch_recipe(ui, plan, candidate, retroarch, dolphin, pcsx2, duckstation);
+        show_launch_recipe(
+            ui,
+            plan,
+            candidate,
+            retroarch,
+            dolphin,
+            pcsx2,
+            duckstation,
+            ppsspp,
+            rpcs3,
+        );
 
         open_doctor = show_firmware_summary(ui, candidate);
 

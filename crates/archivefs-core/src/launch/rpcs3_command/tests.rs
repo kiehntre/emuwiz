@@ -61,6 +61,10 @@ fn verified_ps3_content_produces_exact_structured_argv() {
     assert_eq!(command.executable, PathBuf::from("/opt/rpcs3/rpcs3"));
     assert_eq!(command.arguments, vec![OsString::from(content)]);
     assert_eq!(command.selection.verified_ps3_title_id, "BLUS30000");
+    let spec = command.command_spec();
+    assert_eq!(spec.executable, command.executable);
+    assert_eq!(spec.arguments, command.arguments);
+    assert_eq!(spec.working_directory, command.working_directory);
 }
 
 #[test]

@@ -63,6 +63,10 @@ fn verified_iso_produces_exact_structured_argv() {
     assert_eq!(command.executable, PathBuf::from("/opt/ppsspp/PPSSPP"));
     assert_eq!(command.arguments, vec![OsString::from(path)]);
     assert_eq!(command.selection.verified_psp_disc_id, "ULUS-10000");
+    let spec = command.command_spec();
+    assert_eq!(spec.executable, command.executable);
+    assert_eq!(spec.arguments, command.arguments);
+    assert_eq!(spec.working_directory, command.working_directory);
 }
 
 #[test]

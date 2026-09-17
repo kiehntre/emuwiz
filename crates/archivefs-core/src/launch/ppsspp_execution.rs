@@ -58,9 +58,7 @@ use crate::launch::planning::{
 use crate::launch::ppsspp_command::{
     PPSSPP_SUPPORTED_PLATFORM_ID, PpssppCommand, build_ppsspp_command_plan, direct_psp_extension,
 };
-use crate::launch::process_spawn::{
-    self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
-};
+use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
 use crate::patch_manager::{
     PpssppProfileDiscoveryRoots, discover_ppsspp_profiles, resolve_ppsspp_native_launch_binding,
@@ -596,11 +594,7 @@ pub fn spawn_ppsspp(
     command: PpssppCommand,
 ) -> Result<LaunchedPpssppProcess, PpssppLaunchSpawnError> {
     let facts = command_facts(&command);
-    let prepared = PreparedProcessCommand {
-        executable: command.executable,
-        arguments: command.arguments,
-        working_directory: command.working_directory,
-    };
+    let prepared = command.command_spec();
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(PpssppLaunchSpawnError::Spawn)?;
     Ok(LaunchedPpssppProcess {
