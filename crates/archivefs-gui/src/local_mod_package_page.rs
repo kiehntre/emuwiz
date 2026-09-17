@@ -8,8 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::mod_package::{
-    LocalModPackagePlan, LocalModPackageRequest, ModCompatibilityState, SelectedGameForMod,
-    build_local_mod_package_transaction_plan, inspect_local_mod_package,
+    LocalModPackageCandidateInspection, LocalModPackagePlan, ModCompatibilityState,
+    SelectedGameForMod, build_local_mod_package_transaction_plan,
+    inspect_local_mod_package_candidates,
 };
 use archivefs_core::patch_manager::{
     SharedApplyConfirmation, SharedApplyOptions, SharedApplyOutcome, SharedApplyResult,
@@ -23,7 +24,9 @@ use eframe::egui;
 use crate::ui::components as widgets;
 
 enum Stage {
-    Pick(Receiver<Option<PathBuf>>, SelectedGameForMod),
+    Pick(Receiver<Option<PathBuf>>, SelectedGameForMod, Vec<PathBuf>),
+    Candidates(LocalModPackageCandidateInspection, usize),
+    #[allow(dead_code)]
     Planned(LocalModPackagePlan),
     Confirm(SharedTransactionPlan),
     Applying(Receiver<SharedApplyResult>, SharedTransactionPlan),
@@ -56,17 +59,20 @@ impl LocalModPackagePageState {
             return false;
         };
         match stage {
-            Stage::Pick(receiver, selected_game) => match receiver.try_recv() {
+            Stage::Pick(receiver, selected_game, mut package_roots) => match receiver.try_recv() {
                 Ok(Some(path)) => {
-                    self.stage = Some(Stage::Planned(inspect_local_mod_package(
-                        LocalModPackageRequest {
-                            selected_game,
-                            package_root: path,
-                        },
-                    )))
+                    package_roots.push(path);
+                    let inspection =
+                        inspect_local_mod_package_candidates(selected_game, &package_roots);
+                    self.stage = Some(Stage::Candidates(
+                        inspection.clone(),
+                        best_candidate_index(&inspection.plans),
+                    ));
                 }
                 Ok(None) | Err(TryRecvError::Disconnected) => {}
-                Err(TryRecvError::Empty) => self.stage = Some(Stage::Pick(receiver, selected_game)),
+                Err(TryRecvError::Empty) => {
+                    self.stage = Some(Stage::Pick(receiver, selected_game, package_roots))
+                }
             },
             Stage::Applying(receiver, plan) => match receiver.try_recv() {
                 Ok(result) => self.stage = Some(Stage::Applied(result)),
@@ -180,6 +186,55 @@ fn compatibility_presentation(
     }
 }
 
+fn candidate_order(plans: &[LocalModPackagePlan]) -> Vec<usize> {
+    let mut order: Vec<_> = (0..plans.len()).collect();
+    order.sort_by(|left, right| {
+        candidate_rank(&plans[*left])
+            .cmp(&candidate_rank(&plans[*right]))
+            .then_with(|| {
+                candidate_sort_key(&plans[*left]).cmp(&candidate_sort_key(&plans[*right]))
+            })
+    });
+    order
+}
+
+fn best_candidate_index(plans: &[LocalModPackagePlan]) -> usize {
+    candidate_order(plans).into_iter().next().unwrap_or(0)
+}
+
+fn candidate_rank(plan: &LocalModPackagePlan) -> u8 {
+    if !plan.blockers.is_empty() || !plan.conflicts.is_empty() {
+        return 3;
+    }
+    match plan.compatibility.state {
+        ModCompatibilityState::Compatible => 0,
+        ModCompatibilityState::Unknown => 2,
+        ModCompatibilityState::Incompatible => 3,
+    }
+}
+
+fn candidate_sort_key(plan: &LocalModPackagePlan) -> (String, PathBuf) {
+    (
+        plan.package
+            .as_ref()
+            .map(|package| package.package_id.clone())
+            .unwrap_or_default(),
+        plan.package_root.clone(),
+    )
+}
+
+fn candidate_state_label(plan: &LocalModPackagePlan) -> &'static str {
+    if !plan.blockers.is_empty() || !plan.conflicts.is_empty() {
+        "Needs review"
+    } else {
+        match plan.compatibility.state {
+            ModCompatibilityState::Compatible => "Ready to apply",
+            ModCompatibilityState::Incompatible => "Unavailable for this game",
+            ModCompatibilityState::Unknown => "Needs game identity",
+        }
+    }
+}
+
 /// Whether an apply result actually changed at least one game file that a
 /// rollback could restore. `AlreadyInstalled` is deliberately excluded (the
 /// file was already in place, so there is nothing to undo), as is a result
@@ -249,17 +304,96 @@ pub fn show_local_mod_package_panel(
                     game_root: game_root.clone(),
                     identity: identity.clone(),
                 },
+                Vec::new(),
             ));
         }
         return;
     }
     let stage = state.stage.take().unwrap();
     match stage {
-        Stage::Pick(receiver, selected_game) => {
+        Stage::Pick(receiver, selected_game, package_roots) => {
             ui.label("Waiting for folder selection…");
-            state.stage = Some(Stage::Pick(receiver, selected_game));
+            state.stage = Some(Stage::Pick(receiver, selected_game, package_roots));
         }
-        Stage::Planned(plan) => show_plan(ui, state, plan, archive_path, identity, &game_root),
+        Stage::Planned(plan) => {
+            show_plan(ui, state, plan, archive_path, identity, &game_root);
+        }
+        Stage::Candidates(inspection, selected) => {
+            let selected = selected.min(inspection.plans.len().saturating_sub(1));
+            let mut next_selected = selected;
+            widgets::card(ui, |ui| {
+                ui.heading("Local mod candidates");
+                ui.label("Each selected local mod folder is shown here as a separate candidate. EmuWiz never chooses between candidates silently.");
+                if inspection.plans.is_empty() {
+                    ui.label("No readable mod candidates were found.");
+                } else {
+                    for index in candidate_order(&inspection.plans) {
+                        let plan = &inspection.plans[index];
+                        let title = plan
+                            .package
+                            .as_ref()
+                            .map(|package| format!("{} {}", package.title, package.version))
+                            .unwrap_or_else(|| plan.package_root.display().to_string());
+                        let state_label = candidate_state_label(plan);
+                        if ui
+                            .selectable_label(index == selected, format!("{title} — {state_label}"))
+                            .clicked()
+                        {
+                            next_selected = index;
+                        }
+                        ui.small(format!("Source: {}", plan.package_root.display()));
+                    }
+                }
+                if !inspection.blockers.is_empty() {
+                    for blocker in &inspection.blockers {
+                        widgets::banner(
+                            ui,
+                            "Some mod candidates need review",
+                            &blocker.detail,
+                            widgets::StatusTone::Warning,
+                        );
+                    }
+                }
+                if widgets::action_button(
+                    ui,
+                    "Add another local mod folder",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                {
+                    let (sender, receiver) = mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = sender.send(rfd::FileDialog::new().pick_folder());
+                    });
+                    let roots = inspection
+                        .plans
+                        .iter()
+                        .map(|plan| plan.package_root.clone())
+                        .collect();
+                    state.stage = Some(Stage::Pick(
+                        receiver,
+                        SelectedGameForMod {
+                            game_root: game_root.clone(),
+                            identity: identity.clone(),
+                        },
+                        roots,
+                    ));
+                }
+            });
+            if state.stage.is_none() {
+                if let Some(plan) = inspection.plans.get(next_selected).cloned() {
+                    let left_candidates =
+                        show_plan(ui, state, plan, archive_path, identity, &game_root);
+                    if left_candidates {
+                        return;
+                    }
+                }
+                if state.stage.is_none() {
+                    state.stage = Some(Stage::Candidates(inspection, next_selected));
+                }
+            }
+        }
         Stage::Confirm(plan) => {
             widgets::card(ui, |ui| {
                 ui.label("Original game: unchanged");
@@ -433,7 +567,8 @@ fn show_plan(
     archive_path: &std::path::Path,
     identity: &GameIdentityReport,
     game_root: &std::path::Path,
-) {
+) -> bool {
+    let mut left_candidates = false;
     widgets::card(ui, |ui| {
         if let Some(package) = plan.package.as_ref() {
             ui.heading(format!("{} {}", package.title, package.version));
@@ -498,9 +633,11 @@ fn show_plan(
         .clicked()
         {
             state.stage = None;
+            left_candidates = true;
         }
     });
     let _ = (archive_path, identity);
+    left_candidates
 }
 
 #[cfg(test)]
@@ -512,7 +649,9 @@ mod tests {
         GameIdentityReport, IdentityConfidence, IdentityEvidence, IdentityImageFormat,
         IdentityKind, IdentityPlatform, IdentityProvenance, IdentityStatus,
     };
-    use archivefs_core::mod_package::{LocalModPackageRequest, SelectedGameForMod};
+    use archivefs_core::mod_package::{
+        LocalModPackageRequest, SelectedGameForMod, inspect_local_mod_package,
+    };
     use archivefs_core::patch_manager::{
         SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus, execute_shared_apply,
     };
@@ -645,6 +784,59 @@ mod tests {
         assert!(text_contains(&output, "Choose local mod folder"));
         assert!(!text_contains(&output, "Confirm apply"));
         assert!(!text_contains(&output, "Mod apply finished"));
+    }
+
+    #[test]
+    fn multiple_local_candidates_render_with_plain_states() {
+        let (_temp, game_root, package_root) = scenario(
+            r#"{"kind":"replace","payload":"p/new.bin","destination":"game.bin"}"#,
+            Some(("p/new.bin", b"replacement")),
+        );
+        let archive = game_root.join("game.bin");
+        let id = identity(&archive);
+        let selected = plan_for(&game_root, &package_root);
+        let mut review = selected.clone();
+        review.package_root = game_root.join("review-mod");
+        review.package.as_mut().unwrap().package_id = "review.mod".into();
+        review.package.as_mut().unwrap().title = "Review Mod".into();
+        review.compatibility.state = ModCompatibilityState::Unknown;
+        review.eligible_for_later_apply = false;
+        let inspection = LocalModPackageCandidateInspection {
+            plans: vec![review, selected],
+            blockers: Vec::new(),
+        };
+        let mut state = LocalModPackagePageState {
+            key: Some((archive.clone(), game_root.clone())),
+            stage: Some(Stage::Candidates(inspection, 1)),
+        };
+        let output = render(&mut state, &archive, Some(&id));
+        assert!(text_contains(&output, "Local mod candidates"));
+        assert!(text_contains(&output, "Review Mod"));
+        assert!(text_contains(&output, "Needs game identity"));
+        assert!(text_contains(&output, "Ready to apply"));
+        assert!(text_contains(&output, "Choose another folder"));
+    }
+
+    #[test]
+    fn candidate_order_prioritizes_compatible_then_review_then_incompatible() {
+        let (_temp, game_root, package_root) = scenario(
+            r#"{"kind":"replace","payload":"p/new.bin","destination":"game.bin"}"#,
+            Some(("p/new.bin", b"replacement")),
+        );
+        let mut compatible = plan_for(&game_root, &package_root);
+        compatible.package.as_mut().unwrap().package_id = "z-compatible".into();
+        let mut review = compatible.clone();
+        review.package.as_mut().unwrap().package_id = "a-review".into();
+        review.compatibility.state = ModCompatibilityState::Unknown;
+        review.eligible_for_later_apply = false;
+        let mut incompatible = compatible.clone();
+        incompatible.package.as_mut().unwrap().package_id = "a-incompatible".into();
+        incompatible.compatibility.state = ModCompatibilityState::Incompatible;
+        incompatible.eligible_for_later_apply = false;
+        let plans = vec![incompatible, review, compatible];
+        let order = candidate_order(&plans);
+        assert_eq!(order, vec![2, 1, 0]);
+        assert_eq!(best_candidate_index(&plans), 2);
     }
 
     #[test]
