@@ -2352,9 +2352,22 @@ pub(crate) fn show_archive_rows(
             .map(|indices| indices[visible_index])
             .unwrap_or(visible_index);
         let row = &rows[row_index];
+        let dat_status = menu_context
+            .cached
+            .and_then(|cached| {
+                cached
+                    .archives
+                    .iter()
+                    .find(|archive| archive.absolute_path == row.path)
+                    .and_then(|archive| cached.dat_identities.get(&archive.id))
+            })
+            .and_then(|summaries| crate::dat_identity_panel::compact_status_label(summaries));
+        let state_cell = dat_status
+            .map(|status| format!("{} · DAT: {status}", row.state))
+            .unwrap_or_else(|| row.state.clone());
         let cells = [
             row.platform.as_str(),
-            row.state.as_str(),
+            state_cell.as_str(),
             row.archive_path.as_str(),
             row.mount_path.as_str(),
         ];

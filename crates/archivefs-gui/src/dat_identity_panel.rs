@@ -50,6 +50,33 @@ pub(crate) enum DatIdentityStatus {
     NotCheckedYet,
 }
 
+/// Compact row/card wording derived from the same detailed presentation.
+/// This is intentionally a small projection: the selected-game panel remains
+/// the place for hashes, provenance, candidates, and explanations.
+pub(crate) fn compact_status_label(
+    summaries: &[LibraryDatIdentitySummary],
+) -> Option<&'static str> {
+    if summaries.is_empty() {
+        return None;
+    }
+    let presentations = summaries.iter().map(present_summary).collect::<Vec<_>>();
+    if presentations
+        .iter()
+        .any(|presentation| presentation.status == DatIdentityStatus::NeedsReview)
+        || presentations.len() > 1
+    {
+        return Some("Ambiguous");
+    }
+    Some(match presentations[0].status {
+        DatIdentityStatus::Verified => "Exact",
+        DatIdentityStatus::VerifiedNeedsRecheck => "Needs re-check",
+        DatIdentityStatus::LikelyMatch => "Probable",
+        DatIdentityStatus::NeedsReview => "Ambiguous",
+        DatIdentityStatus::NotFoundInDat | DatIdentityStatus::MoreEvidenceNeeded => "No match",
+        DatIdentityStatus::NotCheckedYet => "Not checked",
+    })
+}
+
 impl DatIdentityStatus {
     fn label(self) -> &'static str {
         match self {
@@ -1268,6 +1295,33 @@ mod tests {
         assert_eq!(
             catalogue_name_check(Some("whatever.bin"), &nameless),
             CatalogueNameCheck::Unknown
+        );
+    }
+
+    #[test]
+    fn compact_status_reuses_detailed_truth_without_promoting_weak_evidence() {
+        assert_eq!(
+            compact_status_label(&[summary(DatVerificationState::VerifiedSingleMatch {
+                algorithm: "SHA-1".into(),
+            })]),
+            Some("Exact")
+        );
+        assert_eq!(
+            compact_status_label(&[summary(DatVerificationState::Probable)]),
+            Some("Probable")
+        );
+        assert_eq!(
+            compact_status_label(&[summary(DatVerificationState::NoMatch)]),
+            Some("No match")
+        );
+        assert_eq!(
+            compact_status_label(&[summary(
+                DatVerificationState::AmbiguousMultipleCandidates {
+                    algorithm: "SHA-1".into(),
+                    candidate_count: 2,
+                },
+            )]),
+            Some("Ambiguous")
         );
     }
 }
