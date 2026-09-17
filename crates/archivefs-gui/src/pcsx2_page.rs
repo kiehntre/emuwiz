@@ -379,11 +379,27 @@ fn chain_health_label(chain: &Ps2ClusterChainHealth) -> (&'static str, widgets::
                 | archivefs_core::memory_card_inventory::Ps2CorruptionKind::ClusterOutOfRange
         )
     }) {
-        ("Corrupt chain", widgets::StatusTone::Warning)
-    } else if !chain.complete || !chain.warnings.is_empty() {
+        ("Corrupt", widgets::StatusTone::Warning)
+    } else if !chain.complete {
+        ("Incomplete", widgets::StatusTone::Warning)
+    } else if chain
+        .clusters
+        .windows(2)
+        .any(|clusters| clusters[1] != clusters[0].saturating_add(1))
+    {
+        ("Fragmented but readable", widgets::StatusTone::Success)
+    } else if !chain.warnings.is_empty() {
         ("Warning", widgets::StatusTone::Warning)
     } else {
         ("Healthy", widgets::StatusTone::Success)
+    }
+}
+
+fn save_health_label(directory: &Ps2SaveDirectory) -> (&'static str, widgets::StatusTone) {
+    if !directory.warnings.is_empty() || !directory.entry.warnings.is_empty() {
+        ("Needs review", widgets::StatusTone::Warning)
+    } else {
+        chain_health_label(&directory.chain_health)
     }
 }
 
@@ -748,9 +764,9 @@ fn show_memory_card_contents(
 ) {
     widgets::section_header(
         ui,
-        "Memory Card Contents",
+        "Save Vault · Memory Card Contents",
         Some(
-            "Read-only inventory of shared PS2 memory-card containers. A regular file can be copied out; the card is not modified.",
+            "Inspect PS2 memory-card saves and export one complete save as a PSU file. The card is read-only; restore/import is not available yet.",
         ),
     );
     if memory_cards.is_empty() {
@@ -764,6 +780,7 @@ fn show_memory_card_contents(
                 ui.heading("PS2 Memory Card");
                 widgets::status_badge(ui, health, tone);
             });
+            widgets::path_value(ui, "Source card", &card.path);
             ui.label(format!(
                 "{} save director{} · {} bytes · shared memory-card container",
                 card.ps2_inventory
@@ -810,11 +827,7 @@ fn show_memory_card_contents(
                 ui.label("No saves found on this memory card.");
             }
             for (save_index, directory) in directories.into_iter().enumerate() {
-                let (save_health, save_tone) = if !directory.warnings.is_empty() {
-                    ("Warning", widgets::StatusTone::Warning)
-                } else {
-                    chain_health_label(&directory.chain_health)
-                };
+                let (save_health, save_tone) = save_health_label(directory);
                 let id = ("ps2_memory_card_save", card_index, save_index);
                 ui.push_id(id, |ui| {
                     ui.collapsing(
@@ -1225,6 +1238,30 @@ mod tests {
     }
 
     #[test]
+    fn save_vault_uses_plain_health_states_and_names_the_source_card() {
+        let mut card = sample_ps2_card();
+        card.ps2_inventory.as_mut().unwrap().save_directories[0]
+            .chain_health
+            .clusters = vec![1, 4];
+        assert_eq!(
+            save_health_label(&card.ps2_inventory.as_ref().unwrap().save_directories[0]).0,
+            "Fragmented but readable"
+        );
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_memory_card_contents(ui, false, std::slice::from_ref(&card));
+            });
+        });
+        assert!(rendered_text_contains(&output, "Save Vault"));
+        assert!(rendered_text_contains(&output, "Source card"));
+        assert!(rendered_text_contains(
+            &output,
+            "restore/import is not available yet"
+        ));
+    }
+
+    #[test]
     fn directory_and_warned_files_do_not_expose_export_action() {
         let mut card = sample_ps2_card();
         card.ps2_inventory.as_mut().unwrap().save_directories[0].files[0]
@@ -1420,7 +1457,7 @@ mod tests {
         }
         assert!(rendered_text_contains(
             &output,
-            "regular file can be copied out"
+            "export one complete save as a PSU file"
         ));
     }
 }
