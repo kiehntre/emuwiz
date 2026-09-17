@@ -55,7 +55,7 @@ use archivefs_core::launch::{
     build_amiberry_whdload_command_plan, build_dolphin_command_plan,
     build_duckstation_command_plan, build_fsuae_whdload_command_plan, build_pcsx2_command_plan,
     build_ppsspp_command_plan, build_retroarch_command_plan, build_rpcs3_command_plan,
-    preflight_and_launch_amiga_whdload, preflight_and_launch_duckstation,
+    build_xenia_command_plan, preflight_and_launch_amiga_whdload, preflight_and_launch_duckstation,
     preflight_and_launch_ppsspp, preflight_and_launch_rpcs3, preflight_and_launch_xemu,
     preflight_and_launch_xenia,
 };
@@ -1866,6 +1866,7 @@ fn show_launch_recipe(
     duckstation: Option<&DuckStationLaunchContext>,
     ppsspp: Option<&PpssppLaunchContext>,
     rpcs3: Option<&Rpcs3LaunchContext>,
+    xenia: Option<&XeniaLaunchContext>,
 ) {
     let (emulator, profile) = target_labels(&candidate.target);
     let system = plan.platform_id.as_deref().unwrap_or("Unknown system");
@@ -1884,6 +1885,7 @@ fn show_launch_recipe(
         duckstation,
         ppsspp,
         rpcs3,
+        xenia,
     );
     let readiness = readiness_label_and_tone(candidate.readiness);
 
@@ -1955,6 +1957,7 @@ fn launch_command_preview(
     duckstation: Option<&DuckStationLaunchContext>,
     ppsspp: Option<&PpssppLaunchContext>,
     rpcs3: Option<&Rpcs3LaunchContext>,
+    xenia: Option<&XeniaLaunchContext>,
 ) -> Option<LaunchCommandSpec> {
     let identity = preview_identity(plan);
     match &candidate.target {
@@ -2041,6 +2044,24 @@ fn launch_command_preview(
                 build_rpcs3_command_plan(&identity, title_id, candidate, &binding)
                     .command
                     .map(|command| command.command_spec())
+            }
+            "xenia" => {
+                let context = xenia?;
+                let profile = context
+                    .discovery
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)?;
+                let binding = archivefs_core::patch_manager::resolve_xenia_launch_binding(profile);
+                build_xenia_command_plan(
+                    &identity,
+                    context.verified_xex_title_id.as_deref(),
+                    context.verified_xex_media_id.as_deref(),
+                    candidate,
+                    &binding,
+                )
+                .command
+                .map(|command| command.command_spec())
             }
             _ => None,
         },
@@ -2605,6 +2626,7 @@ fn show_candidate(
             duckstation,
             ppsspp,
             rpcs3,
+            xenia,
         );
 
         open_doctor = show_firmware_summary(ui, candidate);

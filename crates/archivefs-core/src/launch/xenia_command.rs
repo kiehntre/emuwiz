@@ -37,6 +37,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::launch::planning::{CanonicalIdentityStatus, LaunchCandidate, LaunchTarget};
+use crate::launch::process_spawn::LaunchCommandSpec;
 use crate::launch::readiness::{LaunchBlocker, LaunchBlockerKind, LaunchReadiness};
 use crate::patch_manager::{XeniaLaunchBinding, XeniaLaunchBlocker};
 
@@ -57,6 +58,17 @@ pub struct XeniaCommand {
     pub arguments: Vec<OsString>,
     pub working_directory: Option<PathBuf>,
     pub selection: XeniaCommandSelection,
+}
+
+impl XeniaCommand {
+    /// Projects the pure typed command into the shared preview/spawn shape.
+    pub fn command_spec(&self) -> LaunchCommandSpec {
+        LaunchCommandSpec {
+            executable: self.executable.clone(),
+            arguments: self.arguments.clone(),
+            working_directory: self.working_directory.clone(),
+        }
+    }
 }
 
 /// The facts that produced the command's argv - profile, platform, verified

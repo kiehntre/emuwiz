@@ -66,6 +66,10 @@ fn verified_supported_content_produces_an_exact_argv_launch_plan() {
         vec![OsString::from("/games/Halo 3/default.xex")]
     );
     assert_eq!(command.working_directory, None);
+    let spec = command.command_spec();
+    assert_eq!(spec.executable, command.executable);
+    assert_eq!(spec.arguments, command.arguments);
+    assert_eq!(spec.working_directory, command.working_directory);
     assert_eq!(command.selection.platform_id, "Xbox360");
     assert_eq!(
         command.selection.verified_xex_title_id,

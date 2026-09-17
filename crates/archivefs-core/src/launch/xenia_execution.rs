@@ -70,9 +70,7 @@ use crate::launch::integration::{
 use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentRef, LaunchTarget,
 };
-use crate::launch::process_spawn::{
-    self, CapturedFileIdentity, PreparedProcessCommand, ProcessExitReport, WatchedProcess,
-};
+use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
 use crate::launch::readiness::LaunchReadiness;
 use crate::launch::xenia_command::{
     XENIA_SUPPORTED_PLATFORM_ID, XeniaCommand, build_xenia_command_plan, direct_xex_extension,
@@ -636,11 +634,7 @@ impl LaunchedXeniaProcess {
 /// policy (stdin/stdout/stderr, environment, no timeout/kill).
 pub fn spawn_xenia(command: XeniaCommand) -> Result<LaunchedXeniaProcess, XeniaLaunchSpawnError> {
     let facts = command_facts(&command);
-    let prepared = PreparedProcessCommand {
-        executable: command.executable,
-        arguments: command.arguments,
-        working_directory: command.working_directory,
-    };
+    let prepared = command.command_spec();
     let watched =
         process_spawn::spawn_watched_process(&prepared).map_err(XeniaLaunchSpawnError::Spawn)?;
     Ok(LaunchedXeniaProcess {
