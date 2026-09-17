@@ -128,10 +128,8 @@ pub fn inspect_archived_mod_package_for_game(
     }
     let mut patches = Vec::new();
     if plan.format == ArchiveFormat::Zip && plan.eligibility == ArchiveEligibility::Ready {
-        let temp = std::env::temp_dir().join(format!("emuwiz-mod-inspect-{}", std::process::id()));
-        fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
-        let result = inspect_zip_patches(&path, &patch_paths, &temp, &mut patches);
-        let _ = fs::remove_dir_all(&temp);
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let result = inspect_zip_patches(&path, &patch_paths, temp.path(), &mut patches);
         result?;
     } else if !patch_paths.is_empty() {
         warnings.push("patch members are listed but their bytes were not extracted by the external archive adapter".into());
@@ -331,7 +329,7 @@ mod tests {
 
     #[test]
     fn zip_projects_patch_readme_and_executable_without_mutation() {
-        let (dir, path) = zip_fixture(&[
+        let (_dir, path) = zip_fixture(&[
             ("README.md", b"Chrono Translation\n"),
             ("patch.ips", b"PATCHEOF"),
             ("tools/install.exe", b"MZ"),
@@ -361,7 +359,26 @@ mod tests {
         );
         assert_eq!(fs::read(&path).unwrap(), before);
         assert!(report.no_changes_made);
-        assert!(!dir.path().join("emuwiz-mod-inspect").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_inspection_does_not_follow_a_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, path) = zip_fixture(&[("patch.ips", b"PATCHEOF")]);
+        let outside = dir.path().join("outside");
+        fs::write(&outside, b"sentinel").unwrap();
+        let legacy_temp = std::env::temp_dir().join(format!("emuwiz-mod-inspect-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&legacy_temp);
+        fs::create_dir(&legacy_temp).unwrap();
+        symlink(&outside, legacy_temp.join("patch-0")).unwrap();
+
+        let report = inspect_archived_mod_package(&path).unwrap();
+
+        assert_eq!(fs::read(&outside).unwrap(), b"sentinel");
+        assert_eq!(report.patches.len(), 1);
+        fs::remove_dir_all(legacy_temp).unwrap();
     }
 
     #[test]

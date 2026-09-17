@@ -152,6 +152,7 @@ xdvdfs = { version = "0.8.3", default-features = false, features = ["read", "std
 # solely through its `BlockDevice` trait, which our partition-range adapter
 # backs with positional reads and a hard read budget.
 affs-read = "0.4.1"
+tempfile = "3"
 
 [features]
 default = ["dreamcast-cdi"]
@@ -188,4 +189,3 @@ sevenz-rust2 = { version = "0.21.4", default-features = false, features = [
 # --release` (no test targets) never links any codec this crate does not
 # itself need.
 zip = { version = "8.6", features = ["deflate", "aes-crypto"] }
-tempfile = "3"
