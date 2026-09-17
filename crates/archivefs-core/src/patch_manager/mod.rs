@@ -803,8 +803,10 @@ pub use vita3k_local::{
     VITA3K_MAX_CONFIG_BYTES, VITA3K_MAX_PROFILES, VITA3K_MAX_SFO_BYTES, Vita3kConfigInspection,
     Vita3kContentDisposition, Vita3kDiscoveryError, Vita3kExecutable, Vita3kFirmwareState,
     Vita3kInstallationType, Vita3kInstalledTitle, Vita3kLaunchBlocker, Vita3kLaunchBlockerKind,
-    Vita3kLicenseState, Vita3kNativeLaunchBinding, Vita3kProfile, Vita3kProfileDiscovery,
-    Vita3kProfileDiscoveryRoots, classify_vita3k_content, discover_vita3k_profiles,
+    Vita3kLicenseState, Vita3kNativeLaunchBinding, Vita3kProfile, Vita3kProfileBlocker,
+    Vita3kProfileBlockerKind, Vita3kProfileDiscovery, Vita3kProfileDiscoveryRoots,
+    Vita3kProfileReadiness, Vita3kReadinessEvidence, assess_vita3k_profile,
+    assess_vita3k_readiness, classify_vita3k_content, discover_vita3k_profiles,
     inspect_installed_title, parse_vita3k_version, resolve_vita3k_native_launch_binding,
 };
 pub use xemu_local::{

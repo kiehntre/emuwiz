@@ -9,7 +9,7 @@ use crate::launch::process_spawn::{
 };
 use crate::launch::vita3k_command::VITA3K_SUPPORTED_PLATFORM_ID;
 use crate::patch_manager::{
-    Vita3kProfileDiscoveryRoots, discover_vita3k_profiles, inspect_installed_title,
+    Vita3kProfileDiscoveryRoots, assess_vita3k_readiness, discover_vita3k_profiles,
     resolve_vita3k_native_launch_binding,
 };
 
@@ -91,21 +91,28 @@ pub fn preflight_vita3k_launch(
             "installed title changed since authorization",
         ));
     }
-    let title = inspect_installed_title(
-        &discover_vita3k_profiles(roots)
-            .profiles
-            .into_iter()
-            .find(|profile| profile.profile_id == request.profile_id)
-            .ok_or_else(|| {
-                preflight_error(
-                    Vita3kLaunchPreflightErrorKind::ProfileNotFound,
-                    "authorized Vita3K profile was not rediscovered",
-                )
-            })?,
-        &request.expected_title_id,
-    )
-    .map_err(|detail| {
-        preflight_error(Vita3kLaunchPreflightErrorKind::TitleMetadataInvalid, detail)
+    let profile = discover_vita3k_profiles(roots)
+        .profiles
+        .into_iter()
+        .find(|profile| profile.profile_id == request.profile_id)
+        .ok_or_else(|| {
+            preflight_error(
+                Vita3kLaunchPreflightErrorKind::ProfileNotFound,
+                "authorized Vita3K profile was not rediscovered",
+            )
+        })?;
+    let readiness = assess_vita3k_readiness(
+        &profile,
+        Some(&request.expected_title_id),
+        Some(&request.selected_title_path),
+    );
+    let title = readiness.title.ok_or_else(|| {
+        preflight_error(
+            Vita3kLaunchPreflightErrorKind::TitleMetadataInvalid,
+            readiness
+                .first_blocker
+                .unwrap_or_else(|| "installed Vita title is not ready".into()),
+        )
     })?;
     if title.title_id != request.expected_title_id {
         return Err(preflight_error(
@@ -128,16 +135,6 @@ pub fn preflight_vita3k_launch(
         }
     };
     let _ = resolved;
-    let profile = discover_vita3k_profiles(roots)
-        .profiles
-        .into_iter()
-        .find(|profile| profile.profile_id == request.profile_id)
-        .ok_or_else(|| {
-            preflight_error(
-                Vita3kLaunchPreflightErrorKind::ProfileNotFound,
-                "authorized Vita3K profile was not rediscovered",
-            )
-        })?;
     if !profile.eligible {
         return Err(preflight_error(
             Vita3kLaunchPreflightErrorKind::ProfileIneligible,

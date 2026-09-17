@@ -303,6 +303,137 @@ pub struct Vita3kInstalledTitle {
     pub license: Vita3kLicenseState,
 }
 
+/// The adapter-local profile evidence used by launch binding and future
+/// Doctor projection. This is deliberately a projection of the already
+/// discovered profile; it does not perform a second filesystem search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vita3kProfileReadiness {
+    pub profile_id: String,
+    pub executable: Option<Vita3kExecutable>,
+    pub version: Option<String>,
+    pub config: Option<Vita3kConfigInspection>,
+    pub firmware: Vita3kFirmwareState,
+    pub vita_fs_path: PathBuf,
+    pub blockers: Vec<Vita3kProfileBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vita3kProfileBlocker {
+    pub kind: Vita3kProfileBlockerKind,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vita3kProfileBlockerKind {
+    ExecutableMissing,
+    ConfigurationUnreadable,
+    VitaFilesystemUnavailable,
+}
+
+/// Read-only selected-title evidence composed from the profile readiness,
+/// installed-title inspection, and content classifier. `title_id` and
+/// `content_path` are optional because a Doctor/profile scan may not have a
+/// selected game yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vita3kReadinessEvidence {
+    pub profile: Vita3kProfileReadiness,
+    pub title: Option<Vita3kInstalledTitle>,
+    pub license: Option<Vita3kLicenseState>,
+    pub content: Option<Vita3kContentDisposition>,
+    pub title_blocker: Option<String>,
+    pub content_blocker: Option<String>,
+    pub first_blocker: Option<String>,
+    pub ready: bool,
+}
+
+pub fn assess_vita3k_profile(profile: &Vita3kProfile) -> Vita3kProfileReadiness {
+    let executable = profile.executable_candidates.first().cloned();
+    let version = executable
+        .as_ref()
+        .and_then(|candidate| candidate.version.clone());
+    let mut blockers = Vec::new();
+    if executable.is_none() {
+        blockers.push(Vita3kProfileBlocker {
+            kind: Vita3kProfileBlockerKind::ExecutableMissing,
+            detail: "no safe Vita3K executable was discovered".into(),
+        });
+    }
+    if profile
+        .config
+        .as_ref()
+        .is_some_and(|config| !config.readable)
+    {
+        blockers.push(Vita3kProfileBlocker {
+            kind: Vita3kProfileBlockerKind::ConfigurationUnreadable,
+            detail: "Vita3K configuration is unreadable or oversized".into(),
+        });
+    }
+    if !directory(&profile.vita_fs_path) {
+        blockers.push(Vita3kProfileBlocker {
+            kind: Vita3kProfileBlockerKind::VitaFilesystemUnavailable,
+            detail: "Vita3K emulated filesystem is missing or unsafe".into(),
+        });
+    }
+    Vita3kProfileReadiness {
+        profile_id: profile.profile_id.clone(),
+        executable,
+        version,
+        config: profile.config.clone(),
+        firmware: profile.firmware,
+        vita_fs_path: profile.vita_fs_path.clone(),
+        blockers,
+    }
+}
+
+pub fn assess_vita3k_readiness(
+    profile: &Vita3kProfile,
+    title_id: Option<&str>,
+    content_path: Option<&Path>,
+) -> Vita3kReadinessEvidence {
+    let profile_readiness = assess_vita3k_profile(profile);
+    let (title, title_blocker) = match title_id {
+        Some(title_id) => match inspect_installed_title(profile, title_id) {
+            Ok(title) => (Some(title), None),
+            Err(detail) => (None, Some(detail)),
+        },
+        None => (None, None),
+    };
+    let license = title.as_ref().map(|title| title.license);
+    let content = content_path.map(classify_vita3k_content).or_else(|| {
+        title
+            .as_ref()
+            .map(|_| Vita3kContentDisposition::InstalledTitle)
+    });
+    let content_blocker = match content {
+        Some(Vita3kContentDisposition::InstallPackage) => {
+            Some("Vita3K install packages are not launchable content".into())
+        }
+        Some(Vita3kContentDisposition::UnsupportedDirectContent) => {
+            Some("content is not an installed Vita3K title".into())
+        }
+        _ => None,
+    };
+    let license_blocker = matches!(license, Some(Vita3kLicenseState::Missing))
+        .then(|| "installed Vita title license is missing".to_string());
+    let first_blocker = profile_readiness
+        .blockers
+        .first()
+        .map(|blocker| blocker.detail.clone())
+        .or_else(|| title_blocker.clone())
+        .or(license_blocker)
+        .or_else(|| content_blocker.clone());
+    Vita3kReadinessEvidence {
+        profile: profile_readiness,
+        title,
+        license,
+        content,
+        title_blocker,
+        content_blocker,
+        ready: first_blocker.is_none(),
+        first_blocker,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vita3kNativeLaunchBinding {
     pub executable: PathBuf,
@@ -325,9 +456,10 @@ pub enum Vita3kLaunchBlockerKind {
 pub fn resolve_vita3k_native_launch_binding(
     profile: &Vita3kProfile,
 ) -> Result<Vita3kNativeLaunchBinding, Vita3kLaunchBlocker> {
-    let executable = profile
-        .executable_candidates
-        .first()
+    let readiness = assess_vita3k_profile(profile);
+    let executable = readiness
+        .executable
+        .as_ref()
         .ok_or_else(|| Vita3kLaunchBlocker {
             kind: Vita3kLaunchBlockerKind::NoExecutable,
             detail: "no safe Vita3K executable is available".into(),
@@ -343,7 +475,7 @@ pub fn resolve_vita3k_native_launch_binding(
     }
     Ok(Vita3kNativeLaunchBinding {
         executable: executable.path.clone(),
-        profile_id: profile.profile_id.clone(),
+        profile_id: readiness.profile_id,
     })
 }
 
@@ -413,6 +545,90 @@ pub fn classify_vita3k_content(path: &Path) -> Vita3kContentDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn profile_fixture(
+        root: &Path,
+        executable: Option<&Path>,
+        firmware: Vita3kFirmwareState,
+    ) -> Vita3kProfile {
+        let vita_fs_path = root.join("ux0");
+        fs::create_dir_all(&vita_fs_path).unwrap();
+        let executable_candidates = executable
+            .map(|path| {
+                fs::write(path, b"vita3k").unwrap();
+                Vita3kExecutable {
+                    path: path.to_path_buf(),
+                    installation_type: Vita3kInstallationType::Explicit,
+                    version: Some("0.2.0".into()),
+                }
+            })
+            .into_iter()
+            .collect();
+        Vita3kProfile {
+            profile_id: "vita3k-test".into(),
+            installation_type: Vita3kInstallationType::Explicit,
+            configuration_path: root.join("config.yml"),
+            config_path: Some(root.join("config.yml")),
+            vita_fs_path: vita_fs_path.clone(),
+            firmware,
+            eligible: true,
+            blocker: None,
+            executable_candidates,
+            config: Some(Vita3kConfigInspection {
+                path: root.join("config.yml"),
+                readable: true,
+                vita_fs_path: Some(vita_fs_path),
+            }),
+        }
+    }
+
+    fn sfo(entries: &[(&str, &str)]) -> Vec<u8> {
+        let index_table_len = entries.len() * 16;
+        let key_table_start = 20 + index_table_len;
+        let mut key_table = Vec::new();
+        let mut key_offsets = Vec::new();
+        for (key, _) in entries {
+            key_offsets.push(key_table.len() as u16);
+            key_table.extend_from_slice(key.as_bytes());
+            key_table.push(0);
+        }
+        while key_table.len() % 4 != 0 {
+            key_table.push(0);
+        }
+        let data_table_start = key_table_start + key_table.len();
+        let mut data_table = Vec::new();
+        let mut data_offsets = Vec::new();
+        for (_, value) in entries {
+            data_offsets.push(data_table.len() as u32);
+            data_table.extend_from_slice(value.as_bytes());
+            data_table.push(0);
+        }
+        let mut output = vec![0u8; 20];
+        output[0..4].copy_from_slice(&[0, b'P', b'S', b'F']);
+        output[4..8].copy_from_slice(&0x0101_u32.to_le_bytes());
+        output[8..12].copy_from_slice(&(key_table_start as u32).to_le_bytes());
+        output[12..16].copy_from_slice(&(data_table_start as u32).to_le_bytes());
+        output[16..20].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (index_number, ((_, value), (key_offset, data_offset))) in entries
+            .iter()
+            .zip(key_offsets.into_iter().zip(data_offsets))
+            .enumerate()
+        {
+            let mut index = [0u8; 16];
+            index[0..2].copy_from_slice(&key_offset.to_le_bytes());
+            index[2..4].copy_from_slice(&0x0204_u16.to_le_bytes());
+            let value_len = (value.len() + 1) as u32;
+            index[4..8].copy_from_slice(&value_len.to_le_bytes());
+            index[8..12].copy_from_slice(&value_len.to_le_bytes());
+            index[12..16].copy_from_slice(&data_offset.to_le_bytes());
+            output.extend_from_slice(&index);
+            debug_assert_eq!(index_number, output[16..].chunks_exact(16).count() - 1);
+        }
+        output.extend_from_slice(&key_table);
+        output.extend_from_slice(&data_table);
+        output
+    }
 
     #[test]
     fn version_is_bounded_to_vita3k_lines() {
@@ -434,5 +650,120 @@ mod tests {
             classify_vita3k_content(Path::new("game.iso")),
             Vita3kContentDisposition::UnsupportedDirectContent
         );
+    }
+
+    #[test]
+    fn profile_projection_exposes_authoritative_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("vita3k");
+        let profile = profile_fixture(
+            root.path(),
+            Some(&executable),
+            Vita3kFirmwareState::PresentUnverified,
+        );
+        let readiness = assess_vita3k_profile(&profile);
+        assert_eq!(readiness.executable.unwrap().path, executable);
+        assert_eq!(readiness.version.as_deref(), Some("0.2.0"));
+        assert!(readiness.config.unwrap().readable);
+        assert_eq!(readiness.firmware, Vita3kFirmwareState::PresentUnverified);
+        assert!(readiness.blockers.is_empty());
+    }
+
+    #[test]
+    fn profile_blockers_have_deterministic_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut profile = profile_fixture(root.path(), None, Vita3kFirmwareState::Missing);
+        profile.config = Some(Vita3kConfigInspection {
+            path: root.path().join("config.yml"),
+            readable: false,
+            vita_fs_path: None,
+        });
+        profile.vita_fs_path = root.path().join("missing-ux0");
+        let readiness = assess_vita3k_profile(&profile);
+        assert_eq!(
+            readiness
+                .blockers
+                .iter()
+                .map(|blocker| blocker.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                Vita3kProfileBlockerKind::ExecutableMissing,
+                Vita3kProfileBlockerKind::ConfigurationUnreadable,
+                Vita3kProfileBlockerKind::VitaFilesystemUnavailable,
+            ]
+        );
+        assert_eq!(readiness.firmware, Vita3kFirmwareState::Missing);
+    }
+
+    #[test]
+    fn readiness_distinguishes_title_license_and_content_without_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("vita3k");
+        let profile = profile_fixture(
+            root.path(),
+            Some(&executable),
+            Vita3kFirmwareState::PresentUnverified,
+        );
+        let title_id = "PCSA00001";
+        let title_root = profile.vita_fs_path.join("app").join(title_id);
+        fs::create_dir_all(title_root.join("sce_sys")).unwrap();
+        fs::write(
+            title_root.join("sce_sys/param.sfo"),
+            sfo(&[
+                ("TITLE_ID", title_id),
+                ("TITLE", "Test Game"),
+                ("CATEGORY", "GD"),
+            ]),
+        )
+        .unwrap();
+        fs::create_dir_all(profile.vita_fs_path.join("license/app").join(title_id)).unwrap();
+        let marker = root.path().join("marker");
+        fs::write(&marker, b"unchanged").unwrap();
+        let before = fs::read(&marker).unwrap();
+
+        let evidence = assess_vita3k_readiness(&profile, Some(title_id), Some(&title_root));
+        assert_eq!(evidence.title.as_ref().unwrap().title_id, title_id);
+        assert_eq!(
+            evidence.license,
+            Some(Vita3kLicenseState::PresentUnverified)
+        );
+        assert_eq!(
+            evidence.content,
+            Some(Vita3kContentDisposition::InstalledTitle)
+        );
+        assert!(evidence.ready);
+        assert!(evidence.first_blocker.is_none());
+        assert_eq!(fs::read(marker).unwrap(), before);
+    }
+
+    #[test]
+    fn readiness_reports_missing_title_license_and_package_blockers() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = profile_fixture(root.path(), None, Vita3kFirmwareState::Unknown);
+        let package = root.path().join("game.vpk");
+        fs::write(&package, b"package").unwrap();
+        let evidence = assess_vita3k_readiness(&profile, Some("PCSA00001"), Some(&package));
+        assert!(evidence.title.is_none());
+        assert_eq!(
+            evidence.title_blocker.as_deref(),
+            Some("the exact Vita title ID is not installed")
+        );
+        assert_eq!(
+            evidence.content,
+            Some(Vita3kContentDisposition::InstallPackage)
+        );
+        assert!(evidence.content_blocker.is_some());
+        assert!(!evidence.ready);
+        assert!(evidence.first_blocker.is_some());
+    }
+
+    #[test]
+    fn launch_binding_reuses_profile_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("vita3k");
+        let profile = profile_fixture(root.path(), Some(&executable), Vita3kFirmwareState::Unknown);
+        let binding = resolve_vita3k_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, executable);
+        assert_eq!(binding.profile_id, "vita3k-test");
     }
 }
