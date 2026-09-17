@@ -3470,9 +3470,26 @@ fn format_library_scan(report: &LibraryScanReport) -> String {
 fn resolve_source_identifier(identifier: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let sources = load_source_folder_configs_default().map_err(|error| error.to_string())?;
     let database_path = default_database_path()?;
+    if !database_path.exists() {
+        return resolve_source_identifier_without_catalogue(identifier, &sources);
+    }
     let database = Database::open_read_only(&database_path)?;
     let records = database.list_source_folders()?;
     resolve_source_folder_identifier(identifier, &sources, &records)
+        .map_err(|error| error.to_string().into())
+}
+
+fn resolve_source_identifier_without_catalogue(
+    identifier: &str,
+    sources: &[archivefs_core::SourceFolderConfig],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if identifier.parse::<i64>().is_ok() {
+        return Err(
+            "No EmuWiz catalogue exists yet. Initialize the library or run the normal library scan first."
+                .into(),
+        );
+    }
+    resolve_source_folder_identifier(identifier, sources, &[])
         .map_err(|error| error.to_string().into())
 }
 
@@ -5931,6 +5948,25 @@ mod tests {
             explained.contains("emuwiz-cli config-check"),
             "expected the hint to point at config-check, got: {explained}"
         );
+    }
+
+    #[test]
+    fn source_scan_before_catalogue_initialization_resolves_path_or_explains_id() {
+        let sources = [archivefs_core::SourceFolderConfig {
+            path: PathBuf::from("/data/roms"),
+            enabled: true,
+            created_at: None,
+        }];
+
+        assert_eq!(
+            resolve_source_identifier_without_catalogue("/data/roms", &sources).unwrap(),
+            PathBuf::from("/data/roms")
+        );
+        let error = resolve_source_identifier_without_catalogue("7", &sources).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("No EmuWiz catalogue exists yet"));
+        assert!(error.to_string().contains("library scan first"));
     }
 
     /// A dangling symlink at the config path is a real misconfiguration
