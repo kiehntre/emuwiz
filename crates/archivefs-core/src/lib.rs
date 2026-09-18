@@ -298,6 +298,7 @@ pub mod raw_cd_logical_media;
 /// native-dependency tradeoffs of enabling it.
 #[cfg(feature = "chd-optical-specialist")]
 pub mod chd_optical_specialist;
+pub mod conversion_planner;
 
 /// Dreamcast DiscJuggler `.cdi` identity support, behind the
 /// `dreamcast-cdi` feature (default-on). Independent of
