@@ -886,7 +886,10 @@ fn selected_archive_and_filters_survive_a_library_tab_switch() {
         "Health filter state must survive switching tabs"
     );
     assert_eq!(
-        app.health_duplicate_ui.duplicate_filters.platform.as_deref(),
+        app.health_duplicate_ui
+            .duplicate_filters
+            .platform
+            .as_deref(),
         Some("SNES"),
         "Duplicate filter state must survive switching tabs"
     );
@@ -3835,64 +3838,34 @@ fn render_sidebar_at_height(
     )
 }
 
-/// The regression this whole fix addresses: at a short window height, the
-/// last group's entry ("Settings") must not simply be clipped out of
-/// existence. Proving it via rendered text alone is not enough - an egui
-/// `ScrollArea` only *paints* whatever fits in its current scroll offset,
-/// so an unscrolled short viewport legitimately shows nothing below the
-/// fold on the very first frame, scrollable or not. The proof a scroll
-/// container exists (rather than a plain `Ui` that would clip permanently)
-/// is that a mouse-wheel scroll event over the sidebar changes what is
-/// visible - the same technique already used for the platform shelf's own
-/// scroll strip in this file.
+/// Seven destinations fit even in a short desktop window without scrolling.
 #[test]
-fn low_sidebar_destinations_become_visible_after_scrolling_a_short_sidebar() {
+fn settings_is_visible_without_scrolling_a_short_sidebar() {
     let context = egui::Context::default();
-
-    let unscrolled = render_sidebar_at_height(&context, 400.0, Vec::new());
-    assert!(
-        rendered_text_contains(&unscrolled, "Home"),
-        "the topmost destination must render without any scrolling"
-    );
-    assert!(
-        !rendered_text_contains(&unscrolled, "Settings"),
-        "a 400px-tall sidebar showing every group unscrolled would defeat this test's premise \
-         (nothing to prove by scrolling) - Settings must start out of view"
-    );
-
-    let scroll_down = vec![
-        egui::Event::PointerMoved(egui::pos2(100.0, 200.0)),
-        egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(0.0, -2000.0),
-            phase: egui::TouchPhase::Move,
-            modifiers: egui::Modifiers::default(),
-        },
-    ];
-    // A couple of frames: one to deliver the wheel event, one to settle the
-    // resulting scroll offset before painting.
-    let _ = render_sidebar_at_height(&context, 400.0, scroll_down);
-    let scrolled = render_sidebar_at_height(&context, 400.0, Vec::new());
-    assert!(
-        rendered_text_contains(&scrolled, "Settings"),
-        "scrolling the sidebar down must reveal the last group's destination"
-    );
-    assert!(
-        rendered_text_contains(&scrolled, "Library View History"),
-        "scrolling must also reach History & Journals, not only the very last entry"
-    );
+    let output = render_sidebar_at_height(&context, 400.0, Vec::new());
+    for (_, label, _) in navigation::primary::PRIMARY {
+        assert!(
+            rendered_text_contains(&output, label),
+            "{label} must be visible"
+        );
+    }
+    assert!(!rendered_text_contains(&output, "Library View History"));
 }
 
 /// Quick Rename must survive at every scroll position it can reach - this
 /// fix must not have moved, hidden, or duplicated it while adding the
 /// scroll container.
 #[test]
-fn quick_rename_remains_reachable_in_the_scrollable_sidebar() {
+fn quick_rename_moves_beneath_organise_instead_of_the_primary_sidebar() {
     let context = egui::Context::default();
     let unscrolled = render_sidebar_at_height(&context, 400.0, Vec::new());
     assert!(
-        rendered_text_contains(&unscrolled, "Quick Rename"),
-        "Quick Rename sits in the LIBRARY group, near the top - it must not have been pushed \
-         out of the initial, unscrolled view"
+        !rendered_text_contains(&unscrolled, "Quick Rename"),
+        "Quick Rename must not remain a primary row"
+    );
+    assert!(
+        navigation::primary::entries(navigation::primary::Destination::Organise)
+            .iter()
+            .any(|entry| entry.label == "Clean & Rename" && entry.click == NavClick::QuickRename)
     );
 }

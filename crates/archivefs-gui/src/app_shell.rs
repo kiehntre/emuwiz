@@ -186,6 +186,16 @@ pub(crate) fn show_shell(context: &egui::Context, inputs: ShellInputs) -> Option
                     navigation_request = Some(ShellRequest::Navigate(click));
                 }
             });
+        egui::TopBottomPanel::top("task_subnavigation").show(context, |ui| {
+            if let Some(click) = crate::navigation::primary::show_subnavigation(
+                ui,
+                inputs.view,
+                inputs.tools_overlay,
+                inputs.has_database,
+            ) {
+                navigation_request = Some(ShellRequest::Navigate(click));
+            }
+        });
     } else {
         egui::TopBottomPanel::top("gamer_top_bar").show(context, |ui| {
             ui.horizontal(|ui| {

@@ -2056,7 +2056,9 @@ fn cached_health_issues_refreshes_when_recovery_offers_change() {
     let mut app = app_with_health_state(vec![record], Vec::new());
     assert!(app.cached_health_issues().is_empty());
 
-    app.mount_ui.remount_offers.insert(PathBuf::from("/roms/b.zip"));
+    app.mount_ui
+        .remount_offers
+        .insert(PathBuf::from("/roms/b.zip"));
     let issues = app.cached_health_issues();
 
     assert_eq!(
@@ -2201,56 +2203,31 @@ fn sources_and_tools_overlay_navigation_never_touches_library_state_or_activity(
     );
 }
 
-/// Mirrors `show_primary_navigation`'s exact layout (same widgets, same
-/// group order, same enabled/selected predicates) purely to discover each
-/// button's rendered `Rect` for click simulation. The production function
-/// itself only returns `Option<NavClick>`, not per-button geometry; egui's
-/// vertical layout is fully deterministic from widget order and size
-/// alone, so this mirror's rects match the real function's. Iterates the
-/// same `ADVANCED_NAV_GROUPS` const production uses (docs/
-/// GUI_NAVIGATION_RESET_DESIGN.md §3.2's grouped sidebar), so the mirror
-/// cannot drift from the real, grouped destination list. The actual click
-/// below is driven through the real production function, not this mirror.
+/// Discover primary button rectangles with the same small sidebar layout.
 fn primary_nav_rects(
     ctx: &egui::Context,
-    current: MainView,
-    current_overlay: ToolsOverlay,
-    has_database: bool,
+    _current: MainView,
+    _current_overlay: ToolsOverlay,
+    _has_database: bool,
 ) -> Vec<(NavClick, egui::Rect)> {
     let mut rects = Vec::new();
     let _ = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical(|ui| {
-                ui.label(egui::RichText::new("EmuWiz").size(23.0).strong());
-                ui.label(egui::RichText::new("Archive library manager").color(theme::muted(ui)));
-                ui.add_space(18.0);
-                for group in ADVANCED_NAV_GROUPS {
-                    if let Some(heading) = group.heading {
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(heading)
-                                .small()
-                                .strong()
-                                .color(theme::muted(ui)),
+            egui::ScrollArea::vertical()
+                .id_salt("primary_navigation_scroll")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new("EmuWiz").size(23.0).strong());
+                    ui.label(egui::RichText::new("Game library manager").color(theme::muted(ui)));
+                    ui.add_space(18.0);
+                    for (_, label, click) in navigation::primary::PRIMARY {
+                        let response = ui.add(
+                            egui::Button::selectable(false, label)
+                                .min_size(egui::vec2(ui.available_width(), 34.0)),
                         );
+                        rects.push((click, response.rect));
                     }
-                    for entry in group.entries {
-                        let (enabled, selected) = match entry.click {
-                            NavClick::View(view) => (
-                                navigation_destination_enabled(view, has_database),
-                                navigation_destination_selected(current, view),
-                            ),
-                            NavClick::Overlay(overlay) => (true, current_overlay == overlay),
-                            NavClick::QuickRename => (true, false),
-                            NavClick::Romm => (true, false),
-                        };
-                        let button = egui::Button::selectable(selected, entry.label)
-                            .min_size(egui::vec2(ui.available_width(), 30.0));
-                        let resp = ui.add_enabled(enabled, button);
-                        rects.push((entry.click, resp.rect));
-                    }
-                }
-            });
+                });
         });
     });
     rects
@@ -2260,9 +2237,9 @@ fn primary_nav_rects(
 fn all_navigation_destinations_are_reachable_via_a_real_click() {
     let ctx = egui::Context::default();
 
-    let all_destinations: Vec<NavClick> = ADVANCED_NAV_GROUPS
+    let all_destinations: Vec<NavClick> = navigation::primary::PRIMARY
         .iter()
-        .flat_map(|group| group.entries.iter().map(|entry| entry.click))
+        .map(|(_, _, click)| *click)
         .collect();
     for target in all_destinations {
         let rects = primary_nav_rects(&ctx, MainView::Library, ToolsOverlay::None, true);
@@ -2313,6 +2290,141 @@ fn about_is_no_longer_a_flat_sidebar_entry() {
             .iter()
             .any(|(click, _)| *click == NavClick::View(MainView::About)),
         "About must not render as a grouped sidebar entry any more"
+    );
+}
+
+#[test]
+fn stage1_navigation_changes_only_ui_state_and_preserves_backend_files() {
+    use navigation::primary::{PRIMARY, advanced_entries, entries, subviews};
+    let temp = tempfile::tempdir().unwrap();
+    let sentinel = temp.path().join("source.rom");
+    let catalogue = temp.path().join("catalogue.sqlite3");
+    std::fs::write(&sentinel, b"source must not change").unwrap();
+    std::fs::write(&catalogue, b"navigation must not open or migrate this").unwrap();
+    let mut app = app_for_operation_tests();
+    app.database_state = DatabaseState::NotCreated {
+        database_path: catalogue.clone(),
+    };
+    app.archive_context.focused = Some(sentinel.clone());
+    let context = egui::Context::default();
+    let generation = app.database_generation;
+    let mut expected_history_len = app.history.len();
+    let mut requests: Vec<_> = PRIMARY.iter().map(|(_, _, click)| *click).collect();
+    for (group, _, _) in PRIMARY {
+        requests.extend(entries(group).iter().map(|e| e.click));
+        requests.extend(advanced_entries(group).iter().map(|e| e.click));
+    }
+    for (view, _) in PRIMARY_NAVIGATION_DESTINATIONS {
+        requests.extend(subviews(view, ToolsOverlay::None).iter().map(|e| e.click));
+    }
+    for click in requests {
+        // The existing configuration diagnostics entry starts a read-only
+        // check and records one in-memory activity event, not a disk write.
+        if click == NavClick::Overlay(ToolsOverlay::Diagnostics) {
+            expected_history_len += 1;
+        }
+        app_reactions::apply_shell_request(
+            &mut app,
+            &context,
+            Some(app_shell::ShellRequest::Navigate(click)),
+        );
+        assert_eq!(app.archive_context.focused.as_ref(), Some(&sentinel));
+        assert_eq!(app.database_generation, generation);
+        assert!(matches!(
+            app.database_state,
+            DatabaseState::NotCreated { .. }
+        ));
+        assert!(app.sources_ui.source_action.is_none());
+        assert!(app.library_view_action.is_none());
+        assert!(app.shared_history_operation.is_none());
+        assert!(app.setup_action.is_none());
+        assert_eq!(app.history.len(), expected_history_len);
+    }
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"source must not change");
+    assert_eq!(
+        std::fs::read(catalogue).unwrap(),
+        b"navigation must not open or migrate this"
+    );
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn stage1_named_tasks_do_not_reopen_unrelated_remembered_tabs() {
+    let mut app = app_for_operation_tests();
+    let context = egui::Context::default();
+    app.sources_tab = SourcesTab::Dats;
+    app.problems_repair_tab = ProblemsRepairTab::Diagnostics;
+    app_reactions::apply_shell_request(
+        &mut app,
+        &context,
+        Some(app_shell::ShellRequest::Navigate(NavClick::View(
+            MainView::Sources,
+        ))),
+    );
+    assert_eq!(app.view, MainView::Sources);
+    app_reactions::apply_shell_request(
+        &mut app,
+        &context,
+        Some(app_shell::ShellRequest::Navigate(NavClick::View(
+            MainView::Problems,
+        ))),
+    );
+    assert_eq!(app.view, MainView::Problems);
+    for section in [
+        cheats_mods_preview::EnhancementSection::Cheats,
+        cheats_mods_preview::EnhancementSection::Mods,
+    ] {
+        app_reactions::apply_shell_request(
+            &mut app,
+            &context,
+            Some(app_shell::ShellRequest::Navigate(NavClick::Enhancement(
+                section,
+            ))),
+        );
+        assert_eq!(app.view, MainView::CheatsMods);
+        assert_eq!(
+            cheats_mods_preview::current_enhancement_section(&context),
+            section
+        );
+    }
+}
+
+#[test]
+fn stage1_saves_route_renders_existing_pcsx2_panel_without_starting_inspection() {
+    let mut app = app_for_operation_tests();
+    app.ui_mode = GuiMode::AdvancedView;
+    let context = egui::Context::default();
+    app_reactions::apply_shell_request(
+        &mut app,
+        &context,
+        Some(app_shell::ShellRequest::Navigate(NavClick::Overlay(
+            ToolsOverlay::SaveVault,
+        ))),
+    );
+    let output = context.run(egui::RawInput::default(), |context| {
+        let _ = app_pages::show_pages(
+            &mut app,
+            context,
+            app_pages::PageDispatchInputs {
+                busy: false,
+                archive_actions_blocked: false,
+                archive_action_block_reason: None,
+                action_readiness_debug_lines: vec![],
+                missing_removal_available: false,
+            },
+        );
+    });
+    assert!(rendered_text_contains(&output, "Saves"));
+    assert!(rendered_text_contains(&output, "Check PCSX2"));
+    assert!(matches!(
+        app.emulator_readiness.pcsx2_status,
+        pcsx2_page::Pcsx2StatusState::Idle
+    ));
+    assert!(
+        app.emulator_readiness
+            .pcsx2_save_vault
+            .manual_loading
+            .is_none()
     );
 }
 

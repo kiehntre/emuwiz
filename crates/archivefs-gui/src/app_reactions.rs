@@ -16,8 +16,20 @@ pub(crate) fn apply_shell_request(
     navigation_request: Option<app_shell::ShellRequest>,
 ) {
     match navigation_request {
+        Some(app_shell::ShellRequest::Navigate(NavClick::Enhancement(section))) => {
+            crate::cheats_mods_preview::select_enhancement_section(context, section);
+            app.navigate_to_main_view(MainView::CheatsMods);
+        }
         Some(app_shell::ShellRequest::Navigate(NavClick::View(view))) => {
-            app.navigate_to_main_view(view);
+            // These labels name exact tasks, not the last visited tab in an
+            // old consolidated shell (Sources might otherwise reopen DATs).
+            match view {
+                MainView::Sources => app.navigate_to_sources_tab(SourcesTab::Libraries),
+                MainView::Problems => {
+                    app.navigate_to_problems_repair_tab(ProblemsRepairTab::Overview)
+                }
+                _ => app.navigate_to_main_view(view),
+            }
             if view == MainView::DiscConversion {
                 app.optical_conversion_page.get_or_insert_with(
                     optical_conversion_page::OpticalConversionPageState::default,

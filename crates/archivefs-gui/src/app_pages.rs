@@ -64,12 +64,25 @@ pub(crate) fn show_pages(
             ui_layout::ContentWidth::Normal
         };
         let page_scroll = main_view_uses_page_scroll(app.view)
+            || app.tools_overlay == ToolsOverlay::SaveVault
             || (app.ui_mode == GuiMode::GamerView && app.view == MainView::Library);
         ui_layout::page(ui, width, page_scroll, app.view, |ui| {
             app.reconcile_cheats_mods_context(context);
 
             if app.tools_overlay != ToolsOverlay::None {
                 match app.tools_overlay {
+                    ToolsOverlay::SaveVault => {
+                        widgets::section_header(ui, "Saves", Some("PS2 Save Vault — existing PCSX2 memory-card tools."));
+                        let focused_archive = app.archive_context.focused.clone();
+                        app.invalidate_pcsx2_status_if_selection_changed(focused_archive.as_deref());
+                        let verified_ps2_serial = app.cheat_workflow.as_ref()
+                            .and_then(pcsx2_identity_for_workflow).and_then(|id| id.serial);
+                        let action = pcsx2_page::show_pcsx2_panel_with_save_vault(
+                            ui, app.ui_mode == GuiMode::AdvancedView, verified_ps2_serial.as_deref(),
+                            &app.emulator_readiness.pcsx2_status, &mut app.emulator_readiness.pcsx2_save_vault,
+                        );
+                        app.handle_pcsx2_action(context, action);
+                    }
                     ToolsOverlay::Diagnostics => {
                         diagnostics_action = show_setup_diagnostics(
                             ui,

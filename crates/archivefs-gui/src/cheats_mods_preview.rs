@@ -1194,7 +1194,7 @@ pub(crate) fn show_shared_transaction_readiness(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum EnhancementSection {
+pub(crate) enum EnhancementSection {
     Cheats,
     Mods,
 }
@@ -1221,6 +1221,17 @@ fn cheats_mods_layout_for_width(width: f32) -> CheatsModsLayout {
 
 fn enhancement_section_id() -> egui::Id {
     egui::Id::new("cheats-mods-enhancement-section")
+}
+
+pub(crate) fn current_enhancement_section(context: &egui::Context) -> EnhancementSection {
+    context.data(|data| {
+        data.get_temp(enhancement_section_id())
+            .unwrap_or(EnhancementSection::Cheats)
+    })
+}
+
+pub(crate) fn select_enhancement_section(context: &egui::Context, section: EnhancementSection) {
+    context.data_mut(|data| data.insert_temp(enhancement_section_id(), section));
 }
 
 fn active_enhancement_section(ui: &egui::Ui) -> EnhancementSection {
