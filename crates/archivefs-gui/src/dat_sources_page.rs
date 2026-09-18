@@ -12920,6 +12920,10 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
+        if !identify_rename {
+            self.sources_ui.identity_providers.show(ui);
+            ui.add_space(12.0);
+        }
         if self.sources_ui.dat_sources_page.is_none() {
             let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
                 Ok(path) => path,

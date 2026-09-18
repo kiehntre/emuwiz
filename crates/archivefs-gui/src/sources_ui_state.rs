@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use crate::dat_authority_dashboard::DashboardState;
 use crate::dat_sources_page::{DatSourcesPageState, DatSourcesPageUi};
+use crate::identity_providers_page::IdentityProvidersPageState;
 use crate::media_sets_page::MediaSetsPageState;
 use crate::platform_source_actions::{RunningSourceAction, SourcesLastScan};
 use crate::source_controller::{
@@ -28,6 +29,7 @@ pub(crate) struct SourcesUiState {
     pub(crate) sources_remove_dialog: Option<SourcesRemoveDialogState>,
     pub(crate) sources_role_dialog: Option<SourcesRoleDialogState>,
     pub(crate) dat_authority: DashboardState,
+    pub(crate) identity_providers: IdentityProvidersPageState,
     pub(crate) pending_source_scan_summary: Option<ScanPersistSummary>,
     pub(crate) sources_last_scan: Option<SourcesLastScan>,
     pub(crate) gamer_view_pending_first_scan: Option<PathBuf>,

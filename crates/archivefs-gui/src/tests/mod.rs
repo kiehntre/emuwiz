@@ -1059,6 +1059,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             sources_remove_dialog: None,
             sources_role_dialog: None,
             dat_authority: dat_authority_dashboard::DashboardState::default(),
+            identity_providers: identity_providers_page::IdentityProvidersPageState::default(),
             pending_source_scan_summary: None,
             sources_last_scan: None,
             gamer_view_pending_first_scan: None,

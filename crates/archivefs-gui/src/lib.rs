@@ -257,6 +257,7 @@ use navigation::{
 };
 mod selected_game_panel;
 use selected_game_panel::*;
+mod identity_providers_page;
 mod dat_identity_panel;
 mod selected_game_readiness;
 use dat_identity_panel::*;
