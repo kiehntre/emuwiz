@@ -139,6 +139,215 @@ fn find_dat<'a>(inventory: &'a TosecPackInventory, leaf: &str) -> &'a TosecPackD
         .unwrap_or_else(|| panic!("{leaf} missing from inventory"))
 }
 
+fn managed_fixture() -> (PackFixture, TosecPackInventory, BTreeSet<TosecSelectionKey>) {
+    let fixture = PackFixture::standard();
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let mut selections = BTreeSet::new();
+    selections.insert(find_dat(&inventory, "Amiga - Games - Floppy").selection_key());
+    (fixture, inventory, selections)
+}
+
+fn managed_store() -> (tempfile::TempDir, TosecManagedSnapshotStore) {
+    let root = tempfile::tempdir().unwrap();
+    let store = TosecManagedSnapshotStore::new(root.path().join("tosec-snapshots")).unwrap();
+    (root, store)
+}
+
+#[test]
+fn managed_snapshot_stages_without_activation_and_keeps_hashes() {
+    let (_fixture, inventory, selections) = managed_fixture();
+    let (_store_root, store) = managed_store();
+    let candidate = store
+        .stage_release_pack(&inventory, &selections, 123)
+        .unwrap();
+    assert!(store.active_snapshot().unwrap().is_none());
+    assert_eq!(candidate.snapshot.dats.len(), 1);
+    assert_eq!(candidate.snapshot.imported_unix_seconds, 123);
+    assert_eq!(candidate.snapshot.dats[0].0.content_sha256.len(), 64);
+    assert_eq!(candidate.validated.snapshot.sha256.len(), 64);
+    let preview = store.preview_activation(&candidate).unwrap();
+    assert_eq!(preview.dat_count, 1);
+    assert_eq!(preview.selected_group_count, 1);
+    assert!(preview.differs_from_active);
+}
+
+#[test]
+fn managed_snapshot_activation_history_rollback_and_offline_load_work() {
+    let (fixture, inventory, selections) = managed_fixture();
+    let (_store_root, store) = managed_store();
+    let first = store
+        .stage_release_pack(&inventory, &selections, 123)
+        .unwrap();
+    let first_result = store.activate(&first, None).unwrap();
+    assert_eq!(
+        first_result.change.freshness,
+        VerificationFreshness::NeedsRecheck
+    );
+    let first_hash = first_result.active.sha256.clone();
+
+    std::fs::write(
+        fixture
+            .pack_root
+            .join("Amiga/Amiga - Games - Floppy (TOSEC-v2021-01-09).dat"),
+        AMIGA_GAMES_FLOPPY_DAT.replace("Another Game", "Changed Game"),
+    )
+    .unwrap();
+    let second_inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let second = store
+        .stage_release_pack(&second_inventory, &selections, 124)
+        .unwrap();
+    let second_result = store.activate(&second, Some(&first_hash)).unwrap();
+    assert_eq!(
+        second_result.change.freshness,
+        VerificationFreshness::NeedsRecheck
+    );
+    assert!(store.store().list_snapshots().unwrap().len() >= 2);
+    assert_eq!(
+        store.freshness_for(Some(&first_hash)).unwrap(),
+        VerificationFreshness::NeedsRecheck
+    );
+
+    std::fs::remove_dir_all(&fixture.pack_root).unwrap();
+    let offline = store.active_snapshot().unwrap().unwrap();
+    assert_eq!(offline.dats.len(), 1);
+    assert_eq!(
+        offline.dats[0].1,
+        AMIGA_GAMES_FLOPPY_DAT
+            .replace("Another Game", "Changed Game")
+            .as_bytes()
+    );
+    let rollback = store.rollback(&first_hash).unwrap();
+    assert_eq!(rollback.active.sha256, first_hash);
+    assert_eq!(
+        rollback.change.freshness,
+        VerificationFreshness::NeedsRecheck
+    );
+    assert!(store.store().list_snapshots().unwrap().len() >= 2);
+}
+
+#[test]
+fn managed_snapshot_rejects_path_traversal_and_symlink_escape() {
+    let (fixture, mut inventory, selections) = managed_fixture();
+    let (_store_root, store) = managed_store();
+    inventory.dats[0].relative_path = PathBuf::from("../outside.dat");
+    assert!(
+        store
+            .stage_release_pack(&inventory, &selections, 1)
+            .is_err()
+    );
+
+    #[cfg(unix)]
+    {
+        let outside = fixture._root.path().join("outside.dat");
+        std::fs::write(&outside, AMIGA_GAMES_FLOPPY_DAT).unwrap();
+        let link = fixture.pack_root.join("link.dat");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        inventory.dats[0].relative_path = PathBuf::from("link.dat");
+        assert!(
+            store
+                .stage_release_pack(&inventory, &selections, 1)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn managed_snapshot_refuses_oversized_dat_before_import() {
+    let root = tempfile::tempdir().unwrap();
+    let pack = root.path().join("pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    let path = pack.join("Amiga - Games - Floppy.dat");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(crate::dat::limits::DEFAULT_MAX_FILE_SIZE + 1)
+        .unwrap();
+    let inventory = TosecPackInventory {
+        pack_root: pack,
+        pack_id: "oversized".to_string(),
+        dats: vec![TosecPackDat {
+            relative_path: PathBuf::from("Amiga - Games - Floppy.dat"),
+            raw_catalogue_name: "Amiga - Games - Floppy".to_string(),
+            system: "Amiga".to_string(),
+            category: TosecFriendlyCategory::Games,
+            media: TosecMediaType::FloppyDisk,
+            raw_category_label: "Games".to_string(),
+            classification_confident: true,
+            content_sha256: Some("0".repeat(64)),
+        }],
+        skipped: Vec::new(),
+        scan_complete: true,
+    };
+    let (_store_root, store) = managed_store();
+    let mut selections = BTreeSet::new();
+    selections.insert(inventory.dats[0].selection_key());
+    assert!(
+        store
+            .stage_release_pack(&inventory, &selections, 1)
+            .is_err()
+    );
+}
+
+#[test]
+fn managed_snapshot_active_does_not_mean_current() {
+    let (_fixture, inventory, selections) = managed_fixture();
+    let (_store_root, store) = managed_store();
+    let candidate = store
+        .stage_release_pack(&inventory, &selections, 1)
+        .unwrap();
+    store.activate(&candidate, None).unwrap();
+    assert_eq!(
+        store.freshness_for(None).unwrap(),
+        VerificationFreshness::NeedsRecheck
+    );
+    assert_eq!(
+        store
+            .freshness_for(Some(&candidate.validated.snapshot.sha256))
+            .unwrap(),
+        VerificationFreshness::Current
+    );
+}
+
+#[test]
+fn managed_snapshot_rejects_conflicting_duplicate_catalogue_names() {
+    let fixture = PackFixture::new();
+    let first = fixture.write_dat(
+        &["one", "Amiga - Games - Floppy (TOSEC-v2021-01-09).dat"],
+        AMIGA_GAMES_FLOPPY_DAT,
+    );
+    fixture.write_dat(
+        &["two", "Amiga - Games - Floppy (TOSEC-v2021-01-09).dat"],
+        &AMIGA_GAMES_FLOPPY_DAT.replace("Another Game", "Different Game"),
+    );
+    let inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    assert_eq!(inventory.dats.len(), 2);
+    assert_ne!(
+        inventory.dats[0].content_sha256,
+        inventory.dats[1].content_sha256
+    );
+    let mut selections = BTreeSet::new();
+    selections.insert(inventory.dats[0].selection_key());
+    let (_store_root, store) = managed_store();
+    assert!(
+        store
+            .stage_release_pack(&inventory, &selections, 1)
+            .is_err()
+    );
+    assert!(first.exists());
+}
+
+#[test]
+fn managed_snapshot_rejects_excessive_selected_member_count() {
+    let (_fixture, mut inventory, selections) = managed_fixture();
+    let template = inventory.dats[0].clone();
+    let target_len = MAX_TOSEC_SNAPSHOT_MEMBERS + inventory.dats.len();
+    inventory.dats.resize(target_len, template);
+    let (_store_root, store) = managed_store();
+    assert!(
+        store
+            .stage_release_pack(&inventory, &selections, 1)
+            .is_err()
+    );
+}
+
 #[test]
 fn a_small_synthetic_release_directory_is_inventoried() {
     let fixture = PackFixture::standard();

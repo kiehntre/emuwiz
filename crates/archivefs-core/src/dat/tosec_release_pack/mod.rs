@@ -25,7 +25,8 @@
 //! size-bounded, there is no shell, no execution, and EmuWiz never writes
 //! inside the pack.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,23 @@ use super::sources::config::{
 };
 use super::sources::{DEFAULT_DAT_PRIORITY, DatSourceKind, DatSourceOwnership};
 use crate::ArchiveFsError;
+use crate::identity_source::managed_snapshot::{
+    ActivationResult, ManagedSourceDescriptor, ManagedSourceKind, ManagedSourceMetadata,
+    ManagedSourceReference, ManagedSourceStore, ManagedSourceTrust, ValidatedCandidate,
+    VerificationFreshness,
+};
 use crate::identity_source::tosec::import_tosec_dat;
+
+/// The aggregate bound for one immutable TOSEC snapshot. Individual DATs are
+/// already bounded by the parser's 256 MiB limit; the smaller aggregate bound
+/// prevents a selected release from becoming an accidental second full pack.
+pub const MAX_TOSEC_SNAPSHOT_DAT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_TOSEC_SNAPSHOT_MEMBERS: usize = MAX_PACK_DATS;
+const TOSEC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const TOSEC_MANAGED_PROVIDER_ID: &str = "tosec-release-pack";
+const TOSEC_MANAGED_MEDIA_TYPE: &str = "application/vnd.emuwiz.tosec-snapshot";
+const TOSEC_MANAGED_PARSER_SCHEMA: &str = "tosec-managed-snapshot-v1";
+const TOSEC_MANAGED_SOURCE_SENTINEL: &str = "/emuwiz/tosec-local-release-pack";
 
 /// How deep below the chosen pack root discovery may descend.
 const MAX_PACK_WALK_DEPTH: usize = 6;
@@ -719,6 +736,549 @@ pub fn save_tosec_packs(path: &Path, packs: &[PersistedTosecPack]) -> Result<(),
         )));
     }
     crate::atomic_write_text(path, &text)
+}
+
+// ---------------------------------------------------------------------------
+// Immutable managed snapshots
+// ---------------------------------------------------------------------------
+
+/// Metadata retained for one DAT in a managed snapshot. The DAT bytes are
+/// stored beside this record in the immutable object; this manifest is the
+/// inspectable, self-contained catalogue projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TosecManagedDat {
+    pub relative_path: PathBuf,
+    pub raw_catalogue_name: String,
+    pub system: String,
+    pub category: TosecFriendlyCategory,
+    pub media: TosecMediaType,
+    pub raw_category_label: String,
+    pub classification_confident: bool,
+    pub content_sha256: String,
+    pub tosec_header_name: String,
+    pub tosec_version: Option<String>,
+    pub entry_count: usize,
+    pub rom_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TosecSnapshotManifest {
+    schema_version: u32,
+    pack_id: String,
+    release_version: Option<String>,
+    selected_groups: BTreeSet<TosecSelectionKey>,
+    imported_unix_seconds: u64,
+    source_path: PathBuf,
+    dats: Vec<TosecManagedDat>,
+}
+
+/// A decoded active TOSEC snapshot. `dats` contains the actual DAT bytes, so
+/// callers can continue offline after the original extracted directory is
+/// removed. No executable content is represented by this type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TosecManagedSnapshot {
+    pub pack_id: String,
+    pub release_version: Option<String>,
+    pub selected_groups: BTreeSet<TosecSelectionKey>,
+    pub imported_unix_seconds: u64,
+    pub source_path: PathBuf,
+    pub dats: Vec<(TosecManagedDat, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TosecSnapshotPreview {
+    pub release_identifier: String,
+    pub release_version: Option<String>,
+    pub dat_count: usize,
+    pub selected_group_count: usize,
+    pub total_snapshot_bytes: u64,
+    pub categories: BTreeSet<TosecFriendlyCategory>,
+    pub media: BTreeSet<TosecMediaType>,
+    pub current_active_release: Option<String>,
+    pub differs_from_active: bool,
+    pub validation_warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TosecManagedCandidate {
+    pub validated: ValidatedCandidate,
+    pub snapshot: TosecManagedSnapshot,
+}
+
+/// Adapter over the provider-neutral managed snapshot spine. The source
+/// sentinel is deliberately not the user's pack path: that path is provenance
+/// in the manifest only, and activation therefore never depends on it.
+#[derive(Debug, Clone)]
+pub struct TosecManagedSnapshotStore {
+    store: ManagedSourceStore,
+}
+
+impl TosecManagedSnapshotStore {
+    pub fn new(root: PathBuf) -> Result<Self, ArchiveFsError> {
+        let descriptor = ManagedSourceDescriptor {
+            provider_id: TOSEC_MANAGED_PROVIDER_ID.to_string(),
+            display_name: "TOSEC local release snapshots".to_string(),
+            source_kind: ManagedSourceKind::Local,
+            source: ManagedSourceReference::LocalPath(PathBuf::from(TOSEC_MANAGED_SOURCE_SENTINEL)),
+            expected_media_type: TOSEC_MANAGED_MEDIA_TYPE.to_string(),
+            maximum_size_bytes: MAX_TOSEC_SNAPSHOT_DAT_BYTES,
+            attribution_url: None,
+            parser_schema_version: TOSEC_MANAGED_PARSER_SCHEMA.to_string(),
+            trust: ManagedSourceTrust::UserProvided,
+        };
+        Ok(Self {
+            store: ManagedSourceStore::new(root, descriptor)?,
+        })
+    }
+
+    pub fn store(&self) -> &ManagedSourceStore {
+        &self.store
+    }
+
+    /// Read, validate, hash and stage selected DATs. This never activates the
+    /// candidate and never writes into the source release directory.
+    pub fn stage_release_pack(
+        &self,
+        inventory: &TosecPackInventory,
+        selections: &BTreeSet<TosecSelectionKey>,
+        imported_unix_seconds: u64,
+    ) -> Result<TosecManagedCandidate, ArchiveFsError> {
+        if !inventory.scan_complete {
+            return Err(ArchiveFsError::Config(
+                "cannot stage a partial TOSEC release-pack inventory".to_string(),
+            ));
+        }
+        if selections.is_empty() {
+            return Err(ArchiveFsError::Config(
+                "cannot stage a TOSEC snapshot without selected groups".to_string(),
+            ));
+        }
+        let selected: Vec<_> = inventory
+            .dats
+            .iter()
+            .filter(|dat| selections.contains(&dat.selection_key()))
+            .collect();
+        if selected.is_empty() {
+            return Err(ArchiveFsError::Config(
+                "TOSEC selections do not match any inventoried DAT".to_string(),
+            ));
+        }
+        if selected.len() > MAX_TOSEC_SNAPSHOT_MEMBERS {
+            return Err(ArchiveFsError::Config(
+                "TOSEC snapshot contains too many selected DATs".to_string(),
+            ));
+        }
+
+        let mut seen_names = BTreeMap::<String, String>::new();
+        let mut total_bytes = 0_u64;
+        let mut dats = Vec::with_capacity(selected.len());
+        for dat in selected {
+            let path = resolve_inventory_dat_path(&inventory.pack_root, &dat.relative_path)?;
+            let imported = import_tosec_dat(&path).map_err(|error| {
+                ArchiveFsError::Config(format!(
+                    "selected TOSEC DAT {} failed validation: {error}",
+                    dat.relative_path.display()
+                ))
+            })?;
+            if dat.content_sha256.as_deref() != Some(imported.artifact_sha256.as_str()) {
+                return Err(ArchiveFsError::Config(format!(
+                    "selected TOSEC DAT {} changed since inventory; rescan before staging",
+                    dat.relative_path.display()
+                )));
+            }
+            if let Some(previous_hash) = seen_names.insert(
+                dat.raw_catalogue_name.clone(),
+                imported.artifact_sha256.clone(),
+            ) && previous_hash != imported.artifact_sha256
+            {
+                return Err(ArchiveFsError::Config(format!(
+                    "conflicting duplicate TOSEC catalogue name: {}",
+                    dat.raw_catalogue_name
+                )));
+            }
+            let bytes =
+                std::fs::read(&path).map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+            total_bytes = total_bytes.checked_add(bytes.len() as u64).ok_or_else(|| {
+                ArchiveFsError::Config("TOSEC snapshot size overflow".to_string())
+            })?;
+            if total_bytes > MAX_TOSEC_SNAPSHOT_DAT_BYTES {
+                return Err(ArchiveFsError::Config(format!(
+                    "TOSEC snapshot exceeds {} byte aggregate DAT limit",
+                    MAX_TOSEC_SNAPSHOT_DAT_BYTES
+                )));
+            }
+            dats.push((
+                TosecManagedDat {
+                    relative_path: dat.relative_path.clone(),
+                    raw_catalogue_name: dat.raw_catalogue_name.clone(),
+                    system: dat.system.clone(),
+                    category: dat.category,
+                    media: dat.media,
+                    raw_category_label: dat.raw_category_label.clone(),
+                    classification_confident: dat.classification_confident,
+                    content_sha256: imported.artifact_sha256,
+                    tosec_header_name: imported.system_name,
+                    tosec_version: imported.upstream_version,
+                    entry_count: imported.entry_count,
+                    rom_count: imported.rom_count,
+                },
+                bytes,
+            ));
+        }
+        dats.sort_by(|left, right| left.0.relative_path.cmp(&right.0.relative_path));
+        let release_version = common_release_version(&dats);
+        let manifest = TosecSnapshotManifest {
+            schema_version: TOSEC_SNAPSHOT_SCHEMA_VERSION,
+            pack_id: inventory.pack_id.clone(),
+            release_version: release_version.clone(),
+            selected_groups: selections.clone(),
+            imported_unix_seconds,
+            source_path: inventory.pack_root.clone(),
+            dats: dats.iter().map(|(metadata, _)| metadata.clone()).collect(),
+        };
+        let bytes = encode_snapshot(&manifest, &dats)?;
+        let staged = self.store.stage_bytes(
+            &bytes,
+            ManagedSourceMetadata {
+                provider_version: release_version,
+                content_length: Some(bytes.len() as u64),
+                ..ManagedSourceMetadata::default()
+            },
+        )?;
+        let validated = self.store.validate_candidate(
+            staged,
+            crate::identity_source::managed_snapshot::ValidationReport {
+                valid: true,
+                summary: format!("validated {} selected TOSEC DAT files", dats.len()),
+                record_count: Some(
+                    dats.iter()
+                        .map(|(metadata, _)| metadata.entry_count as u64)
+                        .sum(),
+                ),
+                warnings: Vec::new(),
+            },
+        )?;
+        Ok(TosecManagedCandidate {
+            validated,
+            snapshot: TosecManagedSnapshot {
+                pack_id: manifest.pack_id,
+                release_version: manifest.release_version,
+                selected_groups: manifest.selected_groups,
+                imported_unix_seconds: manifest.imported_unix_seconds,
+                source_path: manifest.source_path,
+                dats,
+            },
+        })
+    }
+
+    pub fn preview_activation(
+        &self,
+        candidate: &TosecManagedCandidate,
+    ) -> Result<TosecSnapshotPreview, ArchiveFsError> {
+        let preview = self.store.preview_activation(&candidate.validated)?;
+        let categories = candidate
+            .snapshot
+            .dats
+            .iter()
+            .map(|(dat, _)| dat.category)
+            .collect();
+        let media = candidate
+            .snapshot
+            .dats
+            .iter()
+            .map(|(dat, _)| dat.media)
+            .collect();
+        let current_active_release = self.active_snapshot()?.map(|snapshot| snapshot.pack_id);
+        Ok(TosecSnapshotPreview {
+            release_identifier: candidate.snapshot.pack_id.clone(),
+            release_version: candidate.snapshot.release_version.clone(),
+            dat_count: candidate.snapshot.dats.len(),
+            selected_group_count: candidate.snapshot.selected_groups.len(),
+            total_snapshot_bytes: candidate.validated.snapshot.size_bytes,
+            categories,
+            media,
+            current_active_release,
+            differs_from_active: preview.changed,
+            validation_warnings: preview.warnings,
+        })
+    }
+
+    pub fn activate(
+        &self,
+        candidate: &TosecManagedCandidate,
+        expected_active: Option<&str>,
+    ) -> Result<ActivationResult, ArchiveFsError> {
+        self.store
+            .activate_snapshot(&candidate.validated, expected_active)
+    }
+
+    pub fn rollback(&self, hash: &str) -> Result<ActivationResult, ArchiveFsError> {
+        self.store.rollback_snapshot(hash)
+    }
+
+    pub fn active_snapshot(&self) -> Result<Option<TosecManagedSnapshot>, ArchiveFsError> {
+        let Some(bytes) = self.store.active_snapshot_bytes()? else {
+            return Ok(None);
+        };
+        decode_snapshot(&bytes).map(Some)
+    }
+
+    pub fn active_record(
+        &self,
+    ) -> Result<
+        Option<crate::identity_source::managed_snapshot::ManagedSourceSnapshot>,
+        ArchiveFsError,
+    > {
+        self.store.active_snapshot()
+    }
+
+    /// Existing verification tied to another immutable snapshot must be
+    /// rechecked after activation. Reusing the generic signal avoids making
+    /// "active" imply "verified" or "current".
+    pub fn freshness_for(
+        &self,
+        recorded_snapshot_sha256: Option<&str>,
+    ) -> Result<VerificationFreshness, ArchiveFsError> {
+        let Some(active) = self.store.active_snapshot()? else {
+            return Ok(VerificationFreshness::NeedsRecheck);
+        };
+        Ok(
+            if recorded_snapshot_sha256 == Some(active.sha256.as_str()) {
+                VerificationFreshness::Current
+            } else {
+                VerificationFreshness::NeedsRecheck
+            },
+        )
+    }
+}
+
+fn common_release_version(dats: &[(TosecManagedDat, Vec<u8>)]) -> Option<String> {
+    let first = dats.first()?.0.tosec_version.clone()?;
+    dats.iter()
+        .all(|(dat, _)| dat.tosec_version.as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
+fn resolve_inventory_dat_path(root: &Path, relative: &Path) -> Result<PathBuf, ArchiveFsError> {
+    if !is_normal_relative_path(relative)
+        || relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("dat"))
+    {
+        return Err(ArchiveFsError::Config(format!(
+            "unsafe TOSEC DAT path: {}",
+            relative.display()
+        )));
+    }
+    let root_metadata = std::fs::symlink_metadata(root)
+        .map_err(|error| ArchiveFsError::io(root.to_path_buf(), error))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(ArchiveFsError::Config(
+            "TOSEC release-pack root is not a real directory".to_string(),
+        ));
+    }
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| ArchiveFsError::io(root.to_path_buf(), error))?;
+    let mut current = canonical_root.clone();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(ArchiveFsError::Config("unsafe TOSEC DAT path".to_string()));
+        };
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| ArchiveFsError::io(current.clone(), error))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ArchiveFsError::Config(
+                "TOSEC DAT path contains a symbolic link".to_string(),
+            ));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&current)
+        .map_err(|error| ArchiveFsError::io(current.clone(), error))?;
+    if !metadata.is_file() || metadata.len() > crate::dat::limits::DEFAULT_MAX_FILE_SIZE {
+        return Err(ArchiveFsError::Config(
+            "TOSEC DAT is missing, non-regular, or oversized".to_string(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(&current)
+        .map_err(|error| ArchiveFsError::io(current.clone(), error))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(ArchiveFsError::Config(
+            "TOSEC DAT escapes the release-pack root".to_string(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn encode_snapshot(
+    manifest: &TosecSnapshotManifest,
+    dats: &[(TosecManagedDat, Vec<u8>)],
+) -> Result<Vec<u8>, ArchiveFsError> {
+    let manifest_bytes = serde_json::to_vec(manifest).map_err(|error| {
+        ArchiveFsError::Config(format!("could not encode TOSEC manifest: {error}"))
+    })?;
+    let mut output = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut output);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "manifest.json", manifest_bytes.as_slice())
+            .map_err(|error| {
+                ArchiveFsError::Config(format!("could not encode TOSEC snapshot: {error}"))
+            })?;
+        for (metadata, bytes) in dats {
+            let archive_path = PathBuf::from("dats").join(&metadata.relative_path);
+            let archive_path = archive_path.to_string_lossy();
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, archive_path.as_ref(), bytes.as_slice())
+                .map_err(|error| {
+                    ArchiveFsError::Config(format!("could not encode TOSEC DAT: {error}"))
+                })?;
+        }
+        builder.finish().map_err(|error| {
+            ArchiveFsError::Config(format!("could not finish TOSEC snapshot: {error}"))
+        })?;
+    }
+    Ok(output)
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Result<TosecManagedSnapshot, ArchiveFsError> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let mut manifest_bytes = None;
+    let mut members = BTreeMap::<PathBuf, Vec<u8>>::new();
+    let mut examined = 0usize;
+    for entry in archive.entries().map_err(|error| {
+        ArchiveFsError::Config(format!("invalid TOSEC snapshot archive: {error}"))
+    })? {
+        examined += 1;
+        if examined > MAX_TOSEC_SNAPSHOT_MEMBERS + 1 {
+            return Err(ArchiveFsError::Config(
+                "TOSEC snapshot has too many members".to_string(),
+            ));
+        }
+        let mut entry = entry.map_err(|error| {
+            ArchiveFsError::Config(format!("invalid TOSEC snapshot member: {error}"))
+        })?;
+        if !entry.header().entry_type().is_file() {
+            return Err(ArchiveFsError::Config(
+                "TOSEC snapshot contains a non-file member".to_string(),
+            ));
+        }
+        let path = entry
+            .path()
+            .map_err(|error| {
+                ArchiveFsError::Config(format!("invalid TOSEC snapshot path: {error}"))
+            })?
+            .into_owned();
+        if path.is_absolute()
+            || !path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(ArchiveFsError::Config(
+                "TOSEC snapshot contains an unsafe path".to_string(),
+            ));
+        }
+        let size = entry.size();
+        if size > MAX_TOSEC_SNAPSHOT_DAT_BYTES {
+            return Err(ArchiveFsError::Config(
+                "TOSEC snapshot member is oversized".to_string(),
+            ));
+        }
+        let mut member = Vec::with_capacity(size as usize);
+        entry.read_to_end(&mut member).map_err(|error| {
+            ArchiveFsError::Config(format!("could not read TOSEC snapshot member: {error}"))
+        })?;
+        if member.len() as u64 != size {
+            return Err(ArchiveFsError::Config(
+                "TOSEC snapshot member was truncated".to_string(),
+            ));
+        }
+        if path == Path::new("manifest.json") {
+            if manifest_bytes.replace(member).is_some() {
+                return Err(ArchiveFsError::Config(
+                    "TOSEC snapshot has duplicate manifest".to_string(),
+                ));
+            }
+        } else if path.components().next() == Some(Component::Normal("dats".as_ref())) {
+            let mut components = path.components();
+            components.next();
+            let dat_path: PathBuf = components.map(|component| component.as_os_str()).collect();
+            if !is_normal_relative_path(&dat_path) || members.insert(dat_path, member).is_some() {
+                return Err(ArchiveFsError::Config(
+                    "TOSEC snapshot has duplicate or unsafe DAT member".to_string(),
+                ));
+            }
+        } else {
+            return Err(ArchiveFsError::Config(
+                "TOSEC snapshot contains an unexpected member".to_string(),
+            ));
+        }
+    }
+    let manifest: TosecSnapshotManifest = serde_json::from_slice(
+        &manifest_bytes
+            .ok_or_else(|| ArchiveFsError::Config("TOSEC snapshot has no manifest".to_string()))?,
+    )
+    .map_err(|error| ArchiveFsError::Config(format!("invalid TOSEC snapshot manifest: {error}")))?;
+    if manifest.schema_version != TOSEC_SNAPSHOT_SCHEMA_VERSION
+        || manifest.dats.len() > MAX_TOSEC_SNAPSHOT_MEMBERS
+    {
+        return Err(ArchiveFsError::Config(
+            "unsupported TOSEC snapshot schema or size".to_string(),
+        ));
+    }
+    if manifest.dats.len() != members.len() {
+        return Err(ArchiveFsError::Config(
+            "TOSEC snapshot manifest/member mismatch".to_string(),
+        ));
+    }
+    let mut dats = Vec::with_capacity(manifest.dats.len());
+    for metadata in manifest.dats {
+        let bytes = members.remove(&metadata.relative_path).ok_or_else(|| {
+            ArchiveFsError::Config(format!(
+                "missing TOSEC DAT member: {}",
+                metadata.relative_path.display()
+            ))
+        })?;
+        let digest = sha256_bytes(&bytes);
+        if digest != metadata.content_sha256 {
+            return Err(ArchiveFsError::Config(format!(
+                "TOSEC DAT digest mismatch: {}",
+                metadata.relative_path.display()
+            )));
+        }
+        dats.push((metadata, bytes));
+    }
+    Ok(TosecManagedSnapshot {
+        pack_id: manifest.pack_id,
+        release_version: manifest.release_version,
+        selected_groups: manifest.selected_groups,
+        imported_unix_seconds: manifest.imported_unix_seconds,
+        source_path: manifest.source_path,
+        dats,
+    })
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
