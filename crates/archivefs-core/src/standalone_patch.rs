@@ -6,6 +6,7 @@
 //! untrusted output-size fields.
 
 use std::fs;
+use std::process::Command;
 use std::path::{Component, Path, PathBuf};
 
 use serde::Serialize;
@@ -123,6 +124,7 @@ pub struct DerivedPatchProvenance {
     pub expected_output_crc32: Option<u32>,
     pub header_adjustment: HeaderAdjustment,
     pub applied_at_unix_seconds: u64,
+    pub application: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,7 +344,11 @@ pub fn build_standalone_patch_apply_plan_with_header(
 ) -> Result<StandalonePatchApplyPlan, StandalonePatchError> {
     if !matches!(
         inspection.format,
-        StandalonePatchFormat::Ips | StandalonePatchFormat::Bps | StandalonePatchFormat::Ups
+        StandalonePatchFormat::Ips
+            | StandalonePatchFormat::Bps
+            | StandalonePatchFormat::Ups
+            | StandalonePatchFormat::XdeltaVcdiff
+            | StandalonePatchFormat::Ppf
     ) {
         return Err(StandalonePatchError::Unsupported(
             "only IPS, BPS, and UPS application is enabled".into(),
@@ -361,7 +367,8 @@ pub fn build_standalone_patch_apply_plan_with_header(
             )
         })?,
     };
-    if inspection.source_size != Some(patch_input.len() as u64)
+    if inspection.source_size.is_some()
+        && inspection.source_size != Some(patch_input.len() as u64)
         || inspection
             .source_crc32
             .is_some_and(|expected| crc32(patch_input) != expected)
@@ -417,10 +424,20 @@ pub fn apply_standalone_patch(
             "base CRC differs from reviewed patch source checksum".into(),
         ));
     }
-    let output = match inspection.format {
-        StandalonePatchFormat::Ips => apply_ips(patch_input, &patch)?,
-        StandalonePatchFormat::Bps => apply_bps(patch_input, &patch)?,
-        StandalonePatchFormat::Ups => apply_ups(patch_input, &patch)?,
+    let parent = plan
+        .reviewed
+        .output_path
+        .parent()
+        .ok_or_else(|| StandalonePatchError::UnsafeOutput("output has no parent".into()))?;
+    let (output, application) = match inspection.format {
+        StandalonePatchFormat::Ips => (apply_ips(patch_input, &patch)?, "EmuWiz IPS applier"),
+        StandalonePatchFormat::Bps => (apply_bps(patch_input, &patch)?, "EmuWiz BPS applier"),
+        StandalonePatchFormat::Ups => (apply_ups(patch_input, &patch)?, "EmuWiz UPS applier"),
+        StandalonePatchFormat::Ppf => (apply_ppf3(patch_input, &patch)?, "EmuWiz PPF3 applier"),
+        StandalonePatchFormat::XdeltaVcdiff => (
+            apply_xdelta3(&plan.reviewed.base_path, &plan.reviewed.patch_path, parent, &patch)?,
+            "xdelta3 external applier",
+        ),
         _ => {
             return Err(StandalonePatchError::Unsupported(
                 "format is inspection-only".into(),
@@ -446,11 +463,6 @@ pub fn apply_standalone_patch(
         ));
     }
     let output_hash = hex_digest(&output);
-    let parent = plan
-        .reviewed
-        .output_path
-        .parent()
-        .ok_or_else(|| StandalonePatchError::UnsafeOutput("output has no parent".into()))?;
     if !parent.is_dir()
         || plan.reviewed.output_path.exists()
         || !is_safe_child(parent, &plan.reviewed.output_path)
@@ -473,6 +485,7 @@ pub fn apply_standalone_patch(
         applied_at_unix_seconds: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_secs()),
+        application: application.into(),
     };
     let provenance_path = plan.reviewed.output_path.with_file_name(format!(
         "{}.emuwiz-patch.json",
@@ -617,6 +630,137 @@ fn apply_ips(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
         };
     }
     Err(StandalonePatchError::Malformed("IPS missing EOF".into()))
+}
+
+fn apply_ppf3(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
+    let (image_size, records_start, undo) = parse_ppf3_header(patch)
+        .map_err(StandalonePatchError::Malformed)?;
+    if image_size != base.len() as u64 {
+        return Err(StandalonePatchError::Malformed(
+            "PPF3 source image size differs from the selected base".into(),
+        ));
+    }
+    let mut output = base.to_vec();
+    let mut cursor = records_start;
+    let mut records = 0usize;
+    while cursor < patch.len() {
+        records += 1;
+        if records > MAX_RECORDS {
+            return Err(StandalonePatchError::Malformed("too many PPF3 records".into()));
+        }
+        let offset = u64::from_le_bytes(
+            patch
+                .get(cursor..cursor + 8)
+                .ok_or_else(|| StandalonePatchError::Malformed("truncated PPF3 offset".into()))?
+                .try_into()
+                .unwrap(),
+        );
+        let length = *patch
+            .get(cursor + 8)
+            .ok_or_else(|| StandalonePatchError::Malformed("truncated PPF3 record".into()))?
+            as usize;
+        cursor += 9;
+        let end = cursor
+            .checked_add(length)
+            .ok_or_else(|| StandalonePatchError::Malformed("PPF3 record length overflow".into()))?;
+        let destination_end = offset
+            .checked_add(length as u64)
+            .ok_or_else(|| StandalonePatchError::Malformed("PPF3 offset overflow".into()))?;
+        if destination_end > image_size || end > patch.len() {
+            return Err(StandalonePatchError::Malformed(
+                "PPF3 record lies outside the source image or patch".into(),
+            ));
+        }
+        let destination = usize::try_from(offset)
+            .map_err(|_| StandalonePatchError::Malformed("PPF3 offset is too large".into()))?;
+        output[destination..destination + length].copy_from_slice(&patch[cursor..end]);
+        cursor = end;
+        if undo {
+            cursor = cursor
+                .checked_add(length)
+                .ok_or_else(|| StandalonePatchError::Malformed("PPF3 undo length overflow".into()))?;
+            if cursor > patch.len() {
+                return Err(StandalonePatchError::Malformed("truncated PPF3 undo data".into()));
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn parse_ppf3_header(patch: &[u8]) -> Result<(u64, usize, bool), String> {
+    if patch.len() < 61 || &patch[..5] != b"PPF30" {
+        return Err("PPF3 header is truncated or unsupported".into());
+    }
+    let image_size = u32::from_le_bytes(patch[55..59].try_into().unwrap()) as u64;
+    if image_size > MAX_DECLARED_OUTPUT_BYTES {
+        return Err("PPF3 image size exceeds the safe bound".into());
+    }
+    let block_check = patch[59] != 0;
+    let undo = patch[60] != 0;
+    let records_start = 61usize
+        .checked_add(if block_check { 1024 } else { 0 })
+        .ok_or_else(|| "PPF3 block-check offset overflow".to_string())?;
+    if records_start > patch.len() {
+        return Err("PPF3 block-check data is truncated".into());
+    }
+    Ok((image_size, records_start, undo))
+}
+
+fn apply_xdelta3(
+    base_path: &Path,
+    patch_path: &Path,
+    parent: &Path,
+    patch: &[u8],
+) -> Result<Vec<u8>, StandalonePatchError> {
+    let tool = find_xdelta3().ok_or_else(|| {
+        StandalonePatchError::Unsupported(
+            "xdelta/VCDIFF application requires a safe xdelta3 executable".into(),
+        )
+    })?;
+    let stage = parent.join(format!(".emuwiz-xdelta-stage-{}-{}", std::process::id(), patch.len()));
+    if stage.exists() || !is_safe_child(parent, &stage) {
+        return Err(StandalonePatchError::UnsafeOutput(
+            "xdelta staging path is unavailable or unsafe".into(),
+        ));
+    }
+    let status = Command::new(tool)
+        .arg("-d")
+        .arg("-s")
+        .arg(base_path)
+        .arg(patch_path)
+        .arg(&stage)
+        .status()
+        .map_err(|error| StandalonePatchError::Io(error.to_string()))?;
+    if !status.success() {
+        let _ = fs::remove_file(&stage);
+        return Err(StandalonePatchError::Malformed(format!(
+            "xdelta3 exited with {}",
+            status.code().map_or_else(|| "no exit code".into(), |code| code.to_string())
+        )));
+    }
+    let safe_stage = fs::symlink_metadata(&stage).is_ok_and(|metadata| {
+        metadata.is_file() && !metadata.file_type().is_symlink()
+    });
+    let output = if safe_stage {
+        fs::read(&stage).map_err(|error| StandalonePatchError::Io(error.to_string()))
+    } else {
+        Err(StandalonePatchError::UnsafeOutput(
+            "xdelta produced an unsafe staging object".into(),
+        ))
+    };
+    let _ = fs::remove_file(&stage);
+    output
+}
+
+fn find_xdelta3() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).take(128).map(|dir| dir.join("xdelta3")).find(|candidate| {
+        fs::symlink_metadata(candidate).is_ok_and(|metadata| {
+            if !metadata.is_file() || metadata.file_type().is_symlink() { return false; }
+            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; metadata.permissions().mode() & 0o111 != 0 }
+            #[cfg(not(unix))] { true }
+        })
+    })
 }
 
 fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
@@ -821,30 +965,34 @@ fn parse(b: &[u8]) -> (StandalonePatchFormat, PatchInspectionState, Fields) {
     // with exactly these bytes; an earlier transposition (0xd6, 0xc4, 0xc3)
     // meant every genuine patch was reported as an unknown format.
     if b.starts_with(&[0xd6, 0xc3, 0xc4]) {
-        return (
-            StandalonePatchFormat::XdeltaVcdiff,
-            PatchInspectionState::Valid,
-            Fields {
-                warnings: vec![
-                    "VCDIFF structure recognized; source identity is not embedded".into(),
-                ],
-                ..Default::default()
-            },
-        );
+        let (state, fields) = parse_vcdiff_header(b);
+        return (StandalonePatchFormat::XdeltaVcdiff, state, fields);
     }
     if b.len() >= 4 && &b[..3] == b"PPF" && (b[3] == b'1' || b[3] == b'2' || b[3] == b'3') {
-        if b.len() < 6 {
-            let (state, fields) = invalid(StandalonePatchFormat::Ppf, "truncated PPF header");
-            return (StandalonePatchFormat::Ppf, state, fields);
+        if b.starts_with(b"PPF30") {
+            return match parse_ppf3_header(b) {
+                Ok((image_size, _, _)) => (
+                    StandalonePatchFormat::Ppf,
+                    PatchInspectionState::Valid,
+                    Fields {
+                        source_size: Some(image_size),
+                        target_size: Some(image_size),
+                        warnings: vec!["PPF3 disc-image patch; source identity is size-only".into()],
+                        ..Default::default()
+                    },
+                ),
+                Err(error) => {
+                    let (state, fields) = invalid(StandalonePatchFormat::Ppf, &error);
+                    (StandalonePatchFormat::Ppf, state, fields)
+                }
+            };
         }
         return (
             StandalonePatchFormat::Ppf,
-            PatchInspectionState::Valid,
+            PatchInspectionState::Unsupported,
             Fields {
-                warnings: vec![
-                    "PPF is disc-image oriented; topology and source identity require review"
-                        .into(),
-                ],
+                warnings: vec![format!("PPF{} is recognized but only PPF3 application is supported", b[3] as char)],
+                error: Some("PPF revision is inspection-only".into()),
                 ..Default::default()
             },
         );
@@ -854,6 +1002,30 @@ fn parse(b: &[u8]) -> (StandalonePatchFormat, PatchInspectionState, Fields) {
         PatchInspectionState::Unsupported,
         Fields {
             error: Some("no supported patch signature".into()),
+            ..Default::default()
+        },
+    )
+}
+
+fn parse_vcdiff_header(b: &[u8]) -> (PatchInspectionState, Fields) {
+    if b.len() < 5 {
+        return invalid(StandalonePatchFormat::XdeltaVcdiff, "truncated VCDIFF header");
+    }
+    if b[3] != 0 {
+        return invalid(StandalonePatchFormat::XdeltaVcdiff, "unsupported VCDIFF version");
+    }
+    // The standard header indicator reserves all but these three feature bits.
+    // We do not interpret custom code tables or compressors here; xdelta3 will
+    // do so during apply, but malformed headers must not look valid in preview.
+    if b[4] & !0x07 != 0 {
+        return invalid(StandalonePatchFormat::XdeltaVcdiff, "invalid VCDIFF header indicator");
+    }
+    (
+        PatchInspectionState::Valid,
+        Fields {
+            warnings: vec![
+                "VCDIFF structure recognized; source identity is not embedded".into(),
+            ],
             ..Default::default()
         },
     )
@@ -1392,6 +1564,51 @@ mod tests {
             inspect_standalone_patch(&path).unwrap().format,
             StandalonePatchFormat::XdeltaVcdiff,
             "the transposed magic must not be detected as VCDIFF"
+        );
+    }
+
+    #[test]
+    fn ppf3_applies_to_derived_output_and_preserves_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_path = temp.path().join("base with spaces.bin");
+        let patch_path = temp.path().join("patch.ppf");
+        let output_path = temp.path().join("derived.bin");
+        let base = vec![1u8, 2, 3, 4];
+        fs::write(&base_path, &base).unwrap();
+        let mut patch = vec![0u8; 61];
+        patch[..5].copy_from_slice(b"PPF30");
+        patch[55..59].copy_from_slice(&(base.len() as u32).to_le_bytes());
+        patch.extend_from_slice(&1u64.to_le_bytes());
+        patch.push(2);
+        patch.extend_from_slice(&[9, 8]);
+        fs::write(&patch_path, &patch).unwrap();
+        let inspection = inspect_standalone_patch(&patch_path).unwrap();
+        assert_eq!(inspection.state, PatchInspectionState::Valid);
+        let plan = build_standalone_patch_apply_plan(
+            &inspection,
+            &base_path,
+            &output_path,
+            temp.path(),
+        )
+        .unwrap();
+        let result = apply_standalone_patch(&plan).unwrap();
+        assert_eq!(fs::read(&base_path).unwrap(), base);
+        assert_eq!(fs::read(&output_path).unwrap(), [1, 9, 8, 4]);
+        assert_eq!(result.provenance.application, "EmuWiz PPF3 applier");
+        assert_eq!(result.output_sha256, hex_digest(&[1, 9, 8, 4]));
+    }
+
+    #[test]
+    fn ppf3_bounds_and_older_revisions_fail_closed() {
+        let (_dir, path) = temp_file("bad.ppf", b"PPF30");
+        assert_eq!(
+            inspect_standalone_patch(&path).unwrap().state,
+            PatchInspectionState::Invalid
+        );
+        let (_dir, path) = temp_file("old.ppf", b"PPF20");
+        assert_eq!(
+            inspect_standalone_patch(&path).unwrap().state,
+            PatchInspectionState::Unsupported
         );
     }
 
