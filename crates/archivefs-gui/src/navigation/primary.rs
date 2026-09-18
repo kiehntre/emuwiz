@@ -174,7 +174,7 @@ pub(crate) fn subviews(view: MainView, overlay: ToolsOverlay) -> &'static [NavEn
             const {
                 &[
                     nav_view(MainView::CanonicalOrganisation, "Plan Libraries"),
-                    nav_view(MainView::PublisherProfiles, "Publisher / Export"),
+                    nav_view(MainView::PublisherProfiles, "Export"),
                 ]
             }
         }

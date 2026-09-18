@@ -43,12 +43,9 @@ pub(crate) fn show_problems_repair_tabs(
     ui: &mut egui::Ui,
     current: ProblemsRepairTab,
 ) -> Option<ProblemsRepairTab> {
-    widgets::page_header_with_icon(
-        ui,
-        crate::ui::icons::CHECK,
-        "Problems & Repair",
-        "See what needs attention and fix it, without switching between separate diagnosis and repair screens.",
-    );
+    if current != ProblemsRepairTab::Diagnostics {
+        widgets::workflow_header(ui, "Health & Recovery", "Find and fix things that need attention.");
+    }
     let tab_options: [(ProblemsRepairTab, &str); 3] = [
         (ProblemsRepairTab::Overview, "Overview"),
         (ProblemsRepairTab::Diagnostics, "Diagnostics"),

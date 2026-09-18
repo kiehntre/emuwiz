@@ -766,12 +766,21 @@ pub(crate) fn show_library_shell_header(
     ui: &mut egui::Ui,
     current_tab: LibraryTab,
 ) -> Option<LibraryTab> {
-    widgets::page_header_with_icon(
-        ui,
-        crate::ui::icons::GAMES,
-        "My Games",
-        "Browse and manage your game library.",
-    );
+    show_library_shell_header_with_actions(ui, current_tab, |_| {})
+}
+
+pub(crate) fn show_library_shell_header_with_actions(
+    ui: &mut egui::Ui,
+    current_tab: LibraryTab,
+    actions: impl FnOnce(&mut egui::Ui),
+) -> Option<LibraryTab> {
+    ui.horizontal_top(|ui| {
+        let width = (ui.available_width() - 165.0).max(120.0);
+        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+            widgets::workflow_header(ui, "My Games", "Browse and manage your games.");
+        });
+        actions(ui);
+    });
     let tab_options: [(LibraryTab, &str); 5] = [
         (
             LibraryTab::Archives,

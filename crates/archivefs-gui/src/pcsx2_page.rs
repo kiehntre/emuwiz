@@ -227,6 +227,42 @@ pub(crate) fn show_pcsx2_panel(
     )
 }
 
+/// A saves-first presentation of the existing card inspection and guarded
+/// export/restore controls. Emulator details remain in the PCSX2 setup page.
+pub(crate) fn show_save_vault_landing(
+    ui: &mut egui::Ui,
+    advanced_mode: bool,
+    _verified_ps2_serial: Option<&str>,
+    state: &Pcsx2StatusState,
+    save_vault: &mut Pcsx2SaveVaultState,
+) -> Option<Pcsx2StatusAction> {
+    widgets::workflow_header(ui, "PS2 Save Vault", "Inspect, export and restore saves with a verified backup before changes.");
+    let mut action = None;
+    if widgets::action_button(ui, "Check PCSX2 Cards", widgets::ActionStyle::Primary,
+        !matches!(state, Pcsx2StatusState::Loading { .. })).clicked() {
+        action = Some(Pcsx2StatusAction::Load);
+    }
+    let cards = match state {
+        Pcsx2StatusState::Ready { outcome: Pcsx2StatusOutcome::Found { memory_cards, .. }, .. } => memory_cards.as_slice(),
+        _ => &[],
+    };
+    ui.label("Choose a card, then select a save to export. Restore and undo retain their review and safety checks.");
+    if save_vault.source == Pcsx2SaveCardSource::Pcsx2
+        && !matches!(state, Pcsx2StatusState::Ready { .. })
+    {
+        ui.label(if matches!(state, Pcsx2StatusState::Loading { .. }) {
+            "Checking PCSX2 cards…"
+        } else {
+            "PCSX2 cards have not been checked yet. Check them or choose a memory-card image."
+        });
+        if ui.button("Choose another memory-card image…").clicked() {
+            action = Some(Pcsx2StatusAction::ChooseMemoryCard);
+        }
+        return action;
+    }
+    show_save_vault(ui, advanced_mode, cards, save_vault).or(action)
+}
+
 pub(crate) fn show_pcsx2_panel_with_save_vault(
     ui: &mut egui::Ui,
     advanced_mode: bool,
@@ -1106,6 +1142,7 @@ fn show_memory_card_contents(
                 },
                 card.card_size_bytes
             ));
+            widgets::technical_details(ui, ("card-geometry", card_index), |ui| {
             if let Some(geometry) = &card.ps2_geometry {
                 ui.label(format!(
                     "Filesystem: PS2 v{} · {}",
@@ -1117,6 +1154,7 @@ fn show_memory_card_contents(
                     }
                 ));
             }
+            });
             if !card.warnings.is_empty() {
                 widgets::banner(
                     ui,

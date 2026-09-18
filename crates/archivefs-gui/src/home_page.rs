@@ -640,7 +640,9 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
     let no_source_folders = library_ready == "No source folders yet";
 
     widgets::section_header(ui, "YOUR GAME LIBRARY", None);
+    let content_width = ui.available_width();
     widgets::hero_card(ui, |ui| {
+        ui.set_width((content_width - 2.0 * theme::SPACE_SM - 2.0).max(0.0));
         ui.set_min_height(150.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(
@@ -708,7 +710,7 @@ pub(crate) fn show_home_page(ui: &mut egui::Ui, view: &HomeView) -> Option<HomeC
 
     ui.add_space(theme::SPACE_LG);
     widgets::section_header(ui, "STATUS", None);
-    widgets::card(ui, |ui| {
+    widgets::full_width_card(ui, |ui| {
         ui.set_min_height(58.0);
         ui.horizontal_wrapped(|ui| {
             status_pill(

@@ -236,8 +236,8 @@ fn sources_page_shows_every_configured_source_with_its_full_state_and_actions() 
     });
 
     for expected in [
-        "Game sources",
-        "A game source is a folder where your games already live.",
+        "Game Folders",
+        "Add folders and scan them to find your games.",
         "Add game folder",
         "Game folder: Archives",
         "Folder path",
@@ -886,7 +886,7 @@ fn sources_page_keeps_configured_sources_visible_when_catalogue_is_unavailable()
         });
     });
 
-    assert!(rendered_text_contains(&output, "Game sources"));
+    assert!(rendered_text_contains(&output, "Game Folders"));
     assert!(rendered_text_contains(&output, "Catalogue unavailable"));
     assert!(rendered_text_contains(&output, "/home/davedap/Archives"));
     assert!(!rendered_text_contains(&output, "0 archives"));
@@ -1973,8 +1973,8 @@ fn activity_panel_collapses_without_permanently_narrowing_the_page() {
         let _ = show_activity_panel(ctx, &mut history, &mut expanded, &mut clipboard);
     });
     assert!(
-        rendered_text_contains(&collapsed, "distinctive-activity-marker"),
-        "the compact Activity summary must surface the latest important state"
+        !rendered_text_contains(&collapsed, "distinctive-activity-marker"),
+        "raw event details belong in expanded history"
     );
 
     expanded = true;
@@ -3909,10 +3909,8 @@ fn sources_libraries_tab_still_renders_source_folder_controls() {
     let output = render_sources_app(&mut app);
 
     assert!(rendered_text_contains(&output, "Sources"));
-    assert!(rendered_text_contains(&output, "Libraries"));
-    assert!(rendered_text_contains(&output, "DATs"));
-    assert!(rendered_text_contains(&output, "Cheats"));
-    assert!(rendered_text_contains(&output, "Discovery"));
+    assert!(rendered_text_contains(&output, "Game Folders"));
+    assert!(rendered_text_contains(&output, "Related source tools"));
     assert!(
         rendered_text_contains(&output, "Add game folder"),
         "source-folder configuration must still render"

@@ -72,12 +72,11 @@ pub(crate) fn show_pages(
             if app.tools_overlay != ToolsOverlay::None {
                 match app.tools_overlay {
                     ToolsOverlay::SaveVault => {
-                        widgets::section_header(ui, "Saves", Some("PS2 Save Vault — existing PCSX2 memory-card tools."));
                         let focused_archive = app.archive_context.focused.clone();
                         app.invalidate_pcsx2_status_if_selection_changed(focused_archive.as_deref());
                         let verified_ps2_serial = app.cheat_workflow.as_ref()
                             .and_then(pcsx2_identity_for_workflow).and_then(|id| id.serial);
-                        let action = pcsx2_page::show_pcsx2_panel_with_save_vault(
+                        let action = pcsx2_page::show_save_vault_landing(
                             ui, app.ui_mode == GuiMode::AdvancedView, verified_ps2_serial.as_deref(),
                             &app.emulator_readiness.pcsx2_status, &mut app.emulator_readiness.pcsx2_save_vault,
                         );
@@ -784,6 +783,43 @@ pub(crate) fn show_pages(
                     true,
                     "cheats_mods_workspace_scroll",
                     |ui| {
+                        // Drained before the workspace renders, so a
+                        // running install/undo is reflected in this
+                        // same frame's render, not one frame late.
+                        if app.dolphin_texture_mod.poll() || app.dolphin_texture_mod.is_busy()
+                        {
+                            ui.ctx().request_repaint();
+                        }
+                        if app.local_mod_package.poll() || app.local_mod_package.is_busy() {
+                            ui.ctx().request_repaint();
+                        }
+                        if let Some(workflow) = app.cheat_workflow.as_ref() {
+                            show_cheat_play_target_warning(
+                                ui,
+                                workflow.adapter,
+                                play_target,
+                            );
+                            ui.add_space(theme::SECTION_GAP / 2.0);
+                        }
+                        let action = show_cheats_mods_page(
+                            ui,
+                            app.cheat_workflow.as_mut(),
+                            &app.emulator_readiness.retroarch_profiles,
+                            &app.emulator_readiness.pcsx2_profiles,
+                            &app.emulator_readiness.dolphin_profiles,
+                            &app.emulator_readiness.xenia_profiles,
+                            live,
+                            app.database_state.snapshot(),
+                            &app.history,
+                            busy || app.catalogue_bsfree_ui.catalogue_retrieval.is_some(),
+                            &mut app.clipboard,
+                            &mut app.dolphin_texture_mod,
+                            &mut app.local_mod_package,
+                        );
+                        // Keep these renderers running each frame: they also
+                        // poll existing jobs and invalidate stale selections.
+                        // Presentation order, not lifecycle, is changed.
+                        ui.add_space(theme::SECTION_GAP);
                         app.user_cheat_import_page.show(
                             ui,
                             &ui.ctx().clone(),
@@ -820,39 +856,6 @@ pub(crate) fn show_pages(
                             ui.add_space(theme::SECTION_GAP);
                             action
                         }).flatten();
-                        // Drained before the workspace renders, so a
-                        // running install/undo is reflected in this
-                        // same frame's render, not one frame late.
-                        if app.dolphin_texture_mod.poll() || app.dolphin_texture_mod.is_busy()
-                        {
-                            ui.ctx().request_repaint();
-                        }
-                        if app.local_mod_package.poll() || app.local_mod_package.is_busy() {
-                            ui.ctx().request_repaint();
-                        }
-                        if let Some(workflow) = app.cheat_workflow.as_ref() {
-                            show_cheat_play_target_warning(
-                                ui,
-                                workflow.adapter,
-                                play_target,
-                            );
-                            ui.add_space(theme::SECTION_GAP / 2.0);
-                        }
-                        let action = show_cheats_mods_page(
-                            ui,
-                            app.cheat_workflow.as_mut(),
-                            &app.emulator_readiness.retroarch_profiles,
-                            &app.emulator_readiness.pcsx2_profiles,
-                            &app.emulator_readiness.dolphin_profiles,
-                            &app.emulator_readiness.xenia_profiles,
-                            live,
-                            app.database_state.snapshot(),
-                            &app.history,
-                            busy || app.catalogue_bsfree_ui.catalogue_retrieval.is_some(),
-                            &mut app.clipboard,
-                            &mut app.dolphin_texture_mod,
-                            &mut app.local_mod_package,
-                        );
                         ui.add_space(theme::SECTION_GAP);
                         app.cheat_reconciliation_review.show(ui);
                         ui.add_space(theme::SECTION_GAP);
@@ -1649,8 +1652,19 @@ pub(crate) fn show_pages(
             // arms `return` after rendering, exactly as their own
             // standalone `if` blocks used to.
             if library_tab_for_main_view(app.view).is_some() {
-                if let Some(clicked_tab) = show_library_shell_header(ui, app.library_tab) {
+                let mut add_folder = false;
+                let clicked_tab = if app.ui_mode == GuiMode::GamerView {
+                    show_library_shell_header(ui, app.library_tab)
+                } else {
+                    navigation::show_library_shell_header_with_actions(ui, app.library_tab, |ui| {
+                    add_folder = widgets::action_button(ui, "Add Game Folder", widgets::ActionStyle::Primary, true).clicked();
+                    })
+                };
+                if let Some(clicked_tab) = clicked_tab {
                     app.navigate_to_library_tab(clicked_tab);
+                }
+                if add_folder {
+                    app.navigate_to_sources_tab(SourcesTab::Libraries);
                 }
 
                 match app.library_tab {

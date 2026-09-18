@@ -6,6 +6,10 @@ use eframe::egui;
 use super::theme;
 use crate::{ClipboardBackend, open_folder_in_file_manager};
 
+#[cfg(test)]
+#[path = "workflow_presentation_tests.rs"]
+mod workflow_presentation_tests;
+
 const EMUWIZ_MASCOT_BADGE_PNG: &[u8] = include_bytes!("../../assets/emuwiz_mascot_badge.png");
 const EMUWIZ_MAGIC_DIVIDER_LONG_PNG: &[u8] =
     include_bytes!("../../assets/emuwiz_magic_divider_long.png");
@@ -539,6 +543,49 @@ pub(crate) fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui
         .inner_margin(egui::Margin::same(14))
         .show(ui, add_contents)
         .inner
+}
+
+/// Equal-width workflow cards. Expanded content may grow, never clip; the
+/// collapsed surface has a consistent height and uses the standard padding.
+pub(crate) fn aligned_card<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    minimum_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    card(ui, |ui| {
+        ui.set_width((width - 30.0).max(0.0));
+        ui.set_min_height(minimum_height);
+        add_contents(ui)
+    })
+}
+
+pub(crate) fn full_width_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    aligned_card(ui, ui.available_width(), 0.0, add_contents)
+}
+
+/// A compact, text-first header; actions remain owned by the calling page.
+pub(crate) fn workflow_header(ui: &mut egui::Ui, title: &str, purpose: &str) {
+    ui.heading(title);
+    ui.label(egui::RichText::new(purpose).color(theme::muted(ui)));
+    ui.add_space(theme::SPACE_MD);
+}
+
+/// Picking changes only the draft text. Inspection, persistence and apply
+/// remain separate, explicit actions in the caller.
+pub(crate) fn folder_picker(ui: &mut egui::Ui, label: &str, value: &mut String) {
+    ui.push_id(label, |ui| {
+        ui.label(label);
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - 96.0 - ui.spacing().item_spacing.x).max(1.0);
+            ui.add_sized(egui::vec2(width, 30.0), egui::TextEdit::singleline(value));
+            if ui.add_sized(egui::vec2(96.0, 30.0), egui::Button::new("Browse…")).clicked()
+                && let Some(path) = rfd::FileDialog::new().set_title(label).pick_folder()
+            {
+                *value = path.display().to_string();
+            }
+        });
+    });
 }
 
 /// The selected-content surface used by Gamer View. It provides elevation and

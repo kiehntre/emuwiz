@@ -105,10 +105,9 @@ pub(crate) fn show_doctor_page(
             ..Default::default()
         });
 
-    widgets::workshop_light_header(
+    widgets::workflow_header(ui, "Health & Recovery", "Find and fix things that need attention.");
+    widgets::card(
         ui,
-        "Doctor",
-        "Check your setup and find anything that needs attention.",
         |ui| match displayed {
             Some(_) if health.blocking > 0 => {
                 widgets::status_badge(ui, "Action required", widgets::StatusTone::Blocked)
@@ -132,7 +131,7 @@ pub(crate) fn show_doctor_page(
             ui.add_space(8.0);
             let health_grid = doctor_health_grid_layout(ui.available_width());
             let metrics = [
-                ("Blocking", health.blocking, widgets::StatusTone::Blocked),
+                ("Things to fix", health.blocking, widgets::StatusTone::Blocked),
                 ("Warnings", health.warnings, widgets::StatusTone::Warning),
                 (
                     "Informational",
@@ -157,7 +156,7 @@ pub(crate) fn show_doctor_page(
         ui.horizontal_wrapped(|ui| {
             if widgets::action_button(
                 ui,
-                "Check for problems",
+                "Check My Setup",
                 widgets::ActionStyle::Primary,
                 !running,
             )

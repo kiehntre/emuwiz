@@ -391,15 +391,24 @@ pub(crate) fn activity_outcome_tone(outcome: ActivityOutcome) -> widgets::Status
 }
 
 pub(crate) fn activity_summary_entry(history: &OperationHistory) -> Option<&HistoryEntry> {
-    history
-        .entries()
-        .find(|entry| {
-            matches!(
-                entry.outcome,
-                ActivityOutcome::Failed | ActivityOutcome::Rejected
-            )
-        })
-        .or_else(|| history.entries().next())
+    // Do not promote an old failure above newer work forever. The full,
+    // unchanged event stream remains available in the expanded history.
+    history.entries().next().filter(|entry| {
+        matches!(
+            entry.outcome,
+            ActivityOutcome::Started
+                | ActivityOutcome::Retried
+                | ActivityOutcome::Confirmed
+                | ActivityOutcome::Failed
+                | ActivityOutcome::Rejected
+        )
+    })
+}
+
+fn compact_activity_message(entry: &HistoryEntry) -> String {
+    // Typed action labels are user-facing. Raw repair metadata belongs to
+    // history, not the always-visible strip (or its tooltip).
+    format!("{} — {}", entry.action, entry.outcome)
 }
 
 pub(crate) fn show_activity_panel(
@@ -471,8 +480,9 @@ pub(crate) fn show_activity_panel(
                         entry.outcome.to_string(),
                         activity_outcome_tone(entry.outcome),
                     );
-                    ui.add(egui::Label::new(&entry.message).truncate())
-                        .on_hover_text(&entry.message);
+                    ui.add(egui::Label::new(compact_activity_message(entry)).truncate());
+                } else if !*expanded {
+                    ui.weak("Recent results are in Activity / History");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if *expanded

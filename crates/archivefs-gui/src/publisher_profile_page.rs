@@ -480,16 +480,16 @@ pub(crate) fn show_publisher_profile_page(
     );
     widgets::section_header(
         ui,
-        "Publisher / Frontend Library",
+        "Build Libraries — Export",
         Some(if execution_complete {
-            "Review the current publisher transaction and its result."
+            "Review your export and its result."
         } else {
-            "Preview how your library would look for another app. Nothing is changed here."
+            "Choose an output and destination, preview, then review before applying."
         }),
     );
     if !execution_complete {
         ui.label(
-            egui::RichText::new("PREVIEW ONLY — nothing will be changed.")
+            egui::RichText::new("Preview first. Applying requires a separate review and confirmation.")
                 .strong()
                 .color(theme::muted(ui)),
         );
@@ -519,12 +519,9 @@ pub(crate) fn show_publisher_profile_page(
             }
         });
         ui.add_space(6.0);
+        widgets::folder_picker(ui, "Destination folder", &mut state.destination_root);
         ui.horizontal(|ui| {
-            ui.label("Destination folder:");
-            ui.text_edit_singleline(&mut state.destination_root);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Platform (canonical id):");
+            ui.label("System:");
             ui.text_edit_singleline(&mut state.canonical_platform_id);
         });
         if state.source_plan.is_none() {
@@ -535,7 +532,7 @@ pub(crate) fn show_publisher_profile_page(
                 )
                 .color(theme::muted(ui)),
             );
-            if ui.button("Open Library Organisation").clicked() {
+            if ui.button("Choose games in Build Libraries").clicked() {
                 action = Some(PublisherProfilePageAction::OpenLibraryOrganisation);
             }
         }

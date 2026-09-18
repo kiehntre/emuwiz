@@ -43,7 +43,7 @@ fn cheats_mods_page_has_a_truthful_no_archive_empty_state() {
     });
 
     for expected in [
-        "Cheats & Mods",
+        "Cheats",
         "Choose a game",
         "Select a game to see available cheats and patches.",
         "Open Library",
@@ -2004,7 +2004,7 @@ fn doctor_page_states_the_scan_is_read_only() {
         &output,
         "never creates, mounts, unmounts, repairs, rebuilds or removes anything"
     ));
-    assert!(rendered_text_contains(&output, "Check for problems"));
+    assert!(rendered_text_contains(&output, "Check My Setup"));
     assert!(!rendered_text_contains(&output, "Run Doctor"));
     assert!(rendered_text_contains(&output, "Last run: never"));
     assert!(rendered_text_contains(&output, "No check has run yet"));
@@ -2333,11 +2333,11 @@ fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
 
     let output = render_problems_repair_app(&mut app);
     assert!(
-        rendered_text_contains(&output, "Emulator Setup"),
+        rendered_text_contains(&output, "Emulators"),
         "the dedicated page header must render"
     );
-    assert!(rendered_text_contains(&output, "Emulator candidates"));
-    assert!(rendered_text_contains(&output, "Check emulators"));
+    assert!(rendered_text_contains(&output, "Setup details"));
+    assert!(rendered_text_contains(&output, "Check Emulators"));
     assert!(
         rendered_text_contains(&output, "PPSSPP"),
         "a supported emulator's own row must be visible"
@@ -2345,10 +2345,9 @@ fn emulator_setup_destination_exposes_the_supported_emulator_readiness_list() {
     assert!(
         rendered_text_contains(&output, "Needs setup") || rendered_text_contains(&output, "Ready")
     );
-    assert!(rendered_text_contains(&output, "Technical details"));
-    // Current candidate technical details intentionally retain the configured
-    // profile path; the removed summary page was the only path-suppressing UI.
-    assert!(rendered_text_contains(&output, "/profiles/ppsspp"));
+    // Details remain in the candidate expander; compact cards do not lead
+    // with installation paths or evidence internals.
+    assert!(!rendered_text_contains(&output, "/profiles/ppsspp"));
     // No Problems & Repair tab chrome when arriving at the dedicated route.
     assert!(!rendered_text_contains(&output, "Repair / Recovery"));
 }
@@ -2363,9 +2362,9 @@ fn emulator_setup_groups_the_unchecked_state_instead_of_repeating_nine_rows() {
     app.view = MainView::EmulatorSetup;
 
     let output = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&output, "Emulator candidates"));
+    assert!(rendered_text_contains(&output, "Setup details"));
     assert!(rendered_text_contains(&output, "Not checked"));
-    assert!(rendered_text_contains(
+    assert!(!rendered_text_contains(
         &output,
         "Run an emulator check to inspect this candidate."
     ));
@@ -2390,7 +2389,7 @@ fn emulator_setup_summary_starts_the_shared_doctor_scan() {
         },
         |ctx| app.update(ctx, &mut frame),
     );
-    let button = first_text_shape_rect(&first, "Check emulators")
+    let button = first_text_shape_rect(&first, "Check Emulators")
         .expect("unchecked Emulator Setup must expose Check emulators");
     let pos = button.center();
 
@@ -2431,7 +2430,7 @@ fn emulator_setup_summary_starts_the_shared_doctor_scan() {
 
     let output = render_problems_repair_app(&mut app);
     assert!(rendered_text_contains(&output, "Checking…"));
-    assert!(!rendered_text_contains(&output, "Check emulators"));
+    assert!(!rendered_text_contains(&output, "Check Emulators"));
 }
 
 #[test]
@@ -2451,14 +2450,14 @@ fn emulator_setup_candidates_are_visible_without_running_doctor() {
     let output = render_problems_repair_app(&mut app);
     // Candidate setup is visible before Doctor has results; no global
     // readiness summary is resurrected for this page.
-    assert!(rendered_text_contains(&output, "Emulator candidates"));
+    assert!(rendered_text_contains(&output, "Setup details"));
     assert!(rendered_text_contains(&output, "PCSX2"));
     assert!(rendered_text_contains(&output, "Not checked"));
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
     assert!(rendered_text_contains(
         &on_diagnostics,
-        "Check for problems"
+        "Check My Setup"
     ));
 }
 
@@ -2471,7 +2470,7 @@ fn emulator_setup_and_the_diagnostics_tab_share_one_doctor_scan_state() {
 
     app.view = MainView::EmulatorSetup;
     let on_setup = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(&on_setup, "Emulator candidates"));
+    assert!(rendered_text_contains(&on_setup, "Setup details"));
 
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
@@ -3905,7 +3904,7 @@ fn problems_repair_diagnostics_tab_still_renders_doctor_content() {
 
     assert!(!rendered_text_contains(&output, DOCTOR_READ_ONLY_NOTICE));
     assert!(rendered_text_contains(&output, "Technical details"));
-    assert!(rendered_text_contains(&output, "Check for problems"));
+    assert!(rendered_text_contains(&output, "Check My Setup"));
 }
 
 #[test]

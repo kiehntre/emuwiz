@@ -845,12 +845,8 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         state.generate_plan();
         state.pending_preview = false;
     }
-    widgets::page_header_with_icon(
-        ui,
-        crate::ui::icons::ORGANISE,
-        "Organise",
-        "Preview how your games can be renamed or organised. Nothing moves until you approve it.",
-    );
+    widgets::workflow_header(ui, "Build Libraries", "Create clean libraries for RomM, ES-DE, RetroDECK or Generic.");
+    ui.weak("1. Choose output   /   2. Choose destination   /   3. Preview   /   4. Apply");
 
     ui.horizontal(|ui| {
         if state.showing_playing_library {
@@ -861,8 +857,8 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             }
         } else if widgets::action_button(
             ui,
-            "Build Playing Library",
-            widgets::ActionStyle::Secondary,
+            "Build Library",
+            widgets::ActionStyle::Primary,
             true,
         )
         .clicked()
@@ -881,7 +877,7 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     if !state.showing_playing_library {
         widgets::section_header(
             ui,
-            "Build a library for…",
+            "Choose output",
             Some("Choose a destination, then review the read-only plan before anything changes."),
         );
         show_library_destination_cards(ui, state);
@@ -1211,13 +1207,14 @@ fn destination_card_layout(available_width: f32, card_count: usize) -> Destinati
 fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
     let layout = destination_card_layout(ui.available_width(), LIBRARY_DESTINATION_CARDS.len());
     for row in LIBRARY_DESTINATION_CARDS.chunks(layout.columns) {
-        ui.horizontal(|ui| {
+        ui.horizontal_top(|ui| {
             for (index, (title, description, destination)) in row.iter().enumerate() {
                 ui.allocate_ui_with_layout(
                     egui::vec2(layout.card_width, 0.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        widgets::card(ui, |ui| {
+                        widgets::aligned_card(ui, layout.card_width, 146.0, |ui| {
+                            let top = ui.cursor().top();
                             ui.label(egui::RichText::new(*title).strong());
                             ui.add(
                                 egui::Label::new(
@@ -1231,16 +1228,10 @@ fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisation
                                     .small(),
                             );
                             let selected = state.playing_library.destination == *destination;
-                            if selected {
-                                widgets::status_badge(
-                                    ui,
-                                    "Current choice",
-                                    widgets::StatusTone::Active,
-                                );
-                            }
+                            ui.add_space((top + 112.0 - ui.cursor().top()).max(0.0));
                             if widgets::action_button(
                                 ui,
-                                "Choose",
+                                if selected { "Current choice" } else { "Choose" },
                                 if selected {
                                     widgets::ActionStyle::Secondary
                                 } else {

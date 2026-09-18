@@ -475,13 +475,6 @@ pub(crate) fn show(
     focused_emulator: Option<&str>,
     overrides: &EmulatorPathOverrides,
 ) -> Option<EmulatorSetupAction> {
-    widgets::section_header(
-        ui,
-        "Emulator candidates",
-        Some(
-            "Choose a platform to see every reviewed emulator candidate and why it is ready or needs setup.",
-        ),
-    );
     let mut action = None;
     ui.horizontal_wrapped(|ui| {
         ui.label("Platform");
@@ -512,9 +505,9 @@ pub(crate) fn show(
             if checking {
                 "Checking…"
             } else {
-                "Check emulators"
+                "Check Emulators"
             },
-            widgets::ActionStyle::Secondary,
+            widgets::ActionStyle::Primary,
             !checking,
         )
         .clicked()
@@ -567,12 +560,16 @@ pub(crate) fn show(
                         if focused {
                             ui.scroll_to_cursor(Some(egui::Align::Center));
                         }
-                        widgets::card(ui, |ui| {
+                        widgets::aligned_card(ui, grid.card_width, 96.0, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(candidate.name).strong());
                                 widgets::status_badge(ui, candidate.state.label(), candidate.state.tone());
                             });
                             ui.label(egui::RichText::new(candidate.platform_id).color(theme::muted(ui)));
+                            egui::CollapsingHeader::new("Setup details")
+                                .id_salt(("candidate-setup", candidate.adapter_id, candidate.platform_id))
+                                .default_open(focused)
+                                .show(ui, |ui| {
                             ui.label(&candidate.reason);
                             if let Some(emulator) =
                                 OverridableEmulator::from_adapter_id(candidate.adapter_id)
@@ -595,6 +592,7 @@ pub(crate) fn show(
                                     }
                                 });
                             }
+                            });
                         });
                     },
                 );
@@ -1445,7 +1443,7 @@ mod tests {
                         Some(&findings),
                         false,
                         RetroArchSetupStatus::NotChecked,
-                        None,
+                        Some("PCSX2"),
                         &overrides,
                     );
                 });

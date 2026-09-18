@@ -107,7 +107,7 @@ fn no_intro_health(
 
 pub(crate) fn show(ui: &mut egui::Ui, view: &DatSourcesPageView) {
     let health = build(view);
-    widgets::card(ui, |ui| {
+    widgets::full_width_card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.heading("Verify your collection");
             if health.catalogue_count == 0 {

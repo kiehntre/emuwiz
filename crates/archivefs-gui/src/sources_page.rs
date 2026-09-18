@@ -1395,13 +1395,7 @@ pub(super) fn show_sources_page_with_mount_root_and_role(
     // otherwise; this function keeps its exact signature and every
     // existing test that calls it directly still gets the same content,
     // just without the now-redundant page-level heading repeating.
-    widgets::section_header(
-        ui,
-        "Game sources",
-        Some(
-            "A game source is a folder where your games already live. EmuWiz reads it to build your library; it never moves, renames, or deletes your files.",
-        ),
-    );
+    widgets::workflow_header(ui, "Game Folders", "Add folders and scan them to find your games. Your originals stay where they are.");
 
     if !catalogue_available {
         widgets::card(ui, |ui| {
@@ -2653,12 +2647,6 @@ pub(super) fn show_sources_recent_activity(ui: &mut egui::Ui, history: &Operatio
 /// (`ArchiveFsApp::show_sources_page`) applies it via
 /// `navigate_to_sources_tab`.
 pub(super) fn show_sources_tabs(ui: &mut egui::Ui, current: SourcesTab) -> Option<SourcesTab> {
-    widgets::workshop_light_header(
-        ui,
-        "Sources / Discovery",
-        "Manage where EmuWiz finds games, DAT catalogues, and cheats.",
-        |_ui| {},
-    );
     let tab_options: [(SourcesTab, &str); 4] = [
         (
             SourcesTab::Libraries,
@@ -2671,7 +2659,10 @@ pub(super) fn show_sources_tabs(ui: &mut egui::Ui, current: SourcesTab) -> Optio
             sources_tab_label(SourcesTab::Discovery),
         ),
     ];
-    let clicked = widgets::tab_row(ui, &tab_options, current);
+    let clicked = egui::CollapsingHeader::new("Related source tools")
+        .default_open(false)
+        .show(ui, |ui| widgets::tab_row(ui, &tab_options, current))
+        .body_returned.flatten();
     ui.add_space(8.0);
     clicked
 }
@@ -2826,7 +2817,7 @@ impl ArchiveFsApp {
                 worker.update_launchbox(self.artwork_media.launchbox_local_media.snapshot().cloned());
             }
         }
-        if let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
+        if tab != SourcesTab::Dats && let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
             self.navigate_to_sources_tab(clicked);
         }
         match tab {
@@ -2850,6 +2841,9 @@ impl ArchiveFsApp {
                     }
                 }
             }
+        }
+        if tab == SourcesTab::Dats && let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
+            self.navigate_to_sources_tab(clicked);
         }
     }
 

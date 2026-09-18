@@ -1300,10 +1300,10 @@ pub(crate) fn show_playing_library_page(
     let mut action = None;
 
     let title = match state.destination {
-        PlayingLibraryDestination::Generic => "Build Generic Playing Library (1G1R)",
-        PlayingLibraryDestination::Romm => "Build RomM Library (1G1R)",
-        PlayingLibraryDestination::EsDe => "Build ES-DE Library (1G1R)",
-        PlayingLibraryDestination::RetroDeck => "Build RetroDECK Library (1G1R)",
+        PlayingLibraryDestination::Generic => "Generic Library",
+        PlayingLibraryDestination::Romm => "RomM Library",
+        PlayingLibraryDestination::EsDe => "ES-DE Library",
+        PlayingLibraryDestination::RetroDeck => "RetroDECK Library",
     };
     widgets::section_header(ui, title, None);
     ui.label(
@@ -1318,7 +1318,7 @@ pub(crate) fn show_playing_library_page(
             "A clean linked library without frontend-specific folders."
         }
         PlayingLibraryDestination::Romm => {
-            "The existing RomM projection supplies the reviewed platform folder automatically."
+            "The RomM preview supplies the reviewed system folder automatically."
         }
         PlayingLibraryDestination::EsDe => {
             "The existing ES-DE mapping supplies the reviewed system folder automatically."
@@ -2138,7 +2138,7 @@ fn show_preview_summary(
             if state.selected_family() == Some(elected.dat_entry_name.as_str()) {
                 ui.label(egui::RichText::new("Selected because:").strong());
                 if elected.explanation.steps.is_empty() {
-                    ui.label("- the only election-eligible release in its family");
+                    ui.label("- the only eligible release of this game");
                 }
                 for step in &elected.explanation.steps {
                     ui.label(format!("- {step}"));

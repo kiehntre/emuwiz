@@ -133,7 +133,7 @@ fn trusted_source_warnings_are_summarised_calmly_without_losing_counts() {
 }
 
 #[test]
-fn activity_starts_collapsed_and_compact_summary_prioritises_errors() {
+fn activity_starts_collapsed_and_does_not_promote_historical_errors() {
     assert!(!app_for_operation_tests().show_activity);
     let mut history = OperationHistory::default();
     history.record(HistoryEntry::new(
@@ -150,8 +150,9 @@ fn activity_starts_collapsed_and_compact_summary_prioritises_errors() {
     ));
     assert_eq!(
         activity_summary_entry(&history).map(|entry| entry.message.as_str()),
-        Some("older failure")
+        None
     );
+    assert_eq!(history.len(), 2, "collapsing never deletes history");
 }
 
 #[test]
@@ -315,7 +316,7 @@ fn playing_library_planner_stays_reachable_from_library_organisation() {
             });
         },
     );
-    assert!(rendered_text_contains(&output, "Build Playing Library"));
+    assert!(rendered_text_contains(&output, "Build Library"));
 }
 
 // --- 0.8.1: core workflows directly discoverable ----------------------

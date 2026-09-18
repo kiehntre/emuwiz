@@ -2414,7 +2414,7 @@ fn stage1_saves_route_renders_existing_pcsx2_panel_without_starting_inspection()
             },
         );
     });
-    assert!(rendered_text_contains(&output, "Saves"));
+    assert!(rendered_text_contains(&output, "PS2 Save Vault"));
     assert!(rendered_text_contains(&output, "Check PCSX2"));
     assert!(matches!(
         app.emulator_readiness.pcsx2_status,

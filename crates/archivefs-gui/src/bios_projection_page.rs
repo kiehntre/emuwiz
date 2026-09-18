@@ -40,21 +40,23 @@ pub(crate) struct BiosProjectionPageState {
 
 impl BiosProjectionPageState {
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        ui.heading("BIOS / Firmware");
-        ui.label(
-            "Inspect a master BIOS collection and review safe, emulator-specific setup plans.",
+        crate::widgets::workflow_header(
+            ui,
+            "BIOS / Firmware",
+            "Prepare firmware required by your emulators.",
         );
-        ui.horizontal(|ui| {
-            ui.label("Master BIOS root:");
-            ui.add(egui::TextEdit::singleline(&mut self.master_root).desired_width(420.0));
-            if ui.button("Inspect master BIOS root").clicked() {
-                self.inspect();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Approved target folder:");
-            ui.add(egui::TextEdit::singleline(&mut self.target_root).desired_width(420.0));
-        });
+        crate::widgets::folder_picker(ui, "BIOS folder", &mut self.master_root);
+        if crate::widgets::action_button(
+            ui,
+            "Inspect BIOS Folder",
+            crate::widgets::ActionStyle::Primary,
+            true,
+        )
+        .clicked()
+        {
+            self.inspect();
+        }
+        crate::widgets::folder_picker(ui, "Approved setup destination", &mut self.target_root);
         ui.small("EmuWiz creates BIOS links in this explicitly supplied folder only; it does not edit emulator settings.");
         if let Some(error) = &self.error {
             ui.colored_label(egui::Color32::from_rgb(180, 70, 55), error);

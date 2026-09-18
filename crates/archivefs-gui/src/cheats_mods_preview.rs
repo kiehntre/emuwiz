@@ -1418,17 +1418,17 @@ pub(crate) fn show_cheats_mods_page(
     // Adapter state and audit evidence remain available in Workflow
     // diagnostics instead of determining whether the page is approachable.
     let beginner_route = workflow.is_some();
-    widgets::page_header_with_icon(
-        ui,
-        crate::ui::icons::CHEATS,
-        "Cheats & Mods",
-        if beginner_route {
-            "Choose compatible enhancements for the selected game."
-        } else {
-            "Find cheats, patches and game enhancements for a selected game."
-        },
-    );
-    let active_section = show_enhancement_section_switch(ui);
+    let section = current_enhancement_section(ui.ctx());
+    widgets::workflow_header(ui,
+        if section == EnhancementSection::Mods { "Mods & ROM Hacks" } else { "Cheats" },
+        if section == EnhancementSection::Mods { "Add patches and mods without changing your original game." } else { "Choose a game, find compatible cheats, then review before installing." });
+    if widgets::action_button(ui, if beginner_route { "Change Game" } else { "Choose Game" }, widgets::ActionStyle::Primary, true).clicked() {
+        action = Some(CheatWorkflowAction::ChooseArchive);
+    }
+    let active_section = egui::CollapsingHeader::new("Other enhancements")
+        .default_open(false)
+        .show(ui, show_enhancement_section_switch)
+        .body_returned.unwrap_or(section);
     ui.add_space(theme::SECTION_GAP / 2.0);
 
     show_selected_game_context(ui, workflow.as_deref(), layout);

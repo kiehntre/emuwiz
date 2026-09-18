@@ -7171,19 +7171,14 @@ pub(crate) fn show_dat_sources_page(
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
 
-    widgets::workshop_light_header(
-        ui,
-        "DAT Sources",
-        "Manage the catalogues EmuWiz uses to identify and organise your collection.",
-        |_ui| {},
-    );
-
-    widgets::page_header_with_icon(
-        ui,
-        crate::ui::icons::VERIFY,
-        "Verify Games",
-        "Use trusted game catalogues to identify and check your games.",
-    );
+    widgets::workflow_header(ui, "DATs & Verification", "Check your games against trusted DAT catalogues.");
+    if let Some(verify_action) = show_single_catalogue_verify_section(ui, view, ui_state) {
+        action = Some(verify_action);
+    }
+    ui.add_space(theme::SPACE_MD);
+    if let Some(import_action) = show_toolbar(ui, view) {
+        action = Some(import_action);
+    }
 
     if let Some(error) = &view.load_error {
         widgets::banner(
@@ -7211,6 +7206,22 @@ pub(crate) fn show_dat_sources_page(
     // first screen.
     verify_summary::show(ui, view);
     ui.add_space(12.0);
+    widgets::full_width_card(ui, |ui| {
+        ui.strong("Last verification — match summary");
+        if let Some(audit) = &view.audit {
+            ui.label(format!("{} · {}", audit.source_display_name, audit.scan_root_short));
+            ui.horizontal_wrapped(|ui| {
+                for category in &audit.categories {
+                    let label = if category.label == "Not in catalogue" { "No match" } else { category.label };
+                    ui.label(format!("{label}: {}", category.count)).on_hover_text(category.meaning);
+                }
+            });
+            ui.weak("Needs re-check: freshness is not assessed here. These are results from the last selected audit, not a new scan.");
+        } else {
+            ui.label("Exact · Probable · Ambiguous · No match — not checked yet");
+            ui.weak("Needs re-check: not assessed. Choose Verify Games to check a folder against a DAT.");
+        }
+    });
 
     // Shared page-level visibility toggle: governs both the coverage
     // section below and the "Local DAT Sources" list further down, so a
@@ -7257,24 +7268,12 @@ pub(crate) fn show_dat_sources_page(
             }
             ui.add_space(10.0);
 
-            if action.is_none()
-                && let Some(single_action) =
-                    show_single_catalogue_verify_section(ui, view, ui_state)
-            {
-                action = Some(single_action);
-            }
         });
     if action.is_some() {
         ui.ctx().request_repaint();
     }
     ui.add_space(10.0);
 
-    if let Some(bar_action) = show_toolbar(ui, view)
-        && action.is_none()
-    {
-        action = Some(bar_action);
-    }
-    ui.add_space(10.0);
 
     save_result::show(ui, &view.save_results);
 
@@ -7294,7 +7293,7 @@ pub(crate) fn show_dat_sources_page(
         ui.add_space(8.0);
     }
 
-    egui::CollapsingHeader::new("Local DAT Sources")
+    egui::CollapsingHeader::new("Installed DATs — local files")
         // Keep the established small-source workflow expanded; the wall of
         // rows is the large-registry case this wrapper is meant to contain.
         .default_open(view.rows.len() < 10)
@@ -7530,12 +7529,12 @@ fn show_single_catalogue_verify_section(
     ui_state: &mut DatSourcesPageUi,
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
-    widgets::card(ui, |ui| {
+    widgets::full_width_card(ui, |ui| {
         widgets::section_header(
             ui,
-            "Verify one catalogue",
+            "Verify Games",
             Some(
-                "Choose one installed catalogue explicitly. The combined Identify & Rename audit remains unchanged.",
+                "Choose an installed DAT, then select the game folder to check. Originals are not changed.",
             ),
         );
         if widgets::action_button(
@@ -7543,9 +7542,9 @@ fn show_single_catalogue_verify_section(
             if ui_state.open_catalogue_picker {
                 "Close catalogue picker"
             } else {
-                "Choose a catalogue…"
+                "Verify Games…"
             },
-            widgets::ActionStyle::Secondary,
+            widgets::ActionStyle::Primary,
             true,
         )
         .clicked()
@@ -9518,12 +9517,12 @@ fn managed_dat_status_presentation(status: &ManagedDatStatusView) -> (&str, widg
 fn show_toolbar(ui: &mut egui::Ui, view: &DatSourcesPageView) -> Option<DatSourcesPageAction> {
     let mut action = None;
     let busy = view.background_busy;
-    widgets::card(ui, |ui| {
+    widgets::full_width_card(ui, |ui| {
         ui.horizontal(|ui| {
             // rfd's pickers are synchronous and return `None` on cancel or
             // failure; they never panic. Held here rather than in the state so
             // the state stays testable without a window.
-            if widgets::action_button(ui, "Add DAT file…", widgets::ActionStyle::Primary, !busy)
+            if widgets::action_button(ui, "Import DAT…", widgets::ActionStyle::Secondary, !busy)
                 .clicked()
                 && let Some(path) = choose_local_dat_file("Choose a DAT file")
             {
@@ -12921,10 +12920,6 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
-        if !identify_rename {
-            self.sources_ui.dat_authority
-                .show(ui, database_state_path(&self.database_state));
-        }
         if self.sources_ui.dat_sources_page.is_none() {
             let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
                 Ok(path) => path,
@@ -12979,6 +12974,12 @@ impl ArchiveFsApp {
         } else {
             dat_sources_page::show_dat_sources_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
         };
+        if !identify_rename {
+            widgets::technical_details(ui, "dat-authority-dashboard", |ui| {
+                self.sources_ui.dat_authority
+                    .show(ui, database_state_path(&self.database_state));
+            });
+        }
         if let Some(action) = action {
             let open_dat_sources = matches!(
                 action,

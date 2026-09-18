@@ -282,14 +282,7 @@ impl ArchiveFsApp {
         ) {
             self.start_retroarch_profile_scan(context.clone());
         }
-        widgets::page_header_with_icon(
-            ui,
-            crate::ui::icons::CHECK,
-            "Emulator Setup",
-            "Check the emulators EmuWiz can find and the profile or launch evidence available \
-             for each one. This page keeps library diagnostics out of the way.",
-        );
-        ui.add_space(theme::SECTION_GAP);
+        widgets::workflow_header(ui, "Emulators", "Check which emulators are installed and ready.");
         let setup_action = emulator_setup_page::show(
             ui,
             &mut self.emulator_readiness.emulator_setup_page,

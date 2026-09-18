@@ -1481,8 +1481,57 @@ fn assert_final_content_reachable(output: &egui::FullOutput, needle: &str) {
     );
 }
 
+// Activity is followed by supporting import/catalogue tools after Stage 2.
+// Verify it is actually reachable while scrolling, not fixed to page bottom.
+fn scroll_to_related_activity(
+    ctx: &egui::Context,
+    app: &mut ArchiveFsApp,
+    frame: &mut eframe::Frame,
+    base_input: &egui::RawInput,
+    screen: egui::Vec2,
+) -> egui::FullOutput {
+    // A resized page may already be below this section. Scroll up first;
+    // Home can belong to a focused text field, so use the actual scroll area.
+    for _ in 0..40 {
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(screen.x / 2.0, screen.y / 2.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, 20.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..base_input.clone()
+        };
+        let _ = ctx.run(input, |ctx| app.update(ctx, frame));
+    }
+    for _ in 0..100 {
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(screen.x / 2.0, screen.y / 2.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -8.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..base_input.clone()
+        };
+        let output = ctx.run(input, |ctx| app.update(ctx, frame));
+        if find_exact_text_position_and_clip(&output, "Recent related activity")
+            .is_some_and(|(position, clip)| clip.contains(position))
+        {
+            return output;
+        }
+    }
+    panic!("related activity must remain reachable before the supporting tools");
+}
+
 #[test]
-fn cheats_mods_final_section_is_reachable_at_maximum_scroll() {
+fn cheats_mods_activity_section_is_reachable_by_scrolling() {
     let mut app = app_with_overflowing_cheats_mods_page();
     let ctx = egui::Context::default();
     let mut frame = eframe::Frame::_new_kittest();
@@ -1492,12 +1541,12 @@ fn cheats_mods_final_section_is_reachable_at_maximum_scroll() {
         ..Default::default()
     };
     run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
-    let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
+    let output = scroll_to_related_activity(&ctx, &mut app, &mut frame, &base_input, screen);
     assert_final_content_reachable(&output, "Recent related activity");
 }
 
 #[test]
-fn cheats_mods_final_section_is_reachable_at_a_smaller_viewport() {
+fn cheats_mods_activity_section_is_reachable_at_a_smaller_viewport() {
     let mut app = app_with_overflowing_cheats_mods_page();
     let ctx = egui::Context::default();
     let mut frame = eframe::Frame::_new_kittest();
@@ -1508,7 +1557,7 @@ fn cheats_mods_final_section_is_reachable_at_a_smaller_viewport() {
         ..Default::default()
     };
     run_settle_frames(&ctx, &mut app, &mut frame, &base_input, 3);
-    let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &base_input, screen);
+    let output = scroll_to_related_activity(&ctx, &mut app, &mut frame, &base_input, screen);
     assert_final_content_reachable(&output, "Recent related activity");
 }
 
@@ -1534,7 +1583,7 @@ fn resizing_the_window_does_not_reintroduce_clipping() {
         ..Default::default()
     };
     run_settle_frames(&ctx, &mut app, &mut frame, &small_input, 3);
-    let output = scroll_to_bottom_with_mouse_wheel(&ctx, &mut app, &mut frame, &small_input, small);
+    let output = scroll_to_related_activity(&ctx, &mut app, &mut frame, &small_input, small);
     assert_final_content_reachable(&output, "Recent related activity");
 }
 
