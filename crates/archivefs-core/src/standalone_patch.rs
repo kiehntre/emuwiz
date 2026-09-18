@@ -8,9 +8,12 @@
 use std::fs;
 use std::process::Command;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+use crate::dat::archive::external_process::{ProcessError, ProcessLimits, run_supervised};
 
 pub const MAX_PATCH_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: usize = 1024 * 1024;
@@ -19,6 +22,23 @@ pub const MAX_DECLARED_OUTPUT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Applying is deliberately more conservative than inspection: the first
 /// implementation keeps the selected base and staged result bounded in RAM.
 pub const MAX_APPLY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Wall-clock ceiling for one supervised `xdelta3` decode. Decoding a patch
+/// bounded by [`MAX_APPLY_BYTES`] is a seconds-scale operation; a minute is
+/// generous for slow storage while still bounding a hostile or looping
+/// input.
+const XDELTA_TIMEOUT: Duration = Duration::from_secs(60);
+/// Resource ceilings for that child. `xdelta3` streams through its window
+/// rather than holding the whole target, so the shared 1 GiB address-space
+/// default is ample; the CPU budget matches the wall-clock ceiling so a
+/// spinning tool is stopped by whichever limit trips first.
+const XDELTA_PROCESS_LIMITS: ProcessLimits = ProcessLimits {
+    address_space_bytes: 1024 * 1024 * 1024,
+    cpu_seconds: 60,
+};
+/// `xdelta3` writes the decoded bytes to the staging file, so its stdout is
+/// diagnostics only. Retaining 1 MiB is far more than it should ever emit.
+const XDELTA_STDOUT_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -723,19 +743,36 @@ fn apply_xdelta3(
             "xdelta staging path is unavailable or unsafe".into(),
         ));
     }
-    let status = Command::new(tool)
+    let mut command = Command::new(tool);
+    command
         .arg("-d")
         .arg("-s")
         .arg(base_path)
         .arg(patch_path)
-        .arg(&stage)
-        .status()
-        .map_err(|error| StandalonePatchError::Io(error.to_string()))?;
-    if !status.success() {
+        .arg(&stage);
+    // xdelta3 writes the decoded result to the staging path, so its stdout
+    // carries only incidental diagnostics; anything beyond the cap is a
+    // misbehaving tool rather than data we need.
+    let outcome = run_supervised(
+        command,
+        XDELTA_PROCESS_LIMITS,
+        XDELTA_TIMEOUT,
+        XDELTA_STDOUT_LIMIT,
+        |_chunk| Ok(()),
+        None,
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = fs::remove_file(&stage);
+            return Err(xdelta_process_error(error));
+        }
+    };
+    if !outcome.status.success() {
         let _ = fs::remove_file(&stage);
         return Err(StandalonePatchError::Malformed(format!(
             "xdelta3 exited with {}",
-            status.code().map_or_else(|| "no exit code".into(), |code| code.to_string())
+            outcome.status.code().map_or_else(|| "no exit code".into(), |code| code.to_string())
         )));
     }
     let safe_stage = fs::symlink_metadata(&stage).is_ok_and(|metadata| {
@@ -750,6 +787,30 @@ fn apply_xdelta3(
     };
     let _ = fs::remove_file(&stage);
     output
+}
+
+/// Maps a supervised-run failure onto this module's own error vocabulary.
+/// Process internals never reach the caller: each arm keeps only a short,
+/// user-facing reason.
+fn xdelta_process_error(error: ProcessError) -> StandalonePatchError {
+    match error {
+        ProcessError::Timeout => StandalonePatchError::Unsupported(format!(
+            "xdelta3 exceeded its {}-second time limit",
+            XDELTA_TIMEOUT.as_secs()
+        )),
+        ProcessError::OutputLimitExceeded { limit } => StandalonePatchError::Malformed(format!(
+            "xdelta3 emitted more than {limit} bytes of diagnostics"
+        )),
+        ProcessError::InvalidLimits => {
+            StandalonePatchError::Unsupported("xdelta3 resource limits are invalid".into())
+        }
+        ProcessError::Io { detail } | ProcessError::Sink { detail } => {
+            StandalonePatchError::Io(detail)
+        }
+        ProcessError::CleanupFailure { detail } => StandalonePatchError::UnsafeOutput(format!(
+            "xdelta3 cleanup failed: {detail}"
+        )),
+    }
 }
 
 fn find_xdelta3() -> Option<PathBuf> {
@@ -1596,6 +1657,91 @@ mod tests {
         assert_eq!(fs::read(&output_path).unwrap(), [1, 9, 8, 4]);
         assert_eq!(result.provenance.application, "EmuWiz PPF3 applier");
         assert_eq!(result.output_sha256, hex_digest(&[1, 9, 8, 4]));
+    }
+
+    #[test]
+    fn supervised_process_failures_map_to_safe_patch_errors() {
+        // A timeout is a tool/environment limit, not a claim about the patch.
+        match xdelta_process_error(ProcessError::Timeout) {
+            StandalonePatchError::Unsupported(reason) => {
+                assert!(reason.contains("60-second"), "{reason}");
+            }
+            other => panic!("timeout must stay unsupported, got {other:?}"),
+        }
+        // A tool flooding stdout is malformed behaviour, and the limit is
+        // reported without exposing any process internals.
+        match xdelta_process_error(ProcessError::OutputLimitExceeded {
+            limit: XDELTA_STDOUT_LIMIT,
+        }) {
+            StandalonePatchError::Malformed(reason) => {
+                assert!(reason.contains(&XDELTA_STDOUT_LIMIT.to_string()), "{reason}");
+            }
+            other => panic!("output flooding must be malformed, got {other:?}"),
+        }
+        assert!(matches!(
+            xdelta_process_error(ProcessError::Io {
+                detail: "spawn refused".into()
+            }),
+            StandalonePatchError::Io(detail) if detail == "spawn refused"
+        ));
+        assert!(matches!(
+            xdelta_process_error(ProcessError::Sink {
+                detail: "refused".into()
+            }),
+            StandalonePatchError::Io(_)
+        ));
+        // A failure *during* kill/reap is a safety concern, not a patch fault.
+        assert!(matches!(
+            xdelta_process_error(ProcessError::CleanupFailure {
+                detail: "reap failed".into()
+            }),
+            StandalonePatchError::UnsafeOutput(_)
+        ));
+        assert!(matches!(
+            xdelta_process_error(ProcessError::InvalidLimits),
+            StandalonePatchError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn xdelta_limits_are_finite_and_conservative() {
+        assert!(XDELTA_TIMEOUT.as_secs() > 0 && XDELTA_TIMEOUT.as_secs() <= 300);
+        // The runtime check the supervisor itself performs.
+        assert!(XDELTA_PROCESS_LIMITS.validate().is_ok());
+        // The rest are compile-time guarantees: a future edit that removes a
+        // ceiling fails the build rather than this test.
+        const {
+            assert!(XDELTA_PROCESS_LIMITS.cpu_seconds > 0);
+            assert!(XDELTA_PROCESS_LIMITS.address_space_bytes <= 1024 * 1024 * 1024);
+            assert!(XDELTA_STDOUT_LIMIT > 0 && XDELTA_STDOUT_LIMIT <= 8 * 1024 * 1024);
+        }
+    }
+
+    #[test]
+    fn xdelta_apply_without_a_tool_leaves_source_and_staging_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_path = temp.path().join("base.bin");
+        let patch_path = temp.path().join("patch.xdelta");
+        let base = vec![7u8, 7, 7, 7];
+        fs::write(&base_path, &base).unwrap();
+        let patch = [0xd6, 0xc4, 0xc3, 0x00];
+        fs::write(&patch_path, patch).unwrap();
+
+        let before: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let result = apply_xdelta3(&base_path, &patch_path, temp.path(), &patch);
+        // With no xdelta3 on PATH this refuses outright; with one present the
+        // truncated patch above still cannot decode. Either way the failure
+        // must be clean.
+        assert!(result.is_err(), "a 4-byte VCDIFF stub must not apply");
+        assert_eq!(fs::read(&base_path).unwrap(), base, "source was mutated");
+        let after: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after, "staging residue was left behind");
     }
 
     #[test]
