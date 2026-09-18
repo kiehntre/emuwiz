@@ -46,6 +46,7 @@ pub mod path_map;
 pub mod providers;
 pub mod redump;
 pub mod romm;
+pub mod screenscraper;
 pub mod settings;
 pub mod stale;
 pub mod status;
