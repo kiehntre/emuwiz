@@ -349,6 +349,9 @@ pub mod psp_boot_evidence;
 pub mod psp_reversible_shrink;
 pub mod psp_game_slimmer;
 
+/// Strict, local-first Game Slimmer profile knowledge and read-only matching.
+pub mod game_slimmer_profiles;
+
 /// Pure, read-only PSP/PS3/Vita `EBOOT.PBP` container header evidence:
 /// bounded fixed-header parsing, offset-table validation, and reuse of
 /// [`param_sfo`] for the embedded `PARAM.SFO` section.
