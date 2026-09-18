@@ -34,6 +34,9 @@ pub mod hashing;
 pub mod launchbox_local;
 pub mod mame_listxml;
 pub mod mame_software_list;
+/// Generic immutable managed-provider source lifecycle. Provider parsers stay
+/// outside this module and supply validation reports for staged candidates.
+pub mod managed_snapshot;
 pub mod matching;
 pub mod media_resolver;
 pub mod model;
