@@ -341,6 +341,9 @@ pub mod ps2_boot_evidence;
 /// Pure, read-only PSP boot/layout evidence (`PSP_GAME/` + `PARAM.SFO`).
 pub mod psp_boot_evidence;
 
+/// PSP ISO to CSO v1 conversion with byte-exact reversible verification.
+pub mod psp_reversible_shrink;
+
 /// Pure, read-only PSP/PS3/Vita `EBOOT.PBP` container header evidence:
 /// bounded fixed-header parsing, offset-table validation, and reuse of
 /// [`param_sfo`] for the embedded `PARAM.SFO` section.
