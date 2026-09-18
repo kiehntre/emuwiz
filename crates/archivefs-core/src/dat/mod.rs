@@ -38,6 +38,7 @@ pub mod authority;
 pub mod catalogue_selection;
 pub mod classification;
 pub mod coverage;
+pub mod coverage_expectations;
 pub mod dependency;
 pub mod disk_audit;
 pub mod divergence;
