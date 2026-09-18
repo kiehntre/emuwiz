@@ -13,6 +13,9 @@ use crate::ArchiveFsApp;
 use crate::optical_conversion_page;
 use crate::selected_evidence_page;
 use crate::ui::{components as widgets, theme};
+use archivefs_core::psp_reversible_shrink::{
+    PspShrinkInspection, PspShrinkResult, PspShrinkTrust, convert_psp_iso_to_cso, inspect_psp_iso,
+};
 use archivefs_core::repair::{
     ChdConversionError, ChdConversionPlan, ChdConversionResult, ChdConversionSourceMode,
     ChdConversionTransaction, build_chd_conversion_plan, execute_chd_conversion,
@@ -190,6 +193,94 @@ pub(crate) struct OpticalConversionPageState {
     hero_texture: Option<egui::TextureHandle>,
     hero_load_attempted: bool,
     hero_preview_scroll: bool,
+    psp_shrink: PspShrinkPageState,
+}
+
+#[derive(Default)]
+struct PspShrinkPageState {
+    source_draft: String,
+    output_draft: String,
+    inspection: Option<PspShrinkInspection>,
+    result: Option<PspShrinkResult>,
+    error: Option<String>,
+}
+
+impl PspShrinkPageState {
+    fn choose_source(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PSP ISO", &["iso"])
+            .pick_file()
+        {
+            self.source_draft = path.display().to_string();
+            self.output_draft = path.with_extension("cso").display().to_string();
+            self.inspection = None;
+            self.result = None;
+            self.error = None;
+        }
+    }
+
+    fn inspect(&mut self) {
+        self.result = None;
+        self.error = None;
+        let source = PathBuf::from(self.source_draft.trim());
+        if self.source_draft.trim().is_empty() {
+            self.error = Some("Choose a PSP ISO first.".into());
+            return;
+        }
+        match inspect_psp_iso(&source) {
+            Ok(inspection) => {
+                if self.output_draft.trim().is_empty() {
+                    self.output_draft = source.with_extension("cso").display().to_string();
+                }
+                self.inspection = Some(inspection);
+            }
+            Err(error) => {
+                self.inspection = None;
+                self.error = Some(format!(
+                    "The selected file could not be verified as a usable PSP ISO. {error}"
+                ));
+            }
+        }
+    }
+
+    fn choose_output(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Compressed ISO", &["cso"])
+            .save_file()
+        {
+            self.output_draft = path.display().to_string();
+            self.result = None;
+            self.error = None;
+        }
+    }
+
+    fn convert(&mut self) {
+        self.error = None;
+        let source = PathBuf::from(self.source_draft.trim());
+        let output = PathBuf::from(self.output_draft.trim());
+        if self.inspection.is_none() {
+            self.error = Some("Inspect the PSP ISO before converting it.".into());
+            return;
+        }
+        if self.output_draft.trim().is_empty() {
+            self.error = Some("Choose an output destination first.".into());
+            return;
+        }
+        match convert_psp_iso_to_cso(&source, &output) {
+            Ok(result) => self.result = Some(result),
+            Err(error) => {
+                self.error = Some(match error {
+                    archivefs_core::psp_reversible_shrink::PspShrinkError::OutputExists(path) => {
+                        format!(
+                            "EmuWiz will not overwrite the existing file: {}. Choose another destination or remove it yourself.",
+                            path.display()
+                        )
+                    }
+                    other => other.to_string(),
+                })
+            }
+        }
+    }
 }
 
 impl Default for OpticalConversionPageState {
@@ -210,6 +301,7 @@ impl Default for OpticalConversionPageState {
             hero_texture: None,
             hero_load_attempted: false,
             hero_preview_scroll: false,
+            psp_shrink: PspShrinkPageState::default(),
         }
     }
 }
@@ -773,6 +865,9 @@ pub(crate) fn show_optical_conversion_page(
     if !show_disc_conversion_hero(ui, state) {
         show_disc_conversion_native_hero(ui, ready_fraction, &signal_lines);
     }
+    // Keep the route's text identity available to accessibility/search
+    // output even when the approved hero asset supplies the visual title.
+    ui.label(egui::RichText::new("Disc Conversion · CUE/BIN → CHD").heading());
     widgets::workflow_strip(ui, &WORKFLOW_STEPS, workflow_step(state));
     ui.add_space(theme::SPACE_SM);
     widgets::card(ui, |ui| {
@@ -784,6 +879,8 @@ pub(crate) fn show_optical_conversion_page(
         widgets::format_chip_row(ui, &SUPPORTED_DISC_FORMAT_CHIPS);
     });
     ui.add_space(theme::SPACE_SM);
+    show_psp_shrink_card(ui, &mut state.psp_shrink);
+    ui.add_space(theme::SECTION_GAP);
 
     if state.candidates.is_empty() && !state.scanned {
         show_intro_card(ui, state);
@@ -1125,6 +1222,118 @@ fn show_disc_conversion_native_hero(
         },
         |_ui| {},
     );
+}
+
+fn show_psp_shrink_card(ui: &mut egui::Ui, state: &mut PspShrinkPageState) {
+    widgets::card(ui, |ui| {
+        widgets::section_header(
+            ui,
+            "Reversible Shrink",
+            Some("Create a verified, reversible CSO from a PSP ISO."),
+        );
+        ui.label("Supported operation: PSP ISO → CSO");
+        ui.label("The original ISO is never deleted, replaced, or modified.");
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(ui, "Choose PSP ISO", widgets::ActionStyle::Primary, true)
+                .clicked()
+            {
+                state.choose_source();
+            }
+            if widgets::action_button(ui, "Choose output", widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                state.choose_output();
+            }
+        });
+        ui.add(
+            egui::TextEdit::singleline(&mut state.source_draft)
+                .hint_text("Source PSP ISO path")
+                .desired_width(ui.available_width()),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut state.output_draft)
+                .hint_text("Output CSO path")
+                .desired_width(ui.available_width()),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if widgets::action_button(ui, "Inspect source", widgets::ActionStyle::Secondary, true)
+                .clicked()
+            {
+                state.inspect();
+            }
+            let can_convert = state.inspection.is_some();
+            if widgets::action_button(
+                ui,
+                "Convert to CSO",
+                widgets::ActionStyle::Primary,
+                can_convert,
+            )
+            .clicked()
+            {
+                state.convert();
+            }
+        });
+
+        if let Some(inspection) = &state.inspection {
+            ui.label(format!(
+                "Original ISO · {}",
+                widgets::format_size(Some(inspection.source_size))
+            ));
+            ui.label("Ready to create a new CSO; preview made no changes.");
+        }
+        if let Some(result) = &state.result {
+            let compressed_size = result.compressed_size.unwrap_or_default();
+            let saved = result
+                .inspection
+                .source_size
+                .saturating_sub(compressed_size);
+            let verified = result.trust == PspShrinkTrust::ReversibleVerified;
+            widgets::status_badge(
+                ui,
+                if verified {
+                    "Verified reversible"
+                } else {
+                    "Verification failed"
+                },
+                if verified {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+            ui.label(format!(
+                "CSO · {} · saved {}",
+                widgets::format_size(Some(compressed_size)),
+                widgets::format_size(Some(saved))
+            ));
+            ui.label(if verified {
+                "The restored ISO matched the original byte-for-byte. Original unchanged."
+            } else {
+                "The restored ISO did not match the original. This result is not trusted."
+            });
+            widgets::technical_details(ui, ("psp-reversible-shrink-result",), |ui| {
+                ui.label(format!("Original: {}", result.inspection.source.display()));
+                ui.label(format!("Output: {}", result.provenance.output.display()));
+                ui.label(format!(
+                    "Original SHA-256: {}",
+                    result.provenance.source_sha256
+                ));
+                ui.label(format!(
+                    "Restored SHA-256: {}",
+                    result.restored_sha256.as_deref().unwrap_or("not available")
+                ));
+                ui.label(format!("Format: {}", result.provenance.format));
+            });
+        }
+        if let Some(error) = &state.error {
+            widgets::banner(
+                ui,
+                "Conversion unavailable",
+                error,
+                widgets::StatusTone::Warning,
+            );
+        }
+    });
 }
 
 impl ArchiveFsApp {
@@ -1842,5 +2051,78 @@ mod tests {
         let capability = supported_capability_for_extension(Some("cue")).unwrap();
         assert_eq!(capability.source_format, "CUE/BIN");
         assert_eq!(capability.target_format, "CHD");
+    }
+
+    fn psp_fixture(dir: &Path) -> PathBuf {
+        let source = dir.join("PSP game with spaces.iso");
+        std::fs::write(
+            &source,
+            vec![0x5au8; archivefs_core::psp_reversible_shrink::CSO_BLOCK_SIZE * 2],
+        )
+        .unwrap();
+        source
+    }
+
+    #[test]
+    fn psp_reversible_shrink_card_is_present_and_advanced_details_are_collapsed() {
+        let mut state = OpticalConversionPageState::default();
+        let output = render(&mut state);
+        assert!(rendered_text_contains(&output, "Reversible Shrink"));
+        assert!(rendered_text_contains(&output, "PSP ISO → CSO"));
+        assert!(rendered_text_contains(&output, "Choose PSP ISO"));
+        assert!(!rendered_text_contains(&output, "Original SHA-256:"));
+    }
+
+    #[test]
+    fn psp_preview_and_conversion_preserve_source_and_report_reversible_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = psp_fixture(directory.path());
+        let before = std::fs::read(&source).unwrap();
+        let output = directory.path().join("result.cso");
+        let mut state = PspShrinkPageState {
+            source_draft: source.display().to_string(),
+            output_draft: output.display().to_string(),
+            ..Default::default()
+        };
+        state.inspect();
+        assert_eq!(
+            state.inspection.as_ref().unwrap().source_size,
+            before.len() as u64
+        );
+        state.convert();
+        let result = state.result.as_ref().unwrap();
+        assert_eq!(result.trust, PspShrinkTrust::ReversibleVerified);
+        assert_eq!(
+            result.provenance.source_sha256,
+            result.restored_sha256.clone().unwrap()
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn psp_existing_output_is_refused_without_touching_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = psp_fixture(directory.path());
+        let output = directory.path().join("existing.cso");
+        std::fs::write(&output, b"keep this output").unwrap();
+        let before = std::fs::read(&source).unwrap();
+        let mut state = PspShrinkPageState {
+            source_draft: source.display().to_string(),
+            output_draft: output.display().to_string(),
+            ..Default::default()
+        };
+        state.inspect();
+        state.convert();
+        assert!(state.result.is_none());
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("will not overwrite")
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep this output");
     }
 }

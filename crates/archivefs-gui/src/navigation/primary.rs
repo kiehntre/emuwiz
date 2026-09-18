@@ -126,7 +126,7 @@ pub(crate) fn entries(group: Destination) -> &'static [NavEntry] {
                     nav_quick_rename("Clean & Rename"),
                     nav_view(MainView::CanonicalOrganisation, "Build Libraries"),
                     nav_view(MainView::ExactDuplicateReview, "Duplicates"),
-                    nav_view(MainView::DiscConversion, "Disc Conversion"),
+                    nav_view(MainView::DiscConversion, "Converter"),
                 ]
             }
         }

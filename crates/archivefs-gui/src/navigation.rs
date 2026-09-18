@@ -166,7 +166,7 @@ pub(crate) fn main_view_title(view: MainView) -> &'static str {
         MainView::RepairReview => "Repair Review",
         MainView::RepairHistory => "Repair History",
         MainView::ExactDuplicateReview => "Duplicate Finder",
-        MainView::DiscConversion => "Disc Conversion",
+        MainView::DiscConversion => "Converter",
         MainView::StorageHealth => "Storage Health",
         MainView::TapeInspector => "Tape Inspector",
         MainView::EmulatorSetup => "Emulator Setup",
