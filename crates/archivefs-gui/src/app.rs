@@ -715,7 +715,7 @@ impl ArchiveFsApp {
             });
         match result {
             Ok(()) => {
-                self.screenscraper_enrichment.mark_applied();
+                self.screenscraper_enrichment.mark_applied_for(archive_id);
                 self.feedback = Some(ActionFeedback {
                     succeeded: true,
                     message: "Metadata was applied explicitly. Identity and source files were unchanged.".into(),

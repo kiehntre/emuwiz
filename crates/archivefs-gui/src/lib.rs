@@ -262,6 +262,7 @@ mod dat_identity_panel;
 mod selected_game_readiness;
 mod screenscraper_page;
 mod screenscraper_enrichment_page;
+mod screenscraper_batch_enrichment_page;
 use dat_identity_panel::*;
 mod source_controller;
 #[allow(unused_imports)]

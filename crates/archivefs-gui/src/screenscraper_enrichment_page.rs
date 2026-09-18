@@ -54,6 +54,7 @@ enum WorkflowView {
 pub(crate) struct ScreenScraperEnrichmentState {
     view: WorkflowView,
     reply: Option<Receiver<Result<LookupOutcome, ScreenScraperError>>>,
+    pub(crate) batch: crate::screenscraper_batch_enrichment_page::ScreenScraperBatchState,
 }
 
 impl Default for ScreenScraperEnrichmentState {
@@ -61,6 +62,7 @@ impl Default for ScreenScraperEnrichmentState {
         Self {
             view: WorkflowView::Idle,
             reply: None,
+            batch: Default::default(),
         }
     }
 }
@@ -68,6 +70,12 @@ impl Default for ScreenScraperEnrichmentState {
 impl ScreenScraperEnrichmentState {
     pub(crate) fn mark_applied(&mut self) {
         self.view = WorkflowView::Applied;
+    }
+
+    pub(crate) fn mark_applied_for(&mut self, archive_id: i64) {
+        if !self.batch.mark_applied(archive_id) {
+            self.mark_applied();
+        }
     }
 
     fn poll(&mut self) {
@@ -343,13 +351,13 @@ pub(crate) fn show(
     action
 }
 
-fn default_choices(candidate: &ScreenScraperEnrichment, current: &ArchiveMetadata) -> [bool; 9] {
+pub(crate) fn default_choices(candidate: &ScreenScraperEnrichment, current: &ArchiveMetadata) -> [bool; 9] {
     EnrichmentField::ALL.map(|field| {
         existing_value(current, field).is_none() && field_value(candidate, field).is_some()
     })
 }
 
-fn existing_value(metadata: &ArchiveMetadata, field: EnrichmentField) -> Option<&str> {
+pub(crate) fn existing_value(metadata: &ArchiveMetadata, field: EnrichmentField) -> Option<&str> {
     match field {
         EnrichmentField::Title => metadata.title.as_deref(),
         EnrichmentField::Synopsis => metadata.synopsis.as_deref(),
@@ -363,7 +371,7 @@ fn existing_value(metadata: &ArchiveMetadata, field: EnrichmentField) -> Option<
     }
 }
 
-fn field_value(candidate: &ScreenScraperEnrichment, field: EnrichmentField) -> Option<&str> {
+pub(crate) fn field_value(candidate: &ScreenScraperEnrichment, field: EnrichmentField) -> Option<&str> {
     match field {
         EnrichmentField::Title => candidate.title.as_ref().map(|v| v.value.as_str()),
         EnrichmentField::Synopsis => candidate.description.as_ref().map(|v| v.value.as_str()),
@@ -377,7 +385,7 @@ fn field_value(candidate: &ScreenScraperEnrichment, field: EnrichmentField) -> O
     }
 }
 
-fn selected_values(
+pub(crate) fn selected_values(
     candidate: &ScreenScraperEnrichment,
     choices: &[bool; 9],
 ) -> AcceptedScreenScraperMetadata {
@@ -412,7 +420,7 @@ fn selected_values(
     }
 }
 
-fn public_error(error: &ScreenScraperError) -> String {
+pub(crate) fn public_error(error: &ScreenScraperError) -> String {
     match error {
         ScreenScraperError::Authentication { .. } => {
             "ScreenScraper rejected the credentials. The library is unchanged.".into()

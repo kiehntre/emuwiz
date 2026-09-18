@@ -9,6 +9,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::ArchiveMetadata;
 
+/// Maximum number of explicitly selected games in one foreground enrichment
+/// session.  This is deliberately small: ScreenScraper requests remain
+/// user-triggered, bounded, and reviewable rather than becoming a library
+/// crawler.
+pub const MAX_EXPLICIT_BATCH_SIZE: usize = 25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenScraperBatchLookupRoute {
+    DirectProviderId(u64),
+    Search,
+}
+
+/// Stored provider IDs are used only when they are valid numeric ScreenScraper
+/// IDs. Anything else deliberately falls back to the bounded search path.
+pub fn batch_lookup_route(provider_record_id: Option<&str>) -> ScreenScraperBatchLookupRoute {
+    provider_record_id
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(ScreenScraperBatchLookupRoute::Search, ScreenScraperBatchLookupRoute::DirectProviderId)
+}
+
+pub fn validate_explicit_batch_size(selected_count: usize) -> Result<(), String> {
+    if selected_count == 0 {
+        Err("Select one or more games first.".into())
+    } else if selected_count > MAX_EXPLICIT_BATCH_SIZE {
+        Err(format!(
+            "Select no more than {MAX_EXPLICIT_BATCH_SIZE} games per enrichment batch."
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AcceptedScreenScraperMetadata {
     pub title: Option<String>,
@@ -169,5 +201,26 @@ mod tests {
         let decoded: ScreenScraperEnrichmentReceipt = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, receipt);
         assert!(!encoded.windows(6).any(|window| window == b"secret"));
+    }
+
+    #[test]
+    fn explicit_batch_size_is_bounded() {
+        assert!(validate_explicit_batch_size(1).is_ok());
+        assert!(validate_explicit_batch_size(MAX_EXPLICIT_BATCH_SIZE).is_ok());
+        assert!(validate_explicit_batch_size(MAX_EXPLICIT_BATCH_SIZE + 1).is_err());
+        assert!(validate_explicit_batch_size(0).is_err());
+    }
+
+    #[test]
+    fn stored_provider_id_prefers_direct_lookup_but_invalid_values_search() {
+        assert_eq!(
+            batch_lookup_route(Some("42")),
+            ScreenScraperBatchLookupRoute::DirectProviderId(42)
+        );
+        assert_eq!(
+            batch_lookup_route(Some("not-an-id")),
+            ScreenScraperBatchLookupRoute::Search
+        );
+        assert_eq!(batch_lookup_route(None), ScreenScraperBatchLookupRoute::Search);
     }
 }

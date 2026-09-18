@@ -1226,6 +1226,16 @@ pub(crate) fn show_loaded_data(
 
     show_selection_controls_row(ui, merged_rows, &visible_indices, selected_archives);
     ui.add_space(4.0);
+    if let Some(action) = crate::screenscraper_batch_enrichment_page::show(
+        ui,
+        &mut screenscraper_state.batch,
+        screenscraper_settings,
+        &data.records,
+        cached,
+        selected_archives,
+    ) {
+        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(action)));
+    }
     if *select_all_visible_requested {
         *selected_archives = select_all_visible(merged_rows, &visible_indices);
         *select_all_visible_requested = false;
