@@ -344,6 +344,7 @@ pub mod psp_boot_evidence;
 
 /// PSP ISO to CSO v1 conversion with byte-exact reversible verification.
 pub mod psp_reversible_shrink;
+pub mod psp_game_slimmer;
 
 /// Pure, read-only PSP/PS3/Vita `EBOOT.PBP` container header evidence:
 /// bounded fixed-header parsing, offset-table validation, and reuse of
