@@ -40,7 +40,11 @@ impl MediaSetsPageState {
         if self.generation == Some(generation) {
             return;
         }
-        let records = archives.iter().filter_map(record_from_catalogue).collect();
+        let records = archives
+            .iter()
+            .filter(|archive| archive.last_verified_missing_at.is_none())
+            .filter_map(record_from_catalogue)
+            .collect();
         self.sets = resolve_index(index_media(records)).sets;
         self.generation = Some(generation);
         self.page = 0;
@@ -105,9 +109,9 @@ fn record_from_catalogue(archive: &PersistedArchive) -> Option<MediaRecord> {
 }
 
 /// Reuse the existing platform-assignment vocabulary when the catalogue row
-/// has not retained an explicit assignment. The first relative-path component
-/// is the configured library's platform folder (for example `dc`), not a
-/// filename guess. Unknown or ambiguous aliases remain unresolved.
+/// has not retained an explicit assignment. A canonical alias in the relative
+/// path (for example `dc` in `roms/dc/...`) is configured library context, not
+/// a filename guess. Unknown or ambiguous aliases remain unresolved.
 fn catalogue_platform_hint(archive: &PersistedArchive) -> Option<String> {
     catalogue_platform_from_assignment_or_path(archive.platform.as_deref(), &archive.relative_path)
 }
@@ -119,14 +123,13 @@ fn catalogue_platform_from_assignment_or_path(
     if let Some(platform) = assigned {
         return Some(platform.to_owned());
     }
-    let component = relative_path
-        .components()
-        .next()
-        .and_then(|component| match component {
+    relative_path.components().find_map(|component| {
+        let value = match component {
             std::path::Component::Normal(value) => value.to_str(),
             _ => None,
-        })?;
-    archivefs_core::canonical_platform_for_alias(component).map(str::to_owned)
+        }?;
+        archivefs_core::canonical_platform_for_alias(value).map(str::to_owned)
+    })
 }
 
 fn matches_filter(set: &MediaSet, filter: MediaSetFilter) -> bool {
@@ -675,6 +678,45 @@ mod tests {
                 Path::new("not-a-platform/game/Disc 1.chd")
             ),
             None
+        );
+    }
+
+    #[test]
+    fn verified_missing_catalogue_rows_do_not_pollute_current_media_sets() {
+        let missing = PersistedArchive {
+            id: 1,
+            source_folder_id: 1,
+            relative_path: PathBuf::from("Headhunter (Europe) (Disc 1).chd"),
+            absolute_path: PathBuf::from("/library/Headhunter (Europe) (Disc 1).chd"),
+            archive_kind: "loose_file".into(),
+            display_name: "Headhunter (Europe) (Disc 1)".into(),
+            normalized_name: "headhunter europe disc 1".into(),
+            size_bytes: None,
+            modified_time_unix_seconds: None,
+            platform: None,
+            platform_source: None,
+            last_known_health: "Missing".into(),
+            last_seen_at: "2026-01-01T00:00:00Z".into(),
+            last_verified_missing_at: Some("2026-01-02T00:00:00Z".into()),
+            identity_report: None,
+        };
+        let mut present = missing.clone();
+        present.id = 2;
+        present.relative_path = PathBuf::from("dc/Headhunter (Europe) (Disc 1).chd");
+        present.absolute_path = PathBuf::from("/library/dc/Headhunter (Europe) (Disc 1).chd");
+        present.last_verified_missing_at = None;
+
+        let mut state = MediaSetsPageState::default();
+        state.refresh(&[missing, present], 1);
+        assert_eq!(state.sets.len(), 1);
+        assert_eq!(state.sets[0].platform.as_deref(), Some("Dreamcast"));
+    }
+
+    #[test]
+    fn nested_library_platform_folder_resolves_existing_alias() {
+        assert_eq!(
+            catalogue_platform_from_assignment_or_path(None, Path::new("roms/dc/Disc 1.chd")),
+            Some("Dreamcast".into())
         );
     }
 }
