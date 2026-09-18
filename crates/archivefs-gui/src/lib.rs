@@ -260,6 +260,7 @@ use selected_game_panel::*;
 mod identity_providers_page;
 mod dat_identity_panel;
 mod selected_game_readiness;
+mod screenscraper_page;
 use dat_identity_panel::*;
 mod source_controller;
 #[allow(unused_imports)]

@@ -1139,6 +1139,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             ratarmount_bin: "ratarmount".to_string(),
             master_rom_root: None,
         }),
+        screenscraper_page: screenscraper_page::ScreenScraperPageState::default(),
         romm_ui: RommUiState::default(),
         selected_evidence_ui: SelectedEvidenceUiState::default(),
         gamer_view_scan_review_available: false,

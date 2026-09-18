@@ -221,6 +221,9 @@ pub(crate) struct ArchiveFsApp {
     /// Loaded once for GUI use. RomM rendering and cached browsing borrow this
     /// snapshot instead of reading `config.toml` on every frame.
     pub(crate) gui_config: GuiConfigSnapshot,
+    /// Session-only ScreenScraper metadata-provider settings and connection
+    /// status. Credentials are deliberately never loaded from disk.
+    pub(crate) screenscraper_page: screenscraper_page::ScreenScraperPageState,
     /// The last authoritative RomM snapshot. `None` until the first status load,
     /// so the card shows "reading" rather than a screenful of zeroes.
     pub(crate) romm_ui: RommUiState,
@@ -433,6 +436,7 @@ impl ArchiveFsApp {
             select_all_visible_requested: false,
             catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
             gui_config,
+            screenscraper_page: screenscraper_page::ScreenScraperPageState::default(),
             romm_ui: RommUiState::default(),
             selected_evidence_ui: SelectedEvidenceUiState::default(),
             gamer_view_scan_review_available: false,

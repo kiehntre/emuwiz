@@ -1594,6 +1594,7 @@ pub(crate) fn show_pages(
                     busy,
                     &mut app.clipboard,
                     &mut app.artwork_media.platform_artwork,
+                    &mut app.screenscraper_page,
                 );
                 match action {
                     Some(SettingsPageAction::OpenConfigFolder) => {

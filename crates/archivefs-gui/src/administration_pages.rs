@@ -1,6 +1,7 @@
 // Library-management and settings page rendering extracted mechanically from main.rs.
 
 use super::*;
+use crate::screenscraper_page::show_screen_scraper_settings;
 
 /// Renders the currently-previewed plan's counts and (filtered) entry
 /// details - shared by every view's Preview output, since only one view's
@@ -2279,6 +2280,7 @@ pub(super) fn show_settings_page(
     busy: bool,
     clipboard: &mut dyn ClipboardBackend,
     artwork: &mut PlatformArtworkManager,
+    screenscraper: &mut screenscraper_page::ScreenScraperPageState,
 ) -> Option<SettingsPageAction> {
     let mut action = None;
     widgets::page_header_with_icon(
@@ -2555,9 +2557,12 @@ pub(super) fn show_settings_page(
     });
 
     ui.add_space(theme::SECTION_GAP);
+    show_screen_scraper_settings(ui, screenscraper, busy);
+
+    ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
-        &crate::ui::icons::with_icon(crate::ui::icons::ARTWORK, "5. Platform artwork"),
+        &crate::ui::icons::with_icon(crate::ui::icons::ARTWORK, "6. Platform artwork"),
         Some(
             "Manage local, upgrade-stable artwork overrides. EmuWiz never identifies a machine \
              from its picture: choose the canonical platform explicitly. Imports are normalised \
@@ -2572,7 +2577,7 @@ pub(super) fn show_settings_page(
     }
 
     ui.add_space(theme::SECTION_GAP);
-    widgets::section_header(ui, "6. More settings coming later", None);
+    widgets::section_header(ui, "7. More settings coming later", None);
     widgets::banner(
         ui,
         "More settings coming later",
