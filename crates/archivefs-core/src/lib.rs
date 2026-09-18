@@ -386,6 +386,10 @@ pub mod xbox360_boot_evidence;
 /// documentation for the Xbox digital collision policy.
 pub mod xbox360_stfs_evidence;
 
+/// Read-only XISO reversible-shrink analysis. No byte-exact shrink writer is
+/// exposed until an exact reconstruction representation is proven.
+pub mod xiso_reversible_shrink;
+
 /// Pure, read-only GameCube/Wii disc-structure evidence, backed by the
 /// `nod` crate rather than a hand-written optical filesystem stack.
 pub mod gamecube_wii_boot_evidence;
