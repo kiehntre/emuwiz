@@ -80,6 +80,7 @@ pub fn id_title_index(version: &str, records: &[DetectionRecord]) -> Vec<IdTitle
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn index_canonicalizes_ids_but_keeps_variant_evidence() {
@@ -107,6 +108,25 @@ mod tests {
         let (_, records) = parse_dump(dump).unwrap();
         assert_eq!(records[0].files[0].hash_key, "md5-2");
         assert_eq!(records[0].files[0].size, Some(4));
+    }
+
+    #[test]
+    fn runtime_id_without_exported_record_remains_a_coverage_gap() {
+        let ids = BTreeSet::from(["scumm:tentacle".to_string()]);
+        let records = vec![DetectionRecord {
+            engine: "scumm".into(),
+            game_id: "monkey2".into(),
+            title: "Monkey Island 2".into(),
+            platform: "dos".into(),
+            language: "en".into(),
+            variant: "CD".into(),
+            files: Vec::new(),
+            fields: BTreeMap::new(),
+        }];
+        assert_eq!(
+            classify_detection(&ids, &records, 0, None),
+            DetectionClass::OfficialDetectionCoverageGap
+        );
     }
 }
 
@@ -448,6 +468,29 @@ pub fn native_ids(output: &str) -> BTreeSet<String> {
         .collect()
 }
 
+fn classify_detection(
+    ids: &BTreeSet<String>,
+    records: &[DetectionRecord],
+    matched_count: usize,
+    discovery_status: Option<MatchStatus>,
+) -> DetectionClass {
+    if matched_count > 0 {
+        DetectionClass::OfficialExact
+    } else if !ids.is_empty()
+        && records
+            .iter()
+            .any(|record| ids.contains(&format!("{}:{}", record.engine, record.game_id)))
+    {
+        DetectionClass::OfficialFallback
+    } else if !ids.is_empty() {
+        DetectionClass::OfficialDetectionCoverageGap
+    } else if discovery_status == Some(MatchStatus::Probable) {
+        DetectionClass::EmuwizDerivedProbable
+    } else {
+        DetectionClass::Unknown
+    }
+}
+
 pub fn verify(snapshot: &ProviderSnapshot, root: &Path) -> ProviderResult<ProviderIdentityResult> {
     let ProviderRecords::NativeDetection(records) = &snapshot.records else {
         return Err("ScummVM requires native records".into());
@@ -484,24 +527,12 @@ pub fn verify(snapshot: &ProviderSnapshot, root: &Path) -> ProviderResult<Provid
             .as_ref()
             .map_or(MatchStatus::NoMatch, |d| d.status),
     };
-    let detection_class = if !matches.is_empty() {
-        DetectionClass::OfficialExact
-    } else if !ids.is_empty()
-        && records
-            .iter()
-            .any(|record| ids.contains(&format!("{}:{}", record.engine, record.game_id)))
-    {
-        DetectionClass::OfficialFallback
-    } else if !ids.is_empty() {
-        DetectionClass::OfficialDetectionCoverageGap
-    } else if discovery
-        .as_ref()
-        .is_some_and(|value| value.status == MatchStatus::Probable)
-    {
-        DetectionClass::EmuwizDerivedProbable
-    } else {
-        DetectionClass::Unknown
-    };
+    let detection_class = classify_detection(
+        &ids,
+        records,
+        matches.len(),
+        discovery.as_ref().map(|value| value.status),
+    );
     let origin = if matches.is_empty() {
         MatchOrigin::EmuwizDiscovery
     } else {

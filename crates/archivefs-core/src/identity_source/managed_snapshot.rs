@@ -12,7 +12,7 @@
 //! not have to add provider-specific download/cache/history implementations.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -424,6 +424,29 @@ impl ManagedSourceStore {
             .unwrap_or(Ok(None))
     }
 
+    /// Read and re-verify the immutable object referenced by the active
+    /// snapshot. Provider adapters can deserialize their own payload without
+    /// reaching into the store layout.
+    pub fn active_snapshot_bytes(&self) -> Result<Option<Vec<u8>>> {
+        self.active_snapshot()?
+            .map(|snapshot| self.snapshot_bytes(&snapshot).map(Some))
+            .unwrap_or(Ok(None))
+    }
+
+    pub fn snapshot_bytes(&self, snapshot: &ManagedSourceSnapshot) -> Result<Vec<u8>> {
+        self.validate_snapshot_record(snapshot)?;
+        let path = self.objects_dir().join(&snapshot.sha256);
+        let mut file =
+            File::open(&path).map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+        if bytes.len() as u64 != snapshot.size_bytes || sha256_bytes(&bytes) != snapshot.sha256 {
+            return Err(config("snapshot object failed integrity verification"));
+        }
+        Ok(bytes)
+    }
+
     pub fn list_snapshots(&self) -> Result<Vec<ManagedSourceSnapshot>> {
         let directory = self.snapshots_dir();
         let entries = match fs::read_dir(&directory) {
@@ -516,6 +539,16 @@ impl ManagedSourceStore {
         let mut input =
             File::open(path).map_err(|error| ArchiveFsError::io(path.clone(), error))?;
         self.stage_reader(&mut input, metadata)
+    }
+
+    /// Stage bytes supplied by a provider adapter. Parsing and validation stay
+    /// provider-owned; staging, hashing, and bounds remain generic.
+    pub fn stage_bytes(
+        &self,
+        bytes: &[u8],
+        metadata: ManagedSourceMetadata,
+    ) -> Result<StagedCandidate> {
+        self.stage_reader(&mut Cursor::new(bytes), metadata)
     }
 
     pub fn fetch_candidate(
@@ -1065,6 +1098,13 @@ fn sha256_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..count]);
     }
     Ok(hex(&hasher.finalize()))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn hex(bytes: &[u8]) -> String {
