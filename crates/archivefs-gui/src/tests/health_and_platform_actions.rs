@@ -2866,6 +2866,8 @@ fn render_show_loaded_data_for_test(
                     recent_scan: None,
                     recent_view: false,
                     library_platform_query: &mut library_platform_query,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
                 },
             );
         });
@@ -3048,6 +3050,8 @@ fn recently_found_tab_keeps_its_content_inside_the_library_shell() {
                     recent_scan: None,
                     recent_view: true,
                     library_platform_query: &mut library_platform_query,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
                 },
             );
         });

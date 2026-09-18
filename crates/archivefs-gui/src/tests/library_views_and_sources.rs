@@ -3079,6 +3079,9 @@ fn inspect_contents_button_is_absent_when_nothing_is_selected() {
                     platform_busy: false,
                     clipboard: &mut clipboard,
                     selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
+                    screenscraper_existing: None,
                 },
             );
         });
@@ -3132,6 +3135,9 @@ fn selected_archive_tools_include_inspection_and_cheats_mods() {
                     platform_busy: false,
                     clipboard: &mut clipboard,
                     selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
+                    screenscraper_existing: None,
                 },
             );
         });
@@ -3187,6 +3193,9 @@ fn render_selected_archive_with_reason(
                     platform_busy: false,
                     clipboard: &mut clipboard,
                     selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
+                    screenscraper_existing: None,
                 },
             );
         });

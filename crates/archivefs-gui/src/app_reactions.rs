@@ -242,6 +242,14 @@ pub(crate) fn apply_page_requests(
                 app.sources_ui.quick_rename_mode = false;
                 app.view = MainView::DatSources;
             }
+            AppOperationRequest::ApplyScreenScraperEnrichment(action) => {
+                let crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply {
+                    archive_id,
+                    values,
+                    receipt,
+                } = *action;
+                app.apply_screenscraper_enrichment(context.clone(), archive_id, values, receipt);
+            }
         }
     }
 }

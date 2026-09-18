@@ -1977,6 +1977,8 @@ pub(crate) fn show_pages(
                             },
                             recent_view: app.library_tab == LibraryTab::RecentlyFound,
                             library_platform_query: &mut app.library_ui.library_platform_query,
+                            screenscraper_state: &mut app.screenscraper_enrichment,
+                            screenscraper_settings: &app.screenscraper_page,
                         },
                     );
                     if app.library_tab == LibraryTab::Archives

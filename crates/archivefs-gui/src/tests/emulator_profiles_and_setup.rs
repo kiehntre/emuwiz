@@ -747,6 +747,9 @@ fn library_selected_archive_panel_renders_the_selected_evidence_report() {
                     platform_busy: false,
                     clipboard: &mut clipboard,
                     selected_evidence: selected_report,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
+                    screenscraper_existing: None,
                 },
             );
         });
@@ -805,6 +808,9 @@ fn render_selected_game_panel_evidence(
                     platform_busy: false,
                     clipboard: &mut clipboard,
                     selected_evidence: view,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
+                    screenscraper_existing: None,
                 },
             );
         });

@@ -4273,6 +4273,8 @@ pub(super) struct LoadedViewState<'a> {
     /// list to matching platform names when a library detects dozens of
     /// distinct platforms. Empty means show every platform.
     pub(super) library_platform_query: &'a mut String,
+    pub(super) screenscraper_state: &'a mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState,
+    pub(super) screenscraper_settings: &'a crate::screenscraper_page::ScreenScraperPageState,
 }
 
 pub(super) const REMOVE_MISSING_CANCEL_LABEL: &str = "Cancel";

@@ -1140,6 +1140,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             master_rom_root: None,
         }),
         screenscraper_page: screenscraper_page::ScreenScraperPageState::default(),
+        screenscraper_enrichment: crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
         romm_ui: RommUiState::default(),
         selected_evidence_ui: SelectedEvidenceUiState::default(),
         gamer_view_scan_review_available: false,
@@ -1427,6 +1428,7 @@ fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
         duplicate_report,
         source_views: Vec::new(),
         mod_catalogue_records: Vec::new(),
+        screenscraper_enrichments: HashMap::new(),
     }
 }
 
@@ -2045,6 +2047,8 @@ impl RealLoadedDataHarness {
                         recent_scan: None,
                         recent_view: self.recent_view,
                         library_platform_query: &mut self.library_platform_query,
+                        screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                        screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
                     },
                 );
                 panel_height = ui.min_rect().height();

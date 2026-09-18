@@ -202,6 +202,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist validated provider-neutral mod catalogue records",
         sql: include_str!("migrations/0018_mod_catalogue_records.sql"),
     },
+    Migration {
+        version: 19,
+        description: "persist explicitly accepted ScreenScraper descriptive metadata and receipts without changing identity",
+        sql: include_str!("migrations/0019_screenscraper_enrichment.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -5352,6 +5357,95 @@ impl Database {
             .map_err(|error| db_error("failed to read archives", error))
     }
 
+    /// Loads the latest explicitly accepted ScreenScraper metadata. This is
+    /// descriptive enrichment only; callers must keep the returned values
+    /// separate from platform and identity evidence.
+    pub fn load_screenscraper_enrichments(
+        &self,
+    ) -> Result<Vec<crate::screenscraper_enrichment::PersistedScreenScraperEnrichment>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT archive_id, values_json, receipt_json \
+                 FROM screenscraper_enrichments ORDER BY archive_id",
+            )
+            .map_err(|error| db_error("failed to prepare ScreenScraper enrichment lookup", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                let values: Vec<u8> = row.get(1)?;
+                let receipt: Vec<u8> = row.get(2)?;
+                let values = serde_json::from_slice(&values).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        values.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })?;
+                let receipt = serde_json::from_slice(&receipt).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        receipt.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(crate::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+                    archive_id: row.get(0)?,
+                    values,
+                    receipt,
+                })
+            })
+            .map_err(|error| db_error("failed to query ScreenScraper enrichments", error))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| db_error("failed to read ScreenScraper enrichments", error))
+    }
+
+    /// Atomically records one user-approved ScreenScraper proposal. The
+    /// receipt contains the before/accepted values, so replacing a prior
+    /// enrichment remains auditable without storing credentials or media.
+    pub fn apply_screenscraper_enrichment(
+        &mut self,
+        archive_id: i64,
+        values: &crate::screenscraper_enrichment::AcceptedScreenScraperMetadata,
+        receipt: &crate::screenscraper_enrichment::ScreenScraperEnrichmentReceipt,
+    ) -> Result<()> {
+        if receipt.provider != "ScreenScraper" {
+            return Err(ArchiveFsError::Database(
+                "metadata enrichment receipt has an unexpected provider".to_string(),
+            ));
+        }
+        let values_json = serde_json::to_vec(values).map_err(|error| {
+            ArchiveFsError::Database(format!("failed to encode ScreenScraper metadata: {error}"))
+        })?;
+        let receipt_json = serde_json::to_vec(receipt).map_err(|error| {
+            ArchiveFsError::Database(format!("failed to encode ScreenScraper receipt: {error}"))
+        })?;
+        let now = now_utc_string();
+        let transaction = self.connection.savepoint().map_err(|error| {
+            db_error("failed to start ScreenScraper enrichment transaction", error)
+        })?;
+        let exists: bool = transaction
+            .query_row("SELECT EXISTS(SELECT 1 FROM archives WHERE id = ?1)", [archive_id], |row| row.get(0))
+            .map_err(|error| db_error("failed to validate enrichment archive", error))?;
+        if !exists {
+            return Err(ArchiveFsError::Database(format!(
+                "cannot enrich unknown archive {archive_id}"
+            )));
+        }
+        transaction
+            .execute(
+                "INSERT INTO screenscraper_enrichments \
+                 (archive_id, values_json, receipt_json, updated_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(archive_id) DO UPDATE SET values_json = excluded.values_json, \
+                 receipt_json = excluded.receipt_json, updated_at = excluded.updated_at",
+                params![archive_id, values_json, receipt_json, now],
+            )
+            .map_err(|error| db_error("failed to persist ScreenScraper enrichment", error))?;
+        transaction
+            .commit()
+            .map_err(|error| db_error("failed to commit ScreenScraper enrichment", error))?;
+        Ok(())
+    }
+
     fn persist_identity_report(
         &mut self,
         archive_id: i64,
@@ -8207,17 +8301,17 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 18);
-        assert_eq!(report.applied_versions, vec![17, 18]);
+        assert_eq!(report.to_version, 19);
+        assert_eq!(report.applied_versions, vec![17, 18, 19]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 18);
+        assert_eq!(upgraded.schema_version().unwrap(), 19);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
-            pending_schema_migration_versions(18).unwrap(),
+            pending_schema_migration_versions(19).unwrap(),
             Vec::<i64>::new()
         );
 
@@ -9077,6 +9171,7 @@ mod tests {
                 "scan_fingerprints",
                 "scan_runs",
                 "schema_migrations",
+                "screenscraper_enrichments",
                 "source_folders",
                 "verified_identity_facts",
             ]
@@ -13413,6 +13508,38 @@ mod tests {
     }
 
     #[test]
+    fn screenscraper_enrichment_is_atomic_and_survives_reload_without_identity_changes() {
+        use crate::screenscraper_enrichment::{
+            AcceptedScreenScraperMetadata, ScreenScraperEnrichmentReceipt,
+        };
+        let (root, mut database, archive_id) = unknown_archive_database("screenscraper-enrichment");
+        let values = AcceptedScreenScraperMetadata {
+            synopsis: Some("A provider description".into()),
+            genre: Some("Adventure".into()),
+            ..Default::default()
+        };
+        let receipt = ScreenScraperEnrichmentReceipt {
+            provider: "ScreenScraper".into(),
+            provider_record_id: "123".into(),
+            retrieved_at_unix_seconds: 10,
+            match_basis: "platform-aware search".into(),
+            before: Default::default(),
+            accepted: values.clone(),
+            media_reference_count: 1,
+        };
+        database
+            .apply_screenscraper_enrichment(archive_id, &values, &receipt)
+            .unwrap();
+        let saved = database.load_screenscraper_enrichments().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].archive_id, archive_id);
+        assert_eq!(saved[0].values, values);
+        assert_eq!(saved[0].receipt.provider_record_id, "123");
+        assert_eq!(database.load_archives().unwrap()[0].platform, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn romm_enrichment_persists_through_existing_platform_assignments() {
         let (root, mut database, archive_id) = unknown_archive_database("romm-platform-enrichment");
         let generation = 3;
@@ -17173,7 +17300,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 18);
+            assert_eq!(latest_known_version(MIGRATIONS), 19);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

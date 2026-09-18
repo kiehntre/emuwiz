@@ -62,6 +62,13 @@ pub(crate) struct CachedLibrarySnapshot {
     /// Provider-neutral mod records imported explicitly by a caller. This is
     /// metadata only; records without local payload bytes remain browse-only.
     pub(crate) mod_catalogue_records: Vec<archivefs_core::mod_catalogue::ModCatalogueRecord>,
+    /// Explicitly accepted ScreenScraper descriptive metadata, keyed by
+    /// archive id. This is presentation enrichment only and is never fed to
+    /// identity/platform resolution.
+    pub(crate) screenscraper_enrichments: HashMap<
+        i64,
+        archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment,
+    >,
 }
 
 // A one-shot value moved straight out of a worker channel
@@ -311,6 +318,12 @@ pub(crate) fn load_snapshot_from(
     };
     let schema_version = database.schema_version().map_err(to_failed)?;
     let archives = database.load_archives().map_err(to_failed)?;
+    let screenscraper_enrichments = database
+        .load_screenscraper_enrichments()
+        .map_err(to_failed)?
+        .into_iter()
+        .map(|item| (item.archive_id, item))
+        .collect();
     let configured_dat_sources =
         archivefs_core::dat::sources::load_dat_sources_config_from(config_path)
             .ok()
@@ -398,6 +411,7 @@ pub(crate) fn load_snapshot_from(
         duplicate_report,
         source_views,
         mod_catalogue_records,
+        screenscraper_enrichments,
     })
 }
 

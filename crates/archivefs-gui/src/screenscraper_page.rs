@@ -114,6 +114,18 @@ impl Default for ScreenScraperPageState {
 }
 
 impl ScreenScraperPageState {
+    pub(crate) fn credentials(&self) -> Option<ScreenScraperCredentials> {
+        let developer_id = self.developer_id.trim();
+        let developer_password = ScreenScraperSecret::parse(&self.developer_password).ok()?;
+        let user_id = (!self.user_id.trim().is_empty()).then(|| self.user_id.trim());
+        let user_password = if self.user_password.trim().is_empty() {
+            None
+        } else {
+            Some(ScreenScraperSecret::parse(&self.user_password).ok()?)
+        };
+        ScreenScraperCredentials::new(developer_id, developer_password, user_id, user_password).ok()
+    }
+
     pub(crate) fn poll(&mut self) {
         let Some(request) = self.request.take() else {
             return;

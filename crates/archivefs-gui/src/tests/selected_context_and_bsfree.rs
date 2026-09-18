@@ -284,6 +284,9 @@ fn context_menu_disabled_mount_reason_matches_the_main_button_reason() {
                     platform_busy: false,
                     clipboard: &mut clipboard,
                     selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
+                    screenscraper_existing: None,
                 },
             );
         });
@@ -1276,6 +1279,8 @@ fn existing_global_unmount_all_confirmation_wording_is_unchanged() {
                     recent_scan: None,
                     recent_view: false,
                     library_platform_query: &mut library_platform_query,
+                    screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                    screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
                 },
             );
         });
@@ -3149,6 +3154,9 @@ fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport(
                         platform_busy: false,
                         clipboard: &mut clipboard,
                         selected_evidence: selected_game_panel::SelectedEvidenceView::Loading,
+                        screenscraper_state: &mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+                        screenscraper_settings: &crate::screenscraper_page::ScreenScraperPageState::default(),
+                        screenscraper_existing: None,
                     },
                 );
             });

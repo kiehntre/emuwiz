@@ -126,6 +126,9 @@ pub(crate) struct SelectedArchiveViewState<'a> {
     pub(crate) platform_busy: bool,
     pub(crate) clipboard: &'a mut dyn ClipboardBackend,
     pub(crate) selected_evidence: SelectedEvidenceView<'a>,
+    pub(crate) screenscraper_state: &'a mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState,
+    pub(crate) screenscraper_settings: &'a crate::screenscraper_page::ScreenScraperPageState,
+    pub(crate) screenscraper_existing: Option<&'a archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
 }
 
 #[derive(Default)]
@@ -138,6 +141,7 @@ pub(crate) struct SelectedArchiveActions {
     /// Routes into the existing Verify Games (DAT Sources) page; never
     /// starts an audit itself.
     pub(crate) open_dat_sources: bool,
+    pub(crate) metadata_enrichment: Option<crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction>,
 }
 
 pub(crate) fn show_selected_archive(
@@ -165,12 +169,16 @@ pub(crate) fn show_selected_archive(
         platform_busy,
         clipboard,
         selected_evidence,
+        screenscraper_state,
+        screenscraper_settings,
+        screenscraper_existing,
     } = view_state;
     let mut request = None;
     let mut platform_request = None;
     let mut inspect_request = None;
     let mut cheats_mods_request = None;
     let mut open_dat_sources_request = false;
+    let mut metadata_enrichment_request = None;
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
@@ -258,6 +266,11 @@ pub(crate) fn show_selected_archive(
             return;
         };
 
+        let mut enriched_record = record.clone();
+        if let Some(existing) = screenscraper_existing {
+            existing.values.apply_to(&mut enriched_record.metadata);
+        }
+        let record = &enriched_record;
         ui.strong(gamer_view::gamer_display_title(record));
         let system = record
             .metadata
@@ -391,6 +404,16 @@ pub(crate) fn show_selected_archive(
             dat_identities,
         ) {
             open_dat_sources_request = true;
+        }
+        if let Some(action) = crate::screenscraper_enrichment_page::show(
+            ui,
+            screenscraper_state,
+            screenscraper_settings,
+            record,
+            persisted.map_or(0, |item| item.id),
+            screenscraper_existing,
+        ) {
+            metadata_enrichment_request = Some(action);
         }
         ui.add_space(6.0);
         let can_lazy_unmount = lazy_unmount_available(record, lazy_unmount_offers, busy);
@@ -528,6 +551,7 @@ pub(crate) fn show_selected_archive(
         inspect: inspect_request,
         cheats_mods: cheats_mods_request,
         open_dat_sources: open_dat_sources_request,
+        metadata_enrichment: metadata_enrichment_request,
     }
 }
 

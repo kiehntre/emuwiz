@@ -171,6 +171,9 @@ pub use library_views::{
 /// Read-only external identity providers - RomM in Stage 1, with room for local
 /// DAT catalogues and Hasheous later.
 pub mod identity_source;
+/// Explicit, user-approved descriptive metadata enrichment. This is kept
+/// separate from identity/platform evidence by construction.
+pub mod screenscraper_enrichment;
 
 /// Universal source discovery: container-vs-content classification of a
 /// mixed collection (archives, loose ROMs, disc images, Amiga images,
@@ -4025,7 +4028,7 @@ pub struct ArchiveMetadata {
 }
 
 impl ArchiveMetadata {
-    fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             title: None,
             platform: None,
