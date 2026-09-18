@@ -816,7 +816,11 @@ fn parse(b: &[u8]) -> (StandalonePatchFormat, PatchInspectionState, Fields) {
         let (s, f) = parse_ups(b);
         return (StandalonePatchFormat::Ups, s, f);
     }
-    if b.starts_with(&[0xd6, 0xc4, 0xc3]) {
+    // RFC 3284 section 4.1: 'V', 'C' and 'D' with their most significant
+    // bits set, in that order - 0xd6, 0xc3, 0xc4. Real xdelta3 output begins
+    // with exactly these bytes; an earlier transposition (0xd6, 0xc4, 0xc3)
+    // meant every genuine patch was reported as an unknown format.
+    if b.starts_with(&[0xd6, 0xc3, 0xc4]) {
         return (
             StandalonePatchFormat::XdeltaVcdiff,
             PatchInspectionState::Valid,
@@ -1358,7 +1362,7 @@ mod tests {
     }
     #[test]
     fn unsafe_output_and_vcdiff_ppf() {
-        let (_d, p) = temp_file("x", &[0xd6, 0xc4, 0xc3]);
+        let (_d, p) = temp_file("x", &[0xd6, 0xc3, 0xc4]);
         let i = inspect_standalone_patch(p).unwrap();
         assert_eq!(i.format, StandalonePatchFormat::XdeltaVcdiff);
         let (_d, p) = temp_file("x.ppf", b"PPF3.0");
@@ -1366,6 +1370,45 @@ mod tests {
             inspect_standalone_patch(p).unwrap().format,
             StandalonePatchFormat::Ppf
         );
+    }
+
+    #[test]
+    fn vcdiff_magic_matches_rfc3284_and_rejects_the_transposed_order() {
+        // RFC 3284 section 4.1: 0xd6 0xc3 0xc4, i.e. "VCD" with each most
+        // significant bit set. Derived from the ASCII letters rather than
+        // written as a literal, so a future transposition cannot satisfy
+        // both this test and the parser at once.
+        let rfc_magic = [b'V' | 0x80, b'C' | 0x80, b'D' | 0x80];
+        assert_eq!(rfc_magic, [0xd6, 0xc3, 0xc4]);
+        let (_dir, path) = temp_file("real.xdelta", &[rfc_magic[0], rfc_magic[1], rfc_magic[2], 0]);
+        let inspection = inspect_standalone_patch(&path).unwrap();
+        assert_eq!(inspection.format, StandalonePatchFormat::XdeltaVcdiff);
+        assert_eq!(inspection.state, PatchInspectionState::Valid);
+
+        // The historical bug: bytes 2 and 3 swapped. That is not VCDIFF and
+        // must never be reported as one again.
+        let (_dir, path) = temp_file("transposed.xdelta", &[0xd6, 0xc4, 0xc3, 0]);
+        assert_ne!(
+            inspect_standalone_patch(&path).unwrap().format,
+            StandalonePatchFormat::XdeltaVcdiff,
+            "the transposed magic must not be detected as VCDIFF"
+        );
+    }
+
+    #[test]
+    fn real_xdelta3_header_bytes_are_detected() {
+        // The first 16 bytes emitted by xdelta3 3.0.11 for a synthetic
+        // base/target pair: VCDIFF magic, version 0, an indicator byte, then
+        // the application header carrying the two local file names. No game
+        // data is involved.
+        let header: [u8; 16] = [
+            0xd6, 0xc3, 0xc4, 0x00, 0x05, 0x02, 0x15, b't', b'a', b'r', b'g', b'e', b't', b'.',
+            b'b', b'i',
+        ];
+        let (_dir, path) = temp_file("from-xdelta3.xdelta", &header);
+        let inspection = inspect_standalone_patch(&path).unwrap();
+        assert_eq!(inspection.format, StandalonePatchFormat::XdeltaVcdiff);
+        assert_eq!(inspection.state, PatchInspectionState::Valid);
     }
 
     #[test]
