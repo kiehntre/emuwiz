@@ -103,7 +103,7 @@ pub fn import_mame_listxml(
     Ok(ImportedMameListxmlSource {
         artifact_sha256,
         artifact_name,
-        upstream_version: None,
+        upstream_version: dat.source.version.clone(),
         dat,
         index,
         disk_index,

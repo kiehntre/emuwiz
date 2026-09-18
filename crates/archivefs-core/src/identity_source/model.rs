@@ -22,18 +22,24 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum IdentityProvider {
     Romm,
+    Mame,
+    ScummVm,
 }
 
 impl IdentityProvider {
     pub fn label(self) -> &'static str {
         match self {
             Self::Romm => "RomM",
+            Self::Mame => "MAME",
+            Self::ScummVm => "ScummVM",
         }
     }
 
     pub fn slug(self) -> &'static str {
         match self {
             Self::Romm => "romm",
+            Self::Mame => "mame",
+            Self::ScummVm => "scummvm",
         }
     }
 }

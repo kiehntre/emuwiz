@@ -19,10 +19,10 @@ fn provenance(source: &ImportedMameListxmlSource, representation: Representation
     Provenance {
         channel: EvidenceChannel::LocalMame,
         upstream_source: SourceFamily::MAMEArcade,
-        upstream_version: None,
+        upstream_version: source.upstream_version.clone(),
         source_artifact: Some(SourceArtifactIdentity {
             source_family: SourceFamily::MAMEArcade,
-            upstream_version: None,
+            upstream_version: source.upstream_version.clone(),
             artifact_sha256: Some(source.artifact_sha256.clone()),
             artifact_name: Some(source.artifact_name.clone()),
         }),

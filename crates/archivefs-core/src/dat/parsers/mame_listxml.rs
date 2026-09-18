@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::{Reader, XmlVersion};
 
 use crate::dat::classification::{DatContentClassification, DatOriginalMetadata};
 use crate::dat::hash::{normalise_crc32, normalise_md5, normalise_sha1};
@@ -42,6 +42,7 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
     let mut in_machine = false;
     let mut text = String::new();
     let mut current: Option<Machine> = None;
+    let mut build = None;
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
@@ -53,6 +54,28 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
                     });
                 }
                 let tag = tag(&e)?;
+                if depth == 1 && tag == "mame" {
+                    for attribute in e.attributes() {
+                        let attribute = attribute.map_err(|err| ParseError::MalformedXml {
+                            detail: err.to_string(),
+                            byte_offset: None,
+                        })?;
+                        if attribute.key.as_ref() == b"build" {
+                            build = Some(
+                                attribute
+                                    .decoded_and_normalized_value(
+                                        XmlVersion::Implicit1_0,
+                                        reader.decoder(),
+                                    )
+                                    .map_err(|err| ParseError::MalformedXml {
+                                        detail: err.to_string(),
+                                        byte_offset: None,
+                                    })?
+                                    .into_owned(),
+                            );
+                        }
+                    }
+                }
                 if tag == "machine" {
                     if games.len() >= limits.max_entries {
                         return Err(ParseError::EntryLimitExceeded {
@@ -155,7 +178,7 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
                 file_path: path.to_string_lossy().into_owned(),
                 name: Some("MAME -listxml".into()),
                 description: None,
-                version: None,
+                version: build,
                 author: None,
                 homepage: None,
                 clrmamepro_header: None,
