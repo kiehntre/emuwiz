@@ -1507,7 +1507,7 @@ pub const PLATFORMS: &[Platform] = &[
     Platform {
         id: "Dreamcast",
         display_name: "Sega Dreamcast",
-        folder_aliases: &["dreamcast", "segadreamcast"],
+        folder_aliases: &["dreamcast", "segadreamcast", "dc"],
         filename_aliases: &[],
         strong_extensions: &["gdi", "cdi"],
         weak_extensions: &["iso", "cue", "bin", "chd", "mdf"],

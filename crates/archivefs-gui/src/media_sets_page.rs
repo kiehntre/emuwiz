@@ -83,8 +83,9 @@ fn record_from_catalogue(archive: &PersistedArchive) -> Option<MediaRecord> {
         .extension()
         .and_then(|value| value.to_str())?;
     let family = family_for_extension(extension)?;
+    let platform = catalogue_platform_hint(archive);
     let mut evidence = filename_evidence(&archive.display_name, Some(family));
-    if let Some(platform) = archive.platform.as_deref() {
+    if let Some(platform) = platform.as_deref() {
         evidence
             .notes
             .push(format!("Catalogue platform assignment: {platform}"));
@@ -94,13 +95,38 @@ fn record_from_catalogue(archive: &PersistedArchive) -> Option<MediaRecord> {
             path: archive.absolute_path.clone(),
             archive_member: None,
         },
-        platform: archive.platform.clone(),
+        platform,
         family: Some(family),
         format: extension.to_ascii_lowercase(),
         availability: MediaAvailability::Observed,
         evidence: vec![evidence],
         warnings: vec!["Derived from catalogue filename/path evidence; content and DAT evidence were not re-read.".into()],
     })
+}
+
+/// Reuse the existing platform-assignment vocabulary when the catalogue row
+/// has not retained an explicit assignment. The first relative-path component
+/// is the configured library's platform folder (for example `dc`), not a
+/// filename guess. Unknown or ambiguous aliases remain unresolved.
+fn catalogue_platform_hint(archive: &PersistedArchive) -> Option<String> {
+    catalogue_platform_from_assignment_or_path(archive.platform.as_deref(), &archive.relative_path)
+}
+
+fn catalogue_platform_from_assignment_or_path(
+    assigned: Option<&str>,
+    relative_path: &Path,
+) -> Option<String> {
+    if let Some(platform) = assigned {
+        return Some(platform.to_owned());
+    }
+    let component = relative_path
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })?;
+    archivefs_core::canonical_platform_for_alias(component).map(str::to_owned)
 }
 
 fn matches_filter(set: &MediaSet, filter: MediaSetFilter) -> bool {
@@ -594,5 +620,61 @@ mod tests {
                 .iter()
                 .all(|step| step.preferred_representation.is_none() || step.alternatives.len() <= 1)
         }));
+    }
+
+    #[test]
+    fn real_library_platform_folder_resolves_multidisc_catalogue_records() {
+        let paths = [
+            "/mnt/usbdrive/games/dc/Headhunter (Europe) (En,Fr,De,Es) (Disc 1).chd",
+            "/mnt/usbdrive/games/dc/Headhunter (Europe) (En,Fr,De,Es) (Disc 2).chd",
+        ];
+        let records = paths
+            .iter()
+            .map(|path| {
+                let relative = PathBuf::from(path.strip_prefix("/mnt/usbdrive/games/").unwrap());
+                let platform = catalogue_platform_from_assignment_or_path(None, &relative);
+                let mut evidence = filename_evidence(
+                    Path::new(path).file_stem().unwrap().to_str().unwrap(),
+                    Some(MediaFamily::Optical),
+                );
+                evidence.notes.push(format!(
+                    "Catalogue platform assignment: {}",
+                    platform.as_deref().unwrap()
+                ));
+                MediaRecord {
+                    source: MediaSource {
+                        path: PathBuf::from(path),
+                        archive_member: None,
+                    },
+                    platform,
+                    family: Some(MediaFamily::Optical),
+                    format: "chd".into(),
+                    availability: MediaAvailability::Observed,
+                    evidence: vec![evidence],
+                    warnings: vec![],
+                }
+            })
+            .collect();
+        let sets = resolve_index(index_media(records)).sets;
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].platform.as_deref(), Some("Dreamcast"));
+        assert_eq!(sets[0].members.len(), 2);
+        assert_eq!(sets[0].expected_count, None);
+        assert_eq!(sets[0].state, MediaSetState::UnverifiedSet);
+        assert!(sets[0]
+            .members
+            .iter()
+            .all(|member| member.ordinal.is_some()));
+    }
+
+    #[test]
+    fn unknown_library_folder_does_not_fabricate_platform() {
+        assert_eq!(
+            catalogue_platform_from_assignment_or_path(
+                None,
+                Path::new("not-a-platform/game/Disc 1.chd")
+            ),
+            None
+        );
     }
 }
