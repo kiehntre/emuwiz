@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::destination_safety::{
     DestinationRootState, DestinationSafetyError, DestinationSafetyFailureReason, DestinationState,
-    assess_destination, validate_destination_root,
+    assess_destination, validate_destination_root, validate_single_component,
 };
 
 pub const PREVIEW_MAX_ENTRIES: usize = 512;
@@ -34,6 +34,10 @@ pub enum PreviewAdapter {
     /// The local generic (non-cheat) mod package workflow. Distinct provenance
     /// so a journal / history row is never mislabelled as an emulator adapter.
     LocalModPackage,
+    /// A structurally inspected Cemu graphic pack. Its relative paths may
+    /// contain any number of safe normal components because Cemu preserves
+    /// the pack's nested content/assets/shader layout.
+    CemuGraphicPack,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -48,6 +52,7 @@ pub enum PreviewIdentityKind {
     /// matches in this mode.
     DolphinTexturePack,
     XeniaTitleId,
+    CemuTitleId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -430,7 +435,11 @@ fn preview_one(
 ) -> SharedPreviewEntry {
     let mut entry = base_entry(request, source, Some(relative.clone()));
     apply_eligibility_blockers(request, source, &mut entry);
-    let Some((directory, filename)) = two_safe_components(&relative) else {
+    let Some((directory, filename)) = two_safe_components(&relative)
+        .or_else(|| (request.adapter == PreviewAdapter::CemuGraphicPack).then(|| {
+            (OsString::new(), OsString::new())
+        }))
+    else {
         block(
             &mut entry,
             PreviewState::UnsafeDestination,
@@ -485,11 +494,16 @@ fn preview_one(
         }
     };
 
-    let assessment = match assess_destination(
-        &request.destination_root,
-        directory.as_os_str(),
-        filename.as_os_str(),
-    ) {
+    let assessment = if request.adapter == PreviewAdapter::CemuGraphicPack {
+        assess_nested_destination(&request.destination_root, &relative)
+    } else {
+        assess_destination(
+            &request.destination_root,
+            directory.as_os_str(),
+            filename.as_os_str(),
+        )
+    };
+    let assessment = match assessment {
         Ok(assessment) => assessment,
         Err(error) => {
             entry.destination_path = Some(error.path.clone());
@@ -725,7 +739,10 @@ fn apply_eligibility_blockers(
             source.match_strength,
             PreviewMatchStrength::VerifiedExact | PreviewMatchStrength::Strong
         ),
-        PreviewAdapter::Pcsx2 | PreviewAdapter::Dolphin | PreviewAdapter::LocalModPackage => {
+        PreviewAdapter::Pcsx2
+        | PreviewAdapter::Dolphin
+        | PreviewAdapter::LocalModPackage
+        | PreviewAdapter::CemuGraphicPack => {
             source.match_strength == PreviewMatchStrength::VerifiedExact
         }
     };
@@ -1126,6 +1143,104 @@ fn two_safe_components(relative: &Path) -> Option<(OsString, OsString)> {
     }
 }
 
+/// Cemu graphic packs deliberately retain arbitrary nested normal components
+/// (`content/`, shader folders, patches, and so on). This is the same
+/// destination-safety contract as the generic local-mod path, kept here so
+/// the shared preview can inspect the exact nested destination without
+/// flattening it.
+fn assess_nested_destination(
+    root: &Path,
+    relative: &Path,
+) -> Result<super::destination_safety::DestinationSafetyAssessment, DestinationSafetyError> {
+    let validated_root = validate_destination_root(root)?;
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(DestinationSafetyError::new(
+            DestinationSafetyFailureReason::UnsafeComponent,
+            root.join(relative),
+        ));
+    }
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components.iter().any(|component| {
+            !matches!(component, Component::Normal(name) if validate_single_component(name, root).is_ok())
+        })
+    {
+        return Err(DestinationSafetyError::new(
+            DestinationSafetyFailureReason::UnsafeComponent,
+            root.join(relative),
+        ));
+    }
+    let mut current = root.to_path_buf();
+    let mut inspected_parents = Vec::new();
+    for component in &components[..components.len() - 1] {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DestinationSafetyError::new(
+                    DestinationSafetyFailureReason::ParentSymlink,
+                    current,
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(DestinationSafetyError::new(
+                    DestinationSafetyFailureReason::NonDirectoryParent,
+                    current,
+                ));
+            }
+            Ok(_) => inspected_parents.push(super::destination_safety::InspectedParent {
+                path: current.clone(),
+                state: super::destination_safety::InspectedParentState::ExistingDirectory,
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                inspected_parents.push(super::destination_safety::InspectedParent {
+                    path: current.clone(),
+                    state: super::destination_safety::InspectedParentState::Missing,
+                });
+            }
+            Err(_) => {
+                return Err(DestinationSafetyError::new(
+                    DestinationSafetyFailureReason::InspectionFailed,
+                    current,
+                ));
+            }
+        }
+    }
+    let destination = root.join(relative);
+    let destination_state = match fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(DestinationSafetyError::new(
+                DestinationSafetyFailureReason::FinalSymlink,
+                destination,
+            ));
+        }
+        Ok(metadata) if metadata.is_file() => DestinationState::RegularFile,
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(DestinationSafetyError::new(
+                DestinationSafetyFailureReason::DestinationIsDirectory,
+                destination,
+            ));
+        }
+        Ok(_) => DestinationState::Unsafe,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DestinationState::Absent,
+        Err(_) => {
+            return Err(DestinationSafetyError::new(
+                DestinationSafetyFailureReason::InspectionFailed,
+                destination,
+            ));
+        }
+    };
+    let safe = super::destination_safety::SafeDestination::nested(
+        validated_root.clone(),
+        destination.clone(),
+    );
+    Ok(super::destination_safety::DestinationSafetyAssessment {
+        validated_root,
+        proposed_destination: safe,
+        destination_state,
+        inspected_parents,
+    })
+}
+
 fn is_filesystem_root(path: &Path) -> bool {
     path.is_absolute() && path.parent().is_none()
 }
@@ -1146,6 +1261,7 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         // `mod_package`'s own compatibility check before a plan is built; this
         // adapter never goes through `build_shared_preview`.
         PreviewAdapter::RetroArch | PreviewAdapter::LocalModPackage => !normalized.is_empty(),
+        PreviewAdapter::CemuGraphicPack => matches!(normalized.as_str(), "wiiu" | "wii u"),
     }
 }
 

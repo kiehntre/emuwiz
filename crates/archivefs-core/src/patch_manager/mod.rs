@@ -23,6 +23,7 @@ mod bsfree;
 mod bsfree_gamecube;
 mod bsfree_wii;
 mod cemu_local;
+mod cemu_graphic_pack;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -185,6 +186,17 @@ pub use cemu_local::{
     discover_cemu_profiles, extract_title_identity, form_for_path as cemu_form_for_path,
     inspect_config as cemu_inspect_config, inspect_extracted_layout,
     keys_evidence as cemu_keys_evidence, parse_cemu_version, resolve_cemu_native_launch_binding,
+};
+pub use cemu_graphic_pack::{
+    CEMU_GRAPHIC_PACK_MAX_FILES, CEMU_GRAPHIC_PACK_MAX_RULES_BYTES,
+    CEMU_GRAPHIC_PACK_MAX_TOTAL_BYTES, CEMU_GRAPHIC_PACK_SOURCE_MODE,
+    CemuGraphicPackApplyResult, CemuGraphicPackArchiveInspection,
+    CemuGraphicPackError, CemuGraphicPackErrorKind, CemuGraphicPackInspection,
+    CemuGraphicPackPlan, apply_cemu_graphic_pack, build_cemu_graphic_pack_plan,
+    build_cemu_graphic_pack_transaction_plan, cemu_graphic_packs_root,
+    inspect_cemu_graphic_pack, inspect_cemu_graphic_pack_zip,
+    preview_cemu_graphic_pack_rollback, rollback_cemu_graphic_pack,
+    verified_cemu_title_id,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,

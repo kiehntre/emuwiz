@@ -1533,6 +1533,7 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::Dolphin => "Dolphin",
         PreviewAdapter::Xenia => "Xenia",
         PreviewAdapter::LocalModPackage => "Local mod package",
+        PreviewAdapter::CemuGraphicPack => "Cemu graphic pack",
     }
 }
 

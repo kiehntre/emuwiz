@@ -111,7 +111,8 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Xenia
-        | PreviewAdapter::LocalModPackage => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::LocalModPackage
+        | PreviewAdapter::CemuGraphicPack => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -257,6 +258,7 @@ pub enum SharedContentVerification {
     /// emulator-specific adapters, its destination may contain any number of
     /// safe normal path components beneath the approved game root.
     LocalModPackage,
+    CemuGraphicPack,
     DolphinManagedGameHacking {
         expected_managed_names: Vec<String>,
         require_managed_section: bool,
@@ -695,6 +697,29 @@ pub fn require_local_mod_package_verification(
     Ok(())
 }
 
+/// Marks a Cemu graphic-pack plan as using its reviewed nested-path contract
+/// and reseals the plan before it can be applied.
+pub fn require_cemu_graphic_pack_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::CemuGraphicPack
+        || plan.context.source_mode != "cemu_graphic_pack"
+        || plan.entries.is_empty()
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "Cemu graphic-pack verification requires a Cemu graphic-pack transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::CemuGraphicPack);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
 pub fn execute_shared_apply(
     plan: &SharedTransactionPlan,
     options: &SharedApplyOptions,
@@ -1072,11 +1097,14 @@ fn apply_one(
             "transaction write-byte limit reached",
         );
     }
-    let local_mod_package = matches!(
+    let nested_mod_package = matches!(
         plan.content_verification.as_ref(),
-        Some(SharedContentVerification::LocalModPackage)
+        Some(
+            SharedContentVerification::LocalModPackage
+                | SharedContentVerification::CemuGraphicPack
+        )
     );
-    let assessment = if local_mod_package {
+    let assessment = if nested_mod_package {
         assess_local_mod_destination(destination_root, &relative)
     } else {
         let Some((category, filename)) = exactly_two_components(&relative) else {
@@ -1200,6 +1228,7 @@ fn apply_one(
                 | PreviewAdapter::Dolphin
                 | PreviewAdapter::Xenia
                 | PreviewAdapter::LocalModPackage
+                | PreviewAdapter::CemuGraphicPack
         );
         if !plan.parent_creation_approved || !adapter_allows_parent_creation {
             return fail_result(
@@ -1210,7 +1239,7 @@ fn apply_one(
                 "parent creation was not approved by preview and adapter contract",
             );
         }
-        let create = if local_mod_package {
+        let create = if nested_mod_package {
             create_local_mod_parents(destination_root, parent)
         } else {
             create_one_parent(destination_root, parent).map(|()| vec![parent.to_path_buf()])
@@ -1382,7 +1411,9 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
             }
             Ok(())
         }
-        SharedContentVerification::LocalModPackage => Ok(()),
+        SharedContentVerification::LocalModPackage | SharedContentVerification::CemuGraphicPack => {
+            Ok(())
+        }
     }
 }
 

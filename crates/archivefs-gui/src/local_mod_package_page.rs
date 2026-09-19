@@ -59,6 +59,7 @@ pub struct LocalModPackagePageState {
     stage: Option<Stage>,
     provider_selection: Option<(String, String)>,
     standalone: StandalonePatchPageState,
+    pub(crate) cemu: crate::cemu_graphic_pack_page::CemuGraphicPackPageState,
 }
 
 #[derive(Default)]
@@ -1338,6 +1339,15 @@ pub fn show_local_mod_package_panel_with_catalogue(
         "Ordinary game mods",
         Some("Choose a local mod folder. EmuWiz previews every file before anything changes."),
     );
+    crate::cemu_graphic_pack_page::show_cemu_graphic_pack_panel(
+        ui,
+        &mut state.cemu,
+        archive_path,
+        identity,
+    );
+    if identity.platform == archivefs_core::game_identity::IdentityPlatform::WiiU {
+        ui.add_space(8.0);
+    }
     show_standalone_patch_panel(
         ui,
         &mut state.standalone,

@@ -977,7 +977,7 @@ fn shared_apply_operation(
     rollback: Option<&SharedRollbackPreview>,
 ) -> OperationRecord {
     let kind = match journal.context.adapter {
-        PreviewAdapter::LocalModPackage => OperationKind::ModApply,
+        PreviewAdapter::LocalModPackage | PreviewAdapter::CemuGraphicPack => OperationKind::ModApply,
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::Dolphin
