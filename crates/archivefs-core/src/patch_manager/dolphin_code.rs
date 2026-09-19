@@ -162,6 +162,16 @@ pub struct MemoryOperation {
     pub value: u32,
 }
 
+/// Hard bound for the derived view used by duplicate/conflict analysis.
+///
+/// Action Replay fill codes encode their repeat count in the data word.  The
+/// format permits a single line to request millions of writes, which is
+/// valid emulator input but is not a safe size for an in-memory analysis
+/// projection.  When a body would exceed this bound, the projection fails
+/// closed by returning no operations; the original code lines remain intact
+/// and are still handled by the normal format/installability checks.
+pub const MAX_DERIVED_MEMORY_OPERATIONS: usize = 4_096;
+
 /// Derives the provable direct-write operations of one canonical code body.
 ///
 /// Only `Write8`/`Write16`/`Write32`/`WriteFloat` lines contribute; every
@@ -206,6 +216,12 @@ pub fn derive_memory_operations(lines: &[String]) -> Vec<MemoryOperation> {
             ArLineFamily::Write8 => {
                 let value = data & 0xFF;
                 let repeat = data >> 8;
+                let count = repeat as usize + 1;
+                if count > MAX_DERIVED_MEMORY_OPERATIONS
+                    || operations.len() > MAX_DERIVED_MEMORY_OPERATIONS - count
+                {
+                    return Vec::new();
+                }
                 for offset in 0..=repeat {
                     operations.push(MemoryOperation {
                         address: base_address.wrapping_add(offset),
@@ -217,6 +233,12 @@ pub fn derive_memory_operations(lines: &[String]) -> Vec<MemoryOperation> {
             ArLineFamily::Write16 => {
                 let value = data & 0xFFFF;
                 let repeat = data >> 16;
+                let count = repeat as usize + 1;
+                if count > MAX_DERIVED_MEMORY_OPERATIONS
+                    || operations.len() > MAX_DERIVED_MEMORY_OPERATIONS - count
+                {
+                    return Vec::new();
+                }
                 for index in 0..=repeat {
                     operations.push(MemoryOperation {
                         address: base_address.wrapping_add(index.wrapping_mul(2)),
@@ -226,6 +248,9 @@ pub fn derive_memory_operations(lines: &[String]) -> Vec<MemoryOperation> {
                 }
             }
             ArLineFamily::Write32 | ArLineFamily::WriteFloat => {
+                if operations.len() >= MAX_DERIVED_MEMORY_OPERATIONS {
+                    return Vec::new();
+                }
                 operations.push(MemoryOperation {
                     address: base_address,
                     size: 4,
@@ -401,5 +426,47 @@ mod tests {
         assert!(derive_memory_operations(&["not a code".to_string()]).is_empty());
         assert!(derive_memory_operations(&["042318AC".to_string()]).is_empty());
         assert!(derive_memory_operations(&["XR7M-X292-DZ418".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn excessive_fill_count_fails_closed_without_allocating_an_unbounded_projection() {
+        let line = "0024CD50 FFFFFF02".to_string();
+        let result = std::panic::catch_unwind(|| derive_memory_operations(&[line]));
+        assert!(result.is_ok(), "an excessive fill count must not panic");
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn mixed_body_with_excessive_fill_fails_closed_deterministically() {
+        let lines = vec![
+            "042318AC 00000001".to_string(),
+            "0024CD50 FFFFFF02".to_string(),
+            "042318B0 00000002".to_string(),
+        ];
+        let first = derive_memory_operations(&lines);
+        let second = derive_memory_operations(&lines);
+        assert!(first.is_empty());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn boundary_fill_count_is_retained_without_exceeding_the_projection_limit() {
+        let operations = derive_memory_operations(&["0024CD50 000FFF02".to_string()]);
+        assert_eq!(operations.len(), MAX_DERIVED_MEMORY_OPERATIONS);
+        assert_eq!(operations.first().map(|operation| operation.value), Some(2));
+        assert_eq!(operations.last().map(|operation| operation.value), Some(2));
+    }
+
+    #[test]
+    fn malformed_neighbor_does_not_discard_valid_direct_writes() {
+        let lines = vec![
+            "042318AC 00000001".to_string(),
+            "042318AC nope".to_string(),
+            "042318B0 00000002".to_string(),
+        ];
+        let operations = derive_memory_operations(&lines);
+        assert_eq!(operations.len(), 2);
+        assert_eq!(operations[0].value, 1);
+        assert_eq!(operations[1].value, 2);
     }
 }
