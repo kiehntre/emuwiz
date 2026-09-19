@@ -312,6 +312,23 @@ fn malformed_and_non_software_list_inputs_fail_closed() {
 }
 
 #[test]
+fn oversized_software_list_is_rejected_before_hashing_or_parsing() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("oversized.xml");
+    let size = crate::dat::limits::DatLimits::default().max_file_size + 1;
+    std::fs::File::create(&path).unwrap().set_len(size).unwrap();
+
+    assert!(matches!(
+        import_mame_software_list(&path),
+        Err(MameSoftwareListImportError::FileTooLarge {
+            size: actual,
+            limit,
+            ..
+        }) if actual == size && limit < actual
+    ));
+}
+
+#[test]
 fn mame_redump_derivation_is_unchanged() {
     assert_eq!(
         known_derivation(SourceFamily::MAMERedump),

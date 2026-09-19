@@ -18,6 +18,11 @@ pub enum MameSoftwareListImportError {
         path: PathBuf,
         error: std::io::Error,
     },
+    FileTooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
     NotMameSoftwareList {
         path: PathBuf,
         detected_ecosystem: DatEcosystem,
@@ -29,6 +34,11 @@ impl fmt::Display for MameSoftwareListImportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { path, error } => write!(f, "cannot read {}: {error}", path.display()),
+            Self::FileTooLarge { path, size, limit } => write!(
+                f,
+                "{} is too large for bounded MAME software-list import ({size} bytes; limit {limit})",
+                path.display()
+            ),
             Self::NotMameSoftwareList {
                 path,
                 detected_ecosystem,
@@ -78,14 +88,31 @@ impl ImportedMameSoftwareListSource {
     }
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
+fn sha256_file(path: &Path, limit: u64) -> Result<String, MameSoftwareListImportError> {
+    let mut file = std::fs::File::open(path).map_err(|error| MameSoftwareListImportError::Io {
+        path: path.to_path_buf(),
+        error,
+    })?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
+    let mut size = 0_u64;
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| MameSoftwareListImportError::Io {
+                path: path.to_path_buf(),
+                error,
+            })?;
         if read == 0 {
             break;
+        }
+        size = size.saturating_add(read as u64);
+        if size > limit {
+            return Err(MameSoftwareListImportError::FileTooLarge {
+                path: path.to_path_buf(),
+                size,
+                limit,
+            });
         }
         hasher.update(&buffer[..read]);
     }
@@ -120,10 +147,21 @@ fn disk_count(dat: &ParsedDat) -> usize {
 pub fn import_mame_software_list(
     path: &Path,
 ) -> Result<ImportedMameSoftwareListSource, MameSoftwareListImportError> {
-    let artifact_sha256 = sha256_file(path).map_err(|error| MameSoftwareListImportError::Io {
-        path: path.to_path_buf(),
-        error,
-    })?;
+    let size = std::fs::metadata(path)
+        .map_err(|error| MameSoftwareListImportError::Io {
+            path: path.to_path_buf(),
+            error,
+        })?
+        .len();
+    let limit = DatLimits::default().max_file_size;
+    if size > limit {
+        return Err(MameSoftwareListImportError::FileTooLarge {
+            path: path.to_path_buf(),
+            size,
+            limit,
+        });
+    }
+    let artifact_sha256 = sha256_file(path, limit)?;
     let dat = parse_dat_file(path, DatLimits::default())
         .map_err(MameSoftwareListImportError::Parse)?
         .dat;
