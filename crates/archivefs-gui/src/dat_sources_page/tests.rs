@@ -6020,7 +6020,13 @@ fn redump_game_disc_rows_show_the_reviewed_typed_supported_systems() {
             .iter()
             .all(|row| !row.configured && row.provider == ManagedDatProvider::RedumpGames)
     );
-    let output = render(&view, &mut DatSourcesPageUi::default());
+    let output = render(
+        &view,
+        &mut DatSourcesPageUi {
+            managed_sources_expanded: Some(true),
+            ..Default::default()
+        },
+    );
     assert!(rendered_text_contains(&output, "Redump Game/Disc DATs"));
     assert!(rendered_text_contains(&output, "System: PlayStation"));
     assert!(rendered_text_contains(&output, "System: PlayStation 2"));
@@ -6031,6 +6037,14 @@ fn redump_game_disc_rows_show_the_reviewed_typed_supported_systems() {
     assert!(rendered_text_contains(&output, "System: Wii"));
     assert!(rendered_text_contains(&output, "System: Xbox"));
     assert!(rendered_text_contains(&output, "System: Xbox 360"));
+    assert!(rendered_text_contains(
+        &output,
+        "Mapped Redump authority; managed endpoint is unverified"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Redump authority mappings are shown separately"
+    ));
     assert!(rendered_text_contains(&output, "Redump BIOS DATs"));
     assert!(rendered_text_contains(&output, "MAME software list"));
 }

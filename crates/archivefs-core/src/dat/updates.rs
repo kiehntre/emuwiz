@@ -166,6 +166,18 @@ pub enum RedumpGameSystem {
     NeoGeoCd,
 }
 
+/// How EmuWiz may acquire a reviewed Redump DAT. A known Redump system slug
+/// is not, by itself, evidence that the current managed downloader has a
+/// verified endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RedumpAcquisitionMode {
+    RemoteManaged,
+    RemoteRequiresUserAction,
+    LocalImportOnly,
+    UnavailableOrUnverified,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RedumpGameSystemDefinition {
     system: RedumpGameSystem,
@@ -342,7 +354,16 @@ pub fn redump_managed_support(platform: Option<IdentityPlatform>) -> RedumpManag
         .iter()
         .find(|definition| definition.platform == platform)
     {
-        return RedumpManagedSupport::SupportedManaged(definition.system);
+        return match definition.system.acquisition_mode() {
+            RedumpAcquisitionMode::RemoteManaged => {
+                RedumpManagedSupport::SupportedManaged(definition.system)
+            }
+            RedumpAcquisitionMode::RemoteRequiresUserAction
+            | RedumpAcquisitionMode::LocalImportOnly
+            | RedumpAcquisitionMode::UnavailableOrUnverified => {
+                RedumpManagedSupport::UnsupportedAcquisition
+            }
+        };
     }
     if platform == IdentityPlatform::Other {
         RedumpManagedSupport::UnknownPlatform
@@ -387,6 +408,15 @@ impl RedumpGameSystem {
 
     pub fn source_key(self) -> &'static str {
         self.definition().source_key
+    }
+
+    pub fn acquisition_mode(self) -> RedumpAcquisitionMode {
+        match self {
+            Self::PlayStation | Self::PlayStation2 | Self::Xbox => {
+                RedumpAcquisitionMode::RemoteManaged
+            }
+            _ => RedumpAcquisitionMode::UnavailableOrUnverified,
+        }
     }
 
     fn slug(self) -> &'static str {
@@ -1702,6 +1732,7 @@ pub enum ManagedDatUpdateFailureKind {
     WrongAuthoritativeName,
     EmptyCatalogue,
     Storage,
+    UnsupportedAcquisition,
 }
 
 /// Options shared by the explicit check and update APIs.  `offline` is an
@@ -1741,6 +1772,17 @@ pub fn check_managed_dat_update(
     }
     if options.offline {
         return Ok(ManagedDatUpdateOutcome::Offline);
+    }
+    if let Some(system) = descriptor.redump_games_system()
+        && system.acquisition_mode() != RedumpAcquisitionMode::RemoteManaged
+    {
+        return Ok(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::UnsupportedAcquisition,
+            detail: format!(
+                "Redump {} acquisition is unavailable or unverified; use an explicit local import",
+                system.dataset_label()
+            ),
+        });
     }
     match descriptor.source_id().provider {
         ManagedDatProvider::MameSoftwareList => check_mame_update(descriptor, options, transport),
@@ -1802,6 +1844,17 @@ pub fn update_managed_dat(
     }
     if options.offline {
         return Ok(ManagedDatUpdateOutcome::Offline);
+    }
+    if let Some(system) = descriptor.redump_games_system()
+        && system.acquisition_mode() != RedumpAcquisitionMode::RemoteManaged
+    {
+        return Ok(ManagedDatUpdateOutcome::Failed {
+            kind: ManagedDatUpdateFailureKind::UnsupportedAcquisition,
+            detail: format!(
+                "Redump {} acquisition is unavailable or unverified; use an explicit local import",
+                system.dataset_label()
+            ),
+        });
     }
     match descriptor.source_id().provider {
         ManagedDatProvider::MameSoftwareList => update_mame_dat(descriptor, options, transport),
@@ -4072,10 +4125,14 @@ mod tests {
     #[test]
     fn canonical_platform_support_is_explicit_and_fail_closed() {
         for definition in REDUMP_GAME_SYSTEM_DEFINITIONS {
-            assert_eq!(
-                redump_managed_support(Some(definition.platform)),
-                RedumpManagedSupport::SupportedManaged(definition.system)
-            );
+            let support = redump_managed_support(Some(definition.platform));
+            match definition.system.acquisition_mode() {
+                RedumpAcquisitionMode::RemoteManaged => assert_eq!(
+                    support,
+                    RedumpManagedSupport::SupportedManaged(definition.system)
+                ),
+                _ => assert_eq!(support, RedumpManagedSupport::UnsupportedAcquisition),
+            }
         }
         assert_eq!(
             redump_managed_support(Some(IdentityPlatform::GameBoy)),
@@ -4100,12 +4157,44 @@ mod tests {
             ("GC", IdentityPlatform::GameCube),
             ("TurboGrafx-CD", IdentityPlatform::PcEngineCd),
         ] {
-            assert!(matches!(
-                redump_managed_support(Some(IdentityPlatform::from_catalogue(Some(alias)))),
-                RedumpManagedSupport::SupportedManaged(system)
-                    if system.canonical_platform() == expected
-            ));
+            let actual =
+                redump_managed_support(Some(IdentityPlatform::from_catalogue(Some(alias))));
+            match redump_managed_support(Some(expected)) {
+                RedumpManagedSupport::SupportedManaged(system) => {
+                    assert_eq!(actual, RedumpManagedSupport::SupportedManaged(system))
+                }
+                RedumpManagedSupport::UnsupportedAcquisition => {
+                    assert_eq!(actual, RedumpManagedSupport::UnsupportedAcquisition)
+                }
+                other => panic!("unexpected expected-platform support: {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn mapped_systems_retain_stable_keys_but_unverified_endpoints_cannot_update() {
+        assert_eq!(RedumpGameSystem::PlayStation.source_key(), "playstation");
+        assert_eq!(RedumpGameSystem::PlayStation2.source_key(), "playstation2");
+        assert_eq!(RedumpGameSystem::Xbox.source_key(), "xbox");
+        assert_eq!(
+            RedumpGameSystem::Dreamcast.acquisition_mode(),
+            RedumpAcquisitionMode::UnavailableOrUnverified
+        );
+        let root = tempfile::tempdir().unwrap().path().to_path_buf();
+        let transport = FakeTransport::new(Vec::new());
+        let outcome = check_managed_dat_update(
+            &redump_games_descriptor(RedumpGameSystem::Dreamcast),
+            &update_options(root),
+            &transport,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ManagedDatUpdateOutcome::Failed {
+                kind: ManagedDatUpdateFailureKind::UnsupportedAcquisition,
+                ..
+            }
+        ));
     }
 
     #[test]

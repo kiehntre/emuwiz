@@ -92,8 +92,8 @@ use archivefs_core::dat::updates::{
     HttpsManagedDatTransport, ManagedDatProvider, ManagedDatReadOnlySource,
     ManagedDatSourceDescriptor, ManagedDatSourceId, ManagedDatState, ManagedDatUpdateFailureKind,
     ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy, RedumpBiosSystem,
-    RedumpGameSystem, check_managed_dat_update, import_managed_fbneo_dat, managed_dat_root,
-    rollback_managed_dat_to_previous, update_managed_dat,
+    RedumpAcquisitionMode, RedumpGameSystem, check_managed_dat_update, import_managed_fbneo_dat,
+    managed_dat_root, rollback_managed_dat_to_previous, update_managed_dat,
 };
 use archivefs_core::identity_source::no_intro::{
     NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportStatus,
@@ -776,6 +776,9 @@ fn managed_dat_failure_message(kind: ManagedDatUpdateFailureKind, detail: &str) 
         | ManagedDatUpdateFailureKind::Tls => "Update check failed; existing DAT remains available",
         ManagedDatUpdateFailureKind::HttpStatus | ManagedDatUpdateFailureKind::InvalidResponse => {
             "Update check failed; current copy kept"
+        }
+        ManagedDatUpdateFailureKind::UnsupportedAcquisition => {
+            "Remote acquisition is not verified; use a local DAT import"
         }
     };
     if detail.is_empty() {
@@ -5907,6 +5910,17 @@ impl DatSourcesPageState {
                 ManagedDatStatusView::NotInstalled
             }
         });
+        let status = if provider == ManagedDatProvider::RedumpGames
+            && redump_game_from_source_key(&source_id.source_key).is_some_and(|system| {
+                system.acquisition_mode() != RedumpAcquisitionMode::RemoteManaged
+            }) {
+            ManagedDatStatusView::Failed {
+                detail: "Remote acquisition is not verified; use an explicit local DAT import"
+                    .to_string(),
+            }
+        } else {
+            status
+        };
         ManagedDatSourceRowView {
             source_id: source_id.clone(),
             provider,
@@ -8976,7 +8990,7 @@ fn show_managed_dat_sources_section(
     widgets::section_header(
         ui,
         "Redump Game/Disc DATs",
-        Some("Fixed Redump catalogues for PlayStation, PlayStation 2, and Xbox only."),
+        Some("Redump authority mappings are shown separately from verified remote acquisition."),
     );
     for row in &view.redump_game_rows {
         let open = ui_state
@@ -9027,17 +9041,43 @@ fn show_managed_dat_source_row(
             .color(theme::muted(ui))
             .small(),
         );
+        let remote_acquisition = row.provider != ManagedDatProvider::RedumpGames
+            || redump_game_from_source_key(&row.source_id.source_key).is_some_and(|system| {
+                system.acquisition_mode() == RedumpAcquisitionMode::RemoteManaged
+            });
+        if row.provider == ManagedDatProvider::RedumpGames && !remote_acquisition {
+            ui.label(
+                egui::RichText::new(
+                    "Mapped Redump authority; managed endpoint is unverified. No remote update is offered.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+        }
         if !row.configured {
             ui.horizontal(|ui| {
-                let add_label = format!("Enable {}", managed_provider_short_label(row.provider));
-                if widgets::action_button(ui, &add_label, widgets::ActionStyle::Primary, !busy)
-                    .clicked()
-                    && action.is_none()
-                {
-                    action = managed_add_action(row);
+                if remote_acquisition {
+                    let add_label =
+                        format!("Enable {}", managed_provider_short_label(row.provider));
+                    if widgets::action_button(ui, &add_label, widgets::ActionStyle::Primary, !busy)
+                        .clicked()
+                        && action.is_none()
+                    {
+                        action = managed_add_action(row);
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("Use local DAT import when available")
+                            .color(theme::muted(ui))
+                            .small(),
+                    );
                 }
-                let _ = widgets::action_button(ui, "Check", widgets::ActionStyle::Secondary, false);
-                let _ = widgets::action_button(ui, "Update", widgets::ActionStyle::Primary, false);
+                if remote_acquisition {
+                    let _ =
+                        widgets::action_button(ui, "Check", widgets::ActionStyle::Secondary, false);
+                    let _ =
+                        widgets::action_button(ui, "Update", widgets::ActionStyle::Primary, false);
+                }
             });
             return;
         }
@@ -9140,7 +9180,7 @@ fn show_managed_dat_source_row(
                 ui,
                 "Check",
                 widgets::ActionStyle::Secondary,
-                !busy && row.configured,
+                !busy && row.configured && remote_acquisition,
             )
             .clicked()
                 && action.is_none()
@@ -9154,7 +9194,7 @@ fn show_managed_dat_source_row(
                 ui,
                 "Update",
                 widgets::ActionStyle::Primary,
-                !busy && row.configured && row.update_enabled,
+                !busy && row.configured && row.update_enabled && remote_acquisition,
             )
             .clicked()
                 && action.is_none()
