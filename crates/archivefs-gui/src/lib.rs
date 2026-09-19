@@ -294,6 +294,7 @@ pub(crate) mod mount_batch;
 use mount_batch::*;
 mod dat_authority_dashboard;
 pub(crate) mod dolphin_texture_mod_page;
+pub(crate) mod pcsx2_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
 #[allow(dead_code)]
 pub(crate) mod feature_discovery;

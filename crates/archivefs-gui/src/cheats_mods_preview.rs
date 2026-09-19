@@ -1592,6 +1592,27 @@ pub(crate) fn show_cheats_mods_page(
             }
             CheatEmulatorAdapter::Pcsx2 => {
                 action = show_pcsx2_workflow(ui, workflow, pcsx2_profiles, clipboard).or(action);
+                let selected_profile = match pcsx2_profiles {
+                    Pcsx2ProfilesState::Ready(discovery) => workflow
+                        .selected_pcsx2_profile_id
+                        .as_deref()
+                        .and_then(|id| discovery.profiles.iter().find(|profile| profile.profile_id == id)),
+                    _ => None,
+                };
+                ui.add_space(theme::SECTION_GAP);
+                match selected_profile {
+                    Some(profile) => crate::pcsx2_texture_mod_page::show_pcsx2_texture_mod_panel(
+                        ui,
+                        &mut dolphin_texture_mod.pcsx2_texture_mod,
+                        &workflow.archive_path,
+                        profile,
+                        crate::ready_game_identity(workflow),
+                    ),
+                    None => {
+                        widgets::section_header(ui, "PCSX2 Texture Mods", None);
+                        widgets::card(ui, |ui| ui.label("Select a PCSX2 profile above first."));
+                    }
+                }
             }
             CheatEmulatorAdapter::Dolphin => {
                 action =

@@ -86,6 +86,7 @@ mod pcsx2_install_plan;
 mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
+mod pcsx2_texture_pack;
 mod ppsspp_local;
 mod resolved_emulator_profile;
 mod retrieval;
@@ -650,6 +651,17 @@ pub use pcsx2_local::{
     Pcsx2UserDirectoryMode, discover_pcsx2_profiles, inspect_pcsx2_game, inspect_pcsx2_profile,
     inspect_pcsx2_profile_with_activation, match_pcsx2_inventory, parse_pcsx2_version,
     resolve_pcsx2_native_launch_binding,
+};
+pub use pcsx2_texture_pack::{
+    PCSX2_TEXTURE_PACK_FORMAT, PCSX2_TEXTURE_PACK_MAX_FILES,
+    PCSX2_TEXTURE_PACK_MAX_TOTAL_BYTES, PCSX2_TEXTURE_PACK_SOURCE_MODE,
+    Pcsx2TextureIdentity, Pcsx2TexturePackApplyResult, Pcsx2TexturePackError,
+    Pcsx2TexturePackErrorKind, Pcsx2TexturePackFile, Pcsx2TexturePackInspection,
+    Pcsx2TexturePackPlan, Pcsx2TexturePackPreviewRequest,
+    Pcsx2TexturePackRejectedFile, build_pcsx2_texture_pack_preview,
+    build_pcsx2_texture_pack_transaction_plan, execute_pcsx2_texture_pack_apply,
+    inspect_pcsx2_texture_pack, pcsx2_texture_destination_root,
+    verified_pcsx2_texture_identity,
 };
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,

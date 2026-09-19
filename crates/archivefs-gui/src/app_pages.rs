@@ -786,7 +786,7 @@ pub(crate) fn show_pages(
                         // Drained before the workspace renders, so a
                         // running install/undo is reflected in this
                         // same frame's render, not one frame late.
-                        if app.dolphin_texture_mod.poll() || app.dolphin_texture_mod.is_busy()
+                        if app.dolphin_texture_mod.pcsx2_texture_mod.poll() || app.dolphin_texture_mod.pcsx2_texture_mod.is_busy() || app.dolphin_texture_mod.poll() || app.dolphin_texture_mod.is_busy()
                         {
                             ui.ctx().request_repaint();
                         }

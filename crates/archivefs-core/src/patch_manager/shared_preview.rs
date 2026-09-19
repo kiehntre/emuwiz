@@ -41,6 +41,7 @@ pub enum PreviewAdapter {
 pub enum PreviewIdentityKind {
     RetroArchCatalogueMatch,
     Pcsx2ExecutableCrc,
+    Pcsx2TexturePack,
     DolphinGameId,
     /// An explicit multi-file Dolphin texture-pack manifest. Multiple
     /// verified source files are expected and are not competing identity
@@ -853,7 +854,8 @@ fn detect_cross_entry_conflicts(request: &SharedPreviewRequest, report: &mut Sha
         .filter(|entry| entry.match_strength == PreviewMatchStrength::VerifiedExact)
         .filter_map(|entry| entry.source_path.as_ref())
         .collect::<BTreeSet<_>>();
-    if (request.adapter == PreviewAdapter::Pcsx2
+    if ((request.adapter == PreviewAdapter::Pcsx2
+        && request.identity.kind == PreviewIdentityKind::Pcsx2ExecutableCrc)
         || (request.adapter == PreviewAdapter::Dolphin
             && request.identity.kind == PreviewIdentityKind::DolphinGameId))
         && exact_sources.len() > 1

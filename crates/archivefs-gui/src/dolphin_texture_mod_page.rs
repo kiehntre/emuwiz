@@ -158,6 +158,7 @@ enum DolphinTextureModStage {
 
 #[derive(Default)]
 pub(crate) struct DolphinTextureModPageState {
+    pub(crate) pcsx2_texture_mod: crate::pcsx2_texture_mod_page::Pcsx2TextureModPageState,
     key: Option<DolphinTextureModKey>,
     stage: Option<DolphinTextureModStage>,
     builder_name: String,
