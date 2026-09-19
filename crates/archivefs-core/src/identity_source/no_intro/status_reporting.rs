@@ -13,21 +13,7 @@ use super::managed_lifecycle::{
     NoIntroPackCoverage, NoIntroPackSnapshot, NoIntroPackStatus, NoIntroRetention,
     classify_no_intro_retention, plan_no_intro_rollback, resolve_no_intro_current,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum NoIntroFreshness {
-    /// The imported release is newer than every other locally known release
-    /// for the same coverage. This is not a claim about the upstream site.
-    Current,
-    UpdateAvailable,
-    CheckFailed,
-    NeverChecked,
-    /// Compatibility names retained for persisted reports from older builds.
-    Fresh,
-    Stale,
-    Unknown,
-}
+pub use crate::identity_source::freshness::DatFreshnessState as NoIntroFreshness;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -293,42 +279,19 @@ pub fn report_no_intro_lifecycle(snapshots: &[NoIntroPackSnapshot]) -> ManagedNo
         // Staleness is evaluated at the coverage/platform level here. A pack
         // can remain current for one platform while a newer partial pack
         // supersedes only another platform in the same payload.
+        // A local import, version field, and registry ordering are not an
+        // explicit freshness comparison. Keep the active pack Unknown until
+        // a caller supplies trusted comparison evidence.
         let current_state = current.map(|snapshot| {
-            if snapshot.status == NoIntroPackStatus::Invalid {
-                NoIntroFreshness::Stale
-            } else if entries
+            let version = snapshot
+                .members
                 .iter()
-                .filter(|(candidate, coverage)| {
-                    candidate.pack_sha256 == snapshot.pack_sha256
-                        && resolution.current.contains_key(&format!(
-                            "{}|{}|{:?}",
-                            coverage.canonical_platform.as_deref().unwrap_or("unknown"),
-                            coverage.family,
-                            coverage.variant
-                        ))
-                })
-                .all(|(_, coverage)| {
-                    snapshot.members.iter().any(|member| {
-                        member.source_member_name == coverage.source_member_name
-                            && member.variant == coverage.variant
-                            && member.upstream_version.is_some()
-                    })
-                })
-            {
-                // A versioned import is not automatically current upstream.
-                // Only a comparison with another locally known release can
-                // establish a local Current state.
-                if entries.iter().any(|(candidate, _)| {
-                    candidate.pack_sha256 != snapshot.pack_sha256
-                        && candidate.status != NoIntroPackStatus::Invalid
-                }) {
-                    NoIntroFreshness::Current
-                } else {
-                    NoIntroFreshness::NeverChecked
-                }
-            } else {
-                NoIntroFreshness::Unknown
-            }
+                .find_map(|member| member.upstream_version.as_deref());
+            crate::identity_source::freshness::active_without_comparison(
+                crate::identity_source::freshness::DatFreshnessProvider::NoIntro,
+                version,
+            )
+            .state
         });
         let health = if snapshots
             .iter()
@@ -342,10 +305,10 @@ pub fn report_no_intro_lifecycle(snapshots: &[NoIntroPackSnapshot]) -> ManagedNo
             NoIntroLifecycleHealth::NoCurrent
         } else {
             match current_state.unwrap_or(NoIntroFreshness::Unknown) {
-                NoIntroFreshness::Current | NoIntroFreshness::Fresh => {
+                NoIntroFreshness::Current => {
                     NoIntroLifecycleHealth::Healthy
                 }
-                NoIntroFreshness::Stale | NoIntroFreshness::UpdateAvailable => {
+                NoIntroFreshness::UpdateAvailable => {
                     NoIntroLifecycleHealth::Stale
                 }
                 NoIntroFreshness::CheckFailed
@@ -662,7 +625,7 @@ mod tests {
         assert_eq!(report.health, NoIntroLifecycleHealth::Unknown);
         assert_eq!(
             report.platforms[0].freshness,
-            NoIntroFreshness::NeverChecked
+            NoIntroFreshness::Unknown
         );
         assert_eq!(report.summary.freshness_unknown, 1);
         assert!(!report.platforms[0].rollback_available);
@@ -746,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_pack_has_independent_platform_currents_and_no_zip_dependency() {
+    fn partial_pack_has_independent_platform_coverage_and_no_zip_dependency() {
         let mut pack = snapshot("a", 1, "Nintendo - Game Boy", Some("20240101"));
         let mut old_snes = snapshot(
             "c",
@@ -766,7 +729,7 @@ mod tests {
         pack.coverage.push(old_snes.coverage[0].clone());
         let report = report_no_intro_lifecycle(&[pack, snes]);
         assert_eq!(report.summary.platforms_covered, 2);
-        assert_eq!(report.summary.current, 1);
-        assert_eq!(report.summary.freshness_unknown, 1);
+        assert_eq!(report.summary.current, 0);
+        assert_eq!(report.summary.freshness_unknown, 2);
     }
 }

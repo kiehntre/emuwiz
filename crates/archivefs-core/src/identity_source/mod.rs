@@ -31,6 +31,14 @@ pub mod cache;
 pub mod fbneo;
 pub mod hasheous;
 pub mod hashing;
+pub mod freshness;
+pub use freshness::{
+    active_without_comparison, compare_explicit, failed_check, managed_dat_freshness,
+    managed_dat_freshness_after_successful_check, never_checked,
+    tosec_active_import_freshness, DatFreshnessAssessment, DatFreshnessComparisonBasis,
+    DatFreshnessComparisonSource, DatFreshnessEvidence, DatFreshnessFailureReason,
+    DatFreshnessProvider, DatFreshnessState,
+};
 pub mod launchbox_local;
 pub mod mame_listxml;
 pub mod mame_software_list;
