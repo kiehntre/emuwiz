@@ -46,6 +46,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 use serde::Serialize;
+use url::Url;
 
 /// Cloud and link-local metadata addresses, refused by name as well as by range.
 ///
@@ -93,6 +94,7 @@ pub enum EndpointRefusal {
     /// *address* is named, not just the host, because that is the fact that
     /// decided it.
     NotPrivateAddress { address: String },
+    PrivateAddress { address: String },
     /// A known cloud or link-local metadata endpoint.
     MetadataEndpoint { address: String },
     /// A redirect, which Stage 1 does not follow.
@@ -128,6 +130,9 @@ impl EndpointRefusal {
                 "{address} is not on a local or private network; an identity source must be \
                  reachable only on loopback, a private LAN or a private container network"
             ),
+            Self::PrivateAddress { address } => format!(
+                "{address} is a private, loopback or link-local address; public DAT downloads cannot target internal networks"
+            ),
             Self::MetadataEndpoint { address } => {
                 format!("{address} is a cloud metadata endpoint and is never contacted")
             }
@@ -151,12 +156,58 @@ impl EndpointRefusal {
             Self::NoAddresses => "no_addresses",
             Self::TooManyAddresses { .. } => "too_many_addresses",
             Self::NotPrivateAddress { .. } => "not_private_address",
+            Self::PrivateAddress { .. } => "private_address",
             Self::MetadataEndpoint { .. } => "metadata_endpoint",
             Self::RedirectRefused { .. } => "redirect_refused",
             Self::InvalidPort { .. } => "invalid_port",
             Self::UnsupportedUrlShape { .. } => "unsupported_url_shape",
         }
     }
+}
+
+/// Validates a user-selected public HTTPS download destination. This remains
+/// separate from the private-LAN identity-source policy.
+pub fn validate_public_https_url(
+    url: &str,
+    resolver: &impl HostResolver,
+) -> Result<(), EndpointRefusal> {
+    let parsed = Url::parse(url).map_err(|error| EndpointRefusal::Unparseable {
+        detail: error.to_string(),
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(EndpointRefusal::UnsupportedScheme {
+            scheme: parsed.scheme().to_string(),
+        });
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(EndpointRefusal::EmbeddedCredentials);
+    }
+    let host = parsed.host_str().ok_or(EndpointRefusal::MissingHost)?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let addresses = resolver
+        .resolve(host, port)
+        .map_err(|detail| EndpointRefusal::UnresolvableHost { detail })?;
+    if addresses.is_empty() {
+        return Err(EndpointRefusal::NoAddresses);
+    }
+    if addresses.len() > MAX_RESOLVED_ADDRESSES {
+        return Err(EndpointRefusal::TooManyAddresses {
+            count: addresses.len(),
+        });
+    }
+    for address in addresses {
+        if is_metadata_address(address) {
+            return Err(EndpointRefusal::MetadataEndpoint {
+                address: address.to_string(),
+            });
+        }
+        if is_approved_local_address(address) {
+            return Err(EndpointRefusal::PrivateAddress {
+                address: address.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Display for EndpointRefusal {

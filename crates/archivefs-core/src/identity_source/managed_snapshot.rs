@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::identity_source::net_policy::{SystemResolver, validate_public_https_url};
 use crate::{ArchiveFsError, Result};
 
 const STORE_SCHEMA_VERSION: u32 = 1;
@@ -346,6 +347,8 @@ impl HttpsManagedSourceTransport {
         let mut current = initial_url.to_string();
         for hop in 0..=MAX_REDIRECTS {
             validate_https_url(&current, "source URL").map_err(|error| error.to_string())?;
+            validate_public_https_url(&current, &SystemResolver)
+                .map_err(|error| error.to_string())?;
             let mut request = if head {
                 self.agent.head(&current)
             } else {

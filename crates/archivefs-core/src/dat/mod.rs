@@ -33,6 +33,7 @@
 //! - Unknown status values are preserved rather than discarded.
 
 pub mod archive;
+pub mod acquisition;
 pub mod audit;
 pub mod authority;
 pub mod catalogue_selection;

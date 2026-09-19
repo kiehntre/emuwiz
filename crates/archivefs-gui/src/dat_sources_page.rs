@@ -8257,14 +8257,14 @@ fn show_evidence_acquisition_section(
             ui.label(egui::RichText::new(format!("Status: {status}" )).strong());
             ui.label(
                 egui::RichText::new(
-                "Check for an update on the official DAT-o-MATIC site, download the ZIP in your browser, then select it here. EmuWiz validates each DAT's internal metadata; the ZIP filename is never treated as authority.",
+                    "No-Intro's official DAT-o-MATIC site is recommended, but EmuWiz does not automate downloads from it because its download service is browser-based and automation can be blocked. Download the pack there, then import and validate it here.",
                 )
                 .color(theme::muted(ui))
                 .small(),
             );
             if widgets::action_button(
                 ui,
-                "Check for update (Open DAT-o-MATIC)",
+                "Open DAT-o-MATIC (official)",
                 widgets::ActionStyle::Secondary,
                 !view.background_busy,
             )
@@ -8307,14 +8307,14 @@ fn show_evidence_acquisition_section(
             ui.label(egui::RichText::new("TOSEC — vintage systems").strong());
             ui.label(
                 egui::RichText::new(format!(
-                    "Official release packs are obtained in your browser, then imported and validated here. {available_tosec_packs} imported pack(s) · {selected_tosec_dats} selected DAT(s). Enable System / Category / Media below."
+                    "Official release packs. EmuWiz opens the official downloads page; you choose and download a pack, then EmuWiz validates and manages the imported snapshot. {available_tosec_packs} imported pack(s) · {selected_tosec_dats} selected DAT(s)."
                 ))
                 .color(theme::muted(ui))
                 .small(),
             );
             if widgets::action_button(
                 ui,
-                "Check for update (Open TOSEC downloads)",
+                "Open official TOSEC downloads",
                 widgets::ActionStyle::Secondary,
                 !view.background_busy,
             )
