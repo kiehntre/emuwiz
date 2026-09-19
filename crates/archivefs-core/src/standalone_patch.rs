@@ -1613,7 +1613,10 @@ mod tests {
         // both this test and the parser at once.
         let rfc_magic = [b'V' | 0x80, b'C' | 0x80, b'D' | 0x80];
         assert_eq!(rfc_magic, [0xd6, 0xc3, 0xc4]);
-        let (_dir, path) = temp_file("real.xdelta", &[rfc_magic[0], rfc_magic[1], rfc_magic[2], 0]);
+        let (_dir, path) = temp_file(
+            "real.xdelta",
+            &[rfc_magic[0], rfc_magic[1], rfc_magic[2], 0, 0],
+        );
         let inspection = inspect_standalone_patch(&path).unwrap();
         assert_eq!(inspection.format, StandalonePatchFormat::XdeltaVcdiff);
         assert_eq!(inspection.state, PatchInspectionState::Valid);
@@ -1772,6 +1775,87 @@ mod tests {
         let inspection = inspect_standalone_patch(&path).unwrap();
         assert_eq!(inspection.format, StandalonePatchFormat::XdeltaVcdiff);
         assert_eq!(inspection.state, PatchInspectionState::Valid);
+    }
+
+    #[test]
+    fn real_xdelta3_round_trip_through_emuwiz_apply_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let base_path = temp.path().join("base with spaces.bin");
+        let target_path = temp.path().join("target with spaces.bin");
+        let patch_path = temp.path().join("patch with spaces.xdelta");
+        let output_path = temp.path().join("output with spaces.bin");
+        let base: Vec<u8> = (0..8192).map(|value| (value % 251) as u8).collect();
+        let mut target = base.clone();
+        target[123..456].fill(0xa5);
+        target[7000..7100].copy_from_slice(&[0x5a; 100]);
+        fs::write(&base_path, &base).unwrap();
+        fs::write(&target_path, &target).unwrap();
+
+        let status = Command::new("/usr/bin/xdelta3")
+            .args([
+                "-e",
+                "-s",
+                base_path.to_str().unwrap(),
+                target_path.to_str().unwrap(),
+                patch_path.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "xdelta3 encoding failed: {status}");
+
+        let inspection = inspect_standalone_patch(&patch_path).unwrap();
+        assert_eq!(inspection.format, StandalonePatchFormat::XdeltaVcdiff);
+        assert_eq!(inspection.state, PatchInspectionState::Valid);
+        let plan = build_standalone_patch_apply_plan(
+            &inspection,
+            &base_path,
+            &output_path,
+            temp.path(),
+        )
+        .unwrap();
+        let source_sha = hex_digest(&base);
+        let result = apply_standalone_patch(&plan).unwrap();
+
+        assert_eq!(result.provenance.application, "xdelta3 external applier");
+        assert_eq!(result.provenance.base_sha256, source_sha);
+        assert_eq!(result.output_sha256, hex_digest(&target));
+        assert_eq!(fs::read(&output_path).unwrap(), target);
+        assert_eq!(fs::read(&base_path).unwrap(), base);
+        assert!(!temp.path().join(".emuwiz-xdelta-stage").exists());
+        assert!(!fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .any(|name| name.to_string_lossy().starts_with(".emuwiz-xdelta-stage-")));
+
+        let collision = build_standalone_patch_apply_plan(
+            &inspection,
+            &base_path,
+            &output_path,
+            temp.path(),
+        );
+        assert!(matches!(
+            collision,
+            Err(StandalonePatchError::UnsafeOutput(reason)) if reason.contains("already exists")
+        ));
+
+        let malformed_patch_path = temp.path().join("malformed.xdelta");
+        let malformed_output_path = temp.path().join("malformed-output.bin");
+        fs::write(&malformed_patch_path, [0xd6, 0xc3, 0xc4, 0, 0]).unwrap();
+        let malformed_inspection = inspect_standalone_patch(&malformed_patch_path).unwrap();
+        let malformed_plan = build_standalone_patch_apply_plan(
+            &malformed_inspection,
+            &base_path,
+            &malformed_output_path,
+            temp.path(),
+        )
+        .unwrap();
+        assert!(apply_standalone_patch(&malformed_plan).is_err());
+        assert!(!malformed_output_path.exists());
+        assert!(!fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .any(|name| name.to_string_lossy().starts_with(".emuwiz-xdelta-stage-")));
+        assert_eq!(fs::read(&base_path).unwrap(), base);
     }
 
     #[test]
