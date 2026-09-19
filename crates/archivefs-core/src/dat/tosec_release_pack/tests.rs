@@ -226,6 +226,28 @@ fn managed_snapshot_activation_history_rollback_and_offline_load_work() {
 }
 
 #[test]
+fn managed_snapshot_registration_uses_immutable_materialized_bytes_after_source_disappears() {
+    let (fixture, inventory, selections) = managed_fixture();
+    let (store_root, store) = managed_store();
+    let candidate = store
+        .stage_release_pack(&inventory, &selections, 123)
+        .unwrap();
+    store.activate(&candidate, None).unwrap();
+    let registry_path = store_root.path().join("dat-sources.toml");
+
+    std::fs::remove_dir_all(&fixture.pack_root).unwrap();
+    let outcome = store
+        .register_active_snapshot_to_registry(&registry_path, 124)
+        .unwrap();
+    assert_eq!(outcome.registered.len(), 1);
+    let config = crate::dat::sources::load_dat_sources_config_from(&registry_path).unwrap();
+    let entry = config.sources.unwrap().into_iter().next().unwrap();
+    assert!(entry.path.contains("materialized"));
+    assert!(Path::new(&entry.path).is_file());
+    assert!(!entry.path.contains("TOSEC_pack_2021"));
+}
+
+#[test]
 fn managed_snapshot_rejects_path_traversal_and_symlink_escape() {
     let (fixture, mut inventory, selections) = managed_fixture();
     let (_store_root, store) = managed_store();

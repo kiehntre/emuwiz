@@ -26,7 +26,7 @@
 //! inside the pack.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -810,6 +810,7 @@ pub struct TosecManagedCandidate {
 /// in the manifest only, and activation therefore never depends on it.
 #[derive(Debug, Clone)]
 pub struct TosecManagedSnapshotStore {
+    root: PathBuf,
     store: ManagedSourceStore,
 }
 
@@ -827,6 +828,7 @@ impl TosecManagedSnapshotStore {
             trust: ManagedSourceTrust::UserProvided,
         };
         Ok(Self {
+            root: root.clone(),
             store: ManagedSourceStore::new(root, descriptor)?,
         })
     }
@@ -1032,6 +1034,110 @@ impl TosecManagedSnapshotStore {
         self.store.active_snapshot()
     }
 
+    /// Materializes the active snapshot's DAT members under the managed
+    /// storage root so the ordinary read-only DAT verifier can consume them
+    /// without reaching back into the user's original release directory.
+    /// Existing materialized files are hash-checked and never overwritten.
+    pub fn materialize_active_dat_sources(
+        &self,
+    ) -> Result<Vec<(TosecManagedDat, PathBuf)>, ArchiveFsError> {
+        let record = self
+            .store
+            .active_snapshot()?
+            .ok_or_else(|| ArchiveFsError::Config("no active TOSEC snapshot".to_string()))?;
+        let snapshot = decode_snapshot(&self.store.snapshot_bytes(&record)?)?;
+        let root = self.root.join("materialized").join(&record.sha256);
+        std::fs::create_dir_all(&root).map_err(|error| ArchiveFsError::io(root.clone(), error))?;
+        reject_materialized_symlinks(&root, &root)?;
+        let mut paths = Vec::with_capacity(snapshot.dats.len());
+        for (metadata, bytes) in snapshot.dats {
+            if !is_normal_relative_path(&metadata.relative_path) {
+                return Err(ArchiveFsError::Config(format!(
+                    "unsafe TOSEC materialized DAT path: {}",
+                    metadata.relative_path.display()
+                )));
+            }
+            let path = root.join(&metadata.relative_path);
+            let parent = path
+                .parent()
+                .ok_or_else(|| ArchiveFsError::Config("TOSEC DAT has no parent".to_string()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| ArchiveFsError::io(parent.to_path_buf(), error))?;
+            reject_materialized_symlinks(&root, parent)?;
+            if let Ok(existing) = std::fs::symlink_metadata(&path) {
+                if existing.file_type().is_symlink() || !existing.is_file() {
+                    return Err(ArchiveFsError::Config(format!(
+                        "TOSEC materialized DAT is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                let existing_bytes = std::fs::read(&path)
+                    .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+                if sha256_bytes(&existing_bytes) != metadata.content_sha256 {
+                    return Err(ArchiveFsError::Config(format!(
+                        "TOSEC materialized DAT hash mismatch: {}",
+                        path.display()
+                    )));
+                }
+            } else {
+                let temporary = tempfile::NamedTempFile::new_in(parent)
+                    .map_err(|error| ArchiveFsError::io(parent.to_path_buf(), error))?;
+                let temporary_path = temporary.path().to_path_buf();
+                let mut file = temporary
+                    .reopen()
+                    .map_err(|error| ArchiveFsError::io(temporary_path.clone(), error))?;
+                file.write_all(&bytes)
+                    .map_err(|error| ArchiveFsError::io(temporary_path.clone(), error))?;
+                file.sync_all()
+                    .map_err(|error| ArchiveFsError::io(temporary_path.clone(), error))?;
+                std::fs::rename(&temporary_path, &path)
+                    .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
+            }
+            paths.push((metadata, path));
+        }
+        Ok(paths)
+    }
+
+    /// Registers the active immutable snapshot's materialized DAT members in
+    /// the ordinary local DAT registry. The original release-pack path is
+    /// retained only in snapshot provenance and is never registered here.
+    pub fn register_active_snapshot_to_registry(
+        &self,
+        registry_path: &Path,
+        now_unix_seconds: u64,
+    ) -> Result<TosecRegistrationOutcome, ArchiveFsError> {
+        let active = self.active_snapshot()?.ok_or_else(|| {
+            ArchiveFsError::Config("cannot register without an active TOSEC snapshot".to_string())
+        })?;
+        let paths = self.materialize_active_dat_sources()?;
+        let root_path = self.root.join("materialized").join(
+            self.store
+                .active_snapshot()?
+                .ok_or_else(|| ArchiveFsError::Config("active TOSEC snapshot disappeared".to_string()))?
+                .sha256,
+        );
+        let pack = PersistedTosecPack {
+            pack_id: active.pack_id,
+            root_path,
+            imported_unix_seconds: active.imported_unix_seconds,
+            selections: active.selected_groups,
+            dats: paths
+                .into_iter()
+                .map(|(dat, _)| TosecPackDat {
+                    relative_path: dat.relative_path,
+                    raw_catalogue_name: dat.raw_catalogue_name,
+                    system: dat.system,
+                    category: dat.category,
+                    media: dat.media,
+                    raw_category_label: dat.raw_category_label,
+                    classification_confident: dat.classification_confident,
+                    content_sha256: Some(dat.content_sha256),
+                })
+                .collect(),
+        };
+        apply_selection_to_registry(&pack, registry_path, now_unix_seconds)
+    }
+
     /// Existing verification tied to another immutable snapshot must be
     /// rechecked after activation. Reusing the generic signal avoids making
     /// "active" imply "verified" or "current".
@@ -1057,6 +1163,30 @@ fn common_release_version(dats: &[(TosecManagedDat, Vec<u8>)]) -> Option<String>
     dats.iter()
         .all(|(dat, _)| dat.tosec_version.as_deref() == Some(first.as_str()))
         .then_some(first)
+}
+
+fn reject_materialized_symlinks(root: &Path, path: &Path) -> Result<(), ArchiveFsError> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        ArchiveFsError::Config("TOSEC materialized path escaped its managed root".to_string())
+    })?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(ArchiveFsError::Config(
+                "unsafe TOSEC materialized path".to_string(),
+            ));
+        };
+        current.push(component);
+        if let Ok(metadata) = std::fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(ArchiveFsError::Config(format!(
+                "TOSEC materialized path contains a symbolic link: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_inventory_dat_path(root: &Path, relative: &Path) -> Result<PathBuf, ArchiveFsError> {

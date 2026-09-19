@@ -84,9 +84,9 @@ use archivefs_core::dat::sources::{
     save_dat_sources_config_to, suggest_display_name, validate_dat_source,
 };
 use archivefs_core::dat::tosec_release_pack::{
-    PackAvailability, PersistedTosecPack, TosecPackDat, TosecSelectionKey,
-    apply_selection_to_registry, default_tosec_packs_path, inventory_release_pack,
-    load_tosec_packs, save_tosec_packs,
+    PackAvailability, PersistedTosecPack, TosecManagedCandidate,
+    TosecManagedSnapshotStore, TosecPackDat, TosecSelectionKey, default_tosec_packs_path,
+    inventory_release_pack, load_tosec_packs, save_tosec_packs,
 };
 use archivefs_core::dat::updates::{
     HttpsManagedDatTransport, ManagedDatProvider, ManagedDatReadOnlySource,
@@ -539,6 +539,7 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) tosec_load_error: Option<String>,
     pub(crate) tosec_action_error: Option<String>,
     pub(crate) tosec_last_apply: Option<TosecApplyView>,
+    pub(crate) tosec_managed: TosecManagedLifecycleView,
     pub(crate) no_intro_selected_pack: Option<(String, u64)>,
     pub(crate) no_intro_inspection: Option<NoIntroPackInspection>,
     pub(crate) no_intro_staged: Option<NoIntroPackInspection>,
@@ -668,6 +669,41 @@ pub(crate) struct TosecApplyView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TosecManagedLifecycleView {
+    pub(crate) active_sha256: Option<String>,
+    pub(crate) active_release: Option<String>,
+    pub(crate) active_dat_count: usize,
+    pub(crate) active_source_path: Option<PathBuf>,
+    pub(crate) staged_preview: Option<TosecManagedPreviewView>,
+    pub(crate) history_sha256: Vec<String>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TosecManagedPreviewView {
+    pub(crate) release_identifier: String,
+    pub(crate) release_version: Option<String>,
+    pub(crate) dat_count: usize,
+    pub(crate) selected_group_count: usize,
+    pub(crate) total_snapshot_bytes: u64,
+    pub(crate) differs_from_active: bool,
+}
+
+impl TosecManagedLifecycleView {
+    fn empty() -> Self {
+        Self {
+            active_sha256: None,
+            active_release: None,
+            active_dat_count: 0,
+            active_source_path: None,
+            staged_preview: None,
+            history_sha256: Vec::new(),
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManagedDatTechnicalView {
     pub(crate) sha256: Option<String>,
     pub(crate) etag: Option<String>,
@@ -714,6 +750,13 @@ fn managed_row_freshness(
         (_, true) => DatFreshnessState::Unknown,
         _ => DatFreshnessState::NeverChecked,
     }
+}
+
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn managed_dat_status_from_outcome(outcome: ManagedDatUpdateOutcome) -> ManagedDatStatusView {
@@ -1789,6 +1832,12 @@ pub(crate) enum DatSourcesPageAction {
     ApplyTosecSelection {
         pack_id: String,
     },
+    ActivateTosecSnapshot {
+        pack_id: String,
+    },
+    RollbackTosecSnapshot {
+        hash: String,
+    },
     CancelJob,
     Save,
     Revert,
@@ -2726,6 +2775,10 @@ pub(crate) struct DatSourcesPageState {
     tosec_load_error: Option<String>,
     tosec_action_error: Option<String>,
     tosec_last_apply: Option<TosecApplyView>,
+    tosec_managed_staged: Option<TosecManagedCandidate>,
+    tosec_managed_preview: Option<TosecManagedPreviewView>,
+    tosec_managed_error: Option<String>,
+    tosec_managed_view: TosecManagedLifecycleView,
     no_intro_selected_pack: Option<PathBuf>,
     no_intro_inspection: Option<NoIntroPackInspection>,
     no_intro_staged: Option<NoIntroPackInspection>,
@@ -2971,7 +3024,7 @@ impl DatSourcesPageState {
                 .archived_transaction_ids
                 .contains(&transaction.transaction_id)
         });
-        Self {
+        let mut state = Self {
             config_path,
             managed_config_path,
             managed_root,
@@ -2985,6 +3038,10 @@ impl DatSourcesPageState {
             tosec_load_error,
             tosec_action_error: None,
             tosec_last_apply: None,
+            tosec_managed_staged: None,
+            tosec_managed_preview: None,
+            tosec_managed_error: None,
+            tosec_managed_view: TosecManagedLifecycleView::empty(),
             no_intro_selected_pack: None,
             no_intro_inspection: None,
             no_intro_staged: None,
@@ -3042,7 +3099,9 @@ impl DatSourcesPageState {
             recovery_archive_confirm: None,
             recovery_archive_outcome: None,
             history_records: Vec::new(),
-        }
+        };
+        state.refresh_tosec_managed_view();
+        state
     }
 
     pub(crate) fn with_database_path(mut self, database_path: Option<PathBuf>) -> Self {
@@ -3701,7 +3760,13 @@ impl DatSourcesPageState {
                 enabled,
             } => self.set_tosec_selection(&pack_id, key, enabled),
             DatSourcesPageAction::ApplyTosecSelection { pack_id } => {
-                self.apply_tosec_selection(&pack_id);
+                self.stage_tosec_selection(&pack_id);
+            }
+            DatSourcesPageAction::ActivateTosecSnapshot { pack_id } => {
+                self.activate_tosec_snapshot(&pack_id);
+            }
+            DatSourcesPageAction::RollbackTosecSnapshot { hash } => {
+                self.rollback_tosec_snapshot(&hash);
             }
             DatSourcesPageAction::CancelJob => {
                 if let Some(job) = self.job.as_mut() {
@@ -4780,12 +4845,65 @@ impl DatSourcesPageState {
         }
     }
 
-    fn apply_tosec_selection(&mut self, pack_id: &str) {
+    fn tosec_managed_store(&self) -> Result<TosecManagedSnapshotStore, String> {
+        TosecManagedSnapshotStore::new(self.managed_root.join("tosec-snapshots"))
+            .map_err(|error| error.to_string())
+    }
+
+    fn refresh_tosec_managed_view(&mut self) {
+        let staged_preview = self.tosec_managed_preview.clone();
+        let mut view = TosecManagedLifecycleView {
+            staged_preview,
+            ..TosecManagedLifecycleView::empty()
+        };
+        match self.tosec_managed_store() {
+            Ok(store) => {
+                match (
+                    store.active_record(),
+                    store.active_snapshot(),
+                    store.store().history_snapshots(),
+                ) {
+                    (Ok(record), Ok(snapshot), Ok(history)) => {
+                        view.active_sha256 = record.as_ref().map(|record| record.sha256.clone());
+                        view.active_release = snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.release_version.clone());
+                        view.active_dat_count =
+                            snapshot.as_ref().map_or(0, |snapshot| snapshot.dats.len());
+                        view.active_source_path =
+                            snapshot.as_ref().map(|snapshot| snapshot.source_path.clone());
+                        view.history_sha256 = history
+                            .into_iter()
+                            .map(|snapshot| snapshot.sha256)
+                            .collect();
+                    }
+                    (record, snapshot, history) => {
+                        view.error = Some(format!(
+                            "TOSEC managed snapshot state could not be read: {}",
+                            record
+                                .err()
+                                .or_else(|| snapshot.err())
+                                .or_else(|| history.err())
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| "unknown error".to_string())
+                        ));
+                    }
+                }
+            }
+            Err(error) => view.error = Some(error),
+        }
+        self.tosec_managed_view = view;
+    }
+
+    fn stage_tosec_selection(&mut self, pack_id: &str) {
         self.tosec_action_error = None;
         self.tosec_last_apply = None;
+        self.tosec_managed_error = None;
+        self.tosec_managed_preview = None;
+        self.tosec_managed_staged = None;
         if self.is_busy() || self.tosec_load_error.is_some() || self.load_error.is_some() {
             self.tosec_action_error = Some(
-                "Cannot apply TOSEC selections while a catalogue operation is running or the local catalogue list could not be read."
+                "Cannot stage TOSEC selections while a catalogue operation is running or the local catalogue list could not be read."
                     .to_string(),
             );
             return;
@@ -4804,41 +4922,143 @@ impl DatSourcesPageState {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or(0);
-        match apply_selection_to_registry(pack, &self.config_path, now) {
-            Ok(outcome) => match load_dat_sources_config_from(&self.config_path) {
-                Ok(config) => {
-                    let (registry, problems) = DatSourceRegistry::from_config(&config);
-                    self.saved = registry.clone();
-                    self.draft = registry;
-                    self.load_problems = problems;
-                    self.tosec_last_apply = Some(TosecApplyView {
-                        pack_id: pack_id.to_string(),
-                        registered: outcome.registered.len(),
-                        already_registered: outcome.already_registered.len(),
-                        removed: outcome.removed.len(),
-                        deferred: outcome.deferred.len(),
-                        conflicts: outcome.conflicts.len(),
-                        failed: outcome.failed.len(),
-                    });
-                    if !outcome.failed.is_empty() {
-                        self.tosec_action_error = Some(format!(
-                            "{} selected TOSEC catalogue(s) could not be added. Existing known-good entries were kept.",
-                            outcome.failed.len()
-                        ));
-                    } else if !outcome.conflicts.is_empty() {
-                        self.tosec_action_error = Some(format!(
-                            "{} selected TOSEC DAT(s) conflicted with existing sources; those entries were preserved.",
-                            outcome.conflicts.len()
-                        ));
-                    }
-                }
-                Err(error) => {
-                    self.tosec_action_error = Some(format!(
-                        "TOSEC selection was applied, but the local catalogue list could not be reloaded: {error}"
-                    ));
-                }
-            },
-            Err(error) => self.tosec_action_error = Some(error.to_string()),
+        let inventory = archivefs_core::dat::tosec_release_pack::TosecPackInventory {
+            pack_root: pack.root_path.clone(),
+            pack_id: pack.pack_id.clone(),
+            dats: pack.dats.clone(),
+            skipped: Vec::new(),
+            scan_complete: true,
+        };
+        let result = self
+            .tosec_managed_store()
+            .and_then(|store| {
+                let candidate = store
+                    .stage_release_pack(&inventory, &pack.selections, now)
+                    .map_err(|error| error.to_string())?;
+                let preview = store
+                    .preview_activation(&candidate)
+                    .map_err(|error| error.to_string())?;
+                Ok((candidate, preview))
+            });
+        match result {
+            Ok((candidate, preview)) => {
+                self.tosec_managed_preview = Some(TosecManagedPreviewView {
+                    release_identifier: preview.release_identifier,
+                    release_version: preview.release_version,
+                    dat_count: preview.dat_count,
+                    selected_group_count: preview.selected_group_count,
+                    total_snapshot_bytes: preview.total_snapshot_bytes,
+                    differs_from_active: preview.differs_from_active,
+                });
+                self.tosec_managed_staged = Some(candidate);
+            }
+            Err(error) => {
+                self.tosec_managed_error = Some(error);
+                self.tosec_action_error = self.tosec_managed_error.clone();
+            }
+        }
+        self.refresh_tosec_managed_view();
+    }
+
+    fn activate_tosec_snapshot(&mut self, pack_id: &str) {
+        self.tosec_action_error = None;
+        self.tosec_managed_error = None;
+        let Some(candidate) = self.tosec_managed_staged.clone() else {
+            self.tosec_action_error = Some(
+                "Stage the selected TOSEC groups and review the preview before activation."
+                    .to_string(),
+            );
+            return;
+        };
+        if candidate.snapshot.pack_id != pack_id {
+            self.tosec_action_error = Some("The staged TOSEC pack no longer matches this selection.".to_string());
+            return;
+        }
+        let expected_active = self
+            .tosec_managed_view
+            .active_sha256
+            .as_deref()
+            .map(str::to_string);
+        let result = self.tosec_managed_store().and_then(|store| {
+            store
+                .activate(&candidate, expected_active.as_deref())
+                .map_err(|error| error.to_string())?;
+            store
+                .register_active_snapshot_to_registry(&self.config_path, now_unix_seconds())
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Ok(outcome) => {
+                self.reload_registry_after_tosec_activation(outcome, pack_id);
+                self.tosec_managed_staged = None;
+                self.tosec_managed_preview = None;
+            }
+            Err(error) => {
+                self.tosec_managed_error = Some(error.clone());
+                self.tosec_action_error = Some(error);
+            }
+        }
+        self.refresh_tosec_managed_view();
+    }
+
+    fn rollback_tosec_snapshot(&mut self, hash: &str) {
+        self.tosec_action_error = None;
+        self.tosec_managed_error = None;
+        let result = self.tosec_managed_store().and_then(|store| {
+            store.rollback(hash).map_err(|error| error.to_string())?;
+            store
+                .register_active_snapshot_to_registry(&self.config_path, now_unix_seconds())
+                .map_err(|error| error.to_string())
+        });
+        match result {
+            Ok(outcome) => {
+                self.reload_registry_after_tosec_activation(outcome, "rollback");
+                self.tosec_managed_staged = None;
+                self.tosec_managed_preview = None;
+            }
+            Err(error) => {
+                self.tosec_managed_error = Some(error.clone());
+                self.tosec_action_error = Some(error);
+            }
+        }
+        self.refresh_tosec_managed_view();
+    }
+
+    fn reload_registry_after_tosec_activation(
+        &mut self,
+        outcome: archivefs_core::dat::tosec_release_pack::TosecRegistrationOutcome,
+        pack_id: &str,
+    ) {
+        self.tosec_last_apply = Some(TosecApplyView {
+            pack_id: pack_id.to_string(),
+            registered: outcome.registered.len(),
+            already_registered: outcome.already_registered.len(),
+            removed: outcome.removed.len(),
+            deferred: outcome.deferred.len(),
+            conflicts: outcome.conflicts.len(),
+            failed: outcome.failed.len(),
+        });
+        match load_dat_sources_config_from(&self.config_path) {
+            Ok(config) => {
+                let (registry, problems) = DatSourceRegistry::from_config(&config);
+                self.saved = registry.clone();
+                self.draft = registry;
+                self.load_problems = problems;
+            }
+            Err(error) => self.tosec_action_error = Some(format!(
+                "TOSEC snapshot activated, but the local catalogue list could not be reloaded: {error}"
+            )),
+        }
+        if !outcome.failed.is_empty() {
+            self.tosec_action_error = Some(format!(
+                "{} managed TOSEC catalogue(s) could not be registered; the active snapshot remains intact.",
+                outcome.failed.len()
+            ));
+        } else if !outcome.conflicts.is_empty() {
+            self.tosec_action_error = Some(format!(
+                "{} managed TOSEC DAT(s) conflicted with existing sources; those entries were preserved.",
+                outcome.conflicts.len()
+            ));
         }
     }
 
@@ -5736,6 +5956,7 @@ impl DatSourcesPageState {
             tosec_load_error: self.tosec_load_error.clone(),
             tosec_action_error: self.tosec_action_error.clone(),
             tosec_last_apply: self.tosec_last_apply.clone(),
+            tosec_managed: self.tosec_managed_view.clone(),
             no_intro_selected_pack: self.no_intro_selected_pack.as_ref().and_then(|path| {
                 std::fs::metadata(path).ok().map(|metadata| {
                     (
@@ -9714,6 +9935,97 @@ fn show_tosec_release_packs_section(
             widgets::StatusTone::Blocked,
         );
     }
+    if let Some(error) = &view.tosec_managed.error {
+        widgets::banner(
+            ui,
+            "TOSEC managed snapshot unavailable",
+            error,
+            widgets::StatusTone::Blocked,
+        );
+    }
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Managed TOSEC snapshot").strong());
+        if let Some(hash) = &view.tosec_managed.active_sha256 {
+            ui.label(format!(
+                "Active: {} · {} DAT(s) · freshness Unknown until explicitly compared",
+                view.tosec_managed
+                    .active_release
+                    .as_deref()
+                    .unwrap_or("unversioned release"),
+                view.tosec_managed.active_dat_count
+            ));
+            ui.label(
+                egui::RichText::new(format!("Snapshot SHA-256: {hash}"))
+                    .color(theme::muted(ui))
+                    .small(),
+            );
+            if let Some(source) = &view.tosec_managed.active_source_path {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Original source (provenance only): {}",
+                        source.display()
+                    ))
+                    .color(theme::muted(ui))
+                    .small(),
+                );
+            }
+        } else {
+            ui.label("No active managed TOSEC snapshot.");
+        }
+        if let Some(preview) = &view.tosec_managed.staged_preview {
+            ui.separator();
+            ui.label(format!(
+                "Staged preview: {} · {} DAT(s) · {} selected group(s) · {} bytes",
+                preview
+                    .release_version
+                    .as_deref()
+                    .unwrap_or(&preview.release_identifier),
+                preview.dat_count,
+                preview.selected_group_count,
+                preview.total_snapshot_bytes
+            ));
+            ui.label(if preview.differs_from_active {
+                "Staged content differs from the active snapshot. Activation is explicit."
+            } else {
+                "Staged content matches the active snapshot."
+            });
+            if widgets::action_button(
+                ui,
+                "Activate staged snapshot",
+                widgets::ActionStyle::Primary,
+                !view.background_busy,
+            )
+            .clicked()
+                && action.is_none()
+            {
+                action = Some(DatSourcesPageAction::ActivateTosecSnapshot {
+                    pack_id: preview.release_identifier.clone(),
+                });
+            }
+        }
+        if !view.tosec_managed.history_sha256.is_empty() {
+            ui.separator();
+            ui.label(format!(
+                "{} previous immutable snapshot(s) retained for rollback.",
+                view.tosec_managed.history_sha256.len()
+            ));
+            for hash in &view.tosec_managed.history_sha256 {
+                if widgets::action_button(
+                    ui,
+                    format!("Rollback to {hash}"),
+                    widgets::ActionStyle::Quiet,
+                    !view.background_busy,
+                )
+                .clicked()
+                    && action.is_none()
+                {
+                    action = Some(DatSourcesPageAction::RollbackTosecSnapshot {
+                        hash: hash.clone(),
+                    });
+                }
+            }
+        }
+    });
     if let Some(last) = &view.tosec_last_apply {
         widgets::banner(
             ui,
@@ -9868,7 +10180,7 @@ fn show_tosec_release_packs_section(
             ui.horizontal(|ui| {
                 if widgets::action_button(
                     ui,
-                    "Apply selected DATs",
+                    "Stage selected DATs",
                     widgets::ActionStyle::Primary,
                     !view.background_busy && pack.availability == PackAvailability::Available,
                 )

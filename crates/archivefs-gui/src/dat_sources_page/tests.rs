@@ -6156,7 +6156,7 @@ fn tosec_pack_inventory_starts_with_empty_selection_and_renders_bounded_groups()
         TOSEC_ISO_DEFERRED,
     );
     let mut page = fixture.page();
-    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack });
+    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack.clone() });
 
     let view = page.view();
     assert_eq!(view.tosec_packs.len(), 1);
@@ -6286,7 +6286,7 @@ fn tosec_missing_pack_is_honest_after_restart_and_selection_is_explicit() {
 }
 
 #[test]
-fn applying_an_explicit_tosec_selection_registers_only_the_selected_group() {
+fn tosec_selection_stages_then_activates_managed_content_without_source_dependency() {
     let fixture = Fixture::new();
     let pack = fixture.dir("apply-tosec-pack");
     fixture.write(
@@ -6294,7 +6294,7 @@ fn applying_an_explicit_tosec_selection_registers_only_the_selected_group() {
         TOSEC_AMIGA_FLOPPY,
     );
     let mut page = fixture.page();
-    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack });
+    page.apply(DatSourcesPageAction::ImportTosecReleasePack { root: pack.clone() });
     let view = page.view();
     let pack_id = view.tosec_packs[0].pack_id.clone();
     let key = view.tosec_packs[0].groups[0].key.clone();
@@ -6305,10 +6305,33 @@ fn applying_an_explicit_tosec_selection_registers_only_the_selected_group() {
     });
     page.apply(DatSourcesPageAction::ApplyTosecSelection { pack_id });
 
+    assert!(page.view().tosec_managed.staged_preview.is_some());
+    assert!(page.view().rows.is_empty());
+    let staged_pack_id = page
+        .view()
+        .tosec_managed
+        .staged_preview
+        .as_ref()
+        .unwrap()
+        .release_identifier
+        .clone();
+    page.apply(DatSourcesPageAction::ActivateTosecSnapshot {
+        pack_id: staged_pack_id,
+    });
+
     assert_eq!(page.view().rows.len(), 1);
     let applied = page.tosec_last_apply.as_ref().unwrap();
     assert_eq!(applied.registered, 1);
     assert_eq!(applied.failed, 0);
+    let managed_path = page.view().rows[0].path.clone();
+    assert!(Path::new(&managed_path).exists());
+    assert!(!Path::new(&managed_path).starts_with(&pack));
+
+    std::fs::remove_dir_all(pack).unwrap();
+    let reloaded = fixture.page();
+    assert_eq!(reloaded.view().rows.len(), 1);
+    assert!(Path::new(&reloaded.view().rows[0].path).exists());
+    assert!(reloaded.view().tosec_managed.active_sha256.is_some());
 }
 
 #[test]
