@@ -126,8 +126,13 @@ use crate::{
 mod save_result;
 use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
 
+#[path = "dat_sources_page/authority_projection.rs"]
+mod authority_projection;
 #[path = "verify_summary.rs"]
 mod verify_summary;
+use authority_projection::{
+    AuthorityEvidenceFact, AuthorityProjectionRow, freshness_label, project_platform,
+};
 
 /// Said once on the page, because a DAT audit is the one place a user might
 /// reasonably expect a "fix it" button and there is deliberately not one.
@@ -582,6 +587,9 @@ pub(crate) struct DatSourcesPageView {
     /// One row per configured DAT source for the "Collection coverage"
     /// section. `load` is `NotOpened` until the user expands that source.
     pub(crate) coverage_sources: Vec<SourceCoverageEntry>,
+    /// Expected authoritative ecosystems joined to already-known local state.
+    /// This is presentation-only; it never performs discovery or activation.
+    pub(crate) authority_rows: Vec<AuthorityProjectionRow>,
     /// Cached RomM aggregates supplied by app state. Verify must not walk the
     /// provider catalogue while the page is repainting.
     pub(crate) romm_summary: Option<crate::romm_source::VerifyRommSummary>,
@@ -693,6 +701,19 @@ pub(crate) enum ManagedDatStatusView {
     Failed {
         detail: String,
     },
+}
+
+fn managed_row_freshness(
+    row: &ManagedDatSourceRowView,
+) -> archivefs_core::identity_source::freshness::DatFreshnessState {
+    use archivefs_core::identity_source::freshness::DatFreshnessState;
+    match (&row.status, row.installed) {
+        (ManagedDatStatusView::UpToDate, true) => DatFreshnessState::Current,
+        (ManagedDatStatusView::UpdateAvailable { .. }, true) => DatFreshnessState::UpdateAvailable,
+        (ManagedDatStatusView::Failed { .. }, true) => DatFreshnessState::CheckFailed,
+        (_, true) => DatFreshnessState::Unknown,
+        _ => DatFreshnessState::NeverChecked,
+    }
 }
 
 fn managed_dat_status_from_outcome(outcome: ManagedDatUpdateOutcome) -> ManagedDatStatusView {
@@ -5699,11 +5720,16 @@ impl DatSourcesPageState {
             .map(|entry| self.row_view(entry))
             .collect();
 
+        let managed_rows = self.managed_rows_view();
+        let redump_bios_rows = self.redump_bios_rows_view();
+        let redump_game_rows = self.redump_game_rows_view();
+        let fbneo_rows = self.fbneo_rows_view();
         DatSourcesPageView {
-            managed_rows: self.managed_rows_view(),
-            redump_bios_rows: self.redump_bios_rows_view(),
-            redump_game_rows: self.redump_game_rows_view(),
-            fbneo_rows: self.fbneo_rows_view(),
+            authority_rows: self.authority_projection_view(&redump_game_rows, &fbneo_rows),
+            managed_rows,
+            redump_bios_rows,
+            redump_game_rows,
+            fbneo_rows,
             managed_load_error: self.managed_load_error.clone(),
             managed_action_error: self.managed_action_error.clone(),
             tosec_packs: self.tosec_packs_view(),
@@ -5792,6 +5818,114 @@ impl DatSourcesPageState {
             romm_summary,
             rows,
         }
+    }
+
+    fn authority_projection_view(
+        &self,
+        redump_game_rows: &[ManagedDatSourceRowView],
+        fbneo_rows: &[ManagedDatSourceRowView],
+    ) -> Vec<AuthorityProjectionRow> {
+        let mut facts = Vec::new();
+        for entry in self.draft.sorted_all() {
+            let Some(platform) = entry
+                .platform
+                .as_deref()
+                .and_then(archivefs_core::canonical_platform_for_alias)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Some(ecosystem) = self.validation(&entry.id).and_then(|report| {
+                report.files.iter().find_map(|file| match &file.outcome {
+                    DatFileOutcome::Parsed { ecosystem, .. } => Some(*ecosystem),
+                    DatFileOutcome::Failed { .. } => None,
+                })
+            }) else {
+                continue;
+            };
+            let managed = matches!(
+                entry.ownership,
+                archivefs_core::dat::sources::DatSourceOwnership::EmuWizManaged
+                    | archivefs_core::dat::sources::DatSourceOwnership::ImportedTosecReleasePack { .. }
+            );
+            facts.push(AuthorityEvidenceFact {
+                platform: Some(platform),
+                source:
+                    archivefs_core::dat::coverage_expectations::ExpectedAuthoritativeSource::Dat(
+                        ecosystem,
+                    ),
+                active: entry.enabled,
+                managed,
+                freshness: if entry.enabled {
+                    archivefs_core::identity_source::freshness::DatFreshnessState::Unknown
+                } else {
+                    archivefs_core::identity_source::freshness::DatFreshnessState::NeverChecked
+                },
+            });
+        }
+
+        if let Some(report) = &self.no_intro_status {
+            for platform in &report.platforms {
+                if let Some(canonical_platform) = &platform.canonical_platform {
+                    facts.push(AuthorityEvidenceFact {
+                        platform: Some(canonical_platform.clone()),
+                        source: archivefs_core::dat::coverage_expectations::ExpectedAuthoritativeSource::Dat(
+                            archivefs_core::dat::model::DatEcosystem::NoIntro,
+                        ),
+                        active: platform.current_snapshot_sha256.is_some(),
+                        managed: true,
+                        freshness: platform.freshness,
+                    });
+                }
+            }
+        }
+
+        for (system, row) in archivefs_core::dat::updates::RedumpGameSystem::all()
+            .iter()
+            .copied()
+            .zip(redump_game_rows)
+        {
+            let platform = archivefs_core::canonical_platform_for_alias(&format!(
+                "{:?}",
+                system.canonical_platform()
+            ));
+            facts.push(AuthorityEvidenceFact {
+                platform: platform.map(str::to_string),
+                source:
+                    archivefs_core::dat::coverage_expectations::ExpectedAuthoritativeSource::Dat(
+                        archivefs_core::dat::model::DatEcosystem::Redump,
+                    ),
+                active: row.installed,
+                managed: true,
+                freshness: managed_row_freshness(row),
+            });
+        }
+        if let Some(row) = fbneo_rows.first() {
+            facts.push(AuthorityEvidenceFact {
+                platform: Some("Arcade".to_string()),
+                source:
+                    archivefs_core::dat::coverage_expectations::ExpectedAuthoritativeSource::Dat(
+                        archivefs_core::dat::model::DatEcosystem::FBNeo,
+                    ),
+                active: row.installed,
+                managed: true,
+                freshness: managed_row_freshness(row),
+            });
+        }
+
+        let mut platforms = BTreeSet::from_iter([
+            "Game Boy".to_string(),
+            "PS2".to_string(),
+            "Arcade".to_string(),
+            "ScummVM".to_string(),
+            "Amiga".to_string(),
+            "Philips CD-i".to_string(),
+        ]);
+        platforms.extend(facts.iter().filter_map(|fact| fact.platform.clone()));
+        platforms
+            .into_iter()
+            .map(|platform| project_platform(Some(&platform), &facts))
+            .collect()
     }
 
     /// One [`SourceCoverageEntry`] per configured DAT source, folding in
@@ -7364,6 +7498,7 @@ pub(crate) fn show_dat_sources_page(
     {
         action = Some(coverage_action);
     }
+    show_authority_projection_section(ui, &view.authority_rows);
     ui.add_space(12.0);
 
     egui::CollapsingHeader::new("Catalogue setup and verification")
@@ -7623,6 +7758,78 @@ fn show_dat_coverage_section(
             DatSourcesPageAction::Validate { id: source_id }
         }
     })
+}
+
+fn show_authority_projection_section(ui: &mut egui::Ui, rows: &[AuthorityProjectionRow]) {
+    egui::CollapsingHeader::new("Expected authority and freshness")
+        // Keep the existing DAT management cards visible in the initial
+        // viewport; the projection is available on demand without changing
+        // the established page hierarchy.
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Coverage and freshness are separate: an active source is not automatically Current.",
+                )
+                .color(theme::muted(ui))
+                .small(),
+            );
+            for row in rows {
+                widgets::card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong(&row.platform);
+                        let (label, tone) = authority_coverage_presentation(row.coverage);
+                        widgets::status_badge(ui, label, tone);
+                    });
+                    if row.expected_sources.is_empty() {
+                        ui.label(egui::RichText::new(&row.reason).color(theme::muted(ui)));
+                    } else {
+                        for source in &row.expected_sources {
+                            let role = match source.role {
+                                archivefs_core::dat::coverage_expectations::CoverageSourceRole::Primary => "Primary",
+                                archivefs_core::dat::coverage_expectations::CoverageSourceRole::Secondary => "Secondary",
+                                archivefs_core::dat::coverage_expectations::CoverageSourceRole::Supplementary => "Supplementary",
+                            };
+                            let active = if source.active { "active" } else { "inactive" };
+                            let managed = if source.managed { "managed" } else { "user-managed" };
+                            ui.label(format!(
+                                "{role}: {} · {active} · {managed} · {}",
+                                source.label,
+                                freshness_label(source.freshness)
+                            ));
+                        }
+                        ui.label(egui::RichText::new(&row.reason).color(theme::muted(ui)).small());
+                    }
+                });
+            }
+        });
+}
+
+fn authority_coverage_presentation(
+    state: archivefs_core::dat::coverage_expectations::PlatformCoverageState,
+) -> (&'static str, widgets::StatusTone) {
+    use archivefs_core::dat::coverage_expectations::PlatformCoverageState;
+    match state {
+        PlatformCoverageState::Covered => ("Covered", widgets::StatusTone::Success),
+        PlatformCoverageState::ExpectedButMissing => {
+            ("Expected — missing", widgets::StatusTone::Warning)
+        }
+        PlatformCoverageState::ExpectedButInactive => {
+            ("Expected — inactive", widgets::StatusTone::Pending)
+        }
+        PlatformCoverageState::ExpectedButStale => {
+            ("Expected — stale", widgets::StatusTone::Warning)
+        }
+        PlatformCoverageState::ExpectedButUnmanaged => {
+            ("Expected — unmanaged", widgets::StatusTone::Info)
+        }
+        PlatformCoverageState::NoExpectedSource => {
+            ("No expected source", widgets::StatusTone::Info)
+        }
+        PlatformCoverageState::UnknownPlatform => {
+            ("Unknown platform", widgets::StatusTone::Blocked)
+        }
+    }
 }
 
 /// Explicit one-catalogue Verify entry point. The existing all-enabled
