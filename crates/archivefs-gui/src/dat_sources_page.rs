@@ -85,8 +85,9 @@ use archivefs_core::dat::sources::{
 };
 use archivefs_core::dat::tosec_release_pack::{
     PackAvailability, PersistedTosecPack, TosecManagedCandidate,
-    TosecManagedSnapshotStore, TosecPackDat, TosecSelectionKey, default_tosec_packs_path,
-    inventory_release_pack, load_tosec_packs, save_tosec_packs,
+    TosecManagedSnapshotStore, TosecPackDat, TosecRevisionComparison, TosecSelectionKey,
+    TOSEC_OFFICIAL_DOWNLOADS_PAGE, default_tosec_packs_path, inventory_release_pack,
+    load_tosec_packs, save_tosec_packs,
 };
 use archivefs_core::dat::updates::{
     HttpsManagedDatTransport, ManagedDatProvider, ManagedDatReadOnlySource,
@@ -687,6 +688,7 @@ pub(crate) struct TosecManagedPreviewView {
     pub(crate) selected_group_count: usize,
     pub(crate) total_snapshot_bytes: u64,
     pub(crate) differs_from_active: bool,
+    pub(crate) revision_comparison: TosecRevisionComparison,
 }
 
 impl TosecManagedLifecycleView {
@@ -1821,6 +1823,7 @@ pub(crate) enum DatSourcesPageAction {
     ImportTosecReleasePack {
         root: PathBuf,
     },
+    OpenTosecDownloads,
     RemoveTosecReleasePack {
         pack_id: String,
     },
@@ -3751,6 +3754,11 @@ impl DatSourcesPageState {
                 self.rollback_managed_dat(source_id);
             }
             DatSourcesPageAction::ImportTosecReleasePack { root } => self.import_tosec_pack(root),
+            DatSourcesPageAction::OpenTosecDownloads => {
+                if let Some(error) = open_tosec_downloads_page() {
+                    self.tosec_action_error = Some(error);
+                }
+            }
             DatSourcesPageAction::RemoveTosecReleasePack { pack_id } => {
                 self.remove_tosec_pack(&pack_id);
             }
@@ -4949,6 +4957,7 @@ impl DatSourcesPageState {
                     selected_group_count: preview.selected_group_count,
                     total_snapshot_bytes: preview.total_snapshot_bytes,
                     differs_from_active: preview.differs_from_active,
+                    revision_comparison: preview.revision_comparison,
                 });
                 self.tosec_managed_staged = Some(candidate);
             }
@@ -8298,14 +8307,25 @@ fn show_evidence_acquisition_section(
             ui.label(egui::RichText::new("TOSEC — vintage systems").strong());
             ui.label(
                 egui::RichText::new(format!(
-                    "Managed download is not available: the official site has no durable pack resolver. {available_tosec_packs} imported pack(s) · {selected_tosec_dats} selected DAT(s). Enable System / Category / Media below."
+                    "Official release packs are obtained in your browser, then imported and validated here. {available_tosec_packs} imported pack(s) · {selected_tosec_dats} selected DAT(s). Enable System / Category / Media below."
                 ))
                 .color(theme::muted(ui))
                 .small(),
             );
             if widgets::action_button(
                 ui,
-                "Choose extracted TOSEC pack…",
+                "Check for update (Open TOSEC downloads)",
+                widgets::ActionStyle::Secondary,
+                !view.background_busy,
+            )
+            .clicked()
+                && action.is_none()
+            {
+                action = Some(DatSourcesPageAction::OpenTosecDownloads);
+            }
+            if widgets::action_button(
+                ui,
+                "Import downloaded TOSEC pack…",
                 widgets::ActionStyle::Primary,
                 !view.background_busy && view.tosec_load_error.is_none(),
             )
@@ -8663,6 +8683,17 @@ fn open_no_intro_download_page() -> Option<String> {
         Ok(status) if status.success() => None,
         Ok(status) => Some(format!("Could not open DAT-o-MATIC (status {status}).")),
         Err(error) => Some(format!("Could not open DAT-o-MATIC: {error}")),
+    }
+}
+
+fn open_tosec_downloads_page() -> Option<String> {
+    match std::process::Command::new("xdg-open")
+        .arg(TOSEC_OFFICIAL_DOWNLOADS_PAGE)
+        .status()
+    {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(format!("Could not open TOSEC downloads (status {status}).")),
+        Err(error) => Some(format!("Could not open TOSEC downloads: {error}")),
     }
 }
 
@@ -9983,7 +10014,7 @@ fn show_tosec_release_packs_section(
         ui.label(egui::RichText::new("Managed TOSEC snapshot").strong());
         if let Some(hash) = &view.tosec_managed.active_sha256 {
             ui.label(format!(
-                "Active: {} · {} DAT(s) · freshness Unknown until explicitly compared",
+                "Installed release: {} · {} DAT(s) · Status: update status unknown until a downloaded release is compared",
                 view.tosec_managed
                     .active_release
                     .as_deref()
@@ -10010,6 +10041,24 @@ fn show_tosec_release_packs_section(
         }
         if let Some(preview) = &view.tosec_managed.staged_preview {
             ui.separator();
+            let (comparison, tone) = match preview.revision_comparison {
+                TosecRevisionComparison::NoActiveRelease => {
+                    ("Ready to activate: first installed release" , widgets::StatusTone::Pending)
+                }
+                TosecRevisionComparison::Newer => {
+                    ("Update available: staged release is newer", widgets::StatusTone::Success)
+                }
+                TosecRevisionComparison::Same => {
+                    ("Same release as installed", widgets::StatusTone::Pending)
+                }
+                TosecRevisionComparison::Older => {
+                    ("Older release: activation blocked", widgets::StatusTone::Warning)
+                }
+                TosecRevisionComparison::Unknown => {
+                    ("Revision unknown: review before activation", widgets::StatusTone::Warning)
+                }
+            };
+            widgets::status_badge(ui, comparison, tone);
             ui.label(format!(
                 "Staged preview: {} · {} DAT(s) · {} selected group(s) · {} bytes",
                 preview
@@ -10025,11 +10074,15 @@ fn show_tosec_release_packs_section(
             } else {
                 "Staged content matches the active snapshot."
             });
+            let activation_allowed = !matches!(
+                preview.revision_comparison,
+                TosecRevisionComparison::Older | TosecRevisionComparison::Same
+            );
             if widgets::action_button(
                 ui,
-                "Activate staged snapshot",
+                "Activate staged release",
                 widgets::ActionStyle::Primary,
-                !view.background_busy,
+                !view.background_busy && activation_allowed,
             )
             .clicked()
                 && action.is_none()
@@ -10085,10 +10138,10 @@ fn show_tosec_release_packs_section(
     }
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new("Add extracted release pack").strong());
-        ui.label(egui::RichText::new("Choose a local, already-extracted TOSEC directory. EmuWiz inventories it read-only and starts with no DAT groups enabled.").color(theme::muted(ui)).small());
+        ui.label(egui::RichText::new("After downloading the official ZIP, extract it and choose the release folder. EmuWiz inventories it read-only and starts with no DAT groups enabled.").color(theme::muted(ui)).small());
         if widgets::action_button(
             ui,
-            "Choose release-pack folder",
+            "Choose extracted release folder",
             widgets::ActionStyle::Primary,
             !view.background_busy && view.tosec_load_error.is_none(),
         )

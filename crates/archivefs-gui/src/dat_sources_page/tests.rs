@@ -5911,9 +5911,10 @@ fn dat_acquisition_entry_point_exposes_existing_safe_provider_paths_without_auto
     assert!(rendered_text_contains(&output, "WHDLoad — Amiga packages"));
     assert!(rendered_text_contains(&output, "Choose WHDLoad DAT…"));
     assert!(rendered_text_contains(&output, "TOSEC — vintage systems"));
+    assert!(rendered_text_contains(&output, "Open TOSEC downloads"));
     assert!(rendered_text_contains(
         &output,
-        "Choose extracted TOSEC pack…"
+        "Import downloaded TOSEC pack…"
     ));
     assert!(rendered_text_contains(
         &output,

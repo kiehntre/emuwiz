@@ -48,6 +48,9 @@ use crate::identity_source::tosec::import_tosec_dat;
 /// already bounded by the parser's 256 MiB limit; the smaller aggregate bound
 /// prevents a selected release from becoming an accidental second full pack.
 pub const MAX_TOSEC_SNAPSHOT_DAT_BYTES: u64 = 512 * 1024 * 1024;
+/// Official TOSEC release index for the browser-assisted acquisition flow.
+/// No request is made by the core pack/lifecycle code.
+pub const TOSEC_OFFICIAL_DOWNLOADS_PAGE: &str = "https://tosecdev.org/downloads";
 const MAX_TOSEC_SNAPSHOT_MEMBERS: usize = MAX_PACK_DATS;
 const TOSEC_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const TOSEC_MANAGED_PROVIDER_ID: &str = "tosec-release-pack";
@@ -796,7 +799,21 @@ pub struct TosecSnapshotPreview {
     pub media: BTreeSet<TosecMediaType>,
     pub current_active_release: Option<String>,
     pub differs_from_active: bool,
+    pub revision_comparison: TosecRevisionComparison,
     pub validation_warnings: Vec<String>,
+}
+
+/// Conservative comparison of a staged TOSEC release against the active
+/// managed release. Unknown means the release labels are absent or not in the
+/// documented date-shaped form; content hashes establish identity only, not
+/// ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TosecRevisionComparison {
+    NoActiveRelease,
+    Newer,
+    Same,
+    Older,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -990,7 +1007,14 @@ impl TosecManagedSnapshotStore {
             .iter()
             .map(|(dat, _)| dat.media)
             .collect();
-        let current_active_release = self.active_snapshot()?.map(|snapshot| snapshot.pack_id);
+        let active = self.active_snapshot()?;
+        let current_active_release = active
+            .as_ref()
+            .and_then(|snapshot| snapshot.release_version.clone());
+        let revision_comparison = compare_tosec_release_versions(
+            candidate.snapshot.release_version.as_deref(),
+            current_active_release.as_deref(),
+        );
         Ok(TosecSnapshotPreview {
             release_identifier: candidate.snapshot.pack_id.clone(),
             release_version: candidate.snapshot.release_version.clone(),
@@ -1001,6 +1025,7 @@ impl TosecManagedSnapshotStore {
             media,
             current_active_release,
             differs_from_active: preview.changed,
+            revision_comparison,
             validation_warnings: preview.warnings,
         })
     }
@@ -1163,6 +1188,39 @@ fn common_release_version(dats: &[(TosecManagedDat, Vec<u8>)]) -> Option<String>
     dats.iter()
         .all(|(dat, _)| dat.tosec_version.as_deref() == Some(first.as_str()))
         .then_some(first)
+}
+
+fn compare_tosec_release_versions(
+    candidate: Option<&str>,
+    active: Option<&str>,
+) -> TosecRevisionComparison {
+    let (Some(candidate), Some(active)) = (candidate, active) else {
+        return if active.is_none() {
+            TosecRevisionComparison::NoActiveRelease
+        } else {
+            TosecRevisionComparison::Unknown
+        };
+    };
+    if candidate == active {
+        return TosecRevisionComparison::Same;
+    }
+    let is_date = |value: &str| {
+        value.len() == 10
+            && value.as_bytes()[4] == b'-'
+            && value.as_bytes()[7] == b'-'
+            && value
+                .bytes()
+                .enumerate()
+                .all(|(index, byte)| index == 4 || index == 7 || byte.is_ascii_digit())
+    };
+    if !is_date(candidate) || !is_date(active) {
+        return TosecRevisionComparison::Unknown;
+    }
+    match candidate.cmp(active) {
+        std::cmp::Ordering::Greater => TosecRevisionComparison::Newer,
+        std::cmp::Ordering::Equal => TosecRevisionComparison::Same,
+        std::cmp::Ordering::Less => TosecRevisionComparison::Older,
+    }
 }
 
 fn reject_materialized_symlinks(root: &Path, path: &Path) -> Result<(), ArchiveFsError> {

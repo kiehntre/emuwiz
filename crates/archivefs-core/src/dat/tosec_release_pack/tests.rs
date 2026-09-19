@@ -226,6 +226,70 @@ fn managed_snapshot_activation_history_rollback_and_offline_load_work() {
 }
 
 #[test]
+fn managed_preview_compares_first_install_newer_same_older_and_unknown_release() {
+    let (fixture, inventory, selections) = managed_fixture();
+    let (_store_root, store) = managed_store();
+
+    let first = store
+        .stage_release_pack(&inventory, &selections, 123)
+        .unwrap();
+    assert_eq!(
+        store.preview_activation(&first).unwrap().revision_comparison,
+        TosecRevisionComparison::NoActiveRelease
+    );
+    store.activate(&first, None).unwrap();
+
+    let dat_path = fixture
+        .pack_root
+        .join("Amiga/Amiga - Games - Floppy (TOSEC-v2021-01-09).dat");
+    let newer_contents = AMIGA_GAMES_FLOPPY_DAT
+        .replace("2021-01-09", "2022-01-09")
+        .replace("Another Game", "Newer Game");
+    std::fs::write(&dat_path, &newer_contents).unwrap();
+    let newer_inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let newer = store
+        .stage_release_pack(&newer_inventory, &selections, 124)
+        .unwrap();
+    assert_eq!(
+        store.preview_activation(&newer).unwrap().revision_comparison,
+        TosecRevisionComparison::Newer
+    );
+    let active_hash = store.active_record().unwrap().unwrap().sha256;
+    store.activate(&newer, Some(&active_hash)).unwrap();
+
+    let same_inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let same = store
+        .stage_release_pack(&same_inventory, &selections, 125)
+        .unwrap();
+    assert_eq!(
+        store.preview_activation(&same).unwrap().revision_comparison,
+        TosecRevisionComparison::Same
+    );
+
+    let older_contents = newer_contents.replace("2022-01-09", "2020-01-09");
+    std::fs::write(&dat_path, &older_contents).unwrap();
+    let older_inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let older = store
+        .stage_release_pack(&older_inventory, &selections, 126)
+        .unwrap();
+    assert_eq!(
+        store.preview_activation(&older).unwrap().revision_comparison,
+        TosecRevisionComparison::Older
+    );
+
+    let unknown_contents = older_contents.replace("2020-01-09", "release-a");
+    std::fs::write(&dat_path, &unknown_contents).unwrap();
+    let unknown_inventory = inventory_release_pack(&fixture.pack_root).unwrap();
+    let unknown = store
+        .stage_release_pack(&unknown_inventory, &selections, 127)
+        .unwrap();
+    assert_eq!(
+        store.preview_activation(&unknown).unwrap().revision_comparison,
+        TosecRevisionComparison::Unknown
+    );
+}
+
+#[test]
 fn managed_snapshot_registration_uses_immutable_materialized_bytes_after_source_disappears() {
     let (fixture, inventory, selections) = managed_fixture();
     let (store_root, store) = managed_store();
