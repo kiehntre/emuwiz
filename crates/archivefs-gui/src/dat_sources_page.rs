@@ -8314,7 +8314,7 @@ fn show_evidence_acquisition_section(
             );
             if widgets::action_button(
                 ui,
-                "Open official TOSEC downloads",
+                "Open TOSEC downloads (official)",
                 widgets::ActionStyle::Secondary,
                 !view.background_busy,
             )
@@ -9433,7 +9433,7 @@ fn show_managed_dat_sources_section(
             .unwrap_or(managed_count < 10);
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open)
+            .default_open(open || row.configured)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
@@ -9450,7 +9450,7 @@ fn show_managed_dat_sources_section(
             .unwrap_or(managed_count < 10);
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open)
+            .default_open(open || row.configured)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
@@ -9472,7 +9472,7 @@ fn show_managed_dat_sources_section(
             .unwrap_or(managed_count < 10);
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open)
+            .default_open(open || row.configured)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
@@ -9493,7 +9493,7 @@ fn show_managed_dat_sources_section(
             .unwrap_or(managed_count < 10);
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open)
+            .default_open(open || row.configured)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
