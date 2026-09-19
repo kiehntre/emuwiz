@@ -37,6 +37,7 @@ pub mod audit;
 pub mod authority;
 pub mod catalogue_selection;
 pub mod classification;
+pub mod custom_dat;
 pub mod coverage;
 pub mod coverage_expectations;
 pub mod dependency;
