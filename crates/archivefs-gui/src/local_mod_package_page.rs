@@ -60,6 +60,7 @@ pub struct LocalModPackagePageState {
     provider_selection: Option<(String, String)>,
     standalone: StandalonePatchPageState,
     pub(crate) cemu: crate::cemu_graphic_pack_page::CemuGraphicPackPageState,
+    pub(crate) rpcs3: crate::rpcs3_ordinary_mod_page::Rpcs3OrdinaryModPageState,
 }
 
 #[derive(Default)]
@@ -1346,6 +1347,15 @@ pub fn show_local_mod_package_panel_with_catalogue(
         identity,
     );
     if identity.platform == archivefs_core::game_identity::IdentityPlatform::WiiU {
+        ui.add_space(8.0);
+    }
+    crate::rpcs3_ordinary_mod_page::show_rpcs3_ordinary_mod_panel(
+        ui,
+        &mut state.rpcs3,
+        archive_path,
+        identity,
+    );
+    if identity.platform == archivefs_core::game_identity::IdentityPlatform::PlayStation3 {
         ui.add_space(8.0);
     }
     show_standalone_patch_panel(

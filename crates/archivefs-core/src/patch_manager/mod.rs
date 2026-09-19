@@ -98,6 +98,7 @@ mod retroarch_inventory;
 mod retroarch_materialization;
 mod rmg_local;
 mod rpcs3_local;
+mod rpcs3_ordinary_mod;
 mod sameboy_local;
 mod shared_preview;
 mod shared_transaction;
@@ -757,6 +758,17 @@ pub use rpcs3_local::{
     Rpcs3ProfileDiscovery, Rpcs3ProfileDiscoveryRoots, Rpcs3ProfileScope, Rpcs3SaveTrophyInventory,
     Rpcs3Settings, Rpcs3UpdateInfo, discover_rpcs3_profiles, inspect_rpcs3_game,
     parse_rpcs3_version, resolve_rpcs3_native_launch_binding,
+};
+pub use rpcs3_ordinary_mod::{
+    RPCS3_ORDINARY_MOD_MAX_FILES, RPCS3_ORDINARY_MOD_MAX_SFO_BYTES,
+    RPCS3_ORDINARY_MOD_MAX_TOTAL_BYTES, RPCS3_ORDINARY_MOD_SOURCE_MODE,
+    Rpcs3OrdinaryModArchiveInspection, Rpcs3OrdinaryModApplyResult,
+    Rpcs3OrdinaryModError, Rpcs3OrdinaryModErrorKind, Rpcs3OrdinaryModInspection,
+    Rpcs3OrdinaryModPlan, apply_rpcs3_ordinary_mod,
+    build_rpcs3_ordinary_mod_plan, build_rpcs3_ordinary_mod_transaction_plan,
+    inspect_rpcs3_ordinary_mod, inspect_rpcs3_ordinary_mod_zip,
+    preview_rpcs3_ordinary_mod_rollback, rollback_rpcs3_ordinary_mod,
+    rpcs3_ordinary_mod_destination_root,
 };
 pub use sameboy_local::{
     SAMEBOY_MAX_CONFIG_BYTES, SAMEBOY_MAX_PROFILES, SameBoyBootRomEvidence, SameBoyBootRomState,

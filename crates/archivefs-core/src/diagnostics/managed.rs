@@ -122,7 +122,9 @@ impl ManagedFormat {
             PreviewAdapter::Pcsx2 => Self::Pcsx2Pnach,
             PreviewAdapter::Xenia => Self::XeniaPatch,
             PreviewAdapter::RetroArch => Self::RetroArchCheat,
-            PreviewAdapter::LocalModPackage | PreviewAdapter::CemuGraphicPack => {
+            PreviewAdapter::LocalModPackage
+            | PreviewAdapter::CemuGraphicPack
+            | PreviewAdapter::Rpcs3OrdinaryMod => {
                 Self::LocalModPackage
             }
         }

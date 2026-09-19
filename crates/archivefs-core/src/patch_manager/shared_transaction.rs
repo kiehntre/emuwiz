@@ -112,7 +112,8 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Xenia
         | PreviewAdapter::LocalModPackage
-        | PreviewAdapter::CemuGraphicPack => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::CemuGraphicPack
+        | PreviewAdapter::Rpcs3OrdinaryMod => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -259,6 +260,7 @@ pub enum SharedContentVerification {
     /// safe normal path components beneath the approved game root.
     LocalModPackage,
     CemuGraphicPack,
+    Rpcs3OrdinaryMod,
     DolphinManagedGameHacking {
         expected_managed_names: Vec<String>,
         require_managed_section: bool,
@@ -720,6 +722,29 @@ pub fn require_cemu_graphic_pack_verification(
     Ok(())
 }
 
+/// Marks a validated ordinary RPCS3 file-layer mod as using the reviewed
+/// nested-path contract and reseals its plan before it can be applied.
+pub fn require_rpcs3_ordinary_mod_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::Rpcs3OrdinaryMod
+        || plan.context.source_mode != "rpcs3_ordinary_mod"
+        || plan.entries.is_empty()
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "RPCS3 ordinary-mod verification requires an RPCS3 ordinary-mod transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::Rpcs3OrdinaryMod);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
 pub fn execute_shared_apply(
     plan: &SharedTransactionPlan,
     options: &SharedApplyOptions,
@@ -1102,6 +1127,7 @@ fn apply_one(
         Some(
             SharedContentVerification::LocalModPackage
                 | SharedContentVerification::CemuGraphicPack
+                | SharedContentVerification::Rpcs3OrdinaryMod
         )
     );
     let assessment = if nested_mod_package {
@@ -1229,6 +1255,7 @@ fn apply_one(
                 | PreviewAdapter::Xenia
                 | PreviewAdapter::LocalModPackage
                 | PreviewAdapter::CemuGraphicPack
+                | PreviewAdapter::Rpcs3OrdinaryMod
         );
         if !plan.parent_creation_approved || !adapter_allows_parent_creation {
             return fail_result(
@@ -1411,7 +1438,9 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
             }
             Ok(())
         }
-        SharedContentVerification::LocalModPackage | SharedContentVerification::CemuGraphicPack => {
+        SharedContentVerification::LocalModPackage
+        | SharedContentVerification::CemuGraphicPack
+        | SharedContentVerification::Rpcs3OrdinaryMod => {
             Ok(())
         }
     }

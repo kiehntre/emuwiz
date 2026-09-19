@@ -313,6 +313,7 @@ pub(crate) mod identity_sources_page;
 pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod local_mod_package_page;
+pub(crate) mod rpcs3_ordinary_mod_page;
 pub(crate) mod cemu_graphic_pack_page;
 mod mount_operation_controller;
 mod mount_operations;

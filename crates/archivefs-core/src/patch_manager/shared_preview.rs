@@ -38,6 +38,9 @@ pub enum PreviewAdapter {
     /// contain any number of safe normal components because Cemu preserves
     /// the pack's nested content/assets/shader layout.
     CemuGraphicPack,
+    /// A structurally inspected ordinary RPCS3 file-layer mod. Its relative
+    /// paths retain the package's nested PS3 filesystem layout.
+    Rpcs3OrdinaryMod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -53,6 +56,7 @@ pub enum PreviewIdentityKind {
     DolphinTexturePack,
     XeniaTitleId,
     CemuTitleId,
+    Rpcs3TitleId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -436,7 +440,10 @@ fn preview_one(
     let mut entry = base_entry(request, source, Some(relative.clone()));
     apply_eligibility_blockers(request, source, &mut entry);
     let Some((directory, filename)) = two_safe_components(&relative)
-        .or_else(|| (request.adapter == PreviewAdapter::CemuGraphicPack).then(|| {
+        .or_else(|| (matches!(
+            request.adapter,
+            PreviewAdapter::CemuGraphicPack | PreviewAdapter::Rpcs3OrdinaryMod
+        )).then(|| {
             (OsString::new(), OsString::new())
         }))
     else {
@@ -494,7 +501,10 @@ fn preview_one(
         }
     };
 
-    let assessment = if request.adapter == PreviewAdapter::CemuGraphicPack {
+    let assessment = if matches!(
+        request.adapter,
+        PreviewAdapter::CemuGraphicPack | PreviewAdapter::Rpcs3OrdinaryMod
+    ) {
         assess_nested_destination(&request.destination_root, &relative)
     } else {
         assess_destination(
@@ -742,7 +752,8 @@ fn apply_eligibility_blockers(
         PreviewAdapter::Pcsx2
         | PreviewAdapter::Dolphin
         | PreviewAdapter::LocalModPackage
-        | PreviewAdapter::CemuGraphicPack => {
+        | PreviewAdapter::CemuGraphicPack
+        | PreviewAdapter::Rpcs3OrdinaryMod => {
             source.match_strength == PreviewMatchStrength::VerifiedExact
         }
     };
@@ -874,7 +885,9 @@ fn detect_cross_entry_conflicts(request: &SharedPreviewRequest, report: &mut Sha
     if ((request.adapter == PreviewAdapter::Pcsx2
         && request.identity.kind == PreviewIdentityKind::Pcsx2ExecutableCrc)
         || (request.adapter == PreviewAdapter::Dolphin
-            && request.identity.kind == PreviewIdentityKind::DolphinGameId))
+            && request.identity.kind == PreviewIdentityKind::DolphinGameId)
+        || (request.adapter == PreviewAdapter::Rpcs3OrdinaryMod
+            && request.identity.kind == PreviewIdentityKind::Rpcs3TitleId))
         && exact_sources.len() > 1
     {
         for index in 0..report.entries.len() {
@@ -1262,6 +1275,7 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         // adapter never goes through `build_shared_preview`.
         PreviewAdapter::RetroArch | PreviewAdapter::LocalModPackage => !normalized.is_empty(),
         PreviewAdapter::CemuGraphicPack => matches!(normalized.as_str(), "wiiu" | "wii u"),
+        PreviewAdapter::Rpcs3OrdinaryMod => normalized == "ps3" || normalized == "playstation 3",
     }
 }
 
