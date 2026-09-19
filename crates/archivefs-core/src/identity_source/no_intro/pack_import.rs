@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use super::import::{ImportedNoIntroSource, NoIntroImportError, import_no_intro_dat};
+use crate::identity_source::managed_snapshot::{
+    ManagedSourceDescriptor, ManagedSourceKind, ManagedSourceMetadata, ManagedSourceReference,
+    ManagedSourceStore, ManagedSourceTrust, ValidationReport,
+};
 
 /// Official download page for the user/browser handoff. This is metadata
 /// only; no request is made by this module.
@@ -29,6 +33,10 @@ pub const NO_INTRO_PACK_MAX_DAT_BYTES: u64 = 64 * 1024 * 1024;
 /// compressed archive and per-member limits remain unchanged.
 pub const NO_INTRO_PACK_MAX_TOTAL_DAT_BYTES: u64 = 640 * 1024 * 1024;
 const PACK_DIRECTORY: &str = "no_intro_pack";
+const MANAGED_STORE_DIRECTORY: &str = "managed";
+const MANAGED_PROVIDER_ID: &str = "no-intro-pack";
+const MANAGED_MEDIA_TYPE: &str = "application/vnd.emuwiz.no-intro-snapshot-state";
+const MANAGED_PARSER_SCHEMA: &str = "no-intro-managed-snapshot-v2";
 
 #[derive(Debug)]
 pub enum NoIntroPackImportError {
@@ -212,6 +220,73 @@ struct NoIntroPackStateMember {
     rom_count: usize,
 }
 
+fn managed_store(storage_root: &Path) -> Result<ManagedSourceStore, NoIntroPackImportError> {
+    let descriptor = ManagedSourceDescriptor {
+        provider_id: MANAGED_PROVIDER_ID.to_string(),
+        display_name: "No-Intro managed pack lifecycle".to_string(),
+        source_kind: ManagedSourceKind::Local,
+        source: ManagedSourceReference::LocalPath(PathBuf::from("/emuwiz/no-intro-pack")),
+        expected_media_type: MANAGED_MEDIA_TYPE.to_string(),
+        maximum_size_bytes: NO_INTRO_PACK_MAX_BYTES,
+        attribution_url: None,
+        parser_schema_version: MANAGED_PARSER_SCHEMA.to_string(),
+        trust: ManagedSourceTrust::Official,
+    };
+    ManagedSourceStore::new(storage_root.join(MANAGED_STORE_DIRECTORY), descriptor)
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))
+}
+
+fn encode_managed_state(state: &NoIntroPackState) -> Result<Vec<u8>, NoIntroPackImportError> {
+    serde_json::to_vec(state).map_err(|error| NoIntroPackImportError::State(error.to_string()))
+}
+
+fn decode_managed_state(bytes: &[u8]) -> Result<NoIntroPackState, NoIntroPackImportError> {
+    serde_json::from_slice(bytes).map_err(|error| NoIntroPackImportError::State(error.to_string()))
+}
+
+fn active_managed_state(
+    storage_root: &Path,
+) -> Result<Option<(NoIntroPackState, String)>, NoIntroPackImportError> {
+    let store = managed_store(storage_root)?;
+    let Some(snapshot) = store
+        .active_snapshot()
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let bytes = store
+        .snapshot_bytes(&snapshot)
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
+    Ok(Some((decode_managed_state(&bytes)?, snapshot.sha256)))
+}
+
+fn activate_managed_state(
+    storage_root: &Path,
+    state: &NoIntroPackState,
+    expected_active: Option<&str>,
+) -> Result<String, NoIntroPackImportError> {
+    let store = managed_store(storage_root)?;
+    let bytes = encode_managed_state(state)?;
+    let staged = store
+        .stage_bytes(&bytes, ManagedSourceMetadata::default())
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
+    let candidate = store
+        .validate_candidate(
+            staged,
+            ValidationReport {
+                valid: true,
+                summary: "validated No-Intro managed snapshot state".to_string(),
+                record_count: Some(state.accepted_members.len() as u64),
+                warnings: Vec::new(),
+            },
+        )
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
+    let result = store
+        .activate_snapshot(&candidate, expected_active)
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
+    Ok(result.active.sha256)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PackLimits;
 
@@ -278,7 +353,12 @@ fn publish_no_intro_pack_at(
 
     ensure_directory(storage_root)?;
     let state_path = storage_root.join("state.json");
-    if let Ok(state) = load_state(&state_path)
+    let managed_active = active_managed_state(storage_root)?;
+    let active_state = managed_active
+        .as_ref()
+        .map(|(state, _)| state.clone())
+        .or_else(|| load_state(&state_path).ok());
+    if let Some(state) = active_state.as_ref()
         && state.schema_version == NO_INTRO_PACK_SCHEMA_VERSION
         && (state.pack_sha256 == pack_sha256
             || state.pack_sha256s.iter().any(|sha| sha == &pack_sha256))
@@ -317,7 +397,7 @@ fn publish_no_intro_pack_at(
 
     let mut accepted_members = new_members;
     let mut pack_sha256s = vec![pack_sha256.clone()];
-    if let Ok(previous) = load_state(&state_path)
+    if let Some(previous) = active_state.as_ref()
         && previous.schema_version == NO_INTRO_PACK_SCHEMA_VERSION
     {
         let previous_snapshot = storage_root.join("snapshots").join(
@@ -327,7 +407,7 @@ fn publish_no_intro_pack_at(
                 .unwrap_or(&previous.pack_sha256),
         );
         if snapshot_is_complete(&previous_snapshot, &previous.accepted_members) {
-            let old_members = previous.accepted_members;
+            let old_members = &previous.accepted_members;
             for (index, member) in old_members.iter().enumerate() {
                 if accepted_members
                     .iter()
@@ -344,8 +424,8 @@ fn publish_no_intro_pack_at(
                 .map_err(|error| io_error(&source, error))?;
                 accepted_members.push(member.clone());
             }
-            pack_sha256s.extend(previous.pack_sha256s);
-            pack_sha256s.push(previous.pack_sha256);
+            pack_sha256s.extend(previous.pack_sha256s.clone());
+            pack_sha256s.push(previous.pack_sha256.clone());
             pack_sha256s.sort();
             pack_sha256s.dedup();
         }
@@ -385,6 +465,10 @@ fn publish_no_intro_pack_at(
         rejected: rejected.clone(),
     };
     if activate {
+        let expected_active = managed_active.as_ref().map(|(_, hash)| hash.as_str());
+        activate_managed_state(storage_root, &state, expected_active)?;
+        // Keep the pre-managed pointer as a read-only migration mirror for
+        // older installations. New reads prefer the provider-neutral store.
         write_active_state(storage_root, &state)?;
         prune_old_snapshots(storage_root, &snapshot_id);
         let _ = super::managed_lifecycle::register_no_intro_pack_at(
@@ -466,7 +550,11 @@ pub fn activate_staged_no_intro_pack_at(
             "staged No-Intro snapshot is incomplete".into(),
         ));
     }
-    let previous = load_state(&storage_root.join("state.json")).ok();
+    let managed_active = active_managed_state(storage_root)?;
+    let previous = managed_active
+        .as_ref()
+        .map(|(state, _)| state.clone())
+        .or_else(|| load_state(&storage_root.join("state.json")).ok());
     let mut pack_sha256s = previous
         .as_ref()
         .map(|state| state.pack_sha256s.clone())
@@ -486,6 +574,9 @@ pub fn activate_staged_no_intro_pack_at(
         snapshot_sha256: Some(staged.snapshot_sha256.clone()),
         accepted_members: staged.accepted_members.clone(),
     };
+    let expected_active = managed_active.as_ref().map(|(_, hash)| hash.as_str());
+    activate_managed_state(storage_root, &state, expected_active)?;
+    // Migration mirror; authoritative active/history state is managed/.
     write_active_state(storage_root, &state)?;
     let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
     let _ = super::managed_lifecycle::register_no_intro_pack_at(
@@ -515,31 +606,40 @@ pub fn activate_staged_no_intro_pack_at(
 pub fn rollback_no_intro_pack_at(
     storage_root: &Path,
 ) -> Result<NoIntroPackActivationReport, NoIntroPackImportError> {
-    let state_path = storage_root.join("state.json");
-    let current = load_state(&state_path)?;
-    let snapshots = super::managed_lifecycle::load_no_intro_pack_snapshots_at(storage_root)?;
-    let plan = super::managed_lifecycle::plan_no_intro_rollback(&snapshots, &current.pack_sha256)
+    let store = managed_store(storage_root)?;
+    let current = active_managed_state(storage_root)?
+        .ok_or_else(|| NoIntroPackImportError::State("no active No-Intro snapshot".into()))?;
+    let target_record = store
+        .history_snapshots()
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?
+        .into_iter()
+        .next()
         .ok_or_else(|| {
-        NoIntroPackImportError::State("no safe No-Intro rollback is available".into())
-    })?;
-    let target = snapshots
-        .iter()
-        .find(|snapshot| snapshot.pack_sha256 == plan.to_pack_sha256)
-        .ok_or_else(|| NoIntroPackImportError::State("rollback target is missing".into()))?;
+            NoIntroPackImportError::State("no safe No-Intro rollback is available".into())
+        })?;
+    let target = decode_managed_state(
+        &store
+            .snapshot_bytes(&target_record)
+            .map_err(|error| NoIntroPackImportError::State(error.to_string()))?,
+    )?;
     let members: Vec<_> = target
-        .members
+        .accepted_members
         .iter()
         .map(|member| NoIntroPackStateMember {
-            member: member.source_member_name.clone(),
+            member: member.member.clone(),
             artifact_sha256: member.artifact_sha256.clone(),
             system_name: member.system_name.clone(),
             variant: member.variant,
             upstream_version: member.upstream_version.clone(),
-            entry_count: 0,
-            rom_count: 0,
+            entry_count: member.entry_count,
+            rom_count: member.rom_count,
         })
         .collect();
-    let snapshot_path = storage_root.join("snapshots").join(&target.snapshot_sha256);
+    let target_snapshot = target
+        .snapshot_sha256
+        .clone()
+        .ok_or_else(|| NoIntroPackImportError::State("rollback target has no snapshot".into()))?;
+    let snapshot_path = storage_root.join("snapshots").join(&target_snapshot);
     if !snapshot_is_complete(&snapshot_path, &members) {
         return Err(NoIntroPackImportError::State(
             "rollback target snapshot is incomplete".into(),
@@ -548,18 +648,25 @@ pub fn rollback_no_intro_pack_at(
     let state = NoIntroPackState {
         schema_version: NO_INTRO_PACK_SCHEMA_VERSION,
         pack_sha256: target.pack_sha256.clone(),
-        pack_sha256s: current.pack_sha256s,
-        snapshot_sha256: Some(target.snapshot_sha256.clone()),
+        pack_sha256s: current.0.pack_sha256s,
+        snapshot_sha256: Some(target_snapshot.clone()),
         accepted_members: members,
     };
+    activate_managed_state(storage_root, &state, Some(current.1.as_str()))?;
     write_active_state(storage_root, &state)?;
     let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
+    let rejected = super::managed_lifecycle::load_no_intro_pack_snapshots_at(storage_root)
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?
+        .into_iter()
+        .find(|snapshot| snapshot.pack_sha256 == target.pack_sha256)
+        .map(|snapshot| snapshot.rejected)
+        .unwrap_or_default();
     let _ = super::managed_lifecycle::register_no_intro_pack_at(
         storage_root,
         &target.pack_sha256,
-        &target.snapshot_sha256,
+        &target_snapshot,
         &accepted,
-        &target.rejected,
+        &rejected,
     )?;
     Ok(NoIntroPackActivationReport {
         import: NoIntroPackImportReport {
@@ -567,7 +674,7 @@ pub fn rollback_no_intro_pack_at(
             pack_sha256: target.pack_sha256.clone(),
             snapshot_path,
             accepted,
-            rejected: target.rejected.clone(),
+            rejected,
         },
         verification: crate::identity_source::managed_snapshot::VerificationFreshness::NeedsRecheck,
     })
@@ -584,7 +691,10 @@ pub fn compare_staged_no_intro_pack_at(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(io_error(&staged_path, error)),
     };
-    let Some(active) = load_state(&storage_root.join("state.json")).ok() else {
+    let Some(active) = active_managed_state(storage_root)?
+        .map(|(state, _)| state)
+        .or_else(|| load_state(&storage_root.join("state.json")).ok())
+    else {
         return Ok(Some(NoIntroPackComparison::NoActiveSnapshot));
     };
     Ok(Some(
@@ -686,15 +796,17 @@ pub fn inspect_no_intro_pack(path: &Path) -> Result<NoIntroPackInspection, NoInt
 pub fn load_current_no_intro_pack_summary_at(
     storage_root: &Path,
 ) -> Result<Option<NoIntroPackInstalledSummary>, NoIntroPackImportError> {
-    let state_path = storage_root.join("state.json");
-    let state = match load_state(&state_path) {
-        Ok(state) => state,
-        Err(NoIntroPackImportError::Io { error, .. })
-            if error.kind() == io::ErrorKind::NotFound =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+    let state = match active_managed_state(storage_root)? {
+        Some((state, _)) => state,
+        None => match load_state(&storage_root.join("state.json")) {
+            Ok(state) => state,
+            Err(NoIntroPackImportError::Io { error, .. })
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        },
     };
     if state.schema_version != NO_INTRO_PACK_SCHEMA_VERSION {
         return Err(NoIntroPackImportError::State(format!(
@@ -749,15 +861,17 @@ pub fn load_current_no_intro_pack_summary()
 pub fn load_current_no_intro_pack_at(
     storage_root: &Path,
 ) -> Result<Option<Vec<ImportedNoIntroSource>>, NoIntroPackImportError> {
-    let state_path = storage_root.join("state.json");
-    let state = match load_state(&state_path) {
-        Ok(state) => state,
-        Err(NoIntroPackImportError::Io { error, .. })
-            if error.kind() == io::ErrorKind::NotFound =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
+    let state = match active_managed_state(storage_root)? {
+        Some((state, _)) => state,
+        None => match load_state(&storage_root.join("state.json")) {
+            Ok(state) => state,
+            Err(NoIntroPackImportError::Io { error, .. })
+                if error.kind() == io::ErrorKind::NotFound =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        },
     };
     if state.schema_version != NO_INTRO_PACK_SCHEMA_VERSION {
         return Err(NoIntroPackImportError::State(format!(

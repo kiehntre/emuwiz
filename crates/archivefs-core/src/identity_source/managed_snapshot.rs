@@ -475,6 +475,18 @@ impl ManagedSourceStore {
         Ok(snapshots)
     }
 
+    /// Returns snapshots that are eligible for rollback, in the same order as
+    /// the store's persisted history.  Provider adapters use this instead of
+    /// maintaining a second active-snapshot history of their own.
+    pub fn history_snapshots(&self) -> Result<Vec<ManagedSourceSnapshot>> {
+        let state = self.load_state()?;
+        state
+            .history
+            .iter()
+            .map(|hash| self.load_snapshot(hash))
+            .collect()
+    }
+
     pub fn check_for_update(
         &self,
         offline: bool,
@@ -815,9 +827,14 @@ impl ManagedSourceStore {
         if let Ok(existing) = fs::read_to_string(&record_path) {
             let existing: ManagedSourceSnapshot =
                 serde_json::from_str(&existing).map_err(|error| config(error.to_string()))?;
-            if existing != snapshot {
-                return Err(config("duplicate snapshot metadata conflicts"));
-            }
+            // The object hash is the identity of a managed snapshot. Keep the
+            // first immutable metadata record when the same bytes are staged
+            // again later; retrieval time and transport headers may differ
+            // without making the content a different snapshot.
+            return Ok(ValidatedCandidate {
+                snapshot: existing,
+                object_path,
+            });
         } else {
             let body = serde_json::to_string_pretty(&snapshot)
                 .map_err(|error| config(error.to_string()))?;

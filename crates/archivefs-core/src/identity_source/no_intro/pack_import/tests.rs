@@ -91,6 +91,7 @@ fn staging_does_not_activate_and_explicit_activation_marks_recheck() {
     let storage = dir.path().join("store");
     let staged = stage_no_intro_pack_at(&pack, &storage).unwrap();
     assert!(!storage.join("state.json").exists());
+    assert!(!storage.join("managed/no-intro-pack/state.json").exists());
     assert!(storage.join("staged.json").is_file());
     assert_eq!(
         compare_staged_no_intro_pack_at(&storage).unwrap(),
@@ -103,6 +104,7 @@ fn staging_does_not_activate_and_explicit_activation_marks_recheck() {
     );
     assert_eq!(activated.import.pack_sha256, staged.pack_sha256);
     assert!(load_current_no_intro_pack_at(&storage).unwrap().is_some());
+    assert!(storage.join("managed/no-intro-pack/state.json").is_file());
     assert!(!storage.join("staged.json").exists());
     assert_eq!(fs::read(&pack).unwrap(), pack_before);
 }
@@ -144,6 +146,7 @@ fn rollback_restores_previous_pointer_without_deleting_newer_snapshot() {
         crate::identity_source::managed_snapshot::VerificationFreshness::NeedsRecheck
     );
     assert!(second.snapshot_path.is_dir());
+    assert!(storage.join("managed/no-intro-pack/state.json").is_file());
     assert_eq!(
         load_current_no_intro_pack_at(&storage).unwrap().unwrap()[0].system_name,
         "Nintendo - Game Boy"
