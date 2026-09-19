@@ -156,6 +156,7 @@ use archivefs_core::patch_manager::{
 use collection_discovery_page::*;
 use platform_artwork_manager::{PlatformArtworkManager, PlatformArtworkManagerAction};
 mod activity_history;
+pub mod gui_v2;
 mod administration_pages;
 mod app;
 mod app_frame;

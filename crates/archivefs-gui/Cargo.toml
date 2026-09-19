@@ -37,6 +37,12 @@ path = "src/bin/archivefs-gui.rs"
 # Nothing to test in a launcher; the suite lives in the library target.
 test = false
 
+# Parallel presentation layer; existing launchers intentionally remain legacy.
+[[bin]]
+name = "emuwiz-v2"
+path = "src/bin/emuwiz-v2.rs"
+test = false
+
 [dependencies]
 archivefs-core = { path = "../archivefs-core" }
 log = "0.4"
@@ -71,7 +77,7 @@ arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 # exact crate/version is already present through the GUI dependency graph;
 # a direct dependency makes the deliberately limited PNG API explicit and
 # avoids adding the much larger SVG/resvg parser stack for this milestone.
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Native folder picker for "Add Folder" on the Sources page. Default
 # features enable the "xdg-portal" backend, which talks to the
 # xdg-desktop-portal D-Bus FileChooser directly (GNOME/KDE both implement
@@ -83,7 +89,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"
 time = { version = "0.3.53", features = ["local-offset"] }
+tempfile = "3"
 
 [dev-dependencies]
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
-tempfile = "3"
