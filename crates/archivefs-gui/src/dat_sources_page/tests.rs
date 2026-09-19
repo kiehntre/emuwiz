@@ -40,6 +40,7 @@ fn row_for_visibility(
     health_state: DatHealthState,
 ) -> DatSourceRowView {
     DatSourceRowView {
+        arcade_verification: None,
         id: "test".to_string(),
         display_name: "test.dat".to_string(),
         path: "/tmp/test.dat".to_string(),

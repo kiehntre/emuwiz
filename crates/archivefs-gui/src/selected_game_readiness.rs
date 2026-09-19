@@ -220,6 +220,10 @@ impl ArchiveFsApp {
     /// Phase 4 Undo fix both already use.
     pub(crate) fn review_identity(&mut self, archive_path: PathBuf) {
         self.archive_context.select_only(archive_path);
+        if self.ui_mode == GuiMode::Simple {
+            self.navigate_to_main_view(MainView::Selected);
+            return;
+        }
         self.ui_mode = GuiMode::AdvancedView;
         save_gui_mode(self.ui_mode);
         self.navigate_to_library_tab(LibraryTab::Archives);
@@ -238,8 +242,10 @@ impl ArchiveFsApp {
         focus: EmulatorSetupFocus,
     ) {
         self.archive_context.select_only(archive_path);
-        self.ui_mode = GuiMode::AdvancedView;
-        save_gui_mode(self.ui_mode);
+        if self.ui_mode != GuiMode::Simple {
+            self.ui_mode = GuiMode::AdvancedView;
+            save_gui_mode(self.ui_mode);
+        }
         self.emulator_readiness.emulator_setup_focus = Some(focus);
         self.navigate_to_main_view(MainView::EmulatorSetup);
     }

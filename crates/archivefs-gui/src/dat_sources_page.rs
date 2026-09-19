@@ -125,6 +125,7 @@ use crate::{
 };
 
 mod save_result;
+pub(crate) mod simple;
 use save_result::{DatSaveOperation, DatSaveOutcome, DatSaveResult};
 
 #[path = "dat_sources_page/authority_projection.rs"]
@@ -194,6 +195,7 @@ pub(crate) enum DatSaveState {
 /// One source's row, ready to draw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DatSourceRowView {
+    pub(crate) arcade_verification: Option<String>,
     pub(crate) id: String,
     pub(crate) display_name: String,
     pub(crate) path: String,
@@ -1715,6 +1717,12 @@ pub(crate) fn rename_plan_page_bounds(total: usize, page: usize) -> (usize, usiz
 /// the global preferences by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DatSourcesPageAction {
+    ViewPlatformGames {
+        platform: String,
+    },
+    ImportVerificationData {
+        path: PathBuf,
+    },
     /// Selects the destination naming profile for the read-only rename plan.
     /// Changing it invalidates the current preview so apply can never use a
     /// plan reviewed under a different target.
@@ -3641,6 +3649,15 @@ impl DatSourcesPageState {
             self.save_state = DatSaveState::Idle;
         }
         match action {
+            DatSourcesPageAction::ImportVerificationData { path } => {
+                if !self.is_busy() {
+                    let id = self.draft.suggest_id(&path);
+                    self.add(path, DatSourceKind::File);
+                    if self.action_error.is_none() {
+                        self.start_validate(id);
+                    }
+                }
+            }
             DatSourcesPageAction::AddFile { path } => self.add(path, DatSourceKind::File),
             DatSourcesPageAction::SetPortabilityTarget { .. } => {
                 self.rename_plan = None;
@@ -3722,6 +3739,7 @@ impl DatSourcesPageState {
                 self.start_combined_audit(scan_root)
             }
             DatSourcesPageAction::OpenDatSources
+            | DatSourcesPageAction::ViewPlatformGames { .. }
             | DatSourcesPageAction::OpenAdvancedIdentifyRename => {}
             DatSourcesPageAction::AddManagedMameSoftwareList { authoritative_name } => {
                 self.add_managed_mame_software_list(authoritative_name);
@@ -6892,6 +6910,7 @@ impl DatSourcesPageState {
             })
             .flatten();
         DatSourceRowView {
+            arcade_verification: simple::arcade_label(entry),
             id: entry.id.clone(),
             display_name: entry.display_name.clone(),
             path: entry.path.to_string_lossy().into_owned(),
@@ -7506,6 +7525,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 /// something whose difference from disk defines the unsaved-change state.
 #[derive(Default)]
 pub(crate) struct DatSourcesPageUi {
+    pub(crate) simple: simple::SimpleCheckUi,
     /// Session-local destination naming profile for rename previews. Linux is
     /// the implicit default so existing users retain their current behaviour.
     pub(crate) portability_target: Option<PortabilityTarget>,
@@ -7579,6 +7599,7 @@ pub(crate) struct DatSourcesPageUi {
 impl DatSourcesPageUi {
     /// Forgets every unsubmitted choice.
     pub(crate) fn clear(&mut self) {
+        self.simple = simple::SimpleCheckUi::default();
         self.local_sources_expanded = None;
         self.selected_catalogue = None;
         self.open_catalogue_picker = false;
@@ -8727,7 +8748,7 @@ fn show_evidence_readiness_row(ui: &mut egui::Ui, label: &str, count: usize, det
         if count > 0 {
             widgets::status_badge(ui, "Ready", widgets::StatusTone::Success);
         } else {
-            widgets::status_badge(ui, "Missing", widgets::StatusTone::Pending);
+            widgets::status_badge(ui, "Not configured", widgets::StatusTone::Pending);
         }
     });
     ui.label(egui::RichText::new(detail).color(theme::muted(ui)).small());
@@ -8832,10 +8853,18 @@ pub(crate) fn show_identify_rename_page(
         );
         show_evidence_readiness_row(
             ui,
-            "MAME",
-            mame_installed,
-            &format!("{mame_installed} installed software list(s)"),
+            "Arcade verification data",
+            simple::arcade_ready_count(view),
+            "Imported Arcade verification data works without an installed MAME program.",
         );
+        widgets::technical_details(ui, "mame-software-lists", |ui| {
+            show_evidence_readiness_row(
+                ui,
+                "MAME software lists",
+                mame_installed,
+                "These check computer and console software separately; they are not needed for Arcade verification.",
+            );
+        });
         show_evidence_readiness_row(
             ui,
             "WHDLoad",
@@ -13749,14 +13778,23 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn show_dat_sources_page_mode(&mut self, ui: &mut egui::Ui, identify_rename: bool) {
-        if !identify_rename {
-            self.sources_ui.identity_providers.show(ui);
-            ui.add_space(12.0);
-        }
+        let simple_check = self.view == MainView::CheckGames;
         if self.sources_ui.dat_sources_page.is_none() {
             let path = match archivefs_core::dat::sources::default_dat_sources_config_path() {
                 Ok(path) => path,
                 Err(error) => {
+                    if simple_check {
+                        widgets::banner(
+                            ui,
+                            "Your setup could not be opened",
+                            "EmuWiz cannot find its settings folder, so checking is unavailable for now. Your game files have not changed. Return Home; check that your user account's settings folder is accessible, then reopen EmuWiz.",
+                            widgets::StatusTone::Blocked,
+                        );
+                        widgets::technical_details(ui, "simple-settings-location", |ui| {
+                            ui.label(error.to_string());
+                        });
+                        return;
+                    }
                     widgets::banner(
                         ui,
                         "Registry location unknown",
@@ -13790,30 +13828,68 @@ impl ArchiveFsApp {
         // Drained before the view is built, so the view stays a pure function
         // of state. A running job repaints continuously; an idle page does not.
         let dat_changed = page.poll();
-        if dat_changed {
+        if dat_changed && !page.is_busy() {
+            self.sources_ui.dat_sources_ui.catalogue_picker.invalidate();
             self.sources_ui.dat_authority.invalidate();
             self.needs_attention.invalidate();
         }
         if dat_changed || page.is_busy() {
             ui.ctx().request_repaint();
         }
+        if simple_check {
+            self.sources_ui
+                .dat_sources_ui
+                .catalogue_picker
+                .ensure_loaded_with(crate::dat_catalogue_picker::CatalogueInventorySnapshot {
+                    local_registry: page.draft.clone(),
+                    managed_sources: page.managed_sources.clone(),
+                    managed_root: page.managed_root.clone(),
+                });
+        }
         let view = page.view_with_romm_summary(self.romm_ui.verify_summary);
-        let action = if identify_rename {
+        let assignment_action = if simple_check {
+            None
+        } else {
+            simple::assignment_prompt(ui, &view, &mut self.sources_ui.dat_sources_ui.simple)
+        };
+        let action = if simple_check {
+            simple::show(ui, &view, &mut self.sources_ui.dat_sources_ui)
+        } else if identify_rename {
             if self.sources_ui.quick_rename_mode {
-                dat_sources_page::show_quick_rename_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
+                dat_sources_page::show_quick_rename_page(
+                    ui,
+                    &view,
+                    &mut self.sources_ui.dat_sources_ui,
+                )
             } else {
-                dat_sources_page::show_identify_rename_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
+                dat_sources_page::show_identify_rename_page(
+                    ui,
+                    &view,
+                    &mut self.sources_ui.dat_sources_ui,
+                )
             }
         } else {
             dat_sources_page::show_dat_sources_page(ui, &view, &mut self.sources_ui.dat_sources_ui)
         };
-        if !identify_rename {
+        if !identify_rename && !simple_check {
+            widgets::technical_details(ui, "identity-provider-management", |ui| {
+                self.sources_ui.identity_providers.show(ui);
+            });
             widgets::technical_details(ui, "dat-authority-dashboard", |ui| {
-                self.sources_ui.dat_authority
+                self.sources_ui
+                    .dat_authority
                     .show(ui, database_state_path(&self.database_state));
             });
         }
+        let action = action.or(assignment_action);
         if let Some(action) = action {
+            self.sources_ui.dat_sources_ui.catalogue_picker.invalidate();
+            if let DatSourcesPageAction::ViewPlatformGames { platform } = &action {
+                self.view = MainView::Library;
+                self.library_tab = crate::LibraryTab::Archives;
+                self.library_ui.library_filters.platform = Some(platform.clone());
+                self.tools_overlay = crate::ToolsOverlay::None;
+            }
             let open_dat_sources = matches!(
                 action,
                 dat_sources_page::DatSourcesPageAction::OpenDatSources

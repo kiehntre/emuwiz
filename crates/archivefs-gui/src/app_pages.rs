@@ -56,6 +56,9 @@ pub(crate) fn show_pages(
     let mut stop_mount_all = false;
     let mut stop_unmount_all = false;
     egui::CentralPanel::default().show(context, |ui| {
+        if app.ui_mode == GuiMode::Simple {
+            crate::simple_mode::readability(ui);
+        }
         let width = if app.tools_overlay == ToolsOverlay::None {
             main_view_content_width(app.view)
         } else if app.tools_overlay == ToolsOverlay::ArchiveInspector {
@@ -65,9 +68,23 @@ pub(crate) fn show_pages(
         };
         let page_scroll = main_view_uses_page_scroll(app.view)
             || app.tools_overlay == ToolsOverlay::SaveVault
-            || (app.ui_mode == GuiMode::GamerView && app.view == MainView::Library);
+            || (app.ui_mode != GuiMode::AdvancedView && app.view == MainView::Library);
         ui_layout::page(ui, width, page_scroll, app.view, |ui| {
             app.reconcile_cheats_mods_context(context);
+
+            if app.ui_mode == GuiMode::Simple && app.view == MainView::ReadyToPlay
+                && app.tools_overlay == ToolsOverlay::None {
+                widgets::workflow_header(ui, "Play", "Choose a game from My Games. EmuWiz will show whether it is ready and what to set up next.");
+                if crate::simple_mode::primary_button(ui, "Choose a game to play", true).clicked() {
+                    app.navigate_to_main_view(MainView::Library);
+                    return;
+                }
+                ui.label("Next: select a game, then press Play. Opening the game list does not launch anything.");
+                ui.collapsing("Advanced details — readiness summary", |ui| {
+                    app.emulator_readiness.ready_to_play_page.show(ui);
+                });
+                return;
+            }
 
             if app.tools_overlay != ToolsOverlay::None {
                 match app.tools_overlay {
@@ -190,7 +207,8 @@ pub(crate) fn show_pages(
             // `MainView` destination is Advanced-View-only and
             // unreachable while `ui_mode` is `GamerView`, since
             // nothing in this mode's UI ever sets `app.view` to one.
-            if app.ui_mode == GuiMode::GamerView && app.view != MainView::CheatsMods {
+            if (app.ui_mode == GuiMode::GamerView && app.view != MainView::CheatsMods)
+                || (app.ui_mode == GuiMode::Simple && app.view == MainView::Library) {
                 app.artwork_media.es_de_media.start(ui.ctx().clone());
                 if app.artwork_media.es_de_media.poll() {
                     app.artwork_media.gamer_covers.identity_refreshed();
@@ -427,8 +445,10 @@ pub(crate) fn show_pages(
                     }
                     Some(GamerViewAction::ReviewScan) => {
                         app.gamer_view_scan_review_available = false;
-                        app.ui_mode = GuiMode::AdvancedView;
-                        save_gui_mode(app.ui_mode);
+                        if app.ui_mode != GuiMode::Simple {
+                            app.ui_mode = GuiMode::AdvancedView;
+                            save_gui_mode(app.ui_mode);
+                        }
                         app.navigate_to_sources_tab(SourcesTab::Discovery);
                     }
                     Some(GamerViewAction::ScanForNewGames) => {
@@ -442,8 +462,10 @@ pub(crate) fn show_pages(
                     }
                     Some(GamerViewAction::CheckEmulators(archive_path)) => {
                         app.archive_context.select_only(archive_path);
-                        app.ui_mode = GuiMode::AdvancedView;
-                        save_gui_mode(app.ui_mode);
+                        if app.ui_mode != GuiMode::Simple {
+                            app.ui_mode = GuiMode::AdvancedView;
+                            save_gui_mode(app.ui_mode);
+                        }
                         app.start_doctor_scan(context.clone());
                         app.navigate_to_main_view(MainView::EmulatorSetup);
                     }
@@ -479,10 +501,15 @@ pub(crate) fn show_pages(
             }
 
             if let Some(error) = &app.refresh_error {
+                if app.ui_mode == GuiMode::Simple {
+                    widgets::banner(ui, "Could not refresh your games", "Your files are unchanged, and the previous results are still shown. Use Add My Games to check that the games folder is connected, then scan it again.", widgets::StatusTone::Warning);
+                    widgets::technical_details(ui, "simple-refresh-error", |ui| { ui.label(error); });
+                } else {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
                     format!("Refresh failed; showing the last known snapshot: {error}"),
                 );
+                }
                 ui.separator();
             }
             if let Some(batch) = app.mount_ui.mount_all.as_ref() {
@@ -559,6 +586,16 @@ pub(crate) fn show_pages(
                 return;
             }
 
+            if app.view == MainView::CheckGames {
+                app.show_dat_sources_page_mode(ui, false);
+                return;
+            }
+            if app.view == MainView::Home && app.ui_mode == GuiMode::Simple {
+                if let Some(target) = crate::simple_mode::show_home(ui) {
+                    app.navigate_to_main_view(target);
+                }
+                return;
+            }
             if app.view == MainView::Home {
                 let source_folder_count = app
                     .gui_config

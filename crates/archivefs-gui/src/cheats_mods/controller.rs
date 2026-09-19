@@ -419,21 +419,13 @@ impl ArchiveFsApp {
     /// existing workflow; changing archive replaces it wholesale. The
     /// return value says whether a new source-list load is needed.
     pub(crate) fn prepare_cheats_mods_workspace(&mut self, archive_path: PathBuf) -> bool {
-        // Phase 5 fix: this used to only set `self.view`, which Gamer
-        // View's own render branch never reads (chosen purely from
-        // `ui_mode` - see the Phase 4 fix to `start_cheat_install_
-        // rollback` for the identical bug shape). Clicking "Cheats &
-        // Mods" from Gamer View therefore changed internal state with
-        // nothing visible happening on screen at all - the design doc's
-        // own stated centerpiece workflow (§2.5) was silently
-        // unreachable from the screen it names as its entry point. This
-        // page is deliberately the *existing* full workflow, unsimplified
-        // (§2.1: "opens the existing 5-area workflow page... no
-        // independent archive picker"), so switching modes here is
-        // correct, not a compromise - the doc's own design already
-        // expects this transition.
-        self.ui_mode = GuiMode::AdvancedView;
-        save_gui_mode(self.ui_mode);
+        // Gamer View needs the existing full-page workspace renderer.
+        // Simple Mode already renders task destinations and keeps its
+        // location trail and Back action when opening this workspace.
+        if self.ui_mode != GuiMode::Simple {
+            self.ui_mode = GuiMode::AdvancedView;
+            save_gui_mode(self.ui_mode);
+        }
         self.view = MainView::CheatsMods;
         self.tools_overlay = ToolsOverlay::None;
         if self
@@ -1893,8 +1885,10 @@ impl ArchiveFsApp {
         // `ui_mode` here, this used to silently update `self.view` while
         // still rendering Gamer View, which never reads it: a click with
         // no visible effect at all.
-        self.ui_mode = GuiMode::AdvancedView;
-        save_gui_mode(self.ui_mode);
+        if self.ui_mode != GuiMode::Simple {
+            self.ui_mode = GuiMode::AdvancedView;
+            save_gui_mode(self.ui_mode);
+        }
         self.view = MainView::HistoryLogs;
         self.feedback = Some(ActionFeedback {
             succeeded: true,

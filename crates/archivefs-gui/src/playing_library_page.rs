@@ -1298,9 +1298,16 @@ pub(crate) fn show_playing_library_page(
     state: &mut PlayingLibraryPageState,
 ) -> Option<PlayingLibraryPageAction> {
     let mut action = None;
+    let simple = crate::simple_mode::active(ui.ctx());
 
     let title = match state.destination {
-        PlayingLibraryDestination::Generic => "Generic Library",
+        PlayingLibraryDestination::Generic => {
+            if simple {
+                "Your playing library"
+            } else {
+                "Generic Library"
+            }
+        }
         PlayingLibraryDestination::Romm => "RomM Library",
         PlayingLibraryDestination::EsDe => "ES-DE Library",
         PlayingLibraryDestination::RetroDeck => "RetroDECK Library",
@@ -1333,7 +1340,11 @@ pub(crate) fn show_playing_library_page(
     widgets::section_header(
         ui,
         "Inputs",
-        Some("Choose the catalogue and the folders used for this preview."),
+        Some(if crate::simple_mode::active(ui.ctx()) {
+            "Choose a platform and the folders to use. Next you will preview the result before approving any changes."
+        } else {
+            "Choose the catalogue and the folders used for this preview."
+        }),
     );
     widgets::card(ui, |ui| {
         if state.catalogue_picker.poll() || state.catalogue_picker.loading {
@@ -1354,7 +1365,14 @@ pub(crate) fn show_playing_library_page(
         );
         ui.add_space(6.0);
 
-        ui.label(egui::RichText::new("Source library").strong());
+        ui.label(
+            egui::RichText::new(if simple {
+                "Your games folder"
+            } else {
+                "Source library"
+            })
+            .strong(),
+        );
         ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.source_root_draft)
@@ -1370,7 +1388,7 @@ pub(crate) fn show_playing_library_page(
             }
         });
         if path_looks_missing(&state.source_root_draft, true) {
-            ui.label(egui::RichText::new("This folder was not found.").color(theme::WARNING));
+            ui.label(egui::RichText::new(if simple { "This games folder is unavailable. Connect its drive or use Browse to choose another before previewing. Your games have not changed." } else { "This folder was not found." }).color(theme::WARNING));
         }
         ui.add_space(6.0);
 
@@ -1410,50 +1428,60 @@ pub(crate) fn show_playing_library_page(
     });
 
     ui.add_space(8.0);
-    widgets::section_header(
-        ui,
-        "Preferences",
-        Some("Set the existing 1G1R election preferences."),
-    );
-    ui.label(
+    let mut show_preferences = |ui: &mut egui::Ui| {
+        widgets::section_header(
+            ui,
+            "Preferences",
+            Some("Set the existing 1G1R election preferences."),
+        );
+        ui.label(
         egui::RichText::new(
             "1G1R means 1 Game, 1 ROM: EmuWiz picks one preferred verified release for each game. These are the 1G1R selection rules.",
         )
         .color(theme::muted(ui))
         .small(),
     );
-    widgets::card(ui, |ui| {
-        ui.label("Region order (most preferred first):");
-        ui.add(
-            egui::TextEdit::singleline(&mut state.preferred_regions_draft)
-                .id(egui::Id::new(PREFERRED_REGIONS_FIELD_ID))
-                .hint_text("Europe, USA, Japan"),
-        );
-        ui.add_space(6.0);
+        widgets::card(ui, |ui| {
+            ui.label("Region order (most preferred first):");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.preferred_regions_draft)
+                    .id(egui::Id::new(PREFERRED_REGIONS_FIELD_ID))
+                    .hint_text("Europe, USA, Japan"),
+            );
+            ui.add_space(6.0);
 
-        ui.label("Preferred languages:");
-        ui.add(
-            egui::TextEdit::singleline(&mut state.preferred_languages_draft)
-                .id(egui::Id::new(PREFERRED_LANGUAGES_FIELD_ID))
-                .hint_text("English"),
-        );
-        ui.add_space(6.0);
+            ui.label("Preferred languages:");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.preferred_languages_draft)
+                    .id(egui::Id::new(PREFERRED_LANGUAGES_FIELD_ID))
+                    .hint_text("English"),
+            );
+            ui.add_space(6.0);
 
-        ui.checkbox(
-            &mut state.prefer_newest_revision,
-            "Prefer newest verified revision",
-        );
-        ui.checkbox(&mut state.prefer_parent, "Prefer declared parent");
-        ui.add_space(6.0);
+            ui.checkbox(
+                &mut state.prefer_newest_revision,
+                "Prefer newest verified revision",
+            );
+            ui.checkbox(&mut state.prefer_parent, "Prefer declared parent");
+            ui.add_space(6.0);
 
-        ui.label("Exclude:");
-        ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut state.exclude_beta, "Beta");
-            ui.checkbox(&mut state.exclude_proto, "Proto");
-            ui.checkbox(&mut state.exclude_demo, "Demo");
-            ui.checkbox(&mut state.exclude_sample, "Sample");
+            ui.label("Exclude:");
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut state.exclude_beta, "Beta");
+                ui.checkbox(&mut state.exclude_proto, "Proto");
+                ui.checkbox(&mut state.exclude_demo, "Demo");
+                ui.checkbox(&mut state.exclude_sample, "Sample");
+            });
         });
-    });
+    };
+    if simple {
+        ui.collapsing(
+            "Advanced details — which game versions to prefer",
+            show_preferences,
+        );
+    } else {
+        show_preferences(ui);
+    }
 
     ui.add_space(8.0);
     let ready = state.has_catalogue_selection()
@@ -1462,7 +1490,11 @@ pub(crate) fn show_playing_library_page(
     widgets::section_header(ui, "Plan and preview", None);
     if widgets::action_button(
         ui,
-        "Preview 1G1R Library",
+        if simple {
+            "Preview playing library"
+        } else {
+            "Preview 1G1R Library"
+        },
         widgets::ActionStyle::Primary,
         ready,
     )
@@ -1472,7 +1504,7 @@ pub(crate) fn show_playing_library_page(
     }
     if !ready {
         ui.label(
-            egui::RichText::new("Choose a DAT catalogue, a source, and a destination first.")
+            egui::RichText::new(if crate::simple_mode::active(ui.ctx()) { "Choose verification data, your games folder, and a new output folder above to prepare the preview." } else { "Choose a DAT catalogue, a source, and a destination first." })
                 .color(theme::muted(ui))
                 .small(),
         );
@@ -1483,9 +1515,18 @@ pub(crate) fn show_playing_library_page(
         widgets::banner(
             ui,
             "Could not build a preview",
-            error,
+            if simple {
+                "The preview could not be completed. No links were created by this preview. Check the selected verification data and folders above, then try Preview playing library again."
+            } else {
+                error
+            },
             widgets::StatusTone::Blocked,
         );
+        if simple {
+            widgets::technical_details(ui, "simple-library-preview-error", |ui| {
+                ui.label(error);
+            });
+        }
     }
 
     if let Some(plan) = state.plan().cloned() {
@@ -1533,9 +1574,18 @@ pub(crate) fn show_playing_library_page(
         widgets::banner(
             ui,
             "Could not create the playing library",
-            error,
+            if simple {
+                "The playing library could not be completed. Your original games are safe, but some output links may have been created. Review the result and Technical details before retrying; use Undo if it is offered for this operation."
+            } else {
+                error
+            },
             widgets::StatusTone::Blocked,
         );
+        if simple {
+            widgets::technical_details(ui, "simple-library-apply-error", |ui| {
+                ui.label(error);
+            });
+        }
     }
 
     // Only offered once the links this preview describes actually exist -

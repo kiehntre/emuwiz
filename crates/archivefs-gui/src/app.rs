@@ -540,6 +540,14 @@ impl ArchiveFsApp {
     /// navigation call in a frame always wins over anything set earlier
     /// that frame.
     pub(crate) fn navigate_to_main_view(&mut self, target: MainView) {
+        if self.ui_mode == GuiMode::Simple {
+            match target {
+                MainView::Sources => self.sources_tab = SourcesTab::Libraries,
+                MainView::Library => self.library_tab = LibraryTab::Archives,
+                MainView::Problems => self.problems_repair_tab = ProblemsRepairTab::Overview,
+                _ => {}
+            }
+        }
         if target == MainView::CheatsMods {
             self.view = MainView::CheatsMods;
             self.tools_overlay = ToolsOverlay::None;
@@ -832,6 +840,7 @@ impl ArchiveFsApp {
             context,
             app_shell::ShellInputs {
                 advanced_view: self.ui_mode == GuiMode::AdvancedView,
+                simple_view: self.ui_mode == GuiMode::Simple,
                 view: self.view,
                 tools_overlay: self.tools_overlay,
                 loading,

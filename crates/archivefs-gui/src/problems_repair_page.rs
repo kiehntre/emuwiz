@@ -43,8 +43,29 @@ pub(crate) fn show_problems_repair_tabs(
     ui: &mut egui::Ui,
     current: ProblemsRepairTab,
 ) -> Option<ProblemsRepairTab> {
+    if crate::simple_mode::active(ui.ctx()) {
+        widgets::workflow_header(
+            ui,
+            "Fix Problems",
+            "Check your setup, review what needs attention, then approve a fix only if you want it.",
+        );
+        if current != ProblemsRepairTab::Overview {
+            ui.label(match current {
+                ProblemsRepairTab::Diagnostics => "Fix Problems › Check your setup",
+                _ => "Fix Problems › Review a repair",
+            });
+            if ui.button("← Back to Fix Problems").clicked() {
+                return Some(ProblemsRepairTab::Overview);
+            }
+        }
+        return None;
+    }
     if current != ProblemsRepairTab::Diagnostics {
-        widgets::workflow_header(ui, "Health & Recovery", "Find and fix things that need attention.");
+        widgets::workflow_header(
+            ui,
+            "Health & Recovery",
+            "Find and fix things that need attention.",
+        );
     }
     let tab_options: [(ProblemsRepairTab, &str); 3] = [
         (ProblemsRepairTab::Overview, "Overview"),
@@ -68,6 +89,31 @@ pub(crate) fn show_problems_repair_overview(
     ui: &mut egui::Ui,
     doctor_scan: &DoctorScanState,
 ) -> Option<ProblemsRepairTab> {
+    if crate::simple_mode::active(ui.ctx()) {
+        let mut next = None;
+        widgets::full_width_card(ui, |ui| {
+            ui.heading("Your setup");
+            ui.strong(match doctor_scan.displayed() {
+                Some(outcome) if outcome.scan.is_healthy() => {
+                    "Ready — no problems found in the last check"
+                }
+                Some(_) => "Needs attention — review the last check",
+                None => "Not checked yet — let's see what needs attention",
+            });
+            ui.label("Check your games folders, storage and installed emulators. Opening the check does not change any files.");
+            if crate::simple_mode::primary_button(ui, "Review my setup", true).clicked() {
+                next = Some(ProblemsRepairTab::Diagnostics);
+            }
+            ui.label("Next: press Check My Setup, choose a finding to learn more, and review any proposed fix before approving it.");
+        });
+        ui.collapsing("Advanced details", |ui| {
+            ui.label("Whole-library repair plans and past repairs are available here. Opening them does not apply a repair.");
+            if ui.button("Review repair plans and history").clicked() {
+                next = Some(ProblemsRepairTab::Repair);
+            }
+        });
+        return next;
+    }
     widgets::card(ui, |ui| match doctor_scan.displayed() {
         Some(outcome) if outcome.scan.is_healthy() => {
             widgets::status_badge(ui, "Healthy", widgets::StatusTone::Success);
@@ -175,4 +221,39 @@ pub(crate) fn stale_library_entry_count(doctor_scan: &DoctorScanState) -> usize 
                 .count()
         })
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod simple_tests {
+    use super::*;
+
+    #[test]
+    fn simple_fix_problems_has_a_handle_and_hides_repair_history() {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("simple-mode-active"), true));
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(show_problems_repair_tabs(ui, ProblemsRepairTab::Overview).is_none());
+                assert!(show_problems_repair_overview(ui, &DoctorScanState::NotRun).is_none());
+            });
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Fix Problems",
+            "Review my setup",
+            "Next:",
+            "Advanced details",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains("Review repair plans and history"));
+    }
 }

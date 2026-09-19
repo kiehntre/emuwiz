@@ -89,6 +89,7 @@ pub(crate) struct DatCataloguePickerState {
     pub(crate) loading: bool,
     pub(crate) error: Option<String>,
     query: String,
+    simple_platform: Option<String>,
 }
 
 impl DatCataloguePickerState {
@@ -103,6 +104,26 @@ impl DatCataloguePickerState {
     }
 
     fn start_load(&mut self) {
+        self.start_load_with(None);
+    }
+
+    /// Use the page's current registry, including reviewed but unsaved edits.
+    pub(crate) fn ensure_loaded_with(&mut self, snapshot: CatalogueInventorySnapshot) {
+        if !self.loaded && !self.loading && self.error.is_none() {
+            self.start_load_with(Some(snapshot));
+        }
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.receiver = None;
+        self.loaded = false;
+        self.loading = false;
+        self.error = None;
+        self.summaries.clear();
+    }
+
+    fn start_load_with(&mut self, snapshot: Option<CatalogueInventorySnapshot>) {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.loading = true;
@@ -111,7 +132,13 @@ impl DatCataloguePickerState {
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         std::thread::spawn(move || {
-            let result = load_inventory().map_err(|error| error.to_string());
+            let result = match snapshot {
+                Some(snapshot) => Ok(LoadedInventory {
+                    summaries: list_installed_catalogues(snapshot.inputs()),
+                    snapshot,
+                }),
+                None => load_inventory().map_err(|error| error.to_string()),
+            };
             let _ = sender.send(InventoryMessage::Loaded(generation, result));
         });
     }
@@ -188,35 +215,96 @@ impl DatCataloguePickerState {
         workflow: DatCatalogueWorkflow,
         selected: &mut Option<CatalogueRef>,
     ) -> Option<CatalogueRef> {
+        let simple = crate::simple_mode::active(ui.ctx());
         self.ensure_loaded();
         if self.loading {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Loading installed catalogues…");
+                ui.label(if simple {
+                    "Loading verification data…"
+                } else {
+                    "Loading installed catalogues…"
+                });
             });
             return None;
         }
         if let Some(error) = &self.error {
             widgets::banner(
                 ui,
-                "Catalogue list could not be loaded",
-                error,
+                "Verification data could not be loaded",
+                if simple {
+                    "This preview cannot continue yet. Your games are unchanged. Open Check My Games to review the setup, then return here."
+                } else {
+                    error
+                },
                 widgets::StatusTone::Blocked,
             );
+            if simple {
+                widgets::technical_details(ui, "picker-error", |ui| {
+                    ui.label(error);
+                });
+            }
             return None;
         }
 
+        if simple {
+            let platforms: std::collections::BTreeSet<_> = self
+                .summaries
+                .iter()
+                .filter_map(|row| row.platform.confirmed().cloned())
+                .collect();
+            if self.simple_platform.is_none() && platforms.len() == 1 {
+                self.simple_platform = platforms.first().cloned();
+            }
+            ui.label("Choose the platform for this playing library.");
+            egui::ComboBox::from_id_salt("simple-library-platform")
+                .selected_text(self.simple_platform.as_deref().unwrap_or("Choose platform"))
+                .show_ui(ui, |ui| {
+                    for platform in platforms {
+                        if ui
+                            .selectable_label(
+                                self.simple_platform.as_ref() == Some(&platform),
+                                &platform,
+                            )
+                            .clicked()
+                        {
+                            self.simple_platform = Some(platform);
+                            *selected = None;
+                        }
+                    }
+                });
+            if self.simple_platform.is_none() {
+                ui.label("If your platform is not listed, open Check My Games to set up its verification data, then return here and Refresh.");
+                if ui.button("Refresh").clicked() {
+                    self.refresh();
+                }
+                return None;
+            }
+        }
+
         ui.horizontal(|ui| {
-            ui.label(format!("Choose a catalogue for {}", workflow.label()));
-            ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Filter catalogues"));
+            ui.label(if simple {
+                "Choose verification data".to_string()
+            } else {
+                format!("Choose a catalogue for {}", workflow.label())
+            });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.query).hint_text(if simple {
+                    "Find verification data"
+                } else {
+                    "Filter catalogues"
+                }),
+            );
             if ui.button("Refresh").clicked() {
                 self.refresh();
             }
         });
         ui.label(
-            egui::RichText::new(
-                "Select a row explicitly. EmuWiz will not guess between catalogues.",
-            )
+            egui::RichText::new(if simple {
+                "Choose the data matching your games. Selecting it only prepares a preview."
+            } else {
+                "Select a row explicitly. EmuWiz will not guess between catalogues."
+            })
             .color(theme::muted(ui)),
         );
 
@@ -227,6 +315,7 @@ impl DatCataloguePickerState {
             .max_height(280.0)
             .show(ui, |ui| {
                 for summary in &self.summaries {
+                    if simple && summary.platform.confirmed() != self.simple_platform.as_ref() { continue; }
                     if !query.is_empty() && !summary_matches(summary, &query) {
                         continue;
                     }
@@ -245,10 +334,10 @@ impl DatCataloguePickerState {
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(&summary.display_name).strong());
-                                ui.label(summary.store.label());
-                                ui.label(availability_label(&summary.availability, usable));
+                                if !simple { ui.label(summary.store.label()); }
+                                ui.label(if simple { if usable { "Ready" } else { "Needs attention" } } else { availability_label(&summary.availability, usable) });
                             });
-                            ui.horizontal_wrapped(|ui| {
+                            if !simple { ui.horizontal_wrapped(|ui| {
                                 ui.label(evidence_label(&summary.platform));
                                 ui.label(evidence_ecosystem_label(&summary.ecosystem));
                                 if let Some(variant) = summary.variant.confirmed() {
@@ -258,17 +347,19 @@ impl DatCataloguePickerState {
                                     ui.label(format!("revision {revision}"));
                                 }
                                 ui.label(provenance_label(&summary.provenance));
-                            });
+                            }); }
                             if !summary.availability.is_ready() {
                                 ui.label(
-                                    egui::RichText::new(summary.availability.reason())
-                                        .color(theme::WARNING),
+                                    egui::RichText::new(if simple { "This data is not ready for this preview. Review it in Check My Games, then Refresh.".to_string() } else { summary.availability.reason().to_string() })
+                                        .color(theme::muted(ui)),
                                 );
                             }
                             widgets::technical_details(
                                 ui,
                                 ("catalogue-technical-details", summary.reference.token()),
                                 |ui| {
+                                    ui.label(summary.store.label());
+                                    ui.label(provenance_label(&summary.provenance));
                                     if let Some(path) = &summary.technical_path {
                                         ui.label(format!("Path: {}", path.display()));
                                     }
@@ -288,14 +379,16 @@ impl DatCataloguePickerState {
             });
         if visible == 0 {
             ui.label(
-                egui::RichText::new("No catalogues match this filter.").color(theme::muted(ui)),
+                egui::RichText::new(if simple { "No verification data matches. Clear the search, or use Check My Games to set it up." } else { "No catalogues match this filter." }).color(theme::muted(ui)),
             );
         }
         if let Some(reference) = selected.as_ref() {
-            ui.label(
-                egui::RichText::new(format!("Selected: {}", reference.token()))
-                    .color(theme::muted(ui)),
-            );
+            if !simple {
+                ui.label(
+                    egui::RichText::new(format!("Selected: {}", reference.token()))
+                        .color(theme::muted(ui)),
+                );
+            }
             let matching = self
                 .summaries
                 .iter()
@@ -308,11 +401,25 @@ impl DatCataloguePickerState {
                         .color(theme::WARNING),
                 );
             }
-            if ui.button("Use selected catalogue").clicked() {
+            if ui
+                .button(if simple {
+                    "Use this verification data"
+                } else {
+                    "Use selected catalogue"
+                })
+                .clicked()
+            {
                 return Some(reference.clone());
             }
         } else {
-            ui.label(egui::RichText::new("No catalogue selected.").color(theme::muted(ui)));
+            ui.label(
+                egui::RichText::new(if simple {
+                    "Choose verification data above to continue."
+                } else {
+                    "No catalogue selected."
+                })
+                .color(theme::muted(ui)),
+            );
         }
         None
     }

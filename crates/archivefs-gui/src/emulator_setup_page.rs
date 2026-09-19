@@ -476,16 +476,33 @@ pub(crate) fn show(
     overrides: &EmulatorPathOverrides,
 ) -> Option<EmulatorSetupAction> {
     let mut action = None;
+    let simple = crate::simple_mode::active(ui.ctx());
+    if simple {
+        ui.heading("Set up emulators");
+        ui.label("An emulator is the program that plays your games. Choose a platform, then check which programs are ready. Verification with imported data does not require one.");
+    }
     ui.horizontal_wrapped(|ui| {
         ui.label("Platform");
         egui::ComboBox::from_id_salt("emulator-setup-platform")
             .selected_text(if state.platform_filter.is_empty() {
-                "All platforms"
+                if simple {
+                    "Choose a platform"
+                } else {
+                    "All platforms"
+                }
             } else {
                 &state.platform_filter
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut state.platform_filter, String::new(), "All platforms");
+                ui.selectable_value(
+                    &mut state.platform_filter,
+                    String::new(),
+                    if simple {
+                        "Choose a platform"
+                    } else {
+                        "All platforms"
+                    },
+                );
                 for mapping in LAUNCH_COMPATIBILITY {
                     ui.selectable_value(
                         &mut state.platform_filter,
@@ -517,6 +534,11 @@ pub(crate) fn show(
     });
     ui.add_space(theme::SPACE_MD);
 
+    if simple && state.platform_filter.is_empty() {
+        ui.label("Choose a platform above to see its programs and next steps. Checking reads your setup; it does not install or change anything.");
+        return action;
+    }
+
     let candidates = build_candidates(
         findings,
         retroarch,
@@ -532,7 +554,15 @@ pub(crate) fn show(
         );
         return action;
     }
-    let grid = candidate_grid_layout(ui.available_width(), candidates.len());
+    let grid = if simple {
+        CandidateGridLayout {
+            columns: 1,
+            card_width: ui.available_width().min(900.0),
+            row_width: ui.available_width().min(900.0),
+        }
+    } else {
+        candidate_grid_layout(ui.available_width(), candidates.len())
+    };
     for row in candidates.chunks(grid.columns) {
         // `ui.horizontal` centres its children on the cross (vertical) axis
         // by default - with cards of differing heights (a "Ready" card's
@@ -563,10 +593,17 @@ pub(crate) fn show(
                         widgets::aligned_card(ui, grid.card_width, 96.0, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(egui::RichText::new(candidate.name).strong());
-                                widgets::status_badge(ui, candidate.state.label(), candidate.state.tone());
+                                let label = if simple { match candidate.state {
+                                    CandidateState::Ready => "Ready",
+                                    CandidateState::Warnings | CandidateState::Blocked => "Needs attention",
+                                    CandidateState::NeedsSetup | CandidateState::NotChecked => "Needs setup",
+                                } } else { candidate.state.label() };
+                                if simple { ui.strong(label); }
+                                else { widgets::status_badge(ui, label, candidate.state.tone()); }
                             });
                             ui.label(egui::RichText::new(candidate.platform_id).color(theme::muted(ui)));
-                            egui::CollapsingHeader::new("Setup details")
+                            if simple { ui.label("Open Change setup to see what is configured and what to do next. Your games are unchanged."); }
+                            egui::CollapsingHeader::new(if simple { "Change setup" } else { "Setup details" })
                                 .id_salt(("candidate-setup", candidate.adapter_id, candidate.platform_id))
                                 .default_open(focused)
                                 .show(ui, |ui| {

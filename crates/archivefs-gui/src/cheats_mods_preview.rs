@@ -1428,7 +1428,15 @@ pub(crate) fn show_cheats_mods_page(
     let active_section = egui::CollapsingHeader::new("Other enhancements")
         .default_open(false)
         .show(ui, show_enhancement_section_switch)
-        .body_returned.unwrap_or(section);
+        .body_returned
+        .unwrap_or(section);
+    if crate::simple_mode::active(ui.ctx()) && workflow.is_none() {
+        ui.label("Choose Game to see which mods and cheats are available for it. Next you will preview any changes before installing them.");
+        ui.collapsing("Advanced details", |ui| {
+            ui.label("Compatibility, installation locations, and technical evidence become available after you choose a game. Nothing is installed by browsing.");
+        });
+        return action;
+    }
     ui.add_space(theme::SECTION_GAP / 2.0);
 
     show_selected_game_context(ui, workflow.as_deref(), layout);

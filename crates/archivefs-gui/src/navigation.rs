@@ -147,6 +147,7 @@ pub(crate) const GAMER_MENU_ADVANCED_LABEL: &str = "Advanced View";
 pub(crate) fn main_view_title(view: MainView) -> &'static str {
     match view {
         MainView::Home => "Home",
+        MainView::CheckGames => "Check My Games",
         MainView::NeedsAttention => "Needs Attention",
         MainView::Library => "Library",
         MainView::ReadyToPlay => "Ready-to-Play",
@@ -206,6 +207,7 @@ pub(crate) fn main_view_content_width(view: MainView) -> ui_layout::ContentWidth
         | MainView::LibraryViewHistory => ui_layout::ContentWidth::Wide,
         MainView::Museum => ui_layout::ContentWidth::Wide,
         MainView::CheatSources
+        | MainView::CheckGames
         | MainView::CanonicalOrganisation
         | MainView::PublisherProfiles
         | MainView::IdentifyRename
@@ -230,6 +232,7 @@ pub(crate) fn main_view_uses_page_scroll(view: MainView) -> bool {
     matches!(
         view,
         MainView::Home
+            | MainView::CheckGames
             | MainView::NeedsAttention
             | MainView::Selected
             | MainView::Sources
@@ -531,6 +534,7 @@ pub(crate) fn show_primary_navigation(
 pub(crate) enum MainView {
     #[default]
     Home,
+    CheckGames,
     NeedsAttention,
     Library,
     /// Read-only view over already-gathered Ready-to-Play projections.

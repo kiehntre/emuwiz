@@ -70,6 +70,11 @@ pub(crate) fn apply_shell_request(
             app.tools_overlay = ToolsOverlay::None;
             save_gui_mode(app.ui_mode);
         }
+        Some(app_shell::ShellRequest::SimpleMode) => {
+            app.ui_mode = GuiMode::Simple;
+            app.navigate_to_main_view(MainView::Home);
+            save_gui_mode(app.ui_mode);
+        }
         Some(app_shell::ShellRequest::GamerAddFolder(folder)) => {
             app.gamer_view_scan_review_available = false;
             app.start_source_action(context.clone(), SourceAction::Add(folder));

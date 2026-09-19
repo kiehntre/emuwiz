@@ -307,6 +307,7 @@ use game_presentation::{
 #[allow(dead_code)]
 pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
+mod simple_mode;
 use home_page::home_library_snapshot;
 pub(crate) mod identity_sources_page;
 #[allow(dead_code)]

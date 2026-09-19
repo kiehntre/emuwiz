@@ -845,13 +845,53 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
         state.generate_plan();
         state.pending_preview = false;
     }
-    widgets::workflow_header(ui, "Build Libraries", "Create clean libraries for RomM, ES-DE, RetroDECK or Generic.");
+    if crate::simple_mode::active(ui.ctx()) && !state.showing_playing_library {
+        widgets::workflow_header(
+            ui,
+            "Make a Playing Library",
+            "Prepare an organised library of links to your games. Your original files stay where they are.",
+        );
+        if crate::simple_mode::primary_button(ui, "Start a playing library", true).clicked() {
+            state.showing_playing_library = true;
+            state
+                .playing_library
+                .set_destination(PlayingLibraryDestination::Generic);
+        }
+        ui.label("Next: choose a platform, your games folder, and an output folder. Review the preview before approving any changes.");
+        ui.collapsing("Advanced details — other library layouts", |ui| {
+            ui.label("Use these options when you already use a game-library program such as RomM or ES-DE. Choosing a layout does not write files.");
+            show_library_destination_cards(ui, state);
+        });
+        return;
+    }
+    if crate::simple_mode::active(ui.ctx()) {
+        widgets::workflow_header(
+            ui,
+            "Make a Playing Library › Choose games and folders",
+            "Preview an organised library, then review it before approving any changes.",
+        );
+    } else {
+        widgets::workflow_header(
+            ui,
+            "Build Libraries",
+            "Create clean libraries for RomM, ES-DE, RetroDECK or Generic.",
+        );
+    }
     ui.weak("1. Choose output   /   2. Choose destination   /   3. Preview   /   4. Apply");
 
     ui.horizontal(|ui| {
         if state.showing_playing_library {
-            if widgets::action_button(ui, "< Back to Organise", widgets::ActionStyle::Quiet, true)
-                .clicked()
+            if widgets::action_button(
+                ui,
+                if crate::simple_mode::active(ui.ctx()) {
+                    "← Back to Make a Playing Library"
+                } else {
+                    "< Back to Organise"
+                },
+                widgets::ActionStyle::Quiet,
+                true,
+            )
+            .clicked()
             {
                 state.showing_playing_library = false;
             }
@@ -1473,6 +1513,22 @@ impl ArchiveFsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simple_playing_library_starts_with_one_handle_and_no_file_operation() {
+        let mut state = RomOrganisationPageState::default();
+        let ctx = egui::Context::default();
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("simple-mode-active"), true));
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "Start a playing library"));
+        assert!(rendered_text_contains(&output, "Next: choose a platform"));
+        assert!(!rendered_text_contains(&output, "Move real files"));
+        assert!(!state.showing_playing_library && !state.pending_preview);
+    }
 
     fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
         fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {

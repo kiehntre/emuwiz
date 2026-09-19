@@ -27,6 +27,7 @@ pub(crate) enum ShellRequest {
     ToggleActivity,
     ShowAbout,
     ReturnToGamerView,
+    SimpleMode,
     GamerAddFolder(PathBuf),
     GamerScan,
     GamerSetup,
@@ -34,6 +35,7 @@ pub(crate) enum ShellRequest {
 }
 
 pub(crate) struct ShellInputs {
+    pub(crate) simple_view: bool,
     pub(crate) advanced_view: bool,
     pub(crate) view: MainView,
     pub(crate) tools_overlay: ToolsOverlay,
@@ -46,7 +48,12 @@ pub(crate) struct ShellInputs {
 }
 
 pub(crate) fn show_shell(context: &egui::Context, inputs: ShellInputs) -> Option<ShellRequest> {
+    context
+        .data_mut(|data| data.insert_temp(egui::Id::new("simple-mode-active"), inputs.simple_view));
     let mut navigation_request = None;
+    if inputs.simple_view {
+        return crate::simple_mode::show_shell(context, inputs.view, inputs.tools_overlay);
+    }
     if inputs.advanced_view {
         egui::TopBottomPanel::top("menu_bar").show(context, |ui| {
             ui.horizontal(|ui| {
@@ -156,6 +163,10 @@ pub(crate) fn show_shell(context: &egui::Context, inputs: ShellInputs) -> Option
                     }
                 });
                 ui.menu_button("Help", |ui| {
+                    if ui.button("Simple Mode").clicked() {
+                        navigation_request = Some(ShellRequest::SimpleMode);
+                        ui.close();
+                    }
                     if ui.button("About EmuWiz").clicked() {
                         navigation_request = Some(ShellRequest::ShowAbout);
                         ui.close();
@@ -244,6 +255,10 @@ pub(crate) fn show_shell(context: &egui::Context, inputs: ShellInputs) -> Option
                         }
                         if ui.button(GAMER_MENU_ADVANCED_LABEL).clicked() {
                             navigation_request = Some(ShellRequest::GamerAdvanced);
+                            ui.close();
+                        }
+                        if ui.button("Simple Mode").clicked() {
+                            navigation_request = Some(ShellRequest::SimpleMode);
                             ui.close();
                         }
                     });

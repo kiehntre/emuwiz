@@ -1,18 +1,17 @@
-//! The GUI's view mode: Gamer View or Advanced View.
+//! Task-first Simple Mode, with retained Gamer and Advanced views.
 //!
 //! One enum, one default, one on-disk preference. `GuiMode` is the identity
 //! the running application switches on; `gui_mode.txt` is the only place it
-//! is persisted, holding the stable lower-case values `gamer` and
-//! `advanced`.
+//! is persisted, holding `simple`, `gamer`, or `advanced`. Existing explicit
+//! preferences are preserved; fresh or unreadable preferences use Simple Mode.
 
 use std::path::PathBuf;
 
-/// Decision 5 (docs/GUI_NAVIGATION_RESET_DESIGN.md §9): exactly these two
-/// modes, no alternate labels. `GamerView` is the unconditional default
-/// for a fresh profile/first launch (decision matches §1.1).
+/// Simple Mode is the novice default; the older two modes remain available.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum GuiMode {
     #[default]
+    Simple,
     GamerView,
     AdvancedView,
 }
@@ -30,19 +29,21 @@ fn gui_mode_config_path() -> Option<PathBuf> {
 fn parse_gui_mode(contents: &str) -> GuiMode {
     match contents.trim() {
         "advanced" => GuiMode::AdvancedView,
-        _ => GuiMode::GamerView,
+        "gamer" => GuiMode::GamerView,
+        _ => GuiMode::Simple,
     }
 }
 
 fn gui_mode_file_contents(mode: GuiMode) -> &'static str {
     match mode {
+        GuiMode::Simple => "simple",
         GuiMode::GamerView => "gamer",
         GuiMode::AdvancedView => "advanced",
     }
 }
 
 /// A missing or unreadable file means "nothing chosen yet" - falls back
-/// to the unconditional default (`GamerView`), never an error.
+/// to the default (`Simple`), never an error.
 pub(crate) fn load_gui_mode() -> GuiMode {
     gui_mode_config_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -68,13 +69,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_to_gamer_view() {
-        assert_eq!(GuiMode::default(), GuiMode::GamerView);
+    fn defaults_to_simple_view() {
+        assert_eq!(GuiMode::default(), GuiMode::Simple);
     }
 
     #[test]
     fn persisted_values_round_trip() {
-        for mode in [GuiMode::GamerView, GuiMode::AdvancedView] {
+        for mode in [GuiMode::Simple, GuiMode::GamerView, GuiMode::AdvancedView] {
             assert_eq!(parse_gui_mode(gui_mode_file_contents(mode)), mode);
         }
         assert_eq!(gui_mode_file_contents(GuiMode::GamerView), "gamer");
@@ -101,7 +102,7 @@ mod tests {
             "Gamer View",
             "ADVANCED",
         ] {
-            assert_eq!(parse_gui_mode(contents), GuiMode::GamerView);
+            assert_eq!(parse_gui_mode(contents), GuiMode::Simple);
         }
     }
 }

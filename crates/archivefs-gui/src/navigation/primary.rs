@@ -64,6 +64,7 @@ pub(crate) fn destination(view: MainView, overlay: ToolsOverlay) -> Destination 
     match view {
         MainView::Home => Destination::Home,
         MainView::Library
+        | MainView::CheckGames
         | MainView::ReadyToPlay
         | MainView::RecentlyFound
         | MainView::Health

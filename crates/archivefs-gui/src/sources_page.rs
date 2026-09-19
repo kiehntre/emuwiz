@@ -1253,6 +1253,81 @@ pub(super) fn game_source_status(
     }
 }
 
+fn show_simple_game_folders(
+    ui: &mut egui::Ui,
+    sources: &[SourceFolderView],
+    busy: bool,
+) -> Option<SourcesPageAction> {
+    let mut action = None;
+    widgets::workflow_header(
+        ui,
+        "Add My Games",
+        "Choose the folders where your games already live. Scanning reads them; it does not move or rename them.",
+    );
+    if busy {
+        ui.label("Working on your library. Your game files are unchanged; you can return Home while this finishes.");
+    }
+    if crate::simple_mode::primary_button(ui, "Add a games folder…", !busy).clicked()
+        && let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose a games folder to add")
+            .pick_folder()
+    {
+        action = Some(SourcesPageAction::AddFolder(path));
+    }
+    ui.label("Next: scan the folder, then open My Games or Check My Games. Adding a folder saves only its location in EmuWiz.");
+    if sources.is_empty() {
+        ui.label("No games folders have been added yet. Use Add a games folder to get started.");
+    }
+    for source in sources {
+        ui.push_id(("simple-game-folder", &source.path), |ui| {
+            widgets::full_width_card(ui, |ui| {
+                ui.heading(friendly_source_label(&source.path));
+                ui.label(source.path.display().to_string());
+                let (_, _, explanation, _) = game_source_status(source);
+                let ready = source.enabled && source.availability == SourceAvailability::Available;
+                ui.strong(if ready {
+                    "Ready"
+                } else if !source.enabled {
+                    "Needs setup"
+                } else {
+                    "Needs attention"
+                });
+                ui.label(explanation);
+                if crate::simple_mode::primary_button(
+                    ui,
+                    "Scan this games folder",
+                    !busy && source.enabled,
+                )
+                .clicked()
+                {
+                    action = Some(SourcesPageAction::ScanOne(source.path.clone()));
+                }
+                if !source.enabled && ui.button("Include this folder").clicked() {
+                    action = Some(SourcesPageAction::SetEnabled {
+                        path: source.path.clone(),
+                        enabled: true,
+                    });
+                }
+                if ui.button("View games").clicked() {
+                    action = Some(SourcesPageAction::ViewInLibrary(source.path.clone()));
+                }
+                ui.collapsing("Advanced details", |ui| {
+                    ui.label(source_role_explanation(source.role));
+                    ui.label("To change folder roles or remove a folder, use Advanced View below.");
+                });
+            });
+        });
+        ui.add_space(12.0);
+    }
+    action
+}
+
+fn friendly_source_label(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Games folder".into())
+}
+
 pub(super) fn source_role_explanation(role: SourceRole) -> &'static str {
     match role {
         SourceRole::Games => "Scan this folder for playable game files.",
@@ -2817,7 +2892,10 @@ impl ArchiveFsApp {
                 worker.update_launchbox(self.artwork_media.launchbox_local_media.snapshot().cloned());
             }
         }
-        if tab != SourcesTab::Dats && let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
+        if self.ui_mode != GuiMode::Simple
+            && tab != SourcesTab::Dats
+            && let Some(clicked) = sources_page::show_sources_tabs(ui, tab)
+        {
             self.navigate_to_sources_tab(clicked);
         }
         match tab {
@@ -2842,7 +2920,10 @@ impl ArchiveFsApp {
                 }
             }
         }
-        if tab == SourcesTab::Dats && let Some(clicked) = sources_page::show_sources_tabs(ui, tab) {
+        if self.ui_mode != GuiMode::Simple
+            && tab == SourcesTab::Dats
+            && let Some(clicked) = sources_page::show_sources_tabs(ui, tab)
+        {
             self.navigate_to_sources_tab(clicked);
         }
     }
@@ -2852,7 +2933,12 @@ impl ArchiveFsApp {
     /// exactly the content `MainView::Sources` rendered before
     /// consolidation, unchanged apart from the outer page header now being
     /// `show_sources_page`'s shared one.
-    pub(crate) fn show_sources_libraries_tab(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
+    pub(crate) fn show_sources_libraries_tab(
+        &mut self,
+        context: &egui::Context,
+        ui: &mut egui::Ui,
+    ) {
+        let source_busy = !self.source_action_available();
         let catalogue_snapshot = self.database_state.snapshot();
         let source_state = source_state::merge_configured_sources(
             self.gui_config.source_roots().ok().unwrap_or_default(),
@@ -2868,6 +2954,15 @@ impl ArchiveFsApp {
         };
 
         let sources_action = sources_page::sources_content_column(ui, |ui| {
+            if self.ui_mode == GuiMode::Simple {
+                if let Some(last_scan) = &self.sources_ui.sources_last_scan
+                    && show_sources_last_scan_banner(ui, last_scan)
+                {
+                    self.show_skipped_files = true;
+                    self.skipped_files_filter = None;
+                }
+                return show_simple_game_folders(ui, sources, source_busy);
+            }
             show_sources_overview(
                 ui,
                 sources,
@@ -2969,6 +3064,16 @@ impl ArchiveFsApp {
             }
         }
 
+        if self.ui_mode == GuiMode::Simple {
+            ui.collapsing("Advanced details — connections and folder management", |ui| {
+                ui.label("Advanced View includes folder roles, removal, server connections, and scan history.");
+                if ui.button("Open Advanced View").clicked() {
+                    self.ui_mode = GuiMode::AdvancedView;
+                    save_gui_mode(self.ui_mode);
+                }
+            });
+            return;
+        }
         ui.add_space(theme::SECTION_GAP);
         // Large, infrequently-touched configuration blocks - collapsed by
         // default so the Sources page opens on the source-folder list rather
@@ -3093,6 +3198,31 @@ impl ArchiveFsApp {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn simple_empty_game_folders_have_a_handle_and_a_next_step() {
+        let ctx = egui::Context::default();
+        let output = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert!(show_simple_game_folders(ui, &[], false).is_none());
+            });
+        });
+        let lines: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(lines.contains(&"Add a games folder…"));
+        assert!(lines.iter().any(|line| line.starts_with("Next: scan")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("provider") || line.contains("catalogue"))
+        );
+    }
 
     #[test]
     fn sources_content_column_is_readable_on_desktop_without_clipping_narrow_views() {

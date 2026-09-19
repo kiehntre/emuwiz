@@ -13,7 +13,7 @@ use archivefs_core::identity_source::providers::{
     ProviderSnapshot,
 };
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::ui::components as widgets;
 
@@ -103,7 +103,10 @@ impl ProviderCardState {
 
     fn choose_tool(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .set_title(format!("Choose {} executable", self.provider.label()))
+            .set_title(format!(
+                "Choose installed {} program (not verification data)",
+                self.provider.label()
+            ))
             .pick_file()
         else {
             return;
@@ -112,6 +115,10 @@ impl ProviderCardState {
     }
 
     fn configure(&mut self, executable: PathBuf) {
+        if let Err(error) = validate_program(&executable, self.provider) {
+            self.error = Some(error);
+            return;
+        }
         self.error = None;
         self.active = None;
         self.staged = None;
@@ -153,6 +160,10 @@ impl ProviderCardState {
             self.error = Some("Choose the installed official tool first.".into());
             return;
         };
+        if let Err(error) = validate_program(&executable, self.provider) {
+            self.error = Some(error);
+            return;
+        }
         match check_provider(self.provider, &executable)
             .and_then(|snapshot| store.stage_snapshot(&snapshot))
         {
@@ -313,10 +324,10 @@ fn show_provider_card(ui: &mut egui::Ui, state: &mut ProviderCardState) {
         ui.horizontal_wrapped(|ui| {
             if widgets::action_button(
                 ui,
-                if state.executable.is_some() {
-                    "Change tool"
+                if state.provider == IdentityProvider::Mame {
+                    "Choose installed MAME"
                 } else {
-                    "Choose tool"
+                    "Choose installed ScummVM"
                 },
                 widgets::ActionStyle::Secondary,
                 true,
@@ -380,6 +391,9 @@ fn show_provider_card(ui: &mut egui::Ui, state: &mut ProviderCardState) {
             ui,
             format!("identity-provider-{}", state.provider.slug()),
             |ui| {
+                if let Some(error) = &state.error {
+                    ui.label(error);
+                }
                 if let Some(path) = &state.executable {
                     ui.label(format!("Tool: {}", path.display()));
                 }
@@ -431,11 +445,63 @@ fn confidence_copy(class: DetectionClass) -> (&'static str, &'static str) {
 }
 
 fn plain_error(error: &str) -> String {
-    if error.contains("integrity") {
+    if error.starts_with("That file") || error.starts_with("Choose an installed") {
+        error.to_string()
+    } else if error.contains("integrity") {
         "The active provider data failed its integrity check. EmuWiz will not use it until it is repaired or another snapshot is activated.".into()
     } else {
-        error.to_string()
+        "EmuWiz could not read data from the installed program. This does not stop checks using imported verification data. Choose the installed program again, or return to Check My Games and import verification data. The original error is in Technical details.".into()
     }
+}
+
+/// Validate before configuring *and* before executing, including executable
+/// bits on Unix. Selecting a data file must never reach process spawning.
+pub(crate) fn validate_program(path: &Path, provider: IdentityProvider) -> Result<(), String> {
+    if provider == IdentityProvider::Mame && is_verification_file(path) {
+        return Err(WRONG_MAME_FILE.into());
+    }
+    if crate::emulator_setup_overrides::classify_picked_executable(path)
+        != crate::emulator_setup_overrides::PickedExecutable::Usable
+    {
+        return Err(format!(
+            "Choose an installed {} program that you have permission to run. This file cannot be started. Your imported verification data is safe and can still be used in Check My Games.",
+            provider.label()
+        ));
+    }
+    #[cfg(windows)]
+    if !path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return Err("Choose an installed program (.exe). Your imported verification data is safe; return to Check My Games to use it.".into());
+    }
+    Ok(())
+}
+
+pub(crate) const WRONG_MAME_FILE: &str = "That file is verification data, not the MAME program. EmuWiz has not tried to run it and your imported data is safe. Choose installed MAME, or return to Check My Games → Arcade → Change setup → Import verification data. MAME is optional when using imported data.";
+
+pub(crate) fn is_verification_file(path: &Path) -> bool {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dat") || ext.eq_ignore_ascii_case("xml"))
+    {
+        return true;
+    }
+    if !std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    // Also refuse renamed XML; the check is bounded and never executes bytes.
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut prefix = [0; 512];
+    let Ok(read) = file.read(&mut prefix) else {
+        return false;
+    };
+    let prefix = String::from_utf8_lossy(&prefix[..read]);
+    let prefix = prefix.trim_start_matches('\u{feff}').trim_start();
+    prefix.starts_with('<') || prefix.starts_with("clrmamepro")
 }
 
 #[cfg(test)]
@@ -469,6 +535,49 @@ mod tests {
     use archivefs_core::identity_source::managed_snapshot::{
         ManagedSourceReference, ManagedSourceTrust,
     };
+
+    #[test]
+    fn mame_verification_file_is_rejected_before_configuration_or_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["MAME.0.174.Arcade.XML.dat", "mame.XML", "mame"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"<?xml version=\"1.0\"?><mame build=\"0.174\"/>").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let mut card = ProviderCardState::for_provider(IdentityProvider::Mame);
+            card.configure(path);
+            assert!(card.executable.is_none() && card.store.is_none());
+            let message = plain_error(card.error.as_deref().unwrap());
+            for phrase in [
+                "not the MAME program",
+                "has not tried to run",
+                "safe",
+                "Import verification data",
+                "optional",
+            ] {
+                assert!(message.contains(phrase), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn mame_missing_directory_and_non_executable_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(validate_program(dir.path(), IdentityProvider::Mame).is_err());
+        assert!(validate_program(&dir.path().join("missing"), IdentityProvider::Mame).is_err());
+        #[cfg(unix)]
+        {
+            let path = dir.path().join("mame");
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+            assert!(validate_program(&path, IdentityProvider::Mame).is_err());
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(validate_program(&path, IdentityProvider::Mame).is_ok());
+        }
+    }
 
     fn snapshot() -> ManagedSourceSnapshot {
         ManagedSourceSnapshot {
