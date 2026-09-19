@@ -6010,11 +6010,11 @@ fn managed_sources_render_in_a_separate_section_from_local_sources() {
 }
 
 #[test]
-fn redump_game_disc_rows_show_only_the_three_typed_supported_systems() {
+fn redump_game_disc_rows_show_the_reviewed_typed_supported_systems() {
     let fixture = Fixture::new();
     let page = fixture.page();
     let view = page.view();
-    assert_eq!(view.redump_game_rows.len(), 3);
+    assert_eq!(view.redump_game_rows.len(), 17);
     assert!(
         view.redump_game_rows
             .iter()
@@ -6024,8 +6024,13 @@ fn redump_game_disc_rows_show_only_the_three_typed_supported_systems() {
     assert!(rendered_text_contains(&output, "Redump Game/Disc DATs"));
     assert!(rendered_text_contains(&output, "System: PlayStation"));
     assert!(rendered_text_contains(&output, "System: PlayStation 2"));
+    assert!(rendered_text_contains(&output, "System: PlayStation 3"));
+    assert!(rendered_text_contains(&output, "System: Sega Saturn"));
+    assert!(rendered_text_contains(&output, "System: Dreamcast"));
+    assert!(rendered_text_contains(&output, "System: GameCube"));
+    assert!(rendered_text_contains(&output, "System: Wii"));
     assert!(rendered_text_contains(&output, "System: Xbox"));
-    assert!(!rendered_text_contains(&output, "Saturn"));
+    assert!(rendered_text_contains(&output, "System: Xbox 360"));
     assert!(rendered_text_contains(&output, "Redump BIOS DATs"));
     assert!(rendered_text_contains(&output, "MAME software list"));
 }

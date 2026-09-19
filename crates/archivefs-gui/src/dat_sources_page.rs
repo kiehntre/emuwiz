@@ -6036,12 +6036,9 @@ impl DatSourcesPageState {
     }
 
     fn redump_game_rows_view(&self) -> Vec<ManagedDatSourceRowView> {
-        [
-            RedumpGameSystem::PlayStation,
-            RedumpGameSystem::PlayStation2,
-            RedumpGameSystem::Xbox,
-        ]
-        .into_iter()
+        RedumpGameSystem::all()
+        .iter()
+        .copied()
         .map(|system| self.redump_game_row_view(system))
         .collect()
     }
@@ -9361,12 +9358,10 @@ fn redump_bios_from_source_key(key: &str) -> Option<RedumpBiosSystem> {
 }
 
 fn redump_game_from_source_key(key: &str) -> Option<RedumpGameSystem> {
-    match key {
-        "playstation" => Some(RedumpGameSystem::PlayStation),
-        "playstation2" => Some(RedumpGameSystem::PlayStation2),
-        "xbox" => Some(RedumpGameSystem::Xbox),
-        _ => None,
-    }
+    RedumpGameSystem::all()
+        .iter()
+        .copied()
+        .find(|system| system.source_key() == key)
 }
 
 fn redump_bios_label(system: RedumpBiosSystem) -> &'static str {
@@ -9381,7 +9376,21 @@ fn redump_game_label(system: RedumpGameSystem) -> &'static str {
     match system {
         RedumpGameSystem::PlayStation => "PlayStation",
         RedumpGameSystem::PlayStation2 => "PlayStation 2",
+        RedumpGameSystem::PlayStation3 => "PlayStation 3",
+        RedumpGameSystem::PlayStation4 => "PlayStation 4",
+        RedumpGameSystem::Psp => "PlayStation Portable",
+        RedumpGameSystem::Saturn => "Sega Saturn",
+        RedumpGameSystem::Dreamcast => "Dreamcast",
+        RedumpGameSystem::SegaCd => "Sega CD / Mega CD",
+        RedumpGameSystem::GameCube => "GameCube",
+        RedumpGameSystem::Wii => "Wii",
+        RedumpGameSystem::WiiU => "Wii U",
         RedumpGameSystem::Xbox => "Xbox",
+        RedumpGameSystem::Xbox360 => "Xbox 360",
+        RedumpGameSystem::ThreeDo => "3DO",
+        RedumpGameSystem::Pcfx => "PC-FX",
+        RedumpGameSystem::PcEngineCd => "PC Engine CD / TurboGrafx-CD",
+        RedumpGameSystem::NeoGeoCd => "Neo Geo CD",
     }
 }
 

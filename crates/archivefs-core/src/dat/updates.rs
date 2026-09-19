@@ -24,6 +24,7 @@ use crate::dat::firmware_evidence::FirmwareSystem;
 use crate::dat::limits::DEFAULT_MAX_FILE_SIZE;
 use crate::dat::model::DatEcosystem;
 use crate::dat::sources::DatSourceOwnership;
+use crate::game_identity::IdentityPlatform;
 use crate::{ArchiveFsError, Result};
 
 /// The app-owned directory under EmuWiz's effective data directory.
@@ -134,42 +135,269 @@ impl RedumpBiosSystem {
     }
 }
 
-/// The fixed, closed set of systems this build has actual evidence for
-/// Redump's ordinary (non-BIOS) per-system game/disc DAT.
+/// The typed Redump systems for which EmuWiz has a canonical platform, a
+/// documented Redump system slug, and the existing bounded direct-DAT
+/// acquisition/verification path.
 ///
-/// Deliberately limited to the same three systems [`RedumpBiosSystem`]
-/// already proves a working `redump.info` contract for - not because other
-/// Redump systems (Saturn, Dreamcast, GameCube, Wii, ...) lack a game DAT,
-/// but because this codebase has no proven slug for any of them: Redump's
-/// ordinary-dataset URLs are fixed separately from the versioned BIOS DAT
-/// links resolved through Redump's downloads page. A system whose game-DAT
-/// slug has not been independently proven (Saturn included) is intentionally
-/// left unsupported rather than guessed at; see the module's managed-provider
-/// task notes for why.
+/// This is deliberately a finite, reviewed table rather than a free-text
+/// URL builder. Adding a Redump system requires all three pieces of evidence:
+/// canonical platform support, a stable source mapping, and a parser identity
+/// rule. A Redump system being visible on the public site is not by itself
+/// enough to add it here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedumpGameSystem {
     PlayStation,
     PlayStation2,
+    PlayStation3,
+    PlayStation4,
+    Psp,
+    Saturn,
+    Dreamcast,
+    SegaCd,
+    GameCube,
+    Wii,
+    WiiU,
     Xbox,
+    Xbox360,
+    ThreeDo,
+    Pcfx,
+    PcEngineCd,
+    NeoGeoCd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RedumpGameSystemDefinition {
+    system: RedumpGameSystem,
+    platform: IdentityPlatform,
+    source_key: &'static str,
+    url_slug: &'static str,
+    dataset_label: &'static str,
+    header_markers: &'static [&'static str],
+}
+
+const REDUMP_GAME_SYSTEM_DEFINITIONS: &[RedumpGameSystemDefinition] = &[
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::PlayStation,
+        platform: IdentityPlatform::PlayStation,
+        source_key: "playstation",
+        url_slug: "psx",
+        dataset_label: "Sony - PlayStation",
+        header_markers: &["playstation"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::PlayStation2,
+        platform: IdentityPlatform::PlayStation2,
+        source_key: "playstation2",
+        url_slug: "ps2",
+        dataset_label: "Sony - PlayStation 2",
+        header_markers: &["playstation 2", "playstation2", "ps2"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::PlayStation3,
+        platform: IdentityPlatform::PlayStation3,
+        source_key: "playstation3",
+        url_slug: "ps3",
+        dataset_label: "Sony - PlayStation 3",
+        header_markers: &["playstation 3", "playstation3", "ps3"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::PlayStation4,
+        platform: IdentityPlatform::PlayStation4,
+        source_key: "playstation4",
+        url_slug: "ps4",
+        dataset_label: "Sony - PlayStation 4",
+        header_markers: &["playstation 4", "playstation4", "ps4"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::Psp,
+        platform: IdentityPlatform::Psp,
+        source_key: "psp",
+        url_slug: "psp",
+        dataset_label: "Sony - PlayStation Portable",
+        header_markers: &["playstation portable", "psp"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::Saturn,
+        platform: IdentityPlatform::Saturn,
+        source_key: "saturn",
+        url_slug: "ss",
+        dataset_label: "Sega - Saturn",
+        header_markers: &["saturn"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::Dreamcast,
+        platform: IdentityPlatform::Dreamcast,
+        source_key: "dreamcast",
+        url_slug: "dc",
+        dataset_label: "Sega - Dreamcast",
+        header_markers: &["dreamcast"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::SegaCd,
+        platform: IdentityPlatform::SegaCd,
+        source_key: "sega_cd",
+        url_slug: "mcd",
+        dataset_label: "Sega - Mega CD & Sega CD",
+        header_markers: &["mega cd", "sega cd", "megacd"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::GameCube,
+        platform: IdentityPlatform::GameCube,
+        source_key: "gamecube",
+        url_slug: "gc",
+        dataset_label: "Nintendo - GameCube",
+        header_markers: &["gamecube"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::Wii,
+        platform: IdentityPlatform::Wii,
+        source_key: "wii",
+        url_slug: "wii",
+        dataset_label: "Nintendo - Wii",
+        header_markers: &["wii"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::WiiU,
+        platform: IdentityPlatform::WiiU,
+        source_key: "wiiu",
+        url_slug: "wiiu",
+        dataset_label: "Nintendo - Wii U",
+        header_markers: &["wii u", "wiiu"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::Xbox,
+        platform: IdentityPlatform::Xbox,
+        source_key: "xbox",
+        url_slug: "xbox",
+        dataset_label: "Microsoft - Xbox",
+        header_markers: &["xbox"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::Xbox360,
+        platform: IdentityPlatform::Xbox360,
+        source_key: "xbox360",
+        url_slug: "xbox360",
+        dataset_label: "Microsoft - Xbox 360",
+        header_markers: &["xbox 360", "xbox360"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::ThreeDo,
+        platform: IdentityPlatform::ThreeDo,
+        source_key: "3do",
+        url_slug: "3do",
+        dataset_label: "Panasonic - 3DO Interactive Multiplayer",
+        header_markers: &["3do"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::Pcfx,
+        platform: IdentityPlatform::Pcfx,
+        source_key: "pcfx",
+        url_slug: "pc-fx",
+        dataset_label: "NEC - PC-FX",
+        header_markers: &["pc-fx", "pcfx"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::PcEngineCd,
+        platform: IdentityPlatform::PcEngineCd,
+        source_key: "pc_engine_cd",
+        url_slug: "pce",
+        dataset_label: "NEC - PC Engine CD & TurboGrafx CD",
+        header_markers: &["pc engine cd", "turbografx cd", "cd-rom2"],
+    },
+    RedumpGameSystemDefinition {
+        system: RedumpGameSystem::NeoGeoCd,
+        platform: IdentityPlatform::NeoGeoCd,
+        source_key: "neo_geo_cd",
+        url_slug: "ngcd",
+        dataset_label: "SNK - Neo Geo CD",
+        header_markers: &["neo geo cd", "neogeo cd"],
+    },
+];
+
+/// Whether a canonical platform can use the managed Redump game-DAT path.
+///
+/// This result is intentionally separate from DAT presence or freshness:
+/// `SupportedManaged` means a typed source contract exists, not that a source
+/// is configured or currently active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedumpManagedSupport {
+    SupportedManaged(RedumpGameSystem),
+    /// Reserved for a reviewed local-import contract when Redump publishes
+    /// data that the bounded updater cannot safely acquire.
+    SupportedLocalImportOnly,
+    UnsupportedAcquisition,
+    NotRedumpAuthority,
+    UnknownPlatform,
+}
+
+/// Resolves canonical platform identity to the reviewed Redump support state.
+/// No folder name, extension, title, or fuzzy alias participates in this
+/// decision.
+pub fn redump_managed_support(platform: Option<IdentityPlatform>) -> RedumpManagedSupport {
+    let Some(platform) = platform else {
+        return RedumpManagedSupport::UnknownPlatform;
+    };
+    if let Some(definition) = REDUMP_GAME_SYSTEM_DEFINITIONS
+        .iter()
+        .find(|definition| definition.platform == platform)
+    {
+        return RedumpManagedSupport::SupportedManaged(definition.system);
+    }
+    if platform == IdentityPlatform::Other {
+        RedumpManagedSupport::UnknownPlatform
+    } else {
+        RedumpManagedSupport::NotRedumpAuthority
+    }
 }
 
 impl RedumpGameSystem {
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::PlayStation,
+            Self::PlayStation2,
+            Self::PlayStation3,
+            Self::PlayStation4,
+            Self::Psp,
+            Self::Saturn,
+            Self::Dreamcast,
+            Self::SegaCd,
+            Self::GameCube,
+            Self::Wii,
+            Self::WiiU,
+            Self::Xbox,
+            Self::Xbox360,
+            Self::ThreeDo,
+            Self::Pcfx,
+            Self::PcEngineCd,
+            Self::NeoGeoCd,
+        ]
+    }
+
+    fn definition(self) -> &'static RedumpGameSystemDefinition {
+        REDUMP_GAME_SYSTEM_DEFINITIONS
+            .iter()
+            .find(|definition| definition.system == self)
+            .expect("every Redump game system has a reviewed definition")
+    }
+
+    pub fn canonical_platform(self) -> IdentityPlatform {
+        self.definition().platform
+    }
+
+    pub fn source_key(self) -> &'static str {
+        self.definition().source_key
+    }
+
     fn slug(self) -> &'static str {
-        match self {
-            Self::PlayStation => "playstation",
-            Self::PlayStation2 => "playstation2",
-            Self::Xbox => "xbox",
-        }
+        self.definition().source_key
     }
 
     fn from_slug(slug: &str) -> Option<Self> {
-        match slug {
-            "playstation" => Some(Self::PlayStation),
-            "playstation2" => Some(Self::PlayStation2),
-            "xbox" => Some(Self::Xbox),
-            _ => None,
-        }
+        REDUMP_GAME_SYSTEM_DEFINITIONS
+            .iter()
+            .find(|definition| definition.source_key == slug || definition.url_slug == slug)
+            .map(|definition| definition.system)
     }
 
     /// The one fixed, approved HTTPS URL for this system's ordinary Redump
@@ -177,10 +405,27 @@ impl RedumpGameSystem {
     /// system with the `-bios` path segment removed, never a separately
     /// guessed slug (see this enum's own doc comment).
     fn fixed_url(self) -> &'static str {
-        match self {
-            Self::PlayStation => "https://redump.info/datfile/psx",
-            Self::PlayStation2 => "https://redump.info/datfile/ps2",
-            Self::Xbox => "https://redump.info/datfile/xbox",
+        match self.definition().url_slug {
+            // The slug set above is reviewed against Redump's public system
+            // catalogue; it is not caller-controlled.
+            "psx" => "https://redump.info/datfile/psx",
+            "ps2" => "https://redump.info/datfile/ps2",
+            "ps3" => "https://redump.info/datfile/ps3",
+            "ps4" => "https://redump.info/datfile/ps4",
+            "psp" => "https://redump.info/datfile/psp",
+            "ss" => "https://redump.info/datfile/ss",
+            "dc" => "https://redump.info/datfile/dc",
+            "mcd" => "https://redump.info/datfile/mcd",
+            "gc" => "https://redump.info/datfile/gc",
+            "wii" => "https://redump.info/datfile/wii",
+            "wiiu" => "https://redump.info/datfile/wiiu",
+            "xbox" => "https://redump.info/datfile/xbox",
+            "xbox360" => "https://redump.info/datfile/xbox360",
+            "3do" => "https://redump.info/datfile/3do",
+            "pc-fx" => "https://redump.info/datfile/pc-fx",
+            "pce" => "https://redump.info/datfile/pce",
+            "ngcd" => "https://redump.info/datfile/ngcd",
+            _ => unreachable!("every Redump game system has an approved slug"),
         }
     }
 
@@ -189,11 +434,7 @@ impl RedumpGameSystem {
     /// [`header_identifies_redump_game_dataset`] for the actual (tolerant,
     /// substring-based) match.
     fn dataset_label(self) -> &'static str {
-        match self {
-            Self::PlayStation => "Sony - PlayStation",
-            Self::PlayStation2 => "Sony - PlayStation 2",
-            Self::Xbox => "Microsoft - Xbox",
-        }
+        self.definition().dataset_label
     }
 }
 
@@ -2491,13 +2732,35 @@ fn header_identifies_redump_game_dataset(
     if joined.contains("bios") {
         return false;
     }
-    let mentions_ps2 = joined.contains("playstation 2")
-        || joined.contains("playstation2")
-        || joined.contains("ps2");
     match system {
-        RedumpGameSystem::PlayStation2 => mentions_ps2,
-        RedumpGameSystem::PlayStation => joined.contains("playstation") && !mentions_ps2,
+        RedumpGameSystem::PlayStation => {
+            joined.contains("playstation")
+                && !joined.contains("playstation 2")
+                && !joined.contains("playstation2")
+                && !joined.contains("playstation 3")
+                && !joined.contains("playstation3")
+                && !joined.contains("playstation 4")
+                && !joined.contains("playstation4")
+                && !joined.contains("portable")
+                && !joined.contains("ps2")
+                && !joined.contains("ps3")
+                && !joined.contains("ps4")
+                && !joined.contains("psp")
+        }
+        RedumpGameSystem::PlayStation2 => {
+            joined.contains("playstation 2")
+                || joined.contains("playstation2")
+                || joined.contains("ps2")
+        }
         RedumpGameSystem::Xbox => joined.contains("xbox") && !joined.contains("360"),
+        RedumpGameSystem::Wii => {
+            joined.contains("wii") && !joined.contains("wii u") && !joined.contains("wiiu")
+        }
+        _ => system
+            .definition()
+            .header_markers
+            .iter()
+            .any(|marker| joined.contains(marker)),
     }
 }
 
@@ -3706,11 +3969,7 @@ mod tests {
     }
 
     fn redump_game_header(system: RedumpGameSystem) -> &'static str {
-        match system {
-            RedumpGameSystem::PlayStation => "Sony - PlayStation",
-            RedumpGameSystem::PlayStation2 => "Sony - PlayStation 2",
-            RedumpGameSystem::Xbox => "Microsoft - Xbox",
-        }
+        system.dataset_label()
     }
 
     /// A synthetic, self-hashing Redump ordinary game DAT body - deliberate
@@ -3726,7 +3985,7 @@ mod tests {
             use sha1::{Digest as _, Sha1};
             digest_hex(Sha1::digest(bytes))
         };
-        let header = redump_game_header(system);
+        let header = redump_game_header(system).replace('&', "&amp;");
         format!(
             r#"<?xml version="1.0"?>
 <datafile>
@@ -3782,24 +4041,16 @@ mod tests {
     }
 
     #[test]
-    fn typed_game_descriptor_uses_the_fixed_url_for_all_three_systems() {
-        for (system, slug, expected_url) in [
-            (
-                RedumpGameSystem::PlayStation,
-                "playstation",
-                "https://redump.info/datfile/psx",
-            ),
-            (
-                RedumpGameSystem::PlayStation2,
-                "playstation2",
-                "https://redump.info/datfile/ps2",
-            ),
-            (
-                RedumpGameSystem::Xbox,
-                "xbox",
-                "https://redump.info/datfile/xbox",
-            ),
-        ] {
+    fn typed_game_descriptor_uses_the_reviewed_url_table() {
+        for (system, slug, expected_url) in
+            REDUMP_GAME_SYSTEM_DEFINITIONS.iter().map(|definition| {
+                (
+                    definition.system,
+                    definition.source_key,
+                    format!("https://redump.info/datfile/{}", definition.url_slug),
+                )
+            })
+        {
             let descriptor = ManagedDatSourceDescriptor::redump_games(system).unwrap();
             assert_eq!(
                 descriptor.source_id().provider,
@@ -3815,6 +4066,45 @@ mod tests {
             );
             assert_eq!(system.fixed_url(), expected_url);
             descriptor.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn canonical_platform_support_is_explicit_and_fail_closed() {
+        for definition in REDUMP_GAME_SYSTEM_DEFINITIONS {
+            assert_eq!(
+                redump_managed_support(Some(definition.platform)),
+                RedumpManagedSupport::SupportedManaged(definition.system)
+            );
+        }
+        assert_eq!(
+            redump_managed_support(Some(IdentityPlatform::GameBoy)),
+            RedumpManagedSupport::NotRedumpAuthority
+        );
+        assert_eq!(
+            redump_managed_support(Some(IdentityPlatform::Other)),
+            RedumpManagedSupport::UnknownPlatform
+        );
+        assert_eq!(
+            redump_managed_support(None),
+            RedumpManagedSupport::UnknownPlatform
+        );
+    }
+
+    #[test]
+    fn canonical_aliases_are_normalised_before_redump_mapping() {
+        for (alias, expected) in [
+            ("psx", IdentityPlatform::PlayStation),
+            ("PlayStation 3", IdentityPlatform::PlayStation3),
+            ("sega dreamcast", IdentityPlatform::Dreamcast),
+            ("GC", IdentityPlatform::GameCube),
+            ("TurboGrafx-CD", IdentityPlatform::PcEngineCd),
+        ] {
+            assert!(matches!(
+                redump_managed_support(Some(IdentityPlatform::from_catalogue(Some(alias)))),
+                RedumpManagedSupport::SupportedManaged(system)
+                    if system.canonical_platform() == expected
+            ));
         }
     }
 
@@ -3862,21 +4152,18 @@ mod tests {
     fn arbitrary_redump_games_source_key_fails_validation() {
         let bogus = ManagedDatSourceId {
             provider: ManagedDatProvider::RedumpGames,
-            source_key: "saturn".to_string(),
+            source_key: "not-a-redump-system".to_string(),
         };
         assert!(
             bogus.validate().is_err(),
-            "an unproven system (e.g. Saturn) must never validate as a game-DAT source key"
+            "an unreviewed system must never validate as a game-DAT source key"
         );
     }
 
     #[test]
-    fn manual_and_disabled_policy_persist_for_all_three_game_systems() {
-        for system in [
-            RedumpGameSystem::PlayStation,
-            RedumpGameSystem::PlayStation2,
-            RedumpGameSystem::Xbox,
-        ] {
+    fn manual_and_disabled_policy_persist_for_all_reviewed_game_systems() {
+        for definition in REDUMP_GAME_SYSTEM_DEFINITIONS {
+            let system = definition.system;
             for policy in [
                 ManagedDatUpdatePolicy::Manual,
                 ManagedDatUpdatePolicy::Disabled,
@@ -3891,12 +4178,9 @@ mod tests {
     }
 
     #[test]
-    fn valid_raw_xml_dat_is_accepted_for_each_system() {
-        for system in [
-            RedumpGameSystem::PlayStation,
-            RedumpGameSystem::PlayStation2,
-            RedumpGameSystem::Xbox,
-        ] {
+    fn valid_raw_xml_dat_is_accepted_for_each_reviewed_system() {
+        for definition in REDUMP_GAME_SYSTEM_DEFINITIONS {
+            let system = definition.system;
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join(MANAGED_DAT_DIRECTORY);
             let body = redump_game_dat(system, "Some Game (USA)", &redump_game_bytes("raw"));

@@ -989,7 +989,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn redump_games_add_reload_and_policy_round_trip_for_all_three_systems() {
+    fn redump_games_add_reload_and_policy_round_trip_for_existing_systems() {
         let temp = tempfile::tempdir().unwrap();
         let config = temp.path().join("managed_dat_sources.toml");
         let mut sources = ManagedDatSources::new();
