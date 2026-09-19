@@ -188,17 +188,22 @@ pub fn expected_authoritative_coverage(platform_hint: Option<&str>) -> PlatformC
             ),
         }),
 
-        // Only these Redump game systems have a proven, current EmuWiz
-        // importer/provider contract. Do not infer other Redump systems from
-        // the fact that Redump publishes them upstream.
-        "PSX" | "PS2" | "Xbox" => Some(PlatformCoverageExpectation::ExpectedAuthoritativeSource {
-            platform: platform.to_string(),
-            source: source(
-                ExpectedAuthoritativeSource::Dat(DatEcosystem::Redump),
-                CoverageSourceRole::Primary,
-                CoverageRationale::SupportedOpticalDat,
-            ),
-        }),
+        // These are the reviewed Redump game systems represented by the
+        // current-main `RedumpGameSystem` table. Expectation is about the
+        // authoritative ecosystem, not whether every system currently has a
+        // managed downloader; acquisition mode remains a separate question
+        // in current main.
+        "PSX" | "PS2" | "PS3" | "PS4" | "PSP" | "Saturn" | "Dreamcast" | "Sega CD" | "GameCube"
+        | "Wii" | "WiiU" | "Xbox" | "Xbox360" | "3DO" | "PC-FX" | "PC Engine CD" | "Neo Geo CD" => {
+            Some(PlatformCoverageExpectation::ExpectedAuthoritativeSource {
+                platform: platform.to_string(),
+                source: source(
+                    ExpectedAuthoritativeSource::Dat(DatEcosystem::Redump),
+                    CoverageSourceRole::Primary,
+                    CoverageRationale::SupportedOpticalDat,
+                ),
+            })
+        }
 
         "Arcade" => Some(PlatformCoverageExpectation::MultipleCandidateSources {
             platform: platform.to_string(),
@@ -285,15 +290,33 @@ mod tests {
     }
 
     #[test]
-    fn optical_platforms_are_limited_to_proven_redump_systems() {
-        for platform in ["PSX", "PS2", "Xbox"] {
+    fn all_current_redump_systems_expect_redump_authority() {
+        for platform in [
+            "PSX",
+            "PS2",
+            "PS3",
+            "PS4",
+            "PSP",
+            "Saturn",
+            "Dreamcast",
+            "Sega CD",
+            "GameCube",
+            "Wii",
+            "WiiU",
+            "Xbox",
+            "Xbox360",
+            "3DO",
+            "PC-FX",
+            "PC Engine CD",
+            "Neo Geo CD",
+        ] {
             single_source(
                 Some(platform),
                 ExpectedAuthoritativeSource::Dat(DatEcosystem::Redump),
             );
         }
         assert!(matches!(
-            expected_authoritative_coverage(Some("Saturn")),
+            expected_authoritative_coverage(Some("Philips CD-i")),
             PlatformCoverageExpectation::NoKnownAuthoritativeSource { .. }
         ));
     }

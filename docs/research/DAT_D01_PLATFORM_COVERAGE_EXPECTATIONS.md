@@ -13,8 +13,10 @@ future D-02 coverage projection.
 
 - Supported cartridge families explicitly mapped by the current No-Intro
   importer expect `DatEcosystem::NoIntro`.
-- Only the proven PSX, PS2, and Original Xbox Redump contracts expect
-  `DatEcosystem::Redump`.
+- Redump expectation follows all 17 reviewed systems in current main's typed
+  `RedumpGameSystem` table. This records the authoritative ecosystem; current
+  acquisition support is a separate capability and remains unavailable for
+  some systems.
 - Arcade has official MAME listxml as its primary source and FBNeo as a
   supplementary supported source. Both are retained deterministically.
 - ScummVM expects the official detector evidence, not generic DAT matching.
