@@ -63,6 +63,10 @@ pub enum GeckoCodeWarningKind {
     /// The code body exceeded the fixed per-code bound. Blocking: later
     /// lines were not retained and must never be installed.
     TooManyLines,
+    /// A supported count-declared Gecko block does not contain all of its
+    /// declared continuation lines. Blocking: the incomplete sequence must
+    /// never be installed.
+    StructuralInvalid,
 }
 
 impl GeckoCodeWarningKind {
@@ -78,6 +82,7 @@ impl GeckoCodeWarningKind {
             Self::EmptyCode => "gecko_code_empty",
             Self::MissingName => "gecko_code_missing_name",
             Self::TooManyLines => "gecko_code_too_many_lines",
+            Self::StructuralInvalid => "gecko_code_structural_invalid",
         }
     }
 }
@@ -385,6 +390,15 @@ fn parse_gecko_codes(
                     raw_source: None,
                     detail: format!("code {:?} has no hex code lines", code.name),
                 });
+            } else if section_label.eq_ignore_ascii_case("gecko")
+                && let Some(detail) = validate_gecko_structure(&code.lines)
+            {
+                code.warnings.push(GeckoCodeWarning {
+                    kind: GeckoCodeWarningKind::StructuralInvalid,
+                    line: code.source_line,
+                    raw_source: code.lines.first().cloned(),
+                    detail,
+                });
             }
             codes.push(code);
         }
@@ -484,6 +498,36 @@ pub(crate) fn is_gecko_code_line(line: &str) -> bool {
 
 fn is_hex8(value: &str) -> bool {
     value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Validates the one count-declared Gecko block form for which this reader
+/// has repository-backed semantics. `C2` starts an ASM block and its second
+/// word declares the number of continuation lines. The block must contain
+/// that many lines after the header; all other Gecko opcode families remain
+/// opaque and are deliberately not guessed here.
+fn validate_gecko_structure(lines: &[String]) -> Option<String> {
+    let first = lines.first()?.split_once(' ')?.0;
+    if !first
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("C2"))
+    {
+        return None;
+    }
+    let mut fields = lines[0].split_whitespace();
+    let _header = fields.next()?;
+    let declared = u32::from_str_radix(fields.next()?, 16).ok()? as usize;
+    if declared > MAX_GECKO_CODE_LINES {
+        return Some(format!(
+            "C2 Gecko block declares {declared} continuation lines, exceeding the supported limit"
+        ));
+    }
+    let available = lines.len().saturating_sub(1);
+    if declared > available {
+        return Some(format!(
+            "C2 Gecko block declares {declared} continuation lines but only {available} are present"
+        ));
+    }
+    None
 }
 
 /// Renders `[Gecko_Enabled]\n$Name\n...` for exactly the given names, in

@@ -228,6 +228,63 @@ fn a_malformed_code_line_is_reported_not_silently_dropped_or_repaired() {
 }
 
 #[test]
+fn count_declared_gecko_block_requires_all_continuation_lines() {
+    let valid = parse_dolphin_ini(
+        "[Gecko]\n$Block\nC2123456 00000001\n60000000 00000000\n",
+    );
+    assert!(valid.gecko_codes[0].is_selectable());
+
+    let truncated = parse_dolphin_ini(
+        "[Gecko]\n$Block\nC2123456 00000002\n60000000 00000000\n",
+    );
+    let code = &truncated.gecko_codes[0];
+    assert!(!code.is_selectable());
+    assert!(code.warnings.iter().any(|warning| {
+        warning.kind == GeckoCodeWarningKind::StructuralInvalid
+            && warning.detail.contains("declares 2")
+            && warning.detail.contains("only 1")
+    }));
+}
+
+#[test]
+fn structural_failure_does_not_poison_a_neighbouring_code() {
+    let document = parse_dolphin_ini(
+        "[Gecko]\n$Broken block\nC2123456 00000002\n60000000 00000000\n$Valid\nAABBCCDD 11223344\n",
+    );
+    assert!(!document.gecko_codes[0].is_selectable());
+    assert!(document.gecko_codes[1].is_selectable());
+    assert_eq!(document.selectable_gecko_count(), 1);
+}
+
+#[test]
+fn excessive_declared_continuation_count_is_bounded_and_deterministic() {
+    let text = "[Gecko]\n$Huge block\nC2123456 FFFFFFFF\n60000000 00000000\n";
+    let first = parse_dolphin_ini(text);
+    let second = parse_dolphin_ini(text);
+    assert_eq!(first, second);
+    assert!(!first.gecko_codes[0].is_selectable());
+    assert!(first.gecko_codes[0].warnings.iter().any(|warning| {
+        warning.kind == GeckoCodeWarningKind::StructuralInvalid
+            && warning.detail.contains("exceeding the supported limit")
+    }));
+}
+
+#[test]
+fn structural_failure_cannot_reach_gecko_merge() {
+    let document = parse_dolphin_ini("[Gecko]\n$Existing\nAABBCCDD 11223344\n");
+    let provider = parse_dolphin_ini(
+        "[Gecko]\n$Broken block\nC2123456 00000002\n60000000 00000000\n",
+    );
+    let error = merge_external_gecko_codes(
+        &document,
+        &provider.gecko_codes,
+        &["Broken block".to_string()],
+    )
+    .expect_err("structurally incomplete codes must not be installable");
+    assert!(error.detail.contains("malformed"));
+}
+
+#[test]
 fn a_code_with_no_name_is_reported() {
     let text = "[Gecko]\n$\nAABBCCDD 11223344\n";
     let document = parse_dolphin_ini(text);
