@@ -4274,10 +4274,22 @@ mod tests {
             let root = temp.path().join(MANAGED_DAT_DIRECTORY);
             let body = redump_game_dat(system, "Some Game (USA)", &redump_game_bytes("raw"));
             let outcome = install_redump_games(system, root, body);
-            assert!(
-                matches!(outcome, ManagedDatUpdateOutcome::Updated { .. }),
-                "{system:?}: expected Updated, got {outcome:?}"
-            );
+            match system.acquisition_mode() {
+                RedumpAcquisitionMode::RemoteManaged => assert!(
+                    matches!(outcome, ManagedDatUpdateOutcome::Updated { .. }),
+                    "{system:?}: expected Updated, got {outcome:?}"
+                ),
+                _ => assert!(
+                    matches!(
+                        outcome,
+                        ManagedDatUpdateOutcome::Failed {
+                            kind: ManagedDatUpdateFailureKind::UnsupportedAcquisition,
+                            ..
+                        }
+                    ),
+                    "{system:?}: expected unsupported acquisition, got {outcome:?}"
+                ),
+            }
         }
     }
 
