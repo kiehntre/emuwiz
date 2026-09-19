@@ -96,6 +96,7 @@ pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
 pub mod input_projection;
+pub mod media_handoff;
 pub mod integration;
 pub mod mame_command;
 pub mod mame_execution;
