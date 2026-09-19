@@ -100,6 +100,22 @@ pub struct NoIntroPackImportReport {
     pub rejected: Vec<RejectedNoIntroPackMember>,
 }
 
+/// The result of activating a staged pack.  Activation always invalidates
+/// previously calculated verification results; callers must run verification
+/// again before presenting the new source as checked.
+#[derive(Debug, Clone)]
+pub struct NoIntroPackActivationReport {
+    pub import: NoIntroPackImportReport,
+    pub verification: crate::identity_source::managed_snapshot::VerificationFreshness,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoIntroPackComparison {
+    NoActiveSnapshot,
+    SameSnapshot,
+    DifferentSnapshot,
+}
+
 /// The non-mutating result of validating a user-supplied pack.  This contains
 /// only metadata; the staged DAT files are removed before this is returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +151,9 @@ pub enum NoIntroPackClassification {
 }
 
 impl NoIntroPackClassification {
-    fn from_variants(variants: impl IntoIterator<Item = super::import::NoIntroVariant>) -> Self {
+    pub fn from_variants(
+        variants: impl IntoIterator<Item = super::import::NoIntroVariant>,
+    ) -> Self {
         let mut standard = false;
         let mut aftermarket = false;
         let mut bios = false;
@@ -170,6 +188,15 @@ struct NoIntroPackState {
     #[serde(default)]
     snapshot_sha256: Option<String>,
     accepted_members: Vec<NoIntroPackStateMember>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NoIntroPackStagedState {
+    schema_version: u32,
+    pack_sha256: String,
+    snapshot_sha256: String,
+    accepted_members: Vec<NoIntroPackStateMember>,
+    rejected: Vec<RejectedNoIntroPackMember>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,11 +241,38 @@ pub fn import_no_intro_pack(
     import_no_intro_pack_at(path, &root)
 }
 
+/// Browser-assisted import seam: validate and retain a candidate, but leave
+/// the active source untouched until explicit activation.
+pub fn stage_no_intro_pack(path: &Path) -> Result<NoIntroPackImportReport, NoIntroPackImportError> {
+    let root = crate::app_dirs::data_path(PACK_DIRECTORY).map_err(|error| {
+        NoIntroPackImportError::State(format!("cannot resolve application data path: {error}"))
+    })?;
+    stage_no_intro_pack_at(path, &root)
+}
+
 /// Testable/local-pack seam. `storage_root` is the complete app-owned store
 /// for this source and may point at a temporary directory in tests.
 pub fn import_no_intro_pack_at(
     path: &Path,
     storage_root: &Path,
+) -> Result<NoIntroPackImportReport, NoIntroPackImportError> {
+    publish_no_intro_pack_at(path, storage_root, true)
+}
+
+/// Validates and publishes a content-addressed candidate without changing
+/// the active No-Intro source.  The candidate is retained in a separate
+/// staged record until [`activate_staged_no_intro_pack_at`] is called.
+pub fn stage_no_intro_pack_at(
+    path: &Path,
+    storage_root: &Path,
+) -> Result<NoIntroPackImportReport, NoIntroPackImportError> {
+    publish_no_intro_pack_at(path, storage_root, false)
+}
+
+fn publish_no_intro_pack_at(
+    path: &Path,
+    storage_root: &Path,
+    activate: bool,
 ) -> Result<NoIntroPackImportReport, NoIntroPackImportError> {
     let pack_sha256 = validate_pack(path)?;
 
@@ -237,13 +291,17 @@ pub fn import_no_intro_pack_at(
         );
         if snapshot_is_complete(&snapshot_path, &state.accepted_members) {
             let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
-            return Ok(NoIntroPackImportReport {
+            let report = NoIntroPackImportReport {
                 status: NoIntroPackImportStatus::Unchanged,
                 pack_sha256,
                 snapshot_path,
                 accepted,
                 rejected: Vec::new(),
-            });
+            };
+            if !activate {
+                write_staged_state(storage_root, &report)?;
+            }
+            return Ok(report);
         }
     }
 
@@ -314,32 +372,268 @@ pub fn import_no_intro_pack_at(
     let state = NoIntroPackState {
         schema_version: NO_INTRO_PACK_SCHEMA_VERSION,
         pack_sha256: pack_sha256.clone(),
-        pack_sha256s,
+        pack_sha256s: pack_sha256s.clone(),
         snapshot_sha256: Some(snapshot_id.clone()),
-        accepted_members,
+        accepted_members: accepted_members.clone(),
     };
-    let body = serde_json::to_string_pretty(&state)
-        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
-    if let Err(error) = crate::atomic_write_text(&state_path, &format!("{body}\n")) {
-        return Err(NoIntroPackImportError::State(error.to_string()));
+    let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
+    let report = NoIntroPackImportReport {
+        status: NoIntroPackImportStatus::Updated,
+        pack_sha256: pack_sha256.clone(),
+        snapshot_path,
+        accepted,
+        rejected: rejected.clone(),
+    };
+    if activate {
+        write_active_state(storage_root, &state)?;
+        prune_old_snapshots(storage_root, &snapshot_id);
+        let _ = super::managed_lifecycle::register_no_intro_pack_at(
+            storage_root,
+            &pack_sha256,
+            &snapshot_id,
+            &report.accepted,
+            &rejected,
+        )?;
+    } else {
+        write_staged_state(storage_root, &report)?;
     }
-    prune_old_snapshots(storage_root, &snapshot_id);
+    Ok(report)
+}
 
+fn write_active_state(
+    storage_root: &Path,
+    state: &NoIntroPackState,
+) -> Result<(), NoIntroPackImportError> {
+    let body = serde_json::to_string_pretty(state)
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
+    crate::atomic_write_text(&storage_root.join("state.json"), &format!("{body}\n"))
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))
+}
+
+fn write_staged_state(
+    storage_root: &Path,
+    report: &NoIntroPackImportReport,
+) -> Result<(), NoIntroPackImportError> {
+    let accepted_members = report
+        .accepted
+        .iter()
+        .map(|source| NoIntroPackStateMember {
+            member: source.artifact_name.clone(),
+            artifact_sha256: source.artifact_sha256.clone(),
+            system_name: source.system_name.clone(),
+            variant: source.variant,
+            upstream_version: source.upstream_version.clone(),
+            entry_count: source.entry_count,
+            rom_count: source.rom_count,
+        })
+        .collect();
+    let staged = NoIntroPackStagedState {
+        schema_version: NO_INTRO_PACK_SCHEMA_VERSION,
+        pack_sha256: report.pack_sha256.clone(),
+        snapshot_sha256: report
+            .snapshot_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| NoIntroPackImportError::State("staged snapshot has no id".into()))?
+            .to_string(),
+        accepted_members,
+        rejected: report.rejected.clone(),
+    };
+    let body = serde_json::to_string_pretty(&staged)
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
+    crate::atomic_write_text(&storage_root.join("staged.json"), &format!("{body}\n"))
+        .map_err(|error| NoIntroPackImportError::State(error.to_string()))
+}
+
+/// Activates the staged candidate, if its content-addressed payload is still
+/// complete.  No source DAT is rewritten and no network is involved.
+pub fn activate_staged_no_intro_pack_at(
+    storage_root: &Path,
+) -> Result<NoIntroPackActivationReport, NoIntroPackImportError> {
+    let staged_path = storage_root.join("staged.json");
+    let staged: NoIntroPackStagedState = serde_json::from_str(
+        &fs::read_to_string(&staged_path).map_err(|error| io_error(&staged_path, error))?,
+    )
+    .map_err(|error| NoIntroPackImportError::State(error.to_string()))?;
+    if staged.schema_version != NO_INTRO_PACK_SCHEMA_VERSION {
+        return Err(NoIntroPackImportError::State(
+            "unsupported staged No-Intro pack schema".into(),
+        ));
+    }
+    let snapshot_path = storage_root.join("snapshots").join(&staged.snapshot_sha256);
+    if !snapshot_is_complete(&snapshot_path, &staged.accepted_members) {
+        return Err(NoIntroPackImportError::State(
+            "staged No-Intro snapshot is incomplete".into(),
+        ));
+    }
+    let previous = load_state(&storage_root.join("state.json")).ok();
+    let mut pack_sha256s = previous
+        .as_ref()
+        .map(|state| state.pack_sha256s.clone())
+        .unwrap_or_default();
+    if let Some(state) = previous.as_ref()
+        && !state.pack_sha256.is_empty()
+    {
+        pack_sha256s.push(state.pack_sha256.clone());
+    }
+    pack_sha256s.push(staged.pack_sha256.clone());
+    pack_sha256s.sort();
+    pack_sha256s.dedup();
+    let state = NoIntroPackState {
+        schema_version: NO_INTRO_PACK_SCHEMA_VERSION,
+        pack_sha256: staged.pack_sha256.clone(),
+        pack_sha256s,
+        snapshot_sha256: Some(staged.snapshot_sha256.clone()),
+        accepted_members: staged.accepted_members.clone(),
+    };
+    write_active_state(storage_root, &state)?;
     let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
     let _ = super::managed_lifecycle::register_no_intro_pack_at(
         storage_root,
-        &pack_sha256,
-        &snapshot_id,
+        &staged.pack_sha256,
+        &staged.snapshot_sha256,
         &accepted,
-        &rejected,
+        &staged.rejected,
     )?;
-    Ok(NoIntroPackImportReport {
-        status: NoIntroPackImportStatus::Updated,
-        pack_sha256,
-        snapshot_path,
-        accepted,
-        rejected,
+    fs::remove_file(&staged_path).map_err(|error| io_error(&staged_path, error))?;
+    Ok(NoIntroPackActivationReport {
+        import: NoIntroPackImportReport {
+            status: NoIntroPackImportStatus::Updated,
+            pack_sha256: staged.pack_sha256,
+            snapshot_path,
+            accepted,
+            rejected: staged.rejected,
+        },
+        verification: crate::identity_source::managed_snapshot::VerificationFreshness::NeedsRecheck,
     })
+}
+
+/// Restores the lifecycle-selected predecessor without deleting the newer
+/// snapshot. The returned verification marker is intentionally the same as a
+/// fresh activation: ROM verification must be rerun against the restored
+/// source.
+pub fn rollback_no_intro_pack_at(
+    storage_root: &Path,
+) -> Result<NoIntroPackActivationReport, NoIntroPackImportError> {
+    let state_path = storage_root.join("state.json");
+    let current = load_state(&state_path)?;
+    let snapshots = super::managed_lifecycle::load_no_intro_pack_snapshots_at(storage_root)?;
+    let plan = super::managed_lifecycle::plan_no_intro_rollback(&snapshots, &current.pack_sha256)
+        .ok_or_else(|| {
+        NoIntroPackImportError::State("no safe No-Intro rollback is available".into())
+    })?;
+    let target = snapshots
+        .iter()
+        .find(|snapshot| snapshot.pack_sha256 == plan.to_pack_sha256)
+        .ok_or_else(|| NoIntroPackImportError::State("rollback target is missing".into()))?;
+    let members: Vec<_> = target
+        .members
+        .iter()
+        .map(|member| NoIntroPackStateMember {
+            member: member.source_member_name.clone(),
+            artifact_sha256: member.artifact_sha256.clone(),
+            system_name: member.system_name.clone(),
+            variant: member.variant,
+            upstream_version: member.upstream_version.clone(),
+            entry_count: 0,
+            rom_count: 0,
+        })
+        .collect();
+    let snapshot_path = storage_root.join("snapshots").join(&target.snapshot_sha256);
+    if !snapshot_is_complete(&snapshot_path, &members) {
+        return Err(NoIntroPackImportError::State(
+            "rollback target snapshot is incomplete".into(),
+        ));
+    }
+    let state = NoIntroPackState {
+        schema_version: NO_INTRO_PACK_SCHEMA_VERSION,
+        pack_sha256: target.pack_sha256.clone(),
+        pack_sha256s: current.pack_sha256s,
+        snapshot_sha256: Some(target.snapshot_sha256.clone()),
+        accepted_members: members,
+    };
+    write_active_state(storage_root, &state)?;
+    let accepted = load_sources(&snapshot_path, &state.accepted_members)?;
+    let _ = super::managed_lifecycle::register_no_intro_pack_at(
+        storage_root,
+        &target.pack_sha256,
+        &target.snapshot_sha256,
+        &accepted,
+        &target.rejected,
+    )?;
+    Ok(NoIntroPackActivationReport {
+        import: NoIntroPackImportReport {
+            status: NoIntroPackImportStatus::Updated,
+            pack_sha256: target.pack_sha256.clone(),
+            snapshot_path,
+            accepted,
+            rejected: target.rejected.clone(),
+        },
+        verification: crate::identity_source::managed_snapshot::VerificationFreshness::NeedsRecheck,
+    })
+}
+
+/// Compares a staged content-addressed snapshot with the active pointer.
+pub fn compare_staged_no_intro_pack_at(
+    storage_root: &Path,
+) -> Result<Option<NoIntroPackComparison>, NoIntroPackImportError> {
+    let staged_path = storage_root.join("staged.json");
+    let staged: NoIntroPackStagedState = match fs::read_to_string(&staged_path) {
+        Ok(body) => serde_json::from_str(&body)
+            .map_err(|error| NoIntroPackImportError::State(error.to_string()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(&staged_path, error)),
+    };
+    let Some(active) = load_state(&storage_root.join("state.json")).ok() else {
+        return Ok(Some(NoIntroPackComparison::NoActiveSnapshot));
+    };
+    Ok(Some(
+        if active.snapshot_sha256.as_deref() == Some(staged.snapshot_sha256.as_str()) {
+            NoIntroPackComparison::SameSnapshot
+        } else {
+            NoIntroPackComparison::DifferentSnapshot
+        },
+    ))
+}
+
+/// Loads a persisted staged candidate without activating or reparsing the
+/// active source. A damaged candidate is reported rather than shown as ready.
+pub fn load_staged_no_intro_pack_summary_at(
+    storage_root: &Path,
+) -> Result<Option<NoIntroPackInspection>, NoIntroPackImportError> {
+    let staged_path = storage_root.join("staged.json");
+    let staged: NoIntroPackStagedState = match fs::read_to_string(&staged_path) {
+        Ok(body) => serde_json::from_str(&body)
+            .map_err(|error| NoIntroPackImportError::State(error.to_string()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(&staged_path, error)),
+    };
+    let snapshot_path = storage_root.join("snapshots").join(&staged.snapshot_sha256);
+    if !snapshot_is_complete(&snapshot_path, &staged.accepted_members) {
+        return Err(NoIntroPackImportError::State(
+            "staged No-Intro snapshot is incomplete".into(),
+        ));
+    }
+    Ok(Some(NoIntroPackInspection {
+        pack_sha256: staged.pack_sha256,
+        classification: NoIntroPackClassification::from_variants(
+            staged.accepted_members.iter().map(|member| member.variant),
+        ),
+        accepted: staged
+            .accepted_members
+            .into_iter()
+            .map(|member| NoIntroPackMemberInspection {
+                member: member.member,
+                system_name: member.system_name,
+                variant: member.variant,
+                upstream_version: member.upstream_version,
+                artifact_sha256: member.artifact_sha256,
+                entry_count: member.entry_count,
+                rom_count: member.rom_count,
+            })
+            .collect(),
+        rejected: staged.rejected,
+    }))
 }
 
 /// Validates a pack without publishing a snapshot or changing any managed

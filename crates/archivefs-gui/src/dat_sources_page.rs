@@ -97,8 +97,11 @@ use archivefs_core::dat::updates::{
 };
 use archivefs_core::identity_source::no_intro::{
     NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportStatus,
-    NoIntroPackInspection, import_no_intro_pack, inspect_no_intro_pack,
-    load_current_no_intro_pack_summary, load_no_intro_pack_snapshots_at, report_no_intro_lifecycle,
+    NoIntroPackComparison, NoIntroPackInspection, activate_staged_no_intro_pack_at,
+    compare_staged_no_intro_pack_at, inspect_no_intro_pack,
+    load_current_no_intro_pack_summary, load_no_intro_pack_snapshots_at,
+    load_staged_no_intro_pack_summary_at, report_no_intro_lifecycle, rollback_no_intro_pack_at,
+    stage_no_intro_pack,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -533,6 +536,8 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) tosec_last_apply: Option<TosecApplyView>,
     pub(crate) no_intro_selected_pack: Option<(String, u64)>,
     pub(crate) no_intro_inspection: Option<NoIntroPackInspection>,
+    pub(crate) no_intro_staged: Option<NoIntroPackInspection>,
+    pub(crate) no_intro_staged_comparison: Option<NoIntroPackComparison>,
     pub(crate) no_intro_installed: Option<NoIntroPackInspection>,
     /// Read-only managed No-Intro lifecycle report. This is loaded once when
     /// the page state opens; rendering never walks DATs or reconstructs it.
@@ -1661,7 +1666,9 @@ pub(crate) enum DatSourcesPageAction {
         path: PathBuf,
     },
     InspectNoIntroPack,
-    ImportNoIntroPack,
+    StageNoIntroPack,
+    ActivateNoIntroPack,
+    RollbackNoIntroPack,
     AddFolder {
         path: PathBuf,
     },
@@ -2697,6 +2704,8 @@ pub(crate) struct DatSourcesPageState {
     tosec_last_apply: Option<TosecApplyView>,
     no_intro_selected_pack: Option<PathBuf>,
     no_intro_inspection: Option<NoIntroPackInspection>,
+    no_intro_staged: Option<NoIntroPackInspection>,
+    no_intro_staged_comparison: Option<NoIntroPackComparison>,
     no_intro_installed: Option<NoIntroPackInspection>,
     no_intro_status: Option<archivefs_core::identity_source::no_intro::ManagedNoIntroStatusReport>,
     no_intro_status_error: Option<String>,
@@ -2837,6 +2846,12 @@ impl DatSourcesPageState {
             managed_root,
         );
         state.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
+        state.no_intro_staged = archivefs_core::app_dirs::data_path("no_intro_pack")
+            .ok()
+            .and_then(|root| load_staged_no_intro_pack_summary_at(&root).ok().flatten());
+        state.no_intro_staged_comparison = archivefs_core::app_dirs::data_path("no_intro_pack")
+            .ok()
+            .and_then(|root| compare_staged_no_intro_pack_at(&root).ok().flatten());
         let (status, status_error) = load_no_intro_lifecycle_status();
         state.no_intro_status = status;
         state.no_intro_status_error = status_error;
@@ -2948,6 +2963,8 @@ impl DatSourcesPageState {
             tosec_last_apply: None,
             no_intro_selected_pack: None,
             no_intro_inspection: None,
+            no_intro_staged: None,
+            no_intro_staged_comparison: None,
             no_intro_installed: None,
             no_intro_status: None,
             no_intro_status_error: None,
@@ -3559,7 +3576,9 @@ impl DatSourcesPageState {
                 self.no_intro_import_status = None;
             }
             DatSourcesPageAction::InspectNoIntroPack => self.inspect_no_intro_pack(),
-            DatSourcesPageAction::ImportNoIntroPack => self.import_no_intro_pack(),
+            DatSourcesPageAction::StageNoIntroPack => self.stage_no_intro_pack(),
+            DatSourcesPageAction::ActivateNoIntroPack => self.activate_no_intro_pack(),
+            DatSourcesPageAction::RollbackNoIntroPack => self.rollback_no_intro_pack(),
             DatSourcesPageAction::AddFolder { path } => self.add(path, DatSourceKind::Folder),
             DatSourcesPageAction::SetEnabled { id, enabled } => {
                 if let Some(entry) = self.draft.get_mut(&id) {
@@ -4261,18 +4280,39 @@ impl DatSourcesPageState {
         }
     }
 
-    fn import_no_intro_pack(&mut self) {
+    fn stage_no_intro_pack(&mut self) {
         self.no_intro_action_error = None;
         let Some(path) = self.no_intro_selected_pack.as_deref() else {
             self.no_intro_action_error = Some("Choose a No-Intro ZIP first.".to_string());
             return;
         };
-        match import_no_intro_pack(path) {
+        match stage_no_intro_pack(path) {
             Ok(report) => {
                 self.no_intro_import_status = Some(report.status);
+                self.no_intro_staged = Some(inspection_from_import_report(&report));
+                self.no_intro_staged_comparison = archivefs_core::app_dirs::data_path("no_intro_pack")
+                    .ok()
+                    .and_then(|root| compare_staged_no_intro_pack_at(&root).ok().flatten());
+            }
+            Err(error) => self.no_intro_action_error = Some(error.to_string()),
+        }
+    }
+
+    fn activate_no_intro_pack(&mut self) {
+        self.no_intro_action_error = None;
+        let root = match archivefs_core::app_dirs::data_path("no_intro_pack") {
+            Ok(root) => root,
+            Err(error) => {
+                self.no_intro_action_error = Some(error.to_string());
+                return;
+            }
+        };
+        match activate_staged_no_intro_pack_at(&root) {
+            Ok(report) => {
+                self.no_intro_import_status = Some(report.import.status);
+                self.no_intro_staged = None;
+                self.no_intro_staged_comparison = None;
                 self.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
-                // Refresh the read-only managed lifecycle projection immediately so the
-                // result of this import is visible without reopening DAT Sources.
                 let (status, status_error) = load_no_intro_lifecycle_status();
                 self.no_intro_status = status;
                 self.no_intro_status_error = status_error;
@@ -4289,13 +4329,66 @@ impl DatSourcesPageState {
                 for id in old_pack_ids {
                     let _ = self.draft.remove(&id);
                 }
-                for source in report.accepted {
+                for source in report.import.accepted {
                     if self
                         .draft
                         .entries()
                         .iter()
                         .any(|entry| entry.path == source.artifact_path)
                     {
+                        continue;
+                    }
+                    let entry = DatSourceEntry {
+                        display_name: format!("No-Intro: {}", source.system_name),
+                        origin: Some("browser-assisted No-Intro pack import".to_string()),
+                        ..DatSourceEntry::new(
+                            self.draft.suggest_id(&source.artifact_path),
+                            format!("No-Intro: {}", source.system_name),
+                            source.artifact_path,
+                            DatSourceKind::File,
+                        )
+                    };
+                    if let Err(error) = self.draft.add(entry) {
+                        self.no_intro_action_error = Some(error.to_string());
+                        break;
+                    }
+                }
+                self.save();
+            }
+            Err(error) => self.no_intro_action_error = Some(error.to_string()),
+        }
+    }
+
+    fn rollback_no_intro_pack(&mut self) {
+        self.no_intro_action_error = None;
+        let root = match archivefs_core::app_dirs::data_path("no_intro_pack") {
+            Ok(root) => root,
+            Err(error) => {
+                self.no_intro_action_error = Some(error.to_string());
+                return;
+            }
+        };
+        match rollback_no_intro_pack_at(&root) {
+            Ok(report) => {
+                self.no_intro_import_status = Some(report.import.status);
+                self.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
+                let (status, status_error) = load_no_intro_lifecycle_status();
+                self.no_intro_status = status;
+                self.no_intro_status_error = status_error;
+                let old_pack_ids: Vec<String> = self
+                    .draft
+                    .entries()
+                    .iter()
+                    .filter(|entry| {
+                        entry.origin.as_deref() == Some("browser-assisted No-Intro pack import")
+                    })
+                    .map(|entry| entry.id.clone())
+                    .collect();
+                for id in old_pack_ids {
+                    let _ = self.draft.remove(&id);
+                }
+                for source in report.import.accepted {
+                    if self.draft.entries().iter().any(|entry| entry.path == source.artifact_path) {
                         continue;
                     }
                     let entry = DatSourceEntry {
@@ -5625,6 +5718,8 @@ impl DatSourcesPageState {
                 })
             }),
             no_intro_inspection: self.no_intro_inspection.clone(),
+            no_intro_staged: self.no_intro_staged.clone(),
+            no_intro_staged_comparison: self.no_intro_staged_comparison,
             no_intro_installed: self.no_intro_installed.clone(),
             no_intro_status: self.no_intro_status.clone(),
             no_intro_status_error: self.no_intro_status_error.clone(),
@@ -7732,7 +7827,9 @@ fn show_evidence_acquisition_section(
                     action = Some(DatSourcesPageAction::InspectNoIntroPack);
                 }
             }
-            show_no_intro_lifecycle_status(ui, view);
+            if let Some(lifecycle_action) = show_no_intro_lifecycle_status(ui, view) {
+                action = Some(lifecycle_action);
+            }
         });
 
         widgets::card(&mut columns[1], |ui| {
@@ -7849,18 +7946,50 @@ fn show_evidence_acquisition_section(
                 });
             }
             ui.label(egui::RichText::new(
-                "Inspection is read-only. Nothing is installed until you explicitly import this pack.",
+                "Inspection is read-only. Stage this validated pack first; activation is a separate explicit step.",
             ).color(theme::muted(ui)).small());
             if widgets::action_button(
                 ui,
-                "Import validated pack",
+                "Stage validated pack",
                 widgets::ActionStyle::Primary,
                 !view.background_busy,
             )
             .clicked()
                 && action.is_none()
             {
-                action = Some(DatSourcesPageAction::ImportNoIntroPack);
+                action = Some(DatSourcesPageAction::StageNoIntroPack);
+            }
+        });
+    }
+    if let Some(staged) = &view.no_intro_staged {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Staged No-Intro update").strong());
+            ui.label(format!(
+                "{} · {} valid DAT(s) · version signals retained. The active source has not changed.",
+                no_intro_classification_label(staged.classification),
+                staged.accepted.len()
+            ));
+            let comparison = match view.no_intro_staged_comparison {
+                Some(NoIntroPackComparison::NoActiveSnapshot) => "No active snapshot exists yet.",
+                Some(NoIntroPackComparison::SameSnapshot) => "This staged content matches the active snapshot.",
+                Some(NoIntroPackComparison::DifferentSnapshot) => "This staged content differs from the active snapshot.",
+                None => "The staged content has not been compared with an active snapshot.",
+            };
+            ui.label(comparison);
+            ui.label(egui::RichText::new(
+                "Review the staged release, then activate it explicitly. Activation marks existing verification for re-check.",
+            ).color(theme::muted(ui)).small());
+            if widgets::action_button(
+                ui,
+                "Activate staged pack",
+                widgets::ActionStyle::Primary,
+                !view.background_busy,
+            )
+            .clicked()
+                && action.is_none()
+            {
+                action = Some(DatSourcesPageAction::ActivateNoIntroPack);
             }
         });
     }
@@ -7886,7 +8015,11 @@ fn show_evidence_acquisition_section(
 /// Compact projection of the managed No-Intro lifecycle.  This deliberately
 /// reports imported state, not remote freshness: EmuWiz does not query
 /// DAT-o-MATIC and cannot honestly claim that a source is "up to date".
-fn show_no_intro_lifecycle_status(ui: &mut egui::Ui, view: &DatSourcesPageView) {
+fn show_no_intro_lifecycle_status(
+    ui: &mut egui::Ui,
+    view: &DatSourcesPageView,
+) -> Option<DatSourcesPageAction> {
+    let mut action = None;
     let Some(report) = &view.no_intro_status else {
         if let Some(error) = &view.no_intro_status_error {
             ui.label(
@@ -7895,7 +8028,7 @@ fn show_no_intro_lifecycle_status(ui: &mut egui::Ui, view: &DatSourcesPageView) 
                     .small(),
             );
         }
-        return;
+        return None;
     };
     ui.add_space(6.0);
     ui.label(egui::RichText::new("Managed No-Intro sources").strong());
@@ -7967,6 +8100,17 @@ fn show_no_intro_lifecycle_status(ui: &mut egui::Ui, view: &DatSourcesPageView) 
                 .small(),
             );
         }
+        if platform.rollback_available
+            && widgets::action_button(
+                ui,
+                "Restore previous snapshot",
+                widgets::ActionStyle::Quiet,
+                !view.background_busy,
+            )
+            .clicked()
+        {
+            action = Some(DatSourcesPageAction::RollbackNoIntroPack);
+        }
     }
     if let Some(status) = view.no_intro_import_status {
         let message = match status {
@@ -7979,6 +8123,7 @@ fn show_no_intro_lifecycle_status(ui: &mut egui::Ui, view: &DatSourcesPageView) 
                 .small(),
         );
     }
+    action
 }
 
 fn choose_no_intro_pack() -> Option<PathBuf> {
@@ -8005,6 +8150,33 @@ fn no_intro_classification_label(classification: NoIntroPackClassification) -> &
         NoIntroPackClassification::Bios => "No-Intro BIOS",
         NoIntroPackClassification::Mixed => "Mixed No-Intro pack",
         NoIntroPackClassification::Unknown => "No-Intro pack with unknown variant",
+    }
+}
+
+fn inspection_from_import_report(
+    report: &archivefs_core::identity_source::no_intro::NoIntroPackImportReport,
+) -> NoIntroPackInspection {
+    NoIntroPackInspection {
+        pack_sha256: report.pack_sha256.clone(),
+        classification: NoIntroPackClassification::from_variants(
+            report.accepted.iter().map(|source| source.variant),
+        ),
+        accepted: report
+            .accepted
+            .iter()
+            .map(
+                |source| archivefs_core::identity_source::no_intro::NoIntroPackMemberInspection {
+                    member: source.artifact_name.clone(),
+                    system_name: source.system_name.clone(),
+                    variant: source.variant,
+                    upstream_version: source.upstream_version.clone(),
+                    artifact_sha256: source.artifact_sha256.clone(),
+                    entry_count: source.entry_count,
+                    rom_count: source.rom_count,
+                },
+            )
+            .collect(),
+        rejected: report.rejected.clone(),
     }
 }
 

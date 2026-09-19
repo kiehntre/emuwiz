@@ -52,12 +52,15 @@ pub use managed_lifecycle::{
     register_no_intro_pack_at, resolve_no_intro_current,
 };
 pub use pack_import::{
-    NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportError,
-    NoIntroPackImportReport, NoIntroPackImportStatus, NoIntroPackInspection,
-    NoIntroPackInstalledSummary, NoIntroPackMemberInspection, RejectedNoIntroPackMember,
-    import_no_intro_pack, import_no_intro_pack_at, inspect_no_intro_pack, inspect_no_intro_pack_at,
-    load_current_no_intro_pack, load_current_no_intro_pack_at, load_current_no_intro_pack_summary,
-    load_current_no_intro_pack_summary_at,
+    NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackActivationReport, NoIntroPackClassification,
+    NoIntroPackComparison, NoIntroPackImportError, NoIntroPackImportReport,
+    NoIntroPackImportStatus, NoIntroPackInspection, NoIntroPackInstalledSummary,
+    NoIntroPackMemberInspection, RejectedNoIntroPackMember, activate_staged_no_intro_pack_at,
+    compare_staged_no_intro_pack_at, import_no_intro_pack, import_no_intro_pack_at,
+    inspect_no_intro_pack, inspect_no_intro_pack_at, load_current_no_intro_pack,
+    load_current_no_intro_pack_at, load_current_no_intro_pack_summary,
+    load_current_no_intro_pack_summary_at, load_staged_no_intro_pack_summary_at,
+    rollback_no_intro_pack_at, stage_no_intro_pack, stage_no_intro_pack_at,
 };
 pub use registry::{
     NoIntroSourceLabel, NoIntroSourceSelection, no_intro_selection_fingerprint,

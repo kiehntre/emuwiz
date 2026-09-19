@@ -81,6 +81,76 @@ fn same_pack_is_idempotent_and_survives_reload() {
 }
 
 #[test]
+fn staging_does_not_activate_and_explicit_activation_marks_recheck() {
+    let dir = tempdir().unwrap();
+    let pack = write_zip(
+        &dir.path().join("pack.zip"),
+        &[("gb.dat", GB_DAT.as_bytes())],
+    );
+    let pack_before = fs::read(&pack).unwrap();
+    let storage = dir.path().join("store");
+    let staged = stage_no_intro_pack_at(&pack, &storage).unwrap();
+    assert!(!storage.join("state.json").exists());
+    assert!(storage.join("staged.json").is_file());
+    assert_eq!(
+        compare_staged_no_intro_pack_at(&storage).unwrap(),
+        Some(NoIntroPackComparison::NoActiveSnapshot)
+    );
+    let activated = activate_staged_no_intro_pack_at(&storage).unwrap();
+    assert_eq!(
+        activated.verification,
+        crate::identity_source::managed_snapshot::VerificationFreshness::NeedsRecheck
+    );
+    assert_eq!(activated.import.pack_sha256, staged.pack_sha256);
+    assert!(load_current_no_intro_pack_at(&storage).unwrap().is_some());
+    assert!(!storage.join("staged.json").exists());
+    assert_eq!(fs::read(&pack).unwrap(), pack_before);
+}
+
+#[test]
+fn staged_snapshot_compares_by_content_and_same_content_is_deterministic() {
+    let dir = tempdir().unwrap();
+    let pack = write_zip(
+        &dir.path().join("pack.zip"),
+        &[("gb.dat", GB_DAT.as_bytes())],
+    );
+    let storage = dir.path().join("store");
+    import_no_intro_pack_at(&pack, &storage).unwrap();
+    stage_no_intro_pack_at(&pack, &storage).unwrap();
+    assert_eq!(
+        compare_staged_no_intro_pack_at(&storage).unwrap(),
+        Some(NoIntroPackComparison::SameSnapshot)
+    );
+}
+
+#[test]
+fn rollback_restores_previous_pointer_without_deleting_newer_snapshot() {
+    let dir = tempdir().unwrap();
+    let storage = dir.path().join("store");
+    let first_pack = write_zip(
+        &dir.path().join("first.zip"),
+        &[("gb.dat", GB_DAT.as_bytes())],
+    );
+    let second_pack = write_zip(
+        &dir.path().join("second.zip"),
+        &[("gba.dat", GBA_DAT.as_bytes())],
+    );
+    let first = import_no_intro_pack_at(&first_pack, &storage).unwrap();
+    let second = import_no_intro_pack_at(&second_pack, &storage).unwrap();
+    let rolled_back = rollback_no_intro_pack_at(&storage).unwrap();
+    assert_eq!(rolled_back.import.pack_sha256, first.pack_sha256);
+    assert_eq!(
+        rolled_back.verification,
+        crate::identity_source::managed_snapshot::VerificationFreshness::NeedsRecheck
+    );
+    assert!(second.snapshot_path.is_dir());
+    assert_eq!(
+        load_current_no_intro_pack_at(&storage).unwrap().unwrap()[0].system_name,
+        "Nintendo - Game Boy"
+    );
+}
+
+#[test]
 fn a_changed_pack_publishes_a_new_snapshot_atomically() {
     let dir = tempdir().unwrap();
     let storage = dir.path().join("store");

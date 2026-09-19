@@ -17,6 +17,13 @@ use super::managed_lifecycle::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NoIntroFreshness {
+    /// The imported release is newer than every other locally known release
+    /// for the same coverage. This is not a claim about the upstream site.
+    Current,
+    UpdateAvailable,
+    CheckFailed,
+    NeverChecked,
+    /// Compatibility names retained for persisted reports from older builds.
     Fresh,
     Stale,
     Unknown,
@@ -308,7 +315,17 @@ pub fn report_no_intro_lifecycle(snapshots: &[NoIntroPackSnapshot]) -> ManagedNo
                     })
                 })
             {
-                NoIntroFreshness::Fresh
+                // A versioned import is not automatically current upstream.
+                // Only a comparison with another locally known release can
+                // establish a local Current state.
+                if entries.iter().any(|(candidate, _)| {
+                    candidate.pack_sha256 != snapshot.pack_sha256
+                        && candidate.status != NoIntroPackStatus::Invalid
+                }) {
+                    NoIntroFreshness::Current
+                } else {
+                    NoIntroFreshness::NeverChecked
+                }
             } else {
                 NoIntroFreshness::Unknown
             }
@@ -325,9 +342,15 @@ pub fn report_no_intro_lifecycle(snapshots: &[NoIntroPackSnapshot]) -> ManagedNo
             NoIntroLifecycleHealth::NoCurrent
         } else {
             match current_state.unwrap_or(NoIntroFreshness::Unknown) {
-                NoIntroFreshness::Fresh => NoIntroLifecycleHealth::Healthy,
-                NoIntroFreshness::Stale => NoIntroLifecycleHealth::Stale,
-                NoIntroFreshness::Unknown => NoIntroLifecycleHealth::Unknown,
+                NoIntroFreshness::Current | NoIntroFreshness::Fresh => {
+                    NoIntroLifecycleHealth::Healthy
+                }
+                NoIntroFreshness::Stale | NoIntroFreshness::UpdateAvailable => {
+                    NoIntroLifecycleHealth::Stale
+                }
+                NoIntroFreshness::CheckFailed
+                | NoIntroFreshness::NeverChecked
+                | NoIntroFreshness::Unknown => NoIntroLifecycleHealth::Unknown,
             }
         };
         let rollback =
@@ -633,11 +656,15 @@ mod tests {
     }
 
     #[test]
-    fn single_current_is_fresh_and_has_no_rollback() {
+    fn single_active_snapshot_is_not_claimed_current_without_a_comparison() {
         let report =
             report_no_intro_lifecycle(&[snapshot("a", 1, "Nintendo - Game Boy", Some("20250101"))]);
-        assert_eq!(report.health, NoIntroLifecycleHealth::Healthy);
-        assert_eq!(report.summary.current, 1);
+        assert_eq!(report.health, NoIntroLifecycleHealth::Unknown);
+        assert_eq!(
+            report.platforms[0].freshness,
+            NoIntroFreshness::NeverChecked
+        );
+        assert_eq!(report.summary.freshness_unknown, 1);
         assert!(!report.platforms[0].rollback_available);
     }
 
@@ -739,6 +766,7 @@ mod tests {
         pack.coverage.push(old_snes.coverage[0].clone());
         let report = report_no_intro_lifecycle(&[pack, snes]);
         assert_eq!(report.summary.platforms_covered, 2);
-        assert_eq!(report.summary.current, 2);
+        assert_eq!(report.summary.current, 1);
+        assert_eq!(report.summary.freshness_unknown, 1);
     }
 }
