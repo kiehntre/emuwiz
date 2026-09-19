@@ -121,6 +121,10 @@ pub struct NoIntroPackActivationReport {
 pub enum NoIntroPackComparison {
     NoActiveSnapshot,
     SameSnapshot,
+    NewerRevision,
+    SameRevision,
+    OlderRevision,
+    RevisionUnknown,
     DifferentSnapshot,
 }
 
@@ -411,7 +415,10 @@ fn publish_no_intro_pack_at(
             for (index, member) in old_members.iter().enumerate() {
                 if accepted_members
                     .iter()
-                    .any(|candidate| candidate.artifact_sha256 == member.artifact_sha256)
+                    .any(|candidate| {
+                        candidate.system_name == member.system_name
+                            && candidate.variant == member.variant
+                    })
                 {
                     continue;
                 }
@@ -697,13 +704,60 @@ pub fn compare_staged_no_intro_pack_at(
     else {
         return Ok(Some(NoIntroPackComparison::NoActiveSnapshot));
     };
-    Ok(Some(
-        if active.snapshot_sha256.as_deref() == Some(staged.snapshot_sha256.as_str()) {
-            NoIntroPackComparison::SameSnapshot
-        } else {
-            NoIntroPackComparison::DifferentSnapshot
-        },
-    ))
+    if active.snapshot_sha256.as_deref() == Some(staged.snapshot_sha256.as_str()) {
+        return Ok(Some(NoIntroPackComparison::SameSnapshot));
+    }
+
+    let comparable = staged
+        .accepted_members
+        .iter()
+        .filter_map(|candidate| {
+            let installed = active.accepted_members.iter().find(|member| {
+                member.system_name == candidate.system_name && member.variant == candidate.variant
+            })?;
+            Some((candidate.upstream_version.as_deref()?, installed.upstream_version.as_deref()?))
+        })
+        .collect::<Vec<_>>();
+    if comparable.is_empty() {
+        return Ok(Some(NoIntroPackComparison::RevisionUnknown));
+    }
+
+    let mut newer = false;
+    let mut older = false;
+    let mut unknown = false;
+    for (candidate, installed) in comparable {
+        match compare_no_intro_revision(candidate, installed) {
+            Some(std::cmp::Ordering::Greater) => newer = true,
+            Some(std::cmp::Ordering::Less) => older = true,
+            Some(std::cmp::Ordering::Equal) => {}
+            None => unknown = true,
+        }
+    }
+    let comparison = match (newer, older, unknown) {
+        (true, false, false) => NoIntroPackComparison::NewerRevision,
+        (false, true, false) => NoIntroPackComparison::OlderRevision,
+        (false, false, false) => NoIntroPackComparison::SameRevision,
+        _ => NoIntroPackComparison::RevisionUnknown,
+    };
+    Ok(Some(comparison))
+}
+
+/// Compare only the conservative release signals emitted by No-Intro DATs.
+/// Numeric versions are compared numerically (not lexically); other values
+/// are comparable only when identical. Unknown or mixed signals never claim
+/// that a downloaded pack is newer or current.
+fn compare_no_intro_revision(candidate: &str, installed: &str) -> Option<std::cmp::Ordering> {
+    if candidate == installed {
+        return Some(std::cmp::Ordering::Equal);
+    }
+    if candidate.bytes().all(|byte| byte.is_ascii_digit())
+        && installed.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        let candidate = candidate.trim_start_matches('0');
+        let installed = installed.trim_start_matches('0');
+        return Some(candidate.len().cmp(&installed.len()).then_with(|| candidate.cmp(installed)));
+    }
+    None
 }
 
 /// Loads a persisted staged candidate without activating or reparsing the

@@ -8223,16 +8223,39 @@ fn show_evidence_acquisition_section(
     ui.columns(2, |columns| {
         widgets::card(&mut columns[0], |ui| {
             ui.label(egui::RichText::new("No-Intro — cartridge ROMs").strong());
+            let status = if view.background_busy {
+                "Download/import in progress"
+            } else if view.no_intro_action_error.is_some() {
+                "Update failed"
+            } else if let Some(comparison) = view.no_intro_staged_comparison {
+                match comparison {
+                    NoIntroPackComparison::NoActiveSnapshot => "Ready to activate",
+                    NoIntroPackComparison::NewerRevision => "Update available",
+                    NoIntroPackComparison::SameSnapshot | NoIntroPackComparison::SameRevision => {
+                        "Same as installed revision"
+                    }
+                    NoIntroPackComparison::OlderRevision => "Older downloaded revision",
+                    NoIntroPackComparison::RevisionUnknown
+                    | NoIntroPackComparison::DifferentSnapshot => "Ready to activate · review revision",
+                }
+            } else if view.no_intro_inspection.is_some() {
+                "Validated · ready to stage"
+            } else if view.no_intro_installed.is_some() {
+                "Installed · update status unknown"
+            } else {
+                "Not installed"
+            };
+            ui.label(egui::RichText::new(format!("Status: {status}" )).strong());
             ui.label(
                 egui::RichText::new(
-                    "Download a pack manually from DAT-o-MATIC, then inspect it here. EmuWiz validates each DAT's internal metadata; the ZIP filename is never treated as authority.",
+                "Check for an update on the official DAT-o-MATIC site, download the ZIP in your browser, then select it here. EmuWiz validates each DAT's internal metadata; the ZIP filename is never treated as authority.",
                 )
                 .color(theme::muted(ui))
                 .small(),
             );
             if widgets::action_button(
                 ui,
-                "Open DAT-o-MATIC",
+                "Check for update (Open DAT-o-MATIC)",
                 widgets::ActionStyle::Secondary,
                 !view.background_busy,
             )
@@ -8412,18 +8435,30 @@ fn show_evidence_acquisition_section(
             let comparison = match view.no_intro_staged_comparison {
                 Some(NoIntroPackComparison::NoActiveSnapshot) => "No active snapshot exists yet.",
                 Some(NoIntroPackComparison::SameSnapshot) => "This staged content matches the active snapshot.",
-                Some(NoIntroPackComparison::DifferentSnapshot) => "This staged content differs from the active snapshot.",
+                Some(NoIntroPackComparison::NewerRevision) => "Update available: the staged DAT revision is newer than the installed revision.",
+                Some(NoIntroPackComparison::SameRevision) => "This pack has the same DAT revision as the installed source.",
+                Some(NoIntroPackComparison::OlderRevision) => "This pack is older than the installed revision; activation is blocked.",
+                Some(NoIntroPackComparison::RevisionUnknown) => "Revision comparison is inconclusive; review the staged pack before activation.",
+                Some(NoIntroPackComparison::DifferentSnapshot) => "This staged content differs from the active snapshot; its revision is not known.",
                 None => "The staged content has not been compared with an active snapshot.",
             };
             ui.label(comparison);
             ui.label(egui::RichText::new(
                 "Review the staged release, then activate it explicitly. Activation marks existing verification for re-check.",
             ).color(theme::muted(ui)).small());
+            let activation_allowed = !matches!(
+                view.no_intro_staged_comparison,
+                Some(
+                    NoIntroPackComparison::SameSnapshot
+                        | NoIntroPackComparison::SameRevision
+                        | NoIntroPackComparison::OlderRevision
+                )
+            );
             if widgets::action_button(
                 ui,
                 "Activate staged pack",
                 widgets::ActionStyle::Primary,
-                !view.background_busy,
+                !view.background_busy && activation_allowed,
             )
             .clicked()
                 && action.is_none()
@@ -8442,6 +8477,7 @@ fn show_evidence_acquisition_section(
                 installed.accepted.len(),
                 installed.pack_sha256.chars().take(12).collect::<String>()
             ));
+            ui.label("Installed revision: version signals retained in each DAT. Remote update status is unknown until you check DAT-o-MATIC and import a candidate.");
             ui.label("This is evidence metadata only; it does not imply a complete commercial-game collection.");
             if view.no_intro_import_status == Some(NoIntroPackImportStatus::Unchanged) {
                 ui.label("The selected pack is already installed (Unchanged).");
@@ -8481,7 +8517,7 @@ fn show_no_intro_lifecycle_status(
     for platform in &report.platforms {
         let (label, tone) = match platform.health {
             archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Healthy => {
-                ("Current imported snapshot", widgets::StatusTone::Success)
+                ("Installed snapshot · update status unknown", widgets::StatusTone::Success)
             }
             archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Conflict => {
                 ("Needs review / conflict", widgets::StatusTone::Warning)

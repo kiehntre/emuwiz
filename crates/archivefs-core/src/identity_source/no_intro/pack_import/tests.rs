@@ -20,6 +20,15 @@ const TOSEC_DAT: &str = r#"<?xml version="1.0"?>
 const AFTERMARKET_DAT: &str = r#"<?xml version="1.0"?>
 <datafile><header><name>Nintendo - Love Pack (Aftermarket)</name><version>20260827</version><author>No-Intro</author></header>
 <game name="Test"><rom name="test.gb" size="1" crc="CCCCCCCC"/></game></datafile>"#;
+const GB_DAT_OLDER: &str = r#"<?xml version="1.0"?>
+<datafile><header><name>Nintendo - Game Boy</name><version>20241231</version><author>No-Intro</author></header>
+<game name="Test"><rom name="test.gb" size="1" crc="AAAAAAAA"/></game></datafile>"#;
+const GB_DAT_NEWER: &str = r#"<?xml version="1.0"?>
+<datafile><header><name>Nintendo - Game Boy</name><version>20260101</version><author>No-Intro</author></header>
+<game name="Test"><rom name="test.gb" size="1" crc="DDDDDDDD"/></game></datafile>"#;
+const GB_DAT_SAME_REVISION: &str = r#"<?xml version="1.0"?>
+<datafile><header><name>Nintendo - Game Boy</name><version>20260101</version><author>No-Intro</author></header>
+<game name="Test"><rom name="test.gb" size="1" crc="EEEEEEEE"/></game></datafile>"#;
 
 fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
     let file = fs::File::create(path).unwrap();
@@ -122,6 +131,48 @@ fn staged_snapshot_compares_by_content_and_same_content_is_deterministic() {
     assert_eq!(
         compare_staged_no_intro_pack_at(&storage).unwrap(),
         Some(NoIntroPackComparison::SameSnapshot)
+    );
+}
+
+#[test]
+fn staged_revision_comparison_distinguishes_newer_same_and_older_packs() {
+    let dir = tempdir().unwrap();
+    let storage = dir.path().join("store");
+    let first_pack = write_zip(
+        &dir.path().join("first.zip"),
+        &[("gb.dat", GB_DAT.as_bytes())],
+    );
+    import_no_intro_pack_at(&first_pack, &storage).unwrap();
+
+    let newer_pack = write_zip(
+        &dir.path().join("newer.zip"),
+        &[("gb.dat", GB_DAT_NEWER.as_bytes())],
+    );
+    stage_no_intro_pack_at(&newer_pack, &storage).unwrap();
+    assert_eq!(
+        compare_staged_no_intro_pack_at(&storage).unwrap(),
+        Some(NoIntroPackComparison::NewerRevision)
+    );
+    activate_staged_no_intro_pack_at(&storage).unwrap();
+
+    let same_revision_pack = write_zip(
+        &dir.path().join("same-revision.zip"),
+        &[("gb.dat", GB_DAT_SAME_REVISION.as_bytes())],
+    );
+    stage_no_intro_pack_at(&same_revision_pack, &storage).unwrap();
+    assert_eq!(
+        compare_staged_no_intro_pack_at(&storage).unwrap(),
+        Some(NoIntroPackComparison::SameRevision)
+    );
+
+    let older_pack = write_zip(
+        &dir.path().join("older.zip"),
+        &[("gb.dat", GB_DAT_OLDER.as_bytes())],
+    );
+    stage_no_intro_pack_at(&older_pack, &storage).unwrap();
+    assert_eq!(
+        compare_staged_no_intro_pack_at(&storage).unwrap(),
+        Some(NoIntroPackComparison::OlderRevision)
     );
 }
 
