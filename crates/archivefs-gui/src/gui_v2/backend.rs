@@ -516,6 +516,14 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
         .load_archives()
         .map_err(|error| error.to_string())?;
     let mut library = Library::new(archives);
+    for enrichment in database
+        .load_screenscraper_enrichments()
+        .map_err(|error| error.to_string())?
+    {
+        if let Some(index) = library.by_id.get(&enrichment.archive_id).copied() {
+            library.games[index].screenscraper = Some(enrichment);
+        }
+    }
     library.load_ms = start.elapsed().as_millis();
     log::debug!(
         "gui_v2 library: {} games, {} ms",

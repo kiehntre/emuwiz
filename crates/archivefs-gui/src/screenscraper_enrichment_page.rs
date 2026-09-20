@@ -68,6 +68,10 @@ impl Default for ScreenScraperEnrichmentState {
 }
 
 impl ScreenScraperEnrichmentState {
+    pub(crate) fn is_running(&self) -> bool {
+        self.reply.is_some()
+    }
+
     pub(crate) fn mark_applied(&mut self) {
         self.view = WorkflowView::Applied;
     }

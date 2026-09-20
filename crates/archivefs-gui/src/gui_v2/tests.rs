@@ -802,11 +802,36 @@ fn gui_v2_database_load_is_real_and_read_only() {
             database
                 .assign_platform(row.id, Some("Arcade"), "manual")
                 .unwrap();
+            database
+                .apply_screenscraper_enrichment(
+                    row.id,
+                    &archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata {
+                        synopsis: Some("Persisted synopsis".into()),
+                        ..Default::default()
+                    },
+                    &archivefs_core::screenscraper_enrichment::ScreenScraperEnrichmentReceipt {
+                        provider: "ScreenScraper".into(),
+                        provider_record_id: "fixture-record".into(),
+                        retrieved_at_unix_seconds: 1,
+                        match_basis: "fixture hash".into(),
+                        before: Default::default(),
+                        accepted: Default::default(),
+                        media_reference_count: 0,
+                    },
+                )
+                .unwrap();
         }
     }
     let before = fs::read(&database_path).unwrap();
     let library = backend::load_library(&database_path).unwrap();
     assert_eq!(library.games.len(), 1);
+    assert_eq!(
+        library.games[0]
+            .screenscraper
+            .as_ref()
+            .map(|saved| saved.receipt.provider_record_id.as_str()),
+        Some("fixture-record")
+    );
     let connection = rusqlite::Connection::open_with_flags(
         &database_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1157,6 +1182,7 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     for label in [
         "Play",
         "Verify",
+        "Artwork & Metadata",
         "Mods & Cheats",
         "Fix Problems",
         "Open Folder",
@@ -1400,7 +1426,10 @@ fn gui_v2_accidental_exploration_never_runs_scan_or_legacy() {
         app.go(Route::Section(*section));
         frame(&context, &mut app, [1024.0, 600.0]);
     }
-    assert!(app.activity.jobs.is_empty());
+    assert!(app.activity.jobs.values().all(|job| {
+        job.title == "Refreshing artwork providers"
+            || job.title == "Checking emulator readiness"
+    }));
     assert!(app.load_job.is_none());
     assert!(!app.confirm_scan);
 }
@@ -1490,6 +1519,8 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
                     "Preview playing library",
                     "Preview 1G1R Library",
                 ]
+            } else if section == Section::Sources {
+                vec!["Add source"]
             } else {
                 vec![section.action()]
             };
@@ -1546,4 +1577,130 @@ fn gui_v2_webp_and_transparent_png_cache_keep_correct_pixels() {
         assert!(second.timings.cache_hit);
         assert_eq!(first.image.pixels[0], second.image.pixels[0]);
     }
+}
+
+#[test]
+fn gui_v2_sources_route_hosts_the_native_source_manager() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Sources);
+
+    let output = frame(&context, &mut app, [1280.0, 820.0]);
+    let strings = text(&output);
+
+    assert!(strings.iter().any(|value| value == "Related source tools"));
+    assert!(strings.iter().any(|value| value == "Game Folders"));
+    assert!(!strings.iter().any(|value| value.contains("separate window")));
+}
+
+#[test]
+fn gui_v2_source_worker_lifecycle_is_reflected_in_activity() {
+    let context = egui::Context::default();
+    let mut workflows = native_workflows::NativeWorkflows::new(context.clone());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    workflows.app.sources_ui.source_action = Some(crate::platform_source_actions::RunningSourceAction {
+        action: crate::platform_source_actions::SourceAction::ScanAll,
+        receiver,
+        worker: None,
+    });
+    let mut activity = Activity::default();
+
+    workflows.observe_source_activity(&mut activity);
+    assert_eq!(activity.running(), 1);
+    sender.send(Err("fixture scan failure".into())).unwrap();
+    workflows.poll(&context, &mut activity);
+
+    assert_eq!(activity.running(), 0);
+    assert!(activity.jobs.values().any(|job| job.phase == Phase::Failed));
+}
+
+#[test]
+fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(9, "Rez", Some("Dreamcast"))]));
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.router.current = Route::Section(Section::Artwork);
+
+    let library_output = frame(&context, &mut app, [1280.0, 820.0]);
+    let library_text = text(&library_output);
+    assert!(library_text.iter().any(|value| value == "Library artwork"));
+    assert!(library_text.iter().any(|value| value == "Rez"));
+    assert!(!library_text.iter().any(|value| value.contains("existing interface")));
+
+    app.router.current = Route::Task { section: Section::Artwork, game: 9 };
+    let selected_output = frame(&context, &mut app, [1280.0, 820.0]);
+    let selected_text = text(&selected_output);
+    assert!(selected_text.iter().any(|value| value == "Metadata"));
+    assert!(selected_text.iter().any(|value| value == "No screenshot found. Advanced Details explains which providers were checked."));
+    assert!(!selected_text.iter().any(|value| value.contains("Original path:")), "advanced details start closed");
+}
+
+#[test]
+fn gui_v2_artwork_metadata_reports_provider_unavailability_without_guessing() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let mut library = Library::new(vec![archive(11, "Known Game", Some("PS2"))]);
+    library.games[0].identified = true;
+    app.library = Arc::new(library);
+    let mut index = MediaIndex::default();
+    index.warnings.push("fixture provider unavailable".into());
+    app.artwork.index = Some(Arc::new(index));
+    app.router.current = Route::Task { section: Section::Artwork, game: 11 };
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value.contains("provider is unavailable")));
+    assert!(!strings.iter().any(|value| value.contains("fixture provider unavailable")), "technical provider detail starts hidden");
+}
+
+#[test]
+fn gui_v2_artwork_metadata_displays_local_romm_and_screenscraper_provenance() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let mut library = Library::new(vec![archive(3, "Provider Game", Some("PS2"))]);
+    library.games[0].screenscraper = Some(archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+        archive_id: 3,
+        values: archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata {
+            synopsis: Some("Saved provider synopsis".into()),
+            ..Default::default()
+        },
+        receipt: archivefs_core::screenscraper_enrichment::ScreenScraperEnrichmentReceipt {
+            provider: "ScreenScraper".into(),
+            provider_record_id: "ss-42".into(),
+            retrieved_at_unix_seconds: 1,
+            match_basis: "verified hash".into(),
+            before: Default::default(),
+            accepted: Default::default(),
+            media_reference_count: 0,
+        },
+    });
+    app.library = Arc::new(library);
+    let mut index = MediaIndex::default();
+    index.covers.insert(3, Source::Local("/cache/cover.png".into()));
+    index.descriptions.insert(3, "RomM description".into());
+    app.artwork.index = Some(Arc::new(index));
+    app.router.current = Route::Task { section: Section::Artwork, game: 3 };
+
+    let output = frame(&context, &mut app, [1280.0, 820.0]);
+    let strings = text(&output);
+    assert!(strings.iter().any(|value| value == "RomM description"));
+    assert!(strings.iter().any(|value| value.contains("Local file")));
+    assert!(strings.iter().any(|value| value.contains("ScreenScraper · record ss-42")));
+}
+
+#[test]
+fn gui_v2_artwork_refresh_is_async_and_rejects_duplicate_submit() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.artwork.index_loading = false;
+
+    app.refresh_artwork_index();
+    let generation = app.artwork.generation;
+    let job = app.index_job;
+    app.refresh_artwork_index();
+
+    assert!(app.artwork.index_loading);
+    assert_eq!(app.artwork.generation, generation);
+    assert_eq!(app.index_job, job);
+    assert_eq!(app.activity.running(), 1);
 }

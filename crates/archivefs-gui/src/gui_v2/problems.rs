@@ -180,6 +180,7 @@ mod tests {
             platform: "Arcade".into(),
             identified,
             attention: missing,
+            screenscraper: None,
             search: title.to_lowercase(),
         }
     }

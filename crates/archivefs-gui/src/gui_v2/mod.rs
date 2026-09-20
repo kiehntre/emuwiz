@@ -277,6 +277,19 @@ impl App {
         self.load_job = Some(id);
         self.send(id, Command::Load { scan });
     }
+    fn refresh_artwork_index(&mut self) {
+        if self.artwork.index_loading {
+            return;
+        }
+        self.artwork.reload(self.library.clone());
+        let id = self.activity.queue(
+            "Refreshing metadata and artwork",
+            Route::Section(Section::Artwork),
+            false,
+        );
+        self.activity.start(id);
+        self.index_job = Some(id);
+    }
     fn go(&mut self, route: Route) {
         self.router.go(route);
         self.navigation_changed();
@@ -903,8 +916,22 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.mods.poll();
+        let mut reload_library = false;
+        let mut reload_artwork = false;
         if let Some(workflows) = &mut self.native_workflows {
             workflows.poll(ui.ctx(), &mut self.activity);
+            if self.load_job.is_none() {
+                reload_library = workflows.take_source_library_reload();
+            }
+            if !self.artwork.index_loading {
+                reload_artwork = workflows.take_artwork_reload();
+            }
+        }
+        if reload_library {
+            self.load(false);
+        }
+        if reload_artwork {
+            self.refresh_artwork_index();
         }
         self.poll(ui.ctx());
         self.show(ui.ctx());
