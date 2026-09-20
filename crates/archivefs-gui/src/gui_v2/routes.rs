@@ -6,6 +6,7 @@ pub(super) enum Section {
     #[default]
     Home,
     Games,
+    Duplicates,
     Platforms,
     Check,
     Problems,
@@ -24,6 +25,7 @@ pub(super) enum Section {
 pub(super) const SECTIONS: &[Section] = &[
     Section::Home,
     Section::Games,
+    Section::Duplicates,
     Section::Platforms,
     Section::Check,
     Section::Problems,
@@ -44,6 +46,7 @@ impl Section {
         match self {
             Self::Home => "Home",
             Self::Games => "Games",
+            Self::Duplicates => "Duplicates",
             Self::Platforms => "Platforms",
             Self::Check => "Check Games",
             Self::Problems => "Problems & Repair",
@@ -64,6 +67,9 @@ impl Section {
         match self {
             Self::Home => "Your games, and the things you can do with them.",
             Self::Games => "Browse your games. Select one to see what you can do next.",
+            Self::Duplicates => {
+                "Review exact copies without silently collapsing different releases."
+            }
             Self::Platforms => "Choose a system to explore its games.",
             Self::Check => "Find missing, unknown, damaged or mismatched games.",
             Self::Problems => "Review problems and preview a fix before changing anything.",
@@ -89,6 +95,7 @@ impl Section {
     pub fn action(self) -> &'static str {
         match self {
             Self::Check => "Check my games",
+            Self::Duplicates => "Review duplicates",
             Self::Problems => "Review problems",
             Self::Build => "Build my library",
             Self::Emulators => "Find installed emulators",
@@ -104,6 +111,7 @@ impl Section {
     pub fn group(self) -> Option<&'static str> {
         match self {
             Self::Games => Some("LIBRARY"),
+            Self::Duplicates => Some("LIBRARY"),
             Self::Launch => Some("PLAY"),
             Self::Mods => Some("TOOLS"),
             _ => None,

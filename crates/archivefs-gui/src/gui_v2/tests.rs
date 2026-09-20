@@ -2,7 +2,7 @@ use super::*;
 use super::{
     activity::Phase,
     artwork::{Artwork, Picture},
-    library::Game,
+    library::{DuplicateGroup, DuplicateMember, DuplicateReport, Game},
     media_sources::{Kind, MediaIndex, Source},
 };
 use archivefs_core::PersistedArchive;
@@ -54,6 +54,13 @@ fn fixture(context: &egui::Context) -> App {
         notice: None,
         confirm_scan: false,
         screenshots: false,
+        check_platform: None,
+        verification: None,
+        verification_job: None,
+        duplicate_report: None,
+        duplicate_job: None,
+        duplicate_ignored: std::collections::HashSet::new(),
+        mrwiz_dismissed: false,
     }
 }
 
@@ -119,7 +126,7 @@ fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
         assert!(!section.action().is_empty());
         assert_eq!(Route::Section(*section).section(), *section);
     }
-    assert_eq!(unique.len(), 15);
+    assert_eq!(unique.len(), 16);
 }
 
 #[test]
@@ -142,6 +149,86 @@ fn gui_v2_home_has_six_explained_tasks_with_correct_routes() {
     for (_, title, purpose, action) in routes::HOME_TASKS {
         assert!(!title.is_empty() && purpose.len() > 20 && !action.is_empty());
     }
+}
+
+#[test]
+fn gui_v2_check_games_is_native_and_marks_arcade_ready() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Pac-Man", Some("Arcade"))]));
+    app.router.current = Route::Section(Section::Check);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Choose a platform"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("MAME Arcade verification data ready"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("existing interface"))
+    );
+}
+
+#[test]
+fn gui_v2_duplicate_badge_keeps_separate_files_visible() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let first = archive(1, "Same title", Some("PS2"));
+    let mut second = archive(2, "Same title", Some("PS2"));
+    second.relative_path = "other/Same title.iso".into();
+    second.absolute_path = "/fixture/other/Same title.iso".into();
+    app.library = Arc::new(Library::new(vec![first.clone(), second.clone()]));
+    app.indices = vec![0, 1];
+    app.duplicate_report = Some(DuplicateReport {
+        files_examined: 2,
+        groups: vec![DuplicateGroup {
+            kind: "Exact duplicates".into(),
+            sha256: "abc".into(),
+            size_bytes: 4,
+            members: vec![
+                DuplicateMember {
+                    path: first.absolute_path,
+                    title: first.display_name.clone(),
+                    platform: "PS2".into(),
+                    size_bytes: 4,
+                    evidence: "same hash".into(),
+                },
+                DuplicateMember {
+                    path: second.absolute_path,
+                    title: second.display_name.clone(),
+                    platform: "PS2".into(),
+                    size_bytes: 4,
+                    evidence: "same hash".into(),
+                },
+            ],
+        }],
+    });
+    app.router.current = Route::Section(Section::Games);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value.contains("2 exact copies")));
+    assert!(strings.iter().any(|value| value.contains("Same title")));
+}
+
+#[test]
+fn gui_v2_verification_result_has_per_game_identity_status() {
+    let mut result = VerificationResult {
+        platform: "Arcade".into(),
+        total: 1,
+        matched: 1,
+        ..Default::default()
+    };
+    result.statuses.insert(7, "Verified".into());
+    assert_eq!(result.platform, "Arcade");
+    assert_eq!(
+        result.statuses.get(&7).map(String::as_str),
+        Some("Verified")
+    );
 }
 
 #[test]
@@ -780,12 +867,16 @@ fn gui_v2_handoff_primary_action_is_visible_without_scrolling() {
             app.router.current = Route::Section(section);
             frame(&context, &mut app, size);
             let output = frame(&context, &mut app, size);
+            let action = if section == Section::Check {
+                "Choose a platform"
+            } else {
+                section.action()
+            };
             assert!(
-                output.shapes.iter().any(|shape| visible(
-                    &shape.shape,
-                    shape.clip_rect,
-                    section.action()
-                )),
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| visible(&shape.shape, shape.clip_rect, action)),
                 "primary action is clipped: {section:?} {size:?}"
             );
         }

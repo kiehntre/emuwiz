@@ -38,6 +38,7 @@ pub(super) struct MediaIndex {
     pub elapsed_ms: u128,
     pub warnings: Vec<String>,
     pub descriptions: HashMap<i64, String>,
+    pub diagnostics: HashMap<i64, String>,
 }
 
 impl MediaIndex {
@@ -185,6 +186,11 @@ impl MediaIndex {
                             kind: Kind::Screenshot(ordinal),
                         });
                 }
+                index.diagnostics.insert(id, format!("Identity key: exact original archive path `{}`; artwork source: RomM provider record `{}`. Screenshot candidates: {}.", path.display(), record.provider_game_id, artwork.screenshots.len()));
+            } else if let Some(record) = records.get(path) {
+                index.diagnostics.insert(id, format!("Identity key: exact original archive path `{}`; RomM provider record `{}` matched, but it has no screenshot artwork.", path.display(), record.provider_game_id));
+            } else {
+                index.diagnostics.insert(id, format!("Identity key: exact original archive path `{}`. No matching ES-DE, LaunchBox, or RomM record was found; filename/title fallback is intentionally not used.", path.display()));
             }
         }
         index.elapsed_ms = start.elapsed().as_millis();

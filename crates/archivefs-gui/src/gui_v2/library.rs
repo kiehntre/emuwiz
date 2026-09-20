@@ -9,6 +9,29 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DuplicateMember {
+    pub path: std::path::PathBuf,
+    pub title: String,
+    pub platform: String,
+    pub size_bytes: u64,
+    pub evidence: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DuplicateGroup {
+    pub kind: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub members: Vec<DuplicateMember>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct DuplicateReport {
+    pub groups: Vec<DuplicateGroup>,
+    pub files_examined: usize,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Game {
     pub archive: PersistedArchive,

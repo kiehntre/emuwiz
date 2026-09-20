@@ -13,9 +13,9 @@ mod thumbnail;
 
 use activity::Activity;
 use artwork::Artwork;
-use backend::{Backend, Command, Event, Payload, Preferences};
+use backend::{Backend, Command, Event, Payload, Preferences, VerificationResult};
 use eframe::egui;
-use library::{Detail, Filter, Library, SharedLibrary};
+use library::{Detail, DuplicateReport, Filter, Library, SharedLibrary};
 use routes::{Route, Router, Section};
 use std::{
     sync::Arc,
@@ -145,6 +145,13 @@ pub(super) struct App {
     notice: Option<Notice>,
     confirm_scan: bool,
     screenshots: bool,
+    check_platform: Option<String>,
+    verification: Option<VerificationResult>,
+    verification_job: Option<u64>,
+    duplicate_report: Option<DuplicateReport>,
+    duplicate_job: Option<u64>,
+    duplicate_ignored: std::collections::HashSet<String>,
+    mrwiz_dismissed: bool,
 }
 
 impl App {
@@ -175,6 +182,13 @@ impl App {
             notice: None,
             confirm_scan: false,
             screenshots: false,
+            check_platform: None,
+            verification: None,
+            verification_job: None,
+            duplicate_report: None,
+            duplicate_job: None,
+            duplicate_ignored: std::collections::HashSet::new(),
+            mrwiz_dismissed: false,
         };
         app.send(0, Command::Restore);
         app.load(false);
@@ -232,6 +246,60 @@ impl App {
         self.interacted = true;
         self.preferences_dirty = Some(Instant::now());
     }
+    fn check_platform(&mut self, platform: String) {
+        self.check_platform = Some(platform);
+        self.verification = None;
+        self.go(Route::Section(Section::Check));
+    }
+    fn start_verification(&mut self) {
+        let Some(platform) = self.check_platform.clone() else {
+            return;
+        };
+        let games = self
+            .library
+            .games
+            .iter()
+            .filter(|game| game.platform == platform)
+            .cloned()
+            .collect::<Vec<_>>();
+        let id = self.activity.queue(
+            &format!("Checking {platform}"),
+            Route::Section(Section::Check),
+            true,
+        );
+        let cancel = self
+            .activity
+            .jobs
+            .get(&id)
+            .and_then(|job| job.cancel.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.verification_job = Some(id);
+        self.send(
+            id,
+            Command::Verify {
+                platform,
+                games,
+                cancel,
+            },
+        );
+    }
+    fn start_duplicate_scan(&mut self) {
+        if self.duplicate_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Finding exact duplicate files",
+            Route::Section(Section::Duplicates),
+            true,
+        );
+        self.duplicate_job = Some(id);
+        self.send(
+            id,
+            Command::ScanDuplicates {
+                games: self.library.games.clone(),
+            },
+        );
+    }
     fn legacy(&mut self, section: Section) {
         let path = self
             .router
@@ -254,6 +322,17 @@ impl App {
             };
             match event {
                 Event::Started(id) => self.activity.start(id),
+                Event::Progress {
+                    id,
+                    done,
+                    total,
+                    item,
+                } => {
+                    if let Some(job) = self.activity.jobs.get_mut(&id) {
+                        job.progress = Some((done, total));
+                        job.item = Some(item);
+                    }
+                }
                 Event::Finished { id, outcome } => {
                     if self.load_job == Some(id) {
                         self.load_job = None;
@@ -308,6 +387,15 @@ impl App {
                                     if generation == self.detail_generation {
                                         self.detail = Some(detail);
                                     }
+                                }
+                                Payload::Verification(result) => {
+                                    self.verification_job = None;
+                                    self.verification = Some(result);
+                                    self.router.current = Route::Section(Section::Check);
+                                }
+                                Payload::Duplicates(report) => {
+                                    self.duplicate_job = None;
+                                    self.duplicate_report = Some(report);
                                 }
                                 Payload::Preferences(preferences) => {
                                     if !self.interacted {

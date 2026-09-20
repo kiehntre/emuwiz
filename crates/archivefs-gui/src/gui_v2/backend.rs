@@ -1,16 +1,21 @@
 //! The presentation's I/O boundary. Only this worker opens catalogue/config files.
 use super::{
-    library::{Detail, Filter, Game, Library, SharedLibrary},
+    library::{
+        Detail, DuplicateGroup, DuplicateMember, DuplicateReport, Filter, Game, Library,
+        SharedLibrary,
+    },
     routes::{Route, Section},
 };
 use archivefs_core::{Database, default_database_path};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
     sync::{
         Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     time::Instant,
@@ -36,6 +41,14 @@ pub(super) enum Command {
         game: Box<Game>,
         generation: u64,
     },
+    Verify {
+        platform: String,
+        games: Vec<Game>,
+        cancel: Arc<AtomicBool>,
+    },
+    ScanDuplicates {
+        games: Vec<Game>,
+    },
     OpenFolder(PathBuf),
     Legacy {
         section: Section,
@@ -55,16 +68,35 @@ pub(super) enum Payload {
         detail: Detail,
         generation: u64,
     },
+    Verification(VerificationResult),
+    Duplicates(DuplicateReport),
     Preferences(Preferences),
     Done,
 }
 
 pub(super) enum Event {
     Started(u64),
+    Progress {
+        id: u64,
+        done: u64,
+        total: u64,
+        item: String,
+    },
     Finished {
         id: u64,
         outcome: Result<Payload, String>,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct VerificationResult {
+    pub platform: String,
+    pub matched: usize,
+    pub attention: usize,
+    pub unknown: usize,
+    pub missing: usize,
+    pub total: usize,
+    pub statuses: HashMap<i64, String>,
 }
 
 pub(super) struct Backend {
@@ -83,11 +115,10 @@ impl Backend {
                 }
                 context.request_repaint();
                 // Contain third-party decoder/backend panics at the worker boundary.
-                let outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(command)))
-                        .unwrap_or_else(|_| {
-                            Err("The background operation stopped unexpectedly.".into())
-                        });
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execute(id, command, &answers)
+                }))
+                .unwrap_or_else(|_| Err("The background operation stopped unexpectedly.".into()));
                 if answers.send(Event::Finished { id, outcome }).is_err() {
                     break;
                 }
@@ -101,7 +132,7 @@ impl Backend {
     }
 }
 
-fn execute(command: Command) -> Result<Payload, String> {
+fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload, String> {
     match command {
         Command::Load { scan } => {
             let scan_warning = if scan {
@@ -132,6 +163,93 @@ fn execute(command: Command) -> Result<Payload, String> {
             detail: load_detail(&game)?,
             generation,
         }),
+        Command::Verify {
+            platform,
+            games,
+            cancel,
+        } => {
+            let total = games.len() as u64;
+            let mut result = VerificationResult {
+                platform,
+                total: games.len(),
+                ..Default::default()
+            };
+            for (index, game) in games.into_iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let status = if !game.archive.absolute_path.is_file() {
+                    result.missing += 1;
+                    "Missing"
+                } else if game.attention {
+                    result.attention += 1;
+                    "Needs attention"
+                } else if game.identified {
+                    result.matched += 1;
+                    "Verified"
+                } else {
+                    result.unknown += 1;
+                    "Unknown"
+                };
+                result.statuses.insert(game.archive.id, status.into());
+                let _ = answers.send(Event::Progress {
+                    id,
+                    done: index as u64 + 1,
+                    total,
+                    item: game.title,
+                });
+            }
+            Ok(Payload::Verification(result))
+        }
+        Command::ScanDuplicates { games } => {
+            let candidates: Vec<_> = games
+                .iter()
+                .map(|game| game.archive.absolute_path.clone())
+                .collect();
+            let config =
+                archivefs_core::Config::load_default().map_err(|error| error.to_string())?;
+            let trusted =
+                archivefs_core::safe_read::TrustedRoots::from_paths(config.source_folders.clone());
+            let report = archivefs_core::repair::scan_exact_duplicates(
+                &candidates,
+                &trusted,
+                &config.source_folders,
+                &std::collections::BTreeSet::new(),
+                None,
+            );
+            let groups = report
+                .groups
+                .into_iter()
+                .filter_map(|group| {
+                    let members = group
+                        .members
+                        .into_iter()
+                        .filter_map(|member| {
+                            let game = games
+                                .iter()
+                                .find(|game| game.archive.absolute_path == member.path)?;
+                            Some(DuplicateMember {
+                                path: member.path,
+                                title: game.title.clone(),
+                                platform: game.platform.clone(),
+                                size_bytes: group.size_bytes,
+                                evidence: format!("SHA-256 {}", group.sha256),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (members.len() > 1).then_some(DuplicateGroup {
+                        kind: "Exact duplicates".into(),
+                        sha256: group.sha256,
+                        size_bytes: group.size_bytes,
+                        members,
+                    })
+                })
+                .collect();
+            Ok(Payload::Duplicates(DuplicateReport {
+                groups,
+                files_examined: report.files_examined,
+            }))
+        }
         Command::OpenFolder(path) => {
             let folder = path.parent().ok_or("This game has no containing folder.")?;
             if !folder.is_absolute() || !folder.is_dir() {
