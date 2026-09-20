@@ -3861,6 +3861,10 @@ pub enum ArchiveKind {
     /// A supported game image that is catalogued directly rather than
     /// requiring an archive wrapper. Scanning never mounts or modifies it.
     DirectGameImage,
+    /// One extracted MAME/FBNeo ROM set directory. Its member files remain
+    /// source-level evidence; the directory is the single logical catalogue
+    /// item and is never a mount input.
+    ArcadeSetDirectory,
 }
 
 impl ArchiveKind {
@@ -3871,6 +3875,7 @@ impl ArchiveKind {
             "rar" => Some(Self::Rar),
             "megadrive_rom" => Some(Self::MegaDriveRom),
             "direct_game_image" => Some(Self::DirectGameImage),
+            "arcade_set_directory" => Some(Self::ArcadeSetDirectory),
             _ => None,
         }
     }
@@ -3882,6 +3887,7 @@ impl ArchiveKind {
             Self::Rar => "rar",
             Self::MegaDriveRom => "megadrive_rom",
             Self::DirectGameImage => "direct_game_image",
+            Self::ArcadeSetDirectory => "arcade_set_directory",
         }
     }
 }
@@ -3891,7 +3897,10 @@ impl ArchiveKind {
     /// Loose cartridge ROMs remain selectable library content but never
     /// become queue or mount candidates.
     pub fn is_mount_input(self) -> bool {
-        !matches!(self, Self::MegaDriveRom | Self::DirectGameImage)
+        !matches!(
+            self,
+            Self::MegaDriveRom | Self::DirectGameImage | Self::ArcadeSetDirectory
+        )
     }
 }
 
@@ -4103,6 +4112,18 @@ pub struct Archive {
 }
 
 impl Archive {
+    pub(crate) fn from_arcade_set_directory(path: &Path, source_root: &Path) -> Option<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())?;
+        Some(Self {
+            path: path.to_path_buf(),
+            kind: ArchiveKind::ArcadeSetDirectory,
+            identity: ArchiveIdentity::from_path(path, source_root, Some(&metadata)),
+            health: ArchiveHealth::Pending,
+        })
+    }
+
     fn from_scan_fingerprint(
         path: &Path,
         source_root: &Path,

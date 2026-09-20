@@ -508,6 +508,7 @@ pub fn launch_content_ref_from_archive_record(
             {
                 Some(LaunchContentKind::Cartridge)
             }
+            ArchiveKind::ArcadeSetDirectory => None,
             // `DirectGameImage` covers more than one real platform/format;
             // this bridge does not know which without guessing.
             _ => None,

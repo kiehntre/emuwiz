@@ -1509,6 +1509,7 @@ fn skipped_files_summary(
         ingestion_stats: Default::default(),
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
+        arcade_ingestion: Default::default(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     }

@@ -2272,6 +2272,8 @@ pub struct ScanPersistSummary {
     /// health view's "here's what was recognised" detail list. Re-bounded
     /// across the whole run exactly like `ingestion_skipped` above.
     pub ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery>,
+    /// Role-aware arcade aggregation and support-material diagnostics.
+    pub arcade_ingestion: crate::ingestion::ArcadeIngestionDiagnostics,
 }
 
 impl ScanPersistSummary {
@@ -2679,6 +2681,7 @@ fn archive_kind_str(kind: ArchiveKind) -> &'static str {
         ArchiveKind::Rar => "rar",
         ArchiveKind::MegaDriveRom => "megadrive_rom",
         ArchiveKind::DirectGameImage => "direct_game_image",
+        ArchiveKind::ArcadeSetDirectory => "arcade_set_directory",
     }
 }
 
@@ -7672,6 +7675,7 @@ fn scan_and_persist_folders_transaction(
         std::collections::BTreeMap::new();
     let mut ingestion_skipped: Vec<crate::ingestion::GameDiscovery> = Vec::new();
     let mut ingestion_recognised_sample: Vec<crate::ingestion::GameDiscovery> = Vec::new();
+    let mut arcade_ingestion = crate::ingestion::ArcadeIngestionDiagnostics::default();
 
     for folder in folders {
         let scan_disposition = folder.role.game_scan_disposition();
@@ -7871,7 +7875,45 @@ fn scan_and_persist_folders_transaction(
                 );
             }
         }
-        let archives = discovery.archives;
+        let mut archives = discovery.archives;
+        let arcade_root = if folder.role == SourceRole::ArcadeRomset
+            || folder
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("arcade"))
+        {
+            Some(folder.path.clone())
+        } else {
+            let nested = folder.path.join("arcade");
+            nested.is_dir().then_some(nested)
+        };
+        if let Some(arcade_root) = arcade_root
+            && let Ok(arcade_sets) = crate::ingestion::discover_extracted_sets(&arcade_root)
+        {
+            arcade_ingestion.merge(&arcade_sets.diagnostics);
+            for set in arcade_sets.sets {
+                if let Some(archive) = Archive::from_arcade_set_directory(&set.path, &folder.path)
+                {
+                    archives.retain(|candidate| !candidate.path.starts_with(&set.path));
+                    archives.push(archive);
+                }
+            }
+        }
+        let before_support_filter = archives.len();
+        archives.retain(|archive| {
+            let Some(kind) = crate::ingestion::support_material_kind(
+                &archive.path,
+                &folder.path,
+                folder.role,
+            ) else {
+                return true;
+            };
+            arcade_ingestion.note_support(kind);
+            false
+        });
+        arcade_ingestion.raw_files_considered += before_support_filter;
+        archives.sort_by(|left, right| left.path.cmp(&right.path));
+        archives.dedup_by(|left, right| left.path == right.path);
         let non_archive_fingerprints = discovery.non_archive_fingerprints;
         if let Some(platform) = folder.assigned_platform.as_deref() {
             for archive in &archives {
@@ -7996,6 +8038,7 @@ fn scan_and_persist_folders_transaction(
         ingestion_platform_counts,
         ingestion_skipped,
         ingestion_recognised_sample,
+        arcade_ingestion,
     })
 }
 
@@ -14786,6 +14829,61 @@ mod tests {
         assert_eq!(archives[0].relative_path, Path::new("Game.zip"));
         // The additive ingestion view sees the same file too.
         assert_eq!(summary.ingestion_stats.archives, 1);
+    }
+
+    #[test]
+    fn arcade_support_archives_are_excluded_from_playable_catalogue() {
+        let root = temp_dir("arcade-support-exclusion");
+        let source = root.join("games");
+        zip_fixture(
+            &source,
+            "bios/fbneo/samples/donpachi.zip",
+            "donpachi.sample",
+            b"sample",
+        );
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        database
+            .set_source_role(&source, SourceRole::Games)
+            .unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "support-test").unwrap();
+
+        assert_eq!(summary.counts.archives_seen, 0);
+        assert_eq!(summary.arcade_ingestion.sample_packs_excluded, 1);
+        assert!(database.load_archives().unwrap().is_empty());
+    }
+
+    #[test]
+    fn extracted_arcade_set_is_persisted_as_one_logical_item() {
+        let root = temp_dir("arcade-set-aggregation");
+        let source = root.join("arcade");
+        let set = source.join("pacman");
+        fs::create_dir_all(&set).unwrap();
+        fs::write(set.join("pacman.6e"), b"one").unwrap();
+        fs::write(set.join("pacman.6f"), b"two").unwrap();
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        database
+            .set_source_role(&source, SourceRole::ArcadeRomset)
+            .unwrap();
+
+        let summary = scan_and_persist(&mut database, &config, "arcade-test").unwrap();
+
+        assert_eq!(summary.counts.archives_seen, 1);
+        assert_eq!(summary.arcade_ingestion.logical_sets_aggregated, 1);
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].archive_kind, "arcade_set_directory");
+        assert_eq!(archives[0].relative_path, Path::new("pacman"));
     }
 
     #[test]

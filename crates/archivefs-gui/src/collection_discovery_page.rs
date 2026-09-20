@@ -291,7 +291,10 @@ fn show_found_summary(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
         .filter(|(_, count)| *count > 0)
         .map(|(label, count)| (label.to_string(), count.to_string()))
         .collect();
-        if rows.is_empty() {
+        if rows.is_empty()
+            && summary.arcade_ingestion.support_assets_excluded == 0
+            && summary.arcade_ingestion.logical_sets_aggregated == 0
+        {
             ui.label("Nothing recognisable was found in the scanned source(s).");
             return;
         }
@@ -300,6 +303,24 @@ fn show_found_summary(ui: &mut egui::Ui, summary: &ScanPersistSummary) {
                 ui.label(egui::RichText::new(count).strong().size(16.0));
                 ui.label(label);
             });
+        }
+        if summary.arcade_ingestion.logical_sets_aggregated > 0
+            || summary.arcade_ingestion.support_assets_excluded > 0
+        {
+            ui.weak("Arcade ingestion details:");
+            if summary.arcade_ingestion.logical_sets_aggregated > 0 {
+                ui.label(format!(
+                    "{} extracted ROM set(s) aggregated from {} member file(s)",
+                    summary.arcade_ingestion.logical_sets_aggregated,
+                    summary.arcade_ingestion.logical_set_members
+                ));
+            }
+            if summary.arcade_ingestion.support_assets_excluded > 0 {
+                ui.label(format!(
+                    "{} BIOS/support asset(s) excluded from playable games",
+                    summary.arcade_ingestion.support_assets_excluded
+                ));
+            }
         }
         ui.label(
             egui::RichText::new(
@@ -1021,6 +1042,7 @@ mod tests {
             ingestion_stats,
             ingestion_skip_reasons,
             ingestion_platform_counts: std::collections::BTreeMap::new(),
+            arcade_ingestion: Default::default(),
             ingestion_skipped: vec![
                 item("mystery1.xyz", SkipReason::UnsupportedExtension),
                 item("mystery2.xyz", SkipReason::UnsupportedExtension),
@@ -1129,6 +1151,7 @@ mod tests {
             ingestion_stats: archivefs_core::ingestion::DiscoveryStats::default(),
             ingestion_skip_reasons,
             ingestion_platform_counts: std::collections::BTreeMap::new(),
+            arcade_ingestion: Default::default(),
             ingestion_skipped: Vec::new(),
             ingestion_recognised_sample: Vec::new(),
         }
