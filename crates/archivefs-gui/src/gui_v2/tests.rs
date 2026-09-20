@@ -70,6 +70,8 @@ fn fixture(context: &egui::Context) -> App {
         repair_result: None,
         playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         playing_library_history: Vec::new(),
+        playing_library_job: None,
+        playing_library_generation: 0,
         mods: super::mods::ModsPageState::default(),
         mrwiz_dismissed: false,
     }
@@ -149,6 +151,152 @@ fn gui_v2_arcade_set_is_a_logical_library_row_with_plain_details() {
     assert!(strings.iter().any(|value| value == "Media: Arcade set"));
     assert!(strings.iter().any(|value| value == "Source: pacman"));
     assert!(!strings.iter().any(|value| value.contains("unknown media")));
+}
+
+#[test]
+fn gui_v2_playing_library_preview_runs_on_the_background_worker() {
+    let context = egui::Context::default();
+    let backend = super::backend::Backend::start(context);
+    let state = crate::playing_library_page::PlayingLibraryPageState::load();
+    backend
+        .send(
+            41,
+            super::backend::Command::PlayingLibraryPreview {
+                state: Box::new(state),
+                generation: 9,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        super::backend::Event::Started(41)
+    ));
+    let event = backend
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert!(matches!(
+        event,
+        super::backend::Event::Finished {
+            id: 41,
+            outcome: Ok(super::backend::Payload::PlayingLibraryPreview {
+                generation: 9,
+                ..
+            }),
+        }
+    ));
+}
+
+#[test]
+fn gui_v2_playing_library_apply_runs_on_the_background_worker() {
+    let context = egui::Context::default();
+    let backend = super::backend::Backend::start(context);
+    let state = crate::playing_library_page::PlayingLibraryPageState::load();
+    backend
+        .send(
+            42,
+            super::backend::Command::PlayingLibraryApply {
+                state: Box::new(state),
+                generation: 10,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        super::backend::Event::Started(42)
+    ));
+    assert!(matches!(
+        backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        super::backend::Event::Finished {
+            id: 42,
+            outcome: Ok(super::backend::Payload::PlayingLibraryApply {
+                generation: 10,
+                ..
+            }),
+        }
+    ));
+}
+
+#[test]
+fn gui_v2_stale_playing_library_preview_is_discarded() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.playing_library.source_root_draft = "/new-source".into();
+    app.playing_library_generation = 1;
+    let activity_id = app
+        .activity
+        .queue("Planning your playing library", Route::Section(Section::Build), false);
+    app.playing_library_job = Some(super::PlayingLibraryJob {
+        id: activity_id,
+        kind: super::PlayingLibraryJobKind::Preview,
+        generation: 1,
+        input_fingerprint: "old-input".into(),
+    });
+    let result = app.playing_library.clone();
+    app.finish_playing_library_job(super::PlayingLibraryJobKind::Preview, Box::new(result), 1);
+    assert!(app.playing_library_job.is_none());
+    assert!(
+        app.activity
+            .jobs
+            .get(&activity_id)
+            .unwrap()
+            .summary
+            .contains("discarded")
+    );
+}
+
+#[test]
+fn gui_v2_changed_then_restored_playing_library_input_stays_stale() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let original = app.playing_library.source_root_draft.clone();
+    let activity_id = app
+        .activity
+        .queue("Planning your playing library", Route::Section(Section::Build), false);
+    app.playing_library_job = Some(super::PlayingLibraryJob {
+        id: activity_id,
+        kind: super::PlayingLibraryJobKind::Preview,
+        generation: 1,
+        input_fingerprint: app.playing_library.input_fingerprint(),
+    });
+    app.playing_library_generation = 1;
+    app.playing_library.source_root_draft = "/changed-source".into();
+    app.invalidate_changed_playing_library_plan();
+    app.playing_library.source_root_draft = original;
+    let result = app.playing_library.clone();
+    app.finish_playing_library_job(super::PlayingLibraryJobKind::Preview, Box::new(result), 1);
+    assert!(
+        app.activity
+            .jobs
+            .get(&activity_id)
+            .unwrap()
+            .summary
+            .contains("discarded")
+    );
+}
+
+#[test]
+fn gui_v2_duplicate_playing_library_submit_is_refused() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.playing_library_job = Some(super::PlayingLibraryJob {
+        id: 99,
+        kind: super::PlayingLibraryJobKind::Preview,
+        generation: 1,
+        input_fingerprint: app.playing_library.input_fingerprint(),
+    });
+    app.playing_library_generation = 1;
+    app.start_playing_library_job(super::PlayingLibraryJobKind::Preview);
+    assert_eq!(app.playing_library_job.as_ref().unwrap().id, 99);
 }
 
 #[test]

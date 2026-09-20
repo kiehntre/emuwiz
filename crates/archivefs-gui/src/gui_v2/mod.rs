@@ -128,6 +128,20 @@ struct Notice {
     technical: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayingLibraryJobKind {
+    Preview,
+    Apply,
+}
+
+#[derive(Clone, Debug)]
+struct PlayingLibraryJob {
+    id: u64,
+    kind: PlayingLibraryJobKind,
+    generation: u64,
+    input_fingerprint: String,
+}
+
 pub(super) struct App {
     router: Router,
     backend: Backend,
@@ -168,6 +182,8 @@ pub(super) struct App {
     repair_result: Option<String>,
     playing_library: PlayingLibraryPageState,
     playing_library_history: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+    playing_library_job: Option<PlayingLibraryJob>,
+    playing_library_generation: u64,
     mods: ModsPageState,
     mrwiz_dismissed: bool,
 }
@@ -216,6 +232,8 @@ impl App {
             repair_result: None,
             playing_library: PlayingLibraryPageState::load(),
             playing_library_history: Vec::new(),
+            playing_library_job: None,
+            playing_library_generation: 0,
             mods: ModsPageState::default(),
             mrwiz_dismissed: false,
         };
@@ -224,7 +242,7 @@ impl App {
         app.load(false);
         app
     }
-    fn send(&mut self, id: u64, command: Command) {
+    fn send(&mut self, id: u64, command: Command) -> bool {
         if let Err(error) = self.backend.send(id, command) {
             self.activity.finish(
                 id,
@@ -235,6 +253,9 @@ impl App {
                 message: error,
                 technical: String::new(),
             });
+            false
+        } else {
+            true
         }
     }
     fn load(&mut self, scan: bool) {
@@ -415,64 +436,49 @@ impl App {
         );
         self.send(id, Command::Legacy { section, path });
     }
+
+    fn start_playing_library_job(&mut self, kind: PlayingLibraryJobKind) {
+        if self.playing_library_job.is_some() {
+            return;
+        }
+        self.playing_library_generation = self.playing_library_generation.wrapping_add(1);
+        let generation = self.playing_library_generation;
+        let input_fingerprint = self.playing_library.input_fingerprint();
+        let id = self.activity.queue(
+            match kind {
+                PlayingLibraryJobKind::Preview => "Planning your playing library",
+                PlayingLibraryJobKind::Apply => "Building your playing library",
+            },
+            Route::Section(Section::Build),
+            false,
+        );
+        self.playing_library_job = Some(PlayingLibraryJob {
+            id,
+            kind,
+            generation,
+            input_fingerprint,
+        });
+        let state = Box::new(self.playing_library.clone());
+        let command = match kind {
+            PlayingLibraryJobKind::Preview => Command::PlayingLibraryPreview { state, generation },
+            PlayingLibraryJobKind::Apply => Command::PlayingLibraryApply { state, generation },
+        };
+        if !self.send(id, command) {
+            self.playing_library_job = None;
+        }
+    }
+
     fn handle_playing_library_action(&mut self, action: PlayingLibraryPageAction) {
         use PlayingLibraryPageAction::*;
         match action {
             Preview => {
-                let id = self.activity.queue(
-                    "Planning your playing library",
-                    Route::Section(Section::Build),
-                    false,
-                );
-                self.playing_library.preview();
-                if let Some(error) = self.playing_library.error().map(str::to_owned) {
-                    self.activity.finish(
-                        id,
-                        "The preview could not be completed. Nothing was changed.".into(),
-                        Some(error.clone()),
-                    );
-                    self.notice = Some(Notice {
-                        message: "The playing-library preview needs attention.".into(),
-                        technical: error,
-                    });
-                } else {
-                    self.activity.finish(
-                        id,
-                        "Preview ready. Review the selected games before creating links.".into(),
-                        None,
-                    );
-                }
+                self.start_playing_library_job(PlayingLibraryJobKind::Preview);
             }
             SelectFamily(name) => self.playing_library.select_family(name),
             RequestApply => self.playing_library.request_apply(),
             CancelApply => self.playing_library.cancel_apply(),
             ConfirmApply => {
-                let id = self.activity.queue(
-                    "Building your playing library",
-                    Route::Section(Section::Build),
-                    false,
-                );
-                self.playing_library.confirm_apply();
-                if let Some(error) = self.playing_library.apply_error().map(str::to_owned) {
-                    self.activity.finish(
-                        id,
-                        "The playing library was not completed. Your original collection remains unchanged.".into(),
-                        Some(error),
-                    );
-                } else if let Some(transaction) = self.playing_library.applied().cloned() {
-                    self.playing_library_history.push(transaction.clone());
-                    self.activity.finish(
-                        id,
-                        format!(
-                            "Playing library created: {} links. Your original collection was not changed.",
-                            transaction.applied_count()
-                        ),
-                        None,
-                    );
-                } else {
-                    self.activity
-                        .finish(id, "No playing-library changes were made.".into(), None);
-                }
+                self.start_playing_library_job(PlayingLibraryJobKind::Apply);
             }
             RollbackLast => {
                 let id = self.activity.queue(
@@ -518,6 +524,99 @@ impl App {
             | RollbackRetroDeck => {}
         }
     }
+
+    fn finish_playing_library_job(
+        &mut self,
+        kind: PlayingLibraryJobKind,
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    ) {
+        let Some(job) = self.playing_library_job.take() else {
+            return;
+        };
+        if job.kind != kind || job.generation != generation {
+            return;
+        }
+        match kind {
+            PlayingLibraryJobKind::Preview => {
+                if generation != self.playing_library_generation
+                    || job.input_fingerprint != self.playing_library.input_fingerprint()
+                {
+                    self.activity.finish(
+                        job.id,
+                        "The preview was discarded because the library settings changed. Plan again to review the new settings.".into(),
+                        None,
+                    );
+                    return;
+                }
+                self.playing_library = *state;
+                if let Some(error) = self.playing_library.error().map(str::to_owned) {
+                    self.activity.finish(
+                        job.id,
+                        "The preview could not be completed. Nothing was changed.".into(),
+                        Some(error.clone()),
+                    );
+                    self.notice = Some(Notice {
+                        message: "The playing-library preview needs attention.".into(),
+                        technical: error,
+                    });
+                } else {
+                    self.activity.finish(
+                        job.id,
+                        "Preview ready. Review the selected games before creating links.".into(),
+                        None,
+                    );
+                }
+            }
+            PlayingLibraryJobKind::Apply => {
+                let transaction = state.applied().cloned();
+                let error = state.apply_error().map(str::to_owned);
+                self.playing_library.merge_async_apply_result(*state);
+                if let Some(error) = error {
+                    self.activity.finish(
+                        job.id,
+                        "The playing library was not completed. Your original collection remains unchanged.".into(),
+                        Some(error),
+                    );
+                } else if let Some(transaction) = transaction {
+                    if !self
+                        .playing_library_history
+                        .iter()
+                        .any(|item| item.transaction_id == transaction.transaction_id)
+                    {
+                        self.playing_library_history.push(transaction.clone());
+                    }
+                    self.activity.finish(
+                        job.id,
+                        format!(
+                            "Playing library created: {} links. Your original collection was not changed.",
+                            transaction.applied_count()
+                        ),
+                        None,
+                    );
+                } else {
+                    self.activity
+                        .finish(job.id, "No playing-library changes were made.".into(), None);
+                }
+            }
+        }
+    }
+
+    fn invalidate_changed_playing_library_plan(&mut self) {
+        let Some(job) = self.playing_library_job.as_ref() else {
+            return;
+        };
+        if job.kind == PlayingLibraryJobKind::Preview
+            && job.generation == self.playing_library_generation
+            && job.input_fingerprint != self.playing_library.input_fingerprint()
+        {
+            // The worker owns a snapshot. Once the user edits any planning
+            // input, its eventual result must not be accepted—even if the
+            // user changes the value back before the worker replies.
+            self.playing_library_generation = self.playing_library_generation.wrapping_add(1);
+        }
+    }
+
     fn poll(&mut self, context: &egui::Context) {
         self.artwork.begin_frame(context);
         for _ in 0..32 {
@@ -639,10 +738,27 @@ impl App {
                                         self.filter_dirty = Some(Instant::now());
                                     }
                                 }
+                                Payload::PlayingLibraryPreview { state, generation } => {
+                                    self.finish_playing_library_job(
+                                        PlayingLibraryJobKind::Preview,
+                                        state,
+                                        generation,
+                                    );
+                                }
+                                Payload::PlayingLibraryApply { state, generation } => {
+                                    self.finish_playing_library_job(
+                                        PlayingLibraryJobKind::Apply,
+                                        state,
+                                        generation,
+                                    );
+                                }
                                 Payload::Done => {}
                             }
                         }
                         Err(error) => {
+                            if self.playing_library_job.as_ref().is_some_and(|job| job.id == id) {
+                                self.playing_library_job = None;
+                            }
                             if self.repair_job == Some(id) {
                                 self.repair_job = None;
                             }

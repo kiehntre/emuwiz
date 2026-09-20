@@ -6,6 +6,7 @@ use super::{
     },
     routes::{Route, Section},
 };
+use crate::playing_library_page::PlayingLibraryPageState;
 use archivefs_core::{Database, default_database_path};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -68,6 +69,14 @@ pub(super) enum Command {
     },
     Save(Preferences),
     Restore,
+    PlayingLibraryPreview {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
+    PlayingLibraryApply {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
 }
 
 pub(super) enum Payload {
@@ -91,6 +100,14 @@ pub(super) enum Payload {
     },
     Preferences(Preferences),
     Done,
+    PlayingLibraryPreview {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
+    PlayingLibraryApply {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -468,6 +485,14 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 }
             };
             Ok(Payload::Preferences(preferences))
+        }
+        Command::PlayingLibraryPreview { mut state, generation } => {
+            state.preview();
+            Ok(Payload::PlayingLibraryPreview { state, generation })
+        }
+        Command::PlayingLibraryApply { mut state, generation } => {
+            state.confirm_apply();
+            Ok(Payload::PlayingLibraryApply { state, generation })
         }
     }
 }

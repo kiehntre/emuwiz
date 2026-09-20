@@ -1128,6 +1128,7 @@ impl App {
     }
 
     fn build_library(&mut self, ui: &mut egui::Ui) {
+        self.invalidate_changed_playing_library_plan();
         let mut action = None;
         egui::ScrollArea::vertical()
             .id_salt("v2_build_library")
@@ -1144,9 +1145,10 @@ impl App {
                     });
                 }
                 ui.separator();
-                action = crate::playing_library_page::show_playing_library_page(
+                action = crate::playing_library_page::show_playing_library_page_with_busy(
                     ui,
                     &mut self.playing_library,
+                    self.playing_library_job.is_some(),
                 );
             });
         if let Some(action) = action {

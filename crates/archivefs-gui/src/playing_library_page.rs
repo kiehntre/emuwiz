@@ -77,6 +77,7 @@ pub(crate) enum PlayingLibraryDestination {
 }
 
 /// The page's authoritative state.
+#[derive(Clone)]
 pub(crate) struct PlayingLibraryPageState {
     pub(crate) destination: PlayingLibraryDestination,
     pub(crate) selected_catalogue: Option<CatalogueRef>,
@@ -130,6 +131,7 @@ pub(crate) struct PlayingLibraryPageState {
     applied_plan: Option<PlayingLibraryPlan>,
     apply_error: Option<String>,
     journal_dir: PathBuf,
+    async_busy: bool,
 
     // --- "Publish to ES-DE" (see `archivefs_core::launch::es_de_publish`) ---
     //
@@ -210,6 +212,7 @@ impl Default for PlayingLibraryPageState {
             apply_error: None,
             journal_dir: default_rename_transaction_dir()
                 .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
+            async_busy: false,
             esde_platform_id: None,
             esde_profile: None,
             esde_discovery_error: None,
@@ -353,6 +356,32 @@ impl PlayingLibraryPageState {
 
     pub(crate) fn plan(&self) -> Option<&PlayingLibraryPlan> {
         self.plan.as_ref()
+    }
+
+    pub(crate) fn input_fingerprint(&self) -> String {
+        format!(
+            "{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.destination,
+            self.selected_catalogue,
+            self.source_root_draft,
+            self.destination_root_draft,
+            self.preferred_regions_draft,
+            self.preferred_languages_draft,
+            self.prefer_newest_revision,
+            self.prefer_parent,
+            self.exclude_beta,
+            self.exclude_proto,
+            self.exclude_demo,
+            self.exclude_sample,
+        )
+    }
+
+    pub(crate) fn merge_async_apply_result(&mut self, result: Self) {
+        self.pending_apply = result.pending_apply;
+        self.confirm_text = result.confirm_text;
+        self.applied = result.applied;
+        self.applied_plan = result.applied_plan;
+        self.apply_error = result.apply_error;
     }
 
     pub(crate) fn error(&self) -> Option<&str> {
@@ -1297,6 +1326,15 @@ pub(crate) fn show_playing_library_page(
     ui: &mut egui::Ui,
     state: &mut PlayingLibraryPageState,
 ) -> Option<PlayingLibraryPageAction> {
+    show_playing_library_page_with_busy(ui, state, false)
+}
+
+pub(crate) fn show_playing_library_page_with_busy(
+    ui: &mut egui::Ui,
+    state: &mut PlayingLibraryPageState,
+    async_busy: bool,
+) -> Option<PlayingLibraryPageAction> {
+    state.async_busy = async_busy;
     let mut action = None;
     let simple = crate::simple_mode::active(ui.ctx());
 
@@ -1496,11 +1534,14 @@ pub(crate) fn show_playing_library_page(
             "Preview 1G1R Library"
         },
         widgets::ActionStyle::Primary,
-        ready,
+        ready && !async_busy,
     )
     .clicked()
     {
         action = Some(PlayingLibraryPageAction::Preview);
+    }
+    if async_busy {
+        ui.label("Working in the background… You can keep browsing.");
     }
     if !ready {
         ui.label(
@@ -1704,7 +1745,11 @@ fn show_output_projection_summary(
                 state.applied.is_some()
             }
         };
-        if !pending && !applied && projection.operation_count > 0 && projection.conflicts.is_empty()
+        if !state.async_busy
+            && !pending
+            && !applied
+            && projection.operation_count > 0
+            && projection.conflicts.is_empty()
         {
             let visibility_ok = match projection.profile {
                 LibraryOutputProfile::Romm => state
@@ -1737,6 +1782,9 @@ fn show_output_projection_summary(
             }
         }
         if pending {
+            if state.async_busy {
+                ui.label("Building your playing library in the background…");
+            }
             let count = projection.operation_count;
             if count > TYPED_CONFIRMATION_THRESHOLD {
                 let confirmation = match projection.profile {
@@ -1757,12 +1805,22 @@ fn show_output_projection_summary(
                 );
             }
             ui.horizontal_wrapped(|ui| {
-                if widgets::action_button(ui, "Confirm", widgets::ActionStyle::Destructive, true)
+                if widgets::action_button(
+                    ui,
+                    "Confirm",
+                    widgets::ActionStyle::Destructive,
+                    !state.async_busy,
+                )
                     .clicked()
                 {
                     *action = Some(PlayingLibraryPageAction::ConfirmApply);
                 }
-                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                if widgets::action_button(
+                    ui,
+                    "Cancel",
+                    widgets::ActionStyle::Quiet,
+                    !state.async_busy,
+                )
                     .clicked()
                 {
                     *action = Some(PlayingLibraryPageAction::CancelApply);
