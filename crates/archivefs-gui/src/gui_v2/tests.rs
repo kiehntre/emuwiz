@@ -2,7 +2,7 @@ use super::*;
 use super::{
     activity::Phase,
     artwork::{Artwork, Picture},
-    library::{DuplicateGroup, DuplicateMember, DuplicateReport, Game},
+    library::{DuplicateGroup, DuplicateMember, DuplicateReport, Game, media_kind_label},
     media_sources::{Kind, MediaIndex, Source},
 };
 use archivefs_core::PersistedArchive;
@@ -125,6 +125,30 @@ fn gui_v2_navigation_keeps_selection_and_back_history() {
     assert_eq!(router.current, Route::Section(Section::Games));
     router.back();
     assert_eq!(router.current, Route::Home);
+}
+
+#[test]
+fn gui_v2_arcade_set_is_a_logical_library_row_with_plain_details() {
+    let mut persisted = archive(7, "Pac-Man", Some("Arcade"));
+    persisted.archive_kind = "arcade_set_directory".into();
+    persisted.relative_path = "pacman".into();
+    persisted.absolute_path = "/fixture/arcade/pacman".into();
+
+    assert_eq!(media_kind_label(&persisted.archive_kind), "Arcade set");
+    let library = Library::new(vec![persisted]);
+    assert_eq!(library.games.len(), 1);
+    assert_eq!(library.games[0].title, "Pac-Man");
+    assert_eq!(library.games[0].archive.relative_path, Path::new("pacman"));
+
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(library);
+    app.router.current = Route::Game(7);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+
+    assert!(strings.iter().any(|value| value == "Media: Arcade set"));
+    assert!(strings.iter().any(|value| value == "Source: pacman"));
+    assert!(!strings.iter().any(|value| value.contains("unknown media")));
 }
 
 #[test]

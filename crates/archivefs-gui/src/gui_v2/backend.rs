@@ -212,7 +212,12 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let status = if !game.archive.absolute_path.is_file() {
+                let is_present = game.archive.absolute_path.is_file()
+                    || (matches!(
+                        archivefs_core::ArchiveKind::from_storage(&game.archive.archive_kind),
+                        Some(archivefs_core::ArchiveKind::ArcadeSetDirectory)
+                    ) && game.archive.absolute_path.is_dir());
+                let status = if !is_present {
                     result.missing += 1;
                     "Missing"
                 } else if game.attention {

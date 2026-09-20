@@ -4,7 +4,7 @@ use super::{
     activity::Phase,
     artwork::Picture,
     backend::Command,
-    library::Game,
+    library::{Game, media_kind_label},
     media_sources::Kind,
     problems::{Category, Problem, ProblemSummary, Severity},
     routes::{HOME_TASKS, Route, SECTIONS, Section},
@@ -992,6 +992,8 @@ impl App {
                 self.picture(ui, game, Kind::Cover, egui::vec2(150.0, 200.0));
                 ui.vertical(|ui| {
                     ui.strong(&game.platform);
+                    ui.label(format!("Media: {}", media_kind_label(&game.archive.archive_kind)));
+                    ui.label(format!("Source: {}", game.archive.relative_path.display()));
                     if let Some(status) = &latest_verification {
                         ui.label(format!("Latest verification: {status}"));
                     }
@@ -1045,6 +1047,7 @@ impl App {
             }
             ui.collapsing("Advanced details", |ui| {
                 ui.label(if game.identified { "Identified in the saved game list" } else { "Identity is not confirmed" });
+                ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
                 if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) { ui.label(&detail.technical); }
                 if let Some(index) = &self.artwork.index
                     && let Some(diagnostic) = index.diagnostics.get(&id)

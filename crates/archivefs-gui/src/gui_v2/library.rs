@@ -1,8 +1,21 @@
 //! Lightweight catalogue projection. Never turns filename hints into identity.
 use archivefs_core::{
-    PersistedArchive,
+    ArchiveKind, PersistedArchive,
     launch::{CanonicalIdentityStatus, canonical_identity_from_game_report},
 };
+
+pub(super) fn media_kind_label(storage_name: &str) -> &'static str {
+    match ArchiveKind::from_storage(storage_name) {
+        Some(ArchiveKind::Zip) => "ZIP",
+        Some(ArchiveKind::SevenZip) => "7z",
+        Some(ArchiveKind::Rar) => "RAR",
+        Some(ArchiveKind::MegaDriveRom) => "Mega Drive ROM",
+        Some(ArchiveKind::DirectGameImage) => "Game image",
+        Some(ArchiveKind::ArcadeSetDirectory) => "Arcade set",
+        None if storage_name.eq_ignore_ascii_case("iso") => "Game image",
+        None => "Media",
+    }
+}
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
