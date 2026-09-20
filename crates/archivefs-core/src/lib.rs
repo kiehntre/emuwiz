@@ -566,6 +566,8 @@ pub mod rom_hack_catalogue;
 pub mod mod_catalogue_review;
 /// Local, immutable handoff from downloaded bytes to existing mod inspectors.
 pub mod mod_download_inspection;
+/// Shared, fail-closed activation planning for enabled mod stacks and previews.
+pub mod mod_activation;
 /// Pure, no-network policy validation for future external mod payload fetches.
 pub mod mod_download_policy;
 /// Bounded HTTPS transport for policy-approved external mod payloads.
