@@ -38,6 +38,9 @@ pub(crate) struct CachedLibrarySnapshot {
     pub(crate) database_path: PathBuf,
     pub(crate) schema_version: i64,
     pub(crate) archives: Vec<PersistedArchive>,
+    /// Current trusted topology evidence. Empty means unavailable/stale and
+    /// deliberately causes the media-set page to retain its bounded fallback.
+    pub(crate) media_topology: Vec<archivefs_core::media_set::MediaSet>,
     /// Reconstructed persisted DAT identity, keyed by archive id. Rendering
     /// reads this cache and never audits, hashes, or opens content.
     pub(crate) dat_identities: HashMap<i64, Vec<LibraryDatIdentitySummary>>,
@@ -65,10 +68,8 @@ pub(crate) struct CachedLibrarySnapshot {
     /// Explicitly accepted ScreenScraper descriptive metadata, keyed by
     /// archive id. This is presentation enrichment only and is never fed to
     /// identity/platform resolution.
-    pub(crate) screenscraper_enrichments: HashMap<
-        i64,
-        archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment,
-    >,
+    pub(crate) screenscraper_enrichments:
+        HashMap<i64, archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
 }
 
 // A one-shot value moved straight out of a worker channel
@@ -318,6 +319,9 @@ pub(crate) fn load_snapshot_from(
     };
     let schema_version = database.schema_version().map_err(to_failed)?;
     let archives = database.load_archives().map_err(to_failed)?;
+    let media_topology = database
+        .load_media_topology_evidence(&archives)
+        .map_err(to_failed)?;
     let screenscraper_enrichments = database
         .load_screenscraper_enrichments()
         .map_err(to_failed)?
@@ -402,6 +406,7 @@ pub(crate) fn load_snapshot_from(
         database_path: database_path.to_path_buf(),
         schema_version,
         archives,
+        media_topology,
         dat_identities,
         platform_details,
         stats,

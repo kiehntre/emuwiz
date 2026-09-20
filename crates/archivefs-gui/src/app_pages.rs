@@ -686,7 +686,7 @@ pub(crate) fn show_pages(
             if app.view == MainView::MediaSets {
                 if let Some(snapshot) = app.database_state.snapshot() {
                     app.sources_ui.media_sets_page
-                        .refresh(&snapshot.archives, app.database_generation.0);
+                        .refresh(&snapshot.archives, &snapshot.media_topology, app.database_generation.0);
                 }
                 media_sets_page::show_media_sets_page(ui, &mut app.sources_ui.media_sets_page);
                 return;

@@ -36,16 +36,25 @@ pub(crate) struct MediaSetsPageState {
 }
 
 impl MediaSetsPageState {
-    pub(crate) fn refresh(&mut self, archives: &[PersistedArchive], generation: u64) {
+    pub(crate) fn refresh(
+        &mut self,
+        archives: &[PersistedArchive],
+        persisted: &[MediaSet],
+        generation: u64,
+    ) {
         if self.generation == Some(generation) {
             return;
         }
-        let records = archives
-            .iter()
-            .filter(|archive| archive.last_verified_missing_at.is_none())
-            .filter_map(record_from_catalogue)
-            .collect();
-        self.sets = resolve_index(index_media(records)).sets;
+        self.sets = if persisted.is_empty() {
+            let records = archives
+                .iter()
+                .filter(|archive| archive.last_verified_missing_at.is_none())
+                .filter_map(record_from_catalogue)
+                .collect();
+            resolve_index(index_media(records)).sets
+        } else {
+            persisted.to_vec()
+        };
         self.generation = Some(generation);
         self.page = 0;
         self.selected = None;
@@ -707,7 +716,7 @@ mod tests {
         present.last_verified_missing_at = None;
 
         let mut state = MediaSetsPageState::default();
-        state.refresh(&[missing, present], 1);
+        state.refresh(&[missing, present], &[], 1);
         assert_eq!(state.sets.len(), 1);
         assert_eq!(state.sets[0].platform.as_deref(), Some("Dreamcast"));
     }

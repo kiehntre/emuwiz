@@ -21,7 +21,7 @@
 //! This module uses `std::os::unix::ffi` to store and read back exact path
 //! bytes, so it - like the rest of this Linux-first project - is Unix-only.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(test)]
 use std::env;
 use std::ffi::OsString;
@@ -42,6 +42,7 @@ use crate::emulator_environment::EncodedPath;
 use crate::game_identity::{
     GameIdentityReport, IdentityPlatform, inspect_catalogued_game_identity,
 };
+use crate::media_set::{EvidenceKind, MediaSet, MediaSetConfidence, MediaSetState, TopologyReport};
 use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
 use crate::{
@@ -57,6 +58,9 @@ mod attention;
 mod attention_tests;
 mod authority;
 mod restore;
+#[cfg(test)]
+#[path = "database/topology_evidence_tests.rs"]
+mod topology_evidence_tests;
 pub use restore::{
     DatabaseRestorePlan, DatabaseRestoreReceipt, DatabaseRestoreResult, DatabaseRestoreState,
     prepare_database_restore, restore_database, rollback_database_restore,
@@ -207,6 +211,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist explicitly accepted ScreenScraper descriptive metadata and receipts without changing identity",
         sql: include_str!("migrations/0019_screenscraper_enrichment.sql"),
     },
+    Migration {
+        version: 20,
+        description: "persist trusted catalogue-wide media topology evidence with producer and source provenance",
+        sql: include_str!("migrations/0020_media_topology_evidence.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -276,6 +285,82 @@ fn persisted_set_result_from_row(
 pub struct Database {
     connection: Connection,
     path: PathBuf,
+}
+
+/// The persisted, catalogue-wide topology projection. It is deliberately a
+/// cache of trusted evidence, not a new topology authority.
+pub const MEDIA_TOPOLOGY_PRODUCER_SCHEMA: i64 = 1;
+/// Version of the persisted topology envelope understood by this build.
+/// A producer changing its claim contract must bump this and invalidate old
+/// rows instead of silently reinterpreting them.
+pub const MEDIA_TOPOLOGY_PRODUCER_VERSION: &str = "1";
+pub const MEDIA_TOPOLOGY_MAX_SETS: usize = 4096;
+type TopologySourceMetadata = (Option<u64>, Option<i64>);
+
+fn topology_source_fingerprint(
+    set: &MediaSet,
+    current: Option<&HashMap<PathBuf, TopologySourceMetadata>>,
+) -> Option<String> {
+    let mut sources = BTreeSet::new();
+    for member in &set.members {
+        for representation in &member.representations {
+            let path = &representation.record.source.path;
+            let (size, modified) = if current.is_some() {
+                *current?.get(path)?
+            } else {
+                let metadata = fs::metadata(path).ok()?;
+                let modified = metadata
+                    .modified()
+                    .ok()?
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_secs() as i64;
+                (Some(metadata.len()), Some(modified))
+            };
+            let member = representation.record.source.archive_member.as_ref();
+            sources.insert(format!(
+                "{}\0{}\0{}\0{}\0{}",
+                path.to_string_lossy(),
+                member.map(|m| m.index).unwrap_or(usize::MAX),
+                member
+                    .map(|m| format!("{:x?}", m.name_bytes))
+                    .unwrap_or_default(),
+                size.map(|v| v.to_string()).unwrap_or_default(),
+                modified.map(|v| v.to_string()).unwrap_or_default(),
+            ));
+        }
+    }
+    let mut digest = Sha256::new();
+    for source in sources {
+        digest.update(source.as_bytes());
+        digest.update([0]);
+    }
+    let digest = digest.finalize();
+    let encoded = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(format!("sha256:{encoded}"))
+}
+
+fn trusted_persistable_topology(set: &MediaSet) -> bool {
+    set.confidence == MediaSetConfidence::Proven
+        && set.state != MediaSetState::ConflictingSet
+        && set.state != MediaSetState::AmbiguousSet
+        && !set.conflicts.iter().any(|c| c.blocking)
+        && set.identity.verified
+        && !set.members.is_empty()
+        && set.members.iter().all(|member| {
+            !member.representations.is_empty()
+                && member.representations.iter().all(|representation| {
+                    representation.confidence == MediaSetConfidence::Proven
+                        && representation.record.evidence.iter().any(|e| {
+                            e.provenance.kind >= EvidenceKind::TrustedDat
+                                && e.provenance.version.is_some()
+                        })
+                        && !representation.record.evidence.is_empty()
+                })
+        })
 }
 
 /// The durable result of an explicitly requested library-database upgrade.
@@ -426,6 +511,121 @@ impl Database {
     /// The path this database was opened from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Persists only topology that the existing engine has resolved as
+    /// trusted. Filename, directory, fuzzy, and otherwise review-required
+    /// results are intentionally ignored. This method never opens or writes
+    /// a source media file; it only reads metadata needed for invalidation.
+    pub fn persist_media_topology_evidence(
+        &mut self,
+        report: &TopologyReport,
+        producer: &str,
+        producer_version: &str,
+        generation: u64,
+    ) -> Result<usize> {
+        if producer.trim().is_empty() || producer_version.trim().is_empty() {
+            return Err(ArchiveFsError::Database(
+                "topology producer and version are required".into(),
+            ));
+        }
+        if producer_version != MEDIA_TOPOLOGY_PRODUCER_VERSION {
+            return Err(ArchiveFsError::Database(format!(
+                "unsupported topology producer version {producer_version}; expected {MEDIA_TOPOLOGY_PRODUCER_VERSION}"
+            )));
+        }
+        if report.sets.len() > MEDIA_TOPOLOGY_MAX_SETS {
+            return Err(ArchiveFsError::Database(
+                "topology evidence exceeds the bounded set limit".into(),
+            ));
+        }
+        let mut sets = report.sets.clone();
+        sets.sort_by(|a, b| a.identity.key.cmp(&b.identity.key));
+        let now = now_utc_string();
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|e| db_error("failed to begin topology evidence transaction", e))?;
+        let mut persisted = 0;
+        for set in sets {
+            if !trusted_persistable_topology(&set) {
+                continue;
+            }
+            let Some(fingerprint) = topology_source_fingerprint(&set, None) else {
+                continue;
+            };
+            let json = serde_json::to_vec(&set).map_err(|e| {
+                ArchiveFsError::Database(format!("failed to serialize topology evidence: {e}"))
+            })?;
+            tx.execute(
+                "INSERT INTO media_topology_evidence
+                 (set_namespace,set_value,producer,producer_version,producer_schema,source_fingerprint,generation,created_at,refreshed_at,evidence_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)
+                 ON CONFLICT(set_namespace,set_value,producer,producer_version,producer_schema)
+                 DO UPDATE SET source_fingerprint=excluded.source_fingerprint,generation=excluded.generation,refreshed_at=excluded.refreshed_at,evidence_json=excluded.evidence_json",
+                params![set.identity.key.namespace, set.identity.key.value, producer, producer_version,
+                    MEDIA_TOPOLOGY_PRODUCER_SCHEMA, fingerprint, generation as i64, now, json],
+            ).map_err(|e| db_error("failed to persist topology evidence", e))?;
+            persisted += 1;
+        }
+        tx.commit()
+            .map_err(|e| db_error("failed to commit topology evidence", e))?;
+        Ok(persisted)
+    }
+
+    /// Loads only current, trusted topology. Any producer/schema mismatch,
+    /// malformed row, changed/missing source, or conflict fails closed by
+    /// omitting that row; callers retain their bounded fallback.
+    pub fn load_media_topology_evidence(
+        &self,
+        archives: &[PersistedArchive],
+    ) -> Result<Vec<MediaSet>> {
+        let mut statement = self.connection.prepare(
+            "SELECT producer_version, producer_schema, source_fingerprint, evidence_json
+             FROM media_topology_evidence ORDER BY set_namespace,set_value,producer,producer_version,producer_schema",
+        ).map_err(|e| db_error("failed to prepare topology evidence lookup", e))?;
+        let rows = statement
+            .query_map([], |row| {
+                let version: String = row.get(0)?;
+                let schema: i64 = row.get(1)?;
+                let fingerprint: String = row.get(2)?;
+                let json: Vec<u8> = row.get(3)?;
+                Ok((version, schema, fingerprint, json))
+            })
+            .map_err(|e| db_error("failed to query topology evidence", e))?;
+        let current = archives
+            .iter()
+            .map(|archive| {
+                (
+                    archive.absolute_path.clone(),
+                    (archive.size_bytes, archive.modified_time_unix_seconds),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut result = Vec::new();
+        for row in rows {
+            let (version, schema, fingerprint, json) =
+                row.map_err(|e| db_error("failed to read topology evidence", e))?;
+            if version != MEDIA_TOPOLOGY_PRODUCER_VERSION
+                || schema != MEDIA_TOPOLOGY_PRODUCER_SCHEMA
+            {
+                continue;
+            }
+            let Ok(set) = serde_json::from_slice::<MediaSet>(&json) else {
+                continue;
+            };
+            if !trusted_persistable_topology(&set) {
+                continue;
+            }
+            if topology_source_fingerprint(&set, Some(&current)).as_deref()
+                != Some(fingerprint.as_str())
+            {
+                continue;
+            }
+            result.push(set);
+        }
+        result.sort_by(|a, b| a.identity.key.cmp(&b.identity.key));
+        Ok(result)
     }
 
     /// The current schema version (`PRAGMA user_version`), which equals
@@ -8301,19 +8501,16 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 19);
-        assert_eq!(report.applied_versions, vec![17, 18, 19]);
+        assert_eq!(report.to_version, 20);
+        assert_eq!(report.applied_versions, vec![17, 18, 19, 20]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 19);
+        assert_eq!(upgraded.schema_version().unwrap(), 20);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
-        assert_eq!(
-            pending_schema_migration_versions(19).unwrap(),
-            Vec::<i64>::new()
-        );
+        assert_eq!(pending_schema_migration_versions(19).unwrap(), vec![20]);
 
         let quick_check: String = upgraded
             .connection
@@ -17300,7 +17497,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 19);
+            assert_eq!(latest_known_version(MIGRATIONS), 20);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

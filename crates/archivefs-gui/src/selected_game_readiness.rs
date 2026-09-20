@@ -343,9 +343,11 @@ impl ArchiveFsApp {
             .map(Path::to_path_buf)
         {
             if let Some(snapshot) = self.database_state.snapshot() {
-                self.sources_ui
-                    .media_sets_page
-                    .refresh(&snapshot.archives, self.database_generation.0);
+                self.sources_ui.media_sets_page.refresh(
+                    &snapshot.archives,
+                    &snapshot.media_topology,
+                    self.database_generation.0,
+                );
             }
             if media_sets_page::show_selected_item_link(ui, &self.sources_ui.media_sets_page, &path)
             {
