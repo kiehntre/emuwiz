@@ -7951,7 +7951,8 @@ fn scan_and_persist_folders_transaction(
 
         database.begin_folder_refresh()?;
         let db_write_started = std::time::Instant::now();
-        let fully_reused = discovery_complete
+        let fully_reused = !arcade_specialist
+            && discovery_complete
             && discovery.timings.re_inspected == 0
             && non_archive_fingerprints.is_empty();
         let persisted = if fully_reused {
