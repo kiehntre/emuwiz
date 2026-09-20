@@ -6,6 +6,7 @@ mod legacy;
 mod library;
 mod media_sources;
 mod mods;
+mod native_workflows;
 mod pages;
 mod problems;
 mod routes;
@@ -185,6 +186,7 @@ pub(super) struct App {
     playing_library_job: Option<PlayingLibraryJob>,
     playing_library_generation: u64,
     mods: ModsPageState,
+    native_workflows: Option<native_workflows::NativeWorkflows>,
     mrwiz_dismissed: bool,
 }
 
@@ -235,6 +237,7 @@ impl App {
             playing_library_job: None,
             playing_library_generation: 0,
             mods: ModsPageState::default(),
+            native_workflows: None,
             mrwiz_dismissed: false,
         };
         app.send(0, Command::Restore);
@@ -900,6 +903,9 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.mods.poll();
+        if let Some(workflows) = &mut self.native_workflows {
+            workflows.poll(ui.ctx(), &mut self.activity);
+        }
         self.poll(ui.ctx());
         self.show(ui.ctx());
         self.finish_frame();

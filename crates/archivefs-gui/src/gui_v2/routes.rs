@@ -98,7 +98,7 @@ impl Section {
             Self::Duplicates => "Review duplicates",
             Self::Problems => "Review problems",
             Self::Build => "Build my library",
-            Self::Emulators => "Find installed emulators",
+            Self::Emulators => "Check Emulators",
             Self::Mods => "Choose a game",
             Self::Artwork => "Manage artwork",
             Self::Sources => "Find game folders",

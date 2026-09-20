@@ -1019,7 +1019,7 @@ fn gamer_shelf_geometry(ctx: &egui::Context) -> ShelfGeometry {
         .unwrap_or_default()
 }
 
-pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
+pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
     ArchiveFsApp {
         state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
         database_state: DatabaseState::NotCreated {

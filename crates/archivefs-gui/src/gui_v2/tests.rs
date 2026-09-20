@@ -73,6 +73,7 @@ fn fixture(context: &egui::Context) -> App {
         playing_library_job: None,
         playing_library_generation: 0,
         mods: super::mods::ModsPageState::default(),
+        native_workflows: None,
         mrwiz_dismissed: false,
     }
 }
@@ -542,6 +543,108 @@ fn gui_v2_legacy_handoff_preserves_game_and_workflow() {
         legacy::destination(Section::Advanced, false),
         MainView::DatSources
     );
+}
+
+#[test]
+fn gui_v2_play_route_is_native_and_starts_readiness_without_legacy_handoff() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let game = archive(41, "Shadow of the Colossus", Some("PS2"));
+    app.library = Arc::new(Library::new(vec![game]));
+    app.indices = vec![0];
+    app.router.current = Route::Task {
+        section: Section::Launch,
+        game: 41,
+    };
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|text| text.contains("Shadow of the Colossus")));
+    assert!(strings.iter().any(|text| text.contains("Platform: PS2")));
+    assert!(strings.iter().any(|text| text.contains("Play / Launch readiness")));
+    assert!(!strings.iter().any(|text| text.contains("existing interface")));
+    assert!(app.native_workflows.is_some());
+    assert!(app.activity.running() > 0);
+}
+
+#[test]
+fn gui_v2_emulator_setup_route_is_native_and_not_a_legacy_handoff() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Emulators);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|text| text == "Emulators"));
+    assert!(strings.iter().any(|text| text.contains("Check which emulators")));
+    assert!(!strings.iter().any(|text| text.contains("existing interface")));
+    assert!(app.native_workflows.is_some());
+}
+
+#[test]
+fn gui_v2_native_launch_state_survives_navigation_away_and_back() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(42, "Disc set", Some("PSX"))]));
+    app.indices = vec![0];
+    app.router.current = Route::Task {
+        section: Section::Launch,
+        game: 42,
+    };
+    let _ = frame(&context, &mut app, [1280.0, 820.0]);
+    assert_eq!(
+        app.native_workflows.as_ref().and_then(|bridge| bridge.selected_path()),
+        Some(Path::new("/fixture/Disc set.iso"))
+    );
+
+    app.router.current = Route::Home;
+    let _ = frame(&context, &mut app, [1280.0, 820.0]);
+    app.router.current = Route::Task {
+        section: Section::Launch,
+        game: 42,
+    };
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+
+    assert_eq!(
+        app.native_workflows.as_ref().and_then(|bridge| bridge.selected_path()),
+        Some(Path::new("/fixture/Disc set.iso"))
+    );
+    assert!(strings.iter().any(|text| text.contains("Play / Launch readiness")));
+}
+
+#[test]
+fn gui_v2_changed_game_discards_stale_readiness_and_tracks_the_new_game() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(51, "First game", Some("PSX")),
+        archive(52, "Second game", Some("PS2")),
+    ]));
+    app.indices = vec![0, 1];
+    app.router.current = Route::Task {
+        section: Section::Launch,
+        game: 51,
+    };
+    let _ = frame(&context, &mut app, [1280.0, 820.0]);
+
+    app.router.current = Route::Task {
+        section: Section::Launch,
+        game: 52,
+    };
+    let _ = frame(&context, &mut app, [1280.0, 820.0]);
+
+    assert_eq!(
+        app.native_workflows
+            .as_ref()
+            .and_then(|bridge| bridge.selected_path()),
+        Some(Path::new("/fixture/Second game.iso"))
+    );
+    assert!(app.activity.jobs.values().any(|job| {
+        job.active()
+            && job.result
+                == Route::Task {
+                    section: Section::Launch,
+                    game: 52,
+                }
+    }));
 }
 
 #[test]

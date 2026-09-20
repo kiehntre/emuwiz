@@ -572,6 +572,13 @@ impl AmigaWHDLoadLaunchState {
         )
     }
 
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, _, AmigaWHDLoadStage::Failed(error))) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     fn start(&mut self, request: WHDLoadLaunchInput) {
         let path = request
             .target
@@ -674,6 +681,13 @@ impl StandaloneLaunchState {
                 StandaloneLaunchStage::Starting(_) | StandaloneLaunchStage::Running(_)
             ))
         )
+    }
+
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, _, StandaloneLaunchStage::Failed(error))) => Some(error.clone()),
+            _ => None,
+        }
     }
 
     fn start(&mut self, request: StandaloneLaunchRequest) {
@@ -920,6 +934,13 @@ impl RetroArchLaunchState {
         )
     }
 
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, RetroArchLaunchStage::Failed { error })) => Some(format!("{error:?}")),
+            _ => None,
+        }
+    }
+
     pub(crate) fn start(&mut self, request: RetroArchLaunchRequest) {
         let key = RetroArchLaunchKey::from_request(&request);
         let (sender, receiver) = mpsc::channel();
@@ -1083,6 +1104,13 @@ impl DolphinLaunchState {
         )
     }
 
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, DolphinLaunchStage::Failed { error })) => Some(format!("{error:?}")),
+            _ => None,
+        }
+    }
+
     /// Re-derives the Dolphin discovery roots fresh from the environment
     /// inside the background thread (never the roots captured at button-
     /// render time) - the same "never trust cached readiness as execution
@@ -1214,6 +1242,13 @@ impl Pcsx2LaunchState {
                 Pcsx2LaunchStage::Starting { .. } | Pcsx2LaunchStage::Running { .. }
             ))
         )
+    }
+
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, Pcsx2LaunchStage::Failed { error })) => Some(format!("{error:?}")),
+            _ => None,
+        }
     }
 
     /// Re-derives the PCSX2 discovery roots fresh from the environment

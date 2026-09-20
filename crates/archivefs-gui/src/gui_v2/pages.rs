@@ -154,6 +154,7 @@ impl App {
             match self.router.current.clone() {
                 Route::Home | Route::Section(Section::Home) => self.home(ui),
                 Route::Section(Section::Games | Section::Launch) => self.games(ui),
+                Route::Section(Section::Emulators) => self.emulator_setup(ui),
                 Route::Section(Section::Mods) => self.mods_page(ui, None),
                 Route::Section(Section::Check) => self.check_games(ui),
                 Route::Section(Section::Duplicates) => self.duplicates(ui),
@@ -172,6 +173,10 @@ impl App {
                     section: Section::Mods,
                     game,
                 } => self.mods_page(ui, Some(game)),
+                Route::Task {
+                    section: Section::Launch,
+                    game,
+                } => self.launch(ui, game),
                 Route::Task { section, .. } | Route::Section(section) => self.handoff(ui, section),
             }
         });
@@ -1070,6 +1075,54 @@ impl App {
     fn mods_page(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         let selected = game_id.and_then(|id| self.library.game(id));
         crate::gui_v2::mods::show_mods_page(ui, &mut self.mods, selected, &mut self.activity);
+    }
+
+    fn launch(&mut self, ui: &mut egui::Ui, game_id: i64) {
+        let Some((title, platform, identified, media, path)) = self
+            .library
+            .game(game_id)
+            .map(|game| {
+                (
+                    game.title.clone(),
+                    game.platform.clone(),
+                    game.identified,
+                    media_kind_label(&game.archive.archive_kind).to_string(),
+                    game.archive.absolute_path.clone(),
+                )
+            })
+        else {
+            ui.label("This game is no longer in the current library.");
+            if primary(ui, "Return to games") {
+                self.go(Route::Section(Section::Games));
+            }
+            return;
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading(title);
+            ui.label(format!("Platform: {platform}"));
+            ui.label(format!("Media: {media}"));
+            ui.label(if identified {
+                "Verified identity is available"
+            } else {
+                "Game identity needs review"
+            });
+        });
+        ui.add_space(12.0);
+        let workflows = self.native_workflows.get_or_insert_with(|| {
+            super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+        });
+        if workflows.show_launch(ui, game_id, &path, &mut self.activity) {
+            self.go(Route::Section(Section::Emulators));
+        }
+    }
+
+    fn emulator_setup(&mut self, ui: &mut egui::Ui) {
+        let workflows = self.native_workflows.get_or_insert_with(|| {
+            super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+        });
+        egui::ScrollArea::vertical()
+            .id_salt("v2_native_emulator_setup")
+            .show(ui, |ui| workflows.show_setup(ui));
     }
 
     fn handoff(&mut self, ui: &mut egui::Ui, section: Section) {
