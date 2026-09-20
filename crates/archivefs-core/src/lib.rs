@@ -6027,7 +6027,12 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
     let metadata = fs::symlink_metadata(&archive.path)
         .map_err(|error| ArchiveFsError::io(archive.path.clone(), error))?;
     let identity = filesystem_identity(&metadata);
-    if !metadata.is_file()
+    let expected_shape = if archive.kind == ArchiveKind::ArcadeSetDirectory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    if !expected_shape
         || archive.identity.filesystem_device != Some(identity.device)
         || archive.identity.filesystem_inode != Some(identity.inode)
         || archive.identity.size_bytes != Some(metadata.len())

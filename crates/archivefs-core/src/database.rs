@@ -12150,6 +12150,28 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn extracted_arcade_set_directory_passes_catalogue_revalidation() {
+        let root = temp_dir("arcade-set-directory-revalidation");
+        let source = root.join("arcade");
+        let set = source.join("pacman");
+        let mount = root.join("mount");
+        fs::create_dir_all(&set).unwrap();
+        fs::write(set.join("pacman.6e"), b"one").unwrap();
+        fs::write(set.join("pacman.6f"), b"two").unwrap();
+
+        let archive = Archive::from_arcade_set_directory(&set, &source).unwrap();
+        revalidate_archive_for_catalogue(&archive).unwrap();
+
+        let config = config_for(&source, &mount);
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "test").unwrap();
+        assert_eq!(summary.counts.archives_added, 1);
+        assert_eq!(database.load_archives().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[cfg(unix)]
     #[test]
     fn source_root_replacement_after_scan_is_rejected_before_catalogue_persistence() {
