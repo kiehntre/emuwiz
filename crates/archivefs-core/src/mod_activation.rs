@@ -156,7 +156,14 @@ impl ModStack {
 
     pub fn preview_enable(&self, layer: ModLayer) -> ActivationPlan {
         let mut layers = self.layers.clone();
-        layers.push(layer);
+        if let Some(existing) = layers
+            .iter_mut()
+            .find(|existing| existing.mod_id == layer.mod_id && !existing.enabled)
+        {
+            existing.enabled = true;
+        } else {
+            layers.push(layer);
+        }
         plan(self, ActivationOperation::Enable, layers)
     }
 
@@ -263,7 +270,16 @@ fn plan(
     let mut warnings = Vec::new();
     let explicitly_ordered = layers
         .iter()
-        .map(|layer| (layer.mod_id.clone(), layer.requested_order.is_some()))
+        .map(|layer| {
+            (
+                layer.mod_id.clone(),
+                layer.requested_order.is_some()
+                    || layer
+                        .patch_chain
+                        .as_ref()
+                        .is_some_and(|chain| chain.explicit_order.is_some()),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     if layers.len() > MAX_STACK_LAYERS {
         conflicts.push(ModConflict {
@@ -277,9 +293,9 @@ fn plan(
     }
 
     layers.sort_by(|left, right| {
-        left.requested_order
+        effective_requested_order(left)
             .unwrap_or(u32::MAX)
-            .cmp(&right.requested_order.unwrap_or(u32::MAX))
+            .cmp(&effective_requested_order(right).unwrap_or(u32::MAX))
             .then_with(|| left.mod_id.cmp(&right.mod_id))
     });
     for (index, layer) in layers.iter_mut().enumerate() {
@@ -452,6 +468,15 @@ fn plan(
     }
 }
 
+fn effective_requested_order(layer: &ModLayer) -> Option<u32> {
+    layer.requested_order.or_else(|| {
+        layer
+            .patch_chain
+            .as_ref()
+            .and_then(|chain| chain.explicit_order)
+    })
+}
+
 fn check_patch_chain(left: &ModLayer, right: &ModLayer, conflicts: &mut Vec<ModConflict>) {
     let (Some(a), Some(b)) = (&left.patch_chain, &right.patch_chain) else {
         return;
@@ -557,7 +582,7 @@ mod tests {
         let mut b = layer("b", &["b.dds"]);
         b.enabled = false;
         let mut a = layer("a", &["a.dds"]);
-        a.enabled = false;
+        a.enabled = true;
         stack.layers = vec![b, a];
         let plan = stack.preview_enable(stack.layers[0].clone());
         assert!(plan.can_apply());
@@ -636,7 +661,8 @@ mod tests {
         });
         let mut stack = ModStack::new("GAME");
         stack.layers = vec![a];
-        assert!(stack.preview_enable(b).can_apply());
+        let plan = stack.preview_enable(b);
+        assert!(plan.can_apply());
     }
 
     #[test]
