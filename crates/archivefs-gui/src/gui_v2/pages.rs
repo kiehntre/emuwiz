@@ -157,11 +157,16 @@ impl App {
                 Route::Section(Section::Check) => self.check_games(ui),
                 Route::Section(Section::Duplicates) => self.duplicates(ui),
                 Route::Section(Section::Problems) => self.problems(ui),
+                Route::Section(Section::Build) => self.build_library(ui),
                 Route::Section(Section::Platforms) => self.platforms(ui),
                 Route::Game(id) => self.game_detail(ui, id),
                 Route::Section(Section::Activity) => self.activities(ui),
                 Route::Section(Section::History) => self.history(ui),
                 Route::Section(Section::Settings) => self.settings(ui),
+                Route::Task {
+                    section: Section::Build,
+                    ..
+                } => self.build_library(ui),
                 Route::Task { section, .. } | Route::Section(section) => self.handoff(ui, section),
             }
         });
@@ -827,13 +832,48 @@ impl App {
     }
 
     fn history(&mut self, ui: &mut egui::Ui) {
-        ui.label("Previous repairs are shown from the durable transaction journal. Browsing history changes nothing.");
-        if self.repair_history.is_empty() {
+        ui.label("Previous repairs and playing-library builds are shown from the durable transaction journal. Browsing history changes nothing.");
+        if self.repair_history.is_empty() && self.playing_library_history.is_empty() {
             ui.heading("No repair history yet");
             ui.label(
                 "When a supported repair completes, its receipt and undo status will appear here.",
             );
             return;
+        }
+        let mut open_build = false;
+        if !self.playing_library_history.is_empty() {
+            ui.heading("Playing libraries");
+            for transaction in self.playing_library_history.iter().rev() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.heading("Built Playing Library");
+                    ui.label(format!(
+                        "{} · {} link(s)",
+                        transaction.transaction_id,
+                        transaction.entries.len()
+                    ));
+                    ui.label(format!("Destination: {}", transaction.source_scan_root));
+                    match transaction.state {
+                        TransactionState::Applied => {
+                            ui.strong("Ready to undo");
+                            if ui.button("Open Build Library to preview undo").clicked() {
+                                open_build = true;
+                            }
+                        }
+                        TransactionState::RolledBack => {
+                            ui.label("Already undone");
+                        }
+                        _ => {
+                            ui.label("Needs review — the transaction did not finish normally.");
+                        }
+                    }
+                    ui.collapsing("Advanced Details", |ui| {
+                        ui.label(
+                            "Shared journaled link transaction from the Playing Library planner.",
+                        );
+                    });
+                });
+            }
         }
         let mut undo = None;
         egui::ScrollArea::vertical()
@@ -891,6 +931,9 @@ impl App {
                     if ui.button("Cancel").clicked() { self.undo_confirm = None; }
                     ui.collapsing("Advanced Details", |ui| { ui.monospace(format!("Transaction: {transaction_id}")); });
                 });
+        }
+        if open_build {
+            self.go(Route::Section(Section::Build));
         }
     }
 
@@ -1068,6 +1111,33 @@ impl App {
         });
         if let Some(route) = destination {
             self.go(route);
+        }
+    }
+
+    fn build_library(&mut self, ui: &mut egui::Ui) {
+        let mut action = None;
+        egui::ScrollArea::vertical()
+            .id_salt("v2_build_library")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading("Build a playing library");
+                ui.label("Create a cleaner library containing one preferred copy of each game while leaving your original collection untouched.");
+                ui.label("EmuWiz only creates links in the destination you choose. Your source files stay where they are.");
+                if primary(ui, "Set up library") {
+                    ui.ctx().memory_mut(|memory| {
+                        memory.request_focus(egui::Id::new(
+                            crate::playing_library_page::SOURCE_ROOT_FIELD_ID,
+                        ));
+                    });
+                }
+                ui.separator();
+                action = crate::playing_library_page::show_playing_library_page(
+                    ui,
+                    &mut self.playing_library,
+                );
+            });
+        if let Some(action) = action {
+            self.handle_playing_library_action(action);
         }
     }
 

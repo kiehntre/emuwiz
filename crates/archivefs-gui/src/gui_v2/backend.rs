@@ -85,7 +85,10 @@ pub(super) enum Payload {
     DuplicatePreview(Box<DuplicateRepairPreview>),
     DuplicateApplied(Box<DuplicateRepairRecord>),
     DuplicateUndone(Box<DuplicateRepairRecord>),
-    RepairHistory(Vec<DuplicateRepairRecord>),
+    RepairHistory {
+        duplicates: Vec<DuplicateRepairRecord>,
+        playing_libraries: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+    },
     Preferences(Preferences),
     Done,
 }
@@ -395,24 +398,37 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                     .map_err(|error| error.to_string())?;
             let (transactions, _problems) =
                 archivefs_core::dat::rename_apply::journal::list_journals(&journal_dir);
-            Ok(Payload::RepairHistory(
-                transactions
-                    .into_iter()
-                    .filter(|transaction| {
-                        transaction.entries.iter().any(|entry| {
-                            entry.destination_path.components().any(|component| {
-                                component.as_os_str()
-                                    == archivefs_core::repair::QUARANTINE_DIRECTORY_NAME
-                            })
+            {
+                let mut duplicates = Vec::new();
+                let mut playing_libraries = Vec::new();
+                for transaction in transactions {
+                    let is_duplicate = transaction.entries.iter().any(|entry| {
+                        entry.destination_path.components().any(|component| {
+                            component.as_os_str()
+                                == archivefs_core::repair::QUARANTINE_DIRECTORY_NAME
                         })
-                    })
-                    .map(|transaction| DuplicateRepairRecord {
-                        trusted_root: PathBuf::from(&transaction.source_scan_root),
-                        transaction,
-                        journal_dir: journal_dir.clone(),
-                    })
-                    .collect(),
-            ))
+                    });
+                    let is_playing_library = transaction.entries.iter().any(|entry| {
+                        matches!(
+                            &entry.operation,
+                            &archivefs_core::dat::rename_apply::model::TransactionOperation::CreateSymlink { .. }
+                        )
+                    });
+                    if is_duplicate {
+                        duplicates.push(DuplicateRepairRecord {
+                            trusted_root: PathBuf::from(&transaction.source_scan_root),
+                            transaction,
+                            journal_dir: journal_dir.clone(),
+                        });
+                    } else if is_playing_library {
+                        playing_libraries.push(transaction);
+                    }
+                }
+                Ok(Payload::RepairHistory {
+                    duplicates,
+                    playing_libraries,
+                })
+            }
         }
         Command::OpenFolder(path) => {
             let folder = path.parent().ok_or("This game has no containing folder.")?;

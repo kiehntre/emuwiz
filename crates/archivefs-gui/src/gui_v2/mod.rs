@@ -12,6 +12,7 @@ mod routes;
 mod tests;
 mod thumbnail;
 
+use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
 use activity::Activity;
 use artwork::Artwork;
 use backend::{
@@ -163,6 +164,8 @@ pub(super) struct App {
     undo_confirm: Option<usize>,
     undo_job: Option<u64>,
     repair_result: Option<String>,
+    playing_library: PlayingLibraryPageState,
+    playing_library_history: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     mrwiz_dismissed: bool,
 }
 
@@ -208,6 +211,8 @@ impl App {
             undo_confirm: None,
             undo_job: None,
             repair_result: None,
+            playing_library: PlayingLibraryPageState::load(),
+            playing_library_history: Vec::new(),
             mrwiz_dismissed: false,
         };
         app.send(0, Command::Restore);
@@ -406,6 +411,109 @@ impl App {
         );
         self.send(id, Command::Legacy { section, path });
     }
+    fn handle_playing_library_action(&mut self, action: PlayingLibraryPageAction) {
+        use PlayingLibraryPageAction::*;
+        match action {
+            Preview => {
+                let id = self.activity.queue(
+                    "Planning your playing library",
+                    Route::Section(Section::Build),
+                    false,
+                );
+                self.playing_library.preview();
+                if let Some(error) = self.playing_library.error().map(str::to_owned) {
+                    self.activity.finish(
+                        id,
+                        "The preview could not be completed. Nothing was changed.".into(),
+                        Some(error.clone()),
+                    );
+                    self.notice = Some(Notice {
+                        message: "The playing-library preview needs attention.".into(),
+                        technical: error,
+                    });
+                } else {
+                    self.activity.finish(
+                        id,
+                        "Preview ready. Review the selected games before creating links.".into(),
+                        None,
+                    );
+                }
+            }
+            SelectFamily(name) => self.playing_library.select_family(name),
+            RequestApply => self.playing_library.request_apply(),
+            CancelApply => self.playing_library.cancel_apply(),
+            ConfirmApply => {
+                let id = self.activity.queue(
+                    "Building your playing library",
+                    Route::Section(Section::Build),
+                    false,
+                );
+                self.playing_library.confirm_apply();
+                if let Some(error) = self.playing_library.apply_error().map(str::to_owned) {
+                    self.activity.finish(
+                        id,
+                        "The playing library was not completed. Your original collection remains unchanged.".into(),
+                        Some(error),
+                    );
+                } else if let Some(transaction) = self.playing_library.applied().cloned() {
+                    self.playing_library_history.push(transaction.clone());
+                    self.activity.finish(
+                        id,
+                        format!(
+                            "Playing library created: {} links. Your original collection was not changed.",
+                            transaction.applied_count()
+                        ),
+                        None,
+                    );
+                } else {
+                    self.activity
+                        .finish(id, "No playing-library changes were made.".into(), None);
+                }
+            }
+            RollbackLast => {
+                let id = self.activity.queue(
+                    "Undoing the playing library build",
+                    Route::Section(Section::History),
+                    false,
+                );
+                self.playing_library.rollback_last();
+                if let Some(error) = self.playing_library.apply_error().map(str::to_owned) {
+                    self.activity.finish(
+                        id,
+                        "Undo was refused because the destination is no longer in the expected state.".into(),
+                        Some(error),
+                    );
+                } else {
+                    if let Some(transaction) = self.playing_library.applied().cloned()
+                        && let Some(existing) = self
+                            .playing_library_history
+                            .iter_mut()
+                            .rev()
+                            .find(|item| item.transaction_id == transaction.transaction_id)
+                    {
+                        *existing = transaction;
+                    }
+                    self.activity
+                        .finish(id, "Playing library build undone safely.".into(), None);
+                }
+            }
+            // These destinations are intentionally kept in the existing
+            // specialised page. The v2 generic Build Library journey does
+            // not expose frontend-specific publication workflows.
+            SelectEsdePlatform(_)
+            | PreviewEsde
+            | RequestEsdePublish
+            | CancelEsdePublish
+            | ConfirmEsdePublish
+            | RequestEsdeRecovery
+            | CancelEsdeRecovery
+            | ConfirmEsdeRecovery
+            | PreviewRomm
+            | RollbackRomm
+            | PreviewRetroDeck
+            | RollbackRetroDeck => {}
+        }
+    }
     fn poll(&mut self, context: &egui::Context) {
         self.artwork.begin_frame(context);
         for _ in 0..32 {
@@ -513,8 +621,12 @@ impl App {
                                     self.repair_result =
                                         Some("The quarantined file was restored safely.".into());
                                 }
-                                Payload::RepairHistory(history) => {
-                                    self.repair_history = history;
+                                Payload::RepairHistory {
+                                    duplicates,
+                                    playing_libraries,
+                                } => {
+                                    self.repair_history = duplicates;
+                                    self.playing_library_history = playing_libraries;
                                 }
                                 Payload::Preferences(preferences) => {
                                     if !self.interacted {

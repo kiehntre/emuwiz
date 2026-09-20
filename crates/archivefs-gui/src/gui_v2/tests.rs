@@ -68,6 +68,8 @@ fn fixture(context: &egui::Context) -> App {
         undo_confirm: None,
         undo_job: None,
         repair_result: None,
+        playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
+        playing_library_history: Vec::new(),
         mrwiz_dismissed: false,
     }
 }
@@ -122,6 +124,51 @@ fn gui_v2_navigation_keeps_selection_and_back_history() {
     assert_eq!(router.current, Route::Section(Section::Games));
     router.back();
     assert_eq!(router.current, Route::Home);
+}
+
+#[test]
+fn gui_v2_build_library_is_a_native_plain_english_workflow() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Build a playing library")
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("original collection untouched"))
+    );
+    assert!(strings.iter().any(|value| value.contains("Source library")));
+    assert!(strings.iter().any(|value| value.contains("Inputs")));
+}
+
+#[test]
+fn gui_v2_history_can_project_a_playing_library_transaction() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.playing_library_history.push(
+        archivefs_core::dat::rename_apply::model::RenameTransaction {
+            transaction_id: "playing-library-test".into(),
+            plan_generation: 1,
+            classifier_version: None,
+            created_at_unix: 1,
+            source_scan_root: "/tmp/playing-library".into(),
+            state: archivefs_core::dat::rename_apply::model::TransactionState::Applied,
+            entries: Vec::new(),
+            created_directories: Vec::new(),
+            recovery_resolution: None,
+            recovery_resolved_at_unix: None,
+            unknown: Default::default(),
+        },
+    );
+    app.router.current = Route::Section(Section::History);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value == "Built Playing Library"));
+    assert!(strings.iter().any(|value| value == "Ready to undo"));
 }
 
 #[test]
@@ -1118,7 +1165,7 @@ fn gui_v2_back_shortcut_returns_to_originating_platform_filter() {
 }
 
 #[test]
-fn gui_v2_handoff_primary_action_is_visible_without_scrolling() {
+fn gui_v2_primary_action_is_visible_without_scrolling() {
     fn visible(shape: &egui::Shape, clip: egui::Rect, needle: &str) -> bool {
         match shape {
             egui::Shape::Text(text) => {
@@ -1143,18 +1190,26 @@ fn gui_v2_handoff_primary_action_is_visible_without_scrolling() {
             app.router.current = Route::Section(section);
             frame(&context, &mut app, size);
             let output = frame(&context, &mut app, size);
-            let action = if section == Section::Check {
-                "Choose a platform"
+            let actions = if section == Section::Check {
+                vec!["Choose a platform"]
             } else if section == Section::Problems {
-                "Nothing needs attention right now."
+                vec!["Nothing needs attention right now."]
+            } else if section == Section::Build {
+                vec![
+                    "Set up library",
+                    "Preview playing library",
+                    "Preview 1G1R Library",
+                ]
             } else {
-                section.action()
+                vec![section.action()]
             };
             assert!(
-                output
-                    .shapes
-                    .iter()
-                    .any(|shape| visible(&shape.shape, shape.clip_rect, action)),
+                actions.iter().any(|action| {
+                    output
+                        .shapes
+                        .iter()
+                        .any(|shape| visible(&shape.shape, shape.clip_rect, action))
+                }),
                 "primary action is clipped: {section:?} {size:?}"
             );
         }
