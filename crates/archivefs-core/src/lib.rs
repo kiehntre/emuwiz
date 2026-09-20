@@ -549,6 +549,10 @@ pub mod patch_manager;
 /// cheat/emulator patch manager: it never applies a change or creates history.
 pub mod mod_package;
 
+/// Unified read-only projection of installed mod receipts, including optional
+/// provider provenance attached only after a strong local-package join.
+pub mod mod_history;
+
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Provider-neutral, metadata-only discovery and user-acquisition handoff.
