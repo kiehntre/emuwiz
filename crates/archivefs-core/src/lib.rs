@@ -577,6 +577,7 @@ pub mod archived_mod_package;
 /// Bounded, read-only inspection and immutable-base planning for standalone
 /// IPS/BPS/UPS/VCDIFF/PPF patch files. No patch application is performed.
 pub mod standalone_patch;
+pub mod patch_package_composition;
 
 pub mod emulator_environment;
 

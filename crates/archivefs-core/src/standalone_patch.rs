@@ -10,7 +10,7 @@ use std::process::Command;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dat::archive::external_process::{ProcessError, ProcessLimits, run_supervised};
@@ -40,7 +40,7 @@ const XDELTA_PROCESS_LIMITS: ProcessLimits = ProcessLimits {
 /// diagnostics only. Retaining 1 MiB is far more than it should ever emit.
 const XDELTA_STDOUT_LIMIT: u64 = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StandalonePatchFormat {
     Ips,
