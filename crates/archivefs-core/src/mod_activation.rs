@@ -502,17 +502,16 @@ fn check_patch_chain(left: &ModLayer, right: &ModLayer, conflicts: &mut Vec<ModC
     };
     if let (Some(output), Some(input)) =
         (&first.produced_output_sha256, &second.expected_input_sha256)
+        && output != input
     {
-        if output != input {
-            conflicts.push(ModConflict {
-                left_mod_id: left.mod_id.clone(),
-                right_mod_id: Some(right.mod_id.clone()),
-                kind: ConflictKind::IncompatiblePatchChain,
-                class: ConflictClass::UnsafeRefuse,
-                paths: Vec::new(),
-                detail: "patch-chain output does not match the next stage input".into(),
-            });
-        }
+        conflicts.push(ModConflict {
+            left_mod_id: left.mod_id.clone(),
+            right_mod_id: Some(right.mod_id.clone()),
+            kind: ConflictKind::IncompatiblePatchChain,
+            class: ConflictClass::UnsafeRefuse,
+            paths: Vec::new(),
+            detail: "patch-chain output does not match the next stage input".into(),
+        });
     }
 }
 

@@ -208,7 +208,7 @@ impl ModReceiptSummary {
             game_title: None,
             verified_identity: nonempty(&journal.context.verified_game_identity),
             source_package: source_paths.into_iter().next(),
-            source_fingerprint,
+            source_fingerprint: source_fingerprint.clone(),
             installed_at_unix: journal.timestamp_unix_seconds,
             files_created: created,
             files_replaced: replaced,
@@ -736,6 +736,7 @@ fn dedup_sorted(mut values: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mod_activation::{ActivationOperation, ModLayer, ModProvenance, ModStack};
     use crate::mod_catalogue::{ModCatalogueHash, ModCatalogueHashAlgorithm};
     use crate::mod_provider::{ModAcquisitionMode, ModCompatibilityAssessment, ModProviderId};
     use crate::patch_manager::{
@@ -896,6 +897,10 @@ mod tests {
             Some(ModKind::CemuGraphicPack)
         );
         assert_eq!(
+            kind_for_adapter(PreviewAdapter::Ppsspp),
+            Some(ModKind::PpssppTexture)
+        );
+        assert_eq!(
             kind_for_adapter(PreviewAdapter::LocalModPackage),
             Some(ModKind::LocalPackage)
         );
@@ -1019,6 +1024,87 @@ mod tests {
     }
 
     #[test]
+    fn provider_patch_composition_and_activation_share_one_history_model() {
+        let provider = provider_provenance(
+            ModAcquisitionMode::DirectPermitted,
+            false,
+            Some("0123456789abcdef0123456789abcdef"),
+            ModCompatibilityLevel::Verified,
+        );
+        let provider_hash = provider.locally_calculated_checksum.clone().unwrap();
+        let join = ModPackageJoin {
+            provider: provider.provider.clone(),
+            provider_file_id: "darkwatch-file".into(),
+            local_checksum: provider_hash,
+            evidence: "matching strong checksum".into(),
+        };
+        let composition = ModReceiptSummary::from_patch_composition_with_provider(
+            &PatchCompositionProvenance {
+                source_path: PathBuf::from("/games/base.iso"),
+                source_sha256: "a".repeat(64),
+                package_path: PathBuf::from("/mods/provider-pack.zip"),
+                package_sha256: "b".repeat(64),
+                patches: Vec::new(),
+                verified_identity: Some("GAME-1".into()),
+                output_path: PathBuf::from("/derived/output.iso"),
+                output_sha256: "c".repeat(64),
+                applied_at_unix_seconds: 2,
+                application: "fixture".into(),
+            },
+            provider.clone(),
+            &join,
+        )
+        .unwrap();
+        assert_eq!(composition.kind, ModKind::PatchComposition);
+        assert_eq!(composition.package_hash.as_deref(), Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        assert_eq!(composition.provider_state, Some(ModProviderHistoryState::VerifiedProviderFile));
+
+        let layer = ModLayer {
+            mod_id: "provider-mod".into(),
+            package_id: "provider-pack".into(),
+            game_identity: "GAME-1".into(),
+            platform: "PS2".into(),
+            emulator: Some("PCSX2".into()),
+            mod_type: "ordinary".into(),
+            provenance: ModProvenance {
+                source: "/mods/provider-pack.zip".into(),
+                content_sha256: Some("b".repeat(64)),
+                receipt_id: Some("install-1".into()),
+            },
+            enabled: true,
+            requested_order: Some(1),
+            effective_order: Some(1),
+            affected_paths: vec![PathBuf::from("textures/ui.png")],
+            derived_output: None,
+            exclusive_group: None,
+            patch_chain: None,
+            destination_fingerprint: None,
+            current_destination_fingerprint: None,
+            transaction_id: Some("tx-1".into()),
+            adapter: Some(PreviewAdapter::Pcsx2),
+        };
+        let activation = ActivationReceipt {
+            previous_stack: ModStack::new("GAME-1"),
+            resulting_stack: ModStack {
+                game_identity: "GAME-1".into(),
+                layers: vec![layer],
+                generation: 1,
+            },
+            operation: ActivationOperation::Enable,
+            conflicts: Vec::new(),
+            transaction_ids: vec!["tx-1".into()],
+            timestamp_unix_seconds: 3,
+        };
+        let mut providers = BTreeMap::new();
+        providers.insert("/mods/provider-pack.zip".into(), (provider, join));
+        let rows = ModReceiptSummary::from_activation_receipt_with_providers(&activation, &providers).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ModKind::ActivationStack);
+        assert_eq!(rows[0].requested_order, Some(1));
+        assert!(rows[0].provider_provenance.is_some());
+    }
+
+    #[test]
     fn legacy_receipt_without_provider_fields_still_deserializes() {
         let receipt = ModReceiptSummary::from_patch_provenance(&DerivedPatchProvenance {
             base_path: PathBuf::from("/games/base.iso"),
@@ -1059,6 +1145,13 @@ mod tests {
             SharedApplyOutcome::ReplacedExisting,
         );
         cemu.context.adapter = PreviewAdapter::CemuGraphicPack;
+        let mut ppsspp = journal(
+            "ppsspp",
+            4,
+            "PSP/GAME/TEXTURE.png",
+            SharedApplyOutcome::InstalledNew,
+        );
+        ppsspp.context.adapter = PreviewAdapter::Ppsspp;
         let mut unchanged = journal(
             "unchanged",
             3,
@@ -1091,6 +1184,17 @@ mod tests {
             .unwrap()
             .files_replaced,
             1
+        );
+        assert_eq!(
+            ModReceiptSummary::from_shared_journal(
+                &ppsspp,
+                None,
+                Path::new("/b"),
+                &preview("ppsspp", "PSP/GAME/TEXTURE.png", SharedRollbackOutcome::Available)
+            )
+            .unwrap()
+            .kind,
+            ModKind::PpssppTexture
         );
         let unchanged_receipt = ModReceiptSummary::from_shared_journal(
             &unchanged,
