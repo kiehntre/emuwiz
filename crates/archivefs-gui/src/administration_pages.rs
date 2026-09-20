@@ -1531,6 +1531,7 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::RetroArch => "RetroArch",
         PreviewAdapter::Pcsx2 => "PCSX2",
         PreviewAdapter::Dolphin => "Dolphin",
+        PreviewAdapter::Ppsspp => "PPSSPP",
         PreviewAdapter::Xenia => "Xenia",
         PreviewAdapter::LocalModPackage => "Local mod package",
         PreviewAdapter::CemuGraphicPack => "Cemu graphic pack",

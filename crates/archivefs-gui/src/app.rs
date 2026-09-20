@@ -45,6 +45,7 @@ pub(crate) struct ArchiveFsApp {
     /// never reuses state describing a different game or profile. See
     /// `dolphin_texture_mod_page`'s own module doc comment.
     pub(crate) dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState,
+    pub(crate) ppsspp_texture_mod: ppsspp_texture_mod_page::PpssppTextureModPageState,
     pub(crate) local_mod_package: local_mod_package_page::LocalModPackagePageState,
     /// The Launch Readiness panel's "Launch RetroArch" tracker - see
     /// `launch_readiness_page`'s own module doc comment. Deliberately not
@@ -408,6 +409,7 @@ impl ArchiveFsApp {
             cheat_workflow: None,
             user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState::default(),
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+            ppsspp_texture_mod: ppsspp_texture_mod_page::PpssppTextureModPageState::default(),
             local_mod_package: local_mod_package_page::LocalModPackagePageState::default(),
             launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
             launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),

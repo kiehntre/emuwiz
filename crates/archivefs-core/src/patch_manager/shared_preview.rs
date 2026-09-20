@@ -30,6 +30,7 @@ pub enum PreviewAdapter {
     RetroArch,
     Pcsx2,
     Dolphin,
+    Ppsspp,
     Xenia,
     /// The local generic (non-cheat) mod package workflow. Distinct provenance
     /// so a journal / history row is never mislabelled as an emulator adapter.
@@ -54,6 +55,7 @@ pub enum PreviewIdentityKind {
     /// verified source files are expected and are not competing identity
     /// matches in this mode.
     DolphinTexturePack,
+    PpssppDiscId,
     XeniaTitleId,
     CemuTitleId,
     Rpcs3TitleId,
@@ -751,6 +753,7 @@ fn apply_eligibility_blockers(
         ),
         PreviewAdapter::Pcsx2
         | PreviewAdapter::Dolphin
+        | PreviewAdapter::Ppsspp
         | PreviewAdapter::LocalModPackage
         | PreviewAdapter::CemuGraphicPack
         | PreviewAdapter::Rpcs3OrdinaryMod => {
@@ -1268,6 +1271,10 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::Dolphin => matches!(
             normalized.as_str(),
             "gamecube" | "nintendo gamecube" | "gc" | "gcn" | "wii" | "nintendo wii"
+        ),
+        PreviewAdapter::Ppsspp => matches!(
+            normalized.as_str(),
+            "psp" | "playstation portable" | "sony playstation portable"
         ),
         PreviewAdapter::Xenia => matches!(normalized.as_str(), "xbox360" | "xbox 360"),
         // Platform agreement for a local mod package is already established by

@@ -110,6 +110,7 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::Dolphin
+        | PreviewAdapter::Ppsspp
         | PreviewAdapter::Xenia
         | PreviewAdapter::LocalModPackage
         | PreviewAdapter::CemuGraphicPack
@@ -1252,6 +1253,7 @@ fn apply_one(
             PreviewAdapter::RetroArch
                 | PreviewAdapter::Pcsx2
                 | PreviewAdapter::Dolphin
+                | PreviewAdapter::Ppsspp
                 | PreviewAdapter::Xenia
                 | PreviewAdapter::LocalModPackage
                 | PreviewAdapter::CemuGraphicPack

@@ -119,6 +119,7 @@ impl ManagedFormat {
     fn from_adapter(adapter: PreviewAdapter) -> Self {
         match adapter {
             PreviewAdapter::Dolphin => Self::DolphinGameSettings,
+            PreviewAdapter::Ppsspp => Self::LocalModPackage,
             PreviewAdapter::Pcsx2 => Self::Pcsx2Pnach,
             PreviewAdapter::Xenia => Self::XeniaPatch,
             PreviewAdapter::RetroArch => Self::RetroArchCheat,

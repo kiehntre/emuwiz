@@ -1089,6 +1089,7 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
         tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
         cheat_workflow: None,
         dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
+        ppsspp_texture_mod: ppsspp_texture_mod_page::PpssppTextureModPageState::default(),
         launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),
         launch_dolphin: launch_readiness_page::DolphinLaunchState::default(),
         launch_pcsx2: launch_readiness_page::Pcsx2LaunchState::default(),

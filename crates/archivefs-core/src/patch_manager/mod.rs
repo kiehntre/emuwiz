@@ -89,6 +89,7 @@ mod pcsx2_pnach;
 mod pcsx2_provider;
 mod pcsx2_texture_pack;
 mod ppsspp_local;
+mod ppsspp_texture_pack;
 mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
@@ -699,6 +700,17 @@ pub use ppsspp_local::{
     PpssppProfileDiscoveryRoots, PpssppProfileScope, PpssppSaveDataInventory, PpssppSettings,
     PpssppTextureInventory, discover_ppsspp_profiles, inspect_ppsspp_game, parse_ppsspp_version,
     resolve_ppsspp_native_launch_binding,
+};
+pub use ppsspp_texture_pack::{
+    PPSSPP_TEXTURE_PACK_MANIFEST_FORMAT, PPSSPP_TEXTURE_PACK_MAX_FILES,
+    PPSSPP_TEXTURE_PACK_MAX_TOTAL_BYTES, PPSSPP_TEXTURE_PACK_SOURCE_MODE, PpssppTextureIdentity,
+    PpssppTexturePackApplyResult, PpssppTexturePackBuildPreview, PpssppTexturePackBuildRequest,
+    PpssppTexturePackError, PpssppTexturePackErrorKind, PpssppTexturePackFile,
+    PpssppTexturePackManifest, PpssppTexturePackPlan, PpssppTexturePackPreviewRequest,
+    PpssppTexturePackRejectedFile, build_ppsspp_texture_pack_manifest,
+    build_ppsspp_texture_pack_preview, build_ppsspp_texture_pack_transaction_plan,
+    execute_ppsspp_texture_pack_apply, ppsspp_texture_destination_root,
+    validate_ppsspp_texture_pack_manifest, verified_ppsspp_texture_identity,
 };
 pub use resolved_emulator_profile::{
     EmulatorDestinationDirectories, EmulatorInstallationType, EmulatorProfileConfidence,

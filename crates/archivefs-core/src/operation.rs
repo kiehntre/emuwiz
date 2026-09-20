@@ -983,6 +983,7 @@ fn shared_apply_operation(
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::Dolphin
+        | PreviewAdapter::Ppsspp
         | PreviewAdapter::Xenia => OperationKind::CheatApply,
     };
     let state = match journal.status {
