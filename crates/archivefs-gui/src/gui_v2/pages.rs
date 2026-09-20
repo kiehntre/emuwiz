@@ -20,6 +20,47 @@ fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     .clicked()
 }
 
+/// One bounded main-content scroller; sidebar and header are outside it.
+fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
+    let salt = ("v2_check_scroll", platform);
+    let id = ui.make_persistent_id(salt);
+    let mut scroll = egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .auto_shrink([false, false]);
+    // This page has buttons, not text inputs. Button focus must not disable paging.
+    if ui.input(|i| !i.modifiers.alt && !i.modifiers.ctrl) {
+        let previous = egui::scroll_area::State::load(ui.ctx(), id)
+            .unwrap_or_default()
+            .offset
+            .y;
+        let maximum = ui
+            .ctx()
+            .data(|d| d.get_temp::<f32>(id.with("content_height")))
+            .map(|height| (height - ui.available_height()).max(0.0))
+            .unwrap_or(0.0);
+        let page = ui.available_height() * 0.9;
+        let target = ui.input(|i| {
+            if i.key_pressed(egui::Key::Home) {
+                Some(0.0)
+            } else if i.key_pressed(egui::Key::End) {
+                Some(maximum)
+            } else if i.key_pressed(egui::Key::PageDown) {
+                Some((previous + page).min(maximum))
+            } else if i.key_pressed(egui::Key::PageUp) {
+                Some((previous - page).max(0.0))
+            } else {
+                None
+            }
+        });
+        if let Some(target) = target {
+            scroll = scroll.vertical_scroll_offset(target);
+        }
+    }
+    let output = scroll.show(ui, content);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(id.with("content_height"), output.content_size.y));
+}
+
 impl App {
     pub(super) fn show(&mut self, context: &egui::Context) {
         if context.input(|input| {
@@ -212,6 +253,7 @@ impl App {
                     .desired_width(240.0),
             );
             let mut changed = search.changed();
+            let previous_platform = self.filter.platform.clone();
             egui::ComboBox::from_id_salt("v2_platform_filter")
                 .selected_text(if self.filter.platform.is_empty() {
                     "All systems"
@@ -232,6 +274,9 @@ impl App {
                             .changed();
                     }
                 });
+            if self.filter.platform != previous_platform {
+                self.filter.select_platform(self.filter.platform.clone());
+            }
             changed |= ui
                 .checkbox(&mut self.filter.attention_only, "Needs attention")
                 .changed();
@@ -246,7 +291,9 @@ impl App {
             }
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} games shown", self.indices.len()));
+            if !self.filter_inflight && self.filter_dirty.is_none() {
+                ui.label(format!("{} catalogued games shown", self.indices.len()));
+            }
             if self.filter_inflight || self.filter_dirty.is_some() {
                 ui.spinner();
                 ui.label("Updating results…");
@@ -265,9 +312,41 @@ impl App {
                 self.load(false);
             }
         });
+        if !self.filter.platform.is_empty() {
+            ui.label(format!("{}: {} catalogued games before search or health filters. Other systems remain separate.", self.filter.platform, self.library.platforms.get(&self.filter.platform).copied().unwrap_or(0)));
+            if self.filter.platform == "Arcade" {
+                ui.label("This is the saved game list, not a count of files on disk. Extracted arcade ROM parts may not be catalogued as games.");
+            }
+            if ui
+                .small_button("Missing games? Review folders and scan")
+                .clicked()
+            {
+                self.go(Route::Section(Section::Sources));
+            }
+        }
+        ui.collapsing("Advanced details", |ui| {
+            egui::ScrollArea::vertical().id_salt("v2_filter_details").max_height(150.0).show(ui, |ui| {
+            ui.label(format!("Selected platform ID: {} · display label: {}", self.filter.platform, self.filter.platform));
+            ui.label("Platform IDs are the catalogue's exact current assignments; no alias grouping or artwork filter is applied.");
+            ui.label(format!("Search: {:?} · needs attention only: {} · source/path filter: none", self.filter.search, self.filter.attention_only));
+            ui.label(format!("Logical filtered rows: {} · updating: {}", self.indices.len(), self.filter_inflight || self.filter_dirty.is_some()));
+            for (platform, sources) in &self.library.platform_sources {
+                if self.filter.platform.is_empty() || *platform == self.filter.platform {
+                    ui.label(format!("{platform}: {} total catalogue rows", self.library.platforms[platform]));
+                    for ((id, path), count) in sources {
+                        ui.label(format!("Source {id}: {} · {count} rows", path.display()));
+                    }
+                }
+            }
+            });
+        });
         if !self.loaded {
             ui.spinner();
             ui.label("Loading your game list in the background. Progress is in Activity.");
+            return;
+        }
+        if self.filter_inflight || self.filter_dirty.is_some() {
+            // Never paint the previous platform's result under the new selection.
             return;
         }
         if self.indices.is_empty() && !self.filter_inflight && self.filter_dirty.is_none() {
@@ -483,8 +562,7 @@ impl App {
                             self.check_platform(platform.clone());
                         }
                         if primary(ui, &format!("View {platform} games")) {
-                            self.filter.platform = platform.clone();
-                            self.filter.search.clear();
+                            self.filter.select_platform(platform.clone());
                             self.filter.attention_only = false;
                             self.change_filter();
                             self.go(Route::Section(Section::Games));
@@ -496,6 +574,11 @@ impl App {
     }
 
     fn check_games(&mut self, ui: &mut egui::Ui) {
+        let platform = self.check_platform.clone();
+        check_scroll(ui, platform.as_deref(), |ui| self.check_games_content(ui));
+    }
+
+    fn check_games_content(&mut self, ui: &mut egui::Ui) {
         ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here.");
         if self.check_platform.is_none() {
             ui.heading("Choose a platform");
@@ -557,7 +640,7 @@ impl App {
                 ),
             ] {
                 if count > 0 && ui.button(format!("Review {label} ({count})")).clicked() {
-                    self.filter.platform = platform.clone();
+                    self.filter.select_platform(platform.clone());
                     self.filter.attention_only = label == "Needs attention";
                     self.change_filter();
                     self.go(Route::Section(Section::Games));
@@ -657,15 +740,14 @@ impl App {
                 self.picture(ui, game, Kind::Cover, egui::vec2(150.0, 200.0));
                 ui.vertical(|ui| {
                     ui.strong(&game.platform);
-                    ui.label(if game.identified { "Identified in the saved game list" } else { "Identity not confirmed yet — use Verify to check this game" });
                     if let Some(status) = &latest_verification {
                         ui.label(format!("Latest verification: {status}"));
                     }
                     if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
-                        ui.label(if detail.saved_checks > 0 { "✓ Verified evidence recorded" } else if !detail.file_present { "? Unknown · file is unavailable" } else { "! Needs attention · not verified yet" });
-                        ui.label(if !detail.file_present { "Needs attention · game file is no longer available" } else if !detail.unchanged { "Needs attention · game file changed since the last scan" } else { "Game file available · size and date match the last scan" });
+                        if latest_verification.is_none() { ui.label(if detail.saved_checks > 0 { "Previous verification available" } else { "Not verified yet" }); }
+                        if !detail.file_present { ui.label("Needs attention · game file is unavailable"); }
+                        else if !detail.unchanged { ui.label("Needs attention · game file changed since the last scan"); }
                         ui.label(detail.emulator_status());
-                        ui.label(if detail.saved_checks > 0 { "Previous verification information is available. Verify checks it again." } else { "Not verified yet. Verify shows the available setup." });
                         if detail.saved_checks > 0 && ui.button("View verification result").clicked() {
                             self.go(Route::Section(Section::Check));
                         }
@@ -699,13 +781,7 @@ impl App {
             let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&id)).map_or(0, Vec::len);
             ui.separator(); ui.strong("Screenshots");
             if count == 0 {
-                ui.label("No screenshots matched this game's stable identity yet.");
-                ui.collapsing("Why no screenshot matched", |ui| {
-                    if let Some(index) = &self.artwork.index {
-                        ui.label(index.diagnostics.get(&id).map(String::as_str).unwrap_or("The artwork index has no stable provider record for this game."));
-                    }
-                    ui.label("EmuWiz does not guess from renamed titles or filenames.");
-                });
+                ui.label(if self.artwork.index.is_none() { "Looking for screenshots…" } else { "No screenshots available. See Advanced details for the search results." });
             }
             else if !self.screenshots { if ui.button(format!("Show screenshots ({count})")).clicked() { self.screenshots = true; } }
             else {
@@ -716,6 +792,7 @@ impl App {
                 }
             }
             ui.collapsing("Advanced details", |ui| {
+                ui.label(if game.identified { "Identified in the saved game list" } else { "Identity is not confirmed" });
                 if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) { ui.label(&detail.technical); }
                 if let Some(index) = &self.artwork.index
                     && let Some(diagnostic) = index.diagnostics.get(&id)

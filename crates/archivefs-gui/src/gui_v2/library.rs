@@ -86,6 +86,7 @@ pub(super) struct Library {
     pub games: Vec<Game>,
     pub by_id: HashMap<i64, usize>,
     pub platforms: BTreeMap<String, usize>,
+    pub platform_sources: BTreeMap<String, BTreeMap<(i64, std::path::PathBuf), usize>>,
     pub attention: usize,
     pub sources: usize,
     pub load_ms: u128,
@@ -103,6 +104,19 @@ impl Library {
         for (index, game) in library.games.iter().enumerate() {
             library.by_id.insert(game.archive.id, index);
             *library.platforms.entry(game.platform.clone()).or_default() += 1;
+            let root = game
+                .archive
+                .absolute_path
+                .ancestors()
+                .nth(game.archive.relative_path.components().count())
+                .unwrap_or(&game.archive.absolute_path)
+                .to_path_buf();
+            *library
+                .platform_sources
+                .entry(game.platform.clone())
+                .or_default()
+                .entry((game.archive.source_folder_id, root))
+                .or_default() += 1;
             library.attention += usize::from(game.attention);
         }
         library
@@ -131,6 +145,15 @@ pub(super) struct Filter {
     pub platform: String,
     pub attention_only: bool,
     pub list: bool,
+}
+
+impl Filter {
+    /// Entering a platform is a fresh browse intent, not an old problem/search view.
+    pub fn select_platform(&mut self, platform: String) {
+        self.platform = platform;
+        self.search.clear();
+        self.attention_only = false;
+    }
 }
 
 pub(super) type SharedLibrary = Arc<Library>;

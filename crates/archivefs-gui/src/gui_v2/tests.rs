@@ -407,10 +407,30 @@ fn gui_v2_database_load_is_real_and_read_only() {
     {
         let mut database = archivefs_core::Database::open_or_create(&database_path).unwrap();
         archivefs_core::scan_and_persist(&mut database, &config, "v2-test-fixture").unwrap();
+        for row in database.load_archives().unwrap() {
+            database
+                .assign_platform(row.id, Some("Arcade"), "manual")
+                .unwrap();
+        }
     }
     let before = fs::read(&database_path).unwrap();
     let library = backend::load_library(&database_path).unwrap();
     assert_eq!(library.games.len(), 1);
+    let connection = rusqlite::Connection::open_with_flags(
+        &database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let expected: i64 = connection.query_row("SELECT count(*) FROM archives a JOIN platform_assignments p ON p.archive_id=a.id AND p.is_current=1 WHERE p.platform='Arcade'", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        library
+            .filter(&Filter {
+                platform: "Arcade".into(),
+                ..Default::default()
+            })
+            .len(),
+        expected as usize
+    );
     assert_eq!(fs::read(&database_path).unwrap(), before);
 }
 
@@ -770,12 +790,214 @@ fn gui_v2_browser_virtualizes_large_collection() {
     app.indices = app.library.filter(&Filter::default());
     app.router.current = Route::Section(Section::Games);
     let output = frame(&context, &mut app, [1280.0, 820.0]);
+    assert_eq!(app.indices.len(), 10_000);
+    assert!(
+        text(&output)
+            .iter()
+            .any(|text| text == "10000 catalogued games shown")
+    );
     assert!(
         text(&output)
             .iter()
             .filter(|text| text.starts_with("Game 0"))
             .count()
             < 30
+    );
+}
+
+#[test]
+fn gui_v2_platform_selection_clears_old_filters_and_counts_all_sources() {
+    let mut second = archive(2, "Other copy", Some("Arcade"));
+    second.source_folder_id = 2;
+    second.absolute_path = "/other/Other copy.iso".into();
+    let library = Library::new(vec![
+        archive(1, "First", Some("Arcade")),
+        second,
+        archive(3, "Distinct platform", Some("NeoGeo")),
+    ]);
+    let mut filter = Filter {
+        search: "old search".into(),
+        attention_only: true,
+        list: true,
+        ..Default::default()
+    };
+    filter.select_platform("Arcade".into());
+    assert!(filter.search.is_empty());
+    assert!(!filter.attention_only);
+    assert!(filter.list);
+    assert_eq!(library.filter(&filter).len(), library.platforms["Arcade"]);
+    assert_eq!(library.filter(&filter).len(), 2);
+    assert_eq!(library.platform_sources["Arcade"].len(), 2);
+    assert_eq!(
+        library.platform_sources["Arcade"].values().sum::<usize>(),
+        2
+    );
+}
+
+#[test]
+fn gui_v2_pending_filter_does_not_present_stale_games_or_count() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(
+        1,
+        "STALE OLD GAME",
+        Some("PS2"),
+    )]));
+    app.indices = vec![0];
+    app.router.current = Route::Section(Section::Games);
+    app.filter.select_platform("Arcade".into());
+    app.change_filter();
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|s| s.contains("Updating results")));
+    assert!(
+        !strings
+            .iter()
+            .any(|s| s == "STALE OLD GAME" || s == "1 catalogued games shown")
+    );
+}
+
+#[test]
+fn gui_v2_screenshot_diagnostics_combine_local_and_romm_without_guessing() {
+    use super::media_sources::screenshot_diagnostic;
+    let path = Path::new("/games/original.gba");
+    let zero = screenshot_diagnostic(path, 0, Some(("85674", 0)), "Local indexes checked.", false);
+    assert!(zero.contains("RomM matched this game, but that record has no screenshots."));
+    assert!(zero.contains("Screenshot candidates: 0."));
+    assert!(zero.contains("85674"));
+    assert!(zero.contains("exact original archive path"));
+    let local = screenshot_diagnostic(
+        path,
+        2,
+        Some(("85674", 0)),
+        "ES-DE matched this game.",
+        false,
+    );
+    assert!(local.contains("Screenshot candidates: 2."));
+    assert!(!local.contains("Screenshot candidates: 0."));
+    let incomplete = screenshot_diagnostic(path, 0, None, "Local source could not be read.", true);
+    assert!(incomplete.contains("incomplete"));
+    assert!(!incomplete.contains("Screenshot candidates: 0."));
+}
+
+#[test]
+fn gui_v2_detail_keeps_screenshot_diagnostics_secondary() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Example", Some("GBA"))]));
+    let mut index = MediaIndex::default();
+    index
+        .diagnostics
+        .insert(1, "PRIVATE DIAGNOSTIC 85674".into());
+    app.artwork.index = Some(Arc::new(index));
+    app.router.current = Route::Game(1);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|s| s == "Play"));
+    assert!(!strings.iter().any(|s| s.contains("PRIVATE DIAGNOSTIC")));
+}
+
+#[test]
+fn gui_v2_check_games_scrolls_long_list_and_keeps_sidebar_fixed() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(
+        (0..100)
+            .map(|id| archive(id, "Game", Some(&format!("System {id:03}"))))
+            .collect(),
+    ));
+    app.router.current = Route::Section(Section::Check);
+    frame(&context, &mut app, [1024.0, 600.0]);
+    let first = frame(&context, &mut app, [1024.0, 600.0]);
+    fn position(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos),
+            _ => None,
+        })
+    }
+    let sidebar = position(&first, "EmuWiz").unwrap();
+    let input_frame = |app: &mut App, events: Vec<egui::Event>| {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| app.show(ctx),
+        )
+    };
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    input_frame(&mut app, vec![key(egui::Key::Tab)]);
+    assert!(
+        context.wants_keyboard_input(),
+        "exercise paging with a focused button"
+    );
+    input_frame(&mut app, vec![key(egui::Key::End)]);
+    let last = frame(&context, &mut app, [1024.0, 600.0]);
+    assert_eq!(position(&last, "EmuWiz"), Some(sidebar));
+    let final_row = position(&last, "Check System 099").expect("last platform must be reachable");
+    assert!(final_row.y < 580.0 && final_row.y > 100.0, "{final_row:?}");
+    Arc::make_mut(&mut app.library)
+        .platforms
+        .insert("System 050".into(), 9);
+    app.router.current = Route::Home;
+    frame(&context, &mut app, [1024.0, 600.0]);
+    app.router.current = Route::Section(Section::Check);
+    let restored = frame(&context, &mut app, [1024.0, 600.0]);
+    assert_eq!(position(&restored, "Check System 099"), Some(final_row));
+    input_frame(&mut app, vec![key(egui::Key::Home)]);
+    let home = frame(&context, &mut app, [1024.0, 600.0]);
+    assert!(position(&home, "System 000").unwrap().y < 400.0);
+    input_frame(&mut app, vec![key(egui::Key::PageDown)]);
+    let paged = frame(&context, &mut app, [1024.0, 600.0]);
+    assert_ne!(
+        position(&paged, "System 000"),
+        position(&home, "System 000")
+    );
+    input_frame(&mut app, vec![key(egui::Key::PageUp)]);
+    let returned = frame(&context, &mut app, [1024.0, 600.0]);
+    assert_eq!(
+        position(&returned, "System 000"),
+        position(&home, "System 000")
+    );
+    input_frame(
+        &mut app,
+        vec![
+            egui::Event::PointerMoved(egui::pos2(700.0, 400.0)),
+            egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -400.0),
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    for _ in 0..20 {
+        frame(&context, &mut app, [1024.0, 600.0]);
+    }
+    let scrolled = frame(&context, &mut app, [1024.0, 600.0]);
+    assert_ne!(
+        position(&scrolled, "System 000"),
+        position(&home, "System 000")
+    );
+    assert_eq!(position(&scrolled, "EmuWiz"), Some(sidebar));
+    frame(&context, &mut app, [640.0, 480.0]);
+    frame(&context, &mut app, [1280.0, 820.0]);
+    input_frame(&mut app, vec![key(egui::Key::End)]);
+    assert!(
+        position(
+            &frame(&context, &mut app, [1024.0, 600.0]),
+            "Check System 099"
+        )
+        .unwrap()
+        .y < 580.0
     );
 }
 

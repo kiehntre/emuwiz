@@ -12,6 +12,38 @@ use std::{
     time::Instant,
 };
 
+pub(super) fn screenshot_diagnostic(
+    path: &std::path::Path,
+    local: usize,
+    romm: Option<(&str, usize)>,
+    sources: &str,
+    incomplete: bool,
+) -> String {
+    let mut message = format!(
+        "Identity key: exact original archive path `{}`. {sources}\nLocal screenshot candidates: {local}. ",
+        path.display()
+    );
+    let remote = if let Some((id, count)) = romm {
+        message.push_str(&format!("RomM provider record `{id}`. "));
+        if count == 0 {
+            message.push_str("RomM matched this game, but that record has no screenshots. ");
+        } else {
+            message.push_str(&format!("RomM screenshot candidates: {count}. "));
+        }
+        count
+    } else {
+        message.push_str("No unambiguous exact-path RomM record matched. ");
+        0
+    };
+    if incomplete {
+        message.push_str("Some sources could not be checked; the screenshot search is incomplete.");
+    } else {
+        message.push_str(&format!("Screenshot candidates: {}.", local + remote));
+    }
+    message.push_str(" Filename/title guessing is not used.");
+    message
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Kind {
     Cover,
@@ -59,6 +91,14 @@ impl MediaIndex {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let esde = home.as_ref().map(|home| home.join("ES-DE")).filter(|root| root.is_dir()).map(|root|
             archivefs_core::emulator_environment::es_de_metadata::discover_provider_snapshot_with_rom_root(&root, 1, config.as_ref().and_then(|config| config.master_rom_root.as_deref())));
+        if config.is_none() {
+            index
+                .warnings
+                .push("Game-folder configuration could not be read.".into());
+        }
+        if let Some(provider) = &esde {
+            index.warnings.extend(provider.warnings.clone());
+        }
         // Same environment/default discovery roots as the legacy local provider.
         let launchbox_root = std::env::var_os("LAUNCHBOX_ROOT")
             .map(PathBuf::from)
@@ -89,30 +129,51 @@ impl MediaIndex {
             index.settings = SettingsLocation::new(&root, IdentityProvider::Romm)
                 .load()
                 .unwrap_or_default();
-            if let Ok(cache) =
-                IdentitySourceApi::new(&root, IdentityProvider::Romm).open_cache(None)
-            {
-                index.server = cache.server_id.clone();
-                for record in cache.records {
-                    if let Some(path) = record.archivefs_path.clone()
-                        && records.insert(path.clone(), Arc::new(record)).is_some()
-                    {
-                        ambiguous.insert(path);
+            match IdentitySourceApi::new(&root, IdentityProvider::Romm).open_cache(None) {
+                Ok(cache) => {
+                    index.server = cache.server_id.clone();
+                    for record in cache.records {
+                        if let Some(path) = record.archivefs_path.clone()
+                            && records.insert(path.clone(), Arc::new(record)).is_some()
+                        {
+                            ambiguous.insert(path);
+                        }
+                    }
+                    for path in &ambiguous {
+                        records.remove(path);
                     }
                 }
-                for path in ambiguous {
-                    records.remove(&path);
-                }
+                Err(error) => index
+                    .warnings
+                    .push(format!("RomM cache could not be checked: {error:?}")),
             }
+        } else {
+            index
+                .warnings
+                .push("RomM cache location could not be resolved.".into());
         }
         for game in &library.games {
             let id = game.archive.id;
             let path = &game.archive.absolute_path;
+            let mut sources = format!(
+                "ES-DE: {}. LaunchBox: {}.",
+                if esde.is_some() {
+                    "local index checked"
+                } else {
+                    "not available at the configured/default location"
+                },
+                if launchbox.is_some() {
+                    "local index checked"
+                } else {
+                    "not available at the configured/default location"
+                }
+            );
             // Prefer already-local pictures; a remote server must never hold them up.
             if let Some(entry) = esde
                 .as_ref()
                 .and_then(|provider| provider.lookup_path(&game.platform, path))
             {
+                sources.push_str(" ES-DE matched this game.");
                 if let Some(path) = entry.entry.media.cover {
                     index.covers.insert(id, Source::Local(path));
                 }
@@ -127,6 +188,7 @@ impl MediaIndex {
             if let Some(provider) = &launchbox
                 && let Some(found) = provider.lookup(None, Some(path), Some(&game.platform), None)
             {
+                sources.push_str(" LaunchBox matched this game.");
                 let snapshot = provider.media_snapshot(&found);
                 if let Some(path) = snapshot
                     .cover
@@ -169,6 +231,7 @@ impl MediaIndex {
                     index.descriptions.insert(id, description);
                 }
             }
+            let local_count = index.screenshots.get(&id).map_or(0, Vec::len);
             if let Some(record) = records.get(path)
                 && let Some(artwork) = &record.artwork
             {
@@ -186,12 +249,29 @@ impl MediaIndex {
                             kind: Kind::Screenshot(ordinal),
                         });
                 }
-                index.diagnostics.insert(id, format!("Identity key: exact original archive path `{}`; artwork source: RomM provider record `{}`. Screenshot candidates: {}.", path.display(), record.provider_game_id, artwork.screenshots.len()));
-            } else if let Some(record) = records.get(path) {
-                index.diagnostics.insert(id, format!("Identity key: exact original archive path `{}`; RomM provider record `{}` matched, but it has no screenshot artwork.", path.display(), record.provider_game_id));
-            } else {
-                index.diagnostics.insert(id, format!("Identity key: exact original archive path `{}`. No matching ES-DE, LaunchBox, or RomM record was found; filename/title fallback is intentionally not used.", path.display()));
             }
+            if ambiguous.contains(path) {
+                sources.push_str(" Competing RomM records were refused.");
+            }
+            sources.push_str(&index.warnings.join("\n"));
+            index.diagnostics.insert(
+                id,
+                screenshot_diagnostic(
+                    path,
+                    local_count,
+                    records.get(path).map(|record| {
+                        (
+                            record.provider_game_id.as_str(),
+                            record
+                                .artwork
+                                .as_ref()
+                                .map_or(0, |artwork| artwork.screenshots.len()),
+                        )
+                    }),
+                    &sources,
+                    !index.warnings.is_empty() || ambiguous.contains(path),
+                ),
+            );
         }
         index.elapsed_ms = start.elapsed().as_millis();
         log::debug!(
