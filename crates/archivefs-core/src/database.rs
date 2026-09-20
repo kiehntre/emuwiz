@@ -46,7 +46,8 @@ use crate::media_set::{EvidenceKind, MediaSet, MediaSetConfidence, MediaSetState
 use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySource};
 
 use crate::{
-    ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanner, Config,
+    ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanDiscovery,
+    ArchiveScanner, Config,
     IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION, SCANNER_VERSION,
     ScanFingerprint, canonical_platform_names, detect_platform_with_details, nested_source_roots,
     normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
@@ -7706,25 +7707,54 @@ fn scan_and_persist_folders_transaction(
             .into_iter()
             .map(|fingerprint| (folder.id, fingerprint))
             .collect();
+        let arcade_root = if folder.role == SourceRole::ArcadeRomset
+            || folder
+                .path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("arcade"))
+        {
+            Some(folder.path.clone())
+        } else {
+            let nested = folder.path.join("arcade");
+            nested.is_dir().then_some(nested)
+        };
+        // Discover extracted sets before the generic scanner. The latter can
+        // report a directory-level change while inspecting chip-labelled
+        // members; the bounded arcade pass is still safe and useful in that
+        // case, so retain its result rather than dropping the whole folder.
+        let arcade_sets = arcade_root
+            .as_ref()
+            .and_then(|root| crate::ingestion::discover_extracted_sets(root).ok());
         let discovery_started = std::time::Instant::now();
+        let mut scanner_failed = false;
         let discovery = match ArchiveScanner::new(&folder_config)
             .scan_archives_with_cache_excluding(&fingerprint_refs, &folder.excluded_source_roots)
         {
             Ok(discovery) => discovery,
             Err(error) => {
-                counts.errors_count += 1;
-                let message = error.to_string();
-                database.record_source_scan_result(
-                    folder.id,
-                    SourceScanStatus::Failed,
-                    Some(&message),
-                    None,
-                )?;
-                folder_errors.push((folder.path.clone(), message));
-                continue;
+                if arcade_sets
+                    .as_ref()
+                    .is_some_and(|sets| !sets.sets.is_empty())
+                {
+                    scanner_failed = true;
+                    counts.errors_count += 1;
+                    folder_errors.push((folder.path.clone(), error.to_string()));
+                    ArchiveScanDiscovery::default()
+                } else {
+                    counts.errors_count += 1;
+                    let message = error.to_string();
+                    database.record_source_scan_result(
+                        folder.id,
+                        SourceScanStatus::Failed,
+                        Some(&message),
+                        None,
+                    )?;
+                    folder_errors.push((folder.path.clone(), message));
+                    continue;
+                }
             }
         };
-        let discovery_complete = discovery.is_complete();
+        let discovery_complete = !scanner_failed && discovery.is_complete();
         if !discovery_complete {
             counts.errors_count += discovery.scan_errors_total as i64;
             let detail = discovery
@@ -7876,20 +7906,7 @@ fn scan_and_persist_folders_transaction(
             }
         }
         let mut archives = discovery.archives;
-        let arcade_root = if folder.role == SourceRole::ArcadeRomset
-            || folder
-                .path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("arcade"))
-        {
-            Some(folder.path.clone())
-        } else {
-            let nested = folder.path.join("arcade");
-            nested.is_dir().then_some(nested)
-        };
-        if let Some(arcade_root) = arcade_root
-            && let Ok(arcade_sets) = crate::ingestion::discover_extracted_sets(&arcade_root)
-        {
+        if let Some(arcade_sets) = arcade_sets {
             arcade_ingestion.merge(&arcade_sets.diagnostics);
             for set in arcade_sets.sets {
                 if let Some(archive) = Archive::from_arcade_set_directory(&set.path, &folder.path)
@@ -14743,6 +14760,7 @@ mod tests {
         use zip::ZipWriter;
         use zip::write::SimpleFileOptions;
         let path = dir.join(zip_name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let file = fs::File::create(&path).unwrap();
         let mut writer = ZipWriter::new(file);
         writer

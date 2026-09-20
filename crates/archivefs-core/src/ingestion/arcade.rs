@@ -97,17 +97,18 @@ pub fn support_material_kind(
         .collect();
     let arcade_context = matches!(role, SourceRole::ArcadeRomset)
         || path_context_contains(path, source_root, &["arcade", "mame", "fbneo"]);
-    if components.iter().any(|part| {
-        matches!(
-            part.as_str(),
-            "bios" | "firmware" | "bios_firmware" | "romsets-support"
-        )
-    }) || matches!(role, SourceRole::BiosFirmware)
-    {
-        return Some(SupportMaterialKind::BiosFirmware);
-    }
     if !arcade_context {
-        return None;
+        return if matches!(role, SourceRole::BiosFirmware)
+            || components.iter().any(|part| {
+                matches!(
+                    part.as_str(),
+                    "bios" | "firmware" | "bios_firmware" | "romsets-support"
+                )
+            }) {
+            Some(SupportMaterialKind::BiosFirmware)
+        } else {
+            None
+        };
     }
     if components
         .iter()
@@ -122,6 +123,16 @@ pub fn support_material_kind(
         )
     }) {
         return Some(SupportMaterialKind::EmulatorSupport);
+    }
+    if matches!(role, SourceRole::BiosFirmware)
+        || components.iter().any(|part| {
+            matches!(
+                part.as_str(),
+                "bios" | "firmware" | "bios_firmware" | "romsets-support"
+            )
+        })
+    {
+        return Some(SupportMaterialKind::BiosFirmware);
     }
     None
 }
