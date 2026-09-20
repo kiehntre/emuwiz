@@ -27,6 +27,10 @@ use super::shared_preview::{
 use crate::default_database_path;
 
 pub const SHARED_APPLY_SCHEMA_VERSION: u32 = 1;
+/// Version for the durable intent/checkpoint envelope.  It is deliberately
+/// separate from `SharedApplyJournal`: old final-only receipts remain
+/// readable as legacy completed receipts.
+pub const SHARED_DURABLE_JOURNAL_SCHEMA_VERSION: u32 = 1;
 pub const SHARED_MAX_ENTRIES: usize = 128;
 pub const SHARED_MAX_SOURCE_BYTES: u64 = 1024 * 1024;
 pub const SHARED_MAX_TOTAL_WRITTEN_BYTES: u64 = 32 * 1024 * 1024;
@@ -76,16 +80,29 @@ enum FaultPoint {
     DestinationMutation,
     RollbackRemovalVerification,
     RollbackRestore,
+    ApplyCheckpoint,
+    RollbackCheckpoint,
+    RollbackAfterMutation,
+    TerminalJournal,
+    DurableJournalWrite,
 }
 
 #[cfg(test)]
 thread_local! {
     static INJECTED_FAULT: std::cell::Cell<Option<FaultPoint>> = const { std::cell::Cell::new(None) };
+    static INJECTED_AFTER: std::cell::Cell<Option<(FaultPoint, usize)>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
 fn inject_fault(point: Option<FaultPoint>) {
     INJECTED_FAULT.with(|fault| fault.set(point));
+    INJECTED_AFTER.with(|fault| fault.set(None));
+}
+
+#[cfg(test)]
+fn inject_fault_after(point: FaultPoint, occurrences: usize) {
+    INJECTED_FAULT.with(|fault| fault.set(None));
+    INJECTED_AFTER.with(|fault| fault.set(Some((point, occurrences))));
 }
 
 #[cfg(test)]
@@ -93,8 +110,31 @@ fn should_inject(point: FaultPoint) -> bool {
     INJECTED_FAULT.with(|fault| fault.get() == Some(point))
 }
 
+#[cfg(test)]
+fn should_inject_after(point: FaultPoint) -> bool {
+    INJECTED_AFTER.with(|fault| {
+        let Some((configured, remaining)) = fault.get() else {
+            return false;
+        };
+        if configured != point {
+            return false;
+        }
+        if remaining == 0 {
+            true
+        } else {
+            fault.set(Some((configured, remaining - 1)));
+            false
+        }
+    })
+}
+
 #[cfg(not(test))]
 fn should_inject(_point: FaultPoint) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn should_inject_after(_point: FaultPoint) -> bool {
     false
 }
 
@@ -355,6 +395,87 @@ pub enum SharedApplyStatus {
     Success,
     PartialFailure,
     Failed,
+}
+
+/// Durable state of the shared transaction envelope.  These states are
+/// descriptive only; discovery never resumes or mutates a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedRecoveryState {
+    Planned,
+    Applying,
+    Applied,
+    ApplyFailed,
+    RollingBack,
+    RolledBack,
+    RollbackFailed,
+    NeedsReview,
+    UnsafeToResume,
+    LegacyComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedEntryRecoveryState {
+    Planned,
+    Applying,
+    BackupCreated,
+    DestinationTempWritten,
+    DestinationReplaced,
+    DestinationVerified,
+    Applied,
+    RollingBack,
+    RolledBack,
+    NeedsReview,
+    UnsafeToResume,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDurableEntry {
+    pub plan_entry: SharedPlanEntry,
+    pub state: SharedEntryRecoveryState,
+    pub observed_destination_digest: Option<String>,
+    pub backup_path: Option<SharedTransactionPath>,
+    pub backup_digest: Option<String>,
+    pub resulting_destination_digest: Option<String>,
+    pub temporary_path: Option<SharedTransactionPath>,
+    pub destination_existed_before_apply: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedDurableJournal {
+    pub schema_version: u32,
+    pub transaction_state: SharedRecoveryState,
+    pub operation_id: String,
+    pub operation_type: String,
+    pub plan_id: String,
+    pub timestamp_unix_seconds: u64,
+    pub context: SharedApplyContext,
+    pub approved_source_root: SharedTransactionPath,
+    pub destination_root: SharedTransactionPath,
+    pub backup_root: SharedTransactionPath,
+    pub entries: Vec<SharedDurableEntry>,
+    #[serde(default)]
+    pub created_root_directories: Vec<SharedCreatedRootDirectory>,
+    pub rollback_operation_id: Option<String>,
+    #[serde(default)]
+    pub rollback_of_operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedPendingOperation {
+    pub journal_path: SharedTransactionPath,
+    pub journal: SharedDurableJournal,
+    pub reconciled_entries: Vec<SharedEntryRecoveryState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedPendingRecoveryPlan {
+    pub operation_id: String,
+    pub state: SharedRecoveryState,
+    pub can_safe_rollback: bool,
+    pub can_resume: bool,
+    pub reason: String,
 }
 
 /// The stable filesystem identity of one directory, captured via `fstat` on
@@ -818,12 +939,16 @@ pub fn execute_shared_apply(
         let duplicate = operation.as_ref().ok().is_some_and(|operation| {
             fs::symlink_metadata(options.history_root.join(format!("{operation}.json"))).is_ok()
         });
+        let pending_duplicate = operation.as_ref().ok().is_some_and(|operation| {
+            fs::symlink_metadata(options.history_root.join(format!("{operation}.pending.json")))
+                .is_ok()
+        });
         let managed_overlap = roots_overlap(&options.history_root, &source_root)
             || roots_overlap(&options.history_root, &destination_root)
             || roots_overlap(&options.backup_root, &source_root)
             || roots_overlap(&options.backup_root, &destination_root);
-        if operation.is_err() || duplicate || managed_overlap {
-            let (kind, detail) = if duplicate {
+        if operation.is_err() || duplicate || pending_duplicate || managed_overlap {
+            let (kind, detail) = if duplicate || pending_duplicate {
                 (
                     SharedApplyFailureKind::DuplicateOperationId,
                     "operation ID already has a journal",
@@ -849,6 +974,32 @@ pub fn execute_shared_apply(
                 journal,
                 journal_path: None,
                 journal_failure: None,
+            };
+        }
+    }
+    let pending_path = pending_journal_path(&options.history_root, &options.operation_id).ok();
+    let mut durable = durable_journal_from_plan(plan, options);
+    if !effective_dry_run {
+        if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+            journal.entries = plan
+                .entries
+                .iter()
+                .map(|entry| failed_entry(entry, error.kind, "durable intent could not be written"))
+                .collect();
+            journal.status = SharedApplyStatus::Failed;
+            return SharedApplyResult {
+                journal,
+                journal_path: None,
+                journal_failure: Some(error),
+            };
+        }
+        durable.transaction_state = SharedRecoveryState::Applying;
+        if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+            journal.status = SharedApplyStatus::Failed;
+            return SharedApplyResult {
+                journal,
+                journal_path: None,
+                journal_failure: Some(error),
             };
         }
     }
@@ -912,12 +1063,34 @@ pub fn execute_shared_apply(
                 };
             }
         }
+        durable.created_root_directories = created_root_directories
+            .iter()
+            .map(|entry| SharedCreatedRootDirectory {
+                path: SharedTransactionPath::from_path(&entry.path),
+                identity: Some(entry.identity),
+            })
+            .collect();
+        if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+            journal.status = SharedApplyStatus::Failed;
+            return SharedApplyResult {
+                journal,
+                journal_path: None,
+                journal_failure: Some(error),
+            };
+        }
     }
     let replacement_approved = confirmation.is_some_and(|value| value.replacement_approved);
     let mut written = 0_u64;
     let mut backup_bytes = 0_u64;
-    for entry in &plan.entries {
-        journal.entries.push(apply_one(
+    for (index, entry) in plan.entries.iter().enumerate() {
+        let mut checkpoint = |state: SharedEntryRecoveryState, value: &SharedApplyEntry| {
+            update_durable_entry(&mut durable, index, value);
+            if let Some(durable_entry) = durable.entries.get_mut(index) {
+                durable_entry.state = state;
+            }
+            write_pending_journal(&durable, &options.history_root).is_ok()
+        };
+        let applied_entry = apply_one(
             entry,
             &source_root,
             &destination_root,
@@ -927,7 +1100,36 @@ pub fn execute_shared_apply(
             replacement_approved,
             &mut written,
             &mut backup_bytes,
-        ));
+            &mut checkpoint,
+        );
+        journal.entries.push(applied_entry.clone());
+        update_durable_entry(&mut durable, index, &applied_entry);
+        if !effective_dry_run {
+            if should_inject(FaultPoint::ApplyCheckpoint)
+                || should_inject_after(FaultPoint::ApplyCheckpoint)
+            {
+                durable.transaction_state = SharedRecoveryState::Applying;
+                let error = failure(
+                    SharedApplyFailureKind::JournalFailed,
+                    None,
+                    "injected interruption before apply checkpoint",
+                );
+                return SharedApplyResult {
+                    journal,
+                    journal_path: None,
+                    journal_failure: Some(error),
+                };
+            }
+            if let Err(error) = write_pending_journal(&durable, &options.history_root) {
+                durable.transaction_state = SharedRecoveryState::ApplyFailed;
+                let _ = write_pending_journal(&durable, &options.history_root);
+                return SharedApplyResult {
+                    journal,
+                    journal_path: None,
+                    journal_failure: Some(error),
+                };
+            }
+        }
     }
     if !effective_dry_run && !created_root_directories.is_empty() {
         let any_write = journal.entries.iter().any(|entry| {
@@ -974,6 +1176,17 @@ pub fn execute_shared_apply(
             journal_failure: None,
         };
     }
+    if should_inject(FaultPoint::TerminalJournal) {
+        return SharedApplyResult {
+            journal,
+            journal_path: None,
+            journal_failure: Some(failure(
+                SharedApplyFailureKind::JournalFailed,
+                None,
+                "injected interruption before terminal journal write",
+            )),
+        };
+    }
     match write_journal_once(&journal, &options.history_root) {
         Ok(path) => {
             log::info!(
@@ -981,6 +1194,14 @@ pub fn execute_shared_apply(
                 journal.operation_id,
                 path.display(),
             );
+            durable.transaction_state = match journal.status {
+                SharedApplyStatus::Success => SharedRecoveryState::Applied,
+                SharedApplyStatus::PartialFailure => SharedRecoveryState::ApplyFailed,
+                SharedApplyStatus::Failed => SharedRecoveryState::ApplyFailed,
+                SharedApplyStatus::DryRun => SharedRecoveryState::Planned,
+            };
+            let _ = write_pending_journal(&durable, &options.history_root);
+            let _ = pending_path.and_then(|pending| fs::remove_file(pending).ok());
             SharedApplyResult {
                 journal,
                 journal_path: Some(path),
@@ -1013,6 +1234,8 @@ pub fn execute_shared_apply(
                     }
                 }
             }
+            durable.transaction_state = SharedRecoveryState::ApplyFailed;
+            let _ = write_pending_journal(&durable, &options.history_root);
             SharedApplyResult {
                 journal,
                 journal_path: None,
@@ -1033,6 +1256,7 @@ fn apply_one(
     replacement_approved: bool,
     written: &mut u64,
     backup_bytes: &mut u64,
+    checkpoint: &mut dyn FnMut(SharedEntryRecoveryState, &SharedApplyEntry) -> bool,
 ) -> SharedApplyEntry {
     let mut result = SharedApplyEntry {
         plan_entry: plan.clone(),
@@ -1319,6 +1543,15 @@ fn apply_one(
                 result.backup_path = Some(SharedTransactionPath::from_path(&path));
                 result.backup_digest = Some(existing.digest.clone());
                 result.stages.push(SharedTransactionStage::BackupCreated);
+                if !checkpoint(SharedEntryRecoveryState::BackupCreated, &result) {
+                    return fail_result(
+                        result,
+                        SharedApplyOutcome::BackupFailed,
+                        SharedApplyFailureKind::JournalFailed,
+                        Some(&destination),
+                        "backup was created but its durable checkpoint failed",
+                    );
+                }
             }
             Err(error) => {
                 result.stages.push(SharedTransactionStage::BackupFailed);
@@ -1332,6 +1565,15 @@ fn apply_one(
             }
         }
     }
+    if !checkpoint(SharedEntryRecoveryState::Applying, &result) {
+        return fail_result(
+            result,
+            SharedApplyOutcome::WriteFailed,
+            SharedApplyFailureKind::JournalFailed,
+            Some(&destination),
+            "destination mutation intent checkpoint failed",
+        );
+    }
     match atomic_write(
         &source,
         &destination,
@@ -1340,6 +1582,15 @@ fn apply_one(
     ) {
         Ok(temp) => {
             result.temporary_path = Some(SharedTransactionPath::from_path(&temp));
+            if !checkpoint(SharedEntryRecoveryState::DestinationReplaced, &result) {
+                return fail_result(
+                    result,
+                    SharedApplyOutcome::WriteFailed,
+                    SharedApplyFailureKind::JournalFailed,
+                    Some(&destination),
+                    "destination was replaced but its durable checkpoint failed",
+                );
+            }
             match verify_entry_content(plan, &destination) {
                 Ok(()) => {
                     result.final_destination_digest = Some(source_hash.digest);
@@ -1350,6 +1601,15 @@ fn apply_one(
                         SharedApplyOutcome::ReplacedExisting
                     };
                     result.stages.push(SharedTransactionStage::Success);
+                    if !checkpoint(SharedEntryRecoveryState::DestinationVerified, &result) {
+                        return fail_result(
+                            result,
+                            SharedApplyOutcome::VerificationFailed,
+                            SharedApplyFailureKind::JournalFailed,
+                            Some(&destination),
+                            "verified destination checkpoint failed",
+                        );
+                    }
                     *written += source_hash.bytes;
                 }
                 Err(detail) => {
@@ -1580,10 +1840,13 @@ pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-            path.extension() == Some(OsStr::new("json"))
+                path.extension() == Some(OsStr::new("json"))
                 && !path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().ends_with(".rollback.json"))
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".pending.json"))
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -1720,8 +1983,38 @@ pub fn execute_shared_rollback(
         };
     };
     let original = read_journal(&journal_path).expect("fresh rollback preview parsed journal");
+    let mut durable = durable_journal_from_completed(
+        &original,
+        &options.rollback_operation_id,
+        &options.backup_root,
+    );
+    if write_pending_journal(&durable, &options.history_root).is_err() {
+        return SharedRollbackResult {
+            preview: fresh,
+            journal_path: None,
+            status: SharedApplyStatus::Failed,
+        };
+    }
     let mut applied = fresh.clone();
-    for (rollback, install) in applied.entries.iter_mut().zip(&original.entries) {
+    for (index, (rollback, install)) in applied.entries.iter_mut().zip(&original.entries).enumerate() {
+        durable.transaction_state = SharedRecoveryState::RollingBack;
+        if let Some(entry) = durable.entries.get_mut(index) {
+            entry.state = SharedEntryRecoveryState::RollingBack;
+        }
+        if should_inject(FaultPoint::RollbackCheckpoint) {
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
+        if write_pending_journal(&durable, &options.history_root).is_err() {
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
         let destination = install
             .plan_entry
             .destination_root
@@ -1794,6 +2087,32 @@ pub fn execute_shared_rollback(
             }
             _ => rollback.outcome = SharedRollbackOutcome::NoChangeRequired,
         }
+        if let Some(entry) = durable.entries.get_mut(index) {
+            entry.state = match rollback.outcome {
+                SharedRollbackOutcome::RemovedInstalledFile
+                | SharedRollbackOutcome::RestoredBackup
+                | SharedRollbackOutcome::NoChangeRequired => SharedEntryRecoveryState::RolledBack,
+                SharedRollbackOutcome::Failed => SharedEntryRecoveryState::NeedsReview,
+                _ => SharedEntryRecoveryState::RollingBack,
+            };
+        }
+        if should_inject(FaultPoint::RollbackAfterMutation) {
+            durable.transaction_state = SharedRecoveryState::RollingBack;
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
+        if write_pending_journal(&durable, &options.history_root).is_err() {
+            durable.transaction_state = SharedRecoveryState::RollbackFailed;
+            let _ = write_pending_journal(&durable, &options.history_root);
+            return SharedRollbackResult {
+                preview: applied,
+                journal_path: None,
+                status: SharedApplyStatus::PartialFailure,
+            };
+        }
     }
     // Every per-entry installed file/child directory above has already
     // been removed (or left in place on failure) - only now can a
@@ -1824,6 +2143,19 @@ pub fn execute_shared_rollback(
             atomic_managed_write(&marker, &bytes).ok().map(|_| marker)
         });
     let marker_written = journal_path.is_some();
+    durable.transaction_state = if success && marker_written {
+        SharedRecoveryState::RolledBack
+    } else {
+        SharedRecoveryState::RollbackFailed
+    };
+    if success && marker_written {
+        let _ = write_pending_journal(&durable, &options.history_root);
+        if let Ok(path) = pending_journal_path(&options.history_root, &original.operation_id) {
+            let _ = fs::remove_file(path);
+        }
+    } else {
+        let _ = write_pending_journal(&durable, &options.history_root);
+    }
     SharedRollbackResult {
         preview: applied,
         journal_path,
@@ -2028,6 +2360,375 @@ fn atomic_managed_write(path: &Path, bytes: &[u8]) -> Result<(), SharedApplyFail
     }
     sync_directory(parent);
     Ok(())
+}
+
+fn atomic_managed_replace(path: &Path, bytes: &[u8]) -> Result<(), SharedApplyFailureKind> {
+    let parent = path
+        .parent()
+        .ok_or(SharedApplyFailureKind::ManagedRootUnsafe)?;
+    prepare_managed_root(parent)?;
+    let temp = parent.join(format!(
+        ".archivefs-managed-replace-{}-{}",
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        file.write_all(bytes)
+            .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        file.sync_all()
+            .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        fs::rename(&temp, path).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
+        sync_directory(parent);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn pending_journal_path(
+    history_root: &Path,
+    operation_id: &str,
+) -> Result<PathBuf, SharedApplyFailureKind> {
+    Ok(history_root.join(format!(
+        "{}.pending.json",
+        safe_identifier(operation_id)?
+    )))
+}
+
+fn planned_backup_path(
+    backup_root: &Path,
+    operation_id: &str,
+    entry: &SharedPlanEntry,
+) -> Option<SharedTransactionPath> {
+    if !entry.backup_required {
+        return None;
+    }
+    let relative = entry.destination_relative_path.to_path_buf().ok()?;
+    let destination = entry.destination_root.to_path_buf().ok()?.join(relative);
+    let operation = safe_identifier(operation_id).ok()?;
+    Some(SharedTransactionPath::from_path(
+        &backup_root
+            .join(operation)
+            .join(format!("{}.bak", digest_text(&destination.to_string_lossy()))),
+    ))
+}
+
+fn durable_journal_from_plan(
+    plan: &SharedTransactionPlan,
+    options: &SharedApplyOptions,
+) -> SharedDurableJournal {
+    SharedDurableJournal {
+        schema_version: SHARED_DURABLE_JOURNAL_SCHEMA_VERSION,
+        transaction_state: SharedRecoveryState::Planned,
+        operation_id: options.operation_id.clone(),
+        operation_type: "shared_mod_apply".into(),
+        plan_id: plan.plan_id.clone(),
+        timestamp_unix_seconds: options.timestamp_unix_seconds,
+        context: plan.context.clone(),
+        approved_source_root: plan.approved_source_root.clone(),
+        destination_root: plan.destination_root.clone(),
+        backup_root: SharedTransactionPath::from_path(&options.backup_root),
+        entries: plan
+            .entries
+            .iter()
+            .map(|entry| SharedDurableEntry {
+                plan_entry: entry.clone(),
+                state: SharedEntryRecoveryState::Planned,
+                observed_destination_digest: entry.destination_pre_digest.clone(),
+                backup_path: planned_backup_path(
+                    &options.backup_root,
+                    &options.operation_id,
+                    entry,
+                ),
+                backup_digest: entry.destination_pre_digest.clone(),
+                resulting_destination_digest: None,
+                temporary_path: None,
+                destination_existed_before_apply: Some(matches!(
+                    entry.destination_pre_state,
+                    PreviewDestinationState::RegularFileIdentical
+                        | PreviewDestinationState::RegularFileDifferent
+                )),
+            })
+            .collect(),
+        created_root_directories: Vec::new(),
+        rollback_operation_id: None,
+        rollback_of_operation_id: None,
+    }
+}
+
+fn durable_journal_from_completed(
+    journal: &SharedApplyJournal,
+    rollback_operation_id: &str,
+    backup_root: &Path,
+) -> SharedDurableJournal {
+    SharedDurableJournal {
+        schema_version: SHARED_DURABLE_JOURNAL_SCHEMA_VERSION,
+        transaction_state: SharedRecoveryState::RollingBack,
+        operation_id: journal.operation_id.clone(),
+        operation_type: "shared_mod_rollback".into(),
+        plan_id: journal.plan_id.clone(),
+        timestamp_unix_seconds: journal.timestamp_unix_seconds,
+        context: journal.context.clone(),
+        approved_source_root: journal.approved_source_root.clone(),
+        destination_root: journal.destination_root.clone(),
+        backup_root: SharedTransactionPath::from_path(backup_root),
+        entries: journal
+            .entries
+            .iter()
+            .map(|entry| SharedDurableEntry {
+                plan_entry: entry.plan_entry.clone(),
+                state: SharedEntryRecoveryState::RollingBack,
+                observed_destination_digest: entry.observed_destination_digest.clone(),
+                backup_path: entry.backup_path.clone(),
+                backup_digest: entry.backup_digest.clone(),
+                resulting_destination_digest: entry.final_destination_digest.clone(),
+                temporary_path: entry.temporary_path.clone(),
+                destination_existed_before_apply: entry.destination_existed_before_apply,
+            })
+            .collect(),
+        created_root_directories: journal.created_root_directories.clone(),
+        rollback_operation_id: Some(rollback_operation_id.to_owned()),
+        rollback_of_operation_id: Some(journal.operation_id.clone()),
+    }
+}
+
+fn update_durable_entry(
+    durable: &mut SharedDurableJournal,
+    index: usize,
+    entry: &SharedApplyEntry,
+) {
+    let Some(target) = durable.entries.get_mut(index) else {
+        return;
+    };
+    target.observed_destination_digest = entry.observed_destination_digest.clone();
+    target.backup_path = entry.backup_path.clone();
+    target.backup_digest = entry.backup_digest.clone();
+    target.resulting_destination_digest = entry.final_destination_digest.clone();
+    target.temporary_path = entry.temporary_path.clone();
+    target.destination_existed_before_apply = entry.destination_existed_before_apply;
+    target.state = match entry.outcome {
+        SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
+            if entry.verification_succeeded => SharedEntryRecoveryState::Applied,
+        SharedApplyOutcome::BackupFailed => SharedEntryRecoveryState::Applying,
+        SharedApplyOutcome::WriteFailed | SharedApplyOutcome::VerificationFailed => {
+            SharedEntryRecoveryState::NeedsReview
+        }
+        _ => SharedEntryRecoveryState::Applying,
+    };
+}
+
+fn write_pending_journal(
+    journal: &SharedDurableJournal,
+    history_root: &Path,
+) -> Result<(), SharedApplyFailure> {
+    if should_inject(FaultPoint::DurableJournalWrite) {
+        return Err(failure(
+            SharedApplyFailureKind::JournalFailed,
+            None,
+            "injected durable journal write failure",
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(journal).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::JournalFailed,
+            None,
+            &error.to_string(),
+        )
+    })?;
+    if bytes.len() as u64 > SHARED_MAX_JOURNAL_BYTES {
+        return Err(failure(
+            SharedApplyFailureKind::ResourceLimitReached,
+            None,
+            "durable journal size limit reached",
+        ));
+    }
+    let path = pending_journal_path(history_root, &journal.operation_id)
+        .map_err(|kind| failure(kind, None, "operation ID is not safe for a pending journal"))?;
+    atomic_managed_replace(&path, &bytes)
+        .map_err(|kind| failure(kind, Some(&path), "pending journal could not be written"))
+}
+
+fn read_pending_journal(path: &Path) -> Result<SharedDurableJournal, SharedApplyFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::InvalidJournal,
+            Some(path),
+            &error.to_string(),
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > SHARED_MAX_JOURNAL_BYTES
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidJournal,
+            Some(path),
+            "pending journal is not a bounded regular file",
+        ));
+    }
+    let bytes = read_bounded(path, SHARED_MAX_JOURNAL_BYTES)
+        .map_err(|kind| failure(kind, Some(path), "pending journal could not be read"))?;
+    let journal: SharedDurableJournal = serde_json::from_slice(&bytes).map_err(|error| {
+        failure(
+            SharedApplyFailureKind::InvalidJournal,
+            Some(path),
+            &error.to_string(),
+        )
+    })?;
+    if journal.schema_version != SHARED_DURABLE_JOURNAL_SCHEMA_VERSION {
+        return Err(failure(
+            SharedApplyFailureKind::UnsupportedJournal,
+            Some(path),
+            "durable journal schema version is unsupported",
+        ));
+    }
+    Ok(journal)
+}
+
+/// Read-only startup discovery for durable shared-mod journals.  It performs
+/// no cleanup, rollback, resume, locking, or filesystem mutation.
+pub fn discover_pending_operations(history_root: &Path) -> Vec<SharedPendingOperation> {
+    let Ok(entries) = fs::read_dir(history_root) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension() == Some(OsStr::new("json")))
+        .filter(|path| path.file_name().is_some_and(|name| {
+            name.to_string_lossy().ends_with(".pending.json")
+        }))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let journal = read_pending_journal(&path).ok()?;
+            let reconciled_entries = journal
+                .entries
+                .iter()
+                .map(|entry| reconcile_durable_entry(entry, journal.transaction_state))
+                .collect();
+            if matches!(
+                journal.transaction_state,
+                SharedRecoveryState::Applied | SharedRecoveryState::RolledBack
+            ) {
+                return None;
+            }
+            Some(SharedPendingOperation {
+                journal_path: SharedTransactionPath::from_path(&path),
+                journal,
+                reconciled_entries,
+            })
+        })
+        .collect()
+}
+
+/// Build an explicit, read-only recovery decision.  It never resumes or
+/// rolls back; a caller must separately request an operation after checking
+/// the displayed identities and exact transaction envelope.
+pub fn plan_pending_recovery(
+    operation: &SharedPendingOperation,
+) -> SharedPendingRecoveryPlan {
+    let safe_entries = operation.reconciled_entries.iter().all(|state| {
+        matches!(
+            state,
+            SharedEntryRecoveryState::Applied | SharedEntryRecoveryState::Planned
+        )
+    });
+    let rollback_state = matches!(
+        operation.journal.transaction_state,
+        SharedRecoveryState::Applying
+            | SharedRecoveryState::ApplyFailed
+            | SharedRecoveryState::NeedsReview
+    );
+    let can_safe_rollback = rollback_state && safe_entries;
+    SharedPendingRecoveryPlan {
+        operation_id: operation.journal.operation_id.clone(),
+        state: operation.journal.transaction_state,
+        can_safe_rollback,
+        can_resume: false,
+        reason: if can_safe_rollback {
+            "all observed entries are either proven applied or proven unchanged; explicit rollback may be planned"
+                .into()
+        } else {
+            "identity mismatch, missing backup, rollback in progress, or ambiguous filesystem state"
+                .into()
+        },
+    }
+}
+
+fn reconcile_durable_entry(
+    entry: &SharedDurableEntry,
+    transaction_state: SharedRecoveryState,
+) -> SharedEntryRecoveryState {
+    let Ok(root) = entry.plan_entry.destination_root.to_path_buf() else {
+        return SharedEntryRecoveryState::UnsafeToResume;
+    };
+    let Ok(relative) = entry.plan_entry.destination_relative_path.to_path_buf() else {
+        return SharedEntryRecoveryState::UnsafeToResume;
+    };
+    let destination = root.join(relative);
+    let destination_digest = stable_hash(&destination, SHARED_MAX_SOURCE_BYTES)
+        .ok()
+        .map(|hash| hash.digest);
+    let expected_new = entry.plan_entry.source_digest.as_str();
+    let expected_old = entry.plan_entry.destination_pre_digest.as_deref();
+    let backup_valid = if entry.plan_entry.backup_required {
+        entry
+            .backup_path
+            .as_ref()
+            .and_then(|path| path.to_path_buf().ok())
+            .and_then(|path| stable_hash(&path, SHARED_MAX_BACKUP_BYTES).ok())
+            .is_some_and(|hash| Some(hash.digest.as_str()) == expected_old)
+    } else {
+        true
+    };
+    match transaction_state {
+        SharedRecoveryState::RollingBack | SharedRecoveryState::RollbackFailed => {
+            if (entry.destination_existed_before_apply == Some(false)
+                && destination_digest.is_none())
+                || (backup_valid
+                    && entry.backup_digest.as_deref() == destination_digest.as_deref())
+                || (expected_old.is_none() && destination_digest.is_none())
+            {
+                SharedEntryRecoveryState::RolledBack
+            } else if destination_digest.as_deref() == Some(expected_new) {
+                SharedEntryRecoveryState::RollingBack
+            } else {
+                SharedEntryRecoveryState::NeedsReview
+            }
+        }
+        _ => {
+            if destination_digest.as_deref() == Some(expected_new) {
+                if backup_valid {
+                    SharedEntryRecoveryState::Applied
+                } else {
+                    SharedEntryRecoveryState::UnsafeToResume
+                }
+            } else if destination_digest.as_deref() == expected_old {
+                SharedEntryRecoveryState::Planned
+            } else if destination_digest.is_none() && expected_old.is_none() {
+                if matches!(
+                    entry.state,
+                    SharedEntryRecoveryState::Planned | SharedEntryRecoveryState::Applying
+                ) {
+                    SharedEntryRecoveryState::Planned
+                } else {
+                    SharedEntryRecoveryState::UnsafeToResume
+                }
+            } else {
+                SharedEntryRecoveryState::NeedsReview
+            }
+        }
+    }
 }
 
 fn write_journal_once(
@@ -3223,6 +3924,139 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_apply_is_discoverable_and_reconciles_without_auto_resume() {
+        let fixture = Fixture::new("durable-interrupted-apply");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        inject_fault(Some(FaultPoint::TerminalJournal));
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "durable-interrupted", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(result.journal_path.is_none());
+        assert!(fixture.destination_root().join("Nintendo - NES/game.cht").exists());
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].journal.transaction_state, SharedRecoveryState::Applying);
+        assert_eq!(pending[0].reconciled_entries, vec![SharedEntryRecoveryState::Applied]);
+        assert!(plan_pending_recovery(&pending[0]).can_safe_rollback);
+        assert!(!plan_pending_recovery(&pending[0]).can_resume);
+        assert!(discover_shared_apply_history(&fixture.history_root()).journals.is_empty());
+    }
+
+    #[test]
+    fn multi_file_interruption_after_second_entry_has_all_mutations_discoverable() {
+        let fixture = Fixture::new("durable-multi-file");
+        fs::create_dir(fixture.source_root()).unwrap();
+        fs::create_dir(fixture.destination_root()).unwrap();
+        let source_items = (0..3)
+            .map(|index| {
+                let source = fixture.source_root().join(format!("source-{index}.cht"));
+                fs::write(&source, format!("new-{index}")).unwrap();
+                PreviewSourceItem {
+                    adapter: PreviewAdapter::RetroArch,
+                    source_path: source,
+                    expected_source_digest: None,
+                    destination_relative_paths: vec![PathBuf::from(format!(
+                        "Nintendo - NES/game-{index}.cht"
+                    ))],
+                    match_strength: PreviewMatchStrength::VerifiedExact,
+                }
+            })
+            .collect();
+        let report = build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: fixture.0.join("selected.zip"),
+            platform: Some("NES".into()),
+            identity: PreviewIdentity {
+                kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+                state: PreviewIdentityState::Verified,
+                value: Some("archive-1".into()),
+                archive_path: fixture.0.join("selected.zip"),
+                revision: None,
+            },
+            destination_root: fixture.destination_root(),
+            source_items,
+        })
+        .unwrap();
+        let plan = make_plan(&fixture, &report);
+        inject_fault_after(FaultPoint::ApplyCheckpoint, 1);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "durable-multi", false, true, false),
+        );
+        inject_fault(None);
+        assert_eq!(result.journal_failure.unwrap().kind, SharedApplyFailureKind::JournalFailed);
+        assert!(fixture.destination_root().join("Nintendo - NES/game-0.cht").exists());
+        assert!(fixture.destination_root().join("Nintendo - NES/game-1.cht").exists());
+        assert!(!fixture.destination_root().join("Nintendo - NES/game-2.cht").exists());
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].reconciled_entries,
+            vec![
+                SharedEntryRecoveryState::Applied,
+                SharedEntryRecoveryState::Applied,
+                SharedEntryRecoveryState::Planned
+            ]
+        );
+    }
+
+    #[test]
+    fn interrupted_rollback_is_discoverable_and_not_a_completed_receipt() {
+        let fixture = Fixture::new("durable-interrupted-rollback");
+        let report = preview(&fixture, b"new", Some(b"old"));
+        let plan = make_plan(&fixture, &report);
+        let applied = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "durable-rollback", false, true, true),
+        );
+        let journal_path = applied.journal_path.unwrap();
+        let rollback = preview_shared_rollback(
+            &journal_path,
+            &fixture.destination_root(),
+            &fixture.backup_root(),
+        );
+        inject_fault(Some(FaultPoint::RollbackAfterMutation));
+        let result = execute_shared_rollback(
+            &rollback,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: rollback.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "durable-rollback-reverse".into(),
+                timestamp_unix_seconds: 1_700_000_001,
+                history_root: fixture.history_root(),
+                backup_root: fixture.backup_root(),
+            },
+        );
+        inject_fault(None);
+        assert_eq!(result.status, SharedApplyStatus::PartialFailure);
+        let pending = discover_pending_operations(&fixture.history_root());
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].journal.transaction_state, SharedRecoveryState::RollingBack);
+        assert!(pending[0].journal.rollback_of_operation_id.is_some());
+        assert!(fixture.history_root().join("durable-rollback.json").exists());
+    }
+
+    #[test]
+    fn legacy_final_receipt_is_not_reported_as_pending() {
+        let fixture = Fixture::new("durable-legacy");
+        let report = preview(&fixture, b"new", None);
+        let plan = make_plan(&fixture, &report);
+        let result = execute_shared_apply(
+            &plan,
+            &options(&fixture, &plan, "legacy-receipt", false, true, false),
+        );
+        assert_eq!(result.journal.status, SharedApplyStatus::Success);
+        assert!(discover_pending_operations(&fixture.history_root()).is_empty());
+        assert_eq!(discover_shared_apply_history(&fixture.history_root()).journals.len(), 1);
+    }
+
+    #[test]
     fn dry_run_and_missing_confirmation_write_nothing() {
         let fixture = Fixture::new("dry-run");
         let report = preview(&fixture, b"new", None);
@@ -3452,9 +4286,10 @@ mod tests {
         let fixture = Fixture::new("journal-failure");
         let report = preview(&fixture, b"new", None);
         let plan = make_plan(&fixture, &report);
-        let mut options = options(&fixture, &plan, "partial", false, true, false);
-        options.history_root = fixture.0.join("missing-parent/history");
+        let options = options(&fixture, &plan, "partial", false, true, false);
+        inject_fault(Some(FaultPoint::JournalWrite));
         let result = execute_shared_apply(&plan, &options);
+        inject_fault(None);
         assert_eq!(result.journal.status, SharedApplyStatus::PartialFailure);
         assert!(result.journal_failure.is_some());
         assert_eq!(
