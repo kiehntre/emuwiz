@@ -6,6 +6,7 @@ mod legacy;
 mod library;
 mod media_sources;
 mod pages;
+mod problems;
 mod routes;
 #[cfg(test)]
 mod tests;
@@ -151,6 +152,7 @@ pub(super) struct App {
     duplicate_report: Option<DuplicateReport>,
     duplicate_job: Option<u64>,
     duplicate_ignored: std::collections::HashSet<String>,
+    problem_selected: Option<String>,
     mrwiz_dismissed: bool,
 }
 
@@ -188,6 +190,7 @@ impl App {
             duplicate_report: None,
             duplicate_job: None,
             duplicate_ignored: std::collections::HashSet::new(),
+            problem_selected: None,
             mrwiz_dismissed: false,
         };
         app.send(0, Command::Restore);

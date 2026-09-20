@@ -6,6 +6,7 @@ use super::{
     backend::Command,
     library::Game,
     media_sources::Kind,
+    problems::{Category, Problem, ProblemSummary, Severity},
     routes::{HOME_TASKS, Route, SECTIONS, Section},
 };
 use crate::ui::components::mrwiz_tip;
@@ -154,6 +155,7 @@ impl App {
                 Route::Section(Section::Games | Section::Launch | Section::Mods) => self.games(ui),
                 Route::Section(Section::Check) => self.check_games(ui),
                 Route::Section(Section::Duplicates) => self.duplicates(ui),
+                Route::Section(Section::Problems) => self.problems(ui),
                 Route::Section(Section::Platforms) => self.platforms(ui),
                 Route::Game(id) => self.game_detail(ui, id),
                 Route::Section(Section::Activity) => self.activities(ui),
@@ -716,6 +718,85 @@ impl App {
                 ui.label("Quarantine is recoverable and must be reviewed in Problems & Repair; there is no delete action here.");
             });
         }
+    }
+
+    fn problems(&mut self, ui: &mut egui::Ui) {
+        let summary = ProblemSummary::from_library(&self.library, self.duplicate_report.as_ref());
+        egui::ScrollArea::vertical().id_salt("v2_problems").show(ui, |ui| {
+            ui.label("Here is what needs attention, with the safest next action. Opening this page is read-only.");
+            if summary.problems.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Nothing needs attention right now.");
+                    ui.label("EmuWiz has no saved file, identity, or duplicate findings to show.");
+                    if primary(ui, "Verify my games") { self.go(Route::Section(Section::Check)); }
+                });
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!("Needs attention: {}", summary.count(Severity::NeedsAttention)));
+                ui.label(format!("Warnings: {}", summary.count(Severity::Warning)));
+                ui.label(format!("Informational: {}", summary.count(Severity::Informational)));
+            });
+            if primary(ui, "Review problems") && self.problem_selected.is_none() {
+                self.problem_selected = summary.problems.first().map(|problem| problem.id.clone());
+            }
+            if self.duplicate_report.is_none() {
+                ui.label("Exact duplicates have not been checked in this session.");
+                if ui.button("Check for exact duplicates").clicked() { self.start_duplicate_scan(); }
+            }
+            let mut selected = self.problem_selected.clone();
+            for category in [Category::Files, Category::Duplicates, Category::Identity, Category::Verification] {
+                let entries: Vec<_> = summary.problems.iter().filter(|problem| problem.category == category).collect();
+                if entries.is_empty() { continue; }
+                ui.separator();
+                ui.heading(category.label());
+                for problem in entries {
+                    let is_selected = selected.as_deref() == Some(problem.id.as_str());
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(&problem.title);
+                            ui.label(problem.severity.label());
+                            if ui.button(if is_selected { "Hide details" } else { "View details" }).clicked() {
+                                selected = (!is_selected).then(|| problem.id.clone());
+                            }
+                        });
+                        ui.label(&problem.affected);
+                        ui.label(format!("Recommended action: {}", problem.action));
+                        if is_selected { self.problem_details(ui, problem); }
+                    });
+                }
+            }
+            self.problem_selected = selected;
+        });
+    }
+
+    fn problem_details(&mut self, ui: &mut egui::Ui, problem: &Problem) {
+        ui.separator();
+        ui.strong("What happened");
+        ui.label(&problem.title);
+        ui.strong("Why it matters");
+        ui.label(&problem.why);
+        ui.strong("What EmuWiz can do");
+        ui.label(&problem.action);
+        ui.strong("Safety and undo");
+        ui.label(&problem.safety);
+        ui.label(&problem.undo);
+        match problem.category {
+            Category::Duplicates => {
+                if primary(ui, "Review duplicate groups") {
+                    self.go(Route::Section(Section::Duplicates));
+                }
+            }
+            Category::Files | Category::Identity | Category::Verification => {
+                if primary(ui, "Review games and verify") {
+                    self.go(Route::Section(Section::Games));
+                }
+            }
+        }
+        ui.collapsing("Advanced details", |ui| {
+            ui.monospace(&problem.technical);
+        });
     }
 
     fn game_detail(&mut self, ui: &mut egui::Ui, id: i64) {

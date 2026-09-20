@@ -39,7 +39,7 @@ pub(super) struct Game {
     pub platform: String,
     pub identified: bool,
     pub attention: bool,
-    search: String,
+    pub(super) search: String,
 }
 
 impl Game {

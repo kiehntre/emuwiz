@@ -60,6 +60,7 @@ fn fixture(context: &egui::Context) -> App {
         duplicate_report: None,
         duplicate_job: None,
         duplicate_ignored: std::collections::HashSet::new(),
+        problem_selected: None,
         mrwiz_dismissed: false,
     }
 }
@@ -168,6 +169,32 @@ fn gui_v2_check_games_is_native_and_marks_arcade_ready() {
             .iter()
             .any(|value| value.contains("MAME Arcade verification data ready"))
     );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("existing interface"))
+    );
+}
+
+#[test]
+fn gui_v2_problems_page_is_native_and_plain_english() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(
+        1,
+        "Missing Pac-Man",
+        Some("Arcade"),
+    )]));
+    app.problem_selected = Some("missing-1".into());
+    app.router.current = Route::Section(Section::Problems);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Broken or missing files"))
+    );
+    assert!(strings.iter().any(|value| value.contains("What happened")));
+    assert!(strings.iter().any(|value| value.contains("Read-only")));
     assert!(
         !strings
             .iter()
@@ -1091,6 +1118,8 @@ fn gui_v2_handoff_primary_action_is_visible_without_scrolling() {
             let output = frame(&context, &mut app, size);
             let action = if section == Section::Check {
                 "Choose a platform"
+            } else if section == Section::Problems {
+                "Nothing needs attention right now."
             } else {
                 section.action()
             };
