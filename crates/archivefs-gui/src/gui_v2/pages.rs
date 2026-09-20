@@ -846,7 +846,14 @@ impl App {
 
     fn history(&mut self, ui: &mut egui::Ui) {
         ui.label("Previous repairs and playing-library builds are shown from the durable transaction journal. Browsing history changes nothing.");
-        if self.repair_history.is_empty() && self.playing_library_history.is_empty() {
+        let has_cheat_history = self
+            .native_workflows
+            .as_ref()
+            .is_some_and(super::native_workflows::NativeWorkflows::has_cheat_history);
+        if self.repair_history.is_empty()
+            && self.playing_library_history.is_empty()
+            && !has_cheat_history
+        {
             ui.heading("No repair history yet");
             ui.label(
                 "When a supported repair completes, its receipt and undo status will appear here.",
@@ -854,6 +861,10 @@ impl App {
             return;
         }
         let mut open_build = false;
+        let open_cheats = self
+            .native_workflows
+            .as_ref()
+            .is_some_and(|workflows| workflows.show_cheat_history(ui));
         if !self.playing_library_history.is_empty() {
             ui.heading("Playing libraries");
             for transaction in self.playing_library_history.iter().rev() {
@@ -947,6 +958,9 @@ impl App {
         }
         if open_build {
             self.go(Route::Section(Section::Build));
+        }
+        if open_cheats {
+            self.go(Route::Section(Section::Mods));
         }
     }
 
@@ -1077,7 +1091,19 @@ impl App {
 
     fn mods_page(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         let selected = game_id.and_then(|id| self.library.game(id));
-        crate::gui_v2::mods::show_mods_page(ui, &mut self.mods, selected, &mut self.activity);
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        let destination = crate::gui_v2::mods::show_mods_page(
+            ui,
+            &mut self.mods,
+            selected,
+            workflows,
+            &mut self.activity,
+        );
+        if let Some(destination) = destination {
+            self.go(destination);
+        }
     }
 
     fn launch(&mut self, ui: &mut egui::Ui, game_id: i64) {

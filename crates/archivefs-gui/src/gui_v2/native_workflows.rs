@@ -26,6 +26,7 @@ pub(super) struct NativeWorkflows {
     provider_job: Option<u64>,
     metadata_job: Option<u64>,
     dat_job: Option<u64>,
+    cheat_job: Option<u64>,
     source_library_reload: bool,
     artwork_reload: bool,
 }
@@ -66,6 +67,7 @@ impl NativeWorkflows {
             provider_job: None,
             metadata_job: None,
             dat_job: None,
+            cheat_job: None,
             source_library_reload: false,
             artwork_reload: false,
         }
@@ -89,6 +91,7 @@ impl NativeWorkflows {
         self.observe_provider_activity(activity);
         self.observe_metadata_activity(activity);
         self.poll_dat_activity(context, activity);
+        self.observe_cheat_activity(activity);
 
         let checking_setup = self.app.doctor_repair.doctor_scan.is_running();
         if checking_setup && self.setup_job.is_none() {
@@ -295,12 +298,229 @@ impl NativeWorkflows {
         self.observe_dat_activity(activity);
     }
 
+    pub(super) fn show_cheats(
+        &mut self,
+        ui: &mut egui::Ui,
+        selected: Option<&crate::gui_v2::library::Game>,
+        activity: &mut Activity,
+    ) -> Option<Route> {
+        let Some(game) = selected else {
+            crate::ui::components::card(ui, |ui| {
+                ui.heading("Choose a game first");
+                ui.label("Open a game from Games, then choose Mods & Cheats to review compatible cheats.");
+                ui.label("No cheat is changed by browsing this page.");
+            });
+            return None;
+        };
+        let path = game.archive.absolute_path.clone();
+        if !self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.archive_path == path)
+        {
+            self.app.open_cheats_mods_workspace(ui.ctx(), path);
+        }
+        let Some(workflow) = self.app.cheat_workflow.as_ref() else {
+            crate::ui::components::banner(
+                ui,
+                "Cheat identity is not ready",
+                "EmuWiz could not bind this selection to the loaded library record. Refresh the library and try again; no files were changed.",
+                crate::ui::components::StatusTone::Warning,
+            );
+            return None;
+        };
+        ui.label(format!("Selected game: {} · {}", game.title, game.platform));
+        ui.label(match workflow.adapter.display_name() {
+            Some(adapter) => format!("Supported cheat target: {adapter}"),
+            None => "Unsupported format for automatic cheat apply".to_string(),
+        });
+        let live = match &self.app.state {
+            LoadState::Ready(data) => Some(data.as_ref()),
+            LoadState::Loading { previous, .. } => previous.as_deref(),
+            LoadState::Error(_) => None,
+        };
+        // The shared controller rejects overlapping requests as a second line
+        // of defence. Also disable its submit controls while any cheat worker
+        // is active so a double click is visibly refused at the v2 surface.
+        let busy = cheat_activity_state(self.app.cheat_workflow.as_ref()).is_some();
+        let action = crate::cheats_mods_preview::show_cheats_mods_page(
+            ui,
+            self.app.cheat_workflow.as_mut(),
+            &self.app.emulator_readiness.retroarch_profiles,
+            &self.app.emulator_readiness.pcsx2_profiles,
+            &self.app.emulator_readiness.dolphin_profiles,
+            &self.app.emulator_readiness.xenia_profiles,
+            live,
+            self.app.database_state.snapshot(),
+            &self.app.history,
+            busy,
+            &mut self.app.clipboard,
+            &mut self.app.dolphin_texture_mod,
+            &mut self.app.local_mod_package,
+        );
+        let library = live
+            .map(|data| {
+                data.records
+                    .iter()
+                    .map(
+                        |record| archivefs_core::patch_manager::UserCheatLibraryGame {
+                            game_id: record.mount_plan.archive.path.display().to_string(),
+                            title: record
+                                .metadata
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| record.identity.display_name.clone()),
+                            platform: record
+                                .metadata
+                                .platform
+                                .clone()
+                                .or_else(|| record.identity.platform.clone()),
+                            region: record
+                                .metadata
+                                .region
+                                .clone()
+                                .or_else(|| record.identity.region.clone()),
+                            serial: None,
+                            title_id: None,
+                            crc: None,
+                            content_hash: record.identity.content_hash.clone(),
+                        },
+                    )
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let selected_game = self.app.cheat_workflow.as_ref().map(|workflow| {
+            (
+                workflow.archive_path.display().to_string(),
+                workflow.display_name.clone(),
+            )
+        });
+        let local_retroarch = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::RetroArch)
+            .map(|workflow| {
+                crate::local_cheat_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.retroarch_profiles,
+                )
+            });
+        let local_pcsx2 = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::Pcsx2)
+            .and_then(|workflow| {
+                crate::local_pcsx2_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.pcsx2_profiles,
+                )
+            });
+        let local_dolphin = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::Dolphin)
+            .and_then(|workflow| {
+                crate::local_dolphin_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.dolphin_profiles,
+                )
+            });
+        let local_xenia = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .filter(|workflow| workflow.adapter == crate::CheatEmulatorAdapter::Xenia)
+            .map(|workflow| {
+                crate::local_xenia_install_context(
+                    workflow,
+                    &self.app.emulator_readiness.xenia_profiles,
+                )
+            });
+        ui.add_space(12.0);
+        let context = ui.ctx().clone();
+        self.app.user_cheat_import_page.show(
+            ui,
+            &context,
+            &library,
+            selected_game
+                .as_ref()
+                .map(|(id, title)| (id.as_str(), title.as_str())),
+            local_retroarch.as_ref(),
+            local_pcsx2.as_ref(),
+            local_dolphin.as_ref(),
+            local_xenia.as_ref(),
+        );
+        let destination = action.and_then(|action| self.handle_cheat_action(&context, action));
+        self.observe_cheat_activity(activity);
+        destination
+    }
+
     pub(super) fn take_source_library_reload(&mut self) -> bool {
         std::mem::take(&mut self.source_library_reload)
     }
 
     pub(super) fn take_artwork_reload(&mut self) -> bool {
         std::mem::take(&mut self.artwork_reload)
+    }
+
+    pub(super) fn has_cheat_history(&self) -> bool {
+        self.app.history.entries().any(|entry| {
+            matches!(
+                entry.action,
+                crate::activity_history::ActivityAction::CheatSourceRetrieval
+                    | crate::activity_history::ActivityAction::CheatPreview
+                    | crate::activity_history::ActivityAction::CheatInstall
+            )
+        })
+    }
+
+    pub(super) fn show_cheat_history(&self, ui: &mut egui::Ui) -> bool {
+        let entries = self
+            .app
+            .history
+            .entries()
+            .filter(|entry| {
+                matches!(
+                    entry.action,
+                    crate::activity_history::ActivityAction::CheatSourceRetrieval
+                        | crate::activity_history::ActivityAction::CheatPreview
+                        | crate::activity_history::ActivityAction::CheatInstall
+                )
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return false;
+        }
+        ui.heading("Cheat activity");
+        for entry in entries {
+            crate::ui::components::card(ui, |ui| {
+                ui.strong(entry.action.to_string());
+                ui.label(entry.outcome.to_string());
+                ui.label(&entry.message);
+                if let Some(path) = &entry.archive_path {
+                    ui.collapsing("Advanced Details", |ui| {
+                        ui.monospace(path.display().to_string());
+                    });
+                }
+            });
+        }
+        let undo_available = self.app.cheat_workflow.as_ref().is_some_and(|workflow| {
+            matches!(
+                workflow.transaction,
+                crate::CheatTransactionState::Result { .. }
+            )
+        });
+        if undo_available {
+            ui.label("Undo is available from the reviewed result in Mods & Cheats.");
+            ui.button("Open Mods & Cheats to review undo").clicked()
+        } else {
+            ui.label("Undo is unavailable unless the selected adapter produced a recoverable transaction.");
+            false
+        }
     }
 
     pub(super) fn show_metadata_tools(
@@ -496,6 +716,281 @@ impl NativeWorkflows {
         observe_dat_activity_state(activity, &mut self.dat_job, state, error);
     }
 
+    fn handle_cheat_action(
+        &mut self,
+        context: &egui::Context,
+        action: crate::CheatWorkflowAction,
+    ) -> Option<Route> {
+        use crate::CheatWorkflowAction as A;
+        match action {
+            A::ChooseArchive | A::OpenLibrary => {
+                return Some(Route::Section(super::routes::Section::Games));
+            }
+            A::RescanProfiles => self.app.start_retroarch_profile_scan(context.clone()),
+            A::RescanPcsx2Profiles => self.app.start_pcsx2_profile_scan(context.clone()),
+            A::InspectPcsx2Profile => self.app.start_pcsx2_inventory(context.clone()),
+            A::FetchPcsx2GameHacking { force_refresh } => self
+                .app
+                .start_pcsx2_gamehacking_fetch(context.clone(), force_refresh),
+            A::ConfirmPcsx2GameHackingMatch { game_id } => self
+                .app
+                .confirm_pcsx2_gamehacking_match(context.clone(), game_id),
+            A::TogglePcsx2CheatSelected { id, selected } => {
+                self.app.update_pcsx2_cheat_selection(&id, selected);
+            }
+            A::InstallSelectedPcsx2 => self.app.start_pcsx2_install_preview(),
+            A::RescanDolphinProfiles => self.app.start_dolphin_profile_scan(context.clone()),
+            A::InspectDolphinProfile => self.app.start_dolphin_inventory(context.clone()),
+            A::InspectExistingLibrary => self
+                .app
+                .start_existing_retroarch_library_inspection(context.clone()),
+            A::RefreshSources => self.app.start_cheat_source_list(context.clone()),
+            A::ManageCatalogue => {
+                self.app
+                    .navigate_to_sources_tab(crate::navigation::SourcesTab::Cheats);
+                return Some(Route::Section(super::routes::Section::Sources));
+            }
+            A::UseCachedSnapshot => self.app.start_cheat_source_fetch(context.clone(), true),
+            A::ReviewApply => self.app.review_cheat_apply(),
+            A::ConfirmApply => self.app.start_cheat_apply(context.clone()),
+            A::CancelApply => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                    workflow.transaction_notice = Some(
+                        "Installation cancelled before apply; no live emulator file was changed."
+                            .to_string(),
+                    );
+                }
+                self.app
+                    .history
+                    .record(crate::activity_history::HistoryEntry::new(
+                        crate::activity_history::ActivityAction::CheatInstall,
+                        self.app
+                            .cheat_workflow
+                            .as_ref()
+                            .map(|workflow| workflow.archive_path.clone()),
+                        crate::activity_history::ActivityOutcome::Cancelled,
+                        "Install cancelled before the write phase; nothing was changed.",
+                    ));
+            }
+            A::OpenApplyHistory => {
+                return Some(Route::Section(super::routes::Section::History));
+            }
+            A::MatchCandidates => self.app.start_cheat_candidate_match(context.clone()),
+            A::SelectCandidate(path) => self.app.apply_cheat_candidate_choice(&path),
+            A::ClearCandidateChoice => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.candidate_selection = None;
+                    workflow.candidate_load_error = None;
+                    workflow.preview = crate::CheatStepResource::NotLoaded;
+                    workflow.preview_request = None;
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                }
+            }
+            A::ToggleCheatSelected { index, selected } => {
+                self.app.update_cheat_selection(|selection| {
+                    selection.set_selected(index, selected);
+                })
+            }
+            A::ToggleCheatEnabled { index, enabled } => {
+                self.app.update_cheat_selection(|selection| {
+                    selection.set_enabled(index, enabled);
+                })
+            }
+            A::SelectAllCheats => self
+                .app
+                .update_cheat_selection(archivefs_core::patch_manager::CheatSelection::select_all),
+            A::ClearAllCheats => self
+                .app
+                .update_cheat_selection(archivefs_core::patch_manager::CheatSelection::clear_all),
+            A::BuildInstallPreview => self.app.start_generated_cheat_preview(context.clone()),
+            A::RollbackInstall => self.app.start_cheat_install_rollback(context.clone()),
+            A::FetchDolphinProvider { force_refresh } => self
+                .app
+                .start_dolphin_provider_fetch(context.clone(), force_refresh),
+            A::ToggleDolphinCodeSelected { index, selected } => {
+                self.app.update_dolphin_code_selection(|selection| {
+                    selection.set_selected(index, selected);
+                })
+            }
+            A::SelectAllDolphinCodes => self.app.update_dolphin_code_selection(
+                archivefs_core::patch_manager::DolphinProviderCodeSelection::select_all,
+            ),
+            A::ClearAllDolphinCodes => self.app.update_dolphin_code_selection(
+                archivefs_core::patch_manager::DolphinProviderCodeSelection::clear_all,
+            ),
+            A::BuildDolphinInstallPreview => self.app.start_dolphin_install_preview(),
+            A::RescanXeniaProfiles => self.app.start_xenia_profile_scan(),
+            A::FetchXeniaProvider { force_refresh } => self
+                .app
+                .start_xenia_provider_fetch(context.clone(), force_refresh),
+            A::SelectXeniaCandidate(index) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_selected_candidate_index = Some(index);
+                    workflow.xenia_selection = None;
+                    workflow.xenia_destination_error = None;
+                    workflow.preview = crate::CheatStepResource::NotLoaded;
+                    workflow.preview_request = None;
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                }
+            }
+            A::ClearXeniaCandidateChoice => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_selected_candidate_index = None;
+                    workflow.xenia_selection = None;
+                    workflow.xenia_destination_error = None;
+                    workflow.preview = crate::CheatStepResource::NotLoaded;
+                    workflow.preview_request = None;
+                    workflow.transaction = crate::CheatTransactionState::Idle;
+                }
+            }
+            A::AcknowledgeXeniaPartialVerification(acknowledged) => {
+                if let Some(selection) = self
+                    .app
+                    .cheat_workflow
+                    .as_mut()
+                    .and_then(|workflow| workflow.xenia_selection.as_mut())
+                {
+                    selection.selection.partial_verification_acknowledged = acknowledged;
+                }
+            }
+            A::ToggleXeniaPatchSelected { index, selected } => {
+                self.app.update_xenia_patch_selection(|selection| {
+                    selection.set_selected(index, selected);
+                })
+            }
+            A::SelectAllXeniaPatches => self.app.update_xenia_patch_selection(
+                archivefs_core::patch_manager::XeniaPatchSelection::select_all,
+            ),
+            A::ClearAllXeniaPatches => self.app.update_xenia_patch_selection(
+                archivefs_core::patch_manager::XeniaPatchSelection::clear_all,
+            ),
+            A::BuildXeniaInstallPreview => self.app.start_xenia_install_preview(),
+            A::ChooseDolphinProfile(profile) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.dolphin_profile_choice = Some(profile);
+                }
+                self.app.confirm_dolphin_profile_choice();
+            }
+            A::ChooseXeniaProfile(profile) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_profile_choice = Some(profile);
+                }
+                self.app.confirm_xenia_profile_choice();
+            }
+            A::InstallSelectedDolphin => self.app.start_beginner_install_dolphin(),
+            A::InstallSelectedXenia => self.app.start_beginner_install_xenia(),
+            A::ToggleDolphinShowExactChanges(show) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.dolphin_show_exact_changes = show;
+                }
+            }
+            A::ToggleXeniaShowExactChanges(show) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_show_exact_changes = show;
+                }
+            }
+            A::ToggleDolphinDetailsOpen(open) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.dolphin_details_open = open;
+                }
+            }
+            A::ToggleXeniaDetailsOpen(open) => {
+                if let Some(workflow) = self.app.cheat_workflow.as_mut() {
+                    workflow.xenia_details_open = open;
+                }
+            }
+            A::FetchGameCubeGameHacking { force_refresh } => self
+                .app
+                .start_gamecube_gamehacking_fetch(context.clone(), force_refresh),
+            A::ConfirmGameCubeGameHackingMatch { game_id } => self
+                .app
+                .confirm_gamecube_gamehacking_match(context.clone(), game_id),
+            A::ToggleGameCubeGameHackingCheatSelected { index, selected } => self
+                .app
+                .update_gamecube_gamehacking_cheat_selection(index, selected),
+            A::InstallSelectedGameCubeGameHacking => {
+                self.app.start_gamecube_gamehacking_install_preview();
+            }
+            A::RemoveSelectedGameCubeGameHacking => {
+                self.app.start_gamecube_gamehacking_removal_preview();
+            }
+            A::OpenBrowserImport(platform) => self.app.open_browser_import(platform),
+            A::CloseBrowserImport => self.app.close_browser_import(),
+            A::OpenGameHackingPageInBrowser => self.app.open_gamehacking_page_in_browser(),
+            A::CopyGameHackingPageUrl => self.app.copy_gamehacking_page_url(),
+            A::ImportBrowserSavedFile => self.app.import_browser_saved_file(context.clone()),
+            A::ToggleBrowserImportPaste(open) => {
+                if let Some(state) = self
+                    .app
+                    .cheat_workflow
+                    .as_mut()
+                    .and_then(|workflow| workflow.browser_import.as_mut())
+                {
+                    state.paste_open = open;
+                }
+            }
+            A::ImportBrowserPastedText => self.app.import_browser_pasted_text(context.clone()),
+            A::ImportBrowserClipboard => self.app.import_browser_clipboard(context.clone()),
+            A::ChooseBrowserImportKind(kind) => {
+                if let Some(state) = self
+                    .app
+                    .cheat_workflow
+                    .as_mut()
+                    .and_then(|workflow| workflow.browser_import.as_mut())
+                {
+                    state.kind = kind;
+                }
+            }
+            A::FetchBsFreeGameCube { search_title } => self
+                .app
+                .start_bsfree_gamecube_search(context.clone(), search_title),
+            A::ConfirmBsFreeGameCubeMatch { upstream_uid } => self
+                .app
+                .start_bsfree_gamecube_confirm(context.clone(), upstream_uid),
+            A::ToggleBsFreeGameCubeCheatSelected { index, selected } => self
+                .app
+                .update_bsfree_gamecube_cheat_selection(index, selected),
+            A::SelectAllBsFreeGameCubeCheats => {
+                self.app.update_bsfree_gamecube_cheat_selection_all(true)
+            }
+            A::ClearAllBsFreeGameCubeCheats => {
+                self.app.update_bsfree_gamecube_cheat_selection_all(false)
+            }
+            A::InstallSelectedBsFreeGameCube => {
+                self.app.start_bsfree_gamecube_install_preview();
+            }
+            A::FetchBsFreeWii { search_title } => self
+                .app
+                .start_bsfree_wii_search(context.clone(), search_title),
+            A::ConfirmBsFreeWiiMatch { upstream_uid } => self
+                .app
+                .start_bsfree_wii_confirm(context.clone(), upstream_uid),
+            A::ToggleBsFreeWiiCheatSelected { index, selected } => {
+                self.app.update_bsfree_wii_cheat_selection(index, selected)
+            }
+            A::SelectAllBsFreeWiiCheats => {
+                self.app.update_bsfree_wii_cheat_selection_all(true);
+            }
+            A::ClearAllBsFreeWiiCheats => {
+                self.app.update_bsfree_wii_cheat_selection_all(false);
+            }
+            A::InstallSelectedBsFreeWii => self.app.start_bsfree_wii_install_preview(),
+        }
+        None
+    }
+
+    fn observe_cheat_activity(&mut self, activity: &mut Activity) {
+        let state = cheat_activity_state(self.app.cheat_workflow.as_ref());
+        let error = self
+            .app
+            .cheat_workflow
+            .as_ref()
+            .and_then(|workflow| workflow.transaction_notice.clone())
+            .filter(|notice| notice.to_ascii_lowercase().contains("failed"));
+        observe_cheat_activity_state(activity, &mut self.cheat_job, state, error);
+    }
+
     fn select(&mut self, path: &Path) {
         if self.selected.as_deref() != Some(path) {
             self.selected = Some(path.to_path_buf());
@@ -662,4 +1157,68 @@ pub(super) fn observe_dat_activity_state(
             error,
         );
     }
+}
+
+pub(super) fn observe_cheat_activity_state(
+    activity: &mut Activity,
+    job: &mut Option<u64>,
+    state: Option<(&'static str, &'static str)>,
+    error: Option<String>,
+) {
+    if let Some((title, detail)) = state {
+        if job.is_none() {
+            let id = activity.queue(title, Route::Section(super::routes::Section::Mods), false);
+            activity.start(id);
+            *job = Some(id);
+        }
+        if let Some(active) = job.and_then(|id| activity.jobs.get_mut(&id)) {
+            active.item = Some(detail.to_string());
+        }
+    } else if let Some(id) = job.take() {
+        activity.finish(
+            id,
+            if error.is_some() {
+                "The cheat operation stopped safely; nothing unapproved was applied.".into()
+            } else {
+                "Cheat information is ready to review.".into()
+            },
+            error,
+        );
+    }
+}
+
+fn cheat_activity_state(
+    workflow: Option<&crate::CheatWorkflowState>,
+) -> Option<(&'static str, &'static str)> {
+    let workflow = workflow?;
+    use crate::{CheatStepResource as R, CheatTransactionState as T};
+    if matches!(workflow.transaction, T::Applying { .. }) {
+        return Some(("Applying cheats", "Updating the selected emulator profile."));
+    }
+    if matches!(workflow.preview, R::Loading { .. }) {
+        return Some((
+            "Checking cheat compatibility",
+            "Building the safe apply preview.",
+        ));
+    }
+    if matches!(workflow.identity, R::Loading { .. })
+        || matches!(workflow.source_list, R::Loading { .. })
+        || matches!(workflow.source_fetch, R::Loading { .. })
+        || matches!(workflow.candidates, R::Loading { .. })
+        || matches!(workflow.existing_library, R::Loading { .. })
+        || matches!(workflow.pcsx2_inventory, R::Loading { .. })
+        || matches!(workflow.dolphin_inventory, R::Loading { .. })
+        || matches!(workflow.pcsx2_gamehacking, R::Loading { .. })
+        || matches!(workflow.gamecube_gamehacking, R::Loading { .. })
+        || matches!(workflow.dolphin_provider, R::Loading { .. })
+        || matches!(workflow.xenia_provider, R::Loading { .. })
+        || matches!(workflow.bsfree_gamecube, R::Loading { .. })
+        || matches!(workflow.bsfree_wii, R::Loading { .. })
+    {
+        return Some((
+            "Reading cheats",
+            "Checking identity, sources and compatibility.",
+        ));
+    }
+    None
 }

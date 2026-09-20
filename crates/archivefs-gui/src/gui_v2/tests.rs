@@ -183,10 +183,7 @@ fn gui_v2_playing_library_preview_runs_on_the_background_worker() {
         event,
         super::backend::Event::Finished {
             id: 41,
-            outcome: Ok(super::backend::Payload::PlayingLibraryPreview {
-                generation: 9,
-                ..
-            }),
+            outcome: Ok(super::backend::Payload::PlayingLibraryPreview { generation: 9, .. }),
         }
     ));
 }
@@ -219,10 +216,7 @@ fn gui_v2_playing_library_apply_runs_on_the_background_worker() {
             .unwrap(),
         super::backend::Event::Finished {
             id: 42,
-            outcome: Ok(super::backend::Payload::PlayingLibraryApply {
-                generation: 10,
-                ..
-            }),
+            outcome: Ok(super::backend::Payload::PlayingLibraryApply { generation: 10, .. }),
         }
     ));
 }
@@ -233,9 +227,11 @@ fn gui_v2_stale_playing_library_preview_is_discarded() {
     let mut app = fixture(&context);
     app.playing_library.source_root_draft = "/new-source".into();
     app.playing_library_generation = 1;
-    let activity_id = app
-        .activity
-        .queue("Planning your playing library", Route::Section(Section::Build), false);
+    let activity_id = app.activity.queue(
+        "Planning your playing library",
+        Route::Section(Section::Build),
+        false,
+    );
     app.playing_library_job = Some(super::PlayingLibraryJob {
         id: activity_id,
         kind: super::PlayingLibraryJobKind::Preview,
@@ -260,9 +256,11 @@ fn gui_v2_changed_then_restored_playing_library_input_stays_stale() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     let original = app.playing_library.source_root_draft.clone();
-    let activity_id = app
-        .activity
-        .queue("Planning your playing library", Route::Section(Section::Build), false);
+    let activity_id = app.activity.queue(
+        "Planning your playing library",
+        Route::Section(Section::Build),
+        false,
+    );
     app.playing_library_job = Some(super::PlayingLibraryJob {
         id: activity_id,
         kind: super::PlayingLibraryJobKind::Preview,
@@ -332,6 +330,83 @@ fn gui_v2_mods_page_is_native_and_keeps_cheats_separate() {
     assert!(strings.iter().any(|value| value == "Conflicts"));
     assert!(strings.iter().any(|value| value == "Cheats"));
     assert!(!strings.iter().any(|value| value.contains("legacy handoff")));
+}
+
+#[test]
+fn gui_v2_cheats_tab_is_native_and_has_a_safe_empty_state() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.mods.select_cheats();
+    app.router.current = Route::Section(Section::Mods);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+
+    assert!(strings.iter().any(|value| value == "Choose a game first"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("No cheat is changed"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("existing safe cheat workflow"))
+    );
+    assert!(!strings.iter().any(|value| value.contains("legacy handoff")));
+}
+
+#[test]
+fn gui_v2_cheat_activity_lifecycle_reports_failure_safely() {
+    let mut activity = Activity::default();
+    let mut job = None;
+    native_workflows::observe_cheat_activity_state(
+        &mut activity,
+        &mut job,
+        Some(("Applying cheats", "Updating the selected emulator profile.")),
+        None,
+    );
+    assert_eq!(activity.running(), 1);
+    assert_eq!(
+        activity.jobs.values().next().unwrap().title,
+        "Applying cheats"
+    );
+
+    native_workflows::observe_cheat_activity_state(
+        &mut activity,
+        &mut job,
+        None,
+        Some("fixture apply failed".into()),
+    );
+    let completed = activity.jobs.values().next().unwrap();
+    assert_eq!(completed.phase, Phase::Failed);
+    assert!(completed.summary.contains("stopped safely"));
+}
+
+#[test]
+fn gui_v2_history_projects_cheat_apply_and_truthful_undo_state() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let mut workflows = native_workflows::NativeWorkflows::new(context.clone());
+    workflows
+        .app
+        .history
+        .record(crate::activity_history::HistoryEntry::new(
+            crate::activity_history::ActivityAction::CheatInstall,
+            Some("/games/example.iso".into()),
+            crate::activity_history::ActivityOutcome::Completed,
+            "Installed one reviewed cheat with a recoverable shared transaction.",
+        ));
+    app.native_workflows = Some(workflows);
+    app.router.current = Route::Section(Section::History);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value == "Cheat activity"));
+    assert!(strings.iter().any(|value| value == "Cheats & Mods install"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Undo is unavailable"))
+    );
 }
 
 #[test]
@@ -558,10 +633,22 @@ fn gui_v2_play_route_is_native_and_starts_readiness_without_legacy_handoff() {
     };
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
-    assert!(strings.iter().any(|text| text.contains("Shadow of the Colossus")));
+    assert!(
+        strings
+            .iter()
+            .any(|text| text.contains("Shadow of the Colossus"))
+    );
     assert!(strings.iter().any(|text| text.contains("Platform: PS2")));
-    assert!(strings.iter().any(|text| text.contains("Play / Launch readiness")));
-    assert!(!strings.iter().any(|text| text.contains("existing interface")));
+    assert!(
+        strings
+            .iter()
+            .any(|text| text.contains("Play / Launch readiness"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|text| text.contains("existing interface"))
+    );
     assert!(app.native_workflows.is_some());
     assert!(app.activity.running() > 0);
 }
@@ -574,8 +661,16 @@ fn gui_v2_emulator_setup_route_is_native_and_not_a_legacy_handoff() {
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
     assert!(strings.iter().any(|text| text == "Emulators"));
-    assert!(strings.iter().any(|text| text.contains("Check which emulators")));
-    assert!(!strings.iter().any(|text| text.contains("existing interface")));
+    assert!(
+        strings
+            .iter()
+            .any(|text| text.contains("Check which emulators"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|text| text.contains("existing interface"))
+    );
     assert!(app.native_workflows.is_some());
 }
 
@@ -591,7 +686,9 @@ fn gui_v2_native_launch_state_survives_navigation_away_and_back() {
     };
     let _ = frame(&context, &mut app, [1280.0, 820.0]);
     assert_eq!(
-        app.native_workflows.as_ref().and_then(|bridge| bridge.selected_path()),
+        app.native_workflows
+            .as_ref()
+            .and_then(|bridge| bridge.selected_path()),
         Some(Path::new("/fixture/Disc set.iso"))
     );
 
@@ -604,10 +701,16 @@ fn gui_v2_native_launch_state_survives_navigation_away_and_back() {
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
 
     assert_eq!(
-        app.native_workflows.as_ref().and_then(|bridge| bridge.selected_path()),
+        app.native_workflows
+            .as_ref()
+            .and_then(|bridge| bridge.selected_path()),
         Some(Path::new("/fixture/Disc set.iso"))
     );
-    assert!(strings.iter().any(|text| text.contains("Play / Launch readiness")));
+    assert!(
+        strings
+            .iter()
+            .any(|text| text.contains("Play / Launch readiness"))
+    );
 }
 
 #[test]
@@ -1427,8 +1530,7 @@ fn gui_v2_accidental_exploration_never_runs_scan_or_legacy() {
         frame(&context, &mut app, [1024.0, 600.0]);
     }
     assert!(app.activity.jobs.values().all(|job| {
-        job.title == "Refreshing artwork providers"
-            || job.title == "Checking emulator readiness"
+        job.title == "Refreshing artwork providers" || job.title == "Checking emulator readiness"
     }));
     assert!(app.load_job.is_none());
     assert!(!app.confirm_scan);
@@ -1597,7 +1699,11 @@ fn gui_v2_sources_route_hosts_the_native_source_manager() {
             .iter()
             .any(|value| value == "Verification Data / DATs")
     );
-    assert!(!strings.iter().any(|value| value.contains("separate window")));
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("separate window"))
+    );
 }
 
 #[test]
@@ -1614,7 +1720,11 @@ fn gui_v2_advanced_routes_to_native_dat_management() {
             .iter()
             .any(|value| value.contains("trusted DAT catalogues"))
     );
-    assert!(!strings.iter().any(|value| value.contains("separate window")));
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("separate window"))
+    );
     assert_eq!(
         app.native_workflows.as_ref().unwrap().app.view,
         crate::navigation::MainView::DatSources
@@ -1655,11 +1765,12 @@ fn gui_v2_source_worker_lifecycle_is_reflected_in_activity() {
     let context = egui::Context::default();
     let mut workflows = native_workflows::NativeWorkflows::new(context.clone());
     let (sender, receiver) = std::sync::mpsc::channel();
-    workflows.app.sources_ui.source_action = Some(crate::platform_source_actions::RunningSourceAction {
-        action: crate::platform_source_actions::SourceAction::ScanAll,
-        receiver,
-        worker: None,
-    });
+    workflows.app.sources_ui.source_action =
+        Some(crate::platform_source_actions::RunningSourceAction {
+            action: crate::platform_source_actions::SourceAction::ScanAll,
+            receiver,
+            worker: None,
+        });
     let mut activity = Activity::default();
 
     workflows.observe_source_activity(&mut activity);
@@ -1683,14 +1794,27 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
     let library_text = text(&library_output);
     assert!(library_text.iter().any(|value| value == "Library artwork"));
     assert!(library_text.iter().any(|value| value == "Rez"));
-    assert!(!library_text.iter().any(|value| value.contains("existing interface")));
+    assert!(
+        !library_text
+            .iter()
+            .any(|value| value.contains("existing interface"))
+    );
 
-    app.router.current = Route::Task { section: Section::Artwork, game: 9 };
+    app.router.current = Route::Task {
+        section: Section::Artwork,
+        game: 9,
+    };
     let selected_output = frame(&context, &mut app, [1280.0, 820.0]);
     let selected_text = text(&selected_output);
     assert!(selected_text.iter().any(|value| value == "Metadata"));
-    assert!(selected_text.iter().any(|value| value == "No screenshot found. Advanced Details explains which providers were checked."));
-    assert!(!selected_text.iter().any(|value| value.contains("Original path:")), "advanced details start closed");
+    assert!(selected_text.iter().any(|value| value
+        == "No screenshot found. Advanced Details explains which providers were checked."));
+    assert!(
+        !selected_text
+            .iter()
+            .any(|value| value.contains("Original path:")),
+        "advanced details start closed"
+    );
 }
 
 #[test]
@@ -1703,11 +1827,23 @@ fn gui_v2_artwork_metadata_reports_provider_unavailability_without_guessing() {
     let mut index = MediaIndex::default();
     index.warnings.push("fixture provider unavailable".into());
     app.artwork.index = Some(Arc::new(index));
-    app.router.current = Route::Task { section: Section::Artwork, game: 11 };
+    app.router.current = Route::Task {
+        section: Section::Artwork,
+        game: 11,
+    };
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
-    assert!(strings.iter().any(|value| value.contains("provider is unavailable")));
-    assert!(!strings.iter().any(|value| value.contains("fixture provider unavailable")), "technical provider detail starts hidden");
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("provider is unavailable"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("fixture provider unavailable")),
+        "technical provider detail starts hidden"
+    );
 }
 
 #[test]
@@ -1715,34 +1851,45 @@ fn gui_v2_artwork_metadata_displays_local_romm_and_screenscraper_provenance() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     let mut library = Library::new(vec![archive(3, "Provider Game", Some("PS2"))]);
-    library.games[0].screenscraper = Some(archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
-        archive_id: 3,
-        values: archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata {
-            synopsis: Some("Saved provider synopsis".into()),
-            ..Default::default()
+    library.games[0].screenscraper = Some(
+        archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+            archive_id: 3,
+            values: archivefs_core::screenscraper_enrichment::AcceptedScreenScraperMetadata {
+                synopsis: Some("Saved provider synopsis".into()),
+                ..Default::default()
+            },
+            receipt: archivefs_core::screenscraper_enrichment::ScreenScraperEnrichmentReceipt {
+                provider: "ScreenScraper".into(),
+                provider_record_id: "ss-42".into(),
+                retrieved_at_unix_seconds: 1,
+                match_basis: "verified hash".into(),
+                before: Default::default(),
+                accepted: Default::default(),
+                media_reference_count: 0,
+            },
         },
-        receipt: archivefs_core::screenscraper_enrichment::ScreenScraperEnrichmentReceipt {
-            provider: "ScreenScraper".into(),
-            provider_record_id: "ss-42".into(),
-            retrieved_at_unix_seconds: 1,
-            match_basis: "verified hash".into(),
-            before: Default::default(),
-            accepted: Default::default(),
-            media_reference_count: 0,
-        },
-    });
+    );
     app.library = Arc::new(library);
     let mut index = MediaIndex::default();
-    index.covers.insert(3, Source::Local("/cache/cover.png".into()));
+    index
+        .covers
+        .insert(3, Source::Local("/cache/cover.png".into()));
     index.descriptions.insert(3, "RomM description".into());
     app.artwork.index = Some(Arc::new(index));
-    app.router.current = Route::Task { section: Section::Artwork, game: 3 };
+    app.router.current = Route::Task {
+        section: Section::Artwork,
+        game: 3,
+    };
 
     let output = frame(&context, &mut app, [1280.0, 820.0]);
     let strings = text(&output);
     assert!(strings.iter().any(|value| value == "RomM description"));
     assert!(strings.iter().any(|value| value.contains("Local file")));
-    assert!(strings.iter().any(|value| value.contains("ScreenScraper · record ss-42")));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("ScreenScraper · record ss-42"))
+    );
 }
 
 #[test]

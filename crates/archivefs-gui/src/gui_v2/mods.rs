@@ -9,11 +9,15 @@ use std::path::Path;
 use archivefs_core::mod_history::{ModHistory, ModReceiptSummary};
 use eframe::egui;
 
+use super::{
+    activity::Activity,
+    native_workflows::NativeWorkflows,
+    routes::{Route, Section},
+};
 use crate::local_mod_package_page::{
     LocalModPackagePageState, show_local_mod_package_panel_with_catalogue,
 };
 use crate::ui::components as widgets;
-use super::{activity::Activity, routes::{Route, Section}};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
@@ -56,18 +60,25 @@ impl ModsPageState {
         }
         self.history_loaded = true;
     }
+
+    #[cfg(test)]
+    pub(super) fn select_cheats(&mut self) {
+        self.tab = Tab::Cheats;
+    }
 }
 
 pub(super) fn show_mods_page(
     ui: &mut egui::Ui,
     state: &mut ModsPageState,
     selected_game: Option<&crate::gui_v2::library::Game>,
+    workflows: &mut NativeWorkflows,
     activity: &mut Activity,
-) {
+) -> Option<Route> {
     if !state.history_loaded {
         state.refresh_history();
     }
 
+    let mut destination = None;
     egui::ScrollArea::vertical()
         .id_salt("v2_mods_native")
         .show(ui, |ui| {
@@ -95,7 +106,9 @@ pub(super) fn show_mods_page(
                 Tab::Add => add_package(ui, &mut state.local, selected_game),
                 Tab::Stack => stack(ui, state.history.as_ref(), selected_game),
                 Tab::Conflicts => conflicts(ui, state.history.as_ref(), selected_game),
-                Tab::Cheats => cheats(ui),
+                Tab::Cheats => {
+                    destination = workflows.show_cheats(ui, selected_game, activity);
+                }
             }
 
             if let Some(error) = &state.history_error {
@@ -108,13 +121,22 @@ pub(super) fn show_mods_page(
 
     let busy = state.local.is_busy();
     if busy && state.activity_id.is_none() {
-        let id = activity.queue("Inspecting or applying a mod", Route::Section(Section::Mods), true);
+        let id = activity.queue(
+            "Inspecting or applying a mod",
+            Route::Section(Section::Mods),
+            true,
+        );
         activity.start(id);
         state.activity_id = Some(id);
     } else if !busy && let Some(id) = state.activity_id.take() {
-        activity.finish(id, "Mod workflow finished. Review the result and shared receipt above.".into(), None);
+        activity.finish(
+            id,
+            "Mod workflow finished. Review the result and shared receipt above.".into(),
+            None,
+        );
         state.refresh_history();
     }
+    destination
 }
 
 fn selected_identity(game: Option<&crate::gui_v2::library::Game>) -> Option<String> {
@@ -178,7 +200,10 @@ fn receipt_card(ui: &mut egui::Ui, receipt: &ModReceiptSummary) {
             ui.label(format!("Source: {source}"));
         }
         if !receipt.conflicts.is_empty() || !receipt.conflict_kinds.is_empty() {
-            ui.colored_label(egui::Color32::YELLOW, "Potential mod conflict — review related transactions.");
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Potential mod conflict — review related transactions.",
+            );
         }
         ui.collapsing("Details", |ui| {
             ui.label(format!("Transaction: {}", receipt.transaction_id));
@@ -191,7 +216,9 @@ fn receipt_card(ui: &mut egui::Ui, receipt: &ModReceiptSummary) {
             ui.label(format!("Rollback: {}", receipt.rollback.label()));
             if let Some(reason) = match &receipt.rollback {
                 archivefs_core::mod_history::ModRollbackStatus::CannotSafelyUndo { reason }
-                | archivefs_core::mod_history::ModRollbackStatus::NeedsReview { reason } => Some(reason),
+                | archivefs_core::mod_history::ModRollbackStatus::NeedsReview { reason } => {
+                    Some(reason)
+                }
                 _ => None,
             } {
                 ui.label(reason);
@@ -249,7 +276,12 @@ fn stack(
         ui.label("No active mod layers are recorded for this game.");
     }
     for (index, receipt) in receipts.into_iter().enumerate() {
-        ui.label(format!("{}. {} — {}", index + 1, receipt.kind.label(), receipt.rollback.label()));
+        ui.label(format!(
+            "{}. {} — {}",
+            index + 1,
+            receipt.kind.label(),
+            receipt.rollback.label()
+        ));
     }
 }
 
@@ -280,14 +312,6 @@ fn conflicts(
     }
 }
 
-fn cheats(ui: &mut egui::Ui) {
-    widgets::card(ui, |ui| {
-        ui.heading("Cheats");
-        ui.label("Cheats stay separate from mods. Use the existing safe cheat workflow for the selected game.");
-        ui.label("No cheat is changed by browsing this page.");
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,9 +322,11 @@ mod tests {
         let context = egui::Context::default();
         let mut state = ModsPageState::default();
         let mut activity = Activity::default();
+        let mut workflows = NativeWorkflows::new(context.clone());
         let _ = context.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default()
-                .show(ctx, |ui| show_mods_page(ui, &mut state, None, &mut activity));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = show_mods_page(ui, &mut state, None, &mut workflows, &mut activity);
+            });
         });
         assert_eq!(state.tab, Tab::Installed);
     }
