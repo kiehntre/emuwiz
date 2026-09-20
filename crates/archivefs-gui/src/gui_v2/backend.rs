@@ -49,6 +49,18 @@ pub(super) enum Command {
     ScanDuplicates {
         games: Vec<Game>,
     },
+    PrepareDuplicateRepair {
+        group: Box<archivefs_core::repair::ExactDuplicateGroup>,
+    },
+    ApplyDuplicateRepair {
+        preview: Box<DuplicateRepairPreview>,
+        cancel: Arc<AtomicBool>,
+    },
+    UndoDuplicateRepair {
+        record: Box<DuplicateRepairRecord>,
+        cancel: Arc<AtomicBool>,
+    },
+    LoadRepairHistory,
     OpenFolder(PathBuf),
     Legacy {
         section: Section,
@@ -70,8 +82,27 @@ pub(super) enum Payload {
     },
     Verification(VerificationResult),
     Duplicates(DuplicateReport),
+    DuplicatePreview(Box<DuplicateRepairPreview>),
+    DuplicateApplied(Box<DuplicateRepairRecord>),
+    DuplicateUndone(Box<DuplicateRepairRecord>),
+    RepairHistory(Vec<DuplicateRepairRecord>),
     Preferences(Preferences),
     Done,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DuplicateRepairPreview {
+    pub group: archivefs_core::repair::ExactDuplicateGroup,
+    pub proposals: Vec<archivefs_core::repair::RepairProposal>,
+    pub trusted_root: PathBuf,
+    pub journal_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DuplicateRepairRecord {
+    pub transaction: archivefs_core::dat::rename_apply::model::RenameTransaction,
+    pub trusted_root: PathBuf,
+    pub journal_dir: PathBuf,
 }
 
 pub(super) enum Event {
@@ -217,10 +248,13 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 &std::collections::BTreeSet::new(),
                 None,
             );
+            let exact_groups = report.groups.clone();
             let groups = report
                 .groups
                 .into_iter()
+                .enumerate()
                 .filter_map(|group| {
+                    let (exact_index, group) = group;
                     let members = group
                         .members
                         .into_iter()
@@ -238,6 +272,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                         })
                         .collect::<Vec<_>>();
                     (members.len() > 1).then_some(DuplicateGroup {
+                        exact_index,
                         kind: "Exact duplicates".into(),
                         sha256: group.sha256,
                         size_bytes: group.size_bytes,
@@ -248,7 +283,136 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             Ok(Payload::Duplicates(DuplicateReport {
                 groups,
                 files_examined: report.files_examined,
+                exact_groups,
             }))
+        }
+        Command::PrepareDuplicateRepair { group } => {
+            let config =
+                archivefs_core::Config::load_default().map_err(|error| error.to_string())?;
+            let trusted =
+                archivefs_core::safe_read::TrustedRoots::from_paths(config.source_folders.clone());
+            let retained = group
+                .recommendation
+                .retained_path()
+                .ok_or_else(|| "This duplicate group has no safe retained copy.".to_string())?;
+            let trusted_root = trusted_root_for(retained, &config.source_folders)?;
+            let mut cache = archivefs_core::repair::DuplicateHashCache::new();
+            let proposals = archivefs_core::repair::build_exact_duplicate_group_proposals(
+                &group,
+                &trusted_root,
+                &mut cache,
+                &trusted,
+                None,
+            )?;
+            let journal_dir =
+                archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+                    .map_err(|error| error.to_string())?;
+            Ok(Payload::DuplicatePreview(Box::new(
+                DuplicateRepairPreview {
+                    group: *group,
+                    proposals,
+                    trusted_root,
+                    journal_dir,
+                },
+            )))
+        }
+        Command::ApplyDuplicateRepair { preview, cancel } => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("The repair was cancelled before it changed anything.".into());
+            }
+            let trusted = archivefs_core::safe_read::TrustedRoots::from_paths(
+                archivefs_core::Config::load_default()
+                    .map_err(|error| error.to_string())?
+                    .source_folders,
+            );
+            let retained = preview
+                .group
+                .recommendation
+                .retained_path()
+                .ok_or_else(|| {
+                    "The approved duplicate group no longer has a retained copy.".to_string()
+                })?;
+            std::fs::create_dir_all(&preview.journal_dir)
+                .map_err(|error| format!("Could not prepare repair history: {error}"))?;
+            let mut cache = archivefs_core::repair::DuplicateHashCache::new();
+            let mut transaction = archivefs_core::repair::build_quarantine_transaction(
+                &preview.proposals,
+                retained,
+                &preview.trusted_root,
+                0,
+                &mut cache,
+                &trusted,
+                Some(&cancel),
+            )
+            .map_err(|error| format!("The preview is no longer safe: {error}"))?;
+            let _ = answers.send(Event::Progress {
+                id,
+                done: 0,
+                total: transaction.entries.len() as u64,
+                item: "Validating the approved files".into(),
+            });
+            let outcome = archivefs_core::repair::apply_quarantine_transaction(
+                &mut transaction,
+                retained,
+                &preview.trusted_root,
+                0,
+                trusted,
+                &preview.journal_dir,
+                &cancel,
+                &mut cache,
+            )
+            .map_err(|error| error.to_string())?;
+            let _ = answers.send(Event::Progress {
+                id,
+                done: outcome.transaction.applied_count() as u64,
+                total: outcome.transaction.entries.len() as u64,
+                item: "Writing the repair receipt".into(),
+            });
+            Ok(Payload::DuplicateApplied(Box::new(DuplicateRepairRecord {
+                transaction: outcome.transaction,
+                trusted_root: preview.trusted_root,
+                journal_dir: preview.journal_dir,
+            })))
+        }
+        Command::UndoDuplicateRepair { record, cancel } => {
+            let mut transaction = record.transaction.clone();
+            archivefs_core::repair::rollback_quarantine_transaction(
+                &mut transaction,
+                &record.journal_dir,
+                &cancel,
+                &record.trusted_root,
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(Payload::DuplicateUndone(Box::new(DuplicateRepairRecord {
+                transaction,
+                trusted_root: record.trusted_root,
+                journal_dir: record.journal_dir,
+            })))
+        }
+        Command::LoadRepairHistory => {
+            let journal_dir =
+                archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
+                    .map_err(|error| error.to_string())?;
+            let (transactions, _problems) =
+                archivefs_core::dat::rename_apply::journal::list_journals(&journal_dir);
+            Ok(Payload::RepairHistory(
+                transactions
+                    .into_iter()
+                    .filter(|transaction| {
+                        transaction.entries.iter().any(|entry| {
+                            entry.destination_path.components().any(|component| {
+                                component.as_os_str()
+                                    == archivefs_core::repair::QUARANTINE_DIRECTORY_NAME
+                            })
+                        })
+                    })
+                    .map(|transaction| DuplicateRepairRecord {
+                        trusted_root: PathBuf::from(&transaction.source_scan_root),
+                        transaction,
+                        journal_dir: journal_dir.clone(),
+                    })
+                    .collect(),
+            ))
         }
         Command::OpenFolder(path) => {
             let folder = path.parent().ok_or("This game has no containing folder.")?;
@@ -285,6 +449,15 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             Ok(Payload::Preferences(preferences))
         }
     }
+}
+
+fn trusted_root_for(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+    roots
+        .iter()
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.components().count())
+        .cloned()
+        .ok_or_else(|| "The duplicate is outside every configured trusted game folder.".into())
 }
 
 pub(super) fn load_library(path: &Path) -> Result<Library, String> {

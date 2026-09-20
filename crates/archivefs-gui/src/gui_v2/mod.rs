@@ -14,7 +14,10 @@ mod thumbnail;
 
 use activity::Activity;
 use artwork::Artwork;
-use backend::{Backend, Command, Event, Payload, Preferences, VerificationResult};
+use backend::{
+    Backend, Command, DuplicateRepairPreview, DuplicateRepairRecord, Event, Payload, Preferences,
+    VerificationResult,
+};
 use eframe::egui;
 use library::{Detail, DuplicateReport, Filter, Library, SharedLibrary};
 use routes::{Route, Router, Section};
@@ -153,6 +156,13 @@ pub(super) struct App {
     duplicate_job: Option<u64>,
     duplicate_ignored: std::collections::HashSet<String>,
     problem_selected: Option<String>,
+    repair_preview: Option<DuplicateRepairPreview>,
+    repair_confirm: bool,
+    repair_job: Option<u64>,
+    repair_history: Vec<DuplicateRepairRecord>,
+    undo_confirm: Option<usize>,
+    undo_job: Option<u64>,
+    repair_result: Option<String>,
     mrwiz_dismissed: bool,
 }
 
@@ -191,9 +201,17 @@ impl App {
             duplicate_job: None,
             duplicate_ignored: std::collections::HashSet::new(),
             problem_selected: None,
+            repair_preview: None,
+            repair_confirm: false,
+            repair_job: None,
+            repair_history: Vec::new(),
+            undo_confirm: None,
+            undo_job: None,
+            repair_result: None,
             mrwiz_dismissed: false,
         };
         app.send(0, Command::Restore);
+        app.send(0, Command::LoadRepairHistory);
         app.load(false);
         app
     }
@@ -303,6 +321,77 @@ impl App {
             },
         );
     }
+    fn start_duplicate_preview(&mut self, index: usize) {
+        let Some(report) = self.duplicate_report.as_ref() else {
+            return;
+        };
+        let Some(group) = report.exact_groups.get(index).cloned() else {
+            return;
+        };
+        let id = self.activity.queue(
+            "Preparing the duplicate quarantine preview",
+            Route::Section(Section::Problems),
+            false,
+        );
+        self.repair_preview = None;
+        self.repair_result = None;
+        self.send(
+            id,
+            Command::PrepareDuplicateRepair {
+                group: Box::new(group),
+            },
+        );
+    }
+    fn apply_duplicate_preview(&mut self) {
+        if self.repair_job.is_some() {
+            return;
+        }
+        let Some(preview) = self.repair_preview.clone() else {
+            return;
+        };
+        let id = self.activity.queue(
+            "Applying the approved duplicate quarantine",
+            Route::Section(Section::History),
+            true,
+        );
+        let cancel = self
+            .activity
+            .jobs
+            .get(&id)
+            .and_then(|job| job.cancel.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.repair_job = Some(id);
+        self.repair_confirm = false;
+        self.send(
+            id,
+            Command::ApplyDuplicateRepair {
+                preview: Box::new(preview),
+                cancel,
+            },
+        );
+    }
+    fn undo_history_entry(&mut self, index: usize) {
+        if self.undo_job.is_some() {
+            return;
+        }
+        let Some(record) = self.repair_history.get(index).cloned() else {
+            return;
+        };
+        let id = self.activity.queue(
+            "Undoing the duplicate quarantine",
+            Route::Section(Section::History),
+            false,
+        );
+        self.undo_job = Some(id);
+        self.undo_confirm = None;
+        self.send(
+            id,
+            Command::UndoDuplicateRepair {
+                record: Box::new(record),
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        );
+    }
     fn legacy(&mut self, section: Section) {
         let path = self
             .router
@@ -400,6 +489,33 @@ impl App {
                                     self.duplicate_job = None;
                                     self.duplicate_report = Some(report);
                                 }
+                                Payload::DuplicatePreview(preview) => {
+                                    self.repair_preview = Some(*preview);
+                                    self.repair_result = None;
+                                }
+                                Payload::DuplicateApplied(record) => {
+                                    self.repair_job = None;
+                                    self.repair_history.push(*record);
+                                    self.repair_preview = None;
+                                    self.repair_result = Some("The duplicate copy was moved to EmuWiz quarantine. Your original content was not deleted, and this change can be undone from History.".into());
+                                }
+                                Payload::DuplicateUndone(record) => {
+                                    self.undo_job = None;
+                                    let record = *record;
+                                    if let Some(existing) =
+                                        self.repair_history.iter_mut().find(|item| {
+                                            item.transaction.transaction_id
+                                                == record.transaction.transaction_id
+                                        })
+                                    {
+                                        *existing = record;
+                                    }
+                                    self.repair_result =
+                                        Some("The quarantined file was restored safely.".into());
+                                }
+                                Payload::RepairHistory(history) => {
+                                    self.repair_history = history;
+                                }
                                 Payload::Preferences(preferences) => {
                                     if !self.interacted {
                                         self.router.current = preferences.route;
@@ -411,6 +527,12 @@ impl App {
                             }
                         }
                         Err(error) => {
+                            if self.repair_job == Some(id) {
+                                self.repair_job = None;
+                            }
+                            if self.undo_job == Some(id) {
+                                self.undo_job = None;
+                            }
                             self.detail_failed = self.detail_pending.take();
                             self.filter_inflight = false;
                             let title = self

@@ -78,9 +78,9 @@ impl ProblemSummary {
             }
         }
         if let Some(report) = duplicates {
-            for (index, group) in report.groups.iter().enumerate() {
+            for group in &report.groups {
                 problems.push(Problem {
-                    id: format!("duplicate-{index}-{}", group.sha256),
+                    id: format!("duplicate-{}-{}", group.exact_index, group.sha256),
                     title: format!("{} identical copies were found", group.members.len()),
                     category: Category::Duplicates,
                     severity: Severity::Warning,
@@ -209,7 +209,9 @@ mod tests {
         let library = Library::new(Vec::new());
         let report = DuplicateReport {
             files_examined: 2,
+            exact_groups: Vec::new(),
             groups: vec![super::super::library::DuplicateGroup {
+                exact_index: 0,
                 kind: "Exact duplicates".into(),
                 sha256: "abc".into(),
                 size_bytes: 4,

@@ -10,6 +10,7 @@ use super::{
     routes::{HOME_TASKS, Route, SECTIONS, Section},
 };
 use crate::ui::components::mrwiz_tip;
+use archivefs_core::dat::rename_apply::model::TransactionState;
 use eframe::egui::{self, Color32, RichText};
 
 fn primary(ui: &mut egui::Ui, text: &str) -> bool {
@@ -159,6 +160,7 @@ impl App {
                 Route::Section(Section::Platforms) => self.platforms(ui),
                 Route::Game(id) => self.game_detail(ui, id),
                 Route::Section(Section::Activity) => self.activities(ui),
+                Route::Section(Section::History) => self.history(ui),
                 Route::Section(Section::Settings) => self.settings(ui),
                 Route::Task { section, .. } | Route::Section(section) => self.handoff(ui, section),
             }
@@ -724,6 +726,16 @@ impl App {
         let summary = ProblemSummary::from_library(&self.library, self.duplicate_report.as_ref());
         egui::ScrollArea::vertical().id_salt("v2_problems").show(ui, |ui| {
             ui.label("Here is what needs attention, with the safest next action. Opening this page is read-only.");
+            if let Some(message) = self.repair_result.clone() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.strong("Repair complete");
+                    ui.label(message);
+                    if ui.button("Open History").clicked() { self.go(Route::Section(Section::History)); }
+                });
+            }
+            if let Some(preview) = self.repair_preview.clone() {
+                self.duplicate_preview(ui, &preview);
+            }
             if summary.problems.is_empty() {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("Nothing needs attention right now.");
@@ -763,12 +775,123 @@ impl App {
                         });
                         ui.label(&problem.affected);
                         ui.label(format!("Recommended action: {}", problem.action));
+                        if problem.category == Category::Duplicates
+                            && self.repair_preview.is_none()
+                            && self.repair_job.is_none()
+                            && self.duplicate_report.is_some()
+                            && let Some(index) = problem.id.strip_prefix("duplicate-").and_then(|id| id.split('-').next()).and_then(|id| id.parse::<usize>().ok())
+                            && ui.button("Preview safe quarantine").clicked()
+                        {
+                            self.start_duplicate_preview(index);
+                        }
                         if is_selected { self.problem_details(ui, problem); }
                     });
                 }
             }
             self.problem_selected = selected;
         });
+    }
+
+    fn duplicate_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        preview: &super::backend::DuplicateRepairPreview,
+    ) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading("Repair preview: quarantine duplicate files");
+            ui.label("EmuWiz will move only the redundant byte-identical copies into its recoverable quarantine. It will not delete the retained copy or alter unrelated files.");
+            ui.label(format!("{} file(s) will change · {} byte(s) · retained copy: {}", preview.proposals.len(), preview.group.reclaimable_bytes, preview.group.recommendation.retained_path().map_or("unknown".into(), |path| path.display().to_string())));
+            for proposal in &preview.proposals {
+                if let archivefs_core::repair::RepairAction::MovePath { destination } = &proposal.action {
+                    ui.label(format!("Move {} → {}", proposal.source_path.display(), destination.display()));
+                }
+            }
+            ui.label("Backups are not needed: the transaction journal records the move and undo restores the original path if the files remain unchanged.");
+            ui.label("Safe to undo: yes, while the quarantine and original paths remain under EmuWiz's transaction control.");
+            ui.horizontal_wrapped(|ui| {
+                if primary(ui, "Confirm quarantine") { self.repair_confirm = true; }
+                if ui.button("Cancel preview").clicked() { self.repair_preview = None; }
+            });
+            ui.collapsing("Advanced Details", |ui| {
+                ui.monospace(format!("Trusted root: {}\nJournal directory: {}", preview.trusted_root.display(), preview.journal_dir.display()));
+            });
+        });
+        if self.repair_confirm {
+            egui::Window::new("Confirm safe quarantine").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
+                ui.label(format!("Move {} redundant file(s) to recoverable quarantine?", preview.proposals.len()));
+                ui.label("The current preview will be revalidated immediately before any change. If a file changed, EmuWiz will refuse the whole repair.");
+                if primary(ui, "Apply quarantine") { self.apply_duplicate_preview(); }
+                if ui.button("Cancel").clicked() { self.repair_confirm = false; }
+            });
+        }
+    }
+
+    fn history(&mut self, ui: &mut egui::Ui) {
+        ui.label("Previous repairs are shown from the durable transaction journal. Browsing history changes nothing.");
+        if self.repair_history.is_empty() {
+            ui.heading("No repair history yet");
+            ui.label(
+                "When a supported repair completes, its receipt and undo status will appear here.",
+            );
+            return;
+        }
+        let mut undo = None;
+        egui::ScrollArea::vertical()
+            .id_salt("v2_repair_history")
+            .show(ui, |ui| {
+                for (index, record) in self.repair_history.iter().enumerate().rev() {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.heading("Duplicate quarantine");
+                        ui.label(format!(
+                            "Transaction {} · {} · {} file(s)",
+                            record.transaction.transaction_id,
+                            record.transaction.state.label(),
+                            record.transaction.entries.len()
+                        ));
+                        ui.label(format!(
+                            "Affected folder: {}",
+                            record.trusted_root.display()
+                        ));
+                        match record.transaction.state {
+                            TransactionState::Applied => {
+                                ui.strong("Ready to undo");
+                                if primary(ui, "Preview undo") {
+                                    undo = Some(index);
+                                }
+                            }
+                            TransactionState::RolledBack => {
+                                ui.label("Already undone");
+                            }
+                            TransactionState::RollbackFailed => {
+                                ui.label("Undo is not available — the rollback needs review.");
+                            }
+                            _ => {
+                                ui.label("Needs review — the transaction did not finish normally.");
+                            }
+                        }
+                        ui.collapsing("Advanced Details", |ui| {
+                            ui.monospace(format!("Journal: {}", record.journal_dir.display()));
+                        });
+                    });
+                }
+            });
+        if let Some(index) = undo {
+            self.undo_confirm = Some(index);
+        }
+        if let Some(index) = self.undo_confirm
+            && let Some(transaction_id) = self
+                .repair_history
+                .get(index)
+                .map(|record| record.transaction.transaction_id.clone())
+        {
+            egui::Window::new("Confirm undo").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
+                    ui.label("EmuWiz will revalidate the quarantined files and restore them to their original paths. If anything changed unexpectedly, it will refuse safely.");
+                    if primary(ui, "Undo this repair") { self.undo_history_entry(index); }
+                    if ui.button("Cancel").clicked() { self.undo_confirm = None; }
+                    ui.collapsing("Advanced Details", |ui| { ui.monospace(format!("Transaction: {transaction_id}")); });
+                });
+        }
     }
 
     fn problem_details(&mut self, ui: &mut egui::Ui, problem: &Problem) {

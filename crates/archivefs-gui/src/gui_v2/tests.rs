@@ -61,6 +61,13 @@ fn fixture(context: &egui::Context) -> App {
         duplicate_job: None,
         duplicate_ignored: std::collections::HashSet::new(),
         problem_selected: None,
+        repair_preview: None,
+        repair_confirm: false,
+        repair_job: None,
+        repair_history: Vec::new(),
+        undo_confirm: None,
+        undo_job: None,
+        repair_result: None,
         mrwiz_dismissed: false,
     }
 }
@@ -203,6 +210,24 @@ fn gui_v2_problems_page_is_native_and_plain_english() {
 }
 
 #[test]
+fn gui_v2_history_has_a_truthful_empty_state() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::History);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("No repair history yet"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("Undo this repair"))
+    );
+}
+
+#[test]
 fn gui_v2_duplicate_badge_keeps_separate_files_visible() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
@@ -214,7 +239,9 @@ fn gui_v2_duplicate_badge_keeps_separate_files_visible() {
     app.indices = vec![0, 1];
     app.duplicate_report = Some(DuplicateReport {
         files_examined: 2,
+        exact_groups: Vec::new(),
         groups: vec![DuplicateGroup {
+            exact_index: 0,
             kind: "Exact duplicates".into(),
             sha256: "abc".into(),
             size_bytes: 4,

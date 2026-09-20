@@ -20,6 +20,7 @@ pub(super) struct DuplicateMember {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DuplicateGroup {
+    pub exact_index: usize,
     pub kind: String,
     pub sha256: String,
     pub size_bytes: u64,
@@ -30,6 +31,7 @@ pub(super) struct DuplicateGroup {
 pub(super) struct DuplicateReport {
     pub groups: Vec<DuplicateGroup>,
     pub files_examined: usize,
+    pub exact_groups: Vec<archivefs_core::repair::ExactDuplicateGroup>,
 }
 
 #[derive(Clone, Debug)]
