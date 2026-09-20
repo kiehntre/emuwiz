@@ -707,6 +707,20 @@ mod romm_dispatch_tests {
     ) -> (ArchiveFsApp, u64, u64) {
         let mut app = app();
         let context = egui::Context::default();
+        // A published import asks the live app to refresh its database
+        // snapshot. Keep this operation-dispatch fixture hermetic: the test
+        // owns no real database and must not start a worker against the
+        // process user's default SQLite path. This also makes dropping the
+        // returned app deterministic instead of leaving an unrelated loader
+        // behind while other tests run in parallel.
+        let (_sender, receiver) = mpsc::channel::<DatabaseMessage>();
+        app.database_state = DatabaseState::Loading {
+            generation: app.database_generation,
+            receiver,
+            worker: None,
+            previous: None,
+            scanning: false,
+        };
         app.romm_ui.snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
         let (sender, _progress, generation) = install_running(&mut app, operation);
         let before = app.artwork_media.gamer_covers.generation();
@@ -720,13 +734,17 @@ mod romm_dispatch_tests {
     fn a_published_import_refreshes_the_gamer_view_identity_index() {
         // The signal that makes a game which has just gained a RomM identity
         // eligible for artwork without restarting EmuWiz.
-        let (_app, before, after) = deliver(
+        let (app, before, after) = deliver(
             RommOperation::FullImport,
             Ok(RommOperationOutcome::Import(Box::new(summary(36_259)))),
         );
         assert_ne!(
             before, after,
             "a published import did not refresh the cover cache"
+        );
+        assert!(
+            matches!(app.database_state, DatabaseState::Loading { worker: None, .. }),
+            "the hermetic operation fixture must not launch a real database worker"
         );
     }
 
