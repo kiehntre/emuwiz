@@ -153,7 +153,8 @@ impl App {
             }
             match self.router.current.clone() {
                 Route::Home | Route::Section(Section::Home) => self.home(ui),
-                Route::Section(Section::Games | Section::Launch | Section::Mods) => self.games(ui),
+                Route::Section(Section::Games | Section::Launch) => self.games(ui),
+                Route::Section(Section::Mods) => self.mods_page(ui, None),
                 Route::Section(Section::Check) => self.check_games(ui),
                 Route::Section(Section::Duplicates) => self.duplicates(ui),
                 Route::Section(Section::Problems) => self.problems(ui),
@@ -167,6 +168,10 @@ impl App {
                     section: Section::Build,
                     ..
                 } => self.build_library(ui),
+                Route::Task {
+                    section: Section::Mods,
+                    game,
+                } => self.mods_page(ui, Some(game)),
                 Route::Task { section, .. } | Route::Section(section) => self.handoff(ui, section),
             }
         });
@@ -1057,6 +1062,11 @@ impl App {
                 }
             });
         });
+    }
+
+    fn mods_page(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        let selected = game_id.and_then(|id| self.library.game(id));
+        crate::gui_v2::mods::show_mods_page(ui, &mut self.mods, selected, &mut self.activity);
     }
 
     fn handoff(&mut self, ui: &mut egui::Ui, section: Section) {

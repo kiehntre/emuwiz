@@ -70,6 +70,7 @@ fn fixture(context: &egui::Context) -> App {
         repair_result: None,
         playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         playing_library_history: Vec::new(),
+        mods: super::mods::ModsPageState::default(),
         mrwiz_dismissed: false,
     }
 }
@@ -144,6 +145,20 @@ fn gui_v2_build_library_is_a_native_plain_english_workflow() {
     );
     assert!(strings.iter().any(|value| value.contains("Source library")));
     assert!(strings.iter().any(|value| value.contains("Inputs")));
+}
+
+#[test]
+fn gui_v2_mods_page_is_native_and_keeps_cheats_separate() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Mods);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value == "Mods & Cheats"));
+    assert!(strings.iter().any(|value| value == "Available packages"));
+    assert!(strings.iter().any(|value| value == "Active stack"));
+    assert!(strings.iter().any(|value| value == "Conflicts"));
+    assert!(strings.iter().any(|value| value == "Cheats"));
+    assert!(!strings.iter().any(|value| value.contains("legacy handoff")));
 }
 
 #[test]

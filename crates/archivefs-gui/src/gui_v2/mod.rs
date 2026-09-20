@@ -5,6 +5,7 @@ mod backend;
 mod legacy;
 mod library;
 mod media_sources;
+mod mods;
 mod pages;
 mod problems;
 mod routes;
@@ -15,6 +16,7 @@ mod thumbnail;
 use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
 use activity::Activity;
 use artwork::Artwork;
+use mods::ModsPageState;
 use backend::{
     Backend, Command, DuplicateRepairPreview, DuplicateRepairRecord, Event, Payload, Preferences,
     VerificationResult,
@@ -166,6 +168,7 @@ pub(super) struct App {
     repair_result: Option<String>,
     playing_library: PlayingLibraryPageState,
     playing_library_history: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+    mods: ModsPageState,
     mrwiz_dismissed: bool,
 }
 
@@ -213,6 +216,7 @@ impl App {
             repair_result: None,
             playing_library: PlayingLibraryPageState::load(),
             playing_library_history: Vec::new(),
+            mods: ModsPageState::default(),
             mrwiz_dismissed: false,
         };
         app.send(0, Command::Restore);
@@ -779,6 +783,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.mods.poll();
         self.poll(ui.ctx());
         self.show(ui.ctx());
         self.finish_frame();
