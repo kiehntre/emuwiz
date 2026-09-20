@@ -51,6 +51,7 @@ pub mod attention;
 pub mod bbc_tape;
 /// Read-only master BIOS inventory and emulator projection planning.
 pub mod bios_projection;
+pub mod retrobios_provider;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation
