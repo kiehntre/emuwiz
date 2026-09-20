@@ -549,6 +549,14 @@ pub mod patch_manager;
 /// cheat/emulator patch manager: it never applies a change or creates history.
 pub mod mod_package;
 
+/// Read-only inspection and shared-transaction planning for ordinary folder
+/// and ZIP mod packages. No package content is executed or flattened.
+pub mod archive_mod_package;
+
+/// Unified read-only projection of installed mod receipts, including optional
+/// provider provenance attached only after a strong local-package join.
+pub mod mod_history;
+
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Bounded import of user-supplied local ROM-hack metadata.
