@@ -1,0 +1,666 @@
+//! Version-bound, read-only joins between extracted Arcade sets and MAME XML.
+//!
+//! The directory name is only the candidate key.  Machine metadata from the
+//! selected MAME DAT is the identity authority; member names are used only for
+//! the separate storage comparison.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::dat::limits::DatLimits;
+use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
+use crate::dat::parsers::mame_listxml::parse_mame_listxml;
+use crate::ingestion::arcade::{ArcadeSetDirectory, discover_extracted_sets};
+
+pub const MAME_0174_SHA256: &str =
+    "df9938254e6299a9dc0499ac4d30ef562730d5e1e1d0f8f887402948980fae27";
+pub const MAME_0174_VERSION: &str = "0.174";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ArcadeJoinClass {
+    ExactSetMatch,
+    CloneSet,
+    ParentSet,
+    BiosSet,
+    DeviceSet,
+    Ambiguous,
+    NotFound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum MemberEvidenceKind {
+    Present,
+    Missing,
+    Extra,
+    MergedFromParent,
+    ProvidedByBios,
+    ProvidedByDevice,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeMemberEvidence {
+    pub name: String,
+    pub kind: MemberEvidenceKind,
+    pub checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeDependencyEdge {
+    pub kind: String,
+    pub target: String,
+    pub present: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeJoinEvidence {
+    pub logical_set_name: String,
+    pub dat_set_name: Option<String>,
+    pub class: ArcadeJoinClass,
+    pub description: Option<String>,
+    pub manufacturer: Option<String>,
+    pub year: Option<String>,
+    pub clone_of: Option<String>,
+    pub rom_of: Option<String>,
+    pub parent_description: Option<String>,
+    pub runnable: Option<String>,
+    pub mechanical: bool,
+    pub is_bios: bool,
+    pub is_device: bool,
+    pub expected_member_count: usize,
+    pub members: Vec<ArcadeMemberEvidence>,
+    pub dependencies: Vec<ArcadeDependencyEdge>,
+    pub launchable_normal_game: bool,
+    pub dat_version: String,
+    pub dat_sha256: String,
+    pub dat_path: String,
+    pub audited_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeJoinSummary {
+    pub logical_sets_inspected: usize,
+    pub exact_matches: usize,
+    pub parent_sets: usize,
+    pub clone_sets: usize,
+    pub bios_sets: usize,
+    pub device_sets: usize,
+    pub mechanical_non_runnable: usize,
+    pub unmatched: usize,
+    pub ambiguous: usize,
+    pub complete: usize,
+    pub incomplete: usize,
+    pub sets_with_extras: usize,
+    pub dependency_edges: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArcadeJoinReport {
+    pub dat_path: PathBuf,
+    pub dat_sha256: String,
+    pub dat_version: String,
+    pub dat_machine_count: usize,
+    pub scan_root: PathBuf,
+    pub evidence: Vec<ArcadeJoinEvidence>,
+    pub summary: ArcadeJoinSummary,
+    pub layout_estimate: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedMameDat {
+    pub parsed: ParsedDat,
+    pub path: PathBuf,
+    pub sha256: String,
+    pub version: String,
+}
+
+pub fn load_verified_mame_0174(path: &Path) -> Result<VerifiedMameDat, String> {
+    let bytes = fs::read(path).map_err(|e| format!("read MAME DAT: {e}"))?;
+    let digest = Sha256::digest(&bytes);
+    let sha256 = digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    if sha256 != MAME_0174_SHA256 {
+        return Err(format!(
+            "refusing DAT with SHA-256 {sha256}; expected {MAME_0174_SHA256}"
+        ));
+    }
+    let parsed = parse_mame_listxml(path, DatLimits::default())
+        .map_err(|e| format!("parse MAME XML: {e}"))?
+        .dat;
+    // This DAT is Logiqx-shaped datafile XML with `<machine>` entries rather
+    // than current `-listxml`'s `<mame build=...>` root. The existing bounded
+    // MAME machine parser supplies the entries; this exact header assertion
+    // proves the publisher's internal revision without filename inference.
+    let header_proof = String::from_utf8_lossy(&bytes);
+    if !header_proof.contains("<description>MAME Arcade 0.174</description>") {
+        return Err("refusing DAT without internal MAME 0.174 header description".into());
+    }
+    Ok(VerifiedMameDat {
+        parsed,
+        path: path.to_path_buf(),
+        sha256,
+        version: MAME_0174_VERSION.to_string(),
+    })
+}
+
+pub fn join_extracted_arcade_root(
+    dat: &VerifiedMameDat,
+    root: &Path,
+    audited_at: &str,
+) -> Result<ArcadeJoinReport, String> {
+    let discovered =
+        discover_extracted_sets(root).map_err(|e| format!("discover Arcade sets: {e}"))?;
+    let by_name: BTreeMap<&str, &DatGameEntry> = dat
+        .parsed
+        .games
+        .iter()
+        .map(|g| (g.name.as_str(), g))
+        .collect();
+    let mut dirs = BTreeMap::new();
+    for set in &discovered.sets {
+        dirs.insert(set.set_name.as_str(), set);
+    }
+    let mut evidence = Vec::with_capacity(discovered.sets.len());
+    for set in &discovered.sets {
+        evidence.push(join_one(dat, set, &by_name, &dirs, audited_at));
+    }
+    let mut summary = ArcadeJoinSummary {
+        logical_sets_inspected: evidence.len(),
+        ..Default::default()
+    };
+    for item in &evidence {
+        match item.class {
+            ArcadeJoinClass::ExactSetMatch => summary.exact_matches += 1,
+            ArcadeJoinClass::ParentSet => summary.parent_sets += 1,
+            ArcadeJoinClass::CloneSet => summary.clone_sets += 1,
+            ArcadeJoinClass::BiosSet => summary.bios_sets += 1,
+            ArcadeJoinClass::DeviceSet => summary.device_sets += 1,
+            ArcadeJoinClass::NotFound => summary.unmatched += 1,
+            ArcadeJoinClass::Ambiguous => summary.ambiguous += 1,
+        }
+        if item.mechanical || item.runnable.as_deref() == Some("no") {
+            summary.mechanical_non_runnable += 1;
+        }
+        if item.class != ArcadeJoinClass::NotFound && item.class != ArcadeJoinClass::Ambiguous {
+            if item
+                .members
+                .iter()
+                .any(|m| m.kind == MemberEvidenceKind::Missing)
+            {
+                summary.incomplete += 1;
+            } else {
+                summary.complete += 1;
+            }
+            if item
+                .members
+                .iter()
+                .any(|m| m.kind == MemberEvidenceKind::Extra)
+            {
+                summary.sets_with_extras += 1;
+            }
+        }
+        summary.dependency_edges += item.dependencies.len();
+    }
+    let layout_estimate = estimate_layout(&evidence);
+    Ok(ArcadeJoinReport {
+        dat_path: dat.path.clone(),
+        dat_sha256: dat.sha256.clone(),
+        dat_version: dat.version.clone(),
+        dat_machine_count: dat.parsed.games.len(),
+        scan_root: root.to_path_buf(),
+        evidence,
+        summary,
+        layout_estimate,
+    })
+}
+
+fn join_one(
+    dat: &VerifiedMameDat,
+    set: &ArcadeSetDirectory,
+    by_name: &BTreeMap<&str, &DatGameEntry>,
+    dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
+    audited_at: &str,
+) -> ArcadeJoinEvidence {
+    let candidates = dat
+        .parsed
+        .games
+        .iter()
+        .filter(|g| g.name == set.set_name)
+        .collect::<Vec<_>>();
+    let (game, class) = match candidates.as_slice() {
+        [] => (None, ArcadeJoinClass::NotFound),
+        [_] => {
+            let g = candidates[0];
+            let has_clone = dat
+                .parsed
+                .games
+                .iter()
+                .any(|c| c.clone_of.as_deref() == Some(g.name.as_str()));
+            let class = if flag(&g.is_bios) {
+                ArcadeJoinClass::BiosSet
+            } else if flag(&g.is_device) {
+                ArcadeJoinClass::DeviceSet
+            } else if g.clone_of.is_some() {
+                ArcadeJoinClass::CloneSet
+            } else if has_clone {
+                ArcadeJoinClass::ParentSet
+            } else {
+                ArcadeJoinClass::ExactSetMatch
+            };
+            (Some(g), class)
+        }
+        _ => (None, ArcadeJoinClass::Ambiguous),
+    };
+    let Some(game) = game else {
+        return ArcadeJoinEvidence {
+            logical_set_name: set.set_name.clone(),
+            dat_set_name: None,
+            class,
+            description: None,
+            manufacturer: None,
+            year: None,
+            clone_of: None,
+            rom_of: None,
+            parent_description: None,
+            runnable: None,
+            mechanical: false,
+            is_bios: false,
+            is_device: false,
+            expected_member_count: 0,
+            members: Vec::new(),
+            dependencies: Vec::new(),
+            launchable_normal_game: false,
+            dat_version: dat.version.clone(),
+            dat_sha256: dat.sha256.clone(),
+            dat_path: dat.path.to_string_lossy().into_owned(),
+            audited_at: audited_at.to_string(),
+        };
+    };
+    let present = set
+        .members
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect::<BTreeSet<_>>();
+    let expected = game
+        .roms
+        .iter()
+        .filter(|r| !is_optional(r) && !is_nodump(r))
+        .collect::<Vec<_>>();
+    let expected_names = expected
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut members = expected
+        .iter()
+        .map(|r| member_evidence(r, &present, game, by_name, dirs))
+        .collect::<Vec<_>>();
+    for extra in present
+        .iter()
+        .filter(|n| !expected_names.contains(n.as_str()))
+    {
+        members.push(ArcadeMemberEvidence {
+            name: extra.clone(),
+            kind: MemberEvidenceKind::Extra,
+            checksum: None,
+        });
+    }
+    let mut dependencies = Vec::new();
+    if let Some(parent) = game.clone_of.as_deref() {
+        dependencies.push(ArcadeDependencyEdge {
+            kind: "ParentSet".into(),
+            target: parent.into(),
+            present: by_name.contains_key(parent) && dirs.contains_key(parent),
+        });
+    }
+    if let Some(source) = game.rom_of.as_deref() {
+        dependencies.push(ArcadeDependencyEdge {
+            kind: "RomSource".into(),
+            target: source.into(),
+            present: dirs.contains_key(source),
+        });
+    }
+    for device in &game.device_refs {
+        if let Some(name) = device.name.as_deref() {
+            dependencies.push(ArcadeDependencyEdge {
+                kind: "Device".into(),
+                target: name.into(),
+                present: by_name.get(name).is_some_and(|g| flag(&g.is_device))
+                    && dirs.contains_key(name),
+            });
+        }
+    }
+    for rom in &game.roms {
+        if let Some(bios) = rom.bios.as_deref() {
+            dependencies.push(ArcadeDependencyEdge {
+                kind: "Bios".into(),
+                target: bios.into(),
+                present: game
+                    .bios_sets
+                    .iter()
+                    .any(|b| b.name.as_deref() == Some(bios)),
+            });
+        }
+    }
+    let mechanical = game
+        .original_metadata
+        .fields
+        .get("ismechanical")
+        .is_some_and(|v| v == "yes");
+    let normal = !flag(&game.is_bios)
+        && !flag(&game.is_device)
+        && !mechanical
+        && game.runnable.as_deref() != Some("no");
+    let parent_description = game
+        .clone_of
+        .as_deref()
+        .and_then(|p| by_name.get(p).and_then(|g| g.description.clone()));
+    ArcadeJoinEvidence {
+        logical_set_name: set.set_name.clone(),
+        dat_set_name: Some(game.name.clone()),
+        class,
+        description: game.description.clone(),
+        manufacturer: game.manufacturer.clone(),
+        year: game.year.clone(),
+        clone_of: game.clone_of.clone(),
+        rom_of: game.rom_of.clone(),
+        parent_description,
+        runnable: game.runnable.clone(),
+        mechanical,
+        is_bios: flag(&game.is_bios),
+        is_device: flag(&game.is_device),
+        expected_member_count: expected.len(),
+        members,
+        dependencies,
+        launchable_normal_game: normal,
+        dat_version: dat.version.clone(),
+        dat_sha256: dat.sha256.clone(),
+        dat_path: dat.path.to_string_lossy().into_owned(),
+        audited_at: audited_at.to_string(),
+    }
+}
+
+fn member_evidence(
+    rom: &DatRomEntry,
+    present: &BTreeSet<String>,
+    game: &DatGameEntry,
+    by_name: &BTreeMap<&str, &DatGameEntry>,
+    dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
+) -> ArcadeMemberEvidence {
+    let checksum = rom.sha1.clone().or_else(|| rom.crc32.clone());
+    if present.contains(&rom.name) {
+        return ArcadeMemberEvidence {
+            name: rom.name.clone(),
+            kind: MemberEvidenceKind::Present,
+            checksum,
+        };
+    }
+    if let Some(merge) = rom.merge.as_deref()
+        && provider_has_member(game, merge, by_name, dirs)
+    {
+        return ArcadeMemberEvidence {
+            name: rom.name.clone(),
+            kind: MemberEvidenceKind::MergedFromParent,
+            checksum,
+        };
+    }
+    if let Some(source) = game.rom_of.as_deref().or(game.clone_of.as_deref())
+        && provider_has_member_name(source, &rom.name, dirs)
+    {
+        return ArcadeMemberEvidence {
+            name: rom.name.clone(),
+            kind: MemberEvidenceKind::MergedFromParent,
+            checksum,
+        };
+    }
+    ArcadeMemberEvidence {
+        name: rom.name.clone(),
+        kind: MemberEvidenceKind::Missing,
+        checksum,
+    }
+}
+
+fn provider_has_member(
+    game: &DatGameEntry,
+    member: &str,
+    by_name: &BTreeMap<&str, &DatGameEntry>,
+    dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
+) -> bool {
+    game.rom_of
+        .as_deref()
+        .or(game.clone_of.as_deref())
+        .and_then(|p| by_name.get(p).map(|_| p))
+        .is_some_and(|p| provider_has_member_name(p, member, dirs))
+}
+fn provider_has_member_name(
+    provider: &str,
+    member: &str,
+    dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
+) -> bool {
+    dirs.get(provider).is_some_and(|s| {
+        s.members
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n.to_string_lossy() == member))
+    })
+}
+fn is_optional(r: &DatRomEntry) -> bool {
+    r.optional
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+}
+fn is_nodump(r: &DatRomEntry) -> bool {
+    r.status
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("nodump"))
+}
+fn flag(v: &Option<String>) -> bool {
+    v.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+}
+fn estimate_layout(items: &[ArcadeJoinEvidence]) -> String {
+    let merged = items
+        .iter()
+        .filter(|i| {
+            i.members
+                .iter()
+                .any(|m| m.kind == MemberEvidenceKind::MergedFromParent)
+        })
+        .count();
+    let extras = items
+        .iter()
+        .filter(|i| {
+            i.members
+                .iter()
+                .any(|m| m.kind == MemberEvidenceKind::Extra)
+        })
+        .count();
+    if merged > items.len() / 3 && extras < items.len() / 3 {
+        "mostly merged/extracted".into()
+    } else if merged == 0 {
+        "mostly non-merged or split/extracted".into()
+    } else {
+        "mixed extracted".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn game(name: &str) -> DatGameEntry {
+        DatGameEntry {
+            name: name.into(),
+            runnable: Some("yes".into()),
+            ..Default::default()
+        }
+    }
+
+    fn dat(games: Vec<DatGameEntry>) -> VerifiedMameDat {
+        let source = crate::dat::model::DatSource {
+            format: crate::dat::model::DatFormat::Logiqx,
+            ecosystem: crate::dat::model::DatEcosystem::MAMEArcade,
+            file_path: "mame.dat".into(),
+            name: Some("MAME".into()),
+            description: Some("MAME Arcade 0.174".into()),
+            version: Some("-not specified-".into()),
+            author: None,
+            homepage: None,
+            clrmamepro_header: None,
+            entry_count: games.len(),
+            rom_count: 0,
+            parse_warnings: Vec::new(),
+            packing_policy: crate::dat::model::DatPackingPolicy::Standard,
+        };
+        VerifiedMameDat {
+            parsed: ParsedDat { source, games },
+            path: PathBuf::from("mame.dat"),
+            sha256: MAME_0174_SHA256.into(),
+            version: MAME_0174_VERSION.into(),
+        }
+    }
+
+    fn set(root: &Path, name: &str, members: &[&str]) -> ArcadeSetDirectory {
+        let path = root.join(name);
+        fs::create_dir_all(&path).unwrap();
+        let mut paths = Vec::new();
+        for member in members {
+            let path = path.join(member);
+            fs::write(&path, b"synthetic legal fixture").unwrap();
+            paths.push(path);
+        }
+        ArcadeSetDirectory {
+            path,
+            set_name: name.into(),
+            members: paths,
+        }
+    }
+
+    #[test]
+    fn wrong_version_is_refused_before_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong.dat");
+        fs::write(
+            &path,
+            b"<datafile><header><description>MAME Arcade 0.173</description></header></datafile>",
+        )
+        .unwrap();
+        let err = load_verified_mame_0174(&path);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn flags_are_strict() {
+        assert!(flag(&Some("yes".into())));
+        assert!(!flag(&Some("no".into())));
+    }
+
+    #[test]
+    fn exact_parent_clone_romof_and_merged_members_are_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = game("parent");
+        parent.roms.push(DatRomEntry {
+            name: "shared.bin".into(),
+            sha1: Some("a".repeat(40)),
+            ..Default::default()
+        });
+        let mut clone = game("clone");
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        clone.roms.push(DatRomEntry {
+            name: "shared.bin".into(),
+            merge: Some("shared.bin".into()),
+            ..Default::default()
+        });
+        clone.roms.push(DatRomEntry {
+            name: "clone.bin".into(),
+            ..Default::default()
+        });
+        let verified = dat(vec![parent, clone]);
+        let parent_set = set(root.path(), "parent", &["shared.bin"]);
+        let clone_set = set(root.path(), "clone", &["extra.bin"]);
+        let mut by_name = BTreeMap::new();
+        by_name.insert("parent", &verified.parsed.games[0]);
+        by_name.insert("clone", &verified.parsed.games[1]);
+        let mut dirs = BTreeMap::new();
+        dirs.insert("parent", &parent_set);
+        dirs.insert("clone", &clone_set);
+        let evidence = join_one(&verified, &clone_set, &by_name, &dirs, "test");
+        assert_eq!(evidence.class, ArcadeJoinClass::CloneSet);
+        assert_eq!(
+            evidence
+                .members
+                .iter()
+                .find(|m| m.name == "shared.bin")
+                .unwrap()
+                .kind,
+            MemberEvidenceKind::MergedFromParent
+        );
+        assert!(
+            evidence
+                .members
+                .iter()
+                .any(|m| m.name == "clone.bin" && m.kind == MemberEvidenceKind::Missing)
+        );
+        assert!(
+            evidence
+                .members
+                .iter()
+                .any(|m| m.name == "extra.bin" && m.kind == MemberEvidenceKind::Extra)
+        );
+    }
+
+    #[test]
+    fn bios_device_mechanical_unmatched_and_ambiguous_are_classified() {
+        let root = tempfile::tempdir().unwrap();
+        let mut bios = game("bios");
+        bios.is_bios = Some("yes".into());
+        bios.runnable = Some("no".into());
+        let mut device = game("device");
+        device.is_device = Some("yes".into());
+        let mut mechanical = game("mech");
+        mechanical
+            .original_metadata
+            .fields
+            .insert("ismechanical".into(), "yes".into());
+        let games = vec![bios, device, mechanical, game("dup"), game("dup")];
+        let verified = dat(games);
+        let mut by_name = BTreeMap::new();
+        for game in &verified.parsed.games {
+            by_name.entry(game.name.as_str()).or_insert(game);
+        }
+        let bios_set = set(root.path(), "bios", &["bios.bin", "x.bin"]);
+        let device_set = set(root.path(), "device", &["device.bin", "x.bin"]);
+        let mech_set = set(root.path(), "mech", &["mech.bin", "x.bin"]);
+        let dup_set = set(root.path(), "dup", &["x.bin", "y.bin"]);
+        let mut dirs = BTreeMap::new();
+        dirs.insert("bios", &bios_set);
+        dirs.insert("device", &device_set);
+        dirs.insert("mech", &mech_set);
+        dirs.insert("dup", &dup_set);
+        assert_eq!(
+            join_one(&verified, &bios_set, &by_name, &dirs, "test").class,
+            ArcadeJoinClass::BiosSet
+        );
+        assert_eq!(
+            join_one(&verified, &device_set, &by_name, &dirs, "test").class,
+            ArcadeJoinClass::DeviceSet
+        );
+        assert!(join_one(&verified, &mech_set, &by_name, &dirs, "test").mechanical);
+        assert_eq!(
+            join_one(&verified, &dup_set, &by_name, &dirs, "test").class,
+            ArcadeJoinClass::Ambiguous
+        );
+        let missing = set(root.path(), "missing", &["x.bin", "y.bin"]);
+        assert_eq!(
+            join_one(&verified, &missing, &by_name, &dirs, "test").class,
+            ArcadeJoinClass::NotFound
+        );
+    }
+}

@@ -412,6 +412,134 @@ pub struct PersistedSetAuditDependency {
 }
 
 impl Database {
+    /// Replaces one complete, version-bound Arcade join in the existing DAT
+    /// audit tables. The source id includes the exact DAT digest, so a later
+    /// MAME revision cannot silently replace or satisfy this evidence.
+    pub fn persist_mame_arcade_join(
+        &mut self,
+        report: &crate::dat::mame_arcade_join::ArcadeJoinReport,
+    ) -> Result<usize> {
+        let source_id = format!("mame-arcade:{}:{}", report.dat_version, report.dat_sha256);
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|error| db_error("failed to start MAME Arcade join transaction", error))?;
+        for evidence in &report.evidence {
+            let encoded = serde_json::to_string(evidence).map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "failed to encode MAME Arcade join evidence: {error}"
+                ))
+            })?;
+            let archive_path = report.scan_root.join(&evidence.logical_set_name);
+            tx.execute(
+                "INSERT INTO dat_expected_entries
+                 (dat_source_id, canonical_identity, display_name, source_revision,
+                  ecosystem, metadata_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'mame', ?5, ?6, ?6)
+                 ON CONFLICT(dat_source_id, canonical_identity) DO UPDATE SET
+                  display_name = excluded.display_name,
+                  source_revision = excluded.source_revision,
+                  ecosystem = excluded.ecosystem,
+                  metadata_json = excluded.metadata_json,
+                  updated_at = excluded.updated_at",
+                params![
+                    source_id,
+                    evidence.logical_set_name,
+                    evidence
+                        .dat_set_name
+                        .as_deref()
+                        .unwrap_or(&evidence.logical_set_name),
+                    report.dat_sha256,
+                    encoded.as_bytes(),
+                    evidence.audited_at,
+                ],
+            )
+            .map_err(|error| db_error("failed to persist MAME Arcade evidence inventory", error))?;
+            tx.execute(
+                "INSERT INTO dat_set_audit_results
+                 (archive_id, archive_path, source_id, game_name, platform,
+                  set_state_json, dependency_state_json, ecosystem, dat_revision,
+                  audited_at, stale, exhaustive)
+                 VALUES (NULL, ?1, ?2, ?3, 'arcade', ?4, ?5, '\"m_a_m_e_arcade\"', ?6, ?7, 0, 1)
+                 ON CONFLICT(archive_path, source_id, game_name) DO UPDATE SET
+                  set_state_json = excluded.set_state_json,
+                  dependency_state_json = excluded.dependency_state_json,
+                  ecosystem = excluded.ecosystem,
+                  dat_revision = excluded.dat_revision,
+                  audited_at = excluded.audited_at, stale = 0, exhaustive = 1",
+                params![
+                    archive_path.as_os_str().as_bytes(),
+                    source_id,
+                    evidence.logical_set_name,
+                    if evidence.members.iter().any(|member| matches!(
+                        member.kind,
+                        crate::dat::mame_arcade_join::MemberEvidenceKind::Missing
+                            | crate::dat::mame_arcade_join::MemberEvidenceKind::Extra
+                    )) {
+                        "\"incomplete\""
+                    } else {
+                        "\"complete\""
+                    },
+                    if evidence
+                        .dependencies
+                        .iter()
+                        .any(|dependency| !dependency.present)
+                    {
+                        "\"missing\""
+                    } else {
+                        "\"satisfied\""
+                    },
+                    report.dat_sha256,
+                    evidence.audited_at,
+                ],
+            )
+            .map_err(|error| {
+                db_error(
+                    "failed to persist MAME Arcade join in DAT audit tables",
+                    error,
+                )
+            })?;
+        }
+        tx.commit()
+            .map_err(|error| db_error("failed to commit MAME Arcade DAT audit", error))?;
+        Ok(report.evidence.len())
+    }
+
+    /// Loads only evidence for the requested DAT digest; a different MAME
+    /// revision is never an implicit fallback.
+    pub fn mame_arcade_join_for_dat(
+        &self,
+        dat_sha256: &str,
+    ) -> Result<Vec<crate::dat::mame_arcade_join::ArcadeJoinEvidence>> {
+        let source_prefix = "mame-arcade:";
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT metadata_json FROM dat_expected_entries
+                 WHERE dat_source_id LIKE ?1 AND source_revision = ?2
+                 ORDER BY canonical_identity",
+            )
+            .map_err(|error| db_error("failed to prepare MAME Arcade join query", error))?;
+        let rows = statement
+            .query_map(params![format!("{source_prefix}%"), dat_sha256], |row| {
+                row.get::<_, Option<Vec<u8>>>(0)
+            })
+            .map_err(|error| db_error("failed to query MAME Arcade join evidence", error))?;
+        rows.filter_map(|row| match row {
+            Ok(Some(encoded)) => Some(serde_json::from_slice(&encoded).map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "stored MAME Arcade join evidence is malformed: {error}"
+                ))
+            })),
+            Ok(None) => None,
+            Err(error) => Some(Err(db_error(
+                "failed to read MAME Arcade join evidence",
+                error,
+            ))),
+        })
+        .collect()
+    }
+
     fn begin_catalogue_refresh(&mut self) -> Result<()> {
         self.connection
             .execute_batch("BEGIN IMMEDIATE")
@@ -5573,7 +5701,9 @@ impl Database {
                 "SELECT archive_id, values_json, receipt_json \
                  FROM screenscraper_enrichments ORDER BY archive_id",
             )
-            .map_err(|error| db_error("failed to prepare ScreenScraper enrichment lookup", error))?;
+            .map_err(|error| {
+                db_error("failed to prepare ScreenScraper enrichment lookup", error)
+            })?;
         let rows = statement
             .query_map([], |row| {
                 let values: Vec<u8> = row.get(1)?;
@@ -5592,11 +5722,13 @@ impl Database {
                         Box::new(error),
                     )
                 })?;
-                Ok(crate::screenscraper_enrichment::PersistedScreenScraperEnrichment {
-                    archive_id: row.get(0)?,
-                    values,
-                    receipt,
-                })
+                Ok(
+                    crate::screenscraper_enrichment::PersistedScreenScraperEnrichment {
+                        archive_id: row.get(0)?,
+                        values,
+                        receipt,
+                    },
+                )
             })
             .map_err(|error| db_error("failed to query ScreenScraper enrichments", error))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -5625,10 +5757,17 @@ impl Database {
         })?;
         let now = now_utc_string();
         let transaction = self.connection.savepoint().map_err(|error| {
-            db_error("failed to start ScreenScraper enrichment transaction", error)
+            db_error(
+                "failed to start ScreenScraper enrichment transaction",
+                error,
+            )
         })?;
         let exists: bool = transaction
-            .query_row("SELECT EXISTS(SELECT 1 FROM archives WHERE id = ?1)", [archive_id], |row| row.get(0))
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM archives WHERE id = ?1)",
+                [archive_id],
+                |row| row.get(0),
+            )
             .map_err(|error| db_error("failed to validate enrichment archive", error))?;
         if !exists {
             return Err(ArchiveFsError::Database(format!(
@@ -9426,6 +9565,7 @@ mod tests {
                 "dat_set_audit_results",
                 "discovery_details",
                 "library_dat_identities",
+                "media_topology_evidence",
                 "mod_catalogue_records",
                 "platform_aliases",
                 "platform_assignments",

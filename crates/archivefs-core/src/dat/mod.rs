@@ -53,6 +53,7 @@ pub mod library_identity_projection;
 pub mod library_identity_summary;
 pub mod limits;
 pub mod mame_input_metadata;
+pub mod mame_arcade_join;
 pub mod managed_sources;
 pub mod model;
 /// Neo Geo MVS/AES multi-ROM set coherence: a thin, read-only projection

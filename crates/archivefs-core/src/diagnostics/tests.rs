@@ -1471,12 +1471,14 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 /// 0010 (verified identity facts), 0011 (named expected DAT inventory), and
 /// 0012 (expected-inventory metadata), 0013 (scan fingerprints), 0014
 /// (ingestion fingerprint evidence), 0015 (discovery-detail reuse), 0016
-/// (non-archive fingerprints), and 0017 (source roles). This guard still proves Doctor itself
+/// (non-archive fingerprints), 0017 (source roles), 0018 (provider mod
+/// catalogue records), 0019 (ScreenScraper enrichment), and 0020 (media
+/// topology evidence). This guard still proves Doctor itself
 /// introduced no migration of its own
 /// (the string scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 19] = [
+    const EXPECTED: [&str; 20] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
@@ -1496,6 +1498,7 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("../migrations/0017_source_roles.sql"),
         include_str!("../migrations/0018_mod_catalogue_records.sql"),
         include_str!("../migrations/0019_screenscraper_enrichment.sql"),
+        include_str!("../migrations/0020_media_topology_evidence.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),
