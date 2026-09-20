@@ -128,10 +128,6 @@ impl App {
                                 });
                             }
                         }
-                        ui.separator();
-                        if ui.button("Legacy / Advanced interface").clicked() {
-                            self.go(Route::Section(Section::Advanced));
-                        }
                         ui.label("Tab: move focus\nEnter: open\nAlt+Left: back");
                     });
             });
@@ -167,6 +163,7 @@ impl App {
                 Route::Section(Section::Activity) => self.activities(ui),
                 Route::Section(Section::History) => self.history(ui),
                 Route::Section(Section::Settings) => self.settings(ui),
+                Route::Section(Section::Advanced) => self.dat_sources(ui),
                 Route::Task {
                     section: Section::Build,
                     ..
@@ -183,7 +180,7 @@ impl App {
                     section: Section::Artwork,
                     game,
                 } => self.artwork_metadata(ui, Some(game)),
-                Route::Task { section, .. } | Route::Section(section) => self.handoff(ui, section),
+                Route::Task { section, .. } => self.handoff(ui, section),
             }
         });
         if self.confirm_scan {
@@ -1084,10 +1081,8 @@ impl App {
     }
 
     fn launch(&mut self, ui: &mut egui::Ui, game_id: i64) {
-        let Some((title, platform, identified, media, path)) = self
-            .library
-            .game(game_id)
-            .map(|game| {
+        let Some((title, platform, identified, media, path)) =
+            self.library.game(game_id).map(|game| {
                 (
                     game.title.clone(),
                     game.platform.clone(),
@@ -1114,28 +1109,35 @@ impl App {
             });
         });
         ui.add_space(12.0);
-        let workflows = self.native_workflows.get_or_insert_with(|| {
-            super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
-        });
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
         if workflows.show_launch(ui, game_id, &path, &mut self.activity) {
             self.go(Route::Section(Section::Emulators));
         }
     }
 
     fn emulator_setup(&mut self, ui: &mut egui::Ui) {
-        let workflows = self.native_workflows.get_or_insert_with(|| {
-            super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
-        });
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
         egui::ScrollArea::vertical()
             .id_salt("v2_native_emulator_setup")
             .show(ui, |ui| workflows.show_setup(ui));
     }
 
     fn sources(&mut self, ui: &mut egui::Ui) {
-        let workflows = self.native_workflows.get_or_insert_with(|| {
-            super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
-        });
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
         workflows.show_sources(ui, &mut self.activity);
+    }
+
+    fn dat_sources(&mut self, ui: &mut egui::Ui) {
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.show_dat_sources(ui, &mut self.activity);
     }
 
     fn artwork_metadata(&mut self, ui: &mut egui::Ui, selected: Option<i64>) {
@@ -1255,31 +1257,55 @@ impl App {
     }
 
     fn artwork_summary(&self, game: i64, screenscraper: bool) -> String {
-        let Some(index) = &self.artwork.index else { return "Checking providers…".into(); };
+        let Some(index) = &self.artwork.index else {
+            return "Checking providers…".into();
+        };
         let cover = index.covers.contains_key(&game);
         let screenshots = index.screenshots.get(&game).map_or(0, Vec::len);
         let metadata = index.descriptions.contains_key(&game) || screenscraper;
-        format!("{} · {screenshots} screenshot(s) · {}", if cover { "Cover ready" } else { "No cover found" }, if metadata { "Metadata ready" } else { "No metadata match" })
+        format!(
+            "{} · {screenshots} screenshot(s) · {}",
+            if cover {
+                "Cover ready"
+            } else {
+                "No cover found"
+            },
+            if metadata {
+                "Metadata ready"
+            } else {
+                "No metadata match"
+            }
+        )
     }
 
     fn artwork_provenance(
         &self,
         ui: &mut egui::Ui,
         game: i64,
-        screenscraper: Option<&archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
+        screenscraper: Option<
+            &archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment,
+        >,
     ) {
         ui.strong("Sources");
         let index = self.artwork.index.as_ref();
         if let Some(source) = index.and_then(|index| index.covers.get(&game)) {
             ui.label(match source {
                 Source::Local(path) => format!("Local file · {}", path.display()),
-                Source::Remote { record, .. } => format!("RomM · record {}", record.provider_game_id),
+                Source::Remote { record, .. } => {
+                    format!("RomM · record {}", record.provider_game_id)
+                }
             });
         }
         if let Some(saved) = screenscraper {
-            ui.label(format!("ScreenScraper · record {}", saved.receipt.provider_record_id));
+            ui.label(format!(
+                "ScreenScraper · record {}",
+                saved.receipt.provider_record_id
+            ));
         }
-        if index.is_some_and(|index| !index.covers.contains_key(&game) && !index.descriptions.contains_key(&game)) && screenscraper.is_none() {
+        if index.is_some_and(|index| {
+            !index.covers.contains_key(&game) && !index.descriptions.contains_key(&game)
+        }) && screenscraper.is_none()
+        {
             ui.label("No provider record matched.");
         }
     }

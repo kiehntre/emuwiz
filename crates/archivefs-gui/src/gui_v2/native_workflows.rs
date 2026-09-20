@@ -25,6 +25,7 @@ pub(super) struct NativeWorkflows {
     source_job: Option<u64>,
     provider_job: Option<u64>,
     metadata_job: Option<u64>,
+    dat_job: Option<u64>,
     source_library_reload: bool,
     artwork_reload: bool,
 }
@@ -64,6 +65,7 @@ impl NativeWorkflows {
             source_job: None,
             provider_job: None,
             metadata_job: None,
+            dat_job: None,
             source_library_reload: false,
             artwork_reload: false,
         }
@@ -86,6 +88,7 @@ impl NativeWorkflows {
         self.observe_source_activity(activity);
         self.observe_provider_activity(activity);
         self.observe_metadata_activity(activity);
+        self.poll_dat_activity(context, activity);
 
         let checking_setup = self.app.doctor_repair.doctor_scan.is_running();
         if checking_setup && self.setup_job.is_none() {
@@ -248,13 +251,20 @@ impl NativeWorkflows {
         app_polling::start_view_gated_work(&mut self.app, ui.ctx());
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(self.app.source_action_available(), egui::Button::new("Add source"))
+                .add_enabled(
+                    self.app.source_action_available(),
+                    egui::Button::new("Add source"),
+                )
                 .clicked()
             {
                 self.app.sources_ui.sources_add_dialog =
                     Some(crate::source_controller::SourcesAddDialogState::default());
             }
             ui.label("Add and scan existing folders; source files are never moved or deleted.");
+            if ui.button("Verification Data / DATs").clicked() {
+                self.app
+                    .navigate_to_sources_tab(crate::navigation::SourcesTab::Dats);
+            }
         });
         egui::ScrollArea::vertical()
             .id_salt("v2_native_sources")
@@ -266,6 +276,23 @@ impl NativeWorkflows {
             });
         self.observe_source_activity(activity);
         self.observe_provider_activity(activity);
+        self.observe_dat_activity(activity);
+    }
+
+    pub(super) fn show_dat_sources(&mut self, ui: &mut egui::Ui, activity: &mut Activity) {
+        self.app
+            .navigate_to_sources_tab(crate::navigation::SourcesTab::Dats);
+        app_polling::start_view_gated_work(&mut self.app, ui.ctx());
+        ui.label("Import, validate, activate and review verification data using the same version-bound evidence as library checks.");
+        egui::ScrollArea::vertical()
+            .id_salt("v2_native_dat_sources")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let context = ui.ctx().clone();
+                self.app
+                    .show_sources_page(&context, ui, crate::navigation::SourcesTab::Dats);
+            });
+        self.observe_dat_activity(activity);
     }
 
     pub(super) fn take_source_library_reload(&mut self) -> bool {
@@ -294,26 +321,46 @@ impl NativeWorkflows {
         if let Some((game_id, path)) = selected {
             self.select(path);
             let record = match &self.app.state {
-                LoadState::Ready(data) => data.records.iter().find(|record| record.mount_plan.archive.path == path),
-                LoadState::Loading { previous, .. } => previous.as_ref().and_then(|data| data.records.iter().find(|record| record.mount_plan.archive.path == path)),
+                LoadState::Ready(data) => data
+                    .records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == path),
+                LoadState::Loading { previous, .. } => previous.as_ref().and_then(|data| {
+                    data.records
+                        .iter()
+                        .find(|record| record.mount_plan.archive.path == path)
+                }),
                 LoadState::Error(_) => None,
-            }.cloned();
+            }
+            .cloned();
             if let Some(record) = record {
-                let existing = self.app.database_state.snapshot()
+                let existing = self
+                    .app
+                    .database_state
+                    .snapshot()
                     .and_then(|snapshot| snapshot.screenscraper_enrichments.get(&game_id))
                     .cloned();
-                if let Some(crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply { archive_id, values, receipt }) =
-                    crate::screenscraper_enrichment_page::show(
-                        ui,
-                        &mut self.app.screenscraper_enrichment,
-                        &self.app.screenscraper_page,
-                        &record,
-                        game_id,
-                        existing.as_ref(),
-                    )
-                {
-                    self.app.apply_screenscraper_enrichment(context, archive_id, values, receipt);
-                    changed = self.app.feedback.as_ref().is_some_and(|feedback| feedback.succeeded);
+                if let Some(
+                    crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction::Apply {
+                        archive_id,
+                        values,
+                        receipt,
+                    },
+                ) = crate::screenscraper_enrichment_page::show(
+                    ui,
+                    &mut self.app.screenscraper_enrichment,
+                    &self.app.screenscraper_page,
+                    &record,
+                    game_id,
+                    existing.as_ref(),
+                ) {
+                    self.app
+                        .apply_screenscraper_enrichment(context, archive_id, values, receipt);
+                    changed = self
+                        .app
+                        .feedback
+                        .as_ref()
+                        .is_some_and(|feedback| feedback.succeeded);
                 }
             } else {
                 ui.label("Loading the selected game's provider-safe metadata identity…");
@@ -326,16 +373,10 @@ impl NativeWorkflows {
     fn observe_metadata_activity(&mut self, activity: &mut Activity) {
         let running = self.app.screenscraper_enrichment.is_running();
         if running && self.metadata_job.is_none() {
-            let job = activity.queue(
-                "Refreshing metadata",
-                self.selected_route(),
-                false,
-            );
+            let job = activity.queue("Refreshing metadata", self.selected_route(), false);
             activity.start(job);
             self.metadata_job = Some(job);
-        } else if !running
-            && let Some(job) = self.metadata_job.take()
-        {
+        } else if !running && let Some(job) = self.metadata_job.take() {
             let feedback = self.app.feedback.as_ref();
             let error = feedback
                 .filter(|feedback| !feedback.succeeded)
@@ -409,9 +450,7 @@ impl NativeWorkflows {
             );
             activity.start(job);
             self.provider_job = Some(job);
-        } else if !loading
-            && let Some(job) = self.provider_job.take()
-        {
+        } else if !loading && let Some(job) = self.provider_job.take() {
             let errors = [
                 self.app.artwork_media.es_de_media.error(),
                 self.app.artwork_media.launchbox_local_media.error(),
@@ -430,6 +469,31 @@ impl NativeWorkflows {
             );
             self.artwork_reload = true;
         }
+    }
+
+    fn poll_dat_activity(&mut self, context: &egui::Context, activity: &mut Activity) {
+        if let Some(page) = self.app.sources_ui.dat_sources_page.as_mut()
+            && (page.poll() || page.is_busy())
+        {
+            context.request_repaint();
+        }
+        self.observe_dat_activity(activity);
+    }
+
+    fn observe_dat_activity(&mut self, activity: &mut Activity) {
+        let state = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_ref()
+            .and_then(crate::dat_sources_page::DatSourcesPageState::background_activity);
+        let error = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_ref()
+            .and_then(crate::dat_sources_page::DatSourcesPageState::background_error);
+        observe_dat_activity_state(activity, &mut self.dat_job, state, error);
     }
 
     fn select(&mut self, path: &Path) {
@@ -565,5 +629,37 @@ impl NativeWorkflows {
     #[cfg(test)]
     pub(super) fn selected_path(&self) -> Option<&Path> {
         self.selected.as_deref()
+    }
+}
+
+pub(super) fn observe_dat_activity_state(
+    activity: &mut Activity,
+    job: &mut Option<u64>,
+    state: Option<crate::dat_sources_page::DatBackgroundActivity>,
+    error: Option<String>,
+) {
+    if let Some(state) = state {
+        if job.is_none() {
+            let id = activity.queue(
+                state.title,
+                Route::Section(super::routes::Section::Advanced),
+                false,
+            );
+            activity.start(id);
+            *job = Some(id);
+        }
+        if let Some(active) = job.and_then(|id| activity.jobs.get_mut(&id)) {
+            active.item = Some(state.detail);
+        }
+    } else if let Some(id) = job.take() {
+        activity.finish(
+            id,
+            if error.is_some() {
+                "The verification-data operation stopped safely.".into()
+            } else {
+                "Verification data is ready to review.".into()
+            },
+            error,
+        );
     }
 }

@@ -1521,6 +1521,8 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
                 ]
             } else if section == Section::Sources {
                 vec!["Add source"]
+            } else if section == Section::Advanced {
+                vec!["DATs & Verification"]
             } else {
                 vec![section.action()]
             };
@@ -1590,7 +1592,62 @@ fn gui_v2_sources_route_hosts_the_native_source_manager() {
 
     assert!(strings.iter().any(|value| value == "Related source tools"));
     assert!(strings.iter().any(|value| value == "Game Folders"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Verification Data / DATs")
+    );
     assert!(!strings.iter().any(|value| value.contains("separate window")));
+}
+
+#[test]
+fn gui_v2_advanced_routes_to_native_dat_management() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Advanced);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+
+    assert!(strings.iter().any(|value| value == "DATs & Verification"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("trusted DAT catalogues"))
+    );
+    assert!(!strings.iter().any(|value| value.contains("separate window")));
+    assert_eq!(
+        app.native_workflows.as_ref().unwrap().app.view,
+        crate::navigation::MainView::DatSources
+    );
+}
+
+#[test]
+fn gui_v2_dat_worker_lifecycle_is_reflected_in_activity() {
+    let mut activity = Activity::default();
+    let mut job = None;
+
+    native_workflows::observe_dat_activity_state(
+        &mut activity,
+        &mut job,
+        Some(crate::dat_sources_page::DatBackgroundActivity {
+            title: "Validating DAT",
+            detail: "Reading catalogue entries".into(),
+        }),
+        None,
+    );
+    assert_eq!(activity.running(), 1);
+    let active = activity.jobs.values().next().unwrap();
+    assert_eq!(active.title, "Validating DAT");
+    assert_eq!(active.item.as_deref(), Some("Reading catalogue entries"));
+
+    native_workflows::observe_dat_activity_state(
+        &mut activity,
+        &mut job,
+        None,
+        Some("fixture validation failure".into()),
+    );
+    assert_eq!(activity.running(), 0);
+    assert_eq!(activity.jobs.values().next().unwrap().phase, Phase::Failed);
 }
 
 #[test]

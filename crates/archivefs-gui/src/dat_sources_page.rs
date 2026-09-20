@@ -84,25 +84,24 @@ use archivefs_core::dat::sources::{
     save_dat_sources_config_to, suggest_display_name, validate_dat_source,
 };
 use archivefs_core::dat::tosec_release_pack::{
-    PackAvailability, PersistedTosecPack, TosecManagedCandidate,
+    PackAvailability, PersistedTosecPack, TOSEC_OFFICIAL_DOWNLOADS_PAGE, TosecManagedCandidate,
     TosecManagedSnapshotStore, TosecPackDat, TosecRevisionComparison, TosecSelectionKey,
-    TOSEC_OFFICIAL_DOWNLOADS_PAGE, default_tosec_packs_path, inventory_release_pack,
-    load_tosec_packs, save_tosec_packs,
+    default_tosec_packs_path, inventory_release_pack, load_tosec_packs, save_tosec_packs,
 };
 use archivefs_core::dat::updates::{
     HttpsManagedDatTransport, ManagedDatProvider, ManagedDatReadOnlySource,
     ManagedDatSourceDescriptor, ManagedDatSourceId, ManagedDatState, ManagedDatUpdateFailureKind,
-    ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy, RedumpBiosSystem,
-    RedumpAcquisitionMode, RedumpGameSystem, check_managed_dat_update, import_managed_fbneo_dat,
-    managed_dat_root, rollback_managed_dat_to_previous, update_managed_dat,
+    ManagedDatUpdateOptions, ManagedDatUpdateOutcome, ManagedDatUpdatePolicy,
+    RedumpAcquisitionMode, RedumpBiosSystem, RedumpGameSystem, check_managed_dat_update,
+    import_managed_fbneo_dat, managed_dat_root, rollback_managed_dat_to_previous,
+    update_managed_dat,
 };
 use archivefs_core::identity_source::no_intro::{
-    NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackImportStatus,
-    NoIntroPackComparison, NoIntroPackInspection, activate_staged_no_intro_pack_at,
-    compare_staged_no_intro_pack_at, inspect_no_intro_pack,
-    load_current_no_intro_pack_summary, load_no_intro_pack_snapshots_at,
-    load_staged_no_intro_pack_summary_at, report_no_intro_lifecycle, rollback_no_intro_pack_at,
-    stage_no_intro_pack,
+    NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackComparison,
+    NoIntroPackImportStatus, NoIntroPackInspection, activate_staged_no_intro_pack_at,
+    compare_staged_no_intro_pack_at, inspect_no_intro_pack, load_current_no_intro_pack_summary,
+    load_no_intro_pack_snapshots_at, load_staged_no_intro_pack_summary_at,
+    report_no_intro_lifecycle, rollback_no_intro_pack_at, stage_no_intro_pack,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -440,6 +439,15 @@ pub(crate) struct RunningJobView {
     /// The source's assigned platform, shown only when it is authoritative
     /// (assigned and recognised by this build). Never guessed from the path.
     pub(crate) platform_display: Option<String>,
+}
+
+/// Coarse, privacy-safe state exported to GUI v2's shared Activity surface.
+/// The DAT page remains the owner of execution and detailed progress; this is
+/// deliberately only enough for navigation-independent lifecycle reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DatBackgroundActivity {
+    pub(crate) title: &'static str,
+    pub(crate) detail: String,
 }
 
 impl RunningJobView {
@@ -3145,6 +3153,54 @@ impl DatSourcesPageState {
         self.job.is_some() || self.apply_job.is_some() || self.managed_job.is_some()
     }
 
+    pub(crate) fn background_activity(&self) -> Option<DatBackgroundActivity> {
+        if let Some(job) = &self.job {
+            return Some(DatBackgroundActivity {
+                title: match job.kind {
+                    JobKind::Validate | JobKind::ValidateAll => "Validating DAT",
+                    JobKind::Audit => "Rechecking library",
+                },
+                detail: job.latest.clone(),
+            });
+        }
+        if let Some(job) = &self.managed_job {
+            let status = self
+                .managed_statuses
+                .get(&managed_source_key(&job.source_id));
+            return Some(DatBackgroundActivity {
+                title: if matches!(status, Some(ManagedDatStatusView::Updating)) {
+                    "Updating verification data"
+                } else {
+                    "Checking verification data"
+                },
+                detail: job.source_id.to_string(),
+            });
+        }
+        if self.apply_running {
+            return Some(DatBackgroundActivity {
+                title: "Applying verified renames",
+                detail: "Writing the approved transaction and its recovery journal.".to_string(),
+            });
+        }
+        if self.rollback_running || self.resume_running {
+            return Some(DatBackgroundActivity {
+                title: "Restoring verification history",
+                detail: "Using the existing transaction journal.".to_string(),
+            });
+        }
+        None
+    }
+
+    pub(crate) fn background_error(&self) -> Option<String> {
+        self.managed_action_error
+            .clone()
+            .or_else(|| self.audit_error.clone())
+            .or_else(|| self.apply_error.clone())
+            .or_else(|| self.rollback_error.clone())
+            .or_else(|| self.resume_error.clone())
+            .or_else(|| self.action_error.clone())
+    }
+
     /// Signals cancellation and immediately forgets the running job, whatever
     /// it targets.
     ///
@@ -4405,9 +4461,10 @@ impl DatSourcesPageState {
             Ok(report) => {
                 self.no_intro_import_status = Some(report.status);
                 self.no_intro_staged = Some(inspection_from_import_report(&report));
-                self.no_intro_staged_comparison = archivefs_core::app_dirs::data_path("no_intro_pack")
-                    .ok()
-                    .and_then(|root| compare_staged_no_intro_pack_at(&root).ok().flatten());
+                self.no_intro_staged_comparison =
+                    archivefs_core::app_dirs::data_path("no_intro_pack")
+                        .ok()
+                        .and_then(|root| compare_staged_no_intro_pack_at(&root).ok().flatten());
             }
             Err(error) => self.no_intro_action_error = Some(error.to_string()),
         }
@@ -4503,7 +4560,12 @@ impl DatSourcesPageState {
                     let _ = self.draft.remove(&id);
                 }
                 for source in report.import.accepted {
-                    if self.draft.entries().iter().any(|entry| entry.path == source.artifact_path) {
+                    if self
+                        .draft
+                        .entries()
+                        .iter()
+                        .any(|entry| entry.path == source.artifact_path)
+                    {
                         continue;
                     }
                     let entry = DatSourceEntry {
@@ -4896,8 +4958,9 @@ impl DatSourcesPageState {
                             .and_then(|snapshot| snapshot.release_version.clone());
                         view.active_dat_count =
                             snapshot.as_ref().map_or(0, |snapshot| snapshot.dats.len());
-                        view.active_source_path =
-                            snapshot.as_ref().map(|snapshot| snapshot.source_path.clone());
+                        view.active_source_path = snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.source_path.clone());
                         view.history_sha256 = history
                             .into_iter()
                             .map(|snapshot| snapshot.sha256)
@@ -4955,17 +5018,15 @@ impl DatSourcesPageState {
             skipped: Vec::new(),
             scan_complete: true,
         };
-        let result = self
-            .tosec_managed_store()
-            .and_then(|store| {
-                let candidate = store
-                    .stage_release_pack(&inventory, &pack.selections, now)
-                    .map_err(|error| error.to_string())?;
-                let preview = store
-                    .preview_activation(&candidate)
-                    .map_err(|error| error.to_string())?;
-                Ok((candidate, preview))
-            });
+        let result = self.tosec_managed_store().and_then(|store| {
+            let candidate = store
+                .stage_release_pack(&inventory, &pack.selections, now)
+                .map_err(|error| error.to_string())?;
+            let preview = store
+                .preview_activation(&candidate)
+                .map_err(|error| error.to_string())?;
+            Ok((candidate, preview))
+        });
         match result {
             Ok((candidate, preview)) => {
                 self.tosec_managed_preview = Some(TosecManagedPreviewView {
@@ -4998,7 +5059,8 @@ impl DatSourcesPageState {
             return;
         };
         if candidate.snapshot.pack_id != pack_id {
-            self.tosec_action_error = Some("The staged TOSEC pack no longer matches this selection.".to_string());
+            self.tosec_action_error =
+                Some("The staged TOSEC pack no longer matches this selection.".to_string());
             return;
         }
         let expected_active = self
@@ -5072,9 +5134,11 @@ impl DatSourcesPageState {
                 self.draft = registry;
                 self.load_problems = problems;
             }
-            Err(error) => self.tosec_action_error = Some(format!(
-                "TOSEC snapshot activated, but the local catalogue list could not be reloaded: {error}"
-            )),
+            Err(error) => {
+                self.tosec_action_error = Some(format!(
+                    "TOSEC snapshot activated, but the local catalogue list could not be reloaded: {error}"
+                ))
+            }
         }
         if !outcome.failed.is_empty() {
             self.tosec_action_error = Some(format!(
@@ -6433,10 +6497,10 @@ impl DatSourcesPageState {
 
     fn redump_game_rows_view(&self) -> Vec<ManagedDatSourceRowView> {
         RedumpGameSystem::all()
-        .iter()
-        .copied()
-        .map(|system| self.redump_game_row_view(system))
-        .collect()
+            .iter()
+            .copied()
+            .map(|system| self.redump_game_row_view(system))
+            .collect()
     }
 
     fn redump_game_row_view(&self, system: RedumpGameSystem) -> ManagedDatSourceRowView {
@@ -7662,7 +7726,11 @@ pub(crate) fn show_dat_sources_page(
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
 
-    widgets::workflow_header(ui, "DATs & Verification", "Check your games against trusted DAT catalogues.");
+    widgets::workflow_header(
+        ui,
+        "DATs & Verification",
+        "Check your games against trusted DAT catalogues.",
+    );
     if let Some(verify_action) = show_single_catalogue_verify_section(ui, view, ui_state) {
         action = Some(verify_action);
     }
@@ -7700,11 +7768,19 @@ pub(crate) fn show_dat_sources_page(
     widgets::full_width_card(ui, |ui| {
         ui.strong("Last verification — match summary");
         if let Some(audit) = &view.audit {
-            ui.label(format!("{} · {}", audit.source_display_name, audit.scan_root_short));
+            ui.label(format!(
+                "{} · {}",
+                audit.source_display_name, audit.scan_root_short
+            ));
             ui.horizontal_wrapped(|ui| {
                 for category in &audit.categories {
-                    let label = if category.label == "Not in catalogue" { "No match" } else { category.label };
-                    ui.label(format!("{label}: {}", category.count)).on_hover_text(category.meaning);
+                    let label = if category.label == "Not in catalogue" {
+                        "No match"
+                    } else {
+                        category.label
+                    };
+                    ui.label(format!("{label}: {}", category.count))
+                        .on_hover_text(category.meaning);
                 }
             });
             ui.weak("Needs re-check: freshness is not assessed here. These are results from the last selected audit, not a new scan.");
@@ -7759,13 +7835,11 @@ pub(crate) fn show_dat_sources_page(
                 action = Some(acquisition_action);
             }
             ui.add_space(10.0);
-
         });
     if action.is_some() {
         ui.ctx().request_repaint();
     }
     ui.add_space(10.0);
-
 
     save_result::show(ui, &view.save_results);
 
@@ -8475,12 +8549,24 @@ fn show_evidence_acquisition_section(
             ));
             let comparison = match view.no_intro_staged_comparison {
                 Some(NoIntroPackComparison::NoActiveSnapshot) => "No active snapshot exists yet.",
-                Some(NoIntroPackComparison::SameSnapshot) => "This staged content matches the active snapshot.",
-                Some(NoIntroPackComparison::NewerRevision) => "Update available: the staged DAT revision is newer than the installed revision.",
-                Some(NoIntroPackComparison::SameRevision) => "This pack has the same DAT revision as the installed source.",
-                Some(NoIntroPackComparison::OlderRevision) => "This pack is older than the installed revision; activation is blocked.",
-                Some(NoIntroPackComparison::RevisionUnknown) => "Revision comparison is inconclusive; review the staged pack before activation.",
-                Some(NoIntroPackComparison::DifferentSnapshot) => "This staged content differs from the active snapshot; its revision is not known.",
+                Some(NoIntroPackComparison::SameSnapshot) => {
+                    "This staged content matches the active snapshot."
+                }
+                Some(NoIntroPackComparison::NewerRevision) => {
+                    "Update available: the staged DAT revision is newer than the installed revision."
+                }
+                Some(NoIntroPackComparison::SameRevision) => {
+                    "This pack has the same DAT revision as the installed source."
+                }
+                Some(NoIntroPackComparison::OlderRevision) => {
+                    "This pack is older than the installed revision; activation is blocked."
+                }
+                Some(NoIntroPackComparison::RevisionUnknown) => {
+                    "Revision comparison is inconclusive; review the staged pack before activation."
+                }
+                Some(NoIntroPackComparison::DifferentSnapshot) => {
+                    "This staged content differs from the active snapshot; its revision is not known."
+                }
                 None => "The staged content has not been compared with an active snapshot.",
             };
             ui.label(comparison);
@@ -8557,9 +8643,10 @@ fn show_no_intro_lifecycle_status(
     }
     for platform in &report.platforms {
         let (label, tone) = match platform.health {
-            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Healthy => {
-                ("Installed snapshot · update status unknown", widgets::StatusTone::Success)
-            }
+            archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Healthy => (
+                "Installed snapshot · update status unknown",
+                widgets::StatusTone::Success,
+            ),
             archivefs_core::identity_source::no_intro::NoIntroLifecycleHealth::Conflict => {
                 ("Needs review / conflict", widgets::StatusTone::Warning)
             }
@@ -10071,21 +10158,25 @@ fn show_tosec_release_packs_section(
         if let Some(preview) = &view.tosec_managed.staged_preview {
             ui.separator();
             let (comparison, tone) = match preview.revision_comparison {
-                TosecRevisionComparison::NoActiveRelease => {
-                    ("Ready to activate: first installed release" , widgets::StatusTone::Pending)
-                }
-                TosecRevisionComparison::Newer => {
-                    ("Update available: staged release is newer", widgets::StatusTone::Success)
-                }
+                TosecRevisionComparison::NoActiveRelease => (
+                    "Ready to activate: first installed release",
+                    widgets::StatusTone::Pending,
+                ),
+                TosecRevisionComparison::Newer => (
+                    "Update available: staged release is newer",
+                    widgets::StatusTone::Success,
+                ),
                 TosecRevisionComparison::Same => {
                     ("Same release as installed", widgets::StatusTone::Pending)
                 }
-                TosecRevisionComparison::Older => {
-                    ("Older release: activation blocked", widgets::StatusTone::Warning)
-                }
-                TosecRevisionComparison::Unknown => {
-                    ("Revision unknown: review before activation", widgets::StatusTone::Warning)
-                }
+                TosecRevisionComparison::Older => (
+                    "Older release: activation blocked",
+                    widgets::StatusTone::Warning,
+                ),
+                TosecRevisionComparison::Unknown => (
+                    "Revision unknown: review before activation",
+                    widgets::StatusTone::Warning,
+                ),
             };
             widgets::status_badge(ui, comparison, tone);
             ui.label(format!(
@@ -10137,9 +10228,8 @@ fn show_tosec_release_packs_section(
                 .clicked()
                     && action.is_none()
                 {
-                    action = Some(DatSourcesPageAction::RollbackTosecSnapshot {
-                        hash: hash.clone(),
-                    });
+                    action =
+                        Some(DatSourcesPageAction::RollbackTosecSnapshot { hash: hash.clone() });
                 }
             }
         }
@@ -13751,7 +13841,6 @@ fn show_kept_but_not_understood(ui: &mut egui::Ui, view: &DatSourcesPageView) {
         }
     });
 }
-
 
 impl ArchiveFsApp {
     /// Draws the DAT Sources page and applies whatever it asked for.

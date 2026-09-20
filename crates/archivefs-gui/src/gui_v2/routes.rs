@@ -103,7 +103,7 @@ impl Section {
             Self::Artwork => "Manage artwork",
             Self::Sources => "Find game folders",
             Self::History => "Review previous changes",
-            Self::Advanced => "Open Legacy / Advanced interface",
+            Self::Advanced => "Manage verification data",
             _ => "Browse my games",
         }
     }
