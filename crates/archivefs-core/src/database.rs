@@ -7718,6 +7718,7 @@ fn scan_and_persist_folders_transaction(
             let nested = folder.path.join("arcade");
             nested.is_dir().then_some(nested)
         };
+        let arcade_specialist = arcade_root.is_some();
         // Discover extracted sets before the generic scanner. The latter can
         // report a directory-level change while inspecting chip-labelled
         // members; the bounded arcade pass is still safe and useful in that
@@ -7726,21 +7727,21 @@ fn scan_and_persist_folders_transaction(
             .as_ref()
             .and_then(|root| crate::ingestion::discover_extracted_sets(root).ok());
         let discovery_started = std::time::Instant::now();
-        let mut scanner_failed = false;
-        let discovery = match ArchiveScanner::new(&folder_config)
-            .scan_archives_with_cache_excluding(&fingerprint_refs, &folder.excluded_source_roots)
-        {
-            Ok(discovery) => discovery,
-            Err(error) => {
-                if arcade_sets
-                    .as_ref()
-                    .is_some_and(|sets| !sets.sets.is_empty())
-                {
-                    scanner_failed = true;
-                    counts.errors_count += 1;
-                    folder_errors.push((folder.path.clone(), error.to_string()));
-                    ArchiveScanDiscovery::default()
-                } else {
+        let discovery = if arcade_specialist {
+            // The specialist pass has already enumerated and validated the
+            // extracted sets. Running the generic scanner here would walk
+            // every chip-labelled member again and can reject a set when its
+            // directory changes during that redundant walk.
+            ArchiveScanDiscovery::default()
+        } else {
+            match ArchiveScanner::new(&folder_config)
+                .scan_archives_with_cache_excluding(
+                    &fingerprint_refs,
+                    &folder.excluded_source_roots,
+                )
+            {
+                Ok(discovery) => discovery,
+                Err(error) => {
                     counts.errors_count += 1;
                     let message = error.to_string();
                     database.record_source_scan_result(
@@ -7754,7 +7755,7 @@ fn scan_and_persist_folders_transaction(
                 }
             }
         };
-        let discovery_complete = !scanner_failed && discovery.is_complete();
+        let discovery_complete = discovery.is_complete();
         if !discovery_complete {
             counts.errors_count += discovery.scan_errors_total as i64;
             let detail = discovery
@@ -7815,7 +7816,7 @@ fn scan_and_persist_folders_transaction(
         // never in place of it - see `ScanPersistSummary::ingestion_stats`.
         let mut ingestion_evidence = Vec::new();
         let ingestion_started = std::time::Instant::now();
-        if let Ok(report) =
+        if !arcade_specialist && let Ok(report) =
             crate::ingestion::discover_source_with_fingerprints(&folder.path, &fingerprint_refs)
         {
             info!(
@@ -7928,7 +7929,9 @@ fn scan_and_persist_folders_transaction(
             arcade_ingestion.note_support(kind);
             false
         });
-        arcade_ingestion.raw_files_considered += before_support_filter;
+        if !arcade_specialist {
+            arcade_ingestion.raw_files_considered += before_support_filter;
+        }
         archives.sort_by(|left, right| left.path.cmp(&right.path));
         archives.dedup_by(|left, right| left.path == right.path);
         let non_archive_fingerprints = discovery.non_archive_fingerprints;
