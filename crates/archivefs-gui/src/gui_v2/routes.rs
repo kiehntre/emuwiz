@@ -17,6 +17,7 @@ pub(super) enum Section {
     Mods,
     Artwork,
     Sources,
+    Dat,
     Activity,
     History,
     Settings,
@@ -37,6 +38,7 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::Mods,
     Section::Artwork,
     Section::Sources,
+    Section::Dat,
     Section::Activity,
     Section::History,
     Section::Settings,
@@ -59,6 +61,7 @@ impl Section {
             Self::Mods => "Mods & Cheats",
             Self::Artwork => "Artwork & Metadata",
             Self::Sources => "Sources",
+            Self::Dat => "DAT Management",
             Self::Activity => "Activity",
             Self::History => "History",
             Self::Settings => "Settings",
@@ -89,6 +92,7 @@ impl Section {
             }
             Self::Artwork => "Find covers, screenshots and information for your games.",
             Self::Sources => "Find your game folders and choose which ones to include.",
+            Self::Dat => "Manage the trusted game identification data EmuWiz uses to check releases.",
             Self::Activity => "See what is happening, how it is going and what to do next.",
             Self::History => "Review previous changes and the recovery options available for them.",
             Self::Settings => "Adjust this interface without changing your games.",
@@ -107,8 +111,9 @@ impl Section {
             Self::Mods => "Choose a game",
             Self::Artwork => "Manage artwork",
             Self::Sources => "Find game folders",
+            Self::Dat => "Manage identification data",
             Self::History => "Review previous changes",
-            Self::Advanced => "Manage verification data",
+            Self::Advanced => "Open specialist tools",
             _ => "Browse my games",
         }
     }
@@ -149,6 +154,16 @@ impl Route {
             Self::Game(id) | Self::Task { game: id, .. } => Some(*id),
             _ => None,
         }
+    }
+}
+
+/// Migrate routes written by the pre-retirement shell.  `Advanced` used to
+/// be the normal DAT page; it now intentionally names the specialist escape.
+pub(super) fn migrate_route(route: Route) -> Route {
+    if route == Route::Section(Section::Advanced) {
+        Route::Section(Section::Dat)
+    } else {
+        route
     }
 }
 

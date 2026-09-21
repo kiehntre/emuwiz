@@ -1137,7 +1137,7 @@ pub(super) fn observe_dat_activity_state(
         if job.is_none() {
             let id = activity.queue(
                 state.title,
-                Route::Section(super::routes::Section::Advanced),
+                Route::Section(super::routes::Section::Dat),
                 false,
             );
             activity.start(id);

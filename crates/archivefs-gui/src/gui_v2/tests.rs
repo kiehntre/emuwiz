@@ -700,7 +700,19 @@ fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
         assert!(!section.action().is_empty());
         assert_eq!(Route::Section(*section).section(), *section);
     }
-    assert_eq!(unique.len(), 17);
+    assert_eq!(unique.len(), 18);
+}
+
+#[test]
+fn gui_v2_migrates_the_old_dat_bookmark_to_dat_management() {
+    assert_eq!(
+        routes::migrate_route(Route::Section(Section::Advanced)),
+        Route::Section(Section::Dat)
+    );
+    assert_eq!(
+        routes::migrate_route(Route::Section(Section::Build)),
+        Route::Section(Section::Build)
+    );
 }
 
 #[test]
@@ -913,6 +925,10 @@ fn gui_v2_legacy_handoff_preserves_game_and_workflow() {
     );
     assert_eq!(
         legacy::destination(Section::Advanced, false),
+        MainView::Library
+    );
+    assert_eq!(
+        legacy::destination(Section::Dat, false),
         MainView::DatSources
     );
 }
@@ -1902,6 +1918,7 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
         Section::Build,
         Section::Emulators,
         Section::Sources,
+        Section::Dat,
         Section::Advanced,
     ] {
         for size in [[1024.0, 600.0], [640.0, 480.0]] {
@@ -1920,8 +1937,10 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
                 vec!["Organise verified games", "Build a clean playing library"]
             } else if section == Section::Sources {
                 vec!["Add source"]
-            } else if section == Section::Advanced {
+            } else if section == Section::Dat {
                 vec!["DATs & Verification"]
+            } else if section == Section::Advanced {
+                vec!["Open specialist interface"]
             } else {
                 vec![section.action()]
             };
@@ -2004,10 +2023,10 @@ fn gui_v2_sources_route_hosts_the_native_source_manager() {
 }
 
 #[test]
-fn gui_v2_advanced_routes_to_native_dat_management() {
+fn gui_v2_dat_management_is_the_native_normal_route() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
-    app.router.current = Route::Section(Section::Advanced);
+    app.router.current = Route::Section(Section::Dat);
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
 
@@ -2026,6 +2045,19 @@ fn gui_v2_advanced_routes_to_native_dat_management() {
         app.native_workflows.as_ref().unwrap().app.view,
         crate::navigation::MainView::DatSources
     );
+}
+
+#[test]
+fn gui_v2_advanced_is_a_specialist_escape_not_a_duplicate_dat_route() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Advanced);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value == "Advanced tools"));
+    assert!(strings.iter().any(|value| value == "Open specialist interface"));
+    assert!(strings.iter().any(|value| value == "Open DAT Management"));
+    assert!(!strings.iter().any(|value| value == "DATs & Verification"));
 }
 
 #[test]

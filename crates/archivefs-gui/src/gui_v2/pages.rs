@@ -153,6 +153,7 @@ impl App {
                 Route::Section(Section::Games | Section::Launch) => self.games(ui),
                 Route::Section(Section::Emulators) => self.emulator_setup(ui),
                 Route::Section(Section::Sources) => self.sources(ui),
+                Route::Section(Section::Dat) => self.dat_sources(ui),
                 Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
                 Route::Section(Section::Mods) => self.mods_page(ui, None),
                 Route::Section(Section::Check) => self.check_games(ui),
@@ -165,7 +166,7 @@ impl App {
                 Route::Section(Section::Activity) => self.activities(ui),
                 Route::Section(Section::History) => self.history(ui),
                 Route::Section(Section::Settings) => self.settings(ui),
-                Route::Section(Section::Advanced) => self.dat_sources(ui),
+                Route::Section(Section::Advanced) => self.advanced(ui),
                 Route::Task {
                     section: Section::Build,
                     ..
@@ -1215,6 +1216,30 @@ impl App {
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
         workflows.show_dat_sources(ui, &mut self.activity);
+    }
+
+    fn advanced(&mut self, ui: &mut egui::Ui) {
+        check_scroll(ui, None, |ui| {
+            ui.heading("Advanced tools");
+            ui.label("These tools are for specialist inspection and troubleshooting. Normal organisation, identification data and setup have their own native pages.");
+            if primary(ui, "Open specialist interface") {
+                self.legacy(Section::Advanced);
+            }
+            ui.separator();
+            ui.strong("Specialist tools");
+            ui.label("Mounts, media-set inspection, storage and journal details remain available in the existing technical interface.");
+            ui.add_space(8.0);
+            ui.strong("Normal pages");
+            if ui.button("Open DAT Management").clicked() {
+                self.go(Route::Section(Section::Dat));
+            }
+            if ui.button("Open Organisation").clicked() {
+                self.go(Route::Section(Section::Build));
+            }
+            ui.collapsing("Advanced details", |ui| {
+                ui.label("The specialist interface preserves legacy mount, media, storage and history tools. Opening it changes nothing.");
+            });
+        });
     }
 
     fn artwork_metadata(&mut self, ui: &mut egui::Ui, selected: Option<i64>) {

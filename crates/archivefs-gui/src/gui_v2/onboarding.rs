@@ -120,7 +120,7 @@ pub(super) fn show(
                     ));
                     ui.label("Open the existing database upgrade workflow from Advanced when you are ready.");
                     if button(ui, "Open upgrade tools") {
-                        action = Some(Action::Open(Section::Advanced));
+                        action = Some(Action::Open(Section::Dat));
                     }
                 });
             }
@@ -342,7 +342,7 @@ fn checklist(
             if !snapshot.identification_data_ready
                 && ui.button("Open identification data").clicked()
             {
-                *action = Some(Action::Open(Section::Advanced));
+                *action = Some(Action::Open(Section::Dat));
             }
             ui.end_row();
         });

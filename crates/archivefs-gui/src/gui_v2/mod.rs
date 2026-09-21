@@ -27,7 +27,7 @@ use backend::{
 use eframe::egui;
 use library::{Detail, DuplicateReport, Filter, Library, SharedLibrary};
 use mods::ModsPageState;
-use routes::{Route, Router, Section};
+use routes::{Route, Router, Section, migrate_route};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -1116,6 +1116,8 @@ impl App {
                                 }
                                 Payload::Preferences(preferences) => {
                                     self.welcome_dismissed = preferences.welcome_dismissed;
+                                    let mut preferences = preferences;
+                                    preferences.route = migrate_route(preferences.route);
                                     if !self.interacted {
                                         let keep_onboarding =
                                             self.environment.as_ref().is_some_and(|snapshot| {
