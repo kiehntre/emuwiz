@@ -187,7 +187,7 @@ and `CARGO_INCREMENTAL=0`; no worktree target directory or `/dev/shm` was used.
 | Full GUI library | 2,779 passed, 3 existing failures, 2 ignored |
 | Workspace Clippy, all targets/features, `-D warnings` | Passed |
 | Targeted rustfmt check, git diff check, scoped task-postcheck | Passed |
-| Release build, `archivefs-gui --bin emuwiz-v2` | Passed |
+| Release build, `archivefs-gui --bin emuwiz` (native GUI v2) | Passed |
 
 The three unchanged legacy GUI failures are:
 
@@ -199,7 +199,8 @@ They concern the legacy 1024x600 Library layout and Converter/Disc Conversion
 naming, not these v2 fixes. The subset runs used the GUI test executable produced
 by Cargo. Logs are `/tmp/emuwiz-v2-liveqa-*.log` on the development machine.
 
-Release output: `/home/davedap/.cache/emuwiz-cargo-target/release/emuwiz-v2`.
+Release output: `/home/davedap/.cache/emuwiz-cargo-target/release/emuwiz` (the
+native GUI v2 release target; `emuwiz-gui` and `archivefs-gui` remain aliases).
 A release read-only measurement loaded 103,165 games/52 platforms in 911 ms and
 indexed 18,940 covers/5,095 screenshot groups in 2,723 ms with no artwork network
 requests. These are one-run observations, not timing guarantees. The running

@@ -310,6 +310,29 @@ def validate_binary(
     return info
 
 
+def validate_gui_identity(path: pathlib.Path, fixture_mode: bool) -> dict[str, str]:
+    """Prove that the release GUI is the native v2 entrypoint."""
+    if fixture_mode:
+        return {
+            "target": "emuwiz",
+            "entrypoint": "crates/archivefs-gui/src/bin/emuwiz.rs",
+            "generation": "fixture",
+            "version_probe": "fixture",
+        }
+    version = run_readonly([str(path), "--version"])
+    if not version or "GUI v2" not in version:
+        raise ReleaseError(
+            f"GUI binary does not identify the native v2 release experience: {path}",
+            EXIT_INPUT,
+        )
+    return {
+        "target": "emuwiz",
+        "entrypoint": "crates/archivefs-gui/src/bin/emuwiz.rs",
+        "generation": "native-v2",
+        "version_probe": version,
+    }
+
+
 def safe_output_root(path: pathlib.Path) -> pathlib.Path:
     path = path.expanduser().resolve()
     home = pathlib.Path.home().resolve()
@@ -436,7 +459,7 @@ def write_generated_docs(root: pathlib.Path, version: str, release_platform: str
     docs.mkdir(parents=True, exist_ok=True)
     readme = f"""EmuWiz {version} for {release_platform}
 
-bin/emuwiz is the graphical application.
+bin/emuwiz is the native EmuWiz GUI v2 application.
 bin/emuwiz-cli is the command-line application.
 
 Verify this directory from its top level with:
@@ -623,6 +646,14 @@ def verify_directory(
     artifacts = manifest.get("artifacts")
     if not isinstance(records, list) or not isinstance(artifacts, list):
         raise ReleaseError("manifest files/artifacts are invalid", EXIT_VERIFY)
+    gui = manifest.get("gui")
+    if (
+        not isinstance(gui, dict)
+        or gui.get("target") != "emuwiz"
+        or gui.get("generation") not in {"native-v2", "fixture"}
+        or gui.get("entrypoint") != "crates/archivefs-gui/src/bin/emuwiz.rs"
+    ):
+        raise ReleaseError("manifest does not prove the canonical native GUI target", EXIT_VERIFY)
     expected: dict[str, dict[str, Any]] = {}
     for record in records:
         if not isinstance(record, dict) or not isinstance(record.get("path"), str):
@@ -660,6 +691,9 @@ def verify_directory(
             raise ReleaseError(f"artifact hash disagrees with file record: {relative}", EXIT_VERIFY)
         if artifact.get("size") != expected[relative]["size"]:
             raise ReleaseError(f"artifact size disagrees with file record: {relative}", EXIT_VERIFY)
+    gui_record = next((item for item in artifacts if item.get("path") == "bin/emuwiz"), None)
+    if gui_record is None or gui.get("elf_sha256") != gui_record.get("sha256"):
+        raise ReleaseError("manifest GUI ELF identity is missing or inconsistent", EXIT_VERIFY)
     actual = {path.relative_to(root).as_posix() for path in payload_files(root)}
     allowed = set(expected) | FINAL_METADATA
     extras = sorted(actual - allowed)
@@ -802,6 +836,7 @@ def package(args: argparse.Namespace) -> pathlib.Path:
     inspected: dict[str, dict[str, Any]] = {}
     for kind, path in binaries.items():
         inspected[kind] = validate_binary(path, arch, args.allow_symlink, not args.fixture_mode)
+    gui_identity = validate_gui_identity(inspected["gui"]["source_path"], args.fixture_mode)
     appimages: list[tuple[pathlib.Path, dict[str, Any]]] = []
     for value in args.appimage:
         path = pathlib.Path(value).expanduser()
@@ -880,6 +915,10 @@ def package(args: argparse.Namespace) -> pathlib.Path:
             f"cargo: {cargo_version or 'unavailable'}",
             f"packager_version: {PACKAGER_VERSION}",
             f"packaging_tool_sha: {packaging_sha}",
+            f"gui_target: {gui_identity['target']}",
+            f"gui_entrypoint: {gui_identity['entrypoint']}",
+            f"gui_generation: {gui_identity['generation']}",
+            f"gui_version_probe: {gui_identity['version_probe']}",
             "dynamic_dependency_note: names are informational, not proof of target availability",
             "",
         ]
@@ -945,6 +984,12 @@ def package(args: argparse.Namespace) -> pathlib.Path:
                 "cargo": cargo_version,
             },
             "artifacts": sorted(artifact_records, key=lambda item: item["path"]),
+            "gui": {
+                **gui_identity,
+                "elf_sha256": next(
+                    item["sha256"] for item in artifact_records if item["path"] == "bin/emuwiz"
+                ),
+            },
             "files": sorted(pre_manifest, key=lambda item: item["path"]),
             "licenses": copied_licenses,
             "provenance": {

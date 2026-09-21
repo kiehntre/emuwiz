@@ -1,4 +1,4 @@
-//! GUI v2 is a parallel presentation layer, not a mode of the legacy app.
+//! Native EmuWiz GUI v2 presentation layer.
 mod activity;
 mod artwork;
 mod backend;
@@ -34,12 +34,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Run the independent GUI-v2 executable. Existing entry points remain legacy.
+/// Stable release identity used by packaging and `--version` verification.
+pub const GUI_GENERATION: &str = "native-v2";
+
+/// Run the native EmuWiz GUI v2 application.
 pub fn run() -> eframe::Result<()> {
     crate::init_logging();
     let args: Vec<_> = std::env::args_os().collect();
     if args.iter().any(|arg| arg == "--version") {
-        println!("{} · GUI v2 milestone 1", crate::gui_version_line());
+        println!(
+            "{} · GUI v2 ({})",
+            crate::gui_version_line(),
+            GUI_GENERATION
+        );
         return Ok(());
     }
     if args.iter().any(|arg| arg == "--measure-library") {

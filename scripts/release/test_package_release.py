@@ -92,6 +92,12 @@ class ReleasePackagerTests(unittest.TestCase):
     def test_01_valid_synthetic_executable_package(self) -> None:
         release, result = self._package()
         self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = json.loads((release / "manifest.json").read_text())
+        self.assertEqual(manifest["gui"]["target"], "emuwiz")
+        self.assertEqual(manifest["gui"]["entrypoint"], "crates/archivefs-gui/src/bin/emuwiz.rs")
+        self.assertEqual(manifest["gui"]["generation"], "fixture")
+        gui_artifact = next(item for item in manifest["artifacts"] if item["path"] == "bin/emuwiz")
+        self.assertEqual(manifest["gui"]["elf_sha256"], gui_artifact["sha256"])
         verified = self._verify(release)
         self.assertEqual(verified.returncode, 0, verified.stderr)
 
