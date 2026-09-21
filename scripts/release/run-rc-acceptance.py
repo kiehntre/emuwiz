@@ -26,7 +26,7 @@ from typing import Any
 STAGES = [
     "Source provenance", "Binary validation", "Fresh SBOM generation",
     "SBOM verification", "Release packaging", "Release verification",
-    "Archive extraction verification", "CLI release smoke", "Synthetic library",
+    "Archive extraction verification", "GUI packaged smoke", "CLI release smoke", "Synthetic library",
     "Synthetic scan smoke", "SQLite integrity", "Pending recovery check",
     "Upgrade fixture checks", "Reproducibility comparison", "Evidence bundle",
 ]
@@ -55,6 +55,8 @@ class Gate:
         self.cli = Path(args.cli_binary).resolve()
         self.output = Path(args.output).resolve()
         self.timeout = args.timeout
+        self.gui_smoke_requested = bool(getattr(args, "gui_smoke", False))
+        self.require_gui_smoke = bool(getattr(args, "require_gui_smoke", False))
         self.keep = args.keep
         self.evidence = self.output / "rc-evidence"
         self.logs = self.evidence / "logs"
@@ -113,6 +115,7 @@ class Gate:
         (self.evidence / "sbom").mkdir(exist_ok=True)
         (self.evidence / "package").mkdir(exist_ok=True)
         (self.evidence / "checksums").mkdir(exist_ok=True)
+        (self.evidence / "gui-smoke").mkdir(exist_ok=True)
         (self.evidence / "environment.json").write_text(json.dumps(self.env, indent=2) + "\n")
 
     def command(self, name: str, argv: list[str], *, cwd: Path | None = None,
@@ -144,14 +147,16 @@ class Gate:
         status, detail = "PASS", ""
         try:
             value = fn()
-            if isinstance(value, str):
+            if isinstance(value, tuple):
+                status, detail = value
+            elif isinstance(value, str):
                 detail = value
         except Exception as exc:  # stage failures are evidence, not tracebacks
             status, detail = "FAIL", str(exc)
             self.failures.append(f"{title}: {detail}")
         self.results.append({"number": number, "stage": title, "status": status,
                              "detail": detail, "seconds": round(time.monotonic()-start, 3)})
-        print(f"[{number:02d}/15] {title:<34} {status}")
+        print(f"[{number:02d}/{len(STAGES)}] {title:<34} {status}")
 
     def git(self, *args: str) -> str:
         result = self.command("git-" + args[0], ["git", *args])
@@ -238,6 +243,25 @@ class Gate:
         if result.returncode:
             raise RuntimeError("release smoke failed")
         return "isolated CLI smoke passed"
+
+    def gui_smoke(self, package: tuple[Path, Path] | None) -> tuple[str, str] | str:
+        if not self.gui_smoke_requested and not self.require_gui_smoke:
+            return "SKIPPED", "SKIPPED (not requested)"
+        if not package:
+            raise RuntimeError("packaged release unavailable for GUI smoke")
+        result = self.command("gui-packaged-smoke", [
+            "python3", "scripts/release/packaged_gui_smoke.py",
+            "--archive", str(package[1]), "--output", str(self.evidence / "gui-smoke"),
+            "--timeout", str(min(max(self.timeout, 15), 30)),
+            *( ["--require"] if self.require_gui_smoke else [] ),
+        ])
+        (self.evidence / "gui-smoke" / "result.txt").write_text(result.stdout + result.stderr)
+        if result.returncode:
+            raise RuntimeError("packaged GUI smoke failed")
+        report = self.evidence / "gui-smoke" / "report.json"
+        if report.is_file():
+            return "packaged GUI launched from extracted archive"
+        return "SKIPPED", result.stdout.strip() or "SKIPPED (Xvfb unavailable)"
 
     def synthetic(self) -> Path:
         root = self.evidence / "synthetic" / "library"
@@ -383,6 +407,7 @@ class Gate:
         self.stage("Release packaging", package_stage)
         self.stage("Release verification", lambda: self.verify_package(package) if package else (_ for _ in ()).throw(RuntimeError("package unavailable")))
         self.stage("Archive extraction verification", lambda: self.verify_package(package) if package else (_ for _ in ()).throw(RuntimeError("package unavailable")))
+        self.stage("GUI packaged smoke", lambda: self.gui_smoke(package))
         self.stage("CLI release smoke", self.smoke)
         synthetic_root: Path | None = None
         def synthetic_stage():
@@ -413,6 +438,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--cli-binary")
     p.add_argument("--output")
     p.add_argument("--timeout", type=int, default=120)
+    p.add_argument("--gui-smoke", action="store_true", help="run packaged GUI smoke when available")
+    p.add_argument("--require-gui-smoke", action="store_true", help="fail if packaged GUI smoke cannot run")
     p.add_argument("--keep", action="store_true", help="retain evidence after a failed setup")
     return p
 
@@ -427,7 +454,7 @@ def self_test() -> int:
         try:
             Gate(argparse.Namespace(source_tree=str(source), gui_binary=str(fake),
                                     cli_binary=str(fake), output=str(output), timeout=1,
-                                    keep=False)).setup()
+                                    keep=False, gui_smoke=False, require_gui_smoke=False)).setup()
         except RuntimeError:
             pass
         else:
@@ -435,7 +462,7 @@ def self_test() -> int:
         try:
             Gate(argparse.Namespace(source_tree=str(source), gui_binary=str(fake),
                                     cli_binary=str(fake), output="/tmp", timeout=1,
-                                    keep=False)).setup()
+                                    keep=False, gui_smoke=False, require_gui_smoke=False)).setup()
         except RuntimeError:
             pass
         else:

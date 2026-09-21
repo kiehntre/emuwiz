@@ -14,9 +14,25 @@ scripts/release/run-rc-acceptance.sh \
   --output /tmp/emuwiz-rc-acceptance
 ```
 
+Add `--gui-smoke` to launch the GUI from the extracted, already-verified
+release archive under a dedicated Xvfb display. The stage runs empty,
+existing-profile, legacy-only, and both-root fixtures, retains per-case
+stdout/stderr, an environment summary, a bounded `strace` write report, and a
+first-frame capture when `xwd`/ImageMagick are installed. It never uses the
+build-tree GUI binary. Each case also retains an environment summary and a
+filesystem-write summary. `--require-gui-smoke` makes missing or unusable Xvfb,
+or any GUI failure, a release failure; otherwise the stage reports `SKIPPED
+(Xvfb unavailable)`.
+
+The GUI helper can be tested independently:
+
+```sh
+python3 scripts/release/packaged_gui_smoke.py --self-test
+```
+
 The output contains `rc-evidence/summary.json`, `SUMMARY.md`, provenance,
 binary hashes, SBOM, package/checksum data, smoke/synthetic/upgrade/recovery
-reports, and bounded command logs. `0` means PASS, `1` means a gate failure,
-and `3` means invalid invocation or inspection setup. The optional `--keep`
-flag retains evidence when setup fails. No GUI stage is enabled by default;
-the existing headless CLI smoke is the release gate.
+reports, GUI smoke evidence when requested, and bounded command logs. `0` means
+PASS, `1` means a gate failure, and `3` means invalid invocation or inspection
+setup. The optional `--keep` flag retains evidence when setup fails. The GUI
+stage is optional unless `--require-gui-smoke` is supplied.
