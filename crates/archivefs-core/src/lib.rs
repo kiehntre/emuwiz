@@ -60,6 +60,8 @@ pub mod diagnostics;
 pub mod dragon_coco_tape;
 pub mod emulator_download;
 pub mod emulator_inventory;
+/// Provider-neutral, read-only emulator installation lifecycle projection.
+pub mod emulator_lifecycle;
 pub mod emulator_update;
 /// Manifest-backed ownership and side-by-side managed AppImage installs.
 pub mod managed_emulator_install;

@@ -295,6 +295,13 @@ fn probe_version(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Reuse the same bounded `--version` probe used by PATH inventory callers.
+/// Callers that need provenance can retain this raw output alongside the
+/// resulting inventory projection.
+pub fn probe_version_output(path: &Path) -> Option<String> {
+    probe_version(path)
+}
+
 /// Scan only executable names in the current `PATH`; no home-directory crawl.
 pub fn discover_installed_emulators() -> EmulatorInventory {
     let mut candidates = Vec::new();
