@@ -27,6 +27,9 @@ REPORT_SCHEMA_VERSION = 1
 MAX_JOURNAL_BYTES = 16 * 1024 * 1024
 MAX_ES_DE_RECOVERY_BYTES = 256 * 1024 * 1024
 MAX_DIRECTORY_ENTRIES = 4096
+MAX_PATCH_OUTPUT_JOURNALS = 512
+PATCH_OUTPUT_PREFIX = ".emuwiz-patch-output-"
+PATCH_OUTPUT_SUFFIX = ".json"
 DEFAULT_MAX_HASH_BYTES = 16 * 1024 * 1024
 DEFAULT_TOTAL_HASH_BYTES = 256 * 1024 * 1024
 ES_DE_RECOVERY_SUFFIX = ".es-de-publish-recovery.json"
@@ -726,6 +729,116 @@ def inspect_cheat(path: Path, value: dict[str, Any], budget: HashBudget, *, roll
     return operation
 
 
+PATCH_STATES = {
+    "planned": "Applying",
+    "preparing": "Applying",
+    "prepared": "Applying",
+    "verifying_temporary": "Applying",
+    "publishing": "Applying",
+    "published": "Applying",
+    "verifying_published": "Applying",
+    "completed": "Completed",
+    "failed": "ApplyFailed",
+    "rolling_back": "RollingBack",
+    "rolled_back": "RolledBack",
+    "rollback_failed": "RollbackFailed",
+    "needs_review": "NeedsReview",
+    "unsafe_to_resume": "UnsafeToResume",
+}
+
+
+def patch_checkpoint_details(checkpoints: Any) -> dict[str, Any]:
+    values = [str(item) for item in checkpoints] if isinstance(checkpoints, list) else []
+    return {
+        "checkpoints": values,
+        "publication_checkpoint": next((item for item in reversed(values) if item in {"before_publish", "published", "before_published_verification", "published_verified", "before_completed"}), None),
+        "verification_checkpoint": next((item for item in reversed(values) if item in {"temporary_verified", "published_verified", "verifying_temporary", "before_published_verification"}), None),
+    }
+
+
+def inspect_patch_output(path: Path, value: dict[str, Any], budget: HashBudget) -> dict[str, Any]:
+    """Read-only projection of patch_output_recovery.rs schema 1.
+
+    The branch that owns patch execution remains authoritative for recovery
+    eligibility. This projection deliberately only returns the same safe cases
+    that its inspection routine proves from recorded hashes and filesystem
+    state; it never calls a recovery API.
+    """
+    schema = value.get("schema_version")
+    operation_id = value.get("operation_id")
+    if schema != 1:
+        operation = new_operation("Standalone Patch Output", str(operation_id or path.stem), path)
+        operation.update(schema_version=schema, original_format="patch_output_journal", original_state=value.get("state"), state="UnknownSchema", category="REVIEW_REQUIRED", suggested_status="DO_NOT_TOUCH", needs_review_reason="unknown patch-output journal schema")
+        operation["blockers"].append("patch-output schema is not version 1")
+        return operation
+    required = ("operation_id", "patch_format", "source_path", "source_size", "source_sha256", "patch_path", "patch_size", "patch_sha256", "destination_path", "temporary_output_path", "provenance_path", "state", "checkpoints")
+    missing = [key for key in required if key not in value]
+    if missing or not isinstance(operation_id, str) or not isinstance(value.get("state"), str):
+        raise InspectorError("patch-output journal is missing required fields: " + ", ".join(missing or ["operation_id/state"]))
+    operation = new_operation("Standalone Patch Output", operation_id, path)
+    original = value["state"]
+    normalized = PATCH_STATES.get(original)
+    if normalized is None:
+        operation.update(schema_version=1, original_format="patch_output_journal", original_state=original, state="UnknownSchema", category="REVIEW_REQUIRED", suggested_status="DO_NOT_TOUCH", needs_review_reason="unknown patch-output state")
+        operation["blockers"].append(f"unsupported patch-output state: {original}")
+        return operation
+    operation.update({
+        "schema_version": 1, "original_format": "patch_output_journal", "original_state": original,
+        "state": normalized, "created_at": value.get("created_at_unix"), "updated_at": value.get("updated_at_unix"),
+        "entries_total": 1, "entries_completed": 1 if normalized in {"Completed", "RolledBack"} else 0,
+        "entries_pending": 0 if normalized in {"Completed", "RolledBack"} else 1,
+        "patch_format": value.get("patch_format"),
+        "patch_identity": {"path": value.get("patch_path"), "size": value.get("patch_size"), "sha256": value.get("patch_sha256")},
+        "publication_checkpoint": patch_checkpoint_details(value.get("checkpoints"))["publication_checkpoint"],
+        "verification_checkpoint": patch_checkpoint_details(value.get("checkpoints"))["verification_checkpoint"],
+    })
+    source = Path(value["source_path"]) if isinstance(value.get("source_path"), str) else None
+    patch = Path(value["patch_path"]) if isinstance(value.get("patch_path"), str) else None
+    destination = Path(value["destination_path"]) if isinstance(value.get("destination_path"), str) else None
+    temporary = Path(value["temporary_output_path"]) if isinstance(value.get("temporary_output_path"), str) else None
+    provenance = Path(value["provenance_path"]) if isinstance(value.get("provenance_path"), str) else None
+    for target, collection in ((source, "source_paths"), (patch, "source_paths"), (destination, "destination_paths"), (temporary, "temporary_paths")):
+        add_unique(operation[collection], target)
+    if value.get("backup_path") is not None:
+        add_unique(operation["backup_paths"], Path(value["backup_path"]) if isinstance(value["backup_path"], str) else None)
+    source_evidence = inspect_path(source, budget, expected_digest=value.get("source_sha256")) if source else None
+    patch_evidence = inspect_path(patch, budget, expected_digest=value.get("patch_sha256")) if patch else None
+    temporary_evidence = inspect_path(temporary, budget, expected_root=destination.parent if destination else None, expected_digest=value.get("expected_output_sha256")) if temporary else None
+    destination_evidence = inspect_path(destination, budget, expected_root=destination.parent if destination else None, expected_digest=value.get("expected_output_sha256")) if destination else None
+    provenance_evidence = inspect_path(provenance, budget, expected_root=destination.parent if destination else None, expected_digest=value.get("provenance_sha256")) if provenance else None
+    evidence = [item for item in (source_evidence, patch_evidence, temporary_evidence, destination_evidence, provenance_evidence) if item is not None]
+    operation["evidence"].extend(evidence)
+    operation["filesystem_evidence"] = {
+        "source": source_evidence, "patch": patch_evidence, "temporary_output": temporary_evidence,
+        "destination": destination_evidence, "provenance": provenance_evidence,
+    }
+    source_matches = bool(source_evidence and source_evidence["identity_matches"] is True)
+    patch_matches = bool(patch_evidence and patch_evidence["identity_matches"] is True)
+    temporary_matches = bool(temporary_evidence and temporary_evidence["identity_matches"] is True)
+    destination_matches = bool(destination_evidence and destination_evidence["identity_matches"] is True)
+    provenance_present = bool(provenance_evidence and provenance_evidence["exists"] and provenance_evidence["safe_path"])
+    publication_states = {"publishing", "published", "verifying_published"}
+    temporary_states = {"prepared", "verifying_temporary", "publishing"}
+    if normalized in {"Completed", "RolledBack"}:
+        operation.update(category="COMPLETED_HISTORY", suggested_status="NO_ACTION")
+    elif not source_matches or not patch_matches:
+        operation.update(state="UnsafeToResume", category="REVIEW_REQUIRED", suggested_status="DO_NOT_TOUCH", needs_review_reason="source or patch changed since the durable plan")
+        operation["blockers"].append("source or patch digest does not match the journal")
+    elif original in publication_states and destination_matches and provenance_present:
+        operation.update(category="RECOVERABLE", resume_possible=True, rollback_possible=not bool(value.get("destination_preexisting")), suggested_status="SAFE_ROLLBACK_CANDIDATE" if not value.get("destination_preexisting") else "SAFE_RESUME_CANDIDATE")
+        operation["resume_evidence"].append("destination matches the verified output and provenance is present; core recovery may finalize the journal")
+        if operation["rollback_possible"]:
+            operation["rollback_evidence"].append("destination matches the verified output and was not pre-existing; core rollback may remove only owned output")
+    elif original in temporary_states and temporary_matches and destination_evidence and not destination_evidence["exists"]:
+        operation.update(category="RECOVERABLE", resume_possible=True, suggested_status="SAFE_RESUME_CANDIDATE")
+        operation["resume_evidence"].append("verified temporary output is present and destination is absent")
+    elif normalized == "ApplyFailed":
+        operation.update(category="REVIEW_REQUIRED", suggested_status="REVIEW_REQUIRED", needs_review_reason=value.get("failure_reason") or "patch output failed before completion")
+    else:
+        operation.update(category="REVIEW_REQUIRED", suggested_status="REVIEW_REQUIRED", needs_review_reason="filesystem state does not match a safe patch-output recovery case")
+    return operation
+
+
 def inspect_database_restore(
     path: Path,
     value: dict[str, Any],
@@ -958,6 +1071,35 @@ def direct_files(root: Path, *, suffix: str | None = None) -> tuple[list[Path], 
     return paths, None
 
 
+def patch_output_files(root: Path) -> tuple[list[Path], str | None]:
+    """Find sibling patch journals without following symlinks or unbounded trees."""
+    if not root.exists():
+        return [], None
+    found: list[Path] = []
+    try:
+        pending: list[tuple[Path, int]] = [(root, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                continue
+            children = sorted(directory.iterdir(), key=lambda item: os.fsencode(item.name))
+            if len(children) > MAX_DIRECTORY_ENTRIES:
+                return [], f"patch-output root exceeds the {MAX_DIRECTORY_ENTRIES}-entry inspection bound: {directory}"
+            for child in children:
+                child_info = child.lstat()
+                if stat.S_ISREG(child_info.st_mode) and child.name.startswith(PATCH_OUTPUT_PREFIX) and child.name.endswith(PATCH_OUTPUT_SUFFIX):
+                    found.append(child)
+                elif depth < 4 and stat.S_ISDIR(child_info.st_mode) and not stat.S_ISLNK(child_info.st_mode):
+                    pending.append((child, depth + 1))
+    except OSError as error:
+        return [], f"cannot enumerate patch-output journals under {root}: {error}"
+    found.sort(key=lambda item: os.fsencode(os.fspath(item)))
+    if len(found) > MAX_PATCH_OUTPUT_JOURNALS:
+        return found[:MAX_PATCH_OUTPUT_JOURNALS], f"patch-output journals truncated at {MAX_PATCH_OUTPUT_JOURNALS} entries"
+    return found, None
+
+
 def inspect_library_view_history(path: Path, value: dict[str, Any]) -> dict[str, Any]:
     view_id = value.get("view_id")
     if not isinstance(view_id, str) or not view_id:
@@ -1104,6 +1246,7 @@ def inspect_all(
         "cheat_rollback_runs": os.fspath(data_root / "cheat-rollback-runs"),
         "library_view_history": os.fspath(data_root / "library_views/history"),
         "database_restore_receipts": os.fspath(data_root),
+        "patch_output_journals": os.fspath(data_root),
         "es_de_gamelists": [os.fspath(root) for root in es_de_gamelists_roots(explicit_es_de_roots)],
     }
 
@@ -1147,6 +1290,19 @@ def inspect_all(
             except (InspectorError, OSError, ValueError, TypeError) as error:
                 detail = str(error); item = unreadable_operation(label, path, detail); inspection_errors.append(f"{path}: {detail}")
             if include_history or item["category"] != "COMPLETED_HISTORY": operations.append(item)
+    patch_paths, patch_problem = patch_output_files(data_root)
+    if patch_problem:
+        inspection_errors.append(patch_problem)
+    for path in patch_paths:
+        try:
+            item = inspect_patch_output(path, read_json(path), budget)
+            usable += 1
+        except (InspectorError, OSError, ValueError, TypeError) as error:
+            detail = str(error)
+            item = unreadable_operation("Standalone Patch Output", path, detail)
+            inspection_errors.append(f"{path}: {detail}")
+        if include_history or item["category"] != "COMPLETED_HISTORY":
+            operations.append(item)
     database_paths, database_problem = direct_files(data_root)
     if database_problem:
         inspection_errors.append(database_problem)
@@ -1237,6 +1393,15 @@ def human_report(report: dict[str, Any], redact_home: bool, verbose: bool = Fals
     if summary["completed_history"]: lines.append(f"Completed history: {summary['completed_history']}")
     for index, item in enumerate(report["operations"], 1):
         lines.extend(["", f"[{index}] {item['subsystem']}", f"    ID: {item['operation_id']}", f"    State: {item['state']} (original: {item['original_state']})", f"    Category: {item['category']}", f"    Entries: {item['entries_completed']} / {item['entries_total']} complete", f"    Rollback possible: {'yes' if item['rollback_possible'] else 'no'}", f"    Resume possible: {'yes' if item['resume_possible'] else 'no'}", f"    Suggested status: {item['suggested_status']}", f"    Journal: {redact(item['journal_path'], redact_home)}"])
+        if item["original_format"] == "patch_output_journal":
+            lines.append(f"    Patch format: {item.get('patch_format', 'unknown')}")
+            lines.append(f"    Patch identity: {redact(json.dumps(item.get('patch_identity', {}), sort_keys=True), redact_home)}")
+            lines.append(f"    Temporary output: {redact((item.get('temporary_paths') or ['unknown'])[0], redact_home)}")
+            lines.append(f"    Publication checkpoint: {item.get('publication_checkpoint') or 'none'}")
+            lines.append(f"    Verification checkpoint: {item.get('verification_checkpoint') or 'none'}")
+            if verbose:
+                lines.append("    Filesystem evidence:")
+                lines.append("      " + redact(json.dumps(item.get("filesystem_evidence", {}), sort_keys=True, ensure_ascii=False), redact_home))
         if item["needs_review_reason"]: lines.append(f"    Review reason: {redact(item['needs_review_reason'], redact_home)}")
         touched = item["destination_paths"] + item["backup_paths"] + item["temporary_paths"] + item["created_directories"]
         if touched:
