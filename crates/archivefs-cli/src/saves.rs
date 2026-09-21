@@ -2,7 +2,7 @@
 
 use archivefs_core::persistent_state_inventory::{PersistentStateRecord, PersistentStateType};
 use archivefs_core::save_state_orchestration::{
-    inventory_configured_state, ConfiguredStateInventory,
+    ConfiguredStateInventory, inventory_configured_state,
 };
 use serde::Serialize;
 
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn type_filter_is_case_insensitive() {
         let record = PersistentStateRecord {
-            emulator: StateEmulator::Pcsx2,
+            emulator: archivefs_core::persistent_state_inventory::StateEmulator::Pcsx2,
             selected_installation: None,
             state_type: PersistentStateType::SaveState,
             game_identity: Vec::new(),
