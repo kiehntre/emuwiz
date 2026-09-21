@@ -567,6 +567,8 @@ pub mod mod_catalogue;
 /// This module never scrapes, downloads, extracts, or installs third-party
 /// content; those concerns remain with the existing local safety machinery.
 pub mod mod_provider;
+/// Conservative, metadata-only ModDB project and release provider.
+pub mod moddb;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 
