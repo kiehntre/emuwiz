@@ -99,7 +99,7 @@ quick_check  = ok
 
 The writer enables foreign keys per connection; the diagnostic read-only connection does not, which does not alter the database. No live `-journal`, `-wal`, or `-shm` sidecar existed at inspection time. SQLite transaction recovery is therefore handled by SQLite’s default DELETE rollback journal and FULL synchronous setting, but SQLite does not cover external filesystem mutations. A committed catalogue row cannot be treated as proof that a linked file, backup, mod destination, or receipt was durably committed.
 
-The full database-filter test run also exposed three pre-existing expectation failures in the current main source: expected schema version 19 versus actual registered migration/schema version 20, and an expected table list missing `media_topology_evidence`. This audit made no migration or schema change; the failures are recorded, not fixed.
+The full database-filter test run at audit time also exposed three pre-existing expectation failures: expected schema version 19 versus actual registered migration/schema version 20, and an expected table list missing `media_topology_evidence`. The audit itself made no migration or schema change. During the release-integration pass these assertions were rechecked: the integrated tests now expect schema version 20, migration 20, and the current table set, and the full core suite passes. The inspected live database remains version 19 until the normal library-scan migration is run.
 
 ## Current recovery state and real outage evidence
 
