@@ -27,12 +27,15 @@ use std::{
 pub(super) struct Preferences {
     pub route: Route,
     pub filter: Filter,
+    #[serde(default)]
+    pub welcome_dismissed: bool,
 }
 
 pub(super) enum Command {
     Load {
         scan: bool,
     },
+    EnvironmentCheck,
     Filter {
         library: SharedLibrary,
         filter: Filter,
@@ -91,6 +94,7 @@ pub(super) enum Command {
 
 pub(super) enum Payload {
     Library(SharedLibrary),
+    Environment(crate::gui_v2::environment::EnvironmentSnapshot),
     Filter {
         indices: Vec<usize>,
         generation: u64,
@@ -146,6 +150,7 @@ pub(super) struct DuplicateRepairRecord {
     pub journal_dir: PathBuf,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Event {
     Started(u64),
     Progress {
@@ -206,6 +211,7 @@ impl Backend {
 
 fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload, String> {
     match command {
+        Command::EnvironmentCheck => Ok(Payload::Environment(crate::gui_v2::environment::gather())),
         Command::Load { scan } => {
             let scan_warning = if scan {
                 let summary = archivefs_core::scan_all_enabled_sources_default()

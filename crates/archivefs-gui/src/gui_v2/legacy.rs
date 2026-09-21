@@ -20,6 +20,7 @@ pub(super) fn destination(section: Section, selected: bool) -> MainView {
         Section::Sources => MainView::SourcesDiscovery,
         Section::History => MainView::HistoryLogs,
         Section::Advanced => MainView::DatSources,
+        Section::Setup => MainView::Doctor,
         Section::Settings => MainView::Settings,
         _ => MainView::Library,
     }

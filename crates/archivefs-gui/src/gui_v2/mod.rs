@@ -2,11 +2,13 @@
 mod activity;
 mod artwork;
 mod backend;
+mod environment;
 mod legacy;
 mod library;
 mod media_sources;
 mod mods;
 mod native_workflows;
+mod onboarding;
 mod organisation;
 mod pages;
 mod problems;
@@ -219,6 +221,10 @@ pub(super) struct App {
         Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     mods: ModsPageState,
     native_workflows: Option<native_workflows::NativeWorkflows>,
+    environment: Option<environment::EnvironmentSnapshot>,
+    environment_job: Option<u64>,
+    welcome_dismissed: bool,
+    doctor_platform: Option<String>,
     mrwiz_dismissed: bool,
 }
 
@@ -275,8 +281,19 @@ impl App {
             canonical_organisation_history: Vec::new(),
             mods: ModsPageState::default(),
             native_workflows: None,
+            environment: None,
+            environment_job: None,
+            welcome_dismissed: false,
+            doctor_platform: None,
             mrwiz_dismissed: false,
         };
+        let environment_job = app.activity.queue(
+            "Checking EmuWiz setup",
+            Route::Section(Section::Setup),
+            false,
+        );
+        app.environment_job = Some(environment_job);
+        app.send(environment_job, Command::EnvironmentCheck);
         app.send(0, Command::Restore);
         app.send(0, Command::LoadRepairHistory);
         app.load(false);
@@ -314,6 +331,20 @@ impl App {
         self.load_job = Some(id);
         self.send(id, Command::Load { scan });
     }
+    fn refresh_environment(&mut self, context: &egui::Context) {
+        if self.environment_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Checking EmuWiz setup",
+            Route::Section(Section::Setup),
+            false,
+        );
+        self.environment_job = Some(id);
+        if self.send(id, Command::EnvironmentCheck) {
+            context.request_repaint();
+        }
+    }
     fn refresh_artwork_index(&mut self) {
         if self.artwork.index_loading {
             return;
@@ -330,6 +361,36 @@ impl App {
     fn go(&mut self, route: Route) {
         self.router.go(route);
         self.navigation_changed();
+    }
+
+    fn handle_onboarding_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<onboarding::Action>,
+    ) {
+        match action {
+            None => {}
+            Some(onboarding::Action::DismissWelcome) => {
+                self.welcome_dismissed = true;
+                self.preferences_dirty = Some(Instant::now());
+            }
+            Some(onboarding::Action::DismissAndGoHome) => {
+                self.welcome_dismissed = true;
+                self.preferences_dirty = Some(Instant::now());
+                self.go(Route::Home);
+            }
+            Some(onboarding::Action::Refresh) => self.refresh_environment(context),
+            Some(onboarding::Action::Open(section)) => self.go(Route::Section(section)),
+            Some(onboarding::Action::OpenPlatform(platform)) => {
+                self.doctor_platform = Some(platform);
+            }
+            Some(onboarding::Action::OpenGame(game)) => {
+                self.go(Route::Task {
+                    section: Section::Launch,
+                    game,
+                });
+            }
+        }
     }
     fn navigation_changed(&mut self) {
         self.interacted = true;
@@ -960,6 +1021,14 @@ impl App {
                                 None,
                             );
                             match payload {
+                                Payload::Environment(snapshot) => {
+                                    self.environment_job = None;
+                                    let fresh = snapshot.is_fresh();
+                                    self.environment = Some(snapshot);
+                                    if fresh && !self.welcome_dismissed && !self.interacted {
+                                        self.router.current = Route::Section(Section::Setup);
+                                    }
+                                }
                                 Payload::Library(library) => {
                                     self.activity.finish(id, format!("{} games available to browse. Original game files were not changed.", library.games.len()), None);
                                     if let Some(warning) = &library.scan_warning {
@@ -1046,8 +1115,15 @@ impl App {
                                     self.canonical_organisation_history = organisations;
                                 }
                                 Payload::Preferences(preferences) => {
+                                    self.welcome_dismissed = preferences.welcome_dismissed;
                                     if !self.interacted {
-                                        self.router.current = preferences.route;
+                                        let keep_onboarding =
+                                            self.environment.as_ref().is_some_and(|snapshot| {
+                                                snapshot.is_fresh() && !self.welcome_dismissed
+                                            });
+                                        if !keep_onboarding {
+                                            self.router.current = preferences.route;
+                                        }
                                         self.filter = preferences.filter;
                                         self.filter_dirty = Some(Instant::now());
                                     }
@@ -1097,6 +1173,9 @@ impl App {
                                 .is_some_and(|job| job.id == id)
                             {
                                 self.canonical_organisation_job = None;
+                            }
+                            if self.environment_job == Some(id) {
+                                self.environment_job = None;
                             }
                             if self.repair_job == Some(id) {
                                 self.repair_job = None;
@@ -1182,6 +1261,7 @@ impl App {
                 Command::Save(Preferences {
                     route: self.router.current.clone(),
                     filter: self.filter.clone(),
+                    welcome_dismissed: self.welcome_dismissed,
                 }),
             );
         }

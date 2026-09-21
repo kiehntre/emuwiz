@@ -6,6 +6,7 @@ use super::{
     backend::Command,
     library::{Game, media_kind_label},
     media_sources::{Kind, Source},
+    onboarding,
     problems::{Category, Problem, ProblemSummary, Severity},
     routes::{HOME_TASKS, Route, SECTIONS, Section},
 };
@@ -158,6 +159,7 @@ impl App {
                 Route::Section(Section::Duplicates) => self.duplicates(ui),
                 Route::Section(Section::Problems) => self.problems(ui),
                 Route::Section(Section::Build) => self.organisation_page(ui),
+                Route::Section(Section::Setup) => self.setup_doctor(ui),
                 Route::Section(Section::Platforms) => self.platforms(ui),
                 Route::Game(id) => self.game_detail(ui, id),
                 Route::Section(Section::Activity) => self.activities(ui),
@@ -231,6 +233,17 @@ impl App {
         ui.separator();
     }
 
+    fn setup_doctor(&mut self, ui: &mut egui::Ui) {
+        let action = onboarding::show(
+            ui,
+            self.environment.as_ref(),
+            &self.library,
+            self.welcome_dismissed,
+            self.doctor_platform.as_deref(),
+        );
+        self.handle_onboarding_action(ui.ctx(), action);
+    }
+
     fn home(&mut self, ui: &mut egui::Ui) {
         mrwiz_tip(
             ui,
@@ -246,6 +259,20 @@ impl App {
             ));
         } else {
             ui.label("Loading your existing game list. You can already explore the tasks below.");
+        }
+        if let Some(environment) = self.environment.as_ref() {
+            let ready_count = environment.setup_ready_count(&self.library);
+            let attention_count = environment.setup_attention_count(&self.library);
+            let open_setup = egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("System setup");
+                ui.label(format!(
+                    "{ready_count} ready · {attention_count} need attention"
+                ));
+                ui.button("Open Setup & Doctor").clicked()
+            });
+            if open_setup.inner {
+                self.go(Route::Section(Section::Setup));
+            }
         }
         egui::ScrollArea::vertical().id_salt("v2_home").show(ui, |ui| {
             if self.loaded && self.library.games.is_empty() {

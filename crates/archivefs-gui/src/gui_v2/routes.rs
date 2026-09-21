@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub(super) enum Section {
     #[default]
     Home,
+    Setup,
     Games,
     Duplicates,
     Platforms,
@@ -24,6 +25,7 @@ pub(super) enum Section {
 
 pub(super) const SECTIONS: &[Section] = &[
     Section::Home,
+    Section::Setup,
     Section::Games,
     Section::Duplicates,
     Section::Platforms,
@@ -45,6 +47,7 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Self::Home => "Home",
+            Self::Setup => "Setup & Doctor",
             Self::Games => "Games",
             Self::Duplicates => "Duplicates",
             Self::Platforms => "Platforms",
@@ -66,6 +69,7 @@ impl Section {
     pub fn purpose(self) -> &'static str {
         match self {
             Self::Home => "Your games, and the things you can do with them.",
+            Self::Setup => "Understand what EmuWiz needs and why a game may not be ready.",
             Self::Games => "Browse your games. Select one to see what you can do next.",
             Self::Duplicates => {
                 "Review exact copies without silently collapsing different releases."
@@ -95,6 +99,7 @@ impl Section {
     pub fn action(self) -> &'static str {
         match self {
             Self::Check => "Check my games",
+            Self::Setup => "Check my setup",
             Self::Duplicates => "Review duplicates",
             Self::Problems => "Review problems",
             Self::Build => "Choose an organisation method",
@@ -170,6 +175,12 @@ impl Router {
 }
 
 pub(super) const HOME_TASKS: &[(Section, &str, &str, &str)] = &[
+    (
+        Section::Setup,
+        "Setup & Doctor",
+        "See what EmuWiz can use now, what needs attention, and the next safe step.",
+        "Check my setup",
+    ),
     (
         Section::Games,
         "Browse My Games",

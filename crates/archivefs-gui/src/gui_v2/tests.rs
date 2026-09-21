@@ -79,6 +79,10 @@ fn fixture(context: &egui::Context) -> App {
         canonical_organisation_history: Vec::new(),
         mods: super::mods::ModsPageState::default(),
         native_workflows: None,
+        environment: None,
+        environment_job: None,
+        welcome_dismissed: false,
+        doctor_platform: None,
         mrwiz_dismissed: false,
     }
 }
@@ -696,18 +700,59 @@ fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
         assert!(!section.action().is_empty());
         assert_eq!(Route::Section(*section).section(), *section);
     }
-    assert_eq!(unique.len(), 16);
+    assert_eq!(unique.len(), 17);
 }
 
 #[test]
-fn gui_v2_home_has_six_explained_tasks_with_correct_routes() {
-    assert_eq!(routes::HOME_TASKS.len(), 6);
+fn gui_v2_fresh_profile_opens_plain_language_welcome() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.environment = Some(environment::EnvironmentSnapshot::default());
+    app.router.current = Route::Section(Section::Setup);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value == "Welcome to EmuWiz"));
+    assert!(strings.iter().any(|value| value == "Get started"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Set up the basics"))
+    );
+    assert!(strings.iter().all(|value| value != "DAT registry"));
+}
+
+#[test]
+fn gui_v2_doctor_keeps_missing_mount_distinct_from_fresh_install() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let mut snapshot = environment::EnvironmentSnapshot {
+        source_count: 1,
+        ..environment::EnvironmentSnapshot::default()
+    };
+    snapshot.unavailable_sources.push("/mnt/games".into());
+    assert!(!snapshot.is_fresh());
+    assert!(snapshot.source_needs_attention());
+    app.environment = Some(snapshot);
+    app.welcome_dismissed = true;
+    app.router.current = Route::Section(Section::Setup);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Game drive unavailable"))
+    );
+    assert!(strings.iter().all(|value| value != "Welcome to EmuWiz"));
+}
+
+#[test]
+fn gui_v2_home_has_explained_tasks_with_correct_routes() {
+    assert_eq!(routes::HOME_TASKS.len(), 7);
     assert_eq!(
         routes::HOME_TASKS
             .iter()
             .map(|task| task.0)
             .collect::<Vec<_>>(),
         vec![
+            Section::Setup,
             Section::Games,
             Section::Check,
             Section::Problems,
@@ -1227,6 +1272,7 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
                 search: "Zelda".into(),
                 ..Default::default()
             },
+            welcome_dismissed: false,
         },
     )
     .unwrap();
@@ -1850,6 +1896,7 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
         }
     }
     for section in [
+        Section::Setup,
         Section::Check,
         Section::Problems,
         Section::Build,
@@ -1863,7 +1910,9 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
             app.router.current = Route::Section(section);
             frame(&context, &mut app, size);
             let output = frame(&context, &mut app, size);
-            let actions = if section == Section::Check {
+            let actions = if section == Section::Setup {
+                vec!["Setup & Doctor"]
+            } else if section == Section::Check {
                 vec!["Choose a platform"]
             } else if section == Section::Problems {
                 vec!["Nothing needs attention right now."]
