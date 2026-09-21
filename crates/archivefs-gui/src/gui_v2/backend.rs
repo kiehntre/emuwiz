@@ -77,6 +77,16 @@ pub(super) enum Command {
         state: Box<PlayingLibraryPageState>,
         generation: u64,
     },
+    PlayingLibrarySpecial {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+        kind: super::PlayingLibraryJobKind,
+    },
+    CanonicalOrganisation {
+        state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
+        generation: u64,
+        kind: super::CanonicalOrganisationJobKind,
+    },
 }
 
 pub(super) enum Payload {
@@ -97,6 +107,7 @@ pub(super) enum Payload {
     RepairHistory {
         duplicates: Vec<DuplicateRepairRecord>,
         playing_libraries: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+        organisations: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     },
     Preferences(Preferences),
     Done,
@@ -107,6 +118,16 @@ pub(super) enum Payload {
     PlayingLibraryApply {
         state: Box<PlayingLibraryPageState>,
         generation: u64,
+    },
+    PlayingLibrarySpecial {
+        state: Box<PlayingLibraryPageState>,
+        generation: u64,
+        kind: super::PlayingLibraryJobKind,
+    },
+    CanonicalOrganisation {
+        state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
+        generation: u64,
+        kind: super::CanonicalOrganisationJobKind,
     },
 }
 
@@ -423,6 +444,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             {
                 let mut duplicates = Vec::new();
                 let mut playing_libraries = Vec::new();
+                let mut organisations = Vec::new();
                 for transaction in transactions {
                     let is_duplicate = transaction.entries.iter().any(|entry| {
                         entry.destination_path.components().any(|component| {
@@ -444,11 +466,14 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                         });
                     } else if is_playing_library {
                         playing_libraries.push(transaction);
+                    } else {
+                        organisations.push(transaction);
                     }
                 }
                 Ok(Payload::RepairHistory {
                     duplicates,
                     playing_libraries,
+                    organisations,
                 })
             }
         }
@@ -486,13 +511,61 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             };
             Ok(Payload::Preferences(preferences))
         }
-        Command::PlayingLibraryPreview { mut state, generation } => {
+        Command::PlayingLibraryPreview {
+            mut state,
+            generation,
+        } => {
             state.preview();
             Ok(Payload::PlayingLibraryPreview { state, generation })
         }
-        Command::PlayingLibraryApply { mut state, generation } => {
+        Command::PlayingLibraryApply {
+            mut state,
+            generation,
+        } => {
             state.confirm_apply();
             Ok(Payload::PlayingLibraryApply { state, generation })
+        }
+        Command::PlayingLibrarySpecial {
+            mut state,
+            generation,
+            kind,
+        } => {
+            match kind {
+                super::PlayingLibraryJobKind::PreviewRomm => state.preview_romm(),
+                super::PlayingLibraryJobKind::ApplyRomm => state.confirm_romm_apply(),
+                super::PlayingLibraryJobKind::PreviewRetroDeck => state.preview_retrodeck(),
+                super::PlayingLibraryJobKind::ApplyRetroDeck => state.confirm_retrodeck_apply(),
+                super::PlayingLibraryJobKind::PreviewEsde => state.preview_esde_publication(),
+                super::PlayingLibraryJobKind::PublishEsde => state.confirm_esde_publish(),
+                super::PlayingLibraryJobKind::RecoverEsde => state.confirm_esde_recovery(),
+                super::PlayingLibraryJobKind::Rollback => state.rollback_last(),
+                super::PlayingLibraryJobKind::RollbackRomm => state.rollback_romm_last(),
+                super::PlayingLibraryJobKind::RollbackRetroDeck => state.rollback_retrodeck(),
+                super::PlayingLibraryJobKind::Preview | super::PlayingLibraryJobKind::Apply => {
+                    unreachable!("generic Playing Library jobs use dedicated commands")
+                }
+            }
+            Ok(Payload::PlayingLibrarySpecial {
+                state,
+                generation,
+                kind,
+            })
+        }
+        Command::CanonicalOrganisation {
+            mut state,
+            generation,
+            kind,
+        } => {
+            match kind {
+                super::CanonicalOrganisationJobKind::Preview => state.generate_plan(),
+                super::CanonicalOrganisationJobKind::Apply => state.apply(),
+                super::CanonicalOrganisationJobKind::Rollback => state.rollback(),
+            }
+            Ok(Payload::CanonicalOrganisation {
+                state,
+                generation,
+                kind,
+            })
         }
     }
 }

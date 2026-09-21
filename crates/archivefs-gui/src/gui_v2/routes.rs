@@ -50,7 +50,7 @@ impl Section {
             Self::Platforms => "Platforms",
             Self::Check => "Check Games",
             Self::Problems => "Problems & Repair",
-            Self::Build => "Build Library",
+            Self::Build => "Organisation",
             Self::Launch => "Launch",
             Self::Emulators => "Emulator Setup",
             Self::Mods => "Mods & Cheats",
@@ -74,7 +74,7 @@ impl Section {
             Self::Check => "Find missing, unknown, damaged or mismatched games.",
             Self::Problems => "Review problems and preview a fix before changing anything.",
             Self::Build => {
-                "Make a playing library for your favourite launcher, keeping originals safe."
+                "Arrange or publish verified games with a preview before anything changes."
             }
             Self::Launch => "Choose a game. EmuWiz checks its setup before starting it.",
             Self::Emulators => {
@@ -97,7 +97,7 @@ impl Section {
             Self::Check => "Check my games",
             Self::Duplicates => "Review duplicates",
             Self::Problems => "Review problems",
-            Self::Build => "Build my library",
+            Self::Build => "Choose an organisation method",
             Self::Emulators => "Check Emulators",
             Self::Mods => "Choose a game",
             Self::Artwork => "Manage artwork",
@@ -190,9 +190,9 @@ pub(super) const HOME_TASKS: &[(Section, &str, &str, &str)] = &[
     ),
     (
         Section::Build,
-        "Build My Library",
-        "Prepare a playing library without moving your originals.",
-        "Build my library",
+        "Organisation",
+        "Arrange verified games or prepare a linked library for your frontend.",
+        "Choose an organisation method",
     ),
     (
         Section::Mods,

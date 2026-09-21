@@ -157,7 +157,7 @@ impl App {
                 Route::Section(Section::Check) => self.check_games(ui),
                 Route::Section(Section::Duplicates) => self.duplicates(ui),
                 Route::Section(Section::Problems) => self.problems(ui),
-                Route::Section(Section::Build) => self.build_library(ui),
+                Route::Section(Section::Build) => self.organisation_page(ui),
                 Route::Section(Section::Platforms) => self.platforms(ui),
                 Route::Game(id) => self.game_detail(ui, id),
                 Route::Section(Section::Activity) => self.activities(ui),
@@ -167,7 +167,7 @@ impl App {
                 Route::Task {
                     section: Section::Build,
                     ..
-                } => self.build_library(ui),
+                } => self.organisation_page(ui),
                 Route::Task {
                     section: Section::Mods,
                     game,
@@ -852,6 +852,7 @@ impl App {
             .is_some_and(super::native_workflows::NativeWorkflows::has_cheat_history);
         if self.repair_history.is_empty()
             && self.playing_library_history.is_empty()
+            && self.canonical_organisation_history.is_empty()
             && !has_cheat_history
         {
             ui.heading("No repair history yet");
@@ -895,6 +896,29 @@ impl App {
                         ui.label(
                             "Shared journaled link transaction from the Playing Library planner.",
                         );
+                    });
+                });
+            }
+        }
+        if !self.canonical_organisation_history.is_empty() {
+            ui.heading("Organised verified games");
+            for transaction in self.canonical_organisation_history.iter().rev() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.heading("Organised verified games");
+                    ui.label(format!(
+                        "{} · {} item(s)",
+                        transaction.transaction_id,
+                        transaction.entries.len()
+                    ));
+                    ui.label(format!("Source: {}", transaction.source_scan_root));
+                    ui.label(match transaction.state {
+                        TransactionState::Applied => "Undo available from Organisation",
+                        TransactionState::RolledBack => "Already undone",
+                        _ => "Needs review — recovery state is recorded in the journal",
+                    });
+                    ui.collapsing("Advanced Details", |ui| {
+                        ui.label(format!("State: {}", transaction.state.label()));
                     });
                 });
             }
@@ -1388,35 +1412,6 @@ impl App {
         });
         if let Some(route) = destination {
             self.go(route);
-        }
-    }
-
-    fn build_library(&mut self, ui: &mut egui::Ui) {
-        self.invalidate_changed_playing_library_plan();
-        let mut action = None;
-        egui::ScrollArea::vertical()
-            .id_salt("v2_build_library")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.heading("Build a playing library");
-                ui.label("Create a cleaner library containing one preferred copy of each game while leaving your original collection untouched.");
-                ui.label("EmuWiz only creates links in the destination you choose. Your source files stay where they are.");
-                if primary(ui, "Set up library") {
-                    ui.ctx().memory_mut(|memory| {
-                        memory.request_focus(egui::Id::new(
-                            crate::playing_library_page::SOURCE_ROOT_FIELD_ID,
-                        ));
-                    });
-                }
-                ui.separator();
-                action = crate::playing_library_page::show_playing_library_page_with_busy(
-                    ui,
-                    &mut self.playing_library,
-                    self.playing_library_job.is_some(),
-                );
-            });
-        if let Some(action) = action {
-            self.handle_playing_library_action(action);
         }
     }
 

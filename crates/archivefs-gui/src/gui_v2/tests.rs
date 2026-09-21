@@ -72,6 +72,11 @@ fn fixture(context: &egui::Context) -> App {
         playing_library_history: Vec::new(),
         playing_library_job: None,
         playing_library_generation: 0,
+        organisation: super::organisation::OrganisationState::default(),
+        canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
+        canonical_organisation_job: None,
+        canonical_organisation_generation: 0,
+        canonical_organisation_history: Vec::new(),
         mods: super::mods::ModsPageState::default(),
         native_workflows: None,
         mrwiz_dismissed: false,
@@ -222,6 +227,80 @@ fn gui_v2_playing_library_apply_runs_on_the_background_worker() {
 }
 
 #[test]
+fn gui_v2_canonical_organisation_preview_runs_on_the_background_worker() {
+    let context = egui::Context::default();
+    let backend = super::backend::Backend::start(context);
+    backend
+        .send(
+            43,
+            super::backend::Command::CanonicalOrganisation {
+                state: Box::new(crate::rom_organisation_page::RomOrganisationPageState::default()),
+                generation: 11,
+                kind: super::CanonicalOrganisationJobKind::Preview,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        super::backend::Event::Started(43)
+    ));
+    assert!(matches!(
+        backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        super::backend::Event::Finished {
+            id: 43,
+            outcome: Ok(super::backend::Payload::CanonicalOrganisation {
+                generation: 11,
+                kind: super::CanonicalOrganisationJobKind::Preview,
+                ..
+            }),
+        }
+    ));
+}
+
+#[test]
+fn gui_v2_frontend_projection_preview_runs_on_the_background_worker() {
+    let context = egui::Context::default();
+    let backend = super::backend::Backend::start(context);
+    backend
+        .send(
+            44,
+            super::backend::Command::PlayingLibrarySpecial {
+                state: Box::new(crate::playing_library_page::PlayingLibraryPageState::default()),
+                generation: 12,
+                kind: super::PlayingLibraryJobKind::PreviewRomm,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        super::backend::Event::Started(44)
+    ));
+    assert!(matches!(
+        backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        super::backend::Event::Finished {
+            id: 44,
+            outcome: Ok(super::backend::Payload::PlayingLibrarySpecial {
+                generation: 12,
+                kind: super::PlayingLibraryJobKind::PreviewRomm,
+                ..
+            }),
+        }
+    ));
+}
+
+#[test]
 fn gui_v2_stale_playing_library_preview_is_discarded() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
@@ -299,23 +378,196 @@ fn gui_v2_duplicate_playing_library_submit_is_refused() {
 }
 
 #[test]
-fn gui_v2_build_library_is_a_native_plain_english_workflow() {
+fn gui_v2_duplicate_canonical_organisation_submit_is_refused() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.canonical_organisation_job = Some(super::CanonicalOrganisationJob {
+        id: 98,
+        kind: super::CanonicalOrganisationJobKind::Preview,
+        generation: 1,
+        input_fingerprint: app.canonical_organisation.input_fingerprint(),
+    });
+    app.start_canonical_organisation_job(super::CanonicalOrganisationJobKind::Preview);
+    assert_eq!(app.canonical_organisation_job.as_ref().unwrap().id, 98);
+}
+
+#[test]
+fn gui_v2_stale_canonical_organisation_preview_is_discarded() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.canonical_organisation_generation = 1;
+    let activity_id = app.activity.queue(
+        "Planning verified-game organisation",
+        Route::Section(Section::Build),
+        false,
+    );
+    app.canonical_organisation_job = Some(super::CanonicalOrganisationJob {
+        id: activity_id,
+        kind: super::CanonicalOrganisationJobKind::Preview,
+        generation: 1,
+        input_fingerprint: "older-settings".into(),
+    });
+    app.finish_canonical_organisation_job(
+        super::CanonicalOrganisationJobKind::Preview,
+        Box::new(app.canonical_organisation.clone()),
+        1,
+    );
+    assert!(
+        app.activity.jobs[&activity_id]
+            .summary
+            .contains("discarded")
+    );
+}
+
+#[test]
+fn gui_v2_stale_romm_projection_result_is_discarded() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.playing_library_generation = 3;
+    let activity_id = app.activity.queue(
+        "Checking the RomM library layout",
+        Route::Section(Section::Build),
+        false,
+    );
+    app.playing_library_job = Some(super::PlayingLibraryJob {
+        id: activity_id,
+        kind: super::PlayingLibraryJobKind::PreviewRomm,
+        generation: 3,
+        input_fingerprint: "old-preferences".into(),
+    });
+    app.finish_playing_library_job(
+        super::PlayingLibraryJobKind::PreviewRomm,
+        Box::new(app.playing_library.clone()),
+        3,
+    );
+    assert!(
+        app.activity.jobs[&activity_id]
+            .summary
+            .contains("discarded")
+    );
+}
+
+#[test]
+fn gui_v2_organisation_is_a_native_plain_english_workflow() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Build);
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    for expected in [
+        "Choose what you want to organise",
+        "Organise verified games",
+        "Build a clean playing library",
+    ] {
+        assert!(strings.iter().any(|value| value == expected), "{expected}");
+    }
     assert!(
         strings
             .iter()
-            .any(|value| value == "Build a playing library")
+            .any(|value| value.contains("Nothing changes until"))
     );
     assert!(
         strings
             .iter()
-            .any(|value| value.contains("original collection untouched"))
+            .any(|value| value.contains("Source untouched"))
     );
-    assert!(strings.iter().any(|value| value.contains("Source library")));
-    assert!(strings.iter().any(|value| value.contains("Inputs")));
+}
+
+#[test]
+fn gui_v2_organisation_sidebar_title_and_all_normal_flows_are_reachable() {
+    assert_eq!(Section::Build.title(), "Organisation");
+    let context = egui::Context::default();
+    for (destination, expected) in [
+        (
+            crate::playing_library_page::PlayingLibraryDestination::Generic,
+            "Generic Library",
+        ),
+        (
+            crate::playing_library_page::PlayingLibraryDestination::Romm,
+            "RomM Library",
+        ),
+        (
+            crate::playing_library_page::PlayingLibraryDestination::EsDe,
+            "ES-DE Library",
+        ),
+        (
+            crate::playing_library_page::PlayingLibraryDestination::RetroDeck,
+            "RetroDECK Library",
+        ),
+    ] {
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(Section::Build);
+        app.organisation.view = super::organisation::OrganisationView::PlayingLibrary;
+        app.playing_library.set_destination(destination);
+        let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+        assert!(strings.iter().any(|value| value == expected), "{expected}");
+        assert!(
+            strings
+                .iter()
+                .any(|value| value.contains("Original files stay untouched"))
+        );
+    }
+}
+
+#[test]
+fn gui_v2_verified_game_flow_explains_move_rename_link_and_keeps_advanced_escape() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    app.organisation.view = super::organisation::OrganisationView::VerifiedGames;
+    let strings = text(&frame(&context, &mut app, [1366.0, 768.0]));
+    for wording in ["MOVE changes", "RENAME changes", "LINK leaves"] {
+        assert!(
+            strings.iter().any(|value| value.contains(wording)),
+            "{wording}"
+        );
+    }
+    assert!(strings.iter().any(|value| value == "← Organisation"));
+}
+
+#[test]
+fn gui_v2_organisation_landing_remains_usable_at_supported_viewports() {
+    for size in [
+        [1280.0, 720.0],
+        [1366.0, 768.0],
+        [1920.0, 1080.0],
+        [2560.0, 1440.0],
+    ] {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(Section::Build);
+        let strings = text(&frame(&context, &mut app, size));
+        assert!(
+            strings.iter().any(|value| value == "Organisation"),
+            "{size:?}"
+        );
+        assert!(
+            strings
+                .iter()
+                .any(|value| value == "Organise verified games"),
+            "{size:?}"
+        );
+    }
+}
+
+#[test]
+fn gui_v2_organisation_flow_survives_navigation_away_and_back() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    app.organisation.view = super::organisation::OrganisationView::PlayingLibrary;
+    app.playing_library
+        .set_destination(crate::playing_library_page::PlayingLibraryDestination::Romm);
+    app.go(Route::Section(Section::Activity));
+    app.back();
+    assert_eq!(app.router.current, Route::Section(Section::Build));
+    assert_eq!(
+        app.organisation.view,
+        super::organisation::OrganisationView::PlayingLibrary
+    );
+    assert_eq!(
+        app.playing_library.destination,
+        crate::playing_library_page::PlayingLibraryDestination::Romm
+    );
 }
 
 #[test]
@@ -1616,11 +1868,7 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
             } else if section == Section::Problems {
                 vec!["Nothing needs attention right now."]
             } else if section == Section::Build {
-                vec![
-                    "Set up library",
-                    "Preview playing library",
-                    "Preview 1G1R Library",
-                ]
+                vec!["Organise verified games", "Build a clean playing library"]
             } else if section == Section::Sources {
                 vec!["Add source"]
             } else if section == Section::Advanced {

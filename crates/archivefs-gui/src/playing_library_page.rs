@@ -35,13 +35,13 @@ use archivefs_core::launch::es_de_publish::{
     recover_es_de_gamelist_publication,
 };
 use archivefs_core::playing_library::{
-    CandidateEvidenceSummary, PlayingLibraryPlan, PlayingLibraryPolicy, ReleaseClass,
-    RetroDeckProjectionPlan, RetroDeckVisibility, RommLibraryProjectionPlan, RommVisibility,
-    build_playing_library_plan, build_playing_library_transaction, build_retrodeck_projection,
+    CandidateEvidenceSummary, LibraryOutputProfile, LibraryOutputProjection, PlayingLibraryPlan,
+    PlayingLibraryPolicy, ReleaseClass, RetroDeckProjectionPlan, RetroDeckVisibility,
+    RommLibraryProjectionPlan, RommVisibility, build_playing_library_plan,
+    build_playing_library_transaction, build_retrodeck_projection,
     build_retrodeck_projection_transaction, build_romm_projection_transaction,
-    build_romm_projection_with_visibility, match_loose_files_against_dat,
-    inspect_library_output_ownership, project_generic_playing_library, LibraryOutputProfile,
-    LibraryOutputProjection,
+    build_romm_projection_with_visibility, inspect_library_output_ownership,
+    match_loose_files_against_dat, project_generic_playing_library,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -254,6 +254,35 @@ fn split_preference_list(draft: &str) -> Vec<String> {
 }
 
 impl PlayingLibraryPageState {
+    pub(crate) fn destination_transaction(&self) -> Option<&RenameTransaction> {
+        match self.destination {
+            PlayingLibraryDestination::Romm => self.romm_applied.as_ref(),
+            PlayingLibraryDestination::RetroDeck => self.retrodeck_applied.as_ref(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                self.applied.as_ref()
+            }
+        }
+    }
+
+    pub(crate) fn destination_error(&self) -> Option<&str> {
+        match self.destination {
+            PlayingLibraryDestination::Romm => self.romm_error.as_deref(),
+            PlayingLibraryDestination::RetroDeck => self.retrodeck_error.as_deref(),
+            PlayingLibraryDestination::Generic | PlayingLibraryDestination::EsDe => {
+                self.apply_error.as_deref().or(self.error.as_deref())
+            }
+        }
+    }
+
+    pub(crate) fn esde_operation_error(&self) -> Option<&str> {
+        self.esde_recovery_error
+            .as_ref()
+            .or(self.esde_publish_error.as_ref())
+            .or(self.esde_preview_error.as_ref())
+            .map(|error| error.0.as_str())
+            .or(self.esde_discovery_error.as_deref())
+    }
+
     /// Projects current workflow-owned errors without repeating a preview or
     /// checking a destination. A refreshed workflow replaces these facts.
     pub(crate) fn attention_snapshot(&self) -> archivefs_core::attention::AttentionSnapshot {
@@ -499,7 +528,9 @@ impl PlayingLibraryPageState {
                 if self.destination == PlayingLibraryDestination::Generic {
                     plan = match project_generic_playing_library(
                         &plan,
-                        self.dat_platform_identity.as_ref().expect("identity set above"),
+                        self.dat_platform_identity
+                            .as_ref()
+                            .expect("identity set above"),
                         destination_root.to_path_buf(),
                     ) {
                         Ok(projected) => projected,
@@ -508,21 +539,23 @@ impl PlayingLibraryPageState {
                             return;
                         }
                     };
-                    self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
-                        LibraryOutputProfile::Generic,
-                        destination_root.to_path_buf(),
-                        &plan,
-                        generic_mapping_explanation(self.dat_platform_identity.as_ref()),
-                        &inspect_library_output_ownership(&plan, &self.journal_dir),
-                    ));
+                    self.output_projection =
+                        Some(LibraryOutputProjection::from_plan_with_ownership(
+                            LibraryOutputProfile::Generic,
+                            destination_root.to_path_buf(),
+                            &plan,
+                            generic_mapping_explanation(self.dat_platform_identity.as_ref()),
+                            &inspect_library_output_ownership(&plan, &self.journal_dir),
+                        ));
                 } else if self.destination == PlayingLibraryDestination::EsDe {
-                    self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
-                        LibraryOutputProfile::EsDe,
-                        destination_root,
-                        &plan,
-                        Vec::new(),
-                        &inspect_library_output_ownership(&plan, &self.journal_dir),
-                    ));
+                    self.output_projection =
+                        Some(LibraryOutputProjection::from_plan_with_ownership(
+                            LibraryOutputProfile::EsDe,
+                            destination_root,
+                            &plan,
+                            Vec::new(),
+                            &inspect_library_output_ownership(&plan, &self.journal_dir),
+                        ));
                 }
                 self.plan = Some(plan);
             }
@@ -566,7 +599,9 @@ impl PlayingLibraryPageState {
                 if self.destination == PlayingLibraryDestination::Generic {
                     plan = match project_generic_playing_library(
                         &plan,
-                        self.dat_platform_identity.as_ref().expect("identity set above"),
+                        self.dat_platform_identity
+                            .as_ref()
+                            .expect("identity set above"),
                         destination_root.to_path_buf(),
                     ) {
                         Ok(projected) => projected,
@@ -575,13 +610,14 @@ impl PlayingLibraryPageState {
                             return;
                         }
                     };
-                    self.output_projection = Some(LibraryOutputProjection::from_plan_with_ownership(
-                        LibraryOutputProfile::Generic,
-                        destination_root.to_path_buf(),
-                        &plan,
-                        generic_mapping_explanation(self.dat_platform_identity.as_ref()),
-                        &inspect_library_output_ownership(&plan, &self.journal_dir),
-                    ));
+                    self.output_projection =
+                        Some(LibraryOutputProjection::from_plan_with_ownership(
+                            LibraryOutputProfile::Generic,
+                            destination_root.to_path_buf(),
+                            &plan,
+                            generic_mapping_explanation(self.dat_platform_identity.as_ref()),
+                            &inspect_library_output_ownership(&plan, &self.journal_dir),
+                        ));
                 }
                 self.plan = Some(plan);
             }
@@ -1655,7 +1691,10 @@ fn show_output_projection_summary(
     widgets::card(ui, |ui| {
         widgets::section_header(ui, "Output profile preview", None);
         ui.label(format!("Profile: {}", projection.profile.label()));
-        ui.label(format!("Destination: {}", projection.destination_root.display()));
+        ui.label(format!(
+            "Destination: {}",
+            projection.destination_root.display()
+        ));
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(
                 ui,
@@ -1684,8 +1723,7 @@ fn show_output_projection_summary(
         });
         if !projection.unresolved_mappings.is_empty() {
             ui.label(
-                egui::RichText::new("Some platform mappings need review.")
-                    .color(theme::WARNING),
+                egui::RichText::new("Some platform mappings need review.").color(theme::WARNING),
             );
             for mapping in &projection.unresolved_mappings {
                 ui.label(format!("- {mapping}"));
@@ -1718,7 +1756,10 @@ fn show_output_projection_summary(
             }
             LibraryOutputProfile::RetroDeck => {
                 if let Some(retrodeck) = &state.retrodeck_projection {
-                    ui.label(format!("RetroDECK ROM directory: {}", retrodeck.es_de_system));
+                    ui.label(format!(
+                        "RetroDECK ROM directory: {}",
+                        retrodeck.es_de_system
+                    ));
                 }
             }
         }
@@ -1741,9 +1782,7 @@ fn show_output_projection_summary(
         let applied = match projection.profile {
             LibraryOutputProfile::Romm => state.romm_applied.is_some(),
             LibraryOutputProfile::RetroDeck => state.retrodeck_applied.is_some(),
-            LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => {
-                state.applied.is_some()
-            }
+            LibraryOutputProfile::Generic | LibraryOutputProfile::EsDe => state.applied.is_some(),
         };
         if !state.async_busy
             && !pending
@@ -1811,7 +1850,7 @@ fn show_output_projection_summary(
                     widgets::ActionStyle::Destructive,
                     !state.async_busy,
                 )
-                    .clicked()
+                .clicked()
                 {
                     *action = Some(PlayingLibraryPageAction::ConfirmApply);
                 }
@@ -1821,7 +1860,7 @@ fn show_output_projection_summary(
                     widgets::ActionStyle::Quiet,
                     !state.async_busy,
                 )
-                    .clicked()
+                .clicked()
                 {
                     *action = Some(PlayingLibraryPageAction::CancelApply);
                 }
@@ -1869,9 +1908,14 @@ fn show_romm_projection_summary(
         if !state.romm_visibility_verified {
             ui.label(
                 egui::RichText::new(
-                    "Apply is blocked until Docker/bind-mount visibility is explicitly verified.",
+                    "Needs setup — RomM cannot currently see this source path safely. Apply is blocked.",
                 )
                 .color(theme::WARNING),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("Ready — RomM path visibility has been verified.")
+                    .color(theme::SUCCESS),
             );
         }
         ui.horizontal(|ui| {
@@ -1904,10 +1948,11 @@ fn show_romm_projection_summary(
             ui.label(format!(
                 "{companion_count} companion file(s) kept with their launchers"
             ));
-            ui.label(format!(
-                "Visibility: {}",
-                projection.visibility.description()
-            ));
+            ui.label(if projection.visibility.is_verified() {
+                "Visibility: Ready"
+            } else {
+                "Visibility: Needs setup"
+            });
             match &projection.visibility {
                 RommVisibility::VerifiedVisible {
                     host_root,
@@ -2038,10 +2083,11 @@ fn show_retrodeck_projection_summary(
             ui.label(format!(
                 "{companions} companion file(s) kept with their launchers"
             ));
-            ui.label(format!(
-                "Visibility: {}",
-                projection.visibility.description()
-            ));
+            ui.label(if projection.visibility.is_verified() {
+                "Sandbox visibility: Ready"
+            } else {
+                "Sandbox visibility: Needs setup"
+            });
             if !projection.visibility.is_verified() {
                 ui.label(egui::RichText::new("Apply is blocked until source and destination visibility is explicitly verified.").color(theme::WARNING));
             }
@@ -2139,7 +2185,9 @@ fn generic_mapping_explanation(identity: Option<&DatPlatformIdentity>) -> Vec<St
         Some(DatPlatformIdentity::Ambiguous { .. }) => {
             vec!["platform identity is ambiguous; using the explicit `unknown` folder".into()]
         }
-        None => vec!["platform identity was not available; using the explicit `unknown` folder".into()],
+        None => {
+            vec!["platform identity was not available; using the explicit `unknown` folder".into()]
+        }
     }
 }
 
@@ -2287,7 +2335,6 @@ fn show_preview_summary(
             }
         }
     });
-
 }
 
 /// The "Publish to ES-DE" section: choose a platform, preview, confirm,
@@ -2447,11 +2494,18 @@ fn show_esde_publish_section(
                 "Game list: {}",
                 publication.gamelist_path.display()
             ));
+            ui.label(if publication.previous_content.is_some() {
+                "Existing gamelist: Found"
+            } else {
+                "Existing gamelist: Not found — a new one will be created"
+            });
             ui.label(format!("{} new game(s)", publication.added.len()));
             ui.label(format!(
                 "{} already in ES-DE",
                 publication.already_present.len()
             ));
+            ui.label("Existing unrelated entries preserved: Yes");
+            ui.label("Recovery backup: Ready before publication");
             if let Some(plan) = state.applied_plan() {
                 let not_included = plan.unresolved_groups.len() + plan.exclusions.len();
                 if not_included > 0 {
@@ -2516,6 +2570,18 @@ fn show_esde_publish_section(
 
         if let Some((friendly, detail)) = state.esde_publish_error() {
             ui.add_space(6.0);
+            if matches!(
+                state.applied(),
+                Some(transaction) if transaction.state == TransactionState::Applied
+            ) {
+                ui.label(
+                    egui::RichText::new(
+                        "Library created successfully. ES-DE metadata was not published.",
+                    )
+                    .color(theme::WARNING)
+                    .strong(),
+                );
+            }
             widgets::banner(
                 ui,
                 "Could not add games to ES-DE",

@@ -7,6 +7,7 @@ mod library;
 mod media_sources;
 mod mods;
 mod native_workflows;
+mod organisation;
 mod pages;
 mod problems;
 mod routes;
@@ -17,13 +18,13 @@ mod thumbnail;
 use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
 use activity::Activity;
 use artwork::Artwork;
-use mods::ModsPageState;
 use backend::{
     Backend, Command, DuplicateRepairPreview, DuplicateRepairRecord, Event, Payload, Preferences,
     VerificationResult,
 };
 use eframe::egui;
 use library::{Detail, DuplicateReport, Filter, Library, SharedLibrary};
+use mods::ModsPageState;
 use routes::{Route, Router, Section};
 use std::{
     sync::Arc,
@@ -133,12 +134,37 @@ struct Notice {
 enum PlayingLibraryJobKind {
     Preview,
     Apply,
+    PreviewRomm,
+    ApplyRomm,
+    PreviewRetroDeck,
+    ApplyRetroDeck,
+    PreviewEsde,
+    PublishEsde,
+    RecoverEsde,
+    Rollback,
+    RollbackRomm,
+    RollbackRetroDeck,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalOrganisationJobKind {
+    Preview,
+    Apply,
+    Rollback,
 }
 
 #[derive(Clone, Debug)]
 struct PlayingLibraryJob {
     id: u64,
     kind: PlayingLibraryJobKind,
+    generation: u64,
+    input_fingerprint: String,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalOrganisationJob {
+    id: u64,
+    kind: CanonicalOrganisationJobKind,
     generation: u64,
     input_fingerprint: String,
 }
@@ -185,6 +211,12 @@ pub(super) struct App {
     playing_library_history: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     playing_library_job: Option<PlayingLibraryJob>,
     playing_library_generation: u64,
+    organisation: organisation::OrganisationState,
+    canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
+    canonical_organisation_job: Option<CanonicalOrganisationJob>,
+    canonical_organisation_generation: u64,
+    canonical_organisation_history:
+        Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     mods: ModsPageState,
     native_workflows: Option<native_workflows::NativeWorkflows>,
     mrwiz_dismissed: bool,
@@ -236,6 +268,11 @@ impl App {
             playing_library_history: Vec::new(),
             playing_library_job: None,
             playing_library_generation: 0,
+            organisation: organisation::OrganisationState::default(),
+            canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
+            canonical_organisation_job: None,
+            canonical_organisation_generation: 0,
+            canonical_organisation_history: Vec::new(),
             mods: ModsPageState::default(),
             native_workflows: None,
             mrwiz_dismissed: false,
@@ -453,6 +490,136 @@ impl App {
         self.send(id, Command::Legacy { section, path });
     }
 
+    fn start_canonical_organisation_job(&mut self, kind: CanonicalOrganisationJobKind) {
+        if self.canonical_organisation_job.is_some() {
+            return;
+        }
+        self.canonical_organisation_generation =
+            self.canonical_organisation_generation.wrapping_add(1);
+        let generation = self.canonical_organisation_generation;
+        let input_fingerprint = self.canonical_organisation.input_fingerprint();
+        let id = self.activity.queue(
+            match kind {
+                CanonicalOrganisationJobKind::Preview => "Planning verified-game organisation",
+                CanonicalOrganisationJobKind::Apply => "Organising verified games",
+                CanonicalOrganisationJobKind::Rollback => "Undoing game organisation",
+            },
+            Route::Section(Section::Build),
+            false,
+        );
+        self.canonical_organisation_job = Some(CanonicalOrganisationJob {
+            id,
+            kind,
+            generation,
+            input_fingerprint,
+        });
+        let command = Command::CanonicalOrganisation {
+            state: Box::new(self.canonical_organisation.clone()),
+            generation,
+            kind,
+        };
+        if !self.send(id, command) {
+            self.canonical_organisation_job = None;
+        }
+    }
+
+    fn finish_canonical_organisation_job(
+        &mut self,
+        kind: CanonicalOrganisationJobKind,
+        state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
+        generation: u64,
+    ) {
+        let Some(job) = self.canonical_organisation_job.take() else {
+            return;
+        };
+        if job.kind != kind || job.generation != generation {
+            return;
+        }
+        if kind == CanonicalOrganisationJobKind::Preview
+            && (generation != self.canonical_organisation_generation
+                || job.input_fingerprint != self.canonical_organisation.input_fingerprint())
+        {
+            self.activity.finish(
+                job.id,
+                "The preview was discarded because the organisation settings changed. Preview again.".into(),
+                None,
+            );
+            return;
+        }
+        let previous_transaction_id = self
+            .canonical_organisation
+            .applied()
+            .map(|transaction| transaction.transaction_id.clone());
+        let error = state.error().map(str::to_owned);
+        let transaction = state.applied().cloned();
+        self.canonical_organisation = *state;
+        if let Some(error) = error {
+            self.activity.finish(
+                job.id,
+                match kind {
+                    CanonicalOrganisationJobKind::Preview => {
+                        "The organisation preview could not be completed. Nothing was changed."
+                    }
+                    CanonicalOrganisationJobKind::Apply => {
+                        "The organisation stopped safely. Review the details before trying again."
+                    }
+                    CanonicalOrganisationJobKind::Rollback => {
+                        "Undo could not finish safely. The operation needs review."
+                    }
+                }
+                .into(),
+                Some(error),
+            );
+        } else {
+            if let Some(transaction) = transaction
+                && !self
+                    .canonical_organisation_history
+                    .iter()
+                    .any(|item| item.transaction_id == transaction.transaction_id)
+            {
+                self.canonical_organisation_history.push(transaction);
+            }
+            if kind == CanonicalOrganisationJobKind::Rollback
+                && let Some(transaction_id) = previous_transaction_id
+                && let Some(existing) = self
+                    .canonical_organisation_history
+                    .iter_mut()
+                    .find(|item| item.transaction_id == transaction_id)
+            {
+                existing.state =
+                    archivefs_core::dat::rename_apply::model::TransactionState::RolledBack;
+            }
+            self.activity.finish(
+                job.id,
+                match kind {
+                    CanonicalOrganisationJobKind::Preview => {
+                        "Organisation preview ready. Review every move, rename, link and blocker before confirming.".into()
+                    }
+                    CanonicalOrganisationJobKind::Apply => {
+                        "Verified-game organisation completed. The durable journal records its undo state.".into()
+                    }
+                    CanonicalOrganisationJobKind::Rollback => {
+                        "Organisation was undone safely.".into()
+                    }
+                },
+                None,
+            );
+        }
+    }
+
+    fn invalidate_changed_canonical_organisation_plan(&mut self) {
+        let Some(job) = self.canonical_organisation_job.as_ref() else {
+            return;
+        };
+        if job.kind == CanonicalOrganisationJobKind::Preview
+            && job.generation == self.canonical_organisation_generation
+            && job.input_fingerprint != self.canonical_organisation.input_fingerprint()
+        {
+            self.canonical_organisation_generation =
+                self.canonical_organisation_generation.wrapping_add(1);
+        }
+    }
+
     fn start_playing_library_job(&mut self, kind: PlayingLibraryJobKind) {
         if self.playing_library_job.is_some() {
             return;
@@ -464,6 +631,16 @@ impl App {
             match kind {
                 PlayingLibraryJobKind::Preview => "Planning your playing library",
                 PlayingLibraryJobKind::Apply => "Building your playing library",
+                PlayingLibraryJobKind::PreviewRomm => "Checking the RomM library layout",
+                PlayingLibraryJobKind::ApplyRomm => "Creating the RomM library",
+                PlayingLibraryJobKind::PreviewRetroDeck => "Checking the RetroDECK layout",
+                PlayingLibraryJobKind::ApplyRetroDeck => "Creating the RetroDECK library",
+                PlayingLibraryJobKind::PreviewEsde => "Checking ES-DE metadata",
+                PlayingLibraryJobKind::PublishEsde => "Publishing ES-DE metadata",
+                PlayingLibraryJobKind::RecoverEsde => "Restoring ES-DE metadata",
+                PlayingLibraryJobKind::Rollback
+                | PlayingLibraryJobKind::RollbackRomm
+                | PlayingLibraryJobKind::RollbackRetroDeck => "Undoing linked-library changes",
             },
             Route::Section(Section::Build),
             false,
@@ -478,6 +655,11 @@ impl App {
         let command = match kind {
             PlayingLibraryJobKind::Preview => Command::PlayingLibraryPreview { state, generation },
             PlayingLibraryJobKind::Apply => Command::PlayingLibraryApply { state, generation },
+            _ => Command::PlayingLibrarySpecial {
+                state,
+                generation,
+                kind,
+            },
         };
         if !self.send(id, command) {
             self.playing_library_job = None;
@@ -491,53 +673,70 @@ impl App {
                 self.start_playing_library_job(PlayingLibraryJobKind::Preview);
             }
             SelectFamily(name) => self.playing_library.select_family(name),
-            RequestApply => self.playing_library.request_apply(),
-            CancelApply => self.playing_library.cancel_apply(),
+            RequestApply => match self.playing_library.destination {
+                crate::playing_library_page::PlayingLibraryDestination::Romm => {
+                    self.playing_library.request_romm_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::RetroDeck => {
+                    self.playing_library.request_retrodeck_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::Generic
+                | crate::playing_library_page::PlayingLibraryDestination::EsDe => {
+                    self.playing_library.request_apply()
+                }
+            },
+            CancelApply => match self.playing_library.destination {
+                crate::playing_library_page::PlayingLibraryDestination::Romm => {
+                    self.playing_library.cancel_romm_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::RetroDeck => {
+                    self.playing_library.cancel_retrodeck_apply()
+                }
+                crate::playing_library_page::PlayingLibraryDestination::Generic
+                | crate::playing_library_page::PlayingLibraryDestination::EsDe => {
+                    self.playing_library.cancel_apply()
+                }
+            },
             ConfirmApply => {
-                self.start_playing_library_job(PlayingLibraryJobKind::Apply);
+                let kind = match self.playing_library.destination {
+                    crate::playing_library_page::PlayingLibraryDestination::Romm => {
+                        PlayingLibraryJobKind::ApplyRomm
+                    }
+                    crate::playing_library_page::PlayingLibraryDestination::RetroDeck => {
+                        PlayingLibraryJobKind::ApplyRetroDeck
+                    }
+                    crate::playing_library_page::PlayingLibraryDestination::Generic
+                    | crate::playing_library_page::PlayingLibraryDestination::EsDe => {
+                        PlayingLibraryJobKind::Apply
+                    }
+                };
+                self.start_playing_library_job(kind);
             }
             RollbackLast => {
-                let id = self.activity.queue(
-                    "Undoing the playing library build",
-                    Route::Section(Section::History),
-                    false,
-                );
-                self.playing_library.rollback_last();
-                if let Some(error) = self.playing_library.apply_error().map(str::to_owned) {
-                    self.activity.finish(
-                        id,
-                        "Undo was refused because the destination is no longer in the expected state.".into(),
-                        Some(error),
-                    );
-                } else {
-                    if let Some(transaction) = self.playing_library.applied().cloned()
-                        && let Some(existing) = self
-                            .playing_library_history
-                            .iter_mut()
-                            .rev()
-                            .find(|item| item.transaction_id == transaction.transaction_id)
-                    {
-                        *existing = transaction;
-                    }
-                    self.activity
-                        .finish(id, "Playing library build undone safely.".into(), None);
-                }
+                self.start_playing_library_job(PlayingLibraryJobKind::Rollback);
             }
-            // These destinations are intentionally kept in the existing
-            // specialised page. The v2 generic Build Library journey does
-            // not expose frontend-specific publication workflows.
-            SelectEsdePlatform(_)
-            | PreviewEsde
-            | RequestEsdePublish
-            | CancelEsdePublish
-            | ConfirmEsdePublish
-            | RequestEsdeRecovery
-            | CancelEsdeRecovery
-            | ConfirmEsdeRecovery
-            | PreviewRomm
-            | RollbackRomm
-            | PreviewRetroDeck
-            | RollbackRetroDeck => {}
+            SelectEsdePlatform(platform) => {
+                self.playing_library.select_esde_platform(Some(platform))
+            }
+            PreviewEsde => self.start_playing_library_job(PlayingLibraryJobKind::PreviewEsde),
+            RequestEsdePublish => self.playing_library.request_esde_publish(),
+            CancelEsdePublish => self.playing_library.cancel_esde_publish(),
+            ConfirmEsdePublish => {
+                self.start_playing_library_job(PlayingLibraryJobKind::PublishEsde)
+            }
+            RequestEsdeRecovery => self.playing_library.request_esde_recovery(),
+            CancelEsdeRecovery => self.playing_library.cancel_esde_recovery(),
+            ConfirmEsdeRecovery => {
+                self.start_playing_library_job(PlayingLibraryJobKind::RecoverEsde)
+            }
+            PreviewRomm => self.start_playing_library_job(PlayingLibraryJobKind::PreviewRomm),
+            RollbackRomm => self.start_playing_library_job(PlayingLibraryJobKind::RollbackRomm),
+            PreviewRetroDeck => {
+                self.start_playing_library_job(PlayingLibraryJobKind::PreviewRetroDeck)
+            }
+            RollbackRetroDeck => {
+                self.start_playing_library_job(PlayingLibraryJobKind::RollbackRetroDeck)
+            }
         }
     }
 
@@ -611,8 +810,100 @@ impl App {
                         None,
                     );
                 } else {
-                    self.activity
-                        .finish(job.id, "No playing-library changes were made.".into(), None);
+                    self.activity.finish(
+                        job.id,
+                        "No playing-library changes were made.".into(),
+                        None,
+                    );
+                }
+            }
+            PlayingLibraryJobKind::PreviewRomm
+            | PlayingLibraryJobKind::PreviewRetroDeck
+            | PlayingLibraryJobKind::PreviewEsde
+            | PlayingLibraryJobKind::ApplyRomm
+            | PlayingLibraryJobKind::ApplyRetroDeck
+            | PlayingLibraryJobKind::PublishEsde
+            | PlayingLibraryJobKind::RecoverEsde
+            | PlayingLibraryJobKind::Rollback
+            | PlayingLibraryJobKind::RollbackRomm
+            | PlayingLibraryJobKind::RollbackRetroDeck => {
+                let planning = matches!(
+                    kind,
+                    PlayingLibraryJobKind::PreviewRomm
+                        | PlayingLibraryJobKind::PreviewRetroDeck
+                        | PlayingLibraryJobKind::PreviewEsde
+                );
+                if planning
+                    && (generation != self.playing_library_generation
+                        || job.input_fingerprint != self.playing_library.input_fingerprint())
+                {
+                    self.activity.finish(
+                        job.id,
+                        "The result was discarded because the source, destination or preferences changed. Preview again.".into(),
+                        None,
+                    );
+                    return;
+                }
+                let error = if matches!(
+                    kind,
+                    PlayingLibraryJobKind::PreviewEsde
+                        | PlayingLibraryJobKind::PublishEsde
+                        | PlayingLibraryJobKind::RecoverEsde
+                ) {
+                    state.esde_operation_error().map(str::to_owned)
+                } else {
+                    state.destination_error().map(str::to_owned)
+                };
+                let transaction = state.destination_transaction().cloned();
+                self.playing_library = *state;
+                if let Some(transaction) = transaction {
+                    if let Some(existing) = self
+                        .playing_library_history
+                        .iter_mut()
+                        .find(|item| item.transaction_id == transaction.transaction_id)
+                    {
+                        *existing = transaction;
+                    } else {
+                        self.playing_library_history.push(transaction);
+                    }
+                }
+                if let Some(error) = error {
+                    self.activity.finish(
+                        job.id,
+                        "The organisation operation stopped safely. Review the explanation before retrying.".into(),
+                        Some(error),
+                    );
+                } else {
+                    let summary = match kind {
+                        PlayingLibraryJobKind::PreviewRomm => {
+                            "RomM layout preview ready. Source files remain untouched."
+                        }
+                        PlayingLibraryJobKind::PreviewRetroDeck => {
+                            "RetroDECK layout preview ready, including sandbox visibility."
+                        }
+                        PlayingLibraryJobKind::PreviewEsde => {
+                            "ES-DE metadata preview ready. Existing entries will be preserved."
+                        }
+                        PlayingLibraryJobKind::ApplyRomm => {
+                            "RomM linked library created. No RomM server data was edited."
+                        }
+                        PlayingLibraryJobKind::ApplyRetroDeck => {
+                            "RetroDECK linked library created. Metadata publication remains a separate step."
+                        }
+                        PlayingLibraryJobKind::PublishEsde => "ES-DE metadata published safely.",
+                        PlayingLibraryJobKind::RecoverEsde => {
+                            "ES-DE's previous metadata was restored safely."
+                        }
+                        PlayingLibraryJobKind::Rollback
+                        | PlayingLibraryJobKind::RollbackRomm
+                        | PlayingLibraryJobKind::RollbackRetroDeck => {
+                            "Linked-library changes were undone safely."
+                        }
+                        PlayingLibraryJobKind::Preview | PlayingLibraryJobKind::Apply => {
+                            unreachable!()
+                        }
+                    };
+                    self.activity.finish(job.id, summary.into(), None);
                 }
             }
         }
@@ -622,8 +913,13 @@ impl App {
         let Some(job) = self.playing_library_job.as_ref() else {
             return;
         };
-        if job.kind == PlayingLibraryJobKind::Preview
-            && job.generation == self.playing_library_generation
+        if matches!(
+            job.kind,
+            PlayingLibraryJobKind::Preview
+                | PlayingLibraryJobKind::PreviewRomm
+                | PlayingLibraryJobKind::PreviewRetroDeck
+                | PlayingLibraryJobKind::PreviewEsde
+        ) && job.generation == self.playing_library_generation
             && job.input_fingerprint != self.playing_library.input_fingerprint()
         {
             // The worker owns a snapshot. Once the user edits any planning
@@ -743,9 +1039,11 @@ impl App {
                                 Payload::RepairHistory {
                                     duplicates,
                                     playing_libraries,
+                                    organisations,
                                 } => {
                                     self.repair_history = duplicates;
                                     self.playing_library_history = playing_libraries;
+                                    self.canonical_organisation_history = organisations;
                                 }
                                 Payload::Preferences(preferences) => {
                                     if !self.interacted {
@@ -768,12 +1066,37 @@ impl App {
                                         generation,
                                     );
                                 }
+                                Payload::PlayingLibrarySpecial {
+                                    state,
+                                    generation,
+                                    kind,
+                                } => {
+                                    self.finish_playing_library_job(kind, state, generation);
+                                }
+                                Payload::CanonicalOrganisation {
+                                    state,
+                                    generation,
+                                    kind,
+                                } => {
+                                    self.finish_canonical_organisation_job(kind, state, generation);
+                                }
                                 Payload::Done => {}
                             }
                         }
                         Err(error) => {
-                            if self.playing_library_job.as_ref().is_some_and(|job| job.id == id) {
+                            if self
+                                .playing_library_job
+                                .as_ref()
+                                .is_some_and(|job| job.id == id)
+                            {
                                 self.playing_library_job = None;
+                            }
+                            if self
+                                .canonical_organisation_job
+                                .as_ref()
+                                .is_some_and(|job| job.id == id)
+                            {
+                                self.canonical_organisation_job = None;
                             }
                             if self.repair_job == Some(id) {
                                 self.repair_job = None;
