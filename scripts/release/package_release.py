@@ -25,6 +25,19 @@ import tarfile
 import tempfile
 from typing import Any, Iterable
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+_previous_bytecode_setting = sys.dont_write_bytecode
+sys.dont_write_bytecode = True
+try:
+    from release_signing import (  # noqa: E402
+        SigningError,
+        inspect_signing_key,
+        sign_detached_gpg,
+        verify_detached_gpg,
+    )
+finally:
+    sys.dont_write_bytecode = _previous_bytecode_setting
+
 
 SCHEMA_VERSION = 1
 PACKAGER_VERSION = "1.0.0"
@@ -670,6 +683,8 @@ def verify_archive(
     expected_sha256: str | None = None,
     reference_root: pathlib.Path | None = None,
     source_root: pathlib.Path | None = None,
+    signature_file: pathlib.Path | None = None,
+    public_key_file: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     path = path.resolve()
     if path.is_symlink() or not path.is_file():
@@ -683,6 +698,14 @@ def verify_archive(
             archive.extractall(destination, members=members, filter="data")
             extracted = destination / root_name
             result = verify_directory(extracted, strict=strict, quiet=True, source_root=source_root)
+            if signature_file is not None and public_key_file is not None:
+                try:
+                    valid_signature = verify_detached_gpg(extracted / "SHA256SUMS", signature_file, public_key_file)
+                except SigningError as error:
+                    raise ReleaseError(str(error), EXIT_VERIFY) from error
+                if not valid_signature:
+                    print("INVALID SIGNATURE")
+                    raise ReleaseError("INVALID SIGNATURE", EXIT_VERIFY)
             for relative in result["manifest"]["files"]:
                 candidate = extracted / relative["path"]
                 if sha256_file(candidate) != relative["sha256"]:
@@ -730,6 +753,18 @@ def package(args: argparse.Namespace) -> pathlib.Path:
     release_name = f"emuwiz-{version}-{release_platform}"
     final = output_root / release_name
     archive_path = output_root / f"{release_name}.tar.xz"
+    signature_path = output_root / f"{release_name}.SHA256SUMS.asc"
+    public_key_path = pathlib.Path(args.public_key_output).expanduser() if args.public_key_output else None
+    signing_identity: dict[str, Any] | None = None
+    if args.sign:
+        if not args.signing_key:
+            raise ReleaseError("--sign requires --signing-key", EXIT_INPUT)
+        try:
+            signing_identity = inspect_signing_key(pathlib.Path(args.signing_key).expanduser())
+        except SigningError as error:
+            raise ReleaseError(str(error), EXIT_INPUT) from error
+    elif args.signing_key or args.public_key_output:
+        raise ReleaseError("--signing-key and --public-key-output require --sign", EXIT_INPUT)
     output_root.mkdir(parents=True, exist_ok=True)
     replacing_owned_package = False
     if final.exists():
@@ -748,6 +783,14 @@ def package(args: argparse.Namespace) -> pathlib.Path:
             raise ReleaseError("refusing to replace archive without an associated owned package", EXIT_UNSAFE)
         if not (output_root / f"{release_name}.tar.xz.sha256").is_file():
             raise ReleaseError("refusing to replace archive without its checksum sidecar", EXIT_UNSAFE)
+    if signature_path.exists():
+        if not args.overwrite:
+            raise ReleaseError(f"signature sidecar already exists: {signature_path}", EXIT_UNSAFE)
+        if signature_path.is_symlink() or not signature_path.is_file():
+            raise ReleaseError(f"refusing to replace unsafe signature sidecar: {signature_path}", EXIT_UNSAFE)
+        signature_path.unlink()
+    if public_key_path is not None and public_key_path.exists():
+        raise ReleaseError(f"refusing to replace existing public-key output: {public_key_path}", EXIT_UNSAFE)
     if replacing_owned_package:
         remove_owned_release(final, release_name)
     if archive_path.exists():
@@ -840,6 +883,17 @@ def package(args: argparse.Namespace) -> pathlib.Path:
             "dynamic_dependency_note: names are informational, not proof of target availability",
             "",
         ]
+        if signing_identity is not None:
+            build_info.extend([
+                "Signing:",
+                "  Enabled: yes",
+                f"  Algorithm: {signing_identity['algorithm']}",
+                f"  Key fingerprint: {signing_identity['key_fingerprint']}",
+                "  Signature: detached, outside reproducible archive",
+                f"  Signature file: {signature_path.name}",
+                f"  Public key file: {public_key_path.name if public_key_path else 'published separately'}",
+                "",
+            ])
         if sbom_info is not None:
             summary = sbom_info["summary"]
             counts = summary.get("counts", {})
@@ -901,6 +955,13 @@ def package(args: argparse.Namespace) -> pathlib.Path:
             "checksum_scope": "all files except SHA256SUMS; manifest.json is represented only in SHA256SUMS to avoid a self-hash",
             "variable_fields_when_not_reproducible": ["release.packaging_timestamp"],
         }
+        if signing_identity is not None:
+            manifest["signing"] = {
+                **signing_identity,
+                "signed_file": "SHA256SUMS",
+                "signature_file": signature_path.name,
+                "public_key_file": public_key_path.name if public_key_path else None,
+            }
         if sbom_info is not None:
             summary = sbom_info["summary"]
             manifest["sbom"] = {
@@ -926,6 +987,16 @@ def package(args: argparse.Namespace) -> pathlib.Path:
         checksum_records.append(("manifest.json", sha256_file(release / "manifest.json")))
         checksum_text = "".join(f"{digest}  {relative}\n" for relative, digest in sorted(checksum_records))
         atomic_write(release / "SHA256SUMS", checksum_text.encode())
+        if signing_identity is not None:
+            try:
+                sign_detached_gpg(
+                    release / "SHA256SUMS",
+                    pathlib.Path(args.signing_key).expanduser(),
+                    signature_path,
+                    public_key_path,
+                )
+            except SigningError as error:
+                raise ReleaseError(str(error), EXIT_TOOL) from error
 
         log(6, "Scanning payload")
         scan_secrets(release)
@@ -966,6 +1037,10 @@ def package(args: argparse.Namespace) -> pathlib.Path:
                 pass
         if archive_path.exists():
             archive_path.unlink()
+        if signature_path.is_file() and not signature_path.is_symlink():
+            signature_path.unlink()
+        if public_key_path is not None and public_key_path.is_file() and not public_key_path.is_symlink():
+            public_key_path.unlink()
         raise
 
 
@@ -979,6 +1054,21 @@ def verify_command(args: argparse.Namespace) -> None:
             args.strict,
             source_root=pathlib.Path(args.source_root).expanduser().resolve() if args.source_root else None,
         )
+        if args.verify_signature:
+            signature = pathlib.Path(args.signature).expanduser() if args.signature else target.parent / f"{target.name}.SHA256SUMS.asc"
+            if not signature.exists():
+                print("SIGNATURE NOT PROVIDED")
+                return
+            if not args.public_key:
+                raise ReleaseError("--public-key is required to verify a provided signature", EXIT_INPUT)
+            try:
+                valid = verify_detached_gpg(target / "SHA256SUMS", signature, pathlib.Path(args.public_key).expanduser())
+            except SigningError as error:
+                raise ReleaseError(str(error), EXIT_VERIFY) from error
+            if not valid:
+                print("INVALID SIGNATURE")
+                raise ReleaseError("INVALID SIGNATURE", EXIT_VERIFY)
+            print("VALID SIGNATURE")
     else:
         expected = args.archive_sha256
         if args.checksum:
@@ -991,12 +1081,27 @@ def verify_command(args: argparse.Namespace) -> None:
             if not match or match.group(2) != target.name:
                 raise ReleaseError("archive checksum file is invalid or names a different archive", EXIT_INPUT)
             expected = match.group(1)
+        signature = None
+        public_key = None
+        if args.verify_signature:
+            signature = pathlib.Path(args.signature).expanduser() if args.signature else target.parent / f"{target.name.removesuffix('.tar.xz')}.SHA256SUMS.asc"
+            if not signature.exists():
+                print("SIGNATURE NOT PROVIDED")
+                signature = None
+            elif not args.public_key:
+                raise ReleaseError("--public-key is required to verify a provided signature", EXIT_INPUT)
+            else:
+                public_key = pathlib.Path(args.public_key).expanduser()
         verify_archive(
             target,
             args.strict,
             expected,
             source_root=pathlib.Path(args.source_root).expanduser().resolve() if args.source_root else None,
+            signature_file=signature,
+            public_key_file=public_key,
         )
+        if signature is not None:
+            print("VALID SIGNATURE")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1020,6 +1125,9 @@ def parser() -> argparse.ArgumentParser:
     package_parser.add_argument("--reproducible", action="store_true")
     package_parser.add_argument("--archive", action="store_true")
     package_parser.add_argument("--overwrite", action="store_true")
+    package_parser.add_argument("--sign", action="store_true", help="create a detached GPG signature for SHA256SUMS")
+    package_parser.add_argument("--signing-key", help="private signing key file; imported only into a temporary keyring")
+    package_parser.add_argument("--public-key-output", help="optional separate output path for the armored public key")
     package_parser.add_argument("--allow-symlink", action="store_true")
     package_parser.add_argument("--fixture-mode", action="store_true", help=argparse.SUPPRESS)
     package_parser.set_defaults(function=package)
@@ -1028,6 +1136,9 @@ def parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--archive-sha256")
     verify_parser.add_argument("--checksum", help="one-record archive SHA-256 sidecar")
     verify_parser.add_argument("--source-root", help="optional source tree for full SBOM re-verification")
+    verify_parser.add_argument("--verify-signature", action="store_true")
+    verify_parser.add_argument("--public-key", help="public key used to verify the detached signature")
+    verify_parser.add_argument("--signature", help="detached signature path; defaults to the release sidecar")
     verify_parser.add_argument("target")
     verify_parser.set_defaults(function=verify_command)
     return result
@@ -1041,6 +1152,9 @@ def main(argv: list[str] | None = None) -> int:
     except ReleaseError as error:
         print(f"release-packager: error: {error}", file=sys.stderr)
         return error.code
+    except SigningError as error:
+        print(f"release-packager: signing error: {error}", file=sys.stderr)
+        return EXIT_TOOL
     except (OSError, tarfile.TarError) as error:
         print(f"release-packager: tool failure: {error}", file=sys.stderr)
         return EXIT_TOOL
