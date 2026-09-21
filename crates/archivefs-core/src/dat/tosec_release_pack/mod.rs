@@ -1138,7 +1138,9 @@ impl TosecManagedSnapshotStore {
         let root_path = self.root.join("materialized").join(
             self.store
                 .active_snapshot()?
-                .ok_or_else(|| ArchiveFsError::Config("active TOSEC snapshot disappeared".to_string()))?
+                .ok_or_else(|| {
+                    ArchiveFsError::Config("active TOSEC snapshot disappeared".to_string())
+                })?
                 .sha256,
         );
         let pack = PersistedTosecPack {

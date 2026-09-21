@@ -144,7 +144,8 @@ fn sources_page_scan_all_enabled_populates_the_all_enabled_scope() {
     app.poll_source_action(&egui::Context::default());
 
     assert_eq!(
-        app.sources_ui.sources_last_scan
+        app.sources_ui
+            .sources_last_scan
             .as_ref()
             .map(|last_scan| &last_scan.scope),
         Some(&SourcesScanScope::AllEnabled)
@@ -997,7 +998,13 @@ fn start_source_action_does_not_start_a_second_concurrent_action() {
         receiver,
         worker: None,
     });
-    let first_action = app.sources_ui.source_action.as_ref().unwrap().action.clone();
+    let first_action = app
+        .sources_ui
+        .source_action
+        .as_ref()
+        .unwrap()
+        .action
+        .clone();
 
     // Seed the running action directly: calling start_source_action
     // here would launch the production ScanAll worker against the
@@ -1006,7 +1013,10 @@ fn start_source_action_does_not_start_a_second_concurrent_action() {
         egui::Context::default(),
         SourceAction::Add(PathBuf::from("/mnt/games/roms")),
     );
-    assert_eq!(app.sources_ui.source_action.as_ref().unwrap().action, first_action);
+    assert_eq!(
+        app.sources_ui.source_action.as_ref().unwrap().action,
+        first_action
+    );
 }
 
 #[test]

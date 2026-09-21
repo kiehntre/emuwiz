@@ -450,12 +450,20 @@ impl fmt::Display for ModProviderError {
             Self::CacheFull => formatter.write_str("bounded provider metadata cache is full"),
             Self::InvalidCacheBound => formatter.write_str("invalid provider metadata cache bound"),
             Self::InvalidUrl(detail) => write!(formatter, "invalid ModDB URL: {detail}"),
-            Self::ProviderUnavailable(detail) => write!(formatter, "ModDB is unavailable: {detail}"),
+            Self::ProviderUnavailable(detail) => {
+                write!(formatter, "ModDB is unavailable: {detail}")
+            }
             Self::RateLimited => formatter.write_str("ModDB rate-limited the metadata request"),
-            Self::BrowserRequired(detail) => write!(formatter, "ModDB requires browser handoff: {detail}"),
-            Self::Challenge(detail) => write!(formatter, "ModDB returned a challenge page: {detail}"),
+            Self::BrowserRequired(detail) => {
+                write!(formatter, "ModDB requires browser handoff: {detail}")
+            }
+            Self::Challenge(detail) => {
+                write!(formatter, "ModDB returned a challenge page: {detail}")
+            }
             Self::CorruptCache(detail) => write!(formatter, "ModDB cache is corrupt: {detail}"),
-            Self::UnsupportedSchema(version) => write!(formatter, "ModDB cache schema {version} is unsupported"),
+            Self::UnsupportedSchema(version) => {
+                write!(formatter, "ModDB cache schema {version} is unsupported")
+            }
             Self::HttpStatus(status) => write!(formatter, "ModDB returned HTTP {status}"),
         }
     }

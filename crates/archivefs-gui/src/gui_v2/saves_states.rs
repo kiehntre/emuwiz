@@ -8,12 +8,12 @@ use super::{
     App,
     routes::{Route, Section},
 };
+#[cfg(not(test))]
+use archivefs_core::persistent_state_inventory::StateEmulator;
 use archivefs_core::persistent_state_inventory::{
     PersistentStateInventory, PersistentStateRecord, PersistentStateRoot, PersistentStateType,
     PortabilityClass,
 };
-#[cfg(not(test))]
-use archivefs_core::persistent_state_inventory::StateEmulator;
 use eframe::egui;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

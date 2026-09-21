@@ -298,7 +298,9 @@ impl ArchiveFsApp {
                         activity_message,
                     ));
                     if normal_unmount_recovery {
-                        self.mount_ui.lazy_unmount_offers.insert(archive_path.clone());
+                        self.mount_ui
+                            .lazy_unmount_offers
+                            .insert(archive_path.clone());
                         self.history.record(HistoryEntry::new(
                             ActivityAction::LazyUnmount,
                             Some(archive_path),

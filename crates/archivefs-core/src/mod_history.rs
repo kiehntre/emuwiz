@@ -344,11 +344,16 @@ impl ModReceiptSummary {
             files_created: 1,
             files_replaced: 0,
             files_unchanged: 0,
-            destination_root: provenance.output_path.parent().map(|p| p.display().to_string()),
+            destination_root: provenance
+                .output_path
+                .parent()
+                .map(|p| p.display().to_string()),
             journal_path: None,
             backup_root: None,
             rollback: ModRollbackStatus::CannotSafelyUndo {
-                reason: "This derived patch output has provenance but no rollback journal or backup.".into(),
+                reason:
+                    "This derived patch output has provenance but no rollback journal or backup."
+                        .into(),
             },
             conflicts: Vec::new(),
             notes: vec![format!(
@@ -384,7 +389,10 @@ impl ModReceiptSummary {
             .map(|layer| Self {
                 schema_version: MOD_RECEIPT_SCHEMA_VERSION,
                 transaction_id: layer.transaction_id.clone().unwrap_or_else(|| {
-                    format!("activation:{}:{}", receipt.timestamp_unix_seconds, layer.mod_id)
+                    format!(
+                        "activation:{}:{}",
+                        receipt.timestamp_unix_seconds, layer.mod_id
+                    )
                 }),
                 kind: ModKind::ActivationStack,
                 platform: Some(layer.platform.clone()),
@@ -414,13 +422,23 @@ impl ModReceiptSummary {
                 provider_provenance: None,
                 provider_state: None,
                 package_hash: layer.provenance.content_sha256.clone(),
-                affected_destinations: layer.affected_paths.iter().map(|p| p.display().to_string()).collect(),
+                affected_destinations: layer
+                    .affected_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect(),
                 requested_order: layer.requested_order,
                 effective_order: layer.effective_order,
                 activation_group: layer.exclusive_group.clone(),
-                conflict_kinds: receipt.conflicts.iter().filter(|c| {
-                    c.left_mod_id == layer.mod_id || c.right_mod_id.as_deref() == Some(layer.mod_id.as_str())
-                }).map(|c| format!("{:?}", c.kind)).collect(),
+                conflict_kinds: receipt
+                    .conflicts
+                    .iter()
+                    .filter(|c| {
+                        c.left_mod_id == layer.mod_id
+                            || c.right_mod_id.as_deref() == Some(layer.mod_id.as_str())
+                    })
+                    .map(|c| format!("{:?}", c.kind))
+                    .collect(),
             })
             .collect()
     }
@@ -432,7 +450,9 @@ impl ModReceiptSummary {
         Self::from_activation_receipt(receipt)
             .into_iter()
             .map(|row| {
-                if let Some((provider, join)) = providers.get(row.source_package.as_deref().unwrap_or_default()) {
+                if let Some((provider, join)) =
+                    providers.get(row.source_package.as_deref().unwrap_or_default())
+                {
                     row.attach_provider_provenance_after_join(provider.clone(), join)
                 } else {
                     Ok(row)
@@ -1056,8 +1076,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(composition.kind, ModKind::PatchComposition);
-        assert_eq!(composition.package_hash.as_deref(), Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-        assert_eq!(composition.provider_state, Some(ModProviderHistoryState::VerifiedProviderFile));
+        assert_eq!(
+            composition.package_hash.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            composition.provider_state,
+            Some(ModProviderHistoryState::VerifiedProviderFile)
+        );
 
         let layer = ModLayer {
             mod_id: "provider-mod".into(),
@@ -1097,7 +1123,9 @@ mod tests {
         };
         let mut providers = BTreeMap::new();
         providers.insert("/mods/provider-pack.zip".into(), (provider, join));
-        let rows = ModReceiptSummary::from_activation_receipt_with_providers(&activation, &providers).unwrap();
+        let rows =
+            ModReceiptSummary::from_activation_receipt_with_providers(&activation, &providers)
+                .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].kind, ModKind::ActivationStack);
         assert_eq!(rows[0].requested_order, Some(1));
@@ -1190,7 +1218,11 @@ mod tests {
                 &ppsspp,
                 None,
                 Path::new("/b"),
-                &preview("ppsspp", "PSP/GAME/TEXTURE.png", SharedRollbackOutcome::Available)
+                &preview(
+                    "ppsspp",
+                    "PSP/GAME/TEXTURE.png",
+                    SharedRollbackOutcome::Available
+                )
             )
             .unwrap()
             .kind,

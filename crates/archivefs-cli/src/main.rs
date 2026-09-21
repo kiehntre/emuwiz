@@ -5965,9 +5965,7 @@ mod tests {
             PathBuf::from("/data/roms")
         );
         let error = resolve_source_identifier_without_catalogue("7", &sources).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("No EmuWiz catalogue exists yet"));
+        assert!(error.to_string().contains("No EmuWiz catalogue exists yet"));
         assert!(error.to_string().contains("library scan first"));
     }
 

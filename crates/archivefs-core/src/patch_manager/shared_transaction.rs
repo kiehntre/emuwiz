@@ -940,8 +940,12 @@ pub fn execute_shared_apply(
             fs::symlink_metadata(options.history_root.join(format!("{operation}.json"))).is_ok()
         });
         let pending_duplicate = operation.as_ref().ok().is_some_and(|operation| {
-            fs::symlink_metadata(options.history_root.join(format!("{operation}.pending.json")))
-                .is_ok()
+            fs::symlink_metadata(
+                options
+                    .history_root
+                    .join(format!("{operation}.pending.json")),
+            )
+            .is_ok()
         });
         let managed_overlap = roots_overlap(&options.history_root, &source_root)
             || roots_overlap(&options.history_root, &destination_root)
@@ -1702,9 +1706,7 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
         }
         SharedContentVerification::LocalModPackage
         | SharedContentVerification::CemuGraphicPack
-        | SharedContentVerification::Rpcs3OrdinaryMod => {
-            Ok(())
-        }
+        | SharedContentVerification::Rpcs3OrdinaryMod => Ok(()),
     }
 }
 
@@ -1840,7 +1842,7 @@ pub fn discover_shared_apply_history(history_root: &Path) -> SharedHistoryReport
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
-                path.extension() == Some(OsStr::new("json"))
+            path.extension() == Some(OsStr::new("json"))
                 && !path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().ends_with(".rollback.json"))
@@ -1996,7 +1998,12 @@ pub fn execute_shared_rollback(
         };
     }
     let mut applied = fresh.clone();
-    for (index, (rollback, install)) in applied.entries.iter_mut().zip(&original.entries).enumerate() {
+    for (index, (rollback, install)) in applied
+        .entries
+        .iter_mut()
+        .zip(&original.entries)
+        .enumerate()
+    {
         durable.transaction_state = SharedRecoveryState::RollingBack;
         if let Some(entry) = durable.entries.get_mut(index) {
             entry.state = SharedEntryRecoveryState::RollingBack;
@@ -2396,10 +2403,7 @@ fn pending_journal_path(
     history_root: &Path,
     operation_id: &str,
 ) -> Result<PathBuf, SharedApplyFailureKind> {
-    Ok(history_root.join(format!(
-        "{}.pending.json",
-        safe_identifier(operation_id)?
-    )))
+    Ok(history_root.join(format!("{}.pending.json", safe_identifier(operation_id)?)))
 }
 
 fn planned_backup_path(
@@ -2414,9 +2418,10 @@ fn planned_backup_path(
     let destination = entry.destination_root.to_path_buf().ok()?.join(relative);
     let operation = safe_identifier(operation_id).ok()?;
     Some(SharedTransactionPath::from_path(
-        &backup_root
-            .join(operation)
-            .join(format!("{}.bak", digest_text(&destination.to_string_lossy()))),
+        &backup_root.join(operation).join(format!(
+            "{}.bak",
+            digest_text(&destination.to_string_lossy())
+        )),
     ))
 }
 
@@ -2515,7 +2520,10 @@ fn update_durable_entry(
     target.destination_existed_before_apply = entry.destination_existed_before_apply;
     target.state = match entry.outcome {
         SharedApplyOutcome::InstalledNew | SharedApplyOutcome::ReplacedExisting
-            if entry.verification_succeeded => SharedEntryRecoveryState::Applied,
+            if entry.verification_succeeded =>
+        {
+            SharedEntryRecoveryState::Applied
+        }
         SharedApplyOutcome::BackupFailed => SharedEntryRecoveryState::Applying,
         SharedApplyOutcome::WriteFailed | SharedApplyOutcome::VerificationFailed => {
             SharedEntryRecoveryState::NeedsReview
@@ -2602,9 +2610,10 @@ pub fn discover_pending_operations(history_root: &Path) -> Vec<SharedPendingOper
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension() == Some(OsStr::new("json")))
-        .filter(|path| path.file_name().is_some_and(|name| {
-            name.to_string_lossy().ends_with(".pending.json")
-        }))
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".pending.json"))
+        })
         .collect::<Vec<_>>();
     paths.sort();
     paths
@@ -2634,9 +2643,7 @@ pub fn discover_pending_operations(history_root: &Path) -> Vec<SharedPendingOper
 /// Build an explicit, read-only recovery decision.  It never resumes or
 /// rolls back; a caller must separately request an operation after checking
 /// the displayed identities and exact transaction envelope.
-pub fn plan_pending_recovery(
-    operation: &SharedPendingOperation,
-) -> SharedPendingRecoveryPlan {
+pub fn plan_pending_recovery(operation: &SharedPendingOperation) -> SharedPendingRecoveryPlan {
     let safe_entries = operation.reconciled_entries.iter().all(|state| {
         matches!(
             state,
@@ -2695,8 +2702,7 @@ fn reconcile_durable_entry(
         SharedRecoveryState::RollingBack | SharedRecoveryState::RollbackFailed => {
             if (entry.destination_existed_before_apply == Some(false)
                 && destination_digest.is_none())
-                || (backup_valid
-                    && entry.backup_digest.as_deref() == destination_digest.as_deref())
+                || (backup_valid && entry.backup_digest.as_deref() == destination_digest.as_deref())
                 || (expected_old.is_none() && destination_digest.is_none())
             {
                 SharedEntryRecoveryState::RolledBack
@@ -3936,14 +3942,29 @@ mod tests {
         inject_fault(None);
         assert_eq!(result.journal.status, SharedApplyStatus::Success);
         assert!(result.journal_path.is_none());
-        assert!(fixture.destination_root().join("Nintendo - NES/game.cht").exists());
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game.cht")
+                .exists()
+        );
         let pending = discover_pending_operations(&fixture.history_root());
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].journal.transaction_state, SharedRecoveryState::Applying);
-        assert_eq!(pending[0].reconciled_entries, vec![SharedEntryRecoveryState::Applied]);
+        assert_eq!(
+            pending[0].journal.transaction_state,
+            SharedRecoveryState::Applying
+        );
+        assert_eq!(
+            pending[0].reconciled_entries,
+            vec![SharedEntryRecoveryState::Applied]
+        );
         assert!(plan_pending_recovery(&pending[0]).can_safe_rollback);
         assert!(!plan_pending_recovery(&pending[0]).can_resume);
-        assert!(discover_shared_apply_history(&fixture.history_root()).journals.is_empty());
+        assert!(
+            discover_shared_apply_history(&fixture.history_root())
+                .journals
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3988,10 +4009,28 @@ mod tests {
             &options(&fixture, &plan, "durable-multi", false, true, false),
         );
         inject_fault(None);
-        assert_eq!(result.journal_failure.unwrap().kind, SharedApplyFailureKind::JournalFailed);
-        assert!(fixture.destination_root().join("Nintendo - NES/game-0.cht").exists());
-        assert!(fixture.destination_root().join("Nintendo - NES/game-1.cht").exists());
-        assert!(!fixture.destination_root().join("Nintendo - NES/game-2.cht").exists());
+        assert_eq!(
+            result.journal_failure.unwrap().kind,
+            SharedApplyFailureKind::JournalFailed
+        );
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game-0.cht")
+                .exists()
+        );
+        assert!(
+            fixture
+                .destination_root()
+                .join("Nintendo - NES/game-1.cht")
+                .exists()
+        );
+        assert!(
+            !fixture
+                .destination_root()
+                .join("Nintendo - NES/game-2.cht")
+                .exists()
+        );
         let pending = discover_pending_operations(&fixture.history_root());
         assert_eq!(pending.len(), 1);
         assert_eq!(
@@ -4037,9 +4076,17 @@ mod tests {
         assert_eq!(result.status, SharedApplyStatus::PartialFailure);
         let pending = discover_pending_operations(&fixture.history_root());
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].journal.transaction_state, SharedRecoveryState::RollingBack);
+        assert_eq!(
+            pending[0].journal.transaction_state,
+            SharedRecoveryState::RollingBack
+        );
         assert!(pending[0].journal.rollback_of_operation_id.is_some());
-        assert!(fixture.history_root().join("durable-rollback.json").exists());
+        assert!(
+            fixture
+                .history_root()
+                .join("durable-rollback.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -4053,7 +4100,12 @@ mod tests {
         );
         assert_eq!(result.journal.status, SharedApplyStatus::Success);
         assert!(discover_pending_operations(&fixture.history_root()).is_empty());
-        assert_eq!(discover_shared_apply_history(&fixture.history_root()).journals.len(), 1);
+        assert_eq!(
+            discover_shared_apply_history(&fixture.history_root())
+                .journals
+                .len(),
+            1
+        );
     }
 
     #[test]

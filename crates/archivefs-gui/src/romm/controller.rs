@@ -1,5 +1,5 @@
-use crate::*;
 use crate::romm_config::RommConfigDraft;
+use crate::*;
 
 impl ArchiveFsApp {
     /// Starts one RomM operation, or declines.
@@ -450,15 +450,18 @@ impl ArchiveFsApp {
         let source_roots_result = self.gui_config.source_roots().map(Vec::from);
         let source_roots = source_roots_result.clone().unwrap_or_default();
         let busy = self
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .is_some_and(|running| running.operation.blocks_actions());
         let preview_running = self
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .is_some_and(|running| matches!(running.operation, RommOperation::Preview { .. }));
         let previous = self
-            .romm_ui.snapshot
+            .romm_ui
+            .snapshot
             .as_deref()
             .map(|snapshot| snapshot.settings.clone());
         let preview = self.romm_ui.preview.clone();
@@ -524,15 +527,18 @@ impl ArchiveFsApp {
             .map(Vec::from)
             .unwrap_or_default();
         let busy = self
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .is_some_and(|running| running.operation.blocks_actions());
         let preview_running = self
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .is_some_and(|running| matches!(running.operation, RommOperation::Preview { .. }));
         let previous = self
-            .romm_ui.snapshot
+            .romm_ui
+            .snapshot
             .as_deref()
             .map(|snapshot| snapshot.settings.clone());
         let preview = self.romm_ui.preview.clone();
@@ -663,7 +669,8 @@ impl ArchiveFsApp {
             }
             Some(_) => {}
             None => {
-                self.romm_ui.browse = Some(Box::new(crate::romm_browse::BrowseState::opened_at(view)));
+                self.romm_ui.browse =
+                    Some(Box::new(crate::romm_browse::BrowseState::opened_at(view)));
             }
         }
     }
@@ -697,14 +704,16 @@ impl ArchiveFsApp {
     ) -> Option<crate::romm_browse::BrowseRequest> {
         self.romm_ui.browse.as_ref()?;
         let busy = self
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .is_some_and(|running| running.operation.blocks_actions());
         let progress = self.romm_ui.stale_progress;
         let viewport = context.input(|input| input.screen_rect().size());
         let (initial, maximum) = romm_dialog_sizes(viewport, egui::vec2(900.0, 780.0));
         let title = self
-            .romm_ui.browse
+            .romm_ui
+            .browse
             .as_ref()
             .map(|state| state.view.title())
             .unwrap_or("RomM records");
@@ -758,7 +767,8 @@ impl ArchiveFsApp {
         // it closes that, not the browser underneath it - so the browser only
         // consumes Escape when nothing is layered on top.
         let detail_open = self
-            .romm_ui.browse
+            .romm_ui
+            .browse
             .as_ref()
             .is_some_and(|state| state.detail.is_some());
         if request.is_none()
@@ -783,7 +793,8 @@ impl ArchiveFsApp {
                     state.invalidate_detail_request();
                 }
                 let filters = self
-                    .romm_ui.browse
+                    .romm_ui
+                    .browse
                     .as_ref()
                     .map(|state| state.filters.clone())
                     .unwrap_or_default();
@@ -869,16 +880,19 @@ impl ArchiveFsApp {
     pub(crate) fn show_romm_game_panel(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
         // Following the selection discards the previous game's panel, cover and
         // verification, but starts nothing: a lookup is a button press.
-        self.romm_ui.game
+        self.romm_ui
+            .game
             .focus(self.archive_context.focused.as_deref());
         let running = self
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .map(|running| &running.operation);
         let busy = running.is_some_and(RommOperation::blocks_actions);
         let busy_reason = running.map(|operation| operation.label());
         let cache_present = self
-            .romm_ui.snapshot
+            .romm_ui
+            .snapshot
             .as_deref()
             .is_some_and(|snapshot| snapshot.status.records_imported > 0);
         let hash_progress = self.romm_ui.hash_progress.clone();

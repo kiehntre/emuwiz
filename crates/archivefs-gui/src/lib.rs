@@ -156,7 +156,6 @@ use archivefs_core::patch_manager::{
 use collection_discovery_page::*;
 use platform_artwork_manager::{PlatformArtworkManager, PlatformArtworkManagerAction};
 mod activity_history;
-pub mod gui_v2;
 mod administration_pages;
 mod app;
 mod app_frame;
@@ -166,6 +165,7 @@ mod app_polling;
 mod app_reactions;
 mod app_shell;
 mod archive_context;
+pub mod gui_v2;
 use archive_context::ArchiveContext;
 mod archive_inspector_controller;
 mod artwork_media_state;
@@ -232,9 +232,9 @@ mod library_ui_state;
 use library_ui_state::LibraryUiState;
 mod database_load;
 mod doctor_repair_state;
-mod sources_ui_state;
 mod live_library_controller;
 mod setup_controller;
+mod sources_ui_state;
 #[allow(unused_imports)]
 use setup_controller::{
     DiagnosticsMessage, DiagnosticsState, DiagnosticsUiAction, RunningSetupAction, SetupAction,
@@ -258,12 +258,12 @@ use navigation::{
 };
 mod selected_game_panel;
 use selected_game_panel::*;
-mod identity_providers_page;
 mod dat_identity_panel;
-mod selected_game_readiness;
-mod screenscraper_page;
-mod screenscraper_enrichment_page;
+mod identity_providers_page;
 mod screenscraper_batch_enrichment_page;
+mod screenscraper_enrichment_page;
+mod screenscraper_page;
+mod selected_game_readiness;
 use dat_identity_panel::*;
 mod source_controller;
 #[allow(unused_imports)]
@@ -295,13 +295,13 @@ pub(crate) mod mount_batch;
 use mount_batch::*;
 mod dat_authority_dashboard;
 pub(crate) mod dolphin_texture_mod_page;
-pub(crate) mod ppsspp_texture_mod_page;
-pub(crate) mod pcsx2_texture_mod_page;
 pub(crate) mod exact_duplicate_review_page;
 #[allow(dead_code)]
 pub(crate) mod feature_discovery;
 pub(crate) mod game_metadata;
 pub(crate) mod game_presentation;
+pub(crate) mod pcsx2_texture_mod_page;
+pub(crate) mod ppsspp_texture_mod_page;
 use game_presentation::{
     UNKNOWN_PLATFORM_EXPLANATION, platform_provenance_lines, unknown_platform_aggregate_headline,
     unknown_platform_banner_visible,
@@ -311,13 +311,12 @@ pub(crate) mod gamer_artwork;
 pub(crate) mod home_page;
 mod simple_mode;
 use home_page::home_library_snapshot;
+pub(crate) mod cemu_graphic_pack_page;
 pub(crate) mod identity_sources_page;
 #[allow(dead_code)]
 pub(crate) mod launch_readiness_page;
 pub(crate) mod library_view_history_page;
 pub(crate) mod local_mod_package_page;
-pub(crate) mod rpcs3_ordinary_mod_page;
-pub(crate) mod cemu_graphic_pack_page;
 mod mount_operation_controller;
 mod mount_operations;
 mod mount_ui_state;
@@ -329,6 +328,7 @@ pub(crate) mod pcsx2_page;
 pub(crate) mod plan_preview_page;
 mod platform_source_actions;
 pub(crate) mod ready_to_play_page;
+pub(crate) mod rpcs3_ordinary_mod_page;
 pub(crate) mod storage_health_page;
 use platform_source_actions::*;
 pub(crate) mod playing_library_page;
@@ -400,22 +400,20 @@ use archivefs_core::{
     PlatformAssignmentChange, PlatformProvenanceDetails, RecentScanAdditions, RecoveryAction,
     RecoveryOffer, RemoveSourceFolderOutcome, ScanPersistSummary, SetSourceFolderEnabledOutcome,
     SourceAvailability, SourceFolderConfig, SourceFolderView, SourceHealthIssue, SourceRole,
-    UnmountOneOutcome,
-    add_source_folder_default, assign_source_platform_default, build_source_folder_views,
-    canonical_platform_names, catalogue_filename_duplicates, check_archive_index_freshness,
-    check_database_health, classify_archive_health, cleanup_selected_mount_tree,
-    default_config_path, default_database_path, default_index_path, diagnose_database,
-    format_unix_timestamp_utc, inspect_archive, is_inspectable, is_known_disc_companion,
-    latest_schema_version, lazy_unmount_one_archive_path_with_progress,
+    UnmountOneOutcome, add_source_folder_default, assign_source_platform_default,
+    build_source_folder_views, canonical_platform_names, catalogue_filename_duplicates,
+    check_archive_index_freshness, check_database_health, classify_archive_health,
+    cleanup_selected_mount_tree, default_config_path, default_database_path, default_index_path,
+    diagnose_database, format_unix_timestamp_utc, inspect_archive, is_inspectable,
+    is_known_disc_companion, latest_schema_version, lazy_unmount_one_archive_path_with_progress,
     list_source_folder_views_default, load_library_view_configs_default,
     load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
     pending_schema_migration_versions, persisted_archive_has_unknown_platform,
     plan_stale_mount_directories, read_archive_index, remount_one_archive_path,
     remove_source_folder_default, scan_all_enabled_sources_default, scan_and_persist,
     scan_source_folder_default, set_source_folder_enabled_default, set_source_role_default,
-    source_health_issues,
-    unmount_one_archive_path, upgrade_library_database, validate_library_view_destination,
-    validate_new_source_folder,
+    source_health_issues, unmount_one_archive_path, upgrade_library_database,
+    validate_library_view_destination, validate_new_source_folder,
 };
 use eframe::egui;
 use ui::components::{
@@ -577,6 +575,7 @@ fn run_clipboard_check() {
 use archive_inspector_controller::{
     ArchiveInspectorState, ArchivePreparationState, show_archive_inspector_panel,
 };
+use artwork_media_state::ArtworkMediaState;
 use catalogue_bsfree_ui_state::{
     BsFreeGuiState, BsFreeManagerState, BsFreeOperation, BsFreeOperationResult,
     CatalogueBsFreeUiState, RunningBsFreeOperation,
@@ -600,7 +599,6 @@ use mount_operation_controller::{
 use mount_ui_state::MountUiState;
 use selected_evidence_ui_state::SelectedEvidenceUiState;
 use sources_ui_state::SourcesUiState;
-use artwork_media_state::ArtworkMediaState;
 
 pub(crate) fn open_folder_in_file_manager(folder: &Path) -> archivefs_core::Result<()> {
     let (program, argument) = if cfg!(target_os = "windows") {

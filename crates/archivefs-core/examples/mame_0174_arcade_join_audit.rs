@@ -16,8 +16,7 @@ fn main() {
         eprintln!("usage: mame_0174_arcade_join_audit <mame-0.174-dat> <arcade-root>");
         std::process::exit(2);
     }
-    let dat = load_verified_mame_0174(&dat_path)
-        .expect("the specified MAME 0.174 DAT must verify");
+    let dat = load_verified_mame_0174(&dat_path).expect("the specified MAME 0.174 DAT must verify");
     let audited_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock must be after Unix epoch")

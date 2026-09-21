@@ -780,9 +780,13 @@ pub(crate) fn show_library_shell_header_with_actions(
 ) -> Option<LibraryTab> {
     ui.horizontal_top(|ui| {
         let width = (ui.available_width() - 165.0).max(120.0);
-        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            widgets::workflow_header(ui, "My Games", "Browse and manage your games.");
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                widgets::workflow_header(ui, "My Games", "Browse and manage your games.");
+            },
+        );
         actions(ui);
     });
     let tab_options: [(LibraryTab, &str); 5] = [

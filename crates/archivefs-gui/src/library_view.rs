@@ -450,8 +450,11 @@ pub(crate) fn show_loaded_data(
                                 ),
                                 screenscraper_state,
                                 screenscraper_settings,
-                                screenscraper_existing: selected_persisted
-                                    .and_then(|archive| cached.and_then(|snapshot| snapshot.screenscraper_enrichments.get(&archive.id))),
+                                screenscraper_existing: selected_persisted.and_then(|archive| {
+                                    cached.and_then(|snapshot| {
+                                        snapshot.screenscraper_enrichments.get(&archive.id)
+                                    })
+                                }),
                             },
                         )
                     })
@@ -482,7 +485,9 @@ pub(crate) fn show_loaded_data(
         requested_action = Some(AppOperationRequest::OpenDatSources);
     }
     if let Some(action) = selected_actions.metadata_enrichment {
-        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(action)));
+        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(
+            action,
+        )));
     }
 
     if let Some(result) = mount_all_result {
@@ -1248,7 +1253,9 @@ pub(crate) fn show_loaded_data(
         cached,
         selected_archives,
     ) {
-        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(action)));
+        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(
+            action,
+        )));
     }
     if *select_all_visible_requested {
         *selected_archives = select_all_visible(merged_rows, &visible_indices);

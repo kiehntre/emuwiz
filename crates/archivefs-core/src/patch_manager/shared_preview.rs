@@ -441,14 +441,13 @@ fn preview_one(
 ) -> SharedPreviewEntry {
     let mut entry = base_entry(request, source, Some(relative.clone()));
     apply_eligibility_blockers(request, source, &mut entry);
-    let Some((directory, filename)) = two_safe_components(&relative)
-        .or_else(|| (matches!(
+    let Some((directory, filename)) = two_safe_components(&relative).or_else(|| {
+        (matches!(
             request.adapter,
             PreviewAdapter::CemuGraphicPack | PreviewAdapter::Rpcs3OrdinaryMod
-        )).then(|| {
-            (OsString::new(), OsString::new())
-        }))
-    else {
+        ))
+        .then(|| (OsString::new(), OsString::new()))
+    }) else {
         block(
             &mut entry,
             PreviewState::UnsafeDestination,

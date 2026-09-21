@@ -126,9 +126,11 @@ pub(crate) struct SelectedArchiveViewState<'a> {
     pub(crate) platform_busy: bool,
     pub(crate) clipboard: &'a mut dyn ClipboardBackend,
     pub(crate) selected_evidence: SelectedEvidenceView<'a>,
-    pub(crate) screenscraper_state: &'a mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState,
+    pub(crate) screenscraper_state:
+        &'a mut crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState,
     pub(crate) screenscraper_settings: &'a crate::screenscraper_page::ScreenScraperPageState,
-    pub(crate) screenscraper_existing: Option<&'a archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
+    pub(crate) screenscraper_existing:
+        Option<&'a archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
 }
 
 #[derive(Default)]
@@ -141,7 +143,8 @@ pub(crate) struct SelectedArchiveActions {
     /// Routes into the existing Verify Games (DAT Sources) page; never
     /// starts an audit itself.
     pub(crate) open_dat_sources: bool,
-    pub(crate) metadata_enrichment: Option<crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction>,
+    pub(crate) metadata_enrichment:
+        Option<crate::screenscraper_enrichment_page::ScreenScraperEnrichmentAction>,
 }
 
 pub(crate) fn show_selected_archive(

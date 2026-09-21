@@ -47,10 +47,10 @@ use crate::platform::identity::{PlatformIdentityResolution, PlatformIdentitySour
 
 use crate::{
     ARCHIVE_PARSER_VERSION, Archive, ArchiveFsError, ArchiveKind, ArchiveScanDiscovery,
-    ArchiveScanner, Config,
-    IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION, SCANNER_VERSION,
-    ScanFingerprint, canonical_platform_names, detect_platform_with_details, nested_source_roots,
-    normalize_path_segment, revalidate_archive_for_catalogue, validate_configured_source_roots,
+    ArchiveScanner, Config, IngestionFingerprint, PlatformProvenance, Result, SCAN_CACHE_VERSION,
+    SCANNER_VERSION, ScanFingerprint, canonical_platform_names, detect_platform_with_details,
+    nested_source_roots, normalize_path_segment, revalidate_archive_for_catalogue,
+    validate_configured_source_roots,
 };
 
 mod attention;
@@ -7873,12 +7873,10 @@ fn scan_and_persist_folders_transaction(
             // directory changes during that redundant walk.
             ArchiveScanDiscovery::default()
         } else {
-            match ArchiveScanner::new(&folder_config)
-                .scan_archives_with_cache_excluding(
-                    &fingerprint_refs,
-                    &folder.excluded_source_roots,
-                )
-            {
+            match ArchiveScanner::new(&folder_config).scan_archives_with_cache_excluding(
+                &fingerprint_refs,
+                &folder.excluded_source_roots,
+            ) {
                 Ok(discovery) => discovery,
                 Err(error) => {
                     counts.errors_count += 1;
@@ -7955,8 +7953,9 @@ fn scan_and_persist_folders_transaction(
         // never in place of it - see `ScanPersistSummary::ingestion_stats`.
         let mut ingestion_evidence = Vec::new();
         let ingestion_started = std::time::Instant::now();
-        if !arcade_specialist && let Ok(report) =
-            crate::ingestion::discover_source_with_fingerprints(&folder.path, &fingerprint_refs)
+        if !arcade_specialist
+            && let Ok(report) =
+                crate::ingestion::discover_source_with_fingerprints(&folder.path, &fingerprint_refs)
         {
             info!(
                 "ingestion phases source={} candidates={} cache_hits={} cache_misses={} archives_reused={} archives_reopened={} listings_reused={} listings_regenerated={} fallback_inspections={} detail_fingerprint={}",
@@ -8049,8 +8048,7 @@ fn scan_and_persist_folders_transaction(
         if let Some(arcade_sets) = arcade_sets {
             arcade_ingestion.merge(&arcade_sets.diagnostics);
             for set in arcade_sets.sets {
-                if let Some(archive) = Archive::from_arcade_set_directory(&set.path, &folder.path)
-                {
+                if let Some(archive) = Archive::from_arcade_set_directory(&set.path, &folder.path) {
                     archives.retain(|candidate| !candidate.path.starts_with(&set.path));
                     archives.push(archive);
                 }
@@ -8058,11 +8056,9 @@ fn scan_and_persist_folders_transaction(
         }
         let before_support_filter = archives.len();
         archives.retain(|archive| {
-            let Some(kind) = crate::ingestion::support_material_kind(
-                &archive.path,
-                &folder.path,
-                folder.role,
-            ) else {
+            let Some(kind) =
+                crate::ingestion::support_material_kind(&archive.path, &folder.path, folder.role)
+            else {
                 return true;
             };
             arcade_ingestion.note_support(kind);

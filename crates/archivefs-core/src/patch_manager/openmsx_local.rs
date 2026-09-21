@@ -201,8 +201,14 @@ mod tests {
         assert!(evidence.ready);
         assert_eq!(evidence.version, None);
         assert!(!evidence.config_inspected);
-        assert_eq!(evidence.machine_bindings[0], ("MSX".into(), "C-BIOS_MSX1".into()));
-        assert_eq!(evidence.machine_bindings[1], ("MSX2".into(), "C-BIOS_MSX2".into()));
+        assert_eq!(
+            evidence.machine_bindings[0],
+            ("MSX".into(), "C-BIOS_MSX1".into())
+        );
+        assert_eq!(
+            evidence.machine_bindings[1],
+            ("MSX2".into(), "C-BIOS_MSX2".into())
+        );
     }
 
     #[test]
@@ -218,7 +224,10 @@ mod tests {
             },
         });
         assert!(!evidence.ready);
-        assert_eq!(evidence.first_blocker.as_deref(), Some("openMSX executable is unavailable"));
+        assert_eq!(
+            evidence.first_blocker.as_deref(),
+            Some("openMSX executable is unavailable")
+        );
         assert!(!evidence.config_inspected);
     }
 }

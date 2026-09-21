@@ -6,9 +6,8 @@
 
 use crate::emulator_environment::EncodedPath;
 use crate::launch::{
-    DESMUME_SUPPORTED_PLATFORM_ID, MESEN_SUPPORTED_PLATFORM_IDS,
-    DesmumeProfileDiscoveryRoots, discover_desmume_profiles,
-    resolve_desmume_native_launch_binding,
+    DESMUME_SUPPORTED_PLATFORM_ID, DesmumeProfileDiscoveryRoots, MESEN_SUPPORTED_PLATFORM_IDS,
+    discover_desmume_profiles, resolve_desmume_native_launch_binding,
 };
 use crate::patch_manager::{
     MesenProfileDiscoveryRoots, discover_mesen_profiles, resolve_mesen_native_launch_binding,
@@ -81,9 +80,7 @@ fn missing_mesen() -> DesmumeMesenReadiness {
     }
 }
 
-fn desmume_entry(
-    profile: &crate::launch::DesmumeProfile,
-) -> DesmumeMesenReadiness {
+fn desmume_entry(profile: &crate::launch::DesmumeProfile) -> DesmumeMesenReadiness {
     let executable = profile.executable.as_ref();
     let binding_error = resolve_desmume_native_launch_binding(profile)
         .err()
@@ -153,8 +150,12 @@ fn mesen_entry(profile: &crate::patch_manager::MesenProfile) -> DesmumeMesenRead
                     "settings.json missing or unreadable"
                 }
             ),
-            format!("Supported systems: {}", MESEN_SUPPORTED_PLATFORM_IDS.join(", ")),
-            "Firmware: no external firmware requirement is modeled for the supported systems".into(),
+            format!(
+                "Supported systems: {}",
+                MESEN_SUPPORTED_PLATFORM_IDS.join(", ")
+            ),
+            "Firmware: no external firmware requirement is modeled for the supported systems"
+                .into(),
         ],
         remediation: if ready {
             "Mesen 2 is ready for its supported systems; selected content is still checked by preflight.".into()
@@ -164,9 +165,7 @@ fn mesen_entry(profile: &crate::patch_manager::MesenProfile) -> DesmumeMesenRead
     }
 }
 
-pub fn findings_from_desmume_mesen_readiness(
-    entries: &[DesmumeMesenReadiness],
-) -> Vec<Finding> {
+pub fn findings_from_desmume_mesen_readiness(entries: &[DesmumeMesenReadiness]) -> Vec<Finding> {
     entries
         .iter()
         .map(|entry| {
@@ -245,7 +244,12 @@ mod tests {
             remediation: "Ready.".into(),
         }]);
         assert_eq!(findings[0].severity, DoctorSeverity::Info);
-        assert!(findings[0].evidence.iter().any(|line| line.contains("no external requirement")));
+        assert!(
+            findings[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("no external requirement"))
+        );
     }
 
     #[test]

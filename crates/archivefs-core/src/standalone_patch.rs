@@ -576,19 +576,14 @@ pub fn apply_standalone_patch(
             };
             let provenance_json = serde_json::to_vec_pretty(&provenance)
                 .map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
-            let destination_identity = hex_digest(
-                plan.reviewed
-                    .output_path
-                    .to_string_lossy()
-                    .as_bytes(),
-            );
-            let provenance_stage = provenance_path
-                .with_file_name(format!(
-                    ".emuwiz-patch-provenance-{}-{}-{}",
-                    std::process::id(),
-                    &destination_identity[..16],
-                    &output_hash[..16]
-                ));
+            let destination_identity =
+                hex_digest(plan.reviewed.output_path.to_string_lossy().as_bytes());
+            let provenance_stage = provenance_path.with_file_name(format!(
+                ".emuwiz-patch-provenance-{}-{}-{}",
+                std::process::id(),
+                &destination_identity[..16],
+                &output_hash[..16]
+            ));
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)

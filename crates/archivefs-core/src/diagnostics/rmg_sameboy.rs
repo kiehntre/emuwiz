@@ -4,8 +4,8 @@
 //! those already-inspected facts into the shared Doctor finding model.
 
 use crate::emulator_environment::EncodedPath;
-use crate::launch::sameboy_command::SAMEBOY_SUPPORTED_PLATFORM_IDS;
 use crate::launch::RMG_SUPPORTED_PLATFORM_ID;
+use crate::launch::sameboy_command::SAMEBOY_SUPPORTED_PLATFORM_IDS;
 use crate::patch_manager::{
     RmgProfileDiscoveryRoots, SameBoyProfileDiscoveryRoots, discover_rmg_profiles,
     discover_sameboy_profiles, resolve_rmg_native_launch_binding,
@@ -52,7 +52,9 @@ pub fn discover_rmg_sameboy_readiness() -> Vec<RmgSameBoyReadiness> {
             profile: None,
             supported_systems: sameboy_systems(),
             ready: false,
-            blockers: vec!["SameBoy could not inspect its profile because HOME is unavailable".into()],
+            blockers: vec![
+                "SameBoy could not inspect its profile because HOME is unavailable".into(),
+            ],
             evidence: Vec::new(),
             remediation: "Set a usable HOME directory, then run Doctor again.".into(),
         });
@@ -62,7 +64,10 @@ pub fn discover_rmg_sameboy_readiness() -> Vec<RmgSameBoyReadiness> {
 }
 
 fn sameboy_systems() -> Vec<String> {
-    SAMEBOY_SUPPORTED_PLATFORM_IDS.iter().map(|s| (*s).into()).collect()
+    SAMEBOY_SUPPORTED_PLATFORM_IDS
+        .iter()
+        .map(|s| (*s).into())
+        .collect()
 }
 
 fn missing_rmg() -> RmgSameBoyReadiness {
@@ -119,7 +124,8 @@ fn rmg_entry(profile: &crate::patch_manager::RmgProfile) -> RmgSameBoyReadiness 
             format!("Supported system: {RMG_SUPPORTED_PLATFORM_ID}"),
         ],
         remediation: if ready {
-            "RMG is ready for Nintendo 64 launch; selected content is still checked by preflight.".into()
+            "RMG is ready for Nintendo 64 launch; selected content is still checked by preflight."
+                .into()
         } else {
             "Fix the first reported RMG blocker, then run Doctor again.".into()
         },
@@ -146,14 +152,18 @@ fn sameboy_entry(profile: &crate::patch_manager::SameBoyProfile) -> RmgSameBoyRe
         "preferences not written yet (SameBoy defaults will be used)"
     };
     let boot_rom = match profile.boot_rom.state {
-        crate::patch_manager::SameBoyBootRomState::NotConfigured =>
-            "custom boot ROM: not configured; built-in boot ROMs are optional and will be used",
-        crate::patch_manager::SameBoyBootRomState::PresentUnverified =>
-            "custom boot ROM: configured (presence observed, not verified)",
-        crate::patch_manager::SameBoyBootRomState::Missing =>
-            "custom boot ROM: configured path is missing; built-in boot ROMs remain available",
-        crate::patch_manager::SameBoyBootRomState::Unknown =>
-            "custom boot ROM: configured directory has no recognized boot ROM; built-in boot ROMs remain available",
+        crate::patch_manager::SameBoyBootRomState::NotConfigured => {
+            "custom boot ROM: not configured; built-in boot ROMs are optional and will be used"
+        }
+        crate::patch_manager::SameBoyBootRomState::PresentUnverified => {
+            "custom boot ROM: configured (presence observed, not verified)"
+        }
+        crate::patch_manager::SameBoyBootRomState::Missing => {
+            "custom boot ROM: configured path is missing; built-in boot ROMs remain available"
+        }
+        crate::patch_manager::SameBoyBootRomState::Unknown => {
+            "custom boot ROM: configured directory has no recognized boot ROM; built-in boot ROMs remain available"
+        }
     };
     RmgSameBoyReadiness {
         adapter: "SameBoy".into(),
@@ -166,8 +176,12 @@ fn sameboy_entry(profile: &crate::patch_manager::SameBoyProfile) -> RmgSameBoyRe
         evidence: vec![
             format!("Configuration: {config}"),
             format!("{boot_rom}"),
-            "Firmware: external boot ROM is optional; SameBoy built-ins are used when needed".into(),
-            format!("Supported systems: {}", SAMEBOY_SUPPORTED_PLATFORM_IDS.join(", ")),
+            "Firmware: external boot ROM is optional; SameBoy built-ins are used when needed"
+                .into(),
+            format!(
+                "Supported systems: {}",
+                SAMEBOY_SUPPORTED_PLATFORM_IDS.join(", ")
+            ),
         ],
         remediation: if ready {
             "SameBoy is ready for Game Boy and Game Boy Color launch; selected content is still checked by preflight.".into()
@@ -234,7 +248,10 @@ pub fn findings_from_rmg_sameboy_readiness(entries: &[RmgSameBoyReadiness]) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch_manager::{RmgInstallationType, RmgProfile, SameBoyBootRomEvidence, SameBoyBootRomState, SameBoyConfigInspection, SameBoyInstallationType, SameBoyProfile};
+    use crate::patch_manager::{
+        RmgInstallationType, RmgProfile, SameBoyBootRomEvidence, SameBoyBootRomState,
+        SameBoyConfigInspection, SameBoyInstallationType, SameBoyProfile,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -266,7 +283,12 @@ mod tests {
         });
         assert!(entry.ready);
         assert_eq!(entry.version.as_deref(), Some("0.5.0"));
-        assert!(entry.evidence.iter().any(|line| line.contains("no external requirement")));
+        assert!(
+            entry
+                .evidence
+                .iter()
+                .any(|line| line.contains("no external requirement"))
+        );
     }
 
     #[test]
@@ -280,7 +302,12 @@ mod tests {
             profile_id: "sameboy:/profile".into(),
             installation_type: SameBoyInstallationType::Explicit,
             configuration_path: PathBuf::from("/profile"),
-            config: SameBoyConfigInspection { path: PathBuf::from("/profile/prefs.bin"), exists: false, readable: false, oversized: false },
+            config: SameBoyConfigInspection {
+                path: PathBuf::from("/profile/prefs.bin"),
+                exists: false,
+                readable: false,
+                oversized: false,
+            },
             eligible: true,
             blocker: None,
             executable_candidates: vec![crate::patch_manager::SameBoyExecutable {
@@ -288,7 +315,10 @@ mod tests {
                 installation_type: SameBoyInstallationType::Explicit,
                 version: Some("1.0.3".into()),
             }],
-            boot_rom: SameBoyBootRomEvidence { directory: None, state: SameBoyBootRomState::NotConfigured },
+            boot_rom: SameBoyBootRomEvidence {
+                directory: None,
+                state: SameBoyBootRomState::NotConfigured,
+            },
         });
         assert!(entry.ready);
         assert!(entry.evidence.iter().any(|line| line.contains("optional")));

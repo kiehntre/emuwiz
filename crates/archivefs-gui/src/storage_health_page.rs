@@ -2,14 +2,14 @@
 
 use std::path::PathBuf;
 
+use archivefs_core::PersistedArchive;
 use archivefs_core::archive_workflow::inventory_archive_tools;
 use archivefs_core::storage_conversion::{
-    capability_for_item, probe_conversion_tools, ConversionToolInventory,
+    ConversionToolInventory, capability_for_item, probe_conversion_tools,
 };
 use archivefs_core::storage_health::{
     StorageHealthInput, StorageHealthReport, StorageOpportunityKind,
 };
-use archivefs_core::PersistedArchive;
 use eframe::egui;
 
 #[derive(Default)]

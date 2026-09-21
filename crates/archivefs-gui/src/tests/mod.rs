@@ -1141,7 +1141,8 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
             master_rom_root: None,
         }),
         screenscraper_page: screenscraper_page::ScreenScraperPageState::default(),
-        screenscraper_enrichment: crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+        screenscraper_enrichment:
+            crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
         romm_ui: RommUiState::default(),
         selected_evidence_ui: SelectedEvidenceUiState::default(),
         gamer_view_scan_review_available: false,
@@ -1189,7 +1190,8 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
             game_metadata_worker_allowed: false,
             gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
             es_de_media: crate::es_de_media_state::EsDeMediaState::default(),
-            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(),
+            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(
+            ),
         },
     }
 }

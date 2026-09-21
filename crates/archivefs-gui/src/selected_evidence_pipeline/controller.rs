@@ -15,14 +15,16 @@ impl ArchiveFsApp {
         let cancel = Arc::new(AtomicBool::new(false));
         self.selected_evidence_ui.selected_evidence_cancel = Some(Arc::clone(&cancel));
         let (sender, receiver) = mpsc::channel();
-        self.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
-            generation,
-            path: path.clone(),
-            receiver,
-        };
+        self.selected_evidence_ui.selected_evidence =
+            selected_evidence_page::SelectedEvidenceState::Loading {
+                generation,
+                path: path.clone(),
+                receiver,
+            };
         // A new selection invalidates any in-flight or completed enrichment
         // pass for the previous file.
-        self.selected_evidence_ui.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
+        self.selected_evidence_ui.selected_evidence_enrichment =
+            SelectedEvidenceEnrichmentState::Idle;
         let platform_hint = match &self.state {
             LoadState::Ready(data) => data
                 .records
@@ -90,8 +92,10 @@ impl ArchiveFsApp {
             && state_path.is_some()
         {
             self.cancel_selected_evidence_work();
-            self.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Idle;
-            self.selected_evidence_ui.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Idle;
+            self.selected_evidence_ui.selected_evidence =
+                selected_evidence_page::SelectedEvidenceState::Idle;
+            self.selected_evidence_ui.selected_evidence_enrichment =
+                SelectedEvidenceEnrichmentState::Idle;
         }
     }
 
@@ -110,13 +114,15 @@ impl ArchiveFsApp {
         platform: Option<String>,
     ) {
         let (sender, receiver) = mpsc::channel();
-        self.selected_evidence_ui.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Loading {
-            generation,
-            path: path.clone(),
-            receiver,
-        };
+        self.selected_evidence_ui.selected_evidence_enrichment =
+            SelectedEvidenceEnrichmentState::Loading {
+                generation,
+                path: path.clone(),
+                receiver,
+            };
         let cancel = Arc::clone(
-            self.selected_evidence_ui.selected_evidence_cancel
+            self.selected_evidence_ui
+                .selected_evidence_cancel
                 .get_or_insert_with(|| Arc::new(AtomicBool::new(false))),
         );
         let no_intro_source_cache = Arc::clone(&self.selected_evidence_ui.no_intro_source_cache);
@@ -402,10 +408,11 @@ impl ArchiveFsApp {
         self.selected_evidence_ui.identity_sources_generation += 1;
         let generation = self.selected_evidence_ui.identity_sources_generation;
         let (sender, receiver) = mpsc::channel();
-        self.selected_evidence_ui.identity_sources = identity_sources_page::IdentitySourcesState::Loading {
-            generation,
-            receiver,
-        };
+        self.selected_evidence_ui.identity_sources =
+            identity_sources_page::IdentitySourcesState::Loading {
+                generation,
+                receiver,
+            };
         thread::spawn(move || {
             let config_path = archivefs_core::dat::sources::default_dat_sources_config_path();
             let status =
@@ -439,10 +446,11 @@ impl ArchiveFsApp {
             && let Ok((message_generation, status)) = receiver.try_recv()
             && message_generation == *generation
         {
-            self.selected_evidence_ui.identity_sources = identity_sources_page::IdentitySourcesState::Ready {
-                generation: message_generation,
-                status,
-            };
+            self.selected_evidence_ui.identity_sources =
+                identity_sources_page::IdentitySourcesState::Ready {
+                    generation: message_generation,
+                    status,
+                };
         }
     }
 }

@@ -2456,10 +2456,7 @@ fn emulator_setup_candidates_are_visible_without_running_doctor() {
     assert!(rendered_text_contains(&output, "Not checked"));
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(
-        &on_diagnostics,
-        "Check My Setup"
-    ));
+    assert!(rendered_text_contains(&on_diagnostics, "Check My Setup"));
 }
 
 #[test]

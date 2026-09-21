@@ -70,10 +70,14 @@ pub const MAX_RESOLVED_ADDRESSES: usize = 16;
 #[serde(rename_all = "snake_case", tag = "reason")]
 pub enum EndpointRefusal {
     /// The text is not a URL at all.
-    Unparseable { detail: String },
+    Unparseable {
+        detail: String,
+    },
     /// A scheme other than `http` or `https`. Names the scheme so `file:` and
     /// `unix:` attempts are legible in a diagnostic.
-    UnsupportedScheme { scheme: String },
+    UnsupportedScheme {
+        scheme: String,
+    },
     /// A URL carrying a username or password in its authority component, before
     /// the `@`. Never accepted, because such a URL ends up in caches, logs and
     /// diagnostics.
@@ -85,24 +89,40 @@ pub enum EndpointRefusal {
     /// No host at all.
     MissingHost,
     /// The host could not be resolved.
-    UnresolvableHost { detail: String },
+    UnresolvableHost {
+        detail: String,
+    },
     /// The host resolved to nothing.
     NoAddresses,
     /// The host resolved to more addresses than the policy will consider.
-    TooManyAddresses { count: usize },
+    TooManyAddresses {
+        count: usize,
+    },
     /// At least one resolved address is outside the approved ranges. The
     /// *address* is named, not just the host, because that is the fact that
     /// decided it.
-    NotPrivateAddress { address: String },
-    PrivateAddress { address: String },
+    NotPrivateAddress {
+        address: String,
+    },
+    PrivateAddress {
+        address: String,
+    },
     /// A known cloud or link-local metadata endpoint.
-    MetadataEndpoint { address: String },
+    MetadataEndpoint {
+        address: String,
+    },
     /// A redirect, which Stage 1 does not follow.
-    RedirectRefused { location: String },
+    RedirectRefused {
+        location: String,
+    },
     /// A port outside the usable range, or zero.
-    InvalidPort { port: u16 },
+    InvalidPort {
+        port: u16,
+    },
     /// The URL carried a path that is not a prefix this client will use.
-    UnsupportedUrlShape { detail: String },
+    UnsupportedUrlShape {
+        detail: String,
+    },
 }
 
 impl EndpointRefusal {

@@ -355,7 +355,10 @@ pub(crate) fn show(
     action
 }
 
-pub(crate) fn default_choices(candidate: &ScreenScraperEnrichment, current: &ArchiveMetadata) -> [bool; 9] {
+pub(crate) fn default_choices(
+    candidate: &ScreenScraperEnrichment,
+    current: &ArchiveMetadata,
+) -> [bool; 9] {
     EnrichmentField::ALL.map(|field| {
         existing_value(current, field).is_none() && field_value(candidate, field).is_some()
     })
@@ -375,7 +378,10 @@ pub(crate) fn existing_value(metadata: &ArchiveMetadata, field: EnrichmentField)
     }
 }
 
-pub(crate) fn field_value(candidate: &ScreenScraperEnrichment, field: EnrichmentField) -> Option<&str> {
+pub(crate) fn field_value(
+    candidate: &ScreenScraperEnrichment,
+    field: EnrichmentField,
+) -> Option<&str> {
     match field {
         EnrichmentField::Title => candidate.title.as_ref().map(|v| v.value.as_str()),
         EnrichmentField::Synopsis => candidate.description.as_ref().map(|v| v.value.as_str()),

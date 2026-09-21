@@ -307,13 +307,15 @@ mod romm_dispatch_tests {
         let mut app = app();
         app.open_romm_configuration();
         let first = app
-            .romm_ui.config_draft
+            .romm_ui
+            .config_draft
             .as_ref()
             .map(|draft| draft.url.clone());
         app.open_romm_configuration();
         app.open_romm_configuration();
         assert_eq!(
-            app.romm_ui.config_draft
+            app.romm_ui
+                .config_draft
                 .as_ref()
                 .map(|draft| draft.url.clone()),
             first,
@@ -538,7 +540,8 @@ mod romm_dispatch_tests {
             "the generation must not move for a declined start"
         );
         assert_eq!(
-            app.romm_ui.operation
+            app.romm_ui
+                .operation
                 .as_ref()
                 .map(|running| running.operation.clone()),
             Some(RommOperation::FullImport),
@@ -595,7 +598,8 @@ mod romm_dispatch_tests {
         app.start_romm_status_load(context);
         assert_eq!(app.romm_ui.generation, generation);
         assert_eq!(
-            app.romm_ui.operation
+            app.romm_ui
+                .operation
                 .as_ref()
                 .map(|running| running.operation.clone()),
             Some(RommOperation::Refresh)
@@ -608,7 +612,8 @@ mod romm_dispatch_tests {
         let (_sender, _progress, _generation) =
             install_running(&mut app, RommOperation::FullImport);
         let flag = app
-            .romm_ui.operation
+            .romm_ui
+            .operation
             .as_ref()
             .expect("running")
             .cancellation
@@ -620,7 +625,8 @@ mod romm_dispatch_tests {
             "the worker should be asked to stop"
         );
         assert!(
-            app.romm_ui.operation
+            app.romm_ui
+                .operation
                 .as_ref()
                 .is_some_and(|running| running.cancellation_requested),
             "and the card should know, so Cancel stops being offered"
@@ -743,7 +749,10 @@ mod romm_dispatch_tests {
             "a published import did not refresh the cover cache"
         );
         assert!(
-            matches!(app.database_state, DatabaseState::Loading { worker: None, .. }),
+            matches!(
+                app.database_state,
+                DatabaseState::Loading { worker: None, .. }
+            ),
             "the hermetic operation fixture must not launch a real database worker"
         );
     }
@@ -804,7 +813,8 @@ mod romm_dispatch_tests {
             "a superseded result must not become the visible outcome"
         );
         assert_eq!(
-            app.romm_ui.snapshot
+            app.romm_ui
+                .snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.status.records_imported),
             Some(36_259),
@@ -840,7 +850,8 @@ mod romm_dispatch_tests {
         app.poll_romm_operation(&context);
         assert!(app.romm_ui.operation.is_none(), "the operation finished");
         assert_eq!(
-            app.romm_ui.snapshot
+            app.romm_ui
+                .snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.status.records_imported),
             Some(36_259)
@@ -869,7 +880,8 @@ mod romm_dispatch_tests {
         app.poll_romm_operation(&context);
         // The visible result is the clear...
         assert!(
-            app.romm_ui.card
+            app.romm_ui
+                .card
                 .last_outcome
                 .as_ref()
                 .is_some_and(|outcome| outcome.headline.contains("39"))
@@ -877,7 +889,8 @@ mod romm_dispatch_tests {
         // ...and a status load was started rather than the card being patched by
         // hand, so what it shows next comes from disk.
         assert_eq!(
-            app.romm_ui.operation
+            app.romm_ui
+                .operation
                 .as_ref()
                 .map(|running| running.operation.clone()),
             Some(RommOperation::LoadStatus),
@@ -904,13 +917,17 @@ mod romm_dispatch_tests {
         assert!(outcome.headline.contains("failed"), "{}", outcome.headline);
         // The snapshot is untouched: a failure must not blank the card.
         assert_eq!(
-            app.romm_ui.snapshot
+            app.romm_ui
+                .snapshot
                 .as_ref()
                 .map(|snapshot| snapshot.status.records_imported),
             Some(36_259)
         );
         assert!(matches!(
-            app.romm_ui.snapshot.as_ref().map(|s| s.status.state.clone()),
+            app.romm_ui
+                .snapshot
+                .as_ref()
+                .map(|s| s.status.state.clone()),
             Some(ProviderState::Ready)
         ));
     }
@@ -1013,7 +1030,8 @@ mod romm_dispatch_tests {
         app.romm_ui.snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
         app.open_romm_configuration();
         let first_url = app
-            .romm_ui.config_draft
+            .romm_ui
+            .config_draft
             .as_ref()
             .map(|draft| draft.url.clone());
         assert_eq!(first_url.as_deref(), Some("http://172.19.0.20:8080"));
@@ -1026,14 +1044,16 @@ mod romm_dispatch_tests {
         }
         app.open_romm_configuration();
         assert_eq!(
-            app.romm_ui.config_draft
+            app.romm_ui
+                .config_draft
                 .as_ref()
                 .map(|draft| draft.url.clone()),
             Some("http://10.0.0.5:8080".to_string()),
             "the open dialog must be left alone"
         );
         assert!(
-            app.romm_ui.config_draft
+            app.romm_ui
+                .config_draft
                 .as_ref()
                 .is_some_and(|draft| draft.dirty)
         );
@@ -1047,7 +1067,8 @@ mod romm_dispatch_tests {
         // Without this, a fresh install could never be configured from the GUI.
         assert!(app.romm_ui.config_draft.is_some());
         assert!(
-            app.romm_ui.config_draft
+            app.romm_ui
+                .config_draft
                 .as_ref()
                 .is_some_and(|draft| draft.url.is_empty())
         );
@@ -1062,7 +1083,8 @@ mod romm_dispatch_tests {
         let (_sender, _progress, generation) = install_running(&mut app, RommOperation::FullImport);
 
         let settings = app
-            .romm_ui.config_draft
+            .romm_ui
+            .config_draft
             .as_ref()
             .expect("open")
             .to_settings(None);
@@ -1072,7 +1094,8 @@ mod romm_dispatch_tests {
             "the save must not have started"
         );
         assert_eq!(
-            app.romm_ui.operation
+            app.romm_ui
+                .operation
                 .as_ref()
                 .map(|running| running.operation.clone()),
             Some(RommOperation::FullImport)
@@ -1092,7 +1115,8 @@ mod romm_dispatch_tests {
         app.handle_romm_config_request(&context, ConfigDialogRequest::Preview { limit: 20 });
         assert_eq!(app.romm_ui.generation, generation);
         assert_eq!(
-            app.romm_ui.operation
+            app.romm_ui
+                .operation
                 .as_ref()
                 .map(|running| running.operation.clone()),
             Some(RommOperation::Refresh)
@@ -1107,7 +1131,8 @@ mod romm_dispatch_tests {
         app.romm_ui.snapshot = Some(Box::new(snapshot(36_259, ProviderState::Ready)));
         app.open_romm_configuration();
         let settings = app
-            .romm_ui.config_draft
+            .romm_ui
+            .config_draft
             .as_ref()
             .expect("open")
             .to_settings(None);
@@ -1128,14 +1153,16 @@ mod romm_dispatch_tests {
             "the dialog has served its purpose"
         );
         assert!(
-            app.romm_ui.card
+            app.romm_ui
+                .card
                 .last_outcome
                 .as_ref()
                 .is_some_and(|outcome| outcome.headline.contains("saved"))
         );
         // The card is refreshed from disk rather than from what was typed.
         assert_eq!(
-            app.romm_ui.operation
+            app.romm_ui
+                .operation
                 .as_ref()
                 .map(|running| running.operation.clone()),
             Some(RommOperation::LoadStatus)
@@ -1185,7 +1212,8 @@ mod romm_dispatch_tests {
             draft.dirty = true;
         }
         let settings = app
-            .romm_ui.config_draft
+            .romm_ui
+            .config_draft
             .as_ref()
             .expect("open")
             .to_settings(None);
@@ -1206,7 +1234,8 @@ mod romm_dispatch_tests {
             "a refused save must not discard the draft"
         );
         assert_eq!(
-            app.romm_ui.config_draft
+            app.romm_ui
+                .config_draft
                 .as_ref()
                 .map(|draft| draft.url.clone()),
             Some("http://10.0.0.5:8080".to_string())
@@ -1234,7 +1263,10 @@ mod romm_dispatch_tests {
             ))
             .expect("send");
         app.poll_romm_operation(&context);
-        assert!(app.romm_ui.preview.is_some(), "the open dialog should show it");
+        assert!(
+            app.romm_ui.preview.is_some(),
+            "the open dialog should show it"
+        );
         // A preview is read-only, so no reload follows it.
         assert!(app.romm_ui.operation.is_none());
 
@@ -1292,7 +1324,8 @@ mod romm_dispatch_tests {
         app.romm_ui.browse.as_mut().expect("open").needs_reload = true;
         app.open_romm_browse(BrowseView::Records);
         assert!(
-            app.romm_ui.browse
+            app.romm_ui
+                .browse
                 .as_ref()
                 .is_some_and(|state| state.needs_reload),
             "the open panel must not be replaced"
@@ -1304,7 +1337,8 @@ mod romm_dispatch_tests {
             Some(BrowseView::StaleSummary)
         );
         assert!(
-            app.romm_ui.browse
+            app.romm_ui
+                .browse
                 .as_ref()
                 .is_some_and(|state| state.detail.is_none())
         );
@@ -1347,7 +1381,8 @@ mod romm_dispatch_tests {
         let mut app = app();
         let context = egui::Context::default();
         app.open_romm_browse(crate::romm_browse::BrowseView::Records);
-        app.romm_ui.browse
+        app.romm_ui
+            .browse
             .as_mut()
             .expect("open")
             .begin_detail("2".to_string());
@@ -1380,7 +1415,8 @@ mod romm_dispatch_tests {
         let mut app = app();
         let context = egui::Context::default();
         app.open_romm_browse(crate::romm_browse::BrowseView::Records);
-        app.romm_ui.browse
+        app.romm_ui
+            .browse
             .as_mut()
             .expect("open")
             .begin_detail("1".to_string());
@@ -1391,7 +1427,8 @@ mod romm_dispatch_tests {
             },
         );
         // The selection changed before the old result arrived.
-        app.romm_ui.browse
+        app.romm_ui
+            .browse
             .as_mut()
             .expect("open")
             .begin_detail("2".to_string());
@@ -1612,7 +1649,8 @@ mod romm_dispatch_tests {
             "progress should be cleared once the result is in"
         );
         assert!(
-            app.romm_ui.browse
+            app.romm_ui
+                .browse
                 .as_ref()
                 .is_some_and(|state| state.stale.is_some())
         );
@@ -1634,7 +1672,8 @@ mod romm_dispatch_tests {
             .expect("send");
         app.poll_romm_operation(&context);
         assert!(
-            app.romm_ui.browse
+            app.romm_ui
+                .browse
                 .as_ref()
                 .is_some_and(|state| state.stale.is_none()),
             "a half-probed partition must not be shown as a finding"
@@ -1862,7 +1901,8 @@ mod romm_dispatch_tests {
             },
         );
         // The person clicked a different archive while the lookup was in flight.
-        app.romm_ui.game
+        app.romm_ui
+            .game
             .focus(Some(Path::new("/mnt/games/roms/gb/other.gb")));
         sender
             .send((
@@ -1957,7 +1997,9 @@ mod romm_dispatch_tests {
         app.romm_ui.game.panel = Some(Box::new(panel_for("/mnt/games/roms/gb/game.gb", "1")));
         app.archive_context.focused = Some(PathBuf::from("/mnt/games/roms/gb/other.gb"));
         // The renderer follows the selection at the top of every frame.
-        app.romm_ui.game.focus(app.archive_context.focused.as_deref());
+        app.romm_ui
+            .game
+            .focus(app.archive_context.focused.as_deref());
         assert!(app.romm_ui.game.panel.is_none());
     }
 }

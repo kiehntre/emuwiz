@@ -103,7 +103,9 @@ pub(crate) enum SourceActionOutcome {
         platform: String,
         scan: ScanPersistSummary,
     },
-    RoleAssigned { role: SourceRole },
+    RoleAssigned {
+        role: SourceRole,
+    },
     Removed(RemoveSourceFolderOutcome),
 }
 

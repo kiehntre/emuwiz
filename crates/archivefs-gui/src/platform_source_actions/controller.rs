@@ -431,8 +431,8 @@ impl ArchiveFsApp {
         }
         let log_category = source_action_log_category(&action);
         let path = source_action_path(&action);
-        let gamer_scan_pending =
-            self.gamer_view_scan_pending_review || self.sources_ui.gamer_view_pending_first_scan.is_some();
+        let gamer_scan_pending = self.gamer_view_scan_pending_review
+            || self.sources_ui.gamer_view_pending_first_scan.is_some();
         match result {
             Ok(outcome) => {
                 let message = source_action_success_message(&outcome);
@@ -877,7 +877,11 @@ pub(crate) fn source_action_started_message(action: &SourceAction) -> String {
             path.display()
         ),
         SourceAction::SetRole { path, role } => {
-            format!("Saving {} role for source '{}'.", role.label(), path.display())
+            format!(
+                "Saving {} role for source '{}'.",
+                role.label(),
+                path.display()
+            )
         }
         SourceAction::Remove {
             path,

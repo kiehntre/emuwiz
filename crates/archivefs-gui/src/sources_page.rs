@@ -145,7 +145,10 @@ pub(super) enum SourcesPageAction {
         platform: String,
     },
     EditRole(PathBuf),
-    SaveRole { path: PathBuf, role: SourceRole },
+    SaveRole {
+        path: PathBuf,
+        role: SourceRole,
+    },
     SetEnabled {
         path: PathBuf,
         enabled: bool,
@@ -1332,16 +1335,22 @@ pub(super) fn source_role_explanation(role: SourceRole) -> &'static str {
     match role {
         SourceRole::Games => "Scan this folder for playable game files.",
         SourceRole::ArcadeRomset => "Use this folder for arcade ROMset and dependency analysis.",
-        SourceRole::BiosFirmware => "Use files here when checking emulator BIOS and firmware requirements.",
+        SourceRole::BiosFirmware => {
+            "Use files here when checking emulator BIOS and firmware requirements."
+        }
         SourceRole::SaveData => "Treat this folder as save data, not game content.",
         SourceRole::MemoryCards => "Treat this folder as memory-card data for Save Vault.",
         SourceRole::EmulatorConfig => "Use this folder for emulator configuration files.",
         SourceRole::DatMetadata => "Use this folder for DAT and catalogue metadata.",
         SourceRole::ArtworkMedia => "Use this folder for artwork and media associated with games.",
-        SourceRole::IncomingUnsorted => "Review this folder as incoming content before organising it.",
+        SourceRole::IncomingUnsorted => {
+            "Review this folder as incoming content before organising it."
+        }
         SourceRole::GenericFiles => "Inspect this folder as general game-related files.",
         SourceRole::Ignored => "Do not scan or use this source. Ignored is not the same as hidden.",
-        SourceRole::Unknown => "EmuWiz does not know how this source should be used yet and will not guess.",
+        SourceRole::Unknown => {
+            "EmuWiz does not know how this source should be used yet and will not guess."
+        }
     }
 }
 
@@ -1363,23 +1372,32 @@ pub(super) fn source_role_choices() -> [SourceRole; 12] {
 }
 
 pub(super) fn source_role_effects(role: SourceRole) -> (String, String, String) {
-    let disposition = format!("Game scanning: {}", match role.game_scan_disposition() {
-        archivefs_core::GameScanDisposition::ScanGames => "eligible",
-        archivefs_core::GameScanDisposition::ScanArcade => "arcade analysis",
-        archivefs_core::GameScanDisposition::ScanUnsorted => "review only",
-        archivefs_core::GameScanDisposition::SkipNonGame => "stopped",
-        archivefs_core::GameScanDisposition::SkipIgnored => "disabled",
-        archivefs_core::GameScanDisposition::SkipUnknown => "not started (unknown role)",
-    });
+    let disposition = format!(
+        "Game scanning: {}",
+        match role.game_scan_disposition() {
+            archivefs_core::GameScanDisposition::ScanGames => "eligible",
+            archivefs_core::GameScanDisposition::ScanArcade => "arcade analysis",
+            archivefs_core::GameScanDisposition::ScanUnsorted => "review only",
+            archivefs_core::GameScanDisposition::SkipNonGame => "stopped",
+            archivefs_core::GameScanDisposition::SkipIgnored => "disabled",
+            archivefs_core::GameScanDisposition::SkipUnknown => "not started (unknown role)",
+        }
+    );
     let route = format!("Subsystem: {}", role.subsystem_route().label());
-    let visibility = format!("Library: {}", match archivefs_core::library_visibility::visibility_for_source_role(role).visibility {
-        archivefs_core::library_visibility::LibraryVisibility::Visible => "visible",
-        archivefs_core::library_visibility::LibraryVisibility::HiddenByDefault => "hidden by default",
-        archivefs_core::library_visibility::LibraryVisibility::DependencyOnly => "dependency-only",
-        archivefs_core::library_visibility::LibraryVisibility::NotLibraryContent => "not library content",
-        archivefs_core::library_visibility::LibraryVisibility::UserHidden => "hidden by user",
-        archivefs_core::library_visibility::LibraryVisibility::AdvancedOnly => "advanced-only",
-    });
+    let visibility = format!(
+        "Library: {}",
+        match archivefs_core::library_visibility::visibility_for_source_role(role).visibility {
+            archivefs_core::library_visibility::LibraryVisibility::Visible => "visible",
+            archivefs_core::library_visibility::LibraryVisibility::HiddenByDefault =>
+                "hidden by default",
+            archivefs_core::library_visibility::LibraryVisibility::DependencyOnly =>
+                "dependency-only",
+            archivefs_core::library_visibility::LibraryVisibility::NotLibraryContent =>
+                "not library content",
+            archivefs_core::library_visibility::LibraryVisibility::UserHidden => "hidden by user",
+            archivefs_core::library_visibility::LibraryVisibility::AdvancedOnly => "advanced-only",
+        }
+    );
     (disposition, route, visibility)
 }
 
@@ -1439,9 +1457,19 @@ pub(super) fn show_sources_page_with_mount_root(
 ) -> Option<SourcesPageAction> {
     let mut role_dialog = None;
     show_sources_page_with_mount_root_and_role(
-        ui, sources, archives, mount_root, catalogue_available, busy,
-        mount_root_draft, mount_root_busy, mount_root_feedback, add_dialog,
-        remove_dialog, &mut role_dialog, clipboard,
+        ui,
+        sources,
+        archives,
+        mount_root,
+        catalogue_available,
+        busy,
+        mount_root_draft,
+        mount_root_busy,
+        mount_root_feedback,
+        add_dialog,
+        remove_dialog,
+        &mut role_dialog,
+        clipboard,
     )
 }
 
@@ -1470,7 +1498,11 @@ pub(super) fn show_sources_page_with_mount_root_and_role(
     // otherwise; this function keeps its exact signature and every
     // existing test that calls it directly still gets the same content,
     // just without the now-redundant page-level heading repeating.
-    widgets::workflow_header(ui, "Game Folders", "Add folders and scan them to find your games. Your originals stay where they are.");
+    widgets::workflow_header(
+        ui,
+        "Game Folders",
+        "Add folders and scan them to find your games. Your originals stay where they are.",
+    );
 
     if !catalogue_available {
         widgets::card(ui, |ui| {
@@ -2737,7 +2769,8 @@ pub(super) fn show_sources_tabs(ui: &mut egui::Ui, current: SourcesTab) -> Optio
     let clicked = egui::CollapsingHeader::new("Related source tools")
         .default_open(false)
         .show(ui, |ui| widgets::tab_row(ui, &tab_options, current))
-        .body_returned.flatten();
+        .body_returned
+        .flatten();
     ui.add_space(8.0);
     clicked
 }
@@ -2864,7 +2897,6 @@ pub(super) fn show_sources_discovery_tab(
     refresh
 }
 
-
 impl ArchiveFsApp {
     /// The consolidated "Sources" destination - one sidebar entry over
     /// Libraries/DATs/Cheats/Discovery tabs (`SourcesTab`). Renders the
@@ -2875,7 +2907,12 @@ impl ArchiveFsApp {
     /// `self.show_cheat_sources_page`, `show_sources_discovery_tab`) -
     /// nothing here re-implements source management, DAT handling, cheat
     /// provisioning, or collection discovery.
-    pub(crate) fn show_sources_page(&mut self, context: &egui::Context, ui: &mut egui::Ui, tab: SourcesTab) {
+    pub(crate) fn show_sources_page(
+        &mut self,
+        context: &egui::Context,
+        ui: &mut egui::Ui,
+        tab: SourcesTab,
+    ) {
         self.artwork_media.es_de_media.start(context.clone());
         if self.artwork_media.es_de_media.poll() {
             self.artwork_media.gamer_covers.identity_refreshed();
@@ -2884,12 +2921,15 @@ impl ArchiveFsApp {
                 worker.update_esde(self.artwork_media.es_de_media.snapshot().cloned());
             }
         }
-        self.artwork_media.launchbox_local_media.start(context.clone());
+        self.artwork_media
+            .launchbox_local_media
+            .start(context.clone());
         if self.artwork_media.launchbox_local_media.poll() {
             self.artwork_media.gamer_covers.identity_refreshed();
             self.artwork_media.gamer_screenshots.identity_refreshed();
             if let Some(worker) = self.artwork_media.gamer_cover_worker.as_ref() {
-                worker.update_launchbox(self.artwork_media.launchbox_local_media.snapshot().cloned());
+                worker
+                    .update_launchbox(self.artwork_media.launchbox_local_media.snapshot().cloned());
             }
         }
         if self.ui_mode != GuiMode::Simple
@@ -2914,7 +2954,9 @@ impl ArchiveFsApp {
                             self.artwork_media.es_de_media.refresh(context.clone());
                         }
                         sources_page::LocalProviderRefreshAction::LaunchBoxLocal => {
-                            self.artwork_media.launchbox_local_media.refresh(context.clone());
+                            self.artwork_media
+                                .launchbox_local_media
+                                .refresh(context.clone());
                         }
                     }
                 }
@@ -3031,10 +3073,7 @@ impl ArchiveFsApp {
                     }
                 }
                 SourcesPageAction::SaveRole { path, role } => {
-                    self.start_source_action(
-                        context.clone(),
-                        SourceAction::SetRole { path, role },
-                    );
+                    self.start_source_action(context.clone(), SourceAction::SetRole { path, role });
                 }
                 SourcesPageAction::SetEnabled { path, enabled } => {
                     self.start_source_action(

@@ -106,8 +106,7 @@ impl Pcsx2TextureModPageState {
                                 .unwrap_or_default();
                             match build_pcsx2_texture_pack_transaction_plan(
                                 &plan,
-                                self
-                                    .key
+                                self.key
                                     .as_ref()
                                     .map(|(_, id)| id.as_str())
                                     .unwrap_or_default(),

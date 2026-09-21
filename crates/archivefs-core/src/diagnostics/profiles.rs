@@ -45,17 +45,17 @@ use crate::emulator_environment::EncodedPath;
 use crate::launch::readiness::{FirmwareReadiness, rpcs3_firmware_readiness};
 use crate::patch_manager::{
     AzaharDiscoveryRoots, AzaharEvidenceState, CemuKeysState, CemuMlcState,
-    DolphinProfileDiscovery, DolphinProfileDiscoveryRoots, DuckStationProfileDiscovery,
-    DuckStationProfileDiscoveryRoots, EmulatorProfileSelection, Pcsx2ProfileDiscovery,
-    Pcsx2ProfileDiscoveryRoots, PpssppInstallationType, PpssppLaunchBlocker,
+    CemuProfileDiscoveryRoots, DolphinProfileDiscovery, DolphinProfileDiscoveryRoots,
+    DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots, EmulatorProfileSelection,
+    Pcsx2ProfileDiscovery, Pcsx2ProfileDiscoveryRoots, PpssppInstallationType, PpssppLaunchBlocker,
     PpssppLaunchBlockerKind, PpssppProfileDiscovery, PpssppProfileDiscoveryRoots, Rpcs3GameRequest,
     Rpcs3InstallationType, Rpcs3LaunchBlocker, Rpcs3LaunchBlockerKind, Rpcs3ProfileDiscovery,
     Rpcs3ProfileDiscoveryRoots, XemuGameRequest, XemuInstallationType, XemuLaunchBlocker,
     XemuLaunchBlockerKind, XemuProfileDiscovery, XemuProfileDiscoveryRoots, XemuSystemFileState,
     XeniaLaunchBlocker, XeniaLaunchBlockerKind, XeniaProfileDiscovery, XeniaProfileDiscoveryRoots,
-    CemuProfileDiscoveryRoots, discover_azahar_executable, discover_azahar_profile,
+    discover_azahar_executable, discover_azahar_profile, discover_cemu_profiles,
     discover_dolphin_profiles, discover_duckstation_profiles, discover_pcsx2_profiles,
-    discover_cemu_profiles, discover_ppsspp_profiles, discover_rpcs3_profiles, discover_xemu_profiles,
+    discover_ppsspp_profiles, discover_rpcs3_profiles, discover_xemu_profiles,
     discover_xenia_profiles, inspect_rpcs3_game, inspect_xemu_game,
     resolve_ppsspp_native_launch_binding, resolve_rpcs3_native_launch_binding,
     resolve_xemu_native_launch_binding, resolve_xenia_launch_binding, select_dolphin_profile,
@@ -130,7 +130,11 @@ pub fn discover_azahar_cemu_readiness() -> Vec<AzaharCemuReadiness> {
             } else {
                 Vec::new()
             },
-            evidence: vec![format!("Configuration: {state}"), "Selected-title system-data and content checks remain adapter preflight checks.".into()],
+            evidence: vec![
+                format!("Configuration: {state}"),
+                "Selected-title system-data and content checks remain adapter preflight checks."
+                    .into(),
+            ],
             remediation: if blocked {
                 "Repair or recreate Azahar's configuration, then run Doctor again.".into()
             } else {
@@ -139,8 +143,13 @@ pub fn discover_azahar_cemu_readiness() -> Vec<AzaharCemuReadiness> {
         });
     } else {
         result.push(AzaharCemuReadiness {
-            adapter: "Azahar".into(), executable: None, version: None, profile: None,
-            ready: false, blockers: vec!["Azahar executable was not found".into()], evidence: Vec::new(),
+            adapter: "Azahar".into(),
+            executable: None,
+            version: None,
+            profile: None,
+            ready: false,
+            blockers: vec!["Azahar executable was not found".into()],
+            evidence: Vec::new(),
             remediation: "Install Azahar or select an executable in Emulator Setup.".into(),
         });
     }
@@ -148,8 +157,13 @@ pub fn discover_azahar_cemu_readiness() -> Vec<AzaharCemuReadiness> {
         let discovery = discover_cemu_profiles(&roots);
         if discovery.profiles.is_empty() {
             result.push(AzaharCemuReadiness {
-                adapter: "Cemu".into(), executable: None, version: None, profile: None,
-                ready: false, blockers: vec!["Cemu executable/profile was not found".into()], evidence: Vec::new(),
+                adapter: "Cemu".into(),
+                executable: None,
+                version: None,
+                profile: None,
+                ready: false,
+                blockers: vec!["Cemu executable/profile was not found".into()],
+                evidence: Vec::new(),
                 remediation: "Install Cemu or select its profile in Emulator Setup.".into(),
             });
         }
@@ -4510,9 +4524,14 @@ mod tests {
     #[test]
     fn azahar_doctor_projection_never_overstates_incomplete_configuration() {
         let entries = findings_from_azahar_cemu_readiness(&[AzaharCemuReadiness {
-            adapter: "Azahar".into(), executable: None, version: None, profile: None,
-            ready: false, blockers: vec!["Azahar configuration unreadable".into()],
-            evidence: Vec::new(), remediation: "Repair the configuration.".into(),
+            adapter: "Azahar".into(),
+            executable: None,
+            version: None,
+            profile: None,
+            ready: false,
+            blockers: vec!["Azahar configuration unreadable".into()],
+            evidence: Vec::new(),
+            remediation: "Repair the configuration.".into(),
         }]);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].severity, DoctorSeverity::Warning);
@@ -4523,13 +4542,22 @@ mod tests {
     #[test]
     fn cemu_doctor_projection_keeps_keys_conditional_and_mlc_visible() {
         let entries = findings_from_azahar_cemu_readiness(&[AzaharCemuReadiness {
-            adapter: "Cemu".into(), executable: None, version: Some("2.0".into()), profile: None,
-            ready: false, blockers: vec!["Cemu MLC is missing".into()],
+            adapter: "Cemu".into(),
+            executable: None,
+            version: Some("2.0".into()),
+            profile: None,
+            ready: false,
+            blockers: vec!["Cemu MLC is missing".into()],
             evidence: vec!["Keys: not configured; some titles may require it".into()],
             remediation: "Configure the MLC.".into(),
         }]);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].explanation.contains("MLC"));
-        assert!(entries[0].evidence.iter().any(|line| line.contains("some titles may require it")));
+        assert!(
+            entries[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("some titles may require it"))
+        );
     }
 }

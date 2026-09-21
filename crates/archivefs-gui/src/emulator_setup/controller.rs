@@ -282,7 +282,11 @@ impl ArchiveFsApp {
         ) {
             self.start_retroarch_profile_scan(context.clone());
         }
-        widgets::workflow_header(ui, "Emulators", "Check which emulators are installed and ready.");
+        widgets::workflow_header(
+            ui,
+            "Emulators",
+            "Check which emulators are installed and ready.",
+        );
         let setup_action = emulator_setup_page::show(
             ui,
             &mut self.emulator_readiness.emulator_setup_page,
@@ -1336,9 +1340,7 @@ impl ArchiveFsApp {
                     profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
-                    firmware: archivefs_core::launch::melonds_firmware_readiness(
-                        &profile.firmware,
-                    ),
+                    firmware: archivefs_core::launch::melonds_firmware_readiness(&profile.firmware),
                 }
             }));
         }
@@ -1368,10 +1370,8 @@ impl ArchiveFsApp {
             if let Some(executable) =
                 archivefs_core::patch_manager::discover_azahar_executable(&roots)
             {
-                let profile = archivefs_core::patch_manager::discover_azahar_profile(
-                    &roots,
-                    executable,
-                );
+                let profile =
+                    archivefs_core::patch_manager::discover_azahar_profile(&roots, executable);
                 standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "azahar",
                     profile_id: format!("azahar:{}", profile.executable.display()),

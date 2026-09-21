@@ -225,7 +225,8 @@ pub(crate) struct ArchiveFsApp {
     /// Session-only ScreenScraper metadata-provider settings and connection
     /// status. Credentials are deliberately never loaded from disk.
     pub(crate) screenscraper_page: screenscraper_page::ScreenScraperPageState,
-    pub(crate) screenscraper_enrichment: screenscraper_enrichment_page::ScreenScraperEnrichmentState,
+    pub(crate) screenscraper_enrichment:
+        screenscraper_enrichment_page::ScreenScraperEnrichmentState,
     /// The last authoritative RomM snapshot. `None` until the first status load,
     /// so the card shows "reading" rather than a screenful of zeroes.
     pub(crate) romm_ui: RommUiState,
@@ -440,7 +441,8 @@ impl ArchiveFsApp {
             catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
             gui_config,
             screenscraper_page: screenscraper_page::ScreenScraperPageState::default(),
-            screenscraper_enrichment: screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+            screenscraper_enrichment:
+                screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
             romm_ui: RommUiState::default(),
             selected_evidence_ui: SelectedEvidenceUiState::default(),
             gamer_view_scan_review_available: false,
@@ -728,17 +730,24 @@ impl ArchiveFsApp {
                 self.screenscraper_enrichment.mark_applied_for(archive_id);
                 self.feedback = Some(ActionFeedback {
                     succeeded: true,
-                    message: "Metadata was applied explicitly. Identity and source files were unchanged.".into(),
+                    message:
+                        "Metadata was applied explicitly. Identity and source files were unchanged."
+                            .into(),
                     cleanup: None,
                     warning: None,
-                    more_information: Some(format!("ScreenScraper provider record {}", receipt.provider_record_id)),
+                    more_information: Some(format!(
+                        "ScreenScraper provider record {}",
+                        receipt.provider_record_id
+                    )),
                 });
                 self.start_database_action(context, false);
             }
             Err(error) => {
                 self.feedback = Some(ActionFeedback {
                     succeeded: false,
-                    message: "Metadata could not be applied; the previous library state was preserved.".into(),
+                    message:
+                        "Metadata could not be applied; the previous library state was preserved."
+                            .into(),
                     cleanup: None,
                     warning: Some(error.to_string()),
                     more_information: None,

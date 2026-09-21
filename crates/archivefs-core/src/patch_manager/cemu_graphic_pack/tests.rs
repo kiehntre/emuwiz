@@ -1,10 +1,10 @@
 use super::*;
-use std::io::Write;
 use crate::patch_manager::{
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus,
-    SharedRollbackConfirmation, SharedRollbackOptions,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation,
+    SharedRollbackOptions,
 };
 use std::fs;
+use std::io::Write;
 use tempfile::tempdir;
 
 const TITLE: &str = "00050000101010ED";
@@ -47,8 +47,12 @@ fn zip_package_is_staged_and_inspected_without_touching_the_source() {
         let mut archive = zip::ZipWriter::new(file);
         let options = zip::write::FileOptions::<()>::default();
         archive.start_file("Safe Pack/rules.txt", options).unwrap();
-        archive.write_all(format!("[Definition]\nname = Safe Pack\ntitleIds = {TITLE}\n").as_bytes()).unwrap();
-        archive.start_file("Safe Pack/content/main.bin", options).unwrap();
+        archive
+            .write_all(format!("[Definition]\nname = Safe Pack\ntitleIds = {TITLE}\n").as_bytes())
+            .unwrap();
+        archive
+            .start_file("Safe Pack/content/main.bin", options)
+            .unwrap();
         archive.write_all(b"content").unwrap();
         archive.finish().unwrap();
     }
@@ -115,38 +119,50 @@ fn apply_rollback_and_conflict_preserve_unrelated_files() {
     fs::create_dir_all(destination.join("Other Pack")).unwrap();
     fs::write(destination.join("Other Pack/unrelated.txt"), b"keep").unwrap();
     let inspection = inspect_cemu_graphic_pack(&root).unwrap();
-    let plan = build_cemu_graphic_pack_plan(
-        &inspection,
-        TITLE,
-        &dir.path().join("game"),
-        &destination,
-    )
-    .unwrap();
+    let plan =
+        build_cemu_graphic_pack_plan(&inspection, TITLE, &dir.path().join("game"), &destination)
+            .unwrap();
     assert_eq!(plan.report.summary.install_new, 3);
     let transaction = build_cemu_graphic_pack_transaction_plan(&plan, "cemu:test").unwrap();
     let history = dir.path().join("history");
     let backups = dir.path().join("backups");
-    let applied = apply_cemu_graphic_pack(&transaction, &SharedApplyOptions {
-        dry_run: false,
-        confirmation: Some(SharedApplyConfirmation { plan_id: transaction.plan_id.clone(), general_approved: true, replacement_approved: true }),
-        operation_id: "cemu-test-apply".into(),
-        timestamp_unix_seconds: 1,
-        current_context: transaction.context.clone(),
-        history_root: history.clone(),
-        backup_root: backups.clone(),
-    });
+    let applied = apply_cemu_graphic_pack(
+        &transaction,
+        &SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: transaction.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: true,
+            }),
+            operation_id: "cemu-test-apply".into(),
+            timestamp_unix_seconds: 1,
+            current_context: transaction.context.clone(),
+            history_root: history.clone(),
+            backup_root: backups.clone(),
+        },
+    );
     assert_eq!(applied.apply.journal.status, SharedApplyStatus::Success);
-    assert_eq!(fs::read(destination.join("Other Pack/unrelated.txt")).unwrap(), b"keep");
+    assert_eq!(
+        fs::read(destination.join("Other Pack/unrelated.txt")).unwrap(),
+        b"keep"
+    );
     let journal = applied.apply.journal_path.unwrap();
     let preview = preview_cemu_graphic_pack_rollback(&journal, &destination, &backups);
     assert!(preview.available);
-    let rollback = rollback_cemu_graphic_pack(&preview, &SharedRollbackOptions {
-        confirmation: SharedRollbackConfirmation { preview_id: preview.preview_id.clone(), approved: true },
-        rollback_operation_id: "cemu-test-rollback".into(),
-        timestamp_unix_seconds: 2,
-        history_root: history,
-        backup_root: backups,
-    });
+    let rollback = rollback_cemu_graphic_pack(
+        &preview,
+        &SharedRollbackOptions {
+            confirmation: SharedRollbackConfirmation {
+                preview_id: preview.preview_id.clone(),
+                approved: true,
+            },
+            rollback_operation_id: "cemu-test-rollback".into(),
+            timestamp_unix_seconds: 2,
+            history_root: history,
+            backup_root: backups,
+        },
+    );
     assert_eq!(rollback.status, SharedApplyStatus::Success);
     assert!(!destination.join("Safe Pack/rules.txt").exists());
     assert!(destination.join("Other Pack/unrelated.txt").exists());
@@ -161,12 +177,20 @@ fn identical_existing_files_are_skipped_and_different_files_are_replacements() {
     fs::create_dir_all(destination.join("Safe Pack/content")).unwrap();
     fs::write(destination.join("Safe Pack/content/main.bin"), b"content").unwrap();
     let inspection = inspect_cemu_graphic_pack(&root).unwrap();
-    let plan = build_cemu_graphic_pack_plan(&inspection, TITLE, &dir.path().join("game"), &destination).unwrap();
+    let plan =
+        build_cemu_graphic_pack_plan(&inspection, TITLE, &dir.path().join("game"), &destination)
+            .unwrap();
     assert_eq!(plan.report.summary.already_installed, 1);
     assert_eq!(plan.report.summary.install_new, 2);
     fs::create_dir_all(destination.join("Safe Pack/content/shaders/nested")).unwrap();
-    fs::write(destination.join("Safe Pack/content/shaders/nested/effect_ps.txt"), b"different").unwrap();
-    let changed = build_cemu_graphic_pack_plan(&inspection, TITLE, &dir.path().join("game"), &destination).unwrap();
+    fs::write(
+        destination.join("Safe Pack/content/shaders/nested/effect_ps.txt"),
+        b"different",
+    )
+    .unwrap();
+    let changed =
+        build_cemu_graphic_pack_plan(&inspection, TITLE, &dir.path().join("game"), &destination)
+            .unwrap();
     assert_eq!(changed.report.summary.replace_different, 1);
     assert_eq!(changed.report.summary.install_new, 1);
 }

@@ -7,8 +7,8 @@
 use crate::diagnostics::profiles::DiscoveredProfiles;
 use crate::emulator_lifecycle::inspect_discovered_emulator_lifecycles;
 use crate::persistent_state_inventory::{
-    inventory_persistent_state, PersistentStateInventory, PersistentStateRoot, PersistentStateType,
-    StateEmulator, StateInstallation, StatePathOrigin,
+    PersistentStateInventory, PersistentStateRoot, PersistentStateType, StateEmulator,
+    StateInstallation, StatePathOrigin, inventory_persistent_state,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
