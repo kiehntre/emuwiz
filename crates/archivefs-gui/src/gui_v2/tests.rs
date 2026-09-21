@@ -84,6 +84,7 @@ fn fixture(context: &egui::Context) -> App {
         welcome_dismissed: false,
         doctor_platform: None,
         mrwiz_dismissed: false,
+        saves_states: super::saves_states::SavesStatesState::default(),
     }
 }
 
@@ -700,7 +701,21 @@ fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
         assert!(!section.action().is_empty());
         assert_eq!(Route::Section(*section).section(), *section);
     }
-    assert_eq!(unique.len(), 18);
+    assert_eq!(unique.len(), 19);
+}
+
+#[test]
+fn gui_v2_saves_states_is_a_native_route_and_duplicate_refresh_is_refused() {
+    assert!(routes::SECTIONS.contains(&Section::Saves));
+    assert_eq!(Section::Saves.title(), "Saves & States");
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.start_saves_inventory();
+    let first_job_count = app.activity.jobs.len();
+    assert!(app.saves_states.loading);
+    assert!(app.saves_states.job.is_some());
+    app.start_saves_inventory();
+    assert_eq!(app.activity.jobs.len(), first_job_count);
 }
 
 #[test]
@@ -1844,7 +1859,9 @@ fn gui_v2_accidental_exploration_never_runs_scan_or_legacy() {
         frame(&context, &mut app, [1024.0, 600.0]);
     }
     assert!(app.activity.jobs.values().all(|job| {
-        job.title == "Refreshing artwork providers" || job.title == "Checking emulator readiness"
+        job.title == "Refreshing artwork providers"
+            || job.title == "Checking emulator readiness"
+            || job.title == "Checking save locations"
     }));
     assert!(app.load_job.is_none());
     assert!(!app.confirm_scan);
@@ -2055,7 +2072,11 @@ fn gui_v2_advanced_is_a_specialist_escape_not_a_duplicate_dat_route() {
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
     assert!(strings.iter().any(|value| value == "Advanced tools"));
-    assert!(strings.iter().any(|value| value == "Open specialist interface"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Open specialist interface")
+    );
     assert!(strings.iter().any(|value| value == "Open DAT Management"));
     assert!(!strings.iter().any(|value| value == "DATs & Verification"));
 }

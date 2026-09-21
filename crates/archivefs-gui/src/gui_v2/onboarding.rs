@@ -132,6 +132,14 @@ pub(super) fn show(
                 }
             });
 
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Saves & States");
+                ui.label("Inspect game saves, memory cards, savestates and system storage without changing them.");
+                if button(ui, "Open Saves & States") {
+                    action = Some(Action::Open(Section::Saves));
+                }
+            });
+
             if snapshot.database_upgrade_required {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("Your library needs an upgrade");
@@ -226,7 +234,9 @@ pub(super) fn show(
     action
 }
 
-fn lifecycle_state_label(state: archivefs_core::emulator_lifecycle::LifecycleState) -> &'static str {
+fn lifecycle_state_label(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+) -> &'static str {
     use archivefs_core::emulator_lifecycle::LifecycleState::*;
     match state {
         InstalledCurrent => "Installed",
@@ -240,7 +250,9 @@ fn lifecycle_state_label(state: archivefs_core::emulator_lifecycle::LifecycleSta
     }
 }
 
-fn lifecycle_state_tone(state: archivefs_core::emulator_lifecycle::LifecycleState) -> egui::Color32 {
+fn lifecycle_state_tone(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+) -> egui::Color32 {
     use archivefs_core::emulator_lifecycle::LifecycleState::*;
     match state {
         InstalledCurrent => egui::Color32::from_rgb(90, 205, 150),
@@ -260,11 +272,28 @@ fn lifecycle_installation_card(
 ) {
     use archivefs_core::emulator_lifecycle::ExactBinding;
     ui.group(|ui| {
-        let selected = if installation.selected { " · Currently selected" } else { "" };
-        ui.label(format!("{}{}", installation_type_label(installation.installation_type), selected));
-        ui.label(format!("Version: {}", installation.version.version.as_deref().unwrap_or("unknown")));
-        ui.label(format!("Updates: {}", update_authority_label(installation.update_authority)));
-        ui.label(format!("Health: {}", local_health_label(installation.local_health)));
+        let selected = if installation.selected {
+            " · Currently selected"
+        } else {
+            ""
+        };
+        ui.label(format!(
+            "{}{}",
+            installation_type_label(installation.installation_type),
+            selected
+        ));
+        ui.label(format!(
+            "Version: {}",
+            installation.version.version.as_deref().unwrap_or("unknown")
+        ));
+        ui.label(format!(
+            "Updates: {}",
+            update_authority_label(installation.update_authority)
+        ));
+        ui.label(format!(
+            "Health: {}",
+            local_health_label(installation.local_health)
+        ));
         if let Some(readiness) = installation.launch_readiness {
             ui.label(format!("Launch: {}", launch_readiness_label(readiness)));
         }
@@ -277,23 +306,35 @@ fn lifecycle_installation_card(
         ));
         ui.collapsing("Advanced details", |ui| {
             match &installation.exact_binding {
-                ExactBinding::FlatpakApp { app_id } => ui.label(format!("Flatpak app ID: {app_id}")),
-                ExactBinding::ManagedInstall { manifest_path, executable_path } => {
+                ExactBinding::FlatpakApp { app_id } => {
+                    ui.label(format!("Flatpak app ID: {app_id}"))
+                }
+                ExactBinding::ManagedInstall {
+                    manifest_path,
+                    executable_path,
+                } => {
                     ui.label(format!("Manifest: {}", manifest_path.display()));
                     ui.label(format!("Executable: {}", executable_path.display()))
                 }
                 ExactBinding::NativeExecutable { path }
                 | ExactBinding::PortableExecutable { path }
-                | ExactBinding::UnknownExternal { path } => ui.label(format!("Path: {}", path.display())),
+                | ExactBinding::UnknownExternal { path } => {
+                    ui.label(format!("Path: {}", path.display()))
+                }
             };
-            ui.label(format!("Ownership evidence: {}", ownership_label(installation.ownership_category)));
+            ui.label(format!(
+                "Ownership evidence: {}",
+                ownership_label(installation.ownership_category)
+            ));
             ui.label(format!("Version source: {:?}", installation.version.source));
             ui.label(format!("Channel: {:?}", installation.channel));
         });
     });
 }
 
-fn installation_type_label(kind: archivefs_core::emulator_inventory::InstallationType) -> &'static str {
+fn installation_type_label(
+    kind: archivefs_core::emulator_inventory::InstallationType,
+) -> &'static str {
     use archivefs_core::emulator_inventory::InstallationType::*;
     match kind {
         Flatpak => "Flatpak",
@@ -306,7 +347,9 @@ fn installation_type_label(kind: archivefs_core::emulator_inventory::Installatio
     }
 }
 
-fn ownership_label(ownership: archivefs_core::emulator_lifecycle::OwnershipCategory) -> &'static str {
+fn ownership_label(
+    ownership: archivefs_core::emulator_lifecycle::OwnershipCategory,
+) -> &'static str {
     use archivefs_core::emulator_lifecycle::OwnershipCategory::*;
     match ownership {
         OfficialManaged => "Managed by EmuWiz",
@@ -319,7 +362,9 @@ fn ownership_label(ownership: archivefs_core::emulator_lifecycle::OwnershipCateg
     }
 }
 
-fn update_authority_label(authority: archivefs_core::emulator_lifecycle::UpdateAuthority) -> &'static str {
+fn update_authority_label(
+    authority: archivefs_core::emulator_lifecycle::UpdateAuthority,
+) -> &'static str {
     use archivefs_core::emulator_lifecycle::UpdateAuthority::*;
     match authority {
         EmuWizManaged => "EmuWiz",
@@ -348,7 +393,9 @@ fn local_health_label(health: archivefs_core::emulator_lifecycle::LocalHealth) -
     }
 }
 
-fn launch_readiness_label(readiness: archivefs_core::launch::readiness::LaunchReadiness) -> &'static str {
+fn launch_readiness_label(
+    readiness: archivefs_core::launch::readiness::LaunchReadiness,
+) -> &'static str {
     use archivefs_core::launch::readiness::LaunchReadiness::*;
     match readiness {
         Ready => "Ready",
@@ -597,7 +644,10 @@ mod tests {
 
     #[test]
     fn lifecycle_state_wording_is_normal_user_facing() {
-        assert_eq!(lifecycle_state_label(LifecycleState::InstalledCurrent), "Installed");
+        assert_eq!(
+            lifecycle_state_label(LifecycleState::InstalledCurrent),
+            "Installed"
+        );
         assert_eq!(
             lifecycle_state_label(LifecycleState::InstalledUpdateAvailable),
             "Update available"
@@ -610,12 +660,18 @@ mod tests {
             lifecycle_state_label(LifecycleState::MultipleInstallations),
             "Multiple installations found"
         );
-        assert_eq!(lifecycle_state_label(LifecycleState::Broken), "Needs attention");
+        assert_eq!(
+            lifecycle_state_label(LifecycleState::Broken),
+            "Needs attention"
+        );
     }
 
     #[test]
     fn ownership_and_update_wording_preserve_authority() {
-        assert_eq!(ownership_label(OwnershipCategory::FlatpakManaged), "Managed by Flatpak");
+        assert_eq!(
+            ownership_label(OwnershipCategory::FlatpakManaged),
+            "Managed by Flatpak"
+        );
         assert_eq!(
             ownership_label(OwnershipCategory::SystemPackageManaged),
             "Managed by your system"
@@ -628,6 +684,9 @@ mod tests {
             update_authority_label(UpdateAuthority::SystemPackageManager),
             "your system package manager"
         );
-        assert_eq!(update_authority_label(UpdateAuthority::None), "no automatic updater");
+        assert_eq!(
+            update_authority_label(UpdateAuthority::None),
+            "no automatic updater"
+        );
     }
 }

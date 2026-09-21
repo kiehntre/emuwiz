@@ -13,6 +13,7 @@ mod organisation;
 mod pages;
 mod problems;
 mod routes;
+mod saves_states;
 #[cfg(test)]
 mod tests;
 mod thumbnail;
@@ -226,6 +227,7 @@ pub(super) struct App {
     welcome_dismissed: bool,
     doctor_platform: Option<String>,
     mrwiz_dismissed: bool,
+    saves_states: saves_states::SavesStatesState,
 }
 
 impl App {
@@ -286,6 +288,7 @@ impl App {
             welcome_dismissed: false,
             doctor_platform: None,
             mrwiz_dismissed: false,
+            saves_states: saves_states::SavesStatesState::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -343,6 +346,30 @@ impl App {
         self.environment_job = Some(id);
         if self.send(id, Command::EnvironmentCheck) {
             context.request_repaint();
+        }
+    }
+    fn start_saves_inventory(&mut self) {
+        if self.saves_states.loading {
+            return;
+        }
+        self.saves_states.generation = self.saves_states.generation.wrapping_add(1);
+        let generation = self.saves_states.generation;
+        let id = self.activity.queue(
+            "Checking save locations",
+            Route::Section(Section::Saves),
+            false,
+        );
+        self.saves_states.loading = true;
+        self.saves_states.job = Some(id);
+        self.saves_states.error = None;
+        if !self.send(
+            id,
+            Command::PersistentStateInventory {
+                roots: saves_states::configured_roots(),
+                generation,
+            },
+        ) {
+            self.saves_states.loading = false;
         }
     }
     fn refresh_artwork_index(&mut self) {
@@ -1029,6 +1056,25 @@ impl App {
                                         self.router.current = Route::Section(Section::Setup);
                                     }
                                 }
+                                Payload::PersistentStateInventory {
+                                    inventory,
+                                    generation,
+                                } => {
+                                    if self.saves_states.job == Some(id) {
+                                        self.saves_states.job = None;
+                                        self.saves_states.loading = false;
+                                    }
+                                    if generation == self.saves_states.generation {
+                                        self.saves_states.inventory = Some(inventory);
+                                        self.activity.finish(
+                                            id,
+                                            "Save locations checked. No files were changed.".into(),
+                                            None,
+                                        );
+                                    } else {
+                                        self.activity.finish(id, "An older save inventory was discarded; refresh to check the current locations.".into(), None);
+                                    }
+                                }
                                 Payload::Library(library) => {
                                     self.activity.finish(id, format!("{} games available to browse. Original game files were not changed.", library.games.len()), None);
                                     if let Some(warning) = &library.scan_warning {
@@ -1178,6 +1224,10 @@ impl App {
                             }
                             if self.environment_job == Some(id) {
                                 self.environment_job = None;
+                            }
+                            if self.saves_states.job == Some(id) {
+                                self.saves_states.job = None;
+                                self.saves_states.loading = false;
                             }
                             if self.repair_job == Some(id) {
                                 self.repair_job = None;

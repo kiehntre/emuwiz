@@ -1224,7 +1224,9 @@ fn lifecycle_setup_panel(
     ui.separator();
 }
 
-fn lifecycle_state_label(state: archivefs_core::emulator_lifecycle::LifecycleState) -> &'static str {
+fn lifecycle_state_label(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+) -> &'static str {
     use archivefs_core::emulator_lifecycle::LifecycleState::*;
     match state {
         InstalledCurrent => "Installed",
@@ -1238,7 +1240,9 @@ fn lifecycle_state_label(state: archivefs_core::emulator_lifecycle::LifecycleSta
     }
 }
 
-fn installation_type_label(kind: archivefs_core::emulator_inventory::InstallationType) -> &'static str {
+fn installation_type_label(
+    kind: archivefs_core::emulator_inventory::InstallationType,
+) -> &'static str {
     use archivefs_core::emulator_inventory::InstallationType::*;
     match kind {
         Flatpak => "Flatpak",
@@ -1251,7 +1255,9 @@ fn installation_type_label(kind: archivefs_core::emulator_inventory::Installatio
     }
 }
 
-fn ownership_label(ownership: archivefs_core::emulator_lifecycle::OwnershipCategory) -> &'static str {
+fn ownership_label(
+    ownership: archivefs_core::emulator_lifecycle::OwnershipCategory,
+) -> &'static str {
     use archivefs_core::emulator_lifecycle::OwnershipCategory::*;
     match ownership {
         OfficialManaged => "Managed by EmuWiz",
@@ -1264,7 +1270,9 @@ fn ownership_label(ownership: archivefs_core::emulator_lifecycle::OwnershipCateg
     }
 }
 
-fn update_authority_label(authority: archivefs_core::emulator_lifecycle::UpdateAuthority) -> &'static str {
+fn update_authority_label(
+    authority: archivefs_core::emulator_lifecycle::UpdateAuthority,
+) -> &'static str {
     use archivefs_core::emulator_lifecycle::UpdateAuthority::*;
     match authority {
         EmuWizManaged => "EmuWiz",
@@ -1293,7 +1301,9 @@ fn local_health_label(health: archivefs_core::emulator_lifecycle::LocalHealth) -
     }
 }
 
-fn launch_readiness_label(readiness: archivefs_core::launch::readiness::LaunchReadiness) -> &'static str {
+fn launch_readiness_label(
+    readiness: archivefs_core::launch::readiness::LaunchReadiness,
+) -> &'static str {
     use archivefs_core::launch::readiness::LaunchReadiness::*;
     match readiness {
         Ready => "Ready",
@@ -1322,11 +1332,10 @@ fn lifecycle_executable_path(
     match binding {
         archivefs_core::emulator_lifecycle::ExactBinding::NativeExecutable { path }
         | archivefs_core::emulator_lifecycle::ExactBinding::PortableExecutable { path }
-        | archivefs_core::emulator_lifecycle::ExactBinding::UnknownExternal { path } => {
-            Some(path)
-        }
+        | archivefs_core::emulator_lifecycle::ExactBinding::UnknownExternal { path } => Some(path),
         archivefs_core::emulator_lifecycle::ExactBinding::ManagedInstall {
-            executable_path, ..
+            executable_path,
+            ..
         } => Some(executable_path),
         archivefs_core::emulator_lifecycle::ExactBinding::FlatpakApp { .. } => None,
     }
@@ -1335,7 +1344,9 @@ fn lifecycle_executable_path(
 fn overridable_emulator(
     emulator_id: &str,
 ) -> Option<crate::emulator_setup_overrides::OverridableEmulator> {
-    crate::emulator_setup_overrides::OverridableEmulator::from_adapter_id(&emulator_id.to_ascii_lowercase())
+    crate::emulator_setup_overrides::OverridableEmulator::from_adapter_id(
+        &emulator_id.to_ascii_lowercase(),
+    )
 }
 
 pub(super) fn observe_dat_activity_state(

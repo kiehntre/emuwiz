@@ -7,6 +7,7 @@ pub(super) enum Section {
     Home,
     Setup,
     Games,
+    Saves,
     Duplicates,
     Platforms,
     Check,
@@ -28,6 +29,7 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::Home,
     Section::Setup,
     Section::Games,
+    Section::Saves,
     Section::Duplicates,
     Section::Platforms,
     Section::Check,
@@ -51,6 +53,7 @@ impl Section {
             Self::Home => "Home",
             Self::Setup => "Setup & Doctor",
             Self::Games => "Games",
+            Self::Saves => "Saves & States",
             Self::Duplicates => "Duplicates",
             Self::Platforms => "Platforms",
             Self::Check => "Check Games",
@@ -74,6 +77,7 @@ impl Section {
             Self::Home => "Your games, and the things you can do with them.",
             Self::Setup => "Understand what EmuWiz needs and why a game may not be ready.",
             Self::Games => "Browse your games. Select one to see what you can do next.",
+            Self::Saves => "See which saves are portable, emulator-bound or need careful handling.",
             Self::Duplicates => {
                 "Review exact copies without silently collapsing different releases."
             }
@@ -92,7 +96,9 @@ impl Section {
             }
             Self::Artwork => "Find covers, screenshots and information for your games.",
             Self::Sources => "Find your game folders and choose which ones to include.",
-            Self::Dat => "Manage the trusted game identification data EmuWiz uses to check releases.",
+            Self::Dat => {
+                "Manage the trusted game identification data EmuWiz uses to check releases."
+            }
             Self::Activity => "See what is happening, how it is going and what to do next.",
             Self::History => "Review previous changes and the recovery options available for them.",
             Self::Settings => "Adjust this interface without changing your games.",
@@ -121,6 +127,7 @@ impl Section {
     pub fn group(self) -> Option<&'static str> {
         match self {
             Self::Games => Some("LIBRARY"),
+            Self::Saves => Some("LIBRARY"),
             Self::Duplicates => Some("LIBRARY"),
             Self::Launch => Some("PLAY"),
             Self::Mods => Some("TOOLS"),

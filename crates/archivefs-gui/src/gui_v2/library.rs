@@ -54,7 +54,8 @@ pub(super) struct Game {
     pub platform: String,
     pub identified: bool,
     pub attention: bool,
-    pub screenscraper: Option<archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
+    pub screenscraper:
+        Option<archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
     pub(super) search: String,
 }
 

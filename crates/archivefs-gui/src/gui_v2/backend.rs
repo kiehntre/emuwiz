@@ -90,6 +90,10 @@ pub(super) enum Command {
         generation: u64,
         kind: super::CanonicalOrganisationJobKind,
     },
+    PersistentStateInventory {
+        roots: Vec<archivefs_core::persistent_state_inventory::PersistentStateRoot>,
+        generation: u64,
+    },
 }
 
 pub(super) enum Payload {
@@ -132,6 +136,10 @@ pub(super) enum Payload {
         state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
         generation: u64,
         kind: super::CanonicalOrganisationJobKind,
+    },
+    PersistentStateInventory {
+        inventory: archivefs_core::persistent_state_inventory::PersistentStateInventory,
+        generation: u64,
     },
 }
 
@@ -571,6 +579,14 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 state,
                 generation,
                 kind,
+            })
+        }
+        Command::PersistentStateInventory { roots, generation } => {
+            Ok(Payload::PersistentStateInventory {
+                inventory: archivefs_core::persistent_state_inventory::inventory_persistent_state(
+                    &roots,
+                ),
+                generation,
             })
         }
     }

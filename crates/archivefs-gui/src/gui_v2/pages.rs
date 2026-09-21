@@ -151,6 +151,7 @@ impl App {
             match self.router.current.clone() {
                 Route::Home | Route::Section(Section::Home) => self.home(ui),
                 Route::Section(Section::Games | Section::Launch) => self.games(ui),
+                Route::Section(Section::Saves) => self.saves_states(ui),
                 Route::Section(Section::Emulators) => self.emulator_setup(ui),
                 Route::Section(Section::Sources) => self.sources(ui),
                 Route::Section(Section::Dat) => self.dat_sources(ui),
@@ -195,6 +196,13 @@ impl App {
                 if ui.button("Cancel — keep browsing").clicked() { self.confirm_scan = false; }
             });
         }
+    }
+
+    fn saves_states(&mut self, ui: &mut egui::Ui) {
+        if self.saves_states.inventory.is_none() && !self.saves_states.loading {
+            self.start_saves_inventory();
+        }
+        super::saves_states::show(self, ui);
     }
 
     fn header(&mut self, ui: &mut egui::Ui) {
