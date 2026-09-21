@@ -92,6 +92,7 @@ mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
 mod rom_organise;
 mod romm_identity;
+mod saves;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -228,6 +229,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = cli.args.into_iter();
 
     match command.as_str() {
+        "saves" => saves::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
