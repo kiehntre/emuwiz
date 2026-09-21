@@ -1,8 +1,8 @@
 # GUI v2 Advanced Workflows Audit and Migration Plan
 
-Audit snapshot: 2026-09-20  
-Worktree: `/home/davedap/emuwiz-gui-v2`  
-Branch: `feature/gui-v2-shell`  
+Audit snapshot: 2026-09-20<br>
+Worktree: `/home/davedap/emuwiz-gui-v2`<br>
+Branch: `feature/gui-v2-shell`<br>
 Starting HEAD: `52af8de26da572f36fc57fcd3447d91fc33553dc`
 
 This is an audit and migration plan only. It does not delete legacy pages, change
@@ -309,4 +309,3 @@ not required by the no-code-change scope; known limitations are listed below.
 * `crates/archivefs-gui/src/app_pages.rs` — exact legacy page and overlay dispatch.
 * `docs/GUI_V2_FEATURE_MAP.md` — prior native/handoff/planned capability map.
 * `docs/RECALBOX_COMPETITIVE_AUDIT.md` — prior warning that BIOS-pack projects are not EmuWiz data sources.
-

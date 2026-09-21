@@ -560,6 +560,10 @@ pub mod mod_history;
 
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
+/// Provider-neutral, metadata-only discovery and user-acquisition handoff.
+/// This module never scrapes, downloads, extracts, or installs third-party
+/// content; those concerns remain with the existing local safety machinery.
+pub mod mod_provider;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 

@@ -1,8 +1,8 @@
 # SemaTor Atari ST enhanced-runner research
 
-Research date: 2026-09-20  
-Authoritative EmuWiz source: `/home/davedap/emuwiz-main-release-fix`  
-Research branch: `research/semator-atari-st`  
+Research date: 2026-09-20<br>
+Authoritative EmuWiz source: `/home/davedap/emuwiz-main-release-fix`<br>
+Research branch: `research/semator-atari-st`<br>
 Scope: research only; no production Rust, GUI, library media, or SemaTor files were changed.
 
 ## Executive conclusion

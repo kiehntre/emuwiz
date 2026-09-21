@@ -1,7 +1,7 @@
 # RetroBIOS provider feasibility research
 
-Date: 2026-09-20  
-Scope: research only; no BIOS/firmware blobs were downloaded or added to this checkout.  
+Date: 2026-09-20<br>
+Scope: research only; no BIOS/firmware blobs were downloaded or added to this checkout.<br>
 Authoritative EmuWiz source inspected: `/home/davedap/emuwiz-main-release-fix`.
 
 ## Executive conclusion
@@ -311,4 +311,3 @@ Suggested user-facing messages:
 Proceed only with a metadata/readiness integration, not a RetroBIOS blob downloader. Import or inspect RetroBIOS data as a versioned supplementary provider, preserve per-emulator/core provenance and verification mode, map names through explicit canonical mappings, and compare local files using the strongest available hash/size evidence. Keep official emulator/vendor requirements and current EmuWiz requirements authoritative. For acquisition, default proprietary/unclear files to `UserMustProvide`, `OfficialVendorSource`, `BrowserHandoff`, `UnknownLicense`, or `DoNotAutomate`; reserve `Redistributable` for separately proven files.
 
 This gives EmuWiz the valuable part of RetroBIOS—“what file is expected, how can I recognize it, and where can the user learn more?”—without turning EmuWiz into a generic BIOS piracy downloader.
-
