@@ -37,10 +37,12 @@ The SBOM branch is intentionally independent of
 integration path is:
 
 1. generate and verify `target/release-sbom/SBOM`;
-2. add a packager `--sbom-dir target/release-sbom/SBOM` input;
-3. validate that directory with `verify-sbom.sh` before copying it as `SBOM/`;
-4. include `SBOM/` in the release manifest and `SHA256SUMS` allow-list; and
-5. copy `SBOM/THIRD_PARTY_LICENSES.txt` to the release documentation location
+2. pass `--sbom-dir target/release-sbom/SBOM` to the packager (and
+   `--require-sbom` for a release that requires it);
+3. let the packager validate that directory with the existing verifier before
+   copying it as `SBOM/`;
+4. include `SBOM/` in the release manifest and top-level `SHA256SUMS`; and
+5. retain `SBOM/THIRD_PARTY_LICENSES.txt` byte-for-byte.
    only if a second copy is desired.
 
 Until that small integration change lands, generate the release payload and

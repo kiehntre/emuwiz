@@ -124,6 +124,19 @@ def git_identity(source_root: pathlib.Path) -> tuple[str, bool]:
     return head.stdout.strip(), not bool(status.stdout.strip())
 
 
+def tool_commit() -> str:
+    result = run(
+        ["git", "log", "-1", "--format=%H", "--", "scripts/release/generate_sbom.py"],
+        repository_root(),
+    )
+    if result is not None and result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    fallback = run(["git", "rev-parse", "HEAD"], repository_root())
+    if fallback is None or fallback.returncode != 0 or not fallback.stdout.strip():
+        raise SbomError("SBOM generator provenance is unavailable")
+    return fallback.stdout.strip()
+
+
 def timestamp() -> tuple[int, str]:
     raw = os.environ.get("SOURCE_DATE_EPOCH")
     if raw is None:
@@ -448,6 +461,7 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
     packages_raw, lock_hash = load_lock(source_root)
     metadata, metadata_mode = workspace_metadata(source_root, args.metadata_file)
     source_sha, source_clean = git_identity(source_root)
+    generator_sha = tool_commit()
     epoch, generated_at = timestamp()
     version = project_version(source_root)
     graph, graph_errors = resolve_graph(packages_raw)
@@ -618,6 +632,7 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
                 "properties": [
                     {"name": "emuwiz:source_commit", "value": source_sha},
                     {"name": "emuwiz:cargo_lock_sha256", "value": lock_hash},
+                    {"name": "emuwiz:sbom_tool_sha", "value": generator_sha},
                     {"name": "emuwiz:metadata_mode", "value": metadata_mode},
                 ],
             },
@@ -631,6 +646,7 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
     licence_json = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "generator_version": GENERATOR_VERSION,
+        "sbom_tool_sha": generator_sha,
         "cargo_lock_sha256": lock_hash,
         "source_commit": source_sha,
         "third_party_inventory_sha256": inventory_hash,
@@ -640,6 +656,7 @@ def generate(args: argparse.Namespace) -> pathlib.Path:
     summary = {
         "schema_version": BUNDLE_SCHEMA_VERSION,
         "generator": {"name": "emuwiz-sbom-generator", "version": GENERATOR_VERSION},
+        "sbom_tool_sha": generator_sha,
         "cyclonedx_spec_version": CYCLONEDX_SPEC_VERSION,
         "workspace_version": version,
         "source_commit": source_sha,
@@ -787,8 +804,11 @@ def verify(args: argparse.Namespace) -> pathlib.Path:
     if summary.get("cargo_lock_sha256") != lock_hash or licences.get("cargo_lock_sha256") != lock_hash:
         raise SbomError("Cargo.lock SHA-256 differs from the recorded inventory")
     source_sha, _ = git_identity(source_root)
+    generator_sha = tool_commit()
     if summary.get("source_commit") != source_sha or licences.get("source_commit") != source_sha:
         raise SbomError("source repository SHA differs from the recorded inventory")
+    if summary.get("sbom_tool_sha") != generator_sha or licences.get("sbom_tool_sha") != generator_sha:
+        raise SbomError("SBOM generator provenance differs from the current generator")
     metadata_properties = {
         item.get("name"): item.get("value")
         for item in sbom.get("metadata", {}).get("component", {}).get("properties", [])
@@ -797,6 +817,8 @@ def verify(args: argparse.Namespace) -> pathlib.Path:
         raise SbomError("CycloneDX source repository SHA differs from the current repository")
     if metadata_properties.get("emuwiz:cargo_lock_sha256") != lock_hash:
         raise SbomError("CycloneDX Cargo.lock identity differs from the current lockfile")
+    if metadata_properties.get("emuwiz:sbom_tool_sha") != generator_sha:
+        raise SbomError("CycloneDX SBOM generator provenance differs from the current generator")
     components = sbom.get("components")
     dependencies = sbom.get("dependencies")
     if not isinstance(components, list) or not isinstance(dependencies, list):
