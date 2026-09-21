@@ -1196,12 +1196,13 @@ impl App {
     }
 
     fn emulator_setup(&mut self, ui: &mut egui::Ui) {
+        let environment = self.environment.clone();
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
         egui::ScrollArea::vertical()
             .id_salt("v2_native_emulator_setup")
-            .show(ui, |ui| workflows.show_setup(ui));
+            .show(ui, |ui| workflows.show_setup(ui, environment.as_ref()));
     }
 
     fn sources(&mut self, ui: &mut egui::Ui) {

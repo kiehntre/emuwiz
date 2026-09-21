@@ -7,14 +7,25 @@
 use std::{env, fs, path::PathBuf};
 
 use crate::gui_v2::library::Library;
+use archivefs_core::emulator_lifecycle::{
+    EmulatorLifecycleProjection, SUPPORTED_EMULATOR_IDS, inspect_discovered_emulator_lifecycles,
+    inspect_emulator_lifecycle,
+};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct EmulatorSummary {
-    pub label: String,
-    pub installations: usize,
-    pub paths: Vec<PathBuf>,
-    pub installation_types: Vec<String>,
-}
+const LIFECYCLE_DISPLAY_IDS: &[&str] = &[
+    "RetroArch",
+    "PCSX2",
+    "DuckStation",
+    "RPCS3",
+    "PPSSPP",
+    "Dolphin",
+    "Flycast",
+    "xemu",
+    "MAME",
+    "FBNeo",
+    "Hatari",
+    "FS-UAE",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct EnvironmentSnapshot {
@@ -32,7 +43,7 @@ pub(super) struct EnvironmentSnapshot {
     pub source_error: Option<String>,
     pub identification_data_count: usize,
     pub identification_data_ready: bool,
-    pub emulator_summaries: Vec<EmulatorSummary>,
+    pub lifecycle: Vec<EmulatorLifecycleProjection>,
     pub legacy_config_present: bool,
     pub legacy_data_present: bool,
     pub both_roots_conflict: bool,
@@ -51,9 +62,9 @@ impl EnvironmentSnapshot {
     }
 
     pub fn installed_emulator_count(&self) -> usize {
-        self.emulator_summaries
+        self.lifecycle
             .iter()
-            .map(|summary| summary.installations)
+            .map(|projection| projection.installations.len())
             .sum()
     }
 
@@ -93,7 +104,7 @@ impl Default for EnvironmentSnapshot {
             source_error: None,
             identification_data_count: 0,
             identification_data_ready: false,
-            emulator_summaries: Vec::new(),
+            lifecycle: Vec::new(),
             legacy_config_present: false,
             legacy_data_present: false,
             both_roots_conflict: false,
@@ -146,7 +157,7 @@ pub(super) fn gather() -> EnvironmentSnapshot {
     let identification_data_count = local_dat_count() + managed_dat_count();
     let identification_data_ready = identification_data_count > 0;
 
-    let emulator_summaries = emulator_summaries();
+    let lifecycle = lifecycle_projections();
     let (database_schema, database_error) = if database_present {
         let report = data_path.as_deref().map(archivefs_core::diagnose_database);
         let schema = report.as_ref().and_then(|report| report.schema_version);
@@ -177,7 +188,7 @@ pub(super) fn gather() -> EnvironmentSnapshot {
         source_error,
         identification_data_count,
         identification_data_ready,
-        emulator_summaries,
+        lifecycle,
         legacy_config_present,
         legacy_data_present,
         both_roots_conflict,
@@ -217,37 +228,25 @@ fn managed_dat_count() -> usize {
         .unwrap_or_default()
 }
 
-fn emulator_summaries() -> Vec<EmulatorSummary> {
-    let inventory = archivefs_core::emulator_inventory::discover_installed_emulators();
-    [
-        archivefs_core::emulator_inventory::InventoryEmulator::Dolphin,
-        archivefs_core::emulator_inventory::InventoryEmulator::Rpcs3,
-        archivefs_core::emulator_inventory::InventoryEmulator::Pcsx2,
-        archivefs_core::emulator_inventory::InventoryEmulator::Ppsspp,
-        archivefs_core::emulator_inventory::InventoryEmulator::DuckStation,
-        archivefs_core::emulator_inventory::InventoryEmulator::Xemu,
-    ]
-    .into_iter()
-    .map(|emulator| {
-        let installations = inventory
-            .installations
+fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
+    let mut projections = inspect_discovered_emulator_lifecycles()
+        .into_iter()
+        .filter(|projection| LIFECYCLE_DISPLAY_IDS.contains(&projection.emulator_id.as_str()))
+        .collect::<Vec<_>>();
+    for emulator_id in LIFECYCLE_DISPLAY_IDS {
+        if !projections
             .iter()
-            .filter(|installation| installation.emulator == emulator)
-            .collect::<Vec<_>>();
-        EmulatorSummary {
-            label: emulator.label().to_string(),
-            installations: installations.len(),
-            paths: installations
-                .iter()
-                .map(|installation| installation.executable_path.clone())
-                .collect(),
-            installation_types: installations
-                .iter()
-                .map(|installation| format!("{:?}", installation.installation_type))
-                .collect(),
+            .any(|projection| projection.emulator_id == *emulator_id)
+            && SUPPORTED_EMULATOR_IDS.contains(emulator_id)
+        {
+            projections.push(inspect_emulator_lifecycle(
+                &archivefs_core::emulator_lifecycle::LifecycleContext::default(),
+                emulator_id,
+            ));
         }
-    })
-    .collect()
+    }
+    projections.sort_by(|left, right| left.emulator_id.cmp(&right.emulator_id));
+    projections
 }
 
 fn legacy_roots() -> (bool, bool, bool) {

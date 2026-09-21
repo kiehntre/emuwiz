@@ -4,7 +4,7 @@
 //! discovery, launch planning and process execution. This bridge only gives
 //! those existing workflows v2 navigation and Activity integration.
 
-use super::{activity::Activity, routes::Route};
+use super::{activity::Activity, environment::EnvironmentSnapshot, routes::Route};
 use crate::{
     ArchiveFsApp, DolphinLocalProfilesState, FlycastProfilesState, LoadState,
     Pcsx2FirmwareEvidenceState, Pcsx2LaunchProfilesState, RetroArchProfilesState, app_polling,
@@ -241,7 +241,14 @@ impl NativeWorkflows {
         open_setup
     }
 
-    pub(super) fn show_setup(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn show_setup(
+        &mut self,
+        ui: &mut egui::Ui,
+        environment: Option<&EnvironmentSnapshot>,
+    ) {
+        if let Some(environment) = environment {
+            lifecycle_setup_panel(ui, &environment.lifecycle, &mut self.app);
+        }
         let context = ui.ctx().clone();
         self.app
             .navigate_to_main_view(crate::navigation::MainView::EmulatorSetup);
@@ -1125,6 +1132,210 @@ impl NativeWorkflows {
     pub(super) fn selected_path(&self) -> Option<&Path> {
         self.selected.as_deref()
     }
+}
+
+fn lifecycle_setup_panel(
+    ui: &mut egui::Ui,
+    projections: &[archivefs_core::emulator_lifecycle::EmulatorLifecycleProjection],
+    app: &mut ArchiveFsApp,
+) {
+    ui.heading("Emulator lifecycle health");
+    ui.label("This read-only view explains which installation is selected and who can update it. EmuWiz never runs package-manager updates here.");
+    for projection in projections {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&projection.emulator_id);
+                ui.label(lifecycle_state_label(projection.state));
+            });
+            if projection.stale_selected {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 120, 100),
+                    "Your selected installation can no longer be found.",
+                );
+            }
+            if projection.installations.is_empty() {
+                ui.label("Not installed");
+            }
+            for installation in &projection.installations {
+                ui.group(|ui| {
+                    let marker = if installation.selected {
+                        " · Currently selected"
+                    } else {
+                        ""
+                    };
+                    ui.label(format!(
+                        "{}{}",
+                        installation_type_label(installation.installation_type),
+                        marker
+                    ));
+                    ui.label(format!(
+                        "Version: {} · Updates: {}",
+                        installation.version.version.as_deref().unwrap_or("unknown"),
+                        update_authority_label(installation.update_authority)
+                    ));
+                    ui.label(format!(
+                        "Health: {} · Launch: {}",
+                        local_health_label(installation.local_health),
+                        installation
+                            .launch_readiness
+                            .map(launch_readiness_label)
+                            .unwrap_or("Not checked")
+                    ));
+                    ui.label(format!(
+                        "Update status: {}",
+                        installation
+                            .update_status
+                            .map(update_status_label)
+                            .unwrap_or("Latest version unknown")
+                    ));
+                    if !installation.selected
+                        && let Some(path) = lifecycle_executable_path(&installation.exact_binding)
+                        && let Some(emulator) = overridable_emulator(&projection.emulator_id)
+                        && ui.button("Use this installation").clicked()
+                    {
+                        app.emulator_readiness
+                            .emulator_setup_overrides
+                            .set_executable(emulator, Some(path.to_path_buf()));
+                        ui.label("Selection saved through the existing emulator setup backend. Refresh to inspect it again.");
+                    }
+                    ui.collapsing("Advanced details", |ui| {
+                        ui.label(format!("Ownership: {}", ownership_label(installation.ownership_category)));
+                        ui.label(format!("Channel: {:?} · Version source: {:?}", installation.channel, installation.version.source));
+                        match &installation.exact_binding {
+                            archivefs_core::emulator_lifecycle::ExactBinding::FlatpakApp { app_id } => {
+                                ui.label(format!("Flatpak app ID: {app_id}"));
+                                ui.label("Update using Flatpak; EmuWiz does not run that update.");
+                            }
+                            archivefs_core::emulator_lifecycle::ExactBinding::ManagedInstall { manifest_path, executable_path } => {
+                                ui.label(format!("Manifest: {}", manifest_path.display()));
+                                ui.label(format!("Executable: {}", executable_path.display()));
+                            }
+                            _ => {
+                                if let Some(path) = lifecycle_executable_path(&installation.exact_binding) {
+                                    ui.label(format!("Executable: {}", path.display()));
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+        });
+    }
+    ui.separator();
+}
+
+fn lifecycle_state_label(state: archivefs_core::emulator_lifecycle::LifecycleState) -> &'static str {
+    use archivefs_core::emulator_lifecycle::LifecycleState::*;
+    match state {
+        InstalledCurrent => "Installed",
+        InstalledUpdateAvailable => "Update available",
+        InstalledUnknownVersion => "Installed · version unknown",
+        InstalledUnsupportedVersion => "Installed · unsupported version",
+        Missing => "Not installed",
+        Broken => "Needs attention",
+        MultipleInstallations => "Multiple installations found",
+        ManagedExternally => "Managed by another installer",
+    }
+}
+
+fn installation_type_label(kind: archivefs_core::emulator_inventory::InstallationType) -> &'static str {
+    use archivefs_core::emulator_inventory::InstallationType::*;
+    match kind {
+        Flatpak => "Flatpak",
+        SystemPackage => "System package",
+        AppImage => "AppImage",
+        Portable => "Portable installation",
+        Managed => "EmuWiz-managed installation",
+        Manual => "Installed manually",
+        Unknown => "Installation type unknown",
+    }
+}
+
+fn ownership_label(ownership: archivefs_core::emulator_lifecycle::OwnershipCategory) -> &'static str {
+    use archivefs_core::emulator_lifecycle::OwnershipCategory::*;
+    match ownership {
+        OfficialManaged => "Managed by EmuWiz",
+        OfficialBrowserHandoff => "Official download handoff",
+        FlatpakManaged => "Managed by Flatpak",
+        SystemPackageManaged => "Managed by your system",
+        PortableUserManaged => "Installed manually",
+        Unknown => "Installation source unknown",
+        DoNotAutomate => "Manual updates only",
+    }
+}
+
+fn update_authority_label(authority: archivefs_core::emulator_lifecycle::UpdateAuthority) -> &'static str {
+    use archivefs_core::emulator_lifecycle::UpdateAuthority::*;
+    match authority {
+        EmuWizManaged => "EmuWiz",
+        Flatpak => "Flatpak",
+        SystemPackageManager => "your system package manager",
+        OfficialBrowser => "official download page",
+        UserManaged => "manual updates",
+        None => "no automatic updater",
+        Unknown => "unknown",
+    }
+}
+
+fn local_health_label(health: archivefs_core::emulator_lifecycle::LocalHealth) -> &'static str {
+    use archivefs_core::emulator_lifecycle::LocalHealth::*;
+    match health {
+        Healthy => "Healthy",
+        MissingExecutable => "Selected executable missing",
+        ChangedExecutable => "Executable changed",
+        ManifestMismatch => "Managed manifest mismatch",
+        PermissionsProblem => "Permissions need attention",
+        UnknownVersion => "Version unknown",
+        StaleConfiguredPath => "Selected path is stale",
+        MultipleCandidates => "Multiple candidates",
+        BrokenProfile => "Profile needs attention",
+        Unknown => "Unknown",
+    }
+}
+
+fn launch_readiness_label(readiness: archivefs_core::launch::readiness::LaunchReadiness) -> &'static str {
+    use archivefs_core::launch::readiness::LaunchReadiness::*;
+    match readiness {
+        Ready => "Ready",
+        ReadyWithWarnings => "Ready with warnings",
+        Blocked => "Blocked",
+    }
+}
+
+fn update_status_label(status: archivefs_core::emulator_update::UpdateStatus) -> &'static str {
+    use archivefs_core::emulator_update::UpdateStatus::*;
+    match status {
+        UpToDate => "Up to date",
+        UpdateAvailable => "Update available",
+        InstalledNewer => "Installed version is newer",
+        VersionUnknown => "Version unknown",
+        LatestUnknown => "Latest version unknown",
+        ChannelMismatch => "Channel mismatch",
+        ComparisonUnsupported => "Cannot compare versions",
+        Offline => "Offline",
+    }
+}
+
+fn lifecycle_executable_path(
+    binding: &archivefs_core::emulator_lifecycle::ExactBinding,
+) -> Option<&std::path::Path> {
+    match binding {
+        archivefs_core::emulator_lifecycle::ExactBinding::NativeExecutable { path }
+        | archivefs_core::emulator_lifecycle::ExactBinding::PortableExecutable { path }
+        | archivefs_core::emulator_lifecycle::ExactBinding::UnknownExternal { path } => {
+            Some(path)
+        }
+        archivefs_core::emulator_lifecycle::ExactBinding::ManagedInstall {
+            executable_path, ..
+        } => Some(executable_path),
+        archivefs_core::emulator_lifecycle::ExactBinding::FlatpakApp { .. } => None,
+    }
+}
+
+fn overridable_emulator(
+    emulator_id: &str,
+) -> Option<crate::emulator_setup_overrides::OverridableEmulator> {
+    crate::emulator_setup_overrides::OverridableEmulator::from_adapter_id(&emulator_id.to_ascii_lowercase())
 }
 
 pub(super) fn observe_dat_activity_state(
