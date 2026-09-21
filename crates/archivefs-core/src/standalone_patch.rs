@@ -6,14 +6,17 @@
 //! untrusted output-size fields.
 
 use std::fs;
-use std::process::Command;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dat::archive::external_process::{ProcessError, ProcessLimits, run_supervised};
+use crate::patch_output_recovery::{
+    PatchOutputIntent, PatchOutputRecoveryError, PreparedPatchOutput, publish_durable_patch_output,
+};
 
 pub const MAX_PATCH_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_METADATA_BYTES: usize = 1024 * 1024;
@@ -387,8 +390,7 @@ pub fn build_standalone_patch_apply_plan_with_header(
             )
         })?,
     };
-    if inspection.source_size.is_some()
-        && inspection.source_size != Some(patch_input.len() as u64)
+    if inspection.source_size.is_some() && inspection.source_size != Some(patch_input.len() as u64)
         || inspection
             .source_crc32
             .is_some_and(|expected| crc32(patch_input) != expected)
@@ -449,64 +451,14 @@ pub fn apply_standalone_patch(
         .output_path
         .parent()
         .ok_or_else(|| StandalonePatchError::UnsafeOutput("output has no parent".into()))?;
-    let (output, application) = match inspection.format {
-        StandalonePatchFormat::Ips => (apply_ips(patch_input, &patch)?, "EmuWiz IPS applier"),
-        StandalonePatchFormat::Bps => (apply_bps(patch_input, &patch)?, "EmuWiz BPS applier"),
-        StandalonePatchFormat::Ups => (apply_ups(patch_input, &patch)?, "EmuWiz UPS applier"),
-        StandalonePatchFormat::Ppf => (apply_ppf3(patch_input, &patch)?, "EmuWiz PPF3 applier"),
-        StandalonePatchFormat::XdeltaVcdiff => (
-            apply_xdelta3(&plan.reviewed.base_path, &plan.reviewed.patch_path, parent, &patch)?,
-            "xdelta3 external applier",
-        ),
-        _ => {
-            return Err(StandalonePatchError::Unsupported(
-                "format is inspection-only".into(),
-            ));
-        }
-    };
-    if output.len() as u64 > MAX_APPLY_BYTES {
-        return Err(StandalonePatchError::TooLarge);
-    }
-    if inspection
-        .target_size
-        .is_some_and(|s| s != output.len() as u64)
-    {
-        return Err(StandalonePatchError::Malformed(
-            "output size differs from patch declaration".into(),
-        ));
-    }
-    if let Some(crc) = inspection.target_crc32
-        && crc32(&output) != crc
-    {
-        return Err(StandalonePatchError::Malformed(
-            "output CRC mismatch".into(),
-        ));
-    }
-    let output_hash = hex_digest(&output);
     if !parent.is_dir()
-        || plan.reviewed.output_path.exists()
+        || fs::symlink_metadata(&plan.reviewed.output_path).is_ok()
         || !is_safe_child(parent, &plan.reviewed.output_path)
     {
         return Err(StandalonePatchError::UnsafeOutput(
             "destination is unavailable or unsafe".into(),
         ));
     }
-    let provenance = DerivedPatchProvenance {
-        base_path: plan.reviewed.base_path.clone(),
-        base_sha256: base_hash,
-        patch_path: plan.reviewed.patch_path.clone(),
-        patch_sha256: plan.reviewed.patch_sha256.clone(),
-        format: inspection.format,
-        output_path: plan.reviewed.output_path.clone(),
-        output_sha256: output_hash.clone(),
-        expected_source_crc32: inspection.source_crc32,
-        expected_output_crc32: inspection.target_crc32,
-        header_adjustment: plan.reviewed.header_adjustment,
-        applied_at_unix_seconds: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_secs()),
-        application: application.into(),
-    };
     let provenance_path = plan.reviewed.output_path.with_file_name(format!(
         "{}.emuwiz-patch.json",
         plan.reviewed
@@ -515,66 +467,182 @@ pub fn apply_standalone_patch(
             .and_then(|name| name.to_str())
             .unwrap_or("patched-rom")
     ));
-    if provenance_path.exists() {
+    if fs::symlink_metadata(&provenance_path).is_ok() {
         return Err(StandalonePatchError::UnsafeOutput(
             "provenance destination already exists; overwrite is disabled".into(),
         ));
     }
-    let provenance_json = serde_json::to_vec_pretty(&provenance)
-        .map_err(|error| StandalonePatchError::Io(error.to_string()))?;
-    let stage = parent.join(format!(
-        ".emuwiz-derived-{}-{}",
-        std::process::id(),
-        patch.len()
-    ));
-    let provenance_stage = parent.join(format!(
-        ".emuwiz-derived-provenance-{}-{}",
-        std::process::id(),
-        patch.len()
-    ));
-    let result = (|| {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&stage)
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        file.write_all(&output)
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        let mut provenance_file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&provenance_stage)
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        provenance_file
-            .write_all(&provenance_json)
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        provenance_file
-            .sync_all()
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        fs::hard_link(&stage, &plan.reviewed.output_path)
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        fs::hard_link(&provenance_stage, &provenance_path)
-            .map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        fs::remove_file(&stage).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        fs::remove_file(&provenance_stage).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&stage);
-        let _ = fs::remove_file(&provenance_stage);
-        let _ = fs::remove_file(&plan.reviewed.output_path);
-        let _ = fs::remove_file(&provenance_path);
-        return Err(error);
-    }
+    let mut provenance_result = None;
+    let intent = PatchOutputIntent {
+        patch_format: inspection.format,
+        source_path: plan.reviewed.base_path.clone(),
+        source_size: base.len() as u64,
+        source_sha256: base_hash,
+        patch_path: plan.reviewed.patch_path.clone(),
+        patch_size: patch.len() as u64,
+        patch_sha256: plan.reviewed.patch_sha256.clone(),
+        destination_path: plan.reviewed.output_path.clone(),
+        expected_output_size: inspection.target_size,
+        provenance_path: provenance_path.clone(),
+    };
+    let durable = publish_durable_patch_output(
+        intent,
+        || {
+            let (output, application) = match inspection.format {
+                StandalonePatchFormat::Ips => (
+                    apply_ips(patch_input, &patch)
+                        .map_err(|error| PatchOutputRecoveryError::Failed(error.to_string()))?,
+                    "EmuWiz IPS applier",
+                ),
+                StandalonePatchFormat::Bps => (
+                    apply_bps(patch_input, &patch)
+                        .map_err(|error| PatchOutputRecoveryError::Failed(error.to_string()))?,
+                    "EmuWiz BPS applier",
+                ),
+                StandalonePatchFormat::Ups => (
+                    apply_ups(patch_input, &patch)
+                        .map_err(|error| PatchOutputRecoveryError::Failed(error.to_string()))?,
+                    "EmuWiz UPS applier",
+                ),
+                StandalonePatchFormat::Ppf => (
+                    apply_ppf3(patch_input, &patch)
+                        .map_err(|error| PatchOutputRecoveryError::Failed(error.to_string()))?,
+                    "EmuWiz PPF3 applier",
+                ),
+                StandalonePatchFormat::XdeltaVcdiff => (
+                    apply_xdelta3(
+                        &plan.reviewed.base_path,
+                        &plan.reviewed.patch_path,
+                        parent,
+                        &patch,
+                    )
+                    .map_err(|error| PatchOutputRecoveryError::Failed(error.to_string()))?,
+                    "xdelta3 external applier",
+                ),
+                _ => {
+                    return Err(PatchOutputRecoveryError::Failed(
+                        "format is inspection-only".into(),
+                    ));
+                }
+            };
+            if output.len() as u64 > MAX_APPLY_BYTES {
+                return Err(PatchOutputRecoveryError::Failed(
+                    "output exceeds the bounded apply limit".into(),
+                ));
+            }
+            if inspection
+                .target_size
+                .is_some_and(|size| size != output.len() as u64)
+            {
+                return Err(PatchOutputRecoveryError::Failed(
+                    "output size differs from patch declaration".into(),
+                ));
+            }
+            if inspection
+                .target_crc32
+                .is_some_and(|crc| crc32(&output) != crc)
+            {
+                return Err(PatchOutputRecoveryError::Failed(
+                    "output CRC mismatch".into(),
+                ));
+            }
+            Ok(PreparedPatchOutput {
+                bytes: output,
+                application: application.into(),
+            })
+        },
+        |prepared| {
+            let output_hash = hex_digest(&prepared.bytes);
+            let provenance = DerivedPatchProvenance {
+                base_path: plan.reviewed.base_path.clone(),
+                base_sha256: current_source_hash(
+                    &plan.reviewed.base_path,
+                    plan.reviewed.base_sha256.as_deref().ok_or_else(|| {
+                        PatchOutputRecoveryError::Failed("review plan has no source hash".into())
+                    })?,
+                )?,
+                patch_path: plan.reviewed.patch_path.clone(),
+                patch_sha256: plan.reviewed.patch_sha256.clone(),
+                format: inspection.format,
+                output_path: plan.reviewed.output_path.clone(),
+                output_sha256: output_hash.clone(),
+                expected_source_crc32: inspection.source_crc32,
+                expected_output_crc32: inspection.target_crc32,
+                header_adjustment: plan.reviewed.header_adjustment,
+                applied_at_unix_seconds: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+                application: prepared.application.clone(),
+            };
+            let provenance_json = serde_json::to_vec_pretty(&provenance)
+                .map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
+            let destination_identity = hex_digest(
+                plan.reviewed
+                    .output_path
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            let provenance_stage = provenance_path
+                .with_file_name(format!(
+                    ".emuwiz-patch-provenance-{}-{}-{}",
+                    std::process::id(),
+                    &destination_identity[..16],
+                    &output_hash[..16]
+                ));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&provenance_stage)
+                .map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
+            use std::io::Write;
+            file.write_all(&provenance_json)
+                .map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
+            file.sync_all()
+                .map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
+            fs::hard_link(&provenance_stage, &provenance_path)
+                .map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
+            fs::remove_file(&provenance_stage)
+                .map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
+            provenance_result = Some(provenance);
+            Ok(())
+        },
+    )
+    .map_err(map_patch_recovery_error)?;
     Ok(StandalonePatchApplyResult {
         output_path: plan.reviewed.output_path.clone(),
-        output_size: output.len() as u64,
-        output_sha256: output_hash.clone(),
-        provenance,
+        output_size: durable.output_size,
+        output_sha256: durable.output_sha256,
+        provenance: provenance_result.ok_or_else(|| {
+            StandalonePatchError::Io("durable provenance was not retained".into())
+        })?,
     })
+}
+
+fn current_source_hash(path: &Path, expected: &str) -> Result<String, PatchOutputRecoveryError> {
+    let bytes = fs::read(path).map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
+    let hash = hex_digest(&bytes);
+    if hash != expected {
+        return Err(PatchOutputRecoveryError::PreconditionsChanged(
+            "source changed before provenance publication".into(),
+        ));
+    }
+    Ok(hash)
+}
+
+fn map_patch_recovery_error(error: PatchOutputRecoveryError) -> StandalonePatchError {
+    match error {
+        PatchOutputRecoveryError::Interrupted(value) => StandalonePatchError::Io(format!(
+            "patch output interrupted; recovery journal retained ({value})"
+        )),
+        PatchOutputRecoveryError::Io(value) => StandalonePatchError::Io(value),
+        PatchOutputRecoveryError::InvalidJournal(value) => StandalonePatchError::Io(value),
+        PatchOutputRecoveryError::UnknownSchema(value) => {
+            StandalonePatchError::Io(format!("unsupported patch-output journal schema: {value}"))
+        }
+        PatchOutputRecoveryError::PreconditionsChanged(value)
+        | PatchOutputRecoveryError::Unsafe(value)
+        | PatchOutputRecoveryError::Failed(value) => StandalonePatchError::UnsafeOutput(value),
+    }
 }
 
 fn apply_ips(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
@@ -653,8 +721,8 @@ fn apply_ips(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
 }
 
 fn apply_ppf3(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
-    let (image_size, records_start, undo) = parse_ppf3_header(patch)
-        .map_err(StandalonePatchError::Malformed)?;
+    let (image_size, records_start, undo) =
+        parse_ppf3_header(patch).map_err(StandalonePatchError::Malformed)?;
     if image_size != base.len() as u64 {
         return Err(StandalonePatchError::Malformed(
             "PPF3 source image size differs from the selected base".into(),
@@ -666,7 +734,9 @@ fn apply_ppf3(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError
     while cursor < patch.len() {
         records += 1;
         if records > MAX_RECORDS {
-            return Err(StandalonePatchError::Malformed("too many PPF3 records".into()));
+            return Err(StandalonePatchError::Malformed(
+                "too many PPF3 records".into(),
+            ));
         }
         let offset = u64::from_le_bytes(
             patch
@@ -696,11 +766,13 @@ fn apply_ppf3(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError
         output[destination..destination + length].copy_from_slice(&patch[cursor..end]);
         cursor = end;
         if undo {
-            cursor = cursor
-                .checked_add(length)
-                .ok_or_else(|| StandalonePatchError::Malformed("PPF3 undo length overflow".into()))?;
+            cursor = cursor.checked_add(length).ok_or_else(|| {
+                StandalonePatchError::Malformed("PPF3 undo length overflow".into())
+            })?;
             if cursor > patch.len() {
-                return Err(StandalonePatchError::Malformed("truncated PPF3 undo data".into()));
+                return Err(StandalonePatchError::Malformed(
+                    "truncated PPF3 undo data".into(),
+                ));
             }
         }
     }
@@ -737,7 +809,11 @@ fn apply_xdelta3(
             "xdelta/VCDIFF application requires a safe xdelta3 executable".into(),
         )
     })?;
-    let stage = parent.join(format!(".emuwiz-xdelta-stage-{}-{}", std::process::id(), patch.len()));
+    let stage = parent.join(format!(
+        ".emuwiz-xdelta-stage-{}-{}",
+        std::process::id(),
+        patch.len()
+    ));
     if stage.exists() || !is_safe_child(parent, &stage) {
         return Err(StandalonePatchError::UnsafeOutput(
             "xdelta staging path is unavailable or unsafe".into(),
@@ -772,12 +848,14 @@ fn apply_xdelta3(
         let _ = fs::remove_file(&stage);
         return Err(StandalonePatchError::Malformed(format!(
             "xdelta3 exited with {}",
-            outcome.status.code().map_or_else(|| "no exit code".into(), |code| code.to_string())
+            outcome
+                .status
+                .code()
+                .map_or_else(|| "no exit code".into(), |code| code.to_string())
         )));
     }
-    let safe_stage = fs::symlink_metadata(&stage).is_ok_and(|metadata| {
-        metadata.is_file() && !metadata.file_type().is_symlink()
-    });
+    let safe_stage = fs::symlink_metadata(&stage)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
     let output = if safe_stage {
         fs::read(&stage).map_err(|error| StandalonePatchError::Io(error.to_string()))
     } else {
@@ -807,21 +885,33 @@ fn xdelta_process_error(error: ProcessError) -> StandalonePatchError {
         ProcessError::Io { detail } | ProcessError::Sink { detail } => {
             StandalonePatchError::Io(detail)
         }
-        ProcessError::CleanupFailure { detail } => StandalonePatchError::UnsafeOutput(format!(
-            "xdelta3 cleanup failed: {detail}"
-        )),
+        ProcessError::CleanupFailure { detail } => {
+            StandalonePatchError::UnsafeOutput(format!("xdelta3 cleanup failed: {detail}"))
+        }
     }
 }
 
 fn find_xdelta3() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).take(128).map(|dir| dir.join("xdelta3")).find(|candidate| {
-        fs::symlink_metadata(candidate).is_ok_and(|metadata| {
-            if !metadata.is_file() || metadata.file_type().is_symlink() { return false; }
-            #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; metadata.permissions().mode() & 0o111 != 0 }
-            #[cfg(not(unix))] { true }
+    std::env::split_paths(&path)
+        .take(128)
+        .map(|dir| dir.join("xdelta3"))
+        .find(|candidate| {
+            fs::symlink_metadata(candidate).is_ok_and(|metadata| {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return false;
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    true
+                }
+            })
         })
-    })
 }
 
 fn apply_bps(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
@@ -1038,7 +1128,9 @@ fn parse(b: &[u8]) -> (StandalonePatchFormat, PatchInspectionState, Fields) {
                     Fields {
                         source_size: Some(image_size),
                         target_size: Some(image_size),
-                        warnings: vec!["PPF3 disc-image patch; source identity is size-only".into()],
+                        warnings: vec![
+                            "PPF3 disc-image patch; source identity is size-only".into(),
+                        ],
                         ..Default::default()
                     },
                 ),
@@ -1052,7 +1144,10 @@ fn parse(b: &[u8]) -> (StandalonePatchFormat, PatchInspectionState, Fields) {
             StandalonePatchFormat::Ppf,
             PatchInspectionState::Unsupported,
             Fields {
-                warnings: vec![format!("PPF{} is recognized but only PPF3 application is supported", b[3] as char)],
+                warnings: vec![format!(
+                    "PPF{} is recognized but only PPF3 application is supported",
+                    b[3] as char
+                )],
                 error: Some("PPF revision is inspection-only".into()),
                 ..Default::default()
             },
@@ -1070,23 +1165,30 @@ fn parse(b: &[u8]) -> (StandalonePatchFormat, PatchInspectionState, Fields) {
 
 fn parse_vcdiff_header(b: &[u8]) -> (PatchInspectionState, Fields) {
     if b.len() < 5 {
-        return invalid(StandalonePatchFormat::XdeltaVcdiff, "truncated VCDIFF header");
+        return invalid(
+            StandalonePatchFormat::XdeltaVcdiff,
+            "truncated VCDIFF header",
+        );
     }
     if b[3] != 0 {
-        return invalid(StandalonePatchFormat::XdeltaVcdiff, "unsupported VCDIFF version");
+        return invalid(
+            StandalonePatchFormat::XdeltaVcdiff,
+            "unsupported VCDIFF version",
+        );
     }
     // The standard header indicator reserves all but these three feature bits.
     // We do not interpret custom code tables or compressors here; xdelta3 will
     // do so during apply, but malformed headers must not look valid in preview.
     if b[4] & !0x07 != 0 {
-        return invalid(StandalonePatchFormat::XdeltaVcdiff, "invalid VCDIFF header indicator");
+        return invalid(
+            StandalonePatchFormat::XdeltaVcdiff,
+            "invalid VCDIFF header indicator",
+        );
     }
     (
         PatchInspectionState::Valid,
         Fields {
-            warnings: vec![
-                "VCDIFF structure recognized; source identity is not embedded".into(),
-            ],
+            warnings: vec!["VCDIFF structure recognized; source identity is not embedded".into()],
             ..Default::default()
         },
     )
@@ -1648,18 +1750,77 @@ mod tests {
         fs::write(&patch_path, &patch).unwrap();
         let inspection = inspect_standalone_patch(&patch_path).unwrap();
         assert_eq!(inspection.state, PatchInspectionState::Valid);
-        let plan = build_standalone_patch_apply_plan(
-            &inspection,
-            &base_path,
-            &output_path,
-            temp.path(),
-        )
-        .unwrap();
+        let plan =
+            build_standalone_patch_apply_plan(&inspection, &base_path, &output_path, temp.path())
+                .unwrap();
         let result = apply_standalone_patch(&plan).unwrap();
         assert_eq!(fs::read(&base_path).unwrap(), base);
         assert_eq!(fs::read(&output_path).unwrap(), [1, 9, 8, 4]);
         assert_eq!(result.provenance.application, "EmuWiz PPF3 applier");
         assert_eq!(result.output_sha256, hex_digest(&[1, 9, 8, 4]));
+    }
+
+    #[test]
+    fn durable_wrapper_publishes_ips_bps_and_ups_outputs() {
+        let formats = [
+            ("ips", b"PATCH\0\0\0\0\x01xEOF".to_vec(), vec![b'x']),
+            (
+                "bps",
+                {
+                    let mut patch = bps(1, 1, &{
+                        let mut body = var(1);
+                        body.push(b'x');
+                        body
+                    });
+                    let end = patch.len() - 12;
+                    patch[end..end + 4].copy_from_slice(&crc32(&[7]).to_le_bytes());
+                    patch[end + 4..end + 8].copy_from_slice(&crc32(b"x").to_le_bytes());
+                    let patch_crc = crc32(&patch[..end + 8]);
+                    patch[end + 8..].copy_from_slice(&patch_crc.to_le_bytes());
+                    patch
+                },
+                vec![b'x'],
+            ),
+            (
+                "ups",
+                {
+                    let mut patch = b"UPS1".to_vec();
+                    patch.extend(var(1));
+                    patch.extend(var(1));
+                    patch.extend(crc32(&[7]).to_le_bytes());
+                    patch.extend(crc32(&[7]).to_le_bytes());
+                    let patch_crc = crc32(&patch);
+                    patch.extend(patch_crc.to_le_bytes());
+                    patch
+                },
+                vec![7],
+            ),
+        ];
+        for (label, patch_bytes, expected) in formats {
+            let temp = tempfile::tempdir().unwrap();
+            let base_path = temp.path().join("base.bin");
+            let patch_path = temp.path().join(format!("patch.{label}"));
+            let output_path = temp.path().join(format!("output-{label}.bin"));
+            fs::write(&base_path, [7]).unwrap();
+            fs::write(&patch_path, patch_bytes).unwrap();
+            let inspection = inspect_standalone_patch(&patch_path).unwrap();
+            let plan = build_standalone_patch_apply_plan(
+                &inspection,
+                &base_path,
+                &output_path,
+                temp.path(),
+            )
+            .unwrap();
+            apply_standalone_patch(&plan).unwrap();
+            assert_eq!(fs::read(&output_path).unwrap(), expected, "{label}");
+            assert_eq!(fs::read(&base_path).unwrap(), [7], "{label} mutated source");
+            let journals =
+                crate::patch_output_recovery::discover_pending_patch_outputs(temp.path());
+            assert!(
+                journals.0.is_empty(),
+                "{label} left pending output recovery"
+            );
+        }
     }
 
     #[test]
@@ -1677,7 +1838,10 @@ mod tests {
             limit: XDELTA_STDOUT_LIMIT,
         }) {
             StandalonePatchError::Malformed(reason) => {
-                assert!(reason.contains(&XDELTA_STDOUT_LIMIT.to_string()), "{reason}");
+                assert!(
+                    reason.contains(&XDELTA_STDOUT_LIMIT.to_string()),
+                    "{reason}"
+                );
             }
             other => panic!("output flooding must be malformed, got {other:?}"),
         }
@@ -1806,13 +1970,9 @@ mod tests {
         let inspection = inspect_standalone_patch(&patch_path).unwrap();
         assert_eq!(inspection.format, StandalonePatchFormat::XdeltaVcdiff);
         assert_eq!(inspection.state, PatchInspectionState::Valid);
-        let plan = build_standalone_patch_apply_plan(
-            &inspection,
-            &base_path,
-            &output_path,
-            temp.path(),
-        )
-        .unwrap();
+        let plan =
+            build_standalone_patch_apply_plan(&inspection, &base_path, &output_path, temp.path())
+                .unwrap();
         let source_sha = hex_digest(&base);
         let result = apply_standalone_patch(&plan).unwrap();
 
@@ -1822,17 +1982,15 @@ mod tests {
         assert_eq!(fs::read(&output_path).unwrap(), target);
         assert_eq!(fs::read(&base_path).unwrap(), base);
         assert!(!temp.path().join(".emuwiz-xdelta-stage").exists());
-        assert!(!fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .any(|name| name.to_string_lossy().starts_with(".emuwiz-xdelta-stage-")));
-
-        let collision = build_standalone_patch_apply_plan(
-            &inspection,
-            &base_path,
-            &output_path,
-            temp.path(),
+        assert!(
+            !fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .any(|name| name.to_string_lossy().starts_with(".emuwiz-xdelta-stage-"))
         );
+
+        let collision =
+            build_standalone_patch_apply_plan(&inspection, &base_path, &output_path, temp.path());
         assert!(matches!(
             collision,
             Err(StandalonePatchError::UnsafeOutput(reason)) if reason.contains("already exists")
@@ -1851,10 +2009,12 @@ mod tests {
         .unwrap();
         assert!(apply_standalone_patch(&malformed_plan).is_err());
         assert!(!malformed_output_path.exists());
-        assert!(!fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .any(|name| name.to_string_lossy().starts_with(".emuwiz-xdelta-stage-")));
+        assert!(
+            !fs::read_dir(temp.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .any(|name| name.to_string_lossy().starts_with(".emuwiz-xdelta-stage-"))
+        );
         assert_eq!(fs::read(&base_path).unwrap(), base);
     }
 
