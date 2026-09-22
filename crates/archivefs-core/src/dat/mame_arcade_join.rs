@@ -16,6 +16,10 @@ use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
 use crate::dat::parsers::mame_listxml::parse_mame_listxml;
 use crate::dat::set::{SetIdentity, SetResolution, SetState};
+use crate::game_identity::{
+    GameIdentityReport, IdentityConfidence, IdentityEvidence, IdentityImageFormat, IdentityKind,
+    IdentityPlatform, IdentityProvenance, IdentityStatus,
+};
 use crate::ingestion::arcade::{ArcadeSetDirectory, discover_extracted_sets};
 
 pub const MAME_0174_SHA256: &str =
@@ -214,6 +218,80 @@ pub fn launch_resolution_for_join(
             },
             requirements: Vec::new(),
         },
+    })
+}
+
+/// Converts an authoritative MAME join into the catalogue's trusted identity
+/// shape. The logical set is the sole identity target: member paths are
+/// deliberately absent from the identity provenance and cannot become game
+/// keys. The set shortname only becomes verified after the checksum-pinned
+/// DAT supplied a real machine entry with a non-empty member manifest.
+pub fn identity_report_for_join(
+    evidence: &ArcadeJoinEvidence,
+    archive_path: &Path,
+) -> Option<GameIdentityReport> {
+    if !evidence.launchable_normal_game
+        || evidence.dat_version != MAME_0174_VERSION
+        || evidence.dat_sha256 != MAME_0174_SHA256
+        || matches!(
+            evidence.class,
+            ArcadeJoinClass::NotFound
+                | ArcadeJoinClass::Ambiguous
+                | ArcadeJoinClass::BiosSet
+                | ArcadeJoinClass::DeviceSet
+        )
+        || evidence.expected_member_count == 0
+        || evidence.members.is_empty()
+    {
+        return None;
+    }
+    let machine = evidence.dat_set_name.as_deref()?;
+    if machine != evidence.logical_set_name {
+        return None;
+    }
+    let provenance = IdentityProvenance {
+        archive_path: archive_path.to_path_buf(),
+        member_path: None,
+        member_index: None,
+        method: format!(
+            "checksum-pinned MAME {} DAT logical-set join ({})",
+            evidence.dat_version, evidence.dat_sha256
+        ),
+    };
+    Some(GameIdentityReport {
+        archive_path: archive_path.to_path_buf(),
+        platform: IdentityPlatform::Arcade,
+        // This report describes a logical set rather than one byte-image
+        // container. The explicit Arcade platform and MAME identity kind
+        // carry the trust; no raw member format is manufactured here.
+        format: IdentityImageFormat::Unsupported,
+        evidence: vec![
+            IdentityEvidence {
+                kind: IdentityKind::Platform,
+                status: IdentityStatus::Verified,
+                value: Some("Arcade".into()),
+                confidence: IdentityConfidence::CatalogueContext,
+                provenance: provenance.clone(),
+                diagnostic:
+                    "logical Arcade set attached to an exact machine in the verified MAME DAT"
+                        .into(),
+            },
+            IdentityEvidence {
+                kind: IdentityKind::MameMachineName,
+                status: IdentityStatus::Verified,
+                value: Some(machine.to_string()),
+                confidence: IdentityConfidence::StructuredMetadata,
+                provenance,
+                diagnostic: "exact MAME machine shortname from the verified logical-set join"
+                    .into(),
+            },
+        ],
+        warnings: Vec::new(),
+        bytes_read: 0,
+        archive_members_inspected: evidence.members.len(),
+        metadata_paths_inspected: 1,
+        nested_container_depth: 0,
+        complete: true,
     })
 }
 
