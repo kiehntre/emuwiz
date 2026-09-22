@@ -718,6 +718,68 @@ impl Database {
         .collect()
     }
 
+    /// Loads the one current, SHA-bound MAME join attached to an exact
+    /// logical Arcade catalogue path. This is the launch/readiness lookup:
+    /// the path must already be an `arcade_set_directory` archive linked by
+    /// the persisted audit row, so a directory basename or raw member can
+    /// never manufacture MAME identity.
+    pub fn mame_arcade_join_for_archive_path(
+        &self,
+        dat_sha256: &str,
+        archive_path: &Path,
+    ) -> Result<Option<crate::dat::mame_arcade_join::ArcadeJoinEvidence>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT audit.game_name, expected.metadata_json
+                 FROM dat_set_audit_results AS audit
+                 JOIN dat_expected_entries AS expected
+                   ON expected.dat_source_id = audit.source_id
+                  AND expected.canonical_identity = audit.game_name
+                 JOIN archives AS archive
+                   ON archive.id = audit.archive_id
+                  AND archive.absolute_path_cached = audit.archive_path
+                  AND archive.archive_kind = 'arcade_set_directory'
+                 WHERE audit.archive_path = ?1
+                   AND audit.dat_revision = ?2
+                   AND audit.stale = 0
+                 ORDER BY audit.source_id, audit.game_name
+                 LIMIT 2",
+            )
+            .map_err(|error| db_error("failed to prepare exact MAME Arcade join query", error))?;
+        let rows = statement
+            .query_map(
+                params![archive_path.as_os_str().as_bytes(), dat_sha256],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+            )
+            .map_err(|error| db_error("failed to query exact MAME Arcade join", error))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| db_error("failed to read exact MAME Arcade join", error))?;
+        if rows.len() > 1 {
+            return Err(ArchiveFsError::Database(format!(
+                "more than one current MAME Arcade identity is attached to {}",
+                archive_path.display()
+            )));
+        }
+        let Some((game_name, Some(encoded))) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let evidence =
+            serde_json::from_slice::<crate::dat::mame_arcade_join::ArcadeJoinEvidence>(&encoded)
+                .map_err(|error| {
+                    ArchiveFsError::Database(format!(
+                        "stored MAME Arcade join evidence for {game_name} is malformed: {error}"
+                    ))
+                })?;
+        if evidence.logical_set_name != game_name {
+            return Err(ArchiveFsError::Database(format!(
+                "stored MAME Arcade identity key {game_name} does not match its logical set {}",
+                evidence.logical_set_name
+            )));
+        }
+        Ok(Some(evidence))
+    }
+
     fn begin_catalogue_refresh(&mut self) -> Result<()> {
         self.connection
             .execute_batch("BEGIN IMMEDIATE")
@@ -15521,6 +15583,19 @@ mod tests {
             .find(|evidence| evidence.logical_set_name == "blackbdb")
             .unwrap();
         assert_eq!(persisted_clone.clone_of.as_deref(), Some("blackbd"));
+        let exact_clone = database
+            .mame_arcade_join_for_archive_path(MAME_0174_SHA256, &clone_path)
+            .unwrap()
+            .expect("the exact logical-set path must recover its trusted join");
+        assert_eq!(exact_clone.logical_set_name, "blackbdb");
+        assert_eq!(exact_clone.clone_of.as_deref(), Some("blackbd"));
+        assert!(
+            database
+                .mame_arcade_join_for_archive_path(MAME_0174_SHA256, &clone_path.join("ru_04b.img"))
+                .unwrap()
+                .is_none(),
+            "a raw member path must never recover logical-set identity"
+        );
 
         let archives = database.load_archives().unwrap();
         assert_eq!(archives.len(), 2);
