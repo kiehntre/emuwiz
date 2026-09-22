@@ -414,8 +414,9 @@ pub struct PersistedSetAuditDependency {
 impl Database {
     /// Keep transactions short enough that a large real-world Arcade source
     /// exposes progress promptly, while amortising SQLite commit overhead.
-    /// Each evidence row performs two upserts, so 256 sets means no more than 512
-    /// row writes in one transaction.
+    /// Each evidence row performs two upserts plus at most one logical-set
+    /// identity update, so 256 sets means no more than 768 row writes in one
+    /// transaction.
     pub const MAME_ARCADE_AUDIT_BATCH_SIZE: usize = 256;
 
     /// Replaces one complete, version-bound Arcade join in the existing DAT
@@ -513,6 +514,16 @@ impl Database {
                 } else {
                     archive_misses_or_ambiguities += 1;
                 }
+                let identity_report =
+                    crate::dat::mame_arcade_join::identity_report_for_join(evidence, &archive_path)
+                        .map(|report| serde_json::to_vec(&report))
+                        .transpose()
+                        .map_err(|error| {
+                            ArchiveFsError::Database(format!(
+                                "failed to encode MAME Arcade game identity for {} in batch {batch_start}..{batch_end}; {committed} rows already committed: {error}",
+                                evidence.logical_set_name
+                            ))
+                        })?;
                 tx.execute(
                     "INSERT INTO dat_expected_entries
                  (dat_source_id, canonical_identity, display_name, source_revision,
@@ -552,6 +563,8 @@ impl Database {
                   audited_at, stale, exhaustive)
                  VALUES (?1, ?2, ?3, ?4, 'arcade', ?5, ?6, '\"m_a_m_e_arcade\"', ?7, ?8, 0, 1)
                  ON CONFLICT(archive_path, source_id, game_name) DO UPDATE SET
+                  archive_id = excluded.archive_id,
+                  platform = excluded.platform,
                   set_state_json = excluded.set_state_json,
                   dependency_state_json = excluded.dependency_state_json,
                   ecosystem = excluded.ecosystem,
@@ -593,6 +606,25 @@ impl Database {
                         error,
                     )
                 })?;
+                if let Some(archive_id) = archive_id {
+                    tx.execute(
+                        "UPDATE archives SET identity_report_json = ?2,
+                          identity_report_size_bytes = CASE WHEN ?2 IS NULL THEN NULL ELSE size_bytes END,
+                          identity_report_modified_time_unix_seconds =
+                            CASE WHEN ?2 IS NULL THEN NULL ELSE modified_time_unix_seconds END
+                         WHERE id = ?1 AND archive_kind = 'arcade_set_directory'",
+                        params![archive_id, identity_report],
+                    )
+                    .map_err(|error| {
+                        db_error(
+                            &format!(
+                                "failed to attach MAME Arcade identity for {} in batch {batch_start}..{batch_end}; {committed} rows already committed",
+                                evidence.logical_set_name
+                            ),
+                            error,
+                        )
+                    })?;
+                }
             }
             if fail_before_commit_batch == Some(batch_index) {
                 return Err(ArchiveFsError::Database(format!(
@@ -609,7 +641,7 @@ impl Database {
             })?;
             committed += batch.len();
             log::info!(
-                "MAME Arcade audit committed batch {}..{} ({} sets, {} SQL rows prepared/written, {} sets total) in {:?}",
+                "MAME Arcade audit committed batch {}..{} ({} sets, {} audit/inventory rows plus logical-set identity updates, {} sets total) in {:?}",
                 batch_start,
                 batch_end,
                 batch.len(),
@@ -15358,6 +15390,196 @@ mod tests {
         assert_eq!(archives.len(), 1);
         assert_eq!(archives[0].archive_kind, "arcade_set_directory");
         assert_eq!(archives[0].relative_path, Path::new("pacman"));
+    }
+
+    #[test]
+    fn verified_mame_clone_join_persists_one_trusted_logical_set_identity_idempotently() {
+        use crate::dat::mame_arcade_join::{
+            ArcadeJoinClass, MAME_0174_SHA256, MAME_0174_VERSION, VerifiedMameDat,
+            join_extracted_arcade_root, launch_resolution_for_join,
+        };
+        use crate::dat::model::{
+            DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource,
+            ParsedDat,
+        };
+        use crate::launch::{CanonicalIdentityStatus, canonical_identity_from_game_report};
+
+        let root = temp_dir("mame-clone-identity-bridge");
+        let source = root.join("arcade");
+        let parent_path = source.join("blackbd");
+        let clone_path = source.join("blackbdb");
+        fs::create_dir_all(&parent_path).unwrap();
+        fs::create_dir_all(&clone_path).unwrap();
+        fs::write(parent_path.join("bios.002"), b"parent bios").unwrap();
+        fs::write(parent_path.join("parent.bin"), b"parent rom").unwrap();
+        for member in ["ru_04b.img", "u1_bbru44.bin", "u2_bbru44.bin"] {
+            fs::write(clone_path.join(member), member.as_bytes()).unwrap();
+        }
+
+        let mut parent = DatGameEntry {
+            name: "blackbd".into(),
+            description: Some("Black Beard parent".into()),
+            runnable: Some("yes".into()),
+            ..Default::default()
+        };
+        parent.roms = vec![
+            DatRomEntry {
+                name: "bios.002".into(),
+                crc32: Some("11111111".into()),
+                ..Default::default()
+            },
+            DatRomEntry {
+                name: "parent.bin".into(),
+                crc32: Some("22222222".into()),
+                ..Default::default()
+            },
+        ];
+        let mut clone = DatGameEntry {
+            name: "blackbdb".into(),
+            description: Some("Black Beard clone".into()),
+            clone_of: Some("blackbd".into()),
+            rom_of: Some("blackbd".into()),
+            runnable: Some("yes".into()),
+            ..Default::default()
+        };
+        clone.roms = vec![
+            DatRomEntry {
+                name: "bios.002".into(),
+                merge: Some("bios.002".into()),
+                crc32: Some("11111111".into()),
+                ..Default::default()
+            },
+            DatRomEntry {
+                name: "ru_04b.img".into(),
+                crc32: Some("33333333".into()),
+                ..Default::default()
+            },
+            DatRomEntry {
+                name: "u1_bbru44.bin".into(),
+                crc32: Some("44444444".into()),
+                ..Default::default()
+            },
+            DatRomEntry {
+                name: "u2_bbru44.bin".into(),
+                crc32: Some("55555555".into()),
+                ..Default::default()
+            },
+        ];
+        let dat = VerifiedMameDat {
+            parsed: ParsedDat {
+                source: DatSource {
+                    format: DatFormat::Logiqx,
+                    ecosystem: DatEcosystem::MAMEArcade,
+                    file_path: root.join("mame.dat").to_string_lossy().into_owned(),
+                    name: Some("MAME".into()),
+                    description: Some("MAME Arcade 0.174".into()),
+                    version: Some(MAME_0174_VERSION.into()),
+                    author: None,
+                    homepage: None,
+                    clrmamepro_header: None,
+                    entry_count: 2,
+                    rom_count: 6,
+                    parse_warnings: Vec::new(),
+                    packing_policy: DatPackingPolicy::Standard,
+                },
+                games: vec![parent, clone],
+            },
+            path: root.join("mame.dat"),
+            sha256: MAME_0174_SHA256.into(),
+            version: MAME_0174_VERSION.into(),
+        };
+
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        database
+            .register_source_folders(std::slice::from_ref(&source))
+            .unwrap();
+        database
+            .set_source_role(&source, SourceRole::ArcadeRomset)
+            .unwrap();
+        scan_and_persist(&mut database, &config, "mame-identity-test").unwrap();
+
+        let report = join_extracted_arcade_root(&dat, &source, "test-audit").unwrap();
+        let clone_evidence = report
+            .evidence
+            .iter()
+            .find(|evidence| evidence.logical_set_name == "blackbdb")
+            .unwrap();
+        assert_eq!(clone_evidence.class, ArcadeJoinClass::CloneSet);
+        assert_eq!(clone_evidence.clone_of.as_deref(), Some("blackbd"));
+        assert_eq!(clone_evidence.dat_set_name.as_deref(), Some("blackbdb"));
+        assert_eq!(clone_evidence.expected_member_count, 4);
+
+        assert_eq!(database.persist_mame_arcade_join(&report).unwrap(), 2);
+        assert_eq!(database.persist_mame_arcade_join(&report).unwrap(), 2);
+
+        let persisted = database.mame_arcade_join_for_dat(MAME_0174_SHA256).unwrap();
+        assert_eq!(persisted.len(), 2);
+        let persisted_clone = persisted
+            .iter()
+            .find(|evidence| evidence.logical_set_name == "blackbdb")
+            .unwrap();
+        assert_eq!(persisted_clone.clone_of.as_deref(), Some("blackbd"));
+
+        let archives = database.load_archives().unwrap();
+        assert_eq!(archives.len(), 2);
+        assert!(archives.iter().all(|archive| {
+            archive.archive_kind == "arcade_set_directory"
+                && archive.absolute_path != clone_path.join("ru_04b.img")
+        }));
+        let clone_archive = archives
+            .iter()
+            .find(|archive| archive.absolute_path == clone_path)
+            .unwrap();
+        let identity = clone_archive.identity_report.as_ref().unwrap();
+        let (status, _) = canonical_identity_from_game_report(identity);
+        assert_eq!(
+            status,
+            CanonicalIdentityStatus::Resolved(crate::launch::ResolvedIdentity {
+                platform_id: "Arcade".into(),
+                game_key: "blackbdb".into(),
+            })
+        );
+        assert!(identity.evidence.iter().all(|item| {
+            item.provenance.member_path.is_none()
+                && item.provenance.archive_path == clone_archive.absolute_path
+        }));
+        let resolution = launch_resolution_for_join(persisted_clone, &clone_path).unwrap();
+        assert_eq!(resolution.identity.game_name, "blackbdb");
+        assert_eq!(resolution.archive_path, clone_path);
+
+        let source_id = format!("mame-arcade:{MAME_0174_VERSION}:{MAME_0174_SHA256}");
+        let inventory_rows: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM dat_expected_entries WHERE dat_source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let audit_rows: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM dat_set_audit_results WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let identity_rows: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM archives WHERE identity_report_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inventory_rows, 2);
+        assert_eq!(audit_rows, 2);
+        assert_eq!(identity_rows, 2);
+
+        database.close().unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -240,6 +240,10 @@ pub enum IdentityKind {
     LooseRomCanonicalSha256,
     LooseRomFormat,
     LooseRomTitle,
+    /// Exact MAME machine shortname supplied by a checksum-pinned MAME DAT
+    /// join for one logical Arcade set. Never populated from a raw ROM
+    /// member or an unverified filename candidate.
+    MameMachineName,
     /// A verified original-Xbox title ID, read from a `default.xbe`-style
     /// executable's own certificate. Distinct from [`Self::XexTitleId`]
     /// (Xbox 360) - the two platforms are never conflated.
@@ -309,6 +313,7 @@ impl fmt::Display for IdentityKind {
             Self::LooseRomCanonicalSha256 => "Canonical byte-order-normalized ROM SHA-256",
             Self::LooseRomFormat => "Loose ROM format",
             Self::LooseRomTitle => "Normalized ROM title",
+            Self::MameMachineName => "MAME machine name",
             Self::XbeTitleId => "Xbox Title ID",
             Self::XexTitleId => "Xbox 360 Title ID",
             Self::XexMediaId => "Xbox 360 Media ID",
@@ -383,6 +388,7 @@ pub enum IdentityPlatform {
     AtariLynx,
     AtariJaguar,
     AtariST,
+    Arcade,
     Enterprise,
     Other,
 }
@@ -470,6 +476,7 @@ impl IdentityPlatform {
             }
             "atari st" | "atarist" | "atari ste" | "atariste" | "atari tt" | "atarittu"
             | "atari falcon" | "atarifalcon" => Self::AtariST,
+            "arcade" | "mame" | "mame arcade" => Self::Arcade,
             "enterprise" | "enterprise 64" | "enterprise64" | "ep64" | "enterprise 128"
             | "enterprise128" | "ep128" => Self::Enterprise,
             _ => Self::Other,
@@ -520,6 +527,7 @@ impl IdentityPlatform {
             Self::AtariLynx => "Atari Lynx",
             Self::AtariJaguar => "Atari Jaguar",
             Self::AtariST => "Atari ST",
+            Self::Arcade => "Arcade",
             Self::Enterprise => "Enterprise 64/128",
             Self::Other => "Unsupported platform",
         }
@@ -3613,6 +3621,7 @@ fn inspect_iso_source(
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::Arcade
         | IdentityPlatform::Enterprise
         | IdentityPlatform::Amiga
         | IdentityPlatform::WiiU
@@ -6523,6 +6532,7 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar => &[IdentityKind::LooseRomSha256],
         IdentityPlatform::AtariST => &[],
+        IdentityPlatform::Arcade => &[IdentityKind::MameMachineName],
         IdentityPlatform::Enterprise => &[],
         IdentityPlatform::GameCube | IdentityPlatform::Wii => {
             &[IdentityKind::DolphinGameId, IdentityKind::DolphinRevision]
@@ -6752,6 +6762,7 @@ fn add_filename_candidate(report: &mut GameIdentityReport) {
         | IdentityPlatform::AtariLynx
         | IdentityPlatform::AtariJaguar
         | IdentityPlatform::AtariST
+        | IdentityPlatform::Arcade
         | IdentityPlatform::Enterprise
         | IdentityPlatform::Amiga
         | IdentityPlatform::Other => {}
