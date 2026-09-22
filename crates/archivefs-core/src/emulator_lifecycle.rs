@@ -805,6 +805,15 @@ pub fn discover_package_ownership(executable: &Path) -> Option<PackageEvidence> 
 /// Bounded local inspection entry point. Remote update refresh is intentionally
 /// not part of this call, so offline use remains useful and fast.
 pub fn inspect_discovered_emulator_lifecycles() -> Vec<EmulatorLifecycleProjection> {
+    inspect_discovered_emulator_lifecycles_with_selections(BTreeMap::new())
+}
+
+/// Discovers lifecycle candidates and marks only the exact persisted bindings
+/// supplied by the caller as selected. An ambiguous emulator remains
+/// ambiguous until the caller provides one exact binding.
+pub fn inspect_discovered_emulator_lifecycles_with_selections(
+    selected_bindings: BTreeMap<EmulatorId, ExactBinding>,
+) -> Vec<EmulatorLifecycleProjection> {
     let inventory = crate::emulator_inventory::discover_installed_emulators();
     let package_evidence = inventory
         .installations
@@ -828,6 +837,7 @@ pub fn inspect_discovered_emulator_lifecycles() -> Vec<EmulatorLifecycleProjecti
         flatpak_installations,
         package_evidence,
         raw_version_output,
+        selected_bindings,
         ..Default::default()
     })
 }

@@ -3653,7 +3653,10 @@ pub fn scan_source_folder_at(
             ))
         })?;
 
-    scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)
+    let summary =
+        scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)?;
+    refresh_configured_mame_arcade_identity(&mut database, &[target.to_path_buf()]);
+    Ok(summary)
 }
 
 /// Scans every *enabled* configured source folder independently - a
@@ -3691,7 +3694,58 @@ pub fn scan_all_enabled_sources_at(
         .filter(|folder| enabled_paths.contains(&folder.path))
         .collect();
 
-    scan_and_persist_folders(&mut database, &enabled_folders, triggered_by)
+    let summary = scan_and_persist_folders(&mut database, &enabled_folders, triggered_by)?;
+    let paths = enabled_folders
+        .iter()
+        .map(|folder| folder.path.clone())
+        .collect::<Vec<_>>();
+    refresh_configured_mame_arcade_identity(&mut database, &paths);
+    Ok(summary)
+}
+
+/// Refreshes the existing persisted MAME Arcade join after a successful
+/// source scan. The DAT registry remains the authority: absent, invalid, or
+/// non-MAME sources are simply not launch-authorizing and never produce
+/// guessed identity. Raw members are only used by the bounded join to build
+/// one logical set record.
+fn refresh_configured_mame_arcade_identity(database: &mut Database, roots: &[PathBuf]) {
+    let Ok(config_path) = dat::sources::default_dat_sources_config_path() else {
+        return;
+    };
+    let Ok(config) = dat::sources::load_dat_sources_config_from(config_path) else {
+        return;
+    };
+    let Some(source) = config
+        .sources
+        .unwrap_or_default()
+        .into_iter()
+        .find(|source| source.id == "mame-0-174-arcade-xml" && source.enabled.unwrap_or(true))
+    else {
+        return;
+    };
+    let Ok(dat) = dat::mame_arcade_join::load_verified_mame_0174(Path::new(&source.path)) else {
+        return;
+    };
+    let audited_at = format!("{:?}", std::time::SystemTime::now());
+    for root in roots {
+        let arcade_root = if root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("arcade"))
+        {
+            root.clone()
+        } else {
+            root.join("arcade")
+        };
+        if !arcade_root.is_dir() {
+            continue;
+        }
+        let Ok(report) =
+            dat::mame_arcade_join::join_extracted_arcade_root(&dat, &arcade_root, &audited_at)
+        else {
+            continue;
+        };
+        let _ = database.persist_mame_arcade_join(&report);
+    }
 }
 
 /// Resolves a CLI-style `<id-or-path>` argument to a configured source

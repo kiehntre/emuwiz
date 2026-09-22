@@ -839,6 +839,7 @@ pub fn official_metadata_url(
         return None;
     }
     match emulator {
+        InventoryEmulator::Mame => None,
         InventoryEmulator::Dolphin => {
             Some("https://api.github.com/repos/dolphin-emu/dolphin/releases/latest")
         }

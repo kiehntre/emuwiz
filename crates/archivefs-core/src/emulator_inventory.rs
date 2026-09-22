@@ -24,6 +24,7 @@ pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Ord, PartialOrd)]
 pub enum InventoryEmulator {
+    Mame,
     Dolphin,
     Rpcs3,
     Pcsx2,
@@ -35,6 +36,7 @@ pub enum InventoryEmulator {
 impl InventoryEmulator {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Mame => "MAME",
             Self::Dolphin => "Dolphin",
             Self::Rpcs3 => "RPCS3",
             Self::Pcsx2 => "PCSX2",
@@ -46,6 +48,7 @@ impl InventoryEmulator {
 
     fn executable_names(self) -> &'static [&'static str] {
         match self {
+            Self::Mame => &["mame", "mame64"],
             Self::Dolphin => &["dolphin-emu", "dolphin"],
             Self::Rpcs3 => &["rpcs3"],
             Self::Pcsx2 => &["pcsx2"],
@@ -313,6 +316,7 @@ pub fn discover_installed_emulators() -> EmulatorInventory {
         .collect();
     for directory in path_entries {
         for emulator in [
+            InventoryEmulator::Mame,
             InventoryEmulator::Dolphin,
             InventoryEmulator::Rpcs3,
             InventoryEmulator::Pcsx2,
