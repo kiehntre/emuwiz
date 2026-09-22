@@ -2258,3 +2258,18 @@ fn gui_v2_artwork_refresh_is_async_and_rejects_duplicate_submit() {
     assert_eq!(app.index_job, job);
     assert_eq!(app.activity.running(), 1);
 }
+
+#[test]
+fn untracked_background_errors_do_not_create_a_global_user_banner() {
+    assert!(notice_for_background_error(None, "history root unavailable").is_none());
+}
+
+#[test]
+fn tracked_background_errors_use_native_plain_language() {
+    let notice = notice_for_background_error(Some("Loading your library"), "database detail")
+        .expect("tracked user work should produce a notice");
+    assert!(notice.message.contains("Retry it from this page"));
+    assert!(notice.message.contains("game files were not changed"));
+    assert!(!notice.message.contains("Legacy / Advanced"));
+    assert_eq!(notice.technical, "database detail");
+}

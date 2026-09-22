@@ -140,6 +140,16 @@ struct Notice {
     technical: String,
 }
 
+fn notice_for_background_error(title: Option<&str>, error: &str) -> Option<Notice> {
+    let title = title?;
+    Some(Notice {
+        message: format!(
+            "{title} could not finish. You can keep browsing the last loaded games. Retry it from this page; your game files were not changed."
+        ),
+        technical: error.to_string(),
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlayingLibraryJobKind {
     Preview,
@@ -1244,21 +1254,22 @@ impl App {
                             }
                             self.detail_failed = self.detail_pending.take();
                             self.filter_inflight = false;
-                            let title = self
-                                .activity
-                                .jobs
-                                .get(&id)
-                                .map(|job| job.title.as_str())
-                                .unwrap_or("This action");
-                            let message = format!(
-                                "{title} could not finish. You can keep browsing the last loaded games. Retry the action, or open Legacy / Advanced interface to check setup."
-                            );
-                            self.activity
-                                .finish(id, message.clone(), Some(error.clone()));
-                            self.notice = Some(Notice {
-                                message,
-                                technical: error,
-                            });
+                            let title = self.activity.jobs.get(&id).map(|job| job.title.clone());
+                            if let Some(notice) =
+                                notice_for_background_error(title.as_deref(), &error)
+                            {
+                                self.activity.finish(
+                                    id,
+                                    notice.message.clone(),
+                                    Some(error.clone()),
+                                );
+                                self.notice = Some(notice);
+                            } else {
+                                // Startup housekeeping (preference restore and history
+                                // discovery) is intentionally untracked. It must not turn a
+                                // recoverable diagnostic detail into a global warning banner.
+                                log::warn!("GUI v2 background operation {id} failed: {error}");
+                            }
                         }
                     }
                 }
