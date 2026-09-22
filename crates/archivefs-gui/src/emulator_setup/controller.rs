@@ -797,41 +797,25 @@ impl ArchiveFsApp {
         });
         let mut identity_status = identity_status;
         let mut mame_set_resolutions = Vec::new();
-        if let Some(record) = focused_record
-            && matches!(
-                record.mount_plan.archive.kind,
-                archivefs_core::ArchiveKind::ArcadeSetDirectory
+        if let Some(focused) = focused
+            && let Ok(database_path) = archivefs_core::default_database_path()
+            && let Ok(database) = archivefs_core::Database::open_read_only(database_path)
+            && let Ok(Some(evidence)) = database.mame_arcade_join_for_archive_path(
+                archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+                focused,
             )
-        {
-            let set_name = record
-                .mount_plan
-                .archive
-                .path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
-            if let (Some(set_name), Ok(database_path)) =
-                (set_name, archivefs_core::default_database_path())
-                && let Ok(database) = archivefs_core::Database::open_read_only(database_path)
-                && let Ok(evidence) = database.mame_arcade_join_for_dat(
-                    archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+            && let Some(resolution) =
+                archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(
+                    &evidence, focused,
                 )
-                && let Some(evidence) = evidence
-                    .iter()
-                    .find(|evidence| evidence.logical_set_name == set_name)
-                && let Some(resolution) =
-                    archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(
-                        evidence,
-                        &record.mount_plan.archive.path,
-                    )
-            {
-                identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
-                    archivefs_core::launch::ResolvedIdentity {
-                        platform_id: "Arcade".to_string(),
-                        game_key: resolution.identity.game_name.clone(),
-                    },
-                );
-                mame_set_resolutions.push(resolution);
-            }
+        {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
+                archivefs_core::launch::ResolvedIdentity {
+                    platform_id: "Arcade".to_string(),
+                    game_key: resolution.identity.game_name.clone(),
+                },
+            );
+            mame_set_resolutions.push(resolution);
         }
 
         match identity_status {
@@ -871,8 +855,7 @@ impl ArchiveFsApp {
             },
         };
         if !mame_set_resolutions.is_empty() {
-            content.resolved_path =
-                focused_record.map(|record| record.mount_plan.archive.path.clone());
+            content.resolved_path = focused.map(Path::to_path_buf);
             content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
             content.requires_mount = false;
             content.provenance =
