@@ -209,6 +209,11 @@ impl UreqTransport {
             // Zero redirects. Following one would send the token to an address
             // the endpoint policy never approved.
             .max_redirects(0)
+            // No environment proxy. `ureq` otherwise honours `HTTP_PROXY` /
+            // `ALL_PROXY`, which would carry the (possibly plain-HTTP) bearer
+            // token to the proxy host instead of the loopback/private address
+            // the endpoint policy approved.
+            .proxy(None)
             .build();
         Self {
             agent: config.into(),

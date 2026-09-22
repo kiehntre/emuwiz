@@ -1303,3 +1303,120 @@ fn a_media_root_that_returns_is_honoured_on_the_next_validation() {
     assert_eq!(mapping.local_root(), std::fs::canonicalize(&root).unwrap());
     assert_eq!(mapping.provider_prefix(), DEGRADATION_MEDIA_PREFIX);
 }
+
+// --- Proxy isolation ----------------------------------------------------------
+
+/// Environment variable that switches
+/// [`the_production_transport_never_routes_a_token_through_an_environment_proxy`]
+/// into its child role. The child is the same test binary re-executed with
+/// proxy variables set, so the parent's environment is never mutated.
+const PROXY_CHILD_TARGET: &str = "EMUWIZ_ROMM_PROXY_CHILD_TARGET";
+
+/// The RomM endpoint policy approves one loopback/private address and the
+/// token is only ever meant to travel there. `ureq` reads `HTTP_PROXY`,
+/// `ALL_PROXY` and friends by default, so without an explicit opt-out a
+/// proxy variable in the desktop session would route the plain-HTTP bearer
+/// token to whatever host the proxy names - an address the policy never saw.
+/// This runs the real transport against a real loopback "RomM" with every
+/// proxy variable pointed at a separate loopback listener, and proves the
+/// proxy is never contacted.
+#[test]
+fn the_production_transport_never_routes_a_token_through_an_environment_proxy() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    if let Ok(target) = std::env::var(PROXY_CHILD_TARGET) {
+        let transport = UreqTransport::new();
+        let response = transport
+            .get(
+                &target,
+                Some("Bearer proxy-isolation-secret"),
+                4096,
+                Duration::from_secs(5),
+            )
+            .expect("the direct request succeeds");
+        assert_eq!(response.status, 200);
+        return;
+    }
+
+    let romm = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let romm_address = romm.local_addr().unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+
+    romm.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match romm.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).unwrap_or(0);
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                  Content-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+        Some(String::from_utf8_lossy(&request).into_owned())
+    });
+
+    let proxy_url = format!("http://{proxy_address}");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .arg("--exact")
+        .arg(
+            "identity_source::romm::tests::\
+             the_production_transport_never_routes_a_token_through_an_environment_proxy",
+        )
+        .arg("--nocapture")
+        .env(
+            PROXY_CHILD_TARGET,
+            format!("http://{romm_address}/api/heartbeat"),
+        )
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    for variable in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        child.env(variable, &proxy_url);
+    }
+    let status = child.status().unwrap();
+
+    let proxy_contacted = proxy.accept().is_ok();
+    assert!(
+        !proxy_contacted,
+        "the RomM transport connected to the environment proxy"
+    );
+    assert!(status.success(), "child transport request failed");
+    let request = server
+        .join()
+        .unwrap()
+        .expect("the approved RomM address received the request");
+    assert!(request.starts_with("GET /api/heartbeat "));
+    assert!(request.contains("proxy-isolation-secret"));
+}

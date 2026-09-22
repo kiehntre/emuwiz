@@ -191,7 +191,10 @@ and this document does not claim it is:
   still be classified against the same policy purely for diagnostic/logging
   purposes (so the refusal message can name where the server tried to send
   the request), but that classification never results in the redirect being
-  followed. Because the policy allows RomM to be reached over plain HTTP, a
+  followed. It also ignores proxy environment variables (`HTTP_PROXY`,
+  `HTTPS_PROXY`, `ALL_PROXY`): the connection always goes straight to the
+  approved address, so a session-wide proxy can never receive the token.
+  Because the policy allows RomM to be reached over plain HTTP, a
   token sent to an HTTP endpoint has no TLS transport protection for that
   request - this is a property of HTTP, not something the client works
   around, and it is the reason the endpoint policy exists to bound *where*
