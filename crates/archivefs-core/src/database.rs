@@ -473,7 +473,7 @@ impl Database {
                  (archive_id, archive_path, source_id, game_name, platform,
                   set_state_json, dependency_state_json, ecosystem, dat_revision,
                   audited_at, stale, exhaustive)
-                 VALUES (?1, ?2, ?3, 'arcade', ?4, ?5, '\"m_a_m_e_arcade\"', ?6, ?7, 0, 1)
+                 VALUES (?1, ?2, ?3, ?4, 'arcade', ?5, ?6, '\"m_a_m_e_arcade\"', ?7, ?8, 0, 1)
                  ON CONFLICT(archive_path, source_id, game_name) DO UPDATE SET
                   set_state_json = excluded.set_state_json,
                   dependency_state_json = excluded.dependency_state_json,
