@@ -96,7 +96,8 @@ const LOGIQX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Bytes whose MD5/SHA-1 are the ones in [`LOGIQX`].
 const SUPER_BIN: &[u8] = b"test";
 
-/// How long a test waits for a worker thread before calling it a failure.
+/// A bounded-fixture worker should settle promptly. This is only a watchdog
+/// for a broken completion path, not part of the behaviour being tested.
 const JOB_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Fixture {
@@ -189,7 +190,9 @@ fn run_to_completion(page: &mut DatSourcesPageState) {
         if Instant::now() > deadline {
             panic!("a background job did not finish within {JOB_TIMEOUT:?}");
         }
-        std::thread::sleep(Duration::from_millis(5));
+        // The worker has an explicit terminal message; yield until it is
+        // observed instead of adding scheduler-dependent sleeps to the test.
+        std::thread::yield_now();
     }
     // One final drain: the job may have finished between the last poll and the
     // loop's exit test.
