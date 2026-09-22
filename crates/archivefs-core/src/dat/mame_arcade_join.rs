@@ -255,19 +255,32 @@ pub fn join_extracted_arcade_root(
 ) -> Result<ArcadeJoinReport, String> {
     let discovered =
         discover_extracted_sets(root).map_err(|e| format!("discover Arcade sets: {e}"))?;
-    let by_name: BTreeMap<&str, &DatGameEntry> = dat
-        .parsed
-        .games
-        .iter()
-        .map(|g| (g.name.as_str(), g))
-        .collect();
+    let mut by_name = BTreeMap::new();
+    let mut ambiguous_names = BTreeSet::new();
+    let mut clone_parents = BTreeSet::new();
+    for game in &dat.parsed.games {
+        if by_name.insert(game.name.as_str(), game).is_some() {
+            ambiguous_names.insert(game.name.as_str());
+        }
+        if let Some(parent) = game.clone_of.as_deref() {
+            clone_parents.insert(parent);
+        }
+    }
     let mut dirs = BTreeMap::new();
     for set in &discovered.sets {
         dirs.insert(set.set_name.as_str(), set);
     }
     let mut evidence = Vec::with_capacity(discovered.sets.len());
     for set in &discovered.sets {
-        evidence.push(join_one(dat, set, &by_name, &dirs, audited_at));
+        evidence.push(join_one_indexed(
+            dat,
+            set,
+            &by_name,
+            &ambiguous_names,
+            &clone_parents,
+            &dirs,
+            audited_at,
+        ));
     }
     let mut summary = ArcadeJoinSummary {
         logical_sets_inspected: evidence.len(),
@@ -319,6 +332,7 @@ pub fn join_extracted_arcade_root(
     })
 }
 
+#[cfg(test)]
 fn join_one(
     dat: &VerifiedMameDat,
     set: &ArcadeSetDirectory,
@@ -326,35 +340,56 @@ fn join_one(
     dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
     audited_at: &str,
 ) -> ArcadeJoinEvidence {
-    let candidates = dat
+    let mut seen_names = BTreeSet::new();
+    let mut ambiguous_names = BTreeSet::new();
+    for game in &dat.parsed.games {
+        if !seen_names.insert(game.name.as_str()) {
+            ambiguous_names.insert(game.name.as_str());
+        }
+    }
+    let clone_parents = dat
         .parsed
         .games
         .iter()
-        .filter(|g| g.name == set.set_name)
-        .collect::<Vec<_>>();
-    let (game, class) = match candidates.as_slice() {
-        [] => (None, ArcadeJoinClass::NotFound),
-        [_] => {
-            let g = candidates[0];
-            let has_clone = dat
-                .parsed
-                .games
-                .iter()
-                .any(|c| c.clone_of.as_deref() == Some(g.name.as_str()));
-            let class = if flag(&g.is_bios) {
-                ArcadeJoinClass::BiosSet
-            } else if flag(&g.is_device) {
-                ArcadeJoinClass::DeviceSet
-            } else if g.clone_of.is_some() {
-                ArcadeJoinClass::CloneSet
-            } else if has_clone {
-                ArcadeJoinClass::ParentSet
-            } else {
-                ArcadeJoinClass::ExactSetMatch
-            };
-            (Some(g), class)
-        }
-        _ => (None, ArcadeJoinClass::Ambiguous),
+        .filter_map(|game| game.clone_of.as_deref())
+        .collect::<BTreeSet<_>>();
+    join_one_indexed(
+        dat,
+        set,
+        by_name,
+        &ambiguous_names,
+        &clone_parents,
+        dirs,
+        audited_at,
+    )
+}
+
+fn join_one_indexed(
+    dat: &VerifiedMameDat,
+    set: &ArcadeSetDirectory,
+    by_name: &BTreeMap<&str, &DatGameEntry>,
+    ambiguous_names: &BTreeSet<&str>,
+    clone_parents: &BTreeSet<&str>,
+    dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
+    audited_at: &str,
+) -> ArcadeJoinEvidence {
+    let (game, class) = if ambiguous_names.contains(set.set_name.as_str()) {
+        (None, ArcadeJoinClass::Ambiguous)
+    } else if let Some(g) = by_name.get(set.set_name.as_str()).copied() {
+        let class = if flag(&g.is_bios) {
+            ArcadeJoinClass::BiosSet
+        } else if flag(&g.is_device) {
+            ArcadeJoinClass::DeviceSet
+        } else if g.clone_of.is_some() {
+            ArcadeJoinClass::CloneSet
+        } else if clone_parents.contains(g.name.as_str()) {
+            ArcadeJoinClass::ParentSet
+        } else {
+            ArcadeJoinClass::ExactSetMatch
+        };
+        (Some(g), class)
+    } else {
+        (None, ArcadeJoinClass::NotFound)
     };
     let Some(game) = game else {
         return ArcadeJoinEvidence {
