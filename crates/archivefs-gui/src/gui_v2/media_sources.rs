@@ -83,6 +83,10 @@ impl MediaIndex {
     pub fn discover(library: &Library) -> Self {
         let start = Instant::now();
         let mut index = Self::default();
+        log::debug!(
+            "gui_v2 artwork indexing started: {} library games",
+            library.games.len()
+        );
         let config = archivefs_core::Config::load_default().ok();
         index.trusted_roots = config
             .as_ref()
@@ -152,6 +156,10 @@ impl MediaIndex {
                 .warnings
                 .push("RomM cache location could not be resolved.".into());
         }
+        log::debug!(
+            "gui_v2 artwork indexing provider snapshots ready: {} cached identity records",
+            records.len()
+        );
         for game in &library.games {
             let id = game.archive.id;
             let path = &game.archive.absolute_path;

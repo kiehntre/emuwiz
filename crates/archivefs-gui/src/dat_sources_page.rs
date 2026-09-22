@@ -9544,12 +9544,11 @@ fn show_managed_dat_sources_section(
         ),
     );
     for row in &view.fbneo_rows {
-        let open = ui_state
-            .managed_sources_expanded
-            .unwrap_or(managed_count < 10);
+        let default_open = managed_count < 10 || row.configured;
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open || row.configured)
+            .default_open(default_open)
+            .open(ui_state.managed_sources_expanded)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
@@ -9561,12 +9560,11 @@ fn show_managed_dat_sources_section(
     }
 
     for row in &view.managed_rows {
-        let open = ui_state
-            .managed_sources_expanded
-            .unwrap_or(managed_count < 10);
+        let default_open = managed_count < 10 || row.configured;
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open || row.configured)
+            .default_open(default_open)
+            .open(ui_state.managed_sources_expanded)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
@@ -9583,12 +9581,11 @@ fn show_managed_dat_sources_section(
         Some("Fixed Redump firmware metadata sources. No URLs or provider settings are exposed."),
     );
     for row in &view.redump_bios_rows {
-        let open = ui_state
-            .managed_sources_expanded
-            .unwrap_or(managed_count < 10);
+        let default_open = managed_count < 10 || row.configured;
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open || row.configured)
+            .default_open(default_open)
+            .open(ui_state.managed_sources_expanded)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)
@@ -9604,12 +9601,11 @@ fn show_managed_dat_sources_section(
         Some("Redump authority mappings are shown separately from verified remote acquisition."),
     );
     for row in &view.redump_game_rows {
-        let open = ui_state
-            .managed_sources_expanded
-            .unwrap_or(managed_count < 10);
+        let default_open = managed_count < 10 || row.configured;
         egui::CollapsingHeader::new(format!("{} · {}", row.source_label, row.authoritative_name))
             .id_salt(("managed-dat-source", row.source_id.clone()))
-            .default_open(open || row.configured)
+            .default_open(default_open)
+            .open(ui_state.managed_sources_expanded)
             .show(ui, |ui| {
                 if action.is_none()
                     && let Some(row_action) = show_managed_dat_source_row(ui, row, view, ui_state)

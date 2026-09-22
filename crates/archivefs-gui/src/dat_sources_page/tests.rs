@@ -6055,6 +6055,42 @@ fn redump_game_disc_rows_show_the_reviewed_typed_supported_systems() {
 }
 
 #[test]
+fn managed_expand_and_collapse_commands_override_persistent_row_state_for_all_sources() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let view = page.view();
+    let managed_count = view.managed_rows.len()
+        + view.redump_bios_rows.len()
+        + view.redump_game_rows.len()
+        + view.fbneo_rows.len();
+    assert_eq!(
+        managed_count, 21,
+        "the production managed-source set is covered"
+    );
+
+    let expanded = render(
+        &view,
+        &mut DatSourcesPageUi {
+            managed_sources_expanded: Some(true),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        rendered_text_count(&expanded, "Not configured"),
+        managed_count
+    );
+
+    let collapsed = render(
+        &view,
+        &mut DatSourcesPageUi {
+            managed_sources_expanded: Some(false),
+            ..Default::default()
+        },
+    );
+    assert_eq!(rendered_text_count(&collapsed, "Not configured"), 0);
+}
+
+#[test]
 fn redump_game_check_and_update_actions_keep_the_closed_typed_system_identity() {
     let source_id = ManagedDatSourceId::redump_games(RedumpGameSystem::PlayStation2);
     assert_eq!(

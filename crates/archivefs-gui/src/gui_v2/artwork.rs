@@ -67,6 +67,7 @@ pub(super) enum Picture {
 pub(super) struct Artwork {
     queue: SharedQueue,
     index_requests: Option<Sender<(u64, SharedLibrary)>>,
+    index_replies: Receiver<Reply>,
     replies: Receiver<Reply>,
     pub index: Option<Arc<MediaIndex>>,
     pub generation: u64,
@@ -91,9 +92,10 @@ impl Artwork {
     pub fn with_cache(context: egui::Context, cache: Option<std::path::PathBuf>) -> Self {
         let queue: SharedQueue = Arc::default();
         let (answers, replies) = mpsc::sync_channel(32);
+        let (index_answers, index_replies) = mpsc::sync_channel(1);
         let (index_requests, index_rx) = mpsc::channel::<(u64, SharedLibrary)>();
         {
-            let answers = answers.clone();
+            let index_answers = index_answers.clone();
             let context = context.clone();
             std::thread::spawn(move || {
                 while let Ok(mut request) = index_rx.recv() {
@@ -114,7 +116,7 @@ impl Artwork {
                     if let Ok(root) = thumbnail::cache_root() {
                         thumbnail::trim_cache(&root);
                     }
-                    if answers
+                    if index_answers
                         .send(Reply::Index {
                             generation: request.0,
                             index: Arc::new(index),
@@ -123,6 +125,7 @@ impl Artwork {
                     {
                         break;
                     }
+                    log::debug!("gui_v2 artwork indexing finished: generation {}", request.0);
                     context.request_repaint();
                 }
             });
@@ -195,6 +198,7 @@ impl Artwork {
         Self {
             queue,
             index_requests: Some(index_requests),
+            index_replies,
             replies,
             index: None,
             generation: 0,
@@ -226,6 +230,11 @@ impl Artwork {
         self.completed = 0;
         self.failures = 0;
         self.cancelled = 0;
+        log::debug!(
+            "gui_v2 artwork indexing queued: generation {}, {} library games",
+            self.generation,
+            library.games.len()
+        );
         if self
             .index_requests
             .as_ref()
@@ -237,6 +246,13 @@ impl Artwork {
     pub fn begin_frame(&mut self, context: &egui::Context) {
         self.frame += 1;
         self.wanted.clear();
+        if let Ok(Reply::Index { generation, index }) = self.index_replies.try_recv()
+            && generation == self.generation
+        {
+            self.index = Some(index);
+            self.index_loading = false;
+            context.request_repaint();
+        }
         // Bound uploads per frame; the bounded reply channel supplies backpressure.
         for _ in 0..4 {
             let Ok(reply) = self.replies.try_recv() else {

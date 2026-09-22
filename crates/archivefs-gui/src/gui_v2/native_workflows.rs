@@ -43,7 +43,7 @@ enum LaunchKind {
 impl NativeWorkflows {
     pub(super) fn new(context: egui::Context) -> Self {
         #[cfg(not(test))]
-        let mut app = ArchiveFsApp::new(context.clone());
+        let mut app = ArchiveFsApp::new_without_initial_load(context.clone());
         #[cfg(test)]
         let mut app = crate::tests::app_for_operation_tests();
         // These are full v2 task pages, not the old shell's simplified
