@@ -112,6 +112,10 @@ pub fn run() -> eframe::Result<()> {
 }
 
 pub(super) fn readable_style(context: &egui::Context) {
+    // Start from the one application palette so embedded legacy workflow
+    // widgets and native-v2 pages share surfaces, borders, selection and
+    // semantic status colors. Only typography and spacing are enlarged here.
+    crate::ui::theme::apply(context);
     let mut style = (*context.style()).clone();
     style
         .text_styles
@@ -128,9 +132,8 @@ pub(super) fn readable_style(context: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(12.0, 10.0);
     style.spacing.button_padding = egui::vec2(14.0, 9.0);
     style.spacing.interact_size.y = 40.0;
-    style.visuals = egui::Visuals::dark();
-    style.visuals.override_text_color = Some(egui::Color32::from_rgb(232, 237, 244));
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(35, 91, 147);
+    style.visuals.override_text_color = Some(crate::ui::theme::PRIMARY_TEXT);
+    style.visuals.selection.bg_fill = crate::ui::theme::PRIMARY_ACTION;
     style.visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0_f32, egui::Color32::WHITE);
     context.set_style(style);
 }

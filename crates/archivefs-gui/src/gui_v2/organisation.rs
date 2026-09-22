@@ -8,11 +8,12 @@ use super::{
     App,
     routes::{Route, Section},
 };
+use crate::ui::theme;
 use crate::{
     playing_library_page::PlayingLibraryDestination,
     rom_organisation_page::{self, RomOrganisationPageAction},
 };
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum OrganisationView {
@@ -71,7 +72,7 @@ const ACTIONS: [ActionCard; 5] = [
 fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(text).strong())
-            .fill(Color32::from_rgb(30, 85, 137))
+            .fill(theme::PRIMARY_ACTION)
             .min_size(egui::vec2(180.0, 44.0)),
     )
     .clicked()

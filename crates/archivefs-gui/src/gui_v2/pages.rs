@@ -10,14 +10,14 @@ use super::{
     problems::{Category, Problem, ProblemSummary, Severity},
     routes::{HOME_TASKS, Route, SECTIONS, Section},
 };
-use crate::ui::components::mrwiz_tip;
+use crate::ui::{components::mrwiz_tip, theme};
 use archivefs_core::dat::rename_apply::model::TransactionState;
 use eframe::egui::{self, Color32, RichText};
 
 fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(text).strong())
-            .fill(Color32::from_rgb(30, 85, 137))
+            .fill(theme::PRIMARY_ACTION)
             .min_size(egui::vec2(180.0, 44.0)),
     )
     .clicked()
