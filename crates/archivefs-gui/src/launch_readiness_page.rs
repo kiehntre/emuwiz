@@ -1356,7 +1356,7 @@ fn dolphin_launch_request(
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,
-        profile_path,
+        ..
     } = &candidate.target
     else {
         return None;
@@ -2242,7 +2242,7 @@ fn standalone_launch_request(
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,
-        ..
+        profile_path,
     } = &candidate.target
     else {
         return None;
