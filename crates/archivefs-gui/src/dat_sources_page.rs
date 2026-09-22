@@ -50,6 +50,7 @@ use archivefs_core::dat::classification::{
     ContentSelectionPolicy, DatContentClassification, DatContentSummary,
 };
 use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::mame_arcade_join::load_verified_mame_0174;
 use archivefs_core::dat::managed_sources::{
     ManagedDatSources, default_managed_dat_sources_config_path, load_managed_dat_sources_from,
     resolve_fbneo_source, resolve_managed_dat_sources, resolve_redump_bios_sources,
@@ -105,6 +106,7 @@ use archivefs_core::identity_source::no_intro::{
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
+use sha2::{Digest, Sha256};
 
 use crate::dat_catalogue_picker::{DatCataloguePickerState, DatCatalogueWorkflow};
 use crate::dat_coverage_panel::{
@@ -239,6 +241,29 @@ pub(crate) struct DatSourceRowView {
     /// card only ever points there when this is true; today the details are
     /// kept inline instead, so this stays false.
     pub(crate) history_link_available: bool,
+    pub(crate) mame_replacement: Option<MameDatReplacementView>,
+}
+
+/// A selected MAME 0.174 Arcade DAT which has not yet been applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MameDatReplacementView {
+    pub(crate) path: PathBuf,
+    pub(crate) file_name: String,
+    pub(crate) size_bytes: Option<u64>,
+    pub(crate) sha256: Option<String>,
+    pub(crate) ecosystem: Option<String>,
+    pub(crate) version: Option<String>,
+    pub(crate) validation_error: Option<String>,
+}
+
+impl MameDatReplacementView {
+    fn valid(&self) -> bool {
+        self.validation_error.is_none()
+            && self.sha256.as_deref()
+                == Some(archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256)
+            && self.version.as_deref()
+                == Some(archivefs_core::dat::mame_arcade_join::MAME_0174_VERSION)
+    }
 }
 
 impl DatSourceRowView {
@@ -1740,6 +1765,16 @@ pub(crate) enum DatSourcesPageAction {
     AddFile {
         path: PathBuf,
     },
+    ChooseMameDatReplacement {
+        id: String,
+        path: PathBuf,
+    },
+    UseMameDatReplacement {
+        id: String,
+    },
+    CancelMameDatReplacement {
+        id: String,
+    },
     /// A deliberately narrow local import for the public Retroplay-derived
     /// WHDLoad catalogue.  It remains a user-selected local DAT: no Retroplay
     /// package infrastructure is downloaded or scraped by EmuWiz.
@@ -2821,6 +2856,8 @@ pub(crate) struct DatSourcesPageState {
     action_error: Option<String>,
     /// The last validation report for each source, this session.
     validations: BTreeMap<String, DatValidationReport>,
+    /// Locally selected MAME DAT replacements awaiting explicit application.
+    mame_replacements: BTreeMap<String, MameDatReplacementView>,
     /// On-demand DAT coverage reads, keyed by source id. Populated only
     /// when the user expands a source's coverage panel; each value is one
     /// bounded read of the authoritative core aggregation plus the pages
@@ -3080,6 +3117,7 @@ impl DatSourcesPageState {
             save_results: BTreeMap::new(),
             action_error: None,
             validations: BTreeMap::new(),
+            mame_replacements: BTreeMap::new(),
             diagnostic_groups: BTreeMap::new(),
             last_validate_all_summary: None,
             audit: None,
@@ -3715,6 +3753,15 @@ impl DatSourcesPageState {
                 }
             }
             DatSourcesPageAction::AddFile { path } => self.add(path, DatSourceKind::File),
+            DatSourcesPageAction::ChooseMameDatReplacement { id, path } => {
+                self.choose_mame_dat_replacement(id, path);
+            }
+            DatSourcesPageAction::UseMameDatReplacement { id } => {
+                self.use_mame_dat_replacement(id);
+            }
+            DatSourcesPageAction::CancelMameDatReplacement { id } => {
+                self.mame_replacements.remove(&id);
+            }
             DatSourcesPageAction::SetPortabilityTarget { .. } => {
                 self.rename_plan = None;
                 self.rename_plan_error = Some(
@@ -3764,6 +3811,7 @@ impl DatSourcesPageState {
                 if self.draft.remove(&id).is_some() {
                     self.validations.remove(&id);
                     self.diagnostic_groups.remove(&id);
+                    self.mame_replacements.remove(&id);
                     if self
                         .audit
                         .as_ref()
@@ -3873,6 +3921,7 @@ impl DatSourcesPageState {
                 self.abandon_running_job();
                 self.draft = self.saved.clone();
                 self.action_error = None;
+                self.mame_replacements.clear();
                 // Discard also forgets the session's validation records: a
                 // re-added source (which reuses its auto-suggested id) must not
                 // show yesterday's Inspect detail or diagnostic groups next to
@@ -4437,6 +4486,41 @@ impl DatSourcesPageState {
         if let Err(error) = self.draft.add(entry) {
             self.action_error = Some(error.to_string());
         }
+    }
+
+    fn choose_mame_dat_replacement(&mut self, id: String, path: PathBuf) {
+        self.action_error = None;
+        let candidate = inspect_mame_dat_replacement(&path);
+        self.mame_replacements.insert(id, candidate);
+    }
+
+    fn use_mame_dat_replacement(&mut self, id: String) {
+        self.action_error = None;
+        let Some(candidate) = self.mame_replacements.get(&id).cloned() else {
+            self.action_error = Some("Choose a MAME DAT file first.".to_string());
+            return;
+        };
+        if !candidate.valid() {
+            self.action_error = Some(candidate.validation_error.clone().unwrap_or_else(|| {
+                "This file does not match the MAME source contract.".to_string()
+            }));
+            return;
+        }
+        let Some(entry) = self.draft.get_mut(&id) else {
+            self.action_error = Some("The MAME DAT source no longer exists.".to_string());
+            return;
+        };
+        if entry.kind != DatSourceKind::File {
+            self.action_error =
+                Some("Only a MAME DAT file source can use this replacement.".to_string());
+            return;
+        }
+        entry.path = candidate.path;
+        entry.health = DatSourceHealth::default();
+        self.validations.remove(&id);
+        self.diagnostic_groups.remove(&id);
+        self.mame_replacements.remove(&id);
+        self.start_validate(id);
     }
 
     fn inspect_no_intro_pack(&mut self) {
@@ -7006,6 +7090,7 @@ impl DatSourcesPageState {
             // The full warning details are kept inline on this card; nothing is
             // recorded in History & Logs today, so nothing points there.
             history_link_available: false,
+            mame_replacement: self.mame_replacements.get(&entry.id).cloned(),
         }
     }
 
@@ -10708,6 +10793,95 @@ fn show_source_row(
             );
         }
 
+        if row.id == MAME_0174_ARCADE_SOURCE_ID && row.kind_label == "DAT file" {
+            ui.add_space(6.0);
+            ui.strong("MAME 0.174 Arcade DAT");
+            if row.health_state != DatHealthState::Valid {
+                ui.label("File missing or invalid — choose a complete local replacement.");
+            }
+            if let Some(candidate) = &row.mame_replacement {
+                ui.label(format!("Selected file: {}", candidate.file_name));
+                ui.label(format!("Path: {}", candidate.path.display()));
+                if let Some(size) = candidate.size_bytes {
+                    ui.label(format!("Size: {}", format_bytes(size)));
+                }
+                ui.label(format!(
+                    "Detected ecosystem: {}",
+                    candidate.ecosystem.as_deref().unwrap_or("not detected")
+                ));
+                ui.label(format!(
+                    "Detected MAME version: {}",
+                    candidate.version.as_deref().unwrap_or("not detected")
+                ));
+                ui.label(format!(
+                    "SHA-256: {}",
+                    candidate.sha256.as_deref().unwrap_or("not computed")
+                ));
+                if let Some(error) = &candidate.validation_error {
+                    widgets::banner(
+                        ui,
+                        "Replacement rejected",
+                        error,
+                        widgets::StatusTone::Warning,
+                    );
+                } else {
+                    ui.label("Validation: complete and matches the MAME 0.174 source contract.");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if widgets::action_button(
+                        ui,
+                        "Use this DAT",
+                        widgets::ActionStyle::Primary,
+                        candidate.valid() && !busy_elsewhere,
+                    )
+                    .clicked()
+                        && action.is_none()
+                    {
+                        action = Some(DatSourcesPageAction::UseMameDatReplacement {
+                            id: row.id.clone(),
+                        });
+                    }
+                    if widgets::action_button(
+                        ui,
+                        "Choose another file…",
+                        widgets::ActionStyle::Secondary,
+                        !busy_elsewhere,
+                    )
+                    .clicked()
+                        && action.is_none()
+                        && let Some(path) = choose_local_dat_file("Choose MAME 0.174 Arcade DAT")
+                    {
+                        action = Some(DatSourcesPageAction::ChooseMameDatReplacement {
+                            id: row.id.clone(),
+                            path,
+                        });
+                    }
+                    if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true)
+                        .clicked()
+                        && action.is_none()
+                    {
+                        action = Some(DatSourcesPageAction::CancelMameDatReplacement {
+                            id: row.id.clone(),
+                        });
+                    }
+                });
+            } else if widgets::action_button(
+                ui,
+                "Choose DAT file…",
+                widgets::ActionStyle::Secondary,
+                !busy_elsewhere,
+            )
+            .clicked()
+                && action.is_none()
+                && let Some(path) = choose_local_dat_file("Choose MAME 0.174 Arcade DAT")
+            {
+                action = Some(DatSourcesPageAction::ChooseMameDatReplacement {
+                    id: row.id.clone(),
+                    path,
+                });
+            }
+        }
+
         // An incomplete catalogue load is a distinct, prominent result: the
         // safety limit stopped the check part-way, so the verdict covers only
         // part of the folder and nothing may imply all of it was read.
@@ -10846,6 +11020,98 @@ fn health_label(row: &DatSourceRowView) -> String {
         format!("{} (out of date)", row.health_state.label())
     } else {
         row.health_state.label().to_string()
+    }
+}
+
+const MAME_0174_ARCADE_SOURCE_ID: &str = "mame-0-174-arcade-xml";
+
+fn inspect_mame_dat_replacement(path: &Path) -> MameDatReplacementView {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+    let mut sha256 = None;
+    let mut ecosystem = None;
+    let mut version = None;
+    let mut validation_error = None;
+
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "part")
+        || file_name.ends_with(".part")
+        || file_name.ends_with(".tmp")
+    {
+        validation_error = Some(
+            "This file is incomplete and cannot replace the current MAME 0.174 DAT.".to_string(),
+        );
+    } else if size_bytes == Some(0) {
+        validation_error =
+            Some("This file is empty and cannot replace the current MAME 0.174 DAT.".to_string());
+    } else {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let digest = Sha256::digest(&bytes);
+                sha256 = Some(digest.iter().map(|byte| format!("{byte:02x}")).collect());
+                let prefix =
+                    String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).to_ascii_lowercase();
+                if prefix.contains("<html")
+                    || prefix.contains("<!doctype html")
+                    || prefix.contains("challenge")
+                {
+                    validation_error =
+                        Some("This file is an HTML or challenge page, not a MAME DAT.".to_string());
+                } else if !bytes
+                    .windows(b"</datafile>".len())
+                    .any(|window| window == b"</datafile>")
+                {
+                    validation_error = Some(
+                        "This file is incomplete and cannot replace the current MAME 0.174 DAT."
+                            .to_string(),
+                    );
+                } else if let Some(start) = String::from_utf8_lossy(&bytes).find("MAME Arcade ") {
+                    let detected = String::from_utf8_lossy(&bytes[start..])
+                        .split_whitespace()
+                        .nth(2)
+                        .map(|value| value.split('<').next().unwrap_or(value).to_string());
+                    version = detected;
+                    ecosystem = Some("MAME Arcade".to_string());
+                    if version.as_deref() != Some("0.174") {
+                        validation_error = Some(
+                            "This file is a MAME DAT, but its version does not match the MAME \
+                             0.174 source contract."
+                                .to_string(),
+                        );
+                    }
+                }
+                if validation_error.is_none() {
+                    match load_verified_mame_0174(path) {
+                        Ok(verified) => {
+                            ecosystem = Some("MAME Arcade".to_string());
+                            version = Some(verified.version);
+                        }
+                        Err(error) => {
+                            validation_error = Some(format!(
+                                "This file does not match the MAME 0.174 source contract: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                validation_error = Some(format!("This DAT file cannot be read: {error}"));
+            }
+        }
+    }
+
+    MameDatReplacementView {
+        path: path.to_path_buf(),
+        file_name,
+        size_bytes,
+        sha256,
+        ecosystem,
+        version,
+        validation_error,
     }
 }
 

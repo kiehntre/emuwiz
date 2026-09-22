@@ -64,6 +64,7 @@ fn row_for_visibility(
         dat_files_read: None,
         dat_files_total: None,
         history_link_available: false,
+        mame_replacement: None,
     }
 }
 
@@ -98,6 +99,110 @@ const SUPER_BIN: &[u8] = b"test";
 
 /// How long a test waits for a worker thread before calling it a failure.
 const JOB_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[test]
+fn mame_replacement_rejects_empty_and_partial_files() {
+    let fixture = Fixture::new();
+    let empty = fixture.write("empty.dat", "");
+    let partial = fixture.write("download.dat.part", "not complete");
+
+    let empty_view = inspect_mame_dat_replacement(&empty);
+    assert!(
+        empty_view
+            .validation_error
+            .as_deref()
+            .is_some_and(|error| error.contains("empty"))
+    );
+    let partial_view = inspect_mame_dat_replacement(&partial);
+    assert!(
+        partial_view
+            .validation_error
+            .as_deref()
+            .is_some_and(|error| error.contains("incomplete"))
+    );
+}
+
+#[test]
+fn mame_replacement_rejects_hash_mismatch_without_staging_a_source_change() {
+    let fixture = Fixture::new();
+    let candidate_path = fixture.write(
+        "MAME.0.174.Arcade.XML.dat",
+        "<datafile><header><description>MAME Arcade 0.174</description></header></datafile>",
+    );
+    let view = inspect_mame_dat_replacement(&candidate_path);
+    assert!(!view.valid());
+    assert!(view.sha256.is_some());
+    assert!(view.validation_error.is_some());
+}
+
+#[test]
+fn mame_replacement_rejects_a_different_declared_version() {
+    let fixture = Fixture::new();
+    let candidate_path = fixture.write(
+        "MAME.0.175.Arcade.XML.dat",
+        "<datafile><header><description>MAME Arcade 0.175</description></header></datafile>",
+    );
+    let view = inspect_mame_dat_replacement(&candidate_path);
+    assert_eq!(view.version.as_deref(), Some("0.175"));
+    assert!(
+        view.validation_error
+            .as_deref()
+            .is_some_and(|error| error.contains("version does not match"))
+    );
+}
+
+#[test]
+fn applying_mame_replacement_updates_only_existing_path_after_explicit_action() {
+    let fixture = Fixture::new();
+    let old_path = fixture.write("old.dat", "");
+    let new_path = fixture.write("new.dat", "candidate");
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile { path: old_path });
+    let id = page.view().rows[0].id.clone();
+    page.mame_replacements.insert(
+        id.clone(),
+        MameDatReplacementView {
+            path: new_path.clone(),
+            file_name: "new.dat".to_string(),
+            size_bytes: Some(9),
+            sha256: Some(archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256.to_string()),
+            ecosystem: Some("MAME Arcade".to_string()),
+            version: Some("0.174".to_string()),
+            validation_error: None,
+        },
+    );
+    page.apply(DatSourcesPageAction::UseMameDatReplacement { id: id.clone() });
+    assert_eq!(page.draft.get(&id).unwrap().path, new_path);
+    assert!(page.is_dirty());
+}
+
+#[test]
+fn cancelling_mame_replacement_leaves_the_draft_path_untouched() {
+    let fixture = Fixture::new();
+    let old_path = fixture.write("old.dat", "");
+    let candidate_path = fixture.write("candidate.dat", "candidate");
+    let mut page = fixture.page();
+    page.apply(DatSourcesPageAction::AddFile {
+        path: old_path.clone(),
+    });
+    let id = page.view().rows[0].id.clone();
+    page.apply(DatSourcesPageAction::Save);
+    page.mame_replacements.insert(
+        id.clone(),
+        MameDatReplacementView {
+            path: candidate_path,
+            file_name: "candidate.dat".to_string(),
+            size_bytes: Some(9),
+            sha256: None,
+            ecosystem: None,
+            version: None,
+            validation_error: Some("rejected".to_string()),
+        },
+    );
+    page.apply(DatSourcesPageAction::CancelMameDatReplacement { id: id.clone() });
+    assert_eq!(page.draft.get(&id).unwrap().path, old_path);
+    assert!(!page.is_dirty());
+}
 
 struct Fixture {
     root: PathBuf,
