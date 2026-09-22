@@ -784,6 +784,56 @@ impl ArchiveFsApp {
             _ => None,
         });
 
+        // Arcade directory archives are logical MAME sets, not ordinary
+        // files, so their identity comes from the persisted, SHA-bound MAME
+        // join. This is the narrow projection bridge that keeps raw members
+        // (for example ru_04b.img) out of launch identity.
+        let focused_record = live.and_then(|data| {
+            focused.and_then(|path| {
+                data.records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == path)
+            })
+        });
+        let mut identity_status = identity_status;
+        let mut mame_set_resolutions = Vec::new();
+        if let Some(record) = focused_record
+            && matches!(
+                record.mount_plan.archive.kind,
+                archivefs_core::ArchiveKind::ArcadeSetDirectory
+            )
+        {
+            let set_name = record
+                .mount_plan
+                .archive
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned());
+            if let (Some(set_name), Ok(database_path)) =
+                (set_name, archivefs_core::default_database_path())
+                && let Ok(database) = archivefs_core::Database::open_read_only(database_path)
+                && let Ok(evidence) = database.mame_arcade_join_for_dat(
+                    archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+                )
+                && let Some(evidence) = evidence
+                    .iter()
+                    .find(|evidence| evidence.logical_set_name == set_name)
+                && let Some(resolution) =
+                    archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(
+                        evidence,
+                        &record.mount_plan.archive.path,
+                    )
+            {
+                identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
+                    archivefs_core::launch::ResolvedIdentity {
+                        platform_id: "Arcade".to_string(),
+                        game_key: resolution.identity.game_name.clone(),
+                    },
+                );
+                mame_set_resolutions.push(resolution);
+            }
+        }
+
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
                 return LaunchReadinessInput::IdentityUnknown;
@@ -794,13 +844,6 @@ impl ArchiveFsApp {
             archivefs_core::launch::CanonicalIdentityStatus::Resolved(_) => {}
         }
 
-        let focused_record = live.and_then(|data| {
-            focused.and_then(|path| {
-                data.records
-                    .iter()
-                    .find(|record| record.mount_plan.archive.path == path)
-            })
-        });
         // Archive safety: only the transient, selection-bound preparation
         // state may provide an inner member. The bridge still refuses it
         // unless the record is genuinely mounted.
@@ -827,6 +870,14 @@ impl ArchiveFsApp {
                     .to_string(),
             },
         };
+        if !mame_set_resolutions.is_empty() {
+            content.resolved_path =
+                focused_record.map(|record| record.mount_plan.archive.path.clone());
+            content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
+            content.requires_mount = false;
+            content.provenance =
+                "verified MAME logical-set directory from the persisted DAT join".into();
+        }
 
         // WHDLoad is an additive, content-bound launch seam.  The package
         // and slave are accepted only after the existing bounded LHA
@@ -1122,6 +1173,24 @@ impl ArchiveFsApp {
                 .chain(flycast_standalone_profiles)
                 .chain(amiga_whdload_profiles)
                 .collect();
+
+        // MAME has no profile directory; its lifecycle binding is the exact
+        // executable selected through Emulator Setup, while its game
+        // eligibility comes only from the persisted MAME join above.
+        if let Some(executable) = self
+            .emulator_readiness
+            .emulator_setup_overrides
+            .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)
+            && !mame_set_resolutions.is_empty()
+        {
+            standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
+                adapter_id: "mame",
+                profile_id: format!("mame:{}", executable.display()),
+                profile_path: Some(executable.to_path_buf()),
+                eligible: true,
+                firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+            });
+        }
 
         // Fuse is a narrow, read-only ZX Spectrum adapter.  Discovery is
         // additive: no executable means no Fuse candidate, and the generic

@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::dat::dependency::SetDependencyReport;
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
 use crate::dat::parsers::mame_listxml::parse_mame_listxml;
+use crate::dat::set::{SetIdentity, SetResolution, SetState};
 use crate::ingestion::arcade::{ArcadeSetDirectory, discover_extracted_sets};
 
 pub const MAME_0174_SHA256: &str =
@@ -118,6 +120,101 @@ pub struct VerifiedMameDat {
     pub path: PathBuf,
     pub sha256: String,
     pub version: String,
+}
+
+/// Projects one persisted, DAT-backed Arcade join into the existing launch
+/// planner shape. This is deliberately a projection of join evidence only:
+/// it never identifies a set from a filename or from a raw member.
+pub fn launch_resolution_for_join(
+    evidence: &ArcadeJoinEvidence,
+    archive_path: &Path,
+) -> Option<SetResolution> {
+    if !evidence.launchable_normal_game
+        || evidence.class == ArcadeJoinClass::NotFound
+        || evidence.class == ArcadeJoinClass::Ambiguous
+    {
+        return None;
+    }
+    let complete = evidence.members.iter().all(|member| {
+        !matches!(
+            member.kind,
+            MemberEvidenceKind::Missing | MemberEvidenceKind::Extra
+        )
+    }) && evidence
+        .dependencies
+        .iter()
+        .all(|dependency| dependency.present);
+    let state = if complete {
+        SetState::Complete
+    } else {
+        SetState::Incomplete
+    };
+    let members_required = evidence
+        .members
+        .iter()
+        .filter(|member| !matches!(member.kind, MemberEvidenceKind::Extra))
+        .map(|member| member.name.clone())
+        .collect::<Vec<_>>();
+    let members_verified = evidence
+        .members
+        .iter()
+        .filter(|member| {
+            matches!(
+                member.kind,
+                MemberEvidenceKind::Present
+                    | MemberEvidenceKind::MergedFromParent
+                    | MemberEvidenceKind::ProvidedByBios
+                    | MemberEvidenceKind::ProvidedByDevice
+            )
+        })
+        .map(|member| member.name.clone())
+        .collect::<Vec<_>>();
+    let members_borrowed = evidence
+        .members
+        .iter()
+        .filter(|member| {
+            matches!(
+                member.kind,
+                MemberEvidenceKind::MergedFromParent
+                    | MemberEvidenceKind::ProvidedByBios
+                    | MemberEvidenceKind::ProvidedByDevice
+            )
+        })
+        .map(|member| member.name.clone())
+        .collect::<Vec<_>>();
+    Some(SetResolution {
+        identity: SetIdentity {
+            source_id: format!(
+                "mame-arcade:{}:{}",
+                evidence.dat_version, evidence.dat_sha256
+            ),
+            game_name: evidence.dat_set_name.clone()?,
+        },
+        archive_path: archive_path.to_path_buf(),
+        state,
+        members_required,
+        members_verified,
+        members_bad: Vec::new(),
+        members_optional: Vec::new(),
+        members_borrowed,
+        disks_required: Vec::new(),
+        disks_verified: Vec::new(),
+        disks_parent_required: Vec::new(),
+        dependencies: SetDependencyReport {
+            state: if evidence.dependencies.is_empty() {
+                crate::dat::dependency::DependencyState::NotApplicable
+            } else if evidence
+                .dependencies
+                .iter()
+                .all(|dependency| dependency.present)
+            {
+                crate::dat::dependency::DependencyState::Satisfied
+            } else {
+                crate::dat::dependency::DependencyState::Missing
+            },
+            requirements: Vec::new(),
+        },
+    })
 }
 
 pub fn load_verified_mame_0174(path: &Path) -> Result<VerifiedMameDat, String> {

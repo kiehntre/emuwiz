@@ -1459,6 +1459,10 @@ pub struct DiscoveredProfiles {
 /// `dolphin_executable` here, only `dolphin_configuration_root`.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveredProfilesOverrides {
+    /// An explicitly selected native MAME executable. MAME does not have a
+    /// profile directory, but its lifecycle binding still needs to flow
+    /// through the same typed override boundary as other adapters.
+    pub mame_executable: Option<PathBuf>,
     pub dolphin_configuration_root: Option<PathBuf>,
     pub pcsx2_executable: Option<PathBuf>,
     pub ppsspp_executable: Option<PathBuf>,

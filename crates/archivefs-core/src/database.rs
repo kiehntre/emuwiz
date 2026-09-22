@@ -431,6 +431,19 @@ impl Database {
                 ))
             })?;
             let archive_path = report.scan_root.join(&evidence.logical_set_name);
+            let archive_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM archives WHERE absolute_path_cached = ?1",
+                    params![archive_path.as_os_str().as_bytes()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    db_error(
+                        "failed to associate MAME Arcade evidence with archive",
+                        error,
+                    )
+                })?;
             tx.execute(
                 "INSERT INTO dat_expected_entries
                  (dat_source_id, canonical_identity, display_name, source_revision,
@@ -460,7 +473,7 @@ impl Database {
                  (archive_id, archive_path, source_id, game_name, platform,
                   set_state_json, dependency_state_json, ecosystem, dat_revision,
                   audited_at, stale, exhaustive)
-                 VALUES (NULL, ?1, ?2, ?3, 'arcade', ?4, ?5, '\"m_a_m_e_arcade\"', ?6, ?7, 0, 1)
+                 VALUES (?1, ?2, ?3, 'arcade', ?4, ?5, '\"m_a_m_e_arcade\"', ?6, ?7, 0, 1)
                  ON CONFLICT(archive_path, source_id, game_name) DO UPDATE SET
                   set_state_json = excluded.set_state_json,
                   dependency_state_json = excluded.dependency_state_json,
@@ -468,6 +481,7 @@ impl Database {
                   dat_revision = excluded.dat_revision,
                   audited_at = excluded.audited_at, stale = 0, exhaustive = 1",
                 params![
+                    archive_id,
                     archive_path.as_os_str().as_bytes(),
                     source_id,
                     evidence.logical_set_name,
@@ -7751,7 +7765,11 @@ pub fn scan_and_persist(
 ) -> Result<ScanPersistSummary> {
     validate_configured_source_roots(&config.source_folders)?;
     let registered_folders = database.register_source_folders(&config.source_folders)?;
-    scan_and_persist_folders(database, &registered_folders, triggered_by)
+    let summary = scan_and_persist_folders(database, &registered_folders, triggered_by)?;
+    // The source scanner owns logical Arcade ingestion; the version-bound DAT
+    // join is persisted immediately after that transaction so nested SQLite
+    // transactions cannot make the catalogue refresh fragile.
+    Ok(summary)
 }
 
 /// The shared scan+persist pipeline both [`scan_and_persist`] (the legacy

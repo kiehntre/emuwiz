@@ -4,12 +4,12 @@
 //! existing core diagnostics and bounded emulator inventory on the GUI-v2
 //! worker, then exposes plain-language state for the onboarding surface.
 
-use std::{env, fs, path::PathBuf};
+use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 use crate::gui_v2::library::Library;
 use archivefs_core::emulator_lifecycle::{
-    EmulatorLifecycleProjection, SUPPORTED_EMULATOR_IDS, inspect_discovered_emulator_lifecycles,
-    inspect_emulator_lifecycle,
+    EmulatorLifecycleProjection, ExactBinding, SUPPORTED_EMULATOR_IDS,
+    inspect_discovered_emulator_lifecycles_with_selections, inspect_emulator_lifecycle,
 };
 
 const LIFECYCLE_DISPLAY_IDS: &[&str] = &[
@@ -229,7 +229,30 @@ fn managed_dat_count() -> usize {
 }
 
 fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
-    let mut projections = inspect_discovered_emulator_lifecycles()
+    let overrides = crate::emulator_setup_overrides::EmulatorPathOverrides::load();
+    let selected_bindings = crate::emulator_setup_overrides::OverridableEmulator::ALL
+        .into_iter()
+        .filter_map(|emulator| {
+            let id = match emulator.adapter_id() {
+                "mame" => "MAME",
+                "pcsx2" => "PCSX2",
+                "rpcs3" => "RPCS3",
+                "ppsspp" => "PPSSPP",
+                "duckstation" => "DuckStation",
+                "xemu" => "xemu",
+                _ => return None,
+            };
+            overrides.executable(emulator).map(|path| {
+                (
+                    id.to_string(),
+                    ExactBinding::NativeExecutable {
+                        path: path.to_path_buf(),
+                    },
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut projections = inspect_discovered_emulator_lifecycles_with_selections(selected_bindings)
         .into_iter()
         .filter(|projection| LIFECYCLE_DISPLAY_IDS.contains(&projection.emulator_id.as_str()))
         .collect::<Vec<_>>();

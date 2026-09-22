@@ -66,10 +66,10 @@ use archivefs_core::launch::{
     LaunchCommandSpec, LaunchContainerKind, LaunchExecutionError, LaunchExitReport, LaunchPlan,
     LaunchPreflightErrorKind, LaunchReadiness, LaunchSpawnError, LaunchTarget, LaunchWarning,
     LaunchWarningKind, LaunchedDolphinProcess, LaunchedPcsx2Process, LaunchedRetroArchProcess,
-    PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError, Pcsx2LaunchExitReport,
-    Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest, Pcsx2LaunchSpawnError,
-    RetroArchLaunchRequest, preflight_and_launch_dolphin, preflight_and_launch_pcsx2,
-    preflight_and_launch_retroarch,
+    MameLaunchRequest, PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError,
+    Pcsx2LaunchExitReport, Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest,
+    Pcsx2LaunchSpawnError, RetroArchLaunchRequest, preflight_and_launch_dolphin,
+    preflight_and_launch_pcsx2, preflight_and_launch_retroarch,
 };
 use archivefs_core::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, Pcsx2ProfileDiscovery,
@@ -610,6 +610,7 @@ impl AmigaWHDLoadLaunchState {
 }
 
 enum StandaloneProcess {
+    Mame(archivefs_core::launch::process_spawn::WatchedProcess),
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
     Rpcs3(LaunchedRpcs3Process),
@@ -649,6 +650,7 @@ impl StandaloneLaunchState {
             },
             StandaloneLaunchStage::Running(mut process) => {
                 let exited = match &mut process {
+                    StandaloneProcess::Mame(p) => p.poll().is_some(),
                     StandaloneProcess::DuckStation(p) => p.poll().is_some(),
                     StandaloneProcess::Ppsspp(p) => p.poll().is_some(),
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
@@ -703,6 +705,7 @@ impl StandaloneLaunchState {
 
 #[derive(Clone)]
 pub(crate) enum StandaloneLaunchRequest {
+    Mame(MameLaunchRequest),
     DuckStation(
         DuckStationLaunchRequest,
         archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -729,6 +732,7 @@ pub(crate) enum StandaloneLaunchRequest {
 impl StandaloneLaunchRequest {
     fn adapter_name(&self) -> &'static str {
         match self {
+            Self::Mame(_) => "MAME",
             Self::DuckStation(_, _, _) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
             Self::Rpcs3(_, _) => "RPCS3",
@@ -739,6 +743,7 @@ impl StandaloneLaunchRequest {
 
     fn key(&self) -> (PathBuf, String) {
         match self {
+            Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
             Self::DuckStation(r, _, _) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
             Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
@@ -748,6 +753,9 @@ impl StandaloneLaunchRequest {
     }
     fn execute(self) -> Result<StandaloneProcess, String> {
         match self {
+            Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
+                .map(StandaloneProcess::Mame)
+                .map_err(|error| format!("{error:?}")),
             Self::DuckStation(r, roots, firmware) => {
                 preflight_and_launch_duckstation(&r, &roots, &firmware)
                     .map(StandaloneProcess::DuckStation)
@@ -1348,7 +1356,7 @@ fn dolphin_launch_request(
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,
-        ..
+        profile_path,
     } = &candidate.target
     else {
         return None;
@@ -2242,6 +2250,31 @@ fn standalone_launch_request(
     let platform = plan.platform_id.clone()?;
     let game_key = plan.game_key.clone()?;
     match *adapter_id {
+        "mame" => {
+            let executable = profile_path.clone()?;
+            let set_name = path.file_name()?.to_string_lossy().into_owned();
+            let database_path = archivefs_core::default_database_path().ok()?;
+            let database = archivefs_core::Database::open_read_only(database_path).ok()?;
+            let evidence = database
+                .mame_arcade_join_for_dat(archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256)
+                .ok()?;
+            let evidence = evidence
+                .iter()
+                .find(|evidence| evidence.logical_set_name == set_name)?;
+            let resolution =
+                archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(evidence, &path)?;
+            Some(StandaloneLaunchRequest::Mame(MameLaunchRequest {
+                identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+                    platform_id: platform,
+                    game_key,
+                }),
+                set_resolutions: vec![resolution],
+                expected_executable: executable,
+                selected_content: path,
+                expected_content_identity: None,
+                rom_search_path_configured: false,
+            }))
+        }
         "duckstation" => {
             let context = duckstation?;
             let serial = context.verified_ps1_serial.clone()?;
