@@ -245,9 +245,7 @@ fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
             overrides.executable(emulator).map(|path| {
                 (
                     id.to_string(),
-                    ExactBinding::NativeExecutable {
-                        path: path.to_path_buf(),
-                    },
+                    executable_override_binding(path.to_path_buf()),
                 )
             })
         })
@@ -270,6 +268,14 @@ fn lifecycle_projections() -> Vec<EmulatorLifecycleProjection> {
     }
     projections.sort_by(|left, right| left.emulator_id.cmp(&right.emulator_id));
     projections
+}
+
+/// Executable overrides persist only an exact path, not package/ownership
+/// provenance. PATH inventory represents such unclassified candidates as
+/// `UnknownExternal`; reconstructing the override as `NativeExecutable`
+/// makes the same path fail exact-binding equality after restart.
+fn executable_override_binding(path: PathBuf) -> ExactBinding {
+    ExactBinding::UnknownExternal { path }
 }
 
 fn legacy_roots() -> (bool, bool, bool) {
@@ -310,5 +316,14 @@ mod tests {
             .push(PathBuf::from("/mnt/games"));
         assert!(snapshot.source_needs_attention());
         assert!(!snapshot.is_fresh());
+    }
+
+    #[test]
+    fn persisted_executable_override_matches_unclassified_path_inventory() {
+        let path = PathBuf::from("/home/test/.local/bin/mame");
+        assert_eq!(
+            executable_override_binding(path.clone()),
+            ExactBinding::UnknownExternal { path }
+        );
     }
 }
