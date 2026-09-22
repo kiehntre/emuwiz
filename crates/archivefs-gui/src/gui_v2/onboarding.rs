@@ -4,6 +4,7 @@
 //! already-loaded library. It does not scan, install, migrate, or repair.
 
 use super::{environment::EnvironmentSnapshot, library::Library, routes::Section};
+use crate::ui::theme;
 use eframe::egui;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,7 +20,7 @@ pub(super) enum Action {
 fn button(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add(
         egui::Button::new(egui::RichText::new(label).strong())
-            .fill(egui::Color32::from_rgb(30, 85, 137))
+            .fill(theme::PRIMARY_ACTION)
             .min_size(egui::vec2(180.0, 42.0)),
     )
     .clicked()

@@ -19,9 +19,8 @@ pub(crate) const BODY_SIZE: f32 = 16.0;
 pub(crate) const METADATA_SIZE: f32 = 14.0;
 pub(crate) const TECHNICAL_SIZE: f32 = 12.0;
 
-/// Restrained amber for the one primary action and selected-content emphasis.
-/// It is deliberately darker than the source Stitch swatch so light interface
-/// text remains readable and amber does not become the application's chrome.
+/// Shared v2 application surfaces and semantic colors. Normal routes use this
+/// module rather than page-local chrome tokens.
 pub(crate) const APP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(13, 21, 19);
 pub(crate) const DEEP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(8, 16, 14);
 pub(crate) const CARD_SURFACE: egui::Color32 = egui::Color32::from_rgb(22, 29, 27);
@@ -32,11 +31,16 @@ pub(crate) const PRIMARY_TEXT: egui::Color32 = egui::Color32::from_rgb(241, 245,
 pub(crate) const SECONDARY_TEXT: egui::Color32 = egui::Color32::from_rgb(148, 163, 184);
 pub(crate) const TECHNICAL_TEXT: egui::Color32 = egui::Color32::from_rgb(100, 116, 139);
 pub(crate) const TEAL: egui::Color32 = egui::Color32::from_rgb(3, 198, 178);
-/// Primary actions and selected-content emphasis. Keep this role sparse.
+/// Semantic amber remains available for warnings and attention states. It is
+/// deliberately darker than the source Stitch swatch so light interface text
+/// remains readable; it is not application chrome.
 pub(crate) const AMBER: egui::Color32 = egui::Color32::from_rgb(143, 97, 31);
-/// Preserved semantic API name: ACCENT is the primary action role.
-pub(crate) const ACCENT: egui::Color32 = AMBER;
-pub(crate) const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(170, 119, 43);
+/// The single blue v2 primary-action role used by native and embedded pages.
+pub(crate) const PRIMARY_ACTION: egui::Color32 = egui::Color32::from_rgb(30, 85, 137);
+pub(crate) const PRIMARY_ACTION_HOVER: egui::Color32 = egui::Color32::from_rgb(45, 110, 175);
+/// Preserved semantic API name: ACCENT is the shared primary action role.
+pub(crate) const ACCENT: egui::Color32 = PRIMARY_ACTION;
+pub(crate) const ACCENT_HOVER: egui::Color32 = PRIMARY_ACTION_HOVER;
 pub(crate) const SUCCESS: egui::Color32 = egui::Color32::from_rgb(16, 185, 129);
 pub(crate) const WARNING: egui::Color32 = AMBER;
 /// Lightened from (214, 82, 88) (2026-08-22, live-QA Phase 7 contrast
@@ -126,14 +130,15 @@ mod tests {
 
     #[test]
     fn semantic_palette_keeps_roles_distinct() {
-        assert_eq!(ACCENT, AMBER);
+        assert_eq!(ACCENT, PRIMARY_ACTION);
+        assert_ne!(ACCENT, AMBER);
         assert_ne!(TEAL, AMBER);
         assert_ne!(SUCCESS, DANGER);
         assert_ne!(PRIMARY_TEXT, TECHNICAL_TEXT);
     }
 
     #[test]
-    fn primary_amber_keeps_light_action_text_contrastable() {
+    fn primary_blue_keeps_light_action_text_contrastable() {
         fn luminance(color: egui::Color32) -> f32 {
             let channel = |value: u8| {
                 let value = value as f32 / 255.0;
@@ -145,10 +150,11 @@ mod tests {
             };
             0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
         }
-        let contrast = (luminance(egui::Color32::WHITE) + 0.05) / (luminance(AMBER) + 0.05);
+        let contrast =
+            (luminance(egui::Color32::WHITE) + 0.05) / (luminance(PRIMARY_ACTION) + 0.05);
         assert!(
             contrast >= 4.5,
-            "amber/light-text contrast was {contrast:.2}:1"
+            "blue/light-text contrast was {contrast:.2}:1"
         );
     }
 }
