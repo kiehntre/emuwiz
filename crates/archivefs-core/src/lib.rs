@@ -3737,10 +3737,23 @@ fn refresh_configured_mame_arcade_identity(
         if !arcade_root.is_dir() {
             continue;
         }
+        let join_started = std::time::Instant::now();
         let report =
             dat::mame_arcade_join::join_extracted_arcade_root(&dat, &arcade_root, &audited_at)
                 .map_err(ArchiveFsError::Config)?;
-        database.persist_mame_arcade_join(&report)?;
+        log::info!(
+            "MAME Arcade join prepared {} logical sets from {} in {:?}",
+            report.evidence.len(),
+            arcade_root.display(),
+            join_started.elapsed()
+        );
+        let persist_started = std::time::Instant::now();
+        let rows = database.persist_mame_arcade_join(&report)?;
+        log::info!(
+            "MAME Arcade audit persisted {rows} rows from {} in {:?}",
+            arcade_root.display(),
+            persist_started.elapsed()
+        );
     }
     Ok(())
 }

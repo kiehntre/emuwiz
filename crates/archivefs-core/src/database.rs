@@ -32,7 +32,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use log::info;
 use rusqlite::{Connection, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension, params};
@@ -412,6 +412,12 @@ pub struct PersistedSetAuditDependency {
 }
 
 impl Database {
+    /// Keep transactions short enough that a large real-world Arcade source
+    /// exposes progress promptly, while amortising SQLite commit overhead.
+    /// Each evidence row performs two upserts, so 256 sets means no more than 512
+    /// row writes in one transaction.
+    pub const MAME_ARCADE_AUDIT_BATCH_SIZE: usize = 256;
+
     /// Replaces one complete, version-bound Arcade join in the existing DAT
     /// audit tables. The source id includes the exact DAT digest, so a later
     /// MAME revision cannot silently replace or satisfy this evidence.
@@ -419,57 +425,128 @@ impl Database {
         &mut self,
         report: &crate::dat::mame_arcade_join::ArcadeJoinReport,
     ) -> Result<usize> {
+        self.persist_mame_arcade_join_batched(report, Self::MAME_ARCADE_AUDIT_BATCH_SIZE, None)
+    }
+
+    fn persist_mame_arcade_join_batched(
+        &mut self,
+        report: &crate::dat::mame_arcade_join::ArcadeJoinReport,
+        batch_size: usize,
+        fail_before_commit_batch: Option<usize>,
+    ) -> Result<usize> {
+        if batch_size == 0 {
+            return Err(ArchiveFsError::Database(
+                "MAME Arcade audit batch size must be greater than zero".to_string(),
+            ));
+        }
         let source_id = format!("mame-arcade:{}:{}", report.dat_version, report.dat_sha256);
-        let tx = self
+        let run_marker = format!("{:?}", SystemTime::now());
+        let lookup_started = Instant::now();
+        let mut archive_ids = HashMap::<Vec<u8>, Option<i64>>::new();
+        let mut statement = self
             .connection
-            .transaction()
-            .map_err(|error| db_error("failed to start MAME Arcade join transaction", error))?;
-        for evidence in &report.evidence {
-            let encoded = serde_json::to_string(evidence).map_err(|error| {
-                ArchiveFsError::Database(format!(
-                    "failed to encode MAME Arcade join evidence: {error}"
-                ))
-            })?;
-            let archive_path = report.scan_root.join(&evidence.logical_set_name);
-            let archive_id: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM archives WHERE absolute_path_cached = ?1",
-                    params![archive_path.as_os_str().as_bytes()],
-                    |row| row.get(0),
+            .prepare("SELECT id, absolute_path_cached FROM archives ORDER BY id")
+            .map_err(|error| db_error("failed to prepare MAME archive path index", error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| db_error("failed to read MAME archive path index", error))?;
+        for row in rows {
+            let (archive_id, path) =
+                row.map_err(|error| db_error("failed to decode MAME archive path index", error))?;
+            match archive_ids.entry(path) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(archive_id));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+        drop(statement);
+        log::info!(
+            "MAME Arcade audit indexed {} catalogue paths in {:?}",
+            archive_ids.len(),
+            lookup_started.elapsed()
+        );
+
+        let mut committed = 0usize;
+        let mut archive_hits = 0usize;
+        let mut archive_misses_or_ambiguities = 0usize;
+        log::info!(
+            "MAME Arcade audit considering {} logical sets in {} deterministic batches of at most {} sets",
+            report.evidence.len(),
+            report.evidence.len().div_ceil(batch_size),
+            batch_size
+        );
+        for (batch_index, batch) in report.evidence.chunks(batch_size).enumerate() {
+            let batch_start = batch_index * batch_size;
+            let batch_end = batch_start + batch.len();
+            let first_set = batch
+                .first()
+                .map(|evidence| evidence.logical_set_name.as_str())
+                .unwrap_or("<empty>");
+            let transaction_started = Instant::now();
+            let tx = self.connection.transaction().map_err(|error| {
+                db_error(
+                    &format!(
+                        "failed to start MAME Arcade audit batch {batch_start}..{batch_end}; first set {first_set}; {committed} rows already committed"
+                    ),
+                    error,
                 )
-                .optional()
-                .map_err(|error| {
-                    db_error(
-                        "failed to associate MAME Arcade evidence with archive",
-                        error,
-                    )
+            })?;
+            for evidence in batch {
+                let encoded = serde_json::to_string(evidence).map_err(|error| {
+                    ArchiveFsError::Database(format!(
+                        "failed to encode MAME Arcade join evidence for {} in batch {batch_start}..{batch_end}; {committed} rows already committed: {error}",
+                        evidence.logical_set_name
+                    ))
                 })?;
-            tx.execute(
-                "INSERT INTO dat_expected_entries
+                let archive_path = report.scan_root.join(&evidence.logical_set_name);
+                let archive_id = archive_ids
+                    .get(archive_path.as_os_str().as_bytes())
+                    .copied()
+                    .flatten();
+                if archive_id.is_some() {
+                    archive_hits += 1;
+                } else {
+                    archive_misses_or_ambiguities += 1;
+                }
+                tx.execute(
+                    "INSERT INTO dat_expected_entries
                  (dat_source_id, canonical_identity, display_name, source_revision,
                   ecosystem, metadata_json, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'mame', ?5, ?6, ?6)
+                  VALUES (?1, ?2, ?3, ?4, 'mame', ?5, ?6, ?6)
                  ON CONFLICT(dat_source_id, canonical_identity) DO UPDATE SET
                   display_name = excluded.display_name,
                   source_revision = excluded.source_revision,
                   ecosystem = excluded.ecosystem,
                   metadata_json = excluded.metadata_json,
                   updated_at = excluded.updated_at",
-                params![
-                    source_id,
-                    evidence.logical_set_name,
-                    evidence
-                        .dat_set_name
-                        .as_deref()
-                        .unwrap_or(&evidence.logical_set_name),
-                    report.dat_sha256,
-                    encoded.as_bytes(),
-                    evidence.audited_at,
-                ],
-            )
-            .map_err(|error| db_error("failed to persist MAME Arcade evidence inventory", error))?;
-            tx.execute(
-                "INSERT INTO dat_set_audit_results
+                    params![
+                        source_id,
+                        evidence.logical_set_name,
+                        evidence
+                            .dat_set_name
+                            .as_deref()
+                            .unwrap_or(&evidence.logical_set_name),
+                        report.dat_sha256,
+                        encoded.as_bytes(),
+                        run_marker,
+                    ],
+                )
+                .map_err(|error| {
+                    db_error(
+                        &format!(
+                            "failed to persist MAME inventory for {} in batch {batch_start}..{batch_end}; {committed} rows already committed",
+                            evidence.logical_set_name
+                        ),
+                        error,
+                    )
+                })?;
+                tx.execute(
+                    "INSERT INTO dat_set_audit_results
                  (archive_id, archive_path, source_id, game_name, platform,
                   set_state_json, dependency_state_json, ecosystem, dat_revision,
                   audited_at, stale, exhaustive)
@@ -480,43 +557,98 @@ impl Database {
                   ecosystem = excluded.ecosystem,
                   dat_revision = excluded.dat_revision,
                   audited_at = excluded.audited_at, stale = 0, exhaustive = 1",
-                params![
-                    archive_id,
-                    archive_path.as_os_str().as_bytes(),
-                    source_id,
-                    evidence.logical_set_name,
-                    if evidence.members.iter().any(|member| matches!(
-                        member.kind,
-                        crate::dat::mame_arcade_join::MemberEvidenceKind::Missing
-                            | crate::dat::mame_arcade_join::MemberEvidenceKind::Extra
-                    )) {
-                        "\"incomplete\""
-                    } else {
-                        "\"complete\""
-                    },
-                    if evidence
-                        .dependencies
-                        .iter()
-                        .any(|dependency| !dependency.present)
-                    {
-                        "\"missing\""
-                    } else {
-                        "\"satisfied\""
-                    },
-                    report.dat_sha256,
-                    evidence.audited_at,
-                ],
-            )
-            .map_err(|error| {
+                    params![
+                        archive_id,
+                        archive_path.as_os_str().as_bytes(),
+                        source_id,
+                        evidence.logical_set_name,
+                        if evidence.members.iter().any(|member| matches!(
+                            member.kind,
+                            crate::dat::mame_arcade_join::MemberEvidenceKind::Missing
+                                | crate::dat::mame_arcade_join::MemberEvidenceKind::Extra
+                        )) {
+                            "\"incomplete\""
+                        } else {
+                            "\"complete\""
+                        },
+                        if evidence
+                            .dependencies
+                            .iter()
+                            .any(|dependency| !dependency.present)
+                        {
+                            "\"missing\""
+                        } else {
+                            "\"satisfied\""
+                        },
+                        report.dat_sha256,
+                        run_marker,
+                    ],
+                )
+                .map_err(|error| {
+                    db_error(
+                        &format!(
+                            "failed to persist MAME audit row for {} in batch {batch_start}..{batch_end}; {committed} rows already committed",
+                            evidence.logical_set_name
+                        ),
+                        error,
+                    )
+                })?;
+            }
+            if fail_before_commit_batch == Some(batch_index) {
+                return Err(ArchiveFsError::Database(format!(
+                    "injected MAME Arcade audit failure for batch {batch_start}..{batch_end}; first set {first_set}; {committed} rows already committed"
+                )));
+            }
+            tx.commit().map_err(|error| {
                 db_error(
-                    "failed to persist MAME Arcade join in DAT audit tables",
+                    &format!(
+                        "failed to commit MAME Arcade audit batch {batch_start}..{batch_end}; first set {first_set}; {committed} rows already committed"
+                    ),
                     error,
                 )
             })?;
+            committed += batch.len();
+            log::info!(
+                "MAME Arcade audit committed batch {}..{} ({} sets, {} SQL rows prepared/written, {} sets total) in {:?}",
+                batch_start,
+                batch_end,
+                batch.len(),
+                batch.len() * 2,
+                committed,
+                transaction_started.elapsed()
+            );
         }
-        tx.commit()
-            .map_err(|error| db_error("failed to commit MAME Arcade DAT audit", error))?;
-        Ok(report.evidence.len())
+
+        let cleanup_started = Instant::now();
+        let cleanup = self.connection.transaction().map_err(|error| {
+            db_error(
+                "failed to start MAME Arcade audit cleanup transaction",
+                error,
+            )
+        })?;
+        cleanup
+            .execute(
+                "DELETE FROM dat_set_audit_results WHERE source_id = ?1 AND audited_at <> ?2",
+                params![source_id, run_marker],
+            )
+            .map_err(|error| db_error("failed to remove stale MAME audit rows", error))?;
+        cleanup
+            .execute(
+                "DELETE FROM dat_expected_entries WHERE dat_source_id = ?1 AND updated_at <> ?2",
+                params![source_id, run_marker],
+            )
+            .map_err(|error| db_error("failed to remove stale MAME inventory rows", error))?;
+        cleanup
+            .commit()
+            .map_err(|error| db_error("failed to commit MAME Arcade audit cleanup", error))?;
+        log::info!(
+            "MAME Arcade audit cleanup committed in {:?}; {} rows persisted; {} archive-index hits; {} misses/ambiguities",
+            cleanup_started.elapsed(),
+            committed,
+            archive_hits,
+            archive_misses_or_ambiguities
+        );
+        Ok(committed)
     }
 
     /// Loads only evidence for the requested DAT digest; a different MAME
@@ -8474,6 +8606,150 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn mame_batch_report(names: &[&str]) -> crate::dat::mame_arcade_join::ArcadeJoinReport {
+        use crate::dat::mame_arcade_join::{
+            ArcadeDependencyEdge, ArcadeJoinClass, ArcadeJoinEvidence, ArcadeJoinReport,
+            ArcadeJoinSummary, ArcadeMemberEvidence, MemberEvidenceKind,
+        };
+
+        let evidence = names
+            .iter()
+            .map(|name| {
+                let is_clone = *name == "clone";
+                ArcadeJoinEvidence {
+                    logical_set_name: (*name).to_string(),
+                    dat_set_name: Some((*name).to_string()),
+                    class: if is_clone {
+                        ArcadeJoinClass::CloneSet
+                    } else {
+                        ArcadeJoinClass::ExactSetMatch
+                    },
+                    description: Some((*name).to_string()),
+                    manufacturer: None,
+                    year: None,
+                    clone_of: is_clone.then(|| "parent".to_string()),
+                    rom_of: is_clone.then(|| "parent".to_string()),
+                    parent_description: is_clone.then(|| "parent".to_string()),
+                    runnable: Some("yes".to_string()),
+                    mechanical: false,
+                    is_bios: false,
+                    is_device: false,
+                    expected_member_count: 1,
+                    members: vec![ArcadeMemberEvidence {
+                        name: format!("{name}.rom"),
+                        kind: MemberEvidenceKind::Present,
+                        checksum: Some("fixture".to_string()),
+                    }],
+                    dependencies: if is_clone {
+                        vec![ArcadeDependencyEdge {
+                            kind: "ParentSet".to_string(),
+                            target: "parent".to_string(),
+                            present: true,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    launchable_normal_game: *name != "unknown",
+                    dat_version: "0.174".to_string(),
+                    dat_sha256: "batch-digest".to_string(),
+                    dat_path: "fixture.dat".to_string(),
+                    audited_at: "fixture".to_string(),
+                }
+            })
+            .collect();
+        ArcadeJoinReport {
+            dat_path: PathBuf::from("fixture.dat"),
+            dat_sha256: "batch-digest".to_string(),
+            dat_version: "0.174".to_string(),
+            dat_machine_count: names.len(),
+            scan_root: PathBuf::from("arcade"),
+            evidence,
+            summary: ArcadeJoinSummary::default(),
+            layout_estimate: "fixture".to_string(),
+        }
+    }
+
+    #[test]
+    fn mame_audit_batches_commit_independently_and_resume_idempotently() {
+        let root = temp_dir("mame-audit-batches");
+        let mut database = Database::open_or_create(root.join("library.sqlite3")).unwrap();
+        // Parent and clone deliberately straddle the first batch boundary;
+        // the raw member remains nested evidence, never an audit target.
+        let report = mame_batch_report(&["valid", "parent", "clone", "unknown", "later"]);
+        let error = database
+            .persist_mame_arcade_join_batched(&report, 2, Some(2))
+            .unwrap_err();
+        assert!(error.to_string().contains("batch 4..5"));
+        assert!(error.to_string().contains("4 rows already committed"));
+
+        let source_id = "mame-arcade:0.174:batch-digest";
+        let after_failure = database.set_audit_results_for_source(source_id).unwrap();
+        assert_eq!(after_failure.len(), 4);
+        assert!(after_failure.iter().all(|row| row.game_name != "clone.rom"));
+
+        assert_eq!(
+            database
+                .persist_mame_arcade_join_batched(&report, 2, None)
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            database
+                .persist_mame_arcade_join_batched(&report, 2, None)
+                .unwrap(),
+            5
+        );
+        let completed = database.set_audit_results_for_source(source_id).unwrap();
+        assert_eq!(completed.len(), 5);
+        let joined = database.mame_arcade_join_for_dat("batch-digest").unwrap();
+        let clone = joined
+            .iter()
+            .find(|evidence| evidence.logical_set_name == "clone")
+            .unwrap();
+        assert_eq!(clone.clone_of.as_deref(), Some("parent"));
+        assert_eq!(clone.dependencies[0].target, "parent");
+
+        let reduced = mame_batch_report(&["valid", "parent", "clone"]);
+        database
+            .persist_mame_arcade_join_batched(&reduced, 2, None)
+            .unwrap();
+        assert_eq!(
+            database
+                .set_audit_results_for_source(source_id)
+                .unwrap()
+                .len(),
+            3,
+            "successful final cleanup must remove rows absent from the new generation"
+        );
+        database
+            .persist_mame_arcade_join_batched(&report, 2, None)
+            .unwrap();
+
+        let clean_root = temp_dir("mame-audit-batches-clean");
+        let mut clean = Database::open_or_create(clean_root.join("library.sqlite3")).unwrap();
+        clean
+            .persist_mame_arcade_join_batched(&report, 2, None)
+            .unwrap();
+        let clean_rows = clean.set_audit_results_for_source(source_id).unwrap();
+        assert_eq!(completed.len(), clean_rows.len());
+
+        let rollback_root = temp_dir("mame-audit-batches-rollback");
+        let mut rollback = Database::open_or_create(rollback_root.join("library.sqlite3")).unwrap();
+        rollback
+            .persist_mame_arcade_join_batched(&report, 2, Some(0))
+            .unwrap_err();
+        assert!(
+            rollback
+                .set_audit_results_for_source(source_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(clean_root);
+        let _ = fs::remove_dir_all(rollback_root);
     }
 
     /// Writes a file at `dir/relative_path` (creating any parent
