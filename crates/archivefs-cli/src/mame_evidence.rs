@@ -46,7 +46,8 @@ fn refresh(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Refreshing MAME member evidence under {}{}; unchanged members reuse exact path/size/mtime cache rows.",
         root.display(),
-        set.as_deref().map_or(String::new(), |name| format!(" for family {name}"))
+        set.as_deref()
+            .map_or(String::new(), |name| format!(" for family {name}"))
     );
     let report = refresh_mame_member_evidence(&mut database, &dat, &root, set.as_deref())?;
     if json {

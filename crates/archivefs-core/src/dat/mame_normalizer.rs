@@ -3,7 +3,8 @@
 //! This is deliberately narrower than a general library organiser: the DAT
 //! is the only source of a mutation identity.  A filename, title, or fuzzy
 //! similarity can make an item visible in a preview, but can never make it
-//! actionable.  ZIP rebuilds are staged and reopened before publication.
+//! actionable. ZIP and extracted-directory rebuilds are staged and reopened
+//! before publication.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -525,7 +526,10 @@ fn plan_split_rebuilds_from_verified_joins(
         else {
             continue;
         };
-        if !is_zip(parent_path) || !is_zip(clone_path) || parent_path == clone_path {
+        if (!is_zip(parent_path) && !parent_path.is_dir()
+            || (!is_zip(clone_path) && !clone_path.is_dir())
+            || parent_path == clone_path)
+        {
             continue;
         }
         if used_archives.contains(parent_path) || used_archives.contains(clone_path) {
@@ -547,14 +551,8 @@ fn plan_split_rebuilds_from_verified_joins(
         {
             continue;
         }
-        let parent_target = parent_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{parent_name}.zip"));
-        let clone_target = clone_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{}.zip", clone.name));
+        let parent_target = set_target(parent_path, parent_name);
+        let clone_target = set_target(clone_path, &clone.name);
         if (parent_target.exists() && parent_target != *parent_path && parent_target != *clone_path)
             || (clone_target.exists()
                 && clone_target != *parent_path
@@ -580,8 +578,8 @@ fn plan_split_rebuilds_from_verified_joins(
         if *parent_path == parent_target
             && *clone_path == clone_target
             && moved_members == 0
-            && archive_matches(parent_path, &parent_members)
-            && archive_matches(clone_path, &clone_members)
+            && rebuilt_set_matches(parent_path, &parent_members)
+            && rebuilt_set_matches(clone_path, &clone_members)
         {
             continue;
         }
@@ -653,10 +651,7 @@ fn located_members_from_join(
         }) {
             return None;
         }
-        let mut archive = zip::ZipArchive::new(File::open(path).ok()?).ok()?;
-        let mut source = archive.by_name(current_name).ok()?;
-        let mut bytes = Vec::new();
-        source.read_to_end(&mut bytes).ok()?;
+        let bytes = read_set_member(path, current_name).ok()?;
         let digest = hashes(&bytes);
         if digest.sha1 != checksum {
             return None;
@@ -922,7 +917,14 @@ fn desired_split_members(
                     && rom_identity_matches(candidate, &member.rom)
             })
             .collect::<Vec<_>>();
-        if matches.len() != 1 {
+        if matches.is_empty()
+            || matches
+                .iter()
+                .map(|member| member.sha256.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 1
+        {
             return None;
         }
         let member = matches[0];
@@ -962,6 +964,55 @@ fn archive_matches(path: &Path, members: &[MameRebuildMember]) -> bool {
             let mut bytes = Vec::new();
             actual.read_to_end(&mut bytes).is_ok() && hashes(&bytes).sha256 == member.sha256
         })
+}
+
+fn set_target(path: &Path, name: &str) -> PathBuf {
+    if path.is_dir() {
+        path.with_file_name(name)
+    } else {
+        path.with_file_name(format!("{name}.zip"))
+    }
+}
+
+fn read_set_member(path: &Path, member_name: &str) -> Result<Vec<u8>, String> {
+    if path.is_dir() {
+        let relative = Path::new(member_name);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err("DAT member escapes its source directory".into());
+        }
+        fs::read(path.join(relative)).map_err(|e| e.to_string())
+    } else {
+        let mut archive = zip::ZipArchive::new(File::open(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        let mut source = archive.by_name(member_name).map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+}
+
+fn rebuilt_set_matches(path: &Path, members: &[MameRebuildMember]) -> bool {
+    if !path.is_dir() {
+        return archive_matches(path, members);
+    }
+    let expected = members
+        .iter()
+        .map(|member| (member.correct.as_str(), member.sha256.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut files = Vec::new();
+    if collect_files(path, path, &mut files).is_err() || files.len() < expected.len() {
+        return false;
+    }
+    expected.iter().all(|(name, hash)| {
+        files
+            .iter()
+            .find(|(actual, _)| actual == name)
+            .is_some_and(|(_, file)| sha256_file(file).ok().as_deref() == Some(*hash))
+    })
 }
 
 fn plan_zip(path: &Path, index: &DatIndex, mode: MameCollectionMode) -> Result<PlannedSet, String> {
@@ -1333,21 +1384,32 @@ pub fn apply_mame_normalisation(
         .collect::<BTreeSet<_>>();
     let mut staged_families = Vec::new();
     for rebuild in &plan.split_rebuilds {
-        let parent_staged = rebuild.parent_path.with_extension("emuwiz-split.tmp.zip");
-        let clone_staged = rebuild.clone_path.with_extension("emuwiz-split.tmp.zip");
-        rebuild_split_zip(&parent_staged, &rebuild.parent_members)?;
-        rebuild_split_zip(&clone_staged, &rebuild.clone_members)?;
+        let directory_mode = rebuild.parent_path.is_dir() && rebuild.clone_path.is_dir();
+        if rebuild.parent_path.is_dir() != rebuild.clone_path.is_dir() {
+            return Err(
+                "parent and clone must use the same extracted-directory or ZIP layout".into(),
+            );
+        }
+        let parent_staged = staged_set_path(&rebuild.parent_path, "parent");
+        let clone_staged = staged_set_path(&rebuild.clone_path, "clone");
+        if directory_mode {
+            rebuild_split_directory(
+                &rebuild.parent_path,
+                &parent_staged,
+                &rebuild.parent_members,
+            )?;
+            rebuild_split_directory(&rebuild.clone_path, &clone_staged, &rebuild.clone_members)?;
+        } else {
+            rebuild_split_zip(&parent_staged, &rebuild.parent_members)?;
+            rebuild_split_zip(&clone_staged, &rebuild.clone_members)?;
+        }
         verify_rebuilt_members(&parent_staged, &rebuild.parent_members)?;
         verify_rebuilt_members(&clone_staged, &rebuild.clone_members)?;
         staged_families.push((rebuild, parent_staged, clone_staged));
     }
     for (rebuild, parent_staged, clone_staged) in &staged_families {
-        let parent_backup = rebuild
-            .parent_path
-            .with_extension("emuwiz-normaliser.original.zip");
-        let clone_backup = rebuild
-            .clone_path
-            .with_extension("emuwiz-normaliser.original.zip");
+        let parent_backup = backup_set_path(&rebuild.parent_path);
+        let clone_backup = backup_set_path(&rebuild.clone_path);
         if parent_backup.exists() || clone_backup.exists() {
             return Err("a previous MAME repair backup already exists".into());
         }
@@ -1366,7 +1428,7 @@ pub fn apply_mame_normalisation(
                 &clone_staged,
             ),
         ] {
-            let original_sha = sha256_file(original)?;
+            let original_sha = sha256_path(original)?;
             journal.entries.push(MameRepairEntry {
                 original: original.clone(),
                 published: published.clone(),
@@ -1389,14 +1451,14 @@ pub fn apply_mame_normalisation(
             };
             rename_noreplace(staged, published).map_err(|e| e.to_string())?;
             let entry_index = journal.entries.len() - 2 + index;
-            journal.entries[entry_index].published_sha256 = sha256_file(published)?;
+            journal.entries[entry_index].published_sha256 = sha256_path(published)?;
             write_journal(journal_path, &journal)?;
         }
     }
     for set in plan.sets.iter().filter(|set| {
         set.status == MameFixStatus::Safe && !family_paths.contains(&set.current_path)
     }) {
-        let original_sha = sha256_file(&set.current_path)?;
+        let original_sha = sha256_path(&set.current_path)?;
         let journal_index = journal.entries.len();
         journal.entries.push(MameRepairEntry {
             original: set.current_path.clone(),
@@ -1437,7 +1499,7 @@ pub fn apply_mame_normalisation(
         journal.entries[journal_index].published = published;
         journal.entries[journal_index].backup = backup;
         journal.entries[journal_index].published_sha256 =
-            sha256_file(&journal.entries[journal_index].published)?;
+            sha256_path(&journal.entries[journal_index].published)?;
         write_journal(journal_path, &journal)?;
     }
     journal.state = MameRepairState::Applied;
@@ -1454,7 +1516,11 @@ pub fn undo_mame_normalisation(journal_path: &Path) -> Result<usize, String> {
     }
     for entry in &journal.entries {
         if entry.backup.is_some() {
-            let _ = fs::remove_file(&entry.published);
+            if entry.published.is_dir() {
+                let _ = fs::remove_dir_all(&entry.published);
+            } else {
+                let _ = fs::remove_file(&entry.published);
+            }
         }
     }
     for entry in journal.entries.iter().rev() {
@@ -1478,6 +1544,56 @@ pub fn undo_mame_normalisation(journal_path: &Path) -> Result<usize, String> {
     Ok(journal.entries.len())
 }
 
+/// Reconciles a journal left in `Applying` state after an interrupted
+/// publication. Only paths recorded in that journal are touched.
+pub fn recover_mame_normalisation(journal_path: &Path) -> Result<usize, String> {
+    let data = fs::read(journal_path).map_err(|e| e.to_string())?;
+    let mut journal: MameRepairJournal =
+        serde_json::from_slice(&data).map_err(|e| e.to_string())?;
+    if journal.state != MameRepairState::Applying {
+        return Err(format!(
+            "repair journal is not interrupted (state: {:?})",
+            journal.state
+        ));
+    }
+    for entry in journal.entries.iter().rev() {
+        if let Some(backup) = &entry.backup {
+            if entry.published.exists() {
+                if entry.published.is_dir() {
+                    fs::remove_dir_all(&entry.published).map_err(|e| e.to_string())?;
+                } else {
+                    fs::remove_file(&entry.published).map_err(|e| e.to_string())?;
+                }
+            }
+            if backup.exists() && !entry.original.exists() {
+                rename_noreplace(backup, &entry.original).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    journal.state = MameRepairState::Undone;
+    write_journal(journal_path, &journal)?;
+    Ok(journal.entries.len())
+}
+
+/// Verifies the published paths in a previously created plan without
+/// changing anything.
+pub fn verify_mame_normalisation(plan: &MameNormalisationPlan) -> Result<usize, String> {
+    let mut verified = 0;
+    for rebuild in &plan.split_rebuilds {
+        if !rebuilt_set_matches(&rebuild.parent_target, &rebuild.parent_members)
+            || !rebuilt_set_matches(&rebuild.clone_target, &rebuild.clone_members)
+        {
+            return Err(format!(
+                "published Split family failed verification: {} / {}",
+                rebuild.parent_target.display(),
+                rebuild.clone_target.display()
+            ));
+        }
+        verified += rebuild.parent_members.len() + rebuild.clone_members.len();
+    }
+    Ok(verified)
+}
+
 fn is_zip(path: &Path) -> bool {
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
@@ -1487,6 +1603,50 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(encode_hex(&Sha256::digest(
         fs::read(path).map_err(|e| e.to_string())?,
     )))
+}
+
+fn sha256_path(path: &Path) -> Result<String, String> {
+    if path.is_file() {
+        return sha256_file(path);
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "set path is not a file or directory: {}",
+            path.display()
+        ));
+    }
+    let mut files = Vec::new();
+    collect_files(path, path, &mut files)?;
+    let mut digest = Sha256::new();
+    for (relative, file) in files {
+        digest.update(relative.as_bytes());
+        digest.update([0]);
+        digest.update(fs::read(file).map_err(|e| e.to_string())?);
+        digest.update([0]);
+    }
+    Ok(encode_hex(&digest.finalize()))
+}
+
+fn staged_set_path(source: &Path, role: &str) -> PathBuf {
+    let suffix = if source.is_dir() {
+        "emuwiz-split.tmp"
+    } else {
+        "emuwiz-split.tmp.zip"
+    };
+    source
+        .with_file_name(format!(
+            ".{}.{}",
+            source.file_name().unwrap_or_default().to_string_lossy(),
+            suffix
+        ))
+        .with_extension(format!("{role}.tmp"))
+}
+
+fn backup_set_path(source: &Path) -> PathBuf {
+    source.with_file_name(format!(
+        ".{}.emuwiz-normaliser.original",
+        source.file_name().unwrap_or_default().to_string_lossy()
+    ))
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -1580,6 +1740,14 @@ fn rebuild_split_zip(destination: &Path, members: &[MameRebuildMember]) -> Resul
 }
 
 fn verify_rebuilt_members(path: &Path, members: &[MameRebuildMember]) -> Result<(), String> {
+    if path.is_dir() {
+        if !rebuilt_set_matches(path, members) {
+            return Err(
+                "rebuilt Split directory membership or checksum verification failed".into(),
+            );
+        }
+        return Ok(());
+    }
     let mut archive = zip::ZipArchive::new(File::open(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     if archive.len() != members.len() {
@@ -1597,6 +1765,57 @@ fn verify_rebuilt_members(path: &Path, members: &[MameRebuildMember]) -> Result<
                 member.correct
             ));
         }
+    }
+    Ok(())
+}
+
+fn rebuild_split_directory(
+    source: &Path,
+    destination: &Path,
+    members: &[MameRebuildMember],
+) -> Result<(), String> {
+    if destination.exists() {
+        return Err(format!(
+            "temporary directory already exists: {}",
+            destination.display()
+        ));
+    }
+    fs::create_dir(destination).map_err(|e| e.to_string())?;
+    let expected = members
+        .iter()
+        .map(|member| member.source_member.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut source_files = Vec::new();
+    collect_files(source, source, &mut source_files)?;
+    for (relative, file) in source_files {
+        if !expected.contains(relative.as_str()) {
+            let target = destination.join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::copy(file, target).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut names = BTreeSet::new();
+    for member in members {
+        if !names.insert(member.correct.as_str()) {
+            return Err(format!("duplicate destination member: {}", member.correct));
+        }
+        let bytes = read_set_member(&member.source_path, &member.source_member)?;
+        if hashes(&bytes).sha256 != member.sha256 {
+            return Err(format!("source checksum changed: {}", member.source_member));
+        }
+        let target = destination.join(&member.correct);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if target.exists() {
+            return Err(format!(
+                "destination member collision: {}",
+                target.display()
+            ));
+        }
+        fs::write(target, bytes).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -1724,6 +1943,89 @@ mod tests {
             plan_mame_normalisation(root, &dat, MameCollectionMode::Split).expect("second plan");
         apply_mame_normalisation(&plan_again, &journal).expect("second apply");
         assert!(repaired.is_file());
+    }
+
+    #[test]
+    fn extracted_split_family_is_staged_verified_applied_and_undone() {
+        let fixture = tempdir().expect("fixture directory");
+        let root = fixture.path();
+        let parent = root.join("parent-source");
+        let clone = root.join("clone-source");
+        fs::create_dir_all(&parent).unwrap();
+        fs::create_dir_all(&clone).unwrap();
+        fs::write(parent.join("shared.bin"), b"shared").unwrap();
+        fs::write(clone.join("clone.bin"), b"clone").unwrap();
+        fs::write(clone.join("user-extra.txt"), b"preserve").unwrap();
+        let shared = hashes(b"shared").sha256;
+        let clone_hash = hashes(b"clone").sha256;
+        let parent_target = root.join("parent");
+        let clone_target = root.join("clone");
+        let plan = MameNormalisationPlan {
+            root: root.to_path_buf(),
+            mode: MameCollectionMode::Split,
+            dat_version: Some("fixture".into()),
+            sets: vec![
+                MameSetFix {
+                    current_path: parent.clone(),
+                    correct_path: parent_target.clone(),
+                    set_name: Some("parent".into()),
+                    parent: None,
+                    status: MameFixStatus::Safe,
+                    members: vec![],
+                    missing_members: vec![],
+                    reason: None,
+                },
+                MameSetFix {
+                    current_path: clone.clone(),
+                    correct_path: clone_target.clone(),
+                    set_name: Some("clone".into()),
+                    parent: Some("parent".into()),
+                    status: MameFixStatus::Safe,
+                    members: vec![],
+                    missing_members: vec![],
+                    reason: None,
+                },
+            ],
+            split_rebuilds: vec![MameSplitRebuild {
+                parent_path: parent.clone(),
+                parent_target: parent_target.clone(),
+                clone_path: clone.clone(),
+                clone_target: clone_target.clone(),
+                parent_members: vec![MameRebuildMember {
+                    source_path: parent.clone(),
+                    destination_path: parent_target.clone(),
+                    source_member: "shared.bin".into(),
+                    correct: "shared.bin".into(),
+                    sha256: shared,
+                }],
+                clone_members: vec![MameRebuildMember {
+                    source_path: clone.clone(),
+                    destination_path: clone_target.clone(),
+                    source_member: "clone.bin".into(),
+                    correct: "clone.bin".into(),
+                    sha256: clone_hash,
+                }],
+                moved_members: 2,
+            }],
+            summary: Default::default(),
+        };
+        let journal = root.join("batch.json");
+        apply_mame_normalisation(&plan, &journal).expect("directory apply");
+        assert_eq!(verify_mame_normalisation(&plan).unwrap(), 2);
+        assert_eq!(
+            fs::read(parent_target.join("shared.bin")).unwrap(),
+            b"shared"
+        );
+        assert_eq!(fs::read(clone_target.join("clone.bin")).unwrap(), b"clone");
+        assert_eq!(
+            fs::read(clone_target.join("user-extra.txt")).unwrap(),
+            b"preserve"
+        );
+        undo_mame_normalisation(&journal).expect("directory undo");
+        assert!(parent.is_dir());
+        assert!(clone.is_dir());
+        assert!(!parent_target.exists());
+        assert!(!clone_target.exists());
     }
 
     fn parent_clone_dat() -> ParsedDat {

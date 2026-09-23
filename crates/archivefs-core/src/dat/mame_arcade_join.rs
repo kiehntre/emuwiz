@@ -199,8 +199,7 @@ pub fn refresh_mame_member_evidence(
             .games
             .iter()
             .filter(|game| {
-                game.name == family_parent
-                    || game.clone_of.as_deref() == Some(family_parent)
+                game.name == family_parent || game.clone_of.as_deref() == Some(family_parent)
             })
             .map(|game| game.name.clone())
             .collect::<BTreeSet<_>>()
@@ -271,7 +270,9 @@ pub fn refresh_mame_member_evidence(
             };
             let file_size = metadata.len();
             #[cfg(unix)]
-            let modified_time_ns = metadata.mtime().saturating_mul(1_000_000_000)
+            let modified_time_ns = metadata
+                .mtime()
+                .saturating_mul(1_000_000_000)
                 .saturating_add(metadata.mtime_nsec());
             #[cfg(not(unix))]
             let modified_time_ns = metadata
@@ -331,9 +332,15 @@ pub fn refresh_mame_member_evidence(
             let (target_member_name, failure_reason) = if matches.len() == 1 {
                 (Some(matches[0].name.clone()), None)
             } else if matches.is_empty() {
-                (None, Some("checksum does not match this DAT set".to_string()))
+                (
+                    None,
+                    Some("checksum does not match this DAT set".to_string()),
+                )
             } else {
-                (None, Some("checksum is ambiguous within this DAT set".to_string()))
+                (
+                    None,
+                    Some("checksum is ambiguous within this DAT set".to_string()),
+                )
             };
             let actionable = target_member_name.is_some();
             if actionable {
@@ -1169,7 +1176,9 @@ mod tests {
         fs::write(&member_path, b"cache fixture").unwrap();
         let metadata = fs::metadata(&member_path).unwrap();
         #[cfg(unix)]
-        let modified_time_ns = metadata.mtime().saturating_mul(1_000_000_000)
+        let modified_time_ns = metadata
+            .mtime()
+            .saturating_mul(1_000_000_000)
             .saturating_add(i64::from(metadata.mtime_nsec()));
         #[cfg(not(unix))]
         let modified_time_ns = 0;
@@ -1188,44 +1197,50 @@ mod tests {
             evidence_version: MAME_MEMBER_EVIDENCE_VERSION.into(),
             observed_at: "test".into(),
         };
-        let mut database = crate::Database::open_or_create(directory.path().join("library.sqlite3"))
-            .unwrap();
+        let mut database =
+            crate::Database::open_or_create(directory.path().join("library.sqlite3")).unwrap();
         database
             .persist_mame_member_evidence_set("mame-arcade:test", "fixture", &[row])
             .unwrap();
-        assert!(database
-            .cached_mame_member_evidence(
-                "mame-arcade:test",
-                &member_path,
-                "wrong-name.bin",
-                metadata.len(),
-                modified_time_ns,
-            )
-            .unwrap()
-            .is_some());
-        assert!(database
-            .cached_mame_member_evidence(
-                "mame-arcade:test",
-                &member_path,
-                "wrong-name.bin",
-                metadata.len() + 1,
-                modified_time_ns,
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            database
+                .cached_mame_member_evidence(
+                    "mame-arcade:test",
+                    &member_path,
+                    "wrong-name.bin",
+                    metadata.len(),
+                    modified_time_ns,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            database
+                .cached_mame_member_evidence(
+                    "mame-arcade:test",
+                    &member_path,
+                    "wrong-name.bin",
+                    metadata.len() + 1,
+                    modified_time_ns,
+                )
+                .unwrap()
+                .is_none()
+        );
         database
             .persist_mame_member_evidence_set("mame-arcade:test", "fixture", &[])
             .unwrap();
-        assert!(database
-            .cached_mame_member_evidence(
-                "mame-arcade:test",
-                &member_path,
-                "wrong-name.bin",
-                metadata.len(),
-                modified_time_ns,
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            database
+                .cached_mame_member_evidence(
+                    "mame-arcade:test",
+                    &member_path,
+                    "wrong-name.bin",
+                    metadata.len(),
+                    modified_time_ns,
+                )
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn set(root: &Path, name: &str, members: &[&str]) -> ArcadeSetDirectory {

@@ -17,15 +17,16 @@ use eframe::egui::{self, RichText};
 use std::path::PathBuf;
 
 use archivefs_core::dat::limits::DatLimits;
-use archivefs_core::dat::mame_normalizer::{
-    MameCollectionMode, MameFixStatus, MameNormalisationPlan, detect_mame_collection_mode,
-    plan_mame_normalisation,
-};
 use archivefs_core::dat::mame_arcade_join::{
     load_verified_mame_0174, refresh_mame_member_evidence,
 };
+use archivefs_core::dat::mame_normalizer::{
+    MameCollectionMode, MameFixStatus, MameNormalisationPlan, detect_mame_collection_mode,
+    plan_mame_normalisation, plan_mame_normalisation_from_verified_joins,
+};
 use archivefs_core::dat::parsers::parse_dat_file;
 use archivefs_core::{Database, default_database_path};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum OrganisationView {
@@ -355,10 +356,12 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                         }
                     }
                 }
-                Ok(outcome) => match plan_mame_normalisation(root, &outcome.dat, state.mame_mode) {
-                    Ok(plan) => state.mame_plan = Some(plan),
-                    Err(error) => state.mame_message = Some(error),
-                },
+                Ok(outcome) => {
+                    match verified_mame_plan(root, dat_path, &outcome.dat, state.mame_mode) {
+                        Ok(plan) => state.mame_plan = Some(plan),
+                        Err(error) => state.mame_message = Some(error),
+                    }
+                }
                 Err(error) => {
                     state.mame_message = Some(format!("The DAT could not be read: {error}"))
                 }
@@ -375,7 +378,7 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
         ui.label(format!("{} sets checked · {} can be fixed automatically · {} already correct · {} need attention", s.total_sets, s.safe, s.already_correct, s.needs_attention + s.collisions + s.missing_data + s.unknown));
         if s.split_rebuilds > 0 {
             ui.label(format!(
-                "{} Split parent/clone families can be rebuilt safely · {} verified members move between archives",
+                "{} Split parent/clone families will rebuild extracted directories safely · {} verified members will be placed",
                 s.split_rebuilds, s.moved_members
             ));
         }
@@ -396,11 +399,20 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             }
         }
         ui.horizontal(|ui| {
-            if ui.button("Fix library").clicked()
+            if ui.button("Rebuild verified directories / Fix library").clicked()
                 && let Some(root) = &state.mame_root
             {
+                let family = state.mame_evidence_set.trim();
+                if family.is_empty() {
+                    state.mame_message = Some("Enter one parent/clone family before applying. Directory Split apply is intentionally family-scoped; preview remains read-only until then.".into());
+                    return;
+                }
+                let Some(family_plan) = family_plan(plan, family) else {
+                    state.mame_message = Some(format!("No verified Split rebuild plan was found for family {family}. Nothing was changed."));
+                    return;
+                };
                 let journal = root.join(".emuwiz-mame-normaliser.json");
-                match archivefs_core::dat::mame_normalizer::apply_mame_normalisation(plan, &journal) {
+                match archivefs_core::dat::mame_normalizer::apply_mame_normalisation(&family_plan, &journal) {
                     Ok(count) => state.mame_message = Some(format!("Applied {count} safe set repairs. Verification is complete for staged archives.")),
                     Err(error) => state.mame_message = Some(format!("Repair stopped safely: {error}")),
                 }
@@ -418,15 +430,66 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
     }
 }
 
+fn family_plan(plan: &MameNormalisationPlan, family: &str) -> Option<MameNormalisationPlan> {
+    let paths = plan
+        .split_rebuilds
+        .iter()
+        .filter(|rebuild| {
+            [
+                &rebuild.parent_path,
+                &rebuild.clone_path,
+                &rebuild.parent_target,
+                &rebuild.clone_target,
+            ]
+            .into_iter()
+            .any(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy() == family)
+            })
+        })
+        .flat_map(|rebuild| [rebuild.parent_path.clone(), rebuild.clone_path.clone()])
+        .collect::<std::collections::BTreeSet<_>>();
+    if paths.is_empty() {
+        return None;
+    }
+    let mut selected = plan.clone();
+    selected.split_rebuilds.retain(|rebuild| {
+        paths.contains(&rebuild.parent_path) && paths.contains(&rebuild.clone_path)
+    });
+    selected
+        .sets
+        .retain(|set| paths.contains(&set.current_path));
+    Some(selected)
+}
+
+fn verified_mame_plan(
+    root: &std::path::Path,
+    dat_path: &std::path::Path,
+    dat: &archivefs_core::dat::model::ParsedDat,
+    mode: MameCollectionMode,
+) -> Result<MameNormalisationPlan, String> {
+    let digest = Sha256::digest(std::fs::read(dat_path).map_err(|e| e.to_string())?);
+    let dat_sha256 = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if let Ok(database_path) = default_database_path()
+        && let Ok(database) = Database::open_read_only(&database_path)
+        && let Ok(joins) = database.mame_arcade_join_paths_for_dat(&dat_sha256)
+        && !joins.is_empty()
+    {
+        return plan_mame_normalisation_from_verified_joins(root, dat, &joins, mode);
+    }
+    plan_mame_normalisation(root, dat, mode)
+}
+
 fn refresh_mame_evidence(state: &mut OrganisationState, requested_set: Option<String>) {
     let (Some(root), Some(dat_path)) = (&state.mame_root, &state.mame_dat) else {
         state.mame_message = Some("Choose both the MAME folder and its verified DAT first.".into());
         return;
     };
     match load_verified_mame_0174(dat_path) {
-        Ok(dat) => match default_database_path()
-            .and_then(|path| Database::open_or_create(&path))
-        {
+        Ok(dat) => match default_database_path().and_then(|path| Database::open_or_create(&path)) {
             Ok(mut database) => match refresh_mame_member_evidence(
                 &mut database,
                 &dat,
@@ -445,11 +508,19 @@ fn refresh_mame_evidence(state: &mut OrganisationState, requested_set: Option<St
                         report.members_failed
                     ));
                 }
-                Err(error) => state.mame_message = Some(format!("Evidence refresh stopped safely: {error}")),
+                Err(error) => {
+                    state.mame_message = Some(format!("Evidence refresh stopped safely: {error}"))
+                }
             },
-            Err(error) => state.mame_message = Some(format!("Could not open the evidence database: {error}")),
+            Err(error) => {
+                state.mame_message = Some(format!("Could not open the evidence database: {error}"))
+            }
         },
-        Err(error) => state.mame_message = Some(format!("The selected DAT is not the verified MAME 0.174 Arcade DAT: {error}")),
+        Err(error) => {
+            state.mame_message = Some(format!(
+                "The selected DAT is not the verified MAME 0.174 Arcade DAT: {error}"
+            ))
+        }
     }
 }
 
