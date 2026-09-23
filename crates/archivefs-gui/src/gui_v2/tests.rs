@@ -6,6 +6,13 @@ use super::{
     media_sources::{Kind, MediaIndex, Source},
 };
 use archivefs_core::PersistedArchive;
+use archivefs_core::game_identity::{
+    IdentityConfidence, IdentityEvidence, IdentityKind, IdentityProvenance, IdentityStatus,
+};
+use archivefs_core::persistent_state_inventory::{
+    PersistentStateInventory, PersistentStateRecord, PersistentStateType, PortabilityClass,
+    StateEmulator, StatePathOrigin,
+};
 use std::{fs, path::Path, sync::atomic::Ordering};
 
 fn archive(id: i64, title: &str, platform: Option<&str>) -> PersistedArchive {
@@ -104,6 +111,23 @@ fn frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOu
     )
 }
 
+fn saves_frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            ..Default::default()
+        },
+        |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                super::saves_states::show(app, ui);
+            });
+        },
+    )
+}
+
 fn text(output: &egui::FullOutput) -> Vec<String> {
     fn gather(shape: &egui::Shape, output: &mut Vec<String>) {
         match shape {
@@ -121,6 +145,119 @@ fn text(output: &egui::FullOutput) -> Vec<String> {
         gather(&shape.shape, &mut texts);
     }
     texts
+}
+
+fn state_record(state_type: PersistentStateType, emulator: StateEmulator) -> PersistentStateRecord {
+    PersistentStateRecord {
+        emulator,
+        selected_installation: None,
+        state_type,
+        game_identity: Vec::new(),
+        path: "/fixture/saves/checkpoint.bin".into(),
+        container_path: None,
+        slot_profile_account: None,
+        emulator_version: None,
+        firmware_context: None,
+        portability_class: PortabilityClass::SafeToCopy,
+        source_path_origin: StatePathOrigin::Configured,
+        provenance: "fixture".into(),
+        sha256: None,
+        size_bytes: 128,
+        warnings: Vec::new(),
+    }
+}
+
+fn saves_inventory(records: Vec<PersistentStateRecord>) -> PersistentStateInventory {
+    PersistentStateInventory {
+        records,
+        warnings: Vec::new(),
+        roots_inspected: 1,
+        read_only: true,
+    }
+}
+
+#[test]
+fn gui_v2_saves_empty_state_explains_read_only_discovery() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.saves_states.inventory = Some(saves_inventory(Vec::new()));
+    app.router.current = Route::Section(Section::Saves);
+
+    let strings = text(&saves_frame(&context, &mut app, [1280.0, 720.0]));
+    for expected in [
+        "Your progress, preserved safely.",
+        "No saves found yet",
+        "game saves, memory cards and savestates",
+        "Inspection never changes them",
+        "Refresh save locations",
+    ] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "missing {expected}"
+        );
+    }
+}
+
+#[test]
+fn gui_v2_saves_populated_state_keeps_save_types_and_game_identity_scanable() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let mut selected = state_record(PersistentStateType::NativeSave, StateEmulator::DuckStation);
+    selected.game_identity.push(IdentityEvidence {
+        kind: IdentityKind::Ps1Serial,
+        status: IdentityStatus::Verified,
+        value: Some("SLUS-20312".into()),
+        confidence: IdentityConfidence::ExactBytes,
+        provenance: IdentityProvenance {
+            archive_path: "/fixture/game.iso".into(),
+            member_path: None,
+            member_index: None,
+            method: "fixture".into(),
+        },
+        diagnostic: "fixture".into(),
+    });
+    app.saves_states.inventory = Some(saves_inventory(vec![
+        selected,
+        state_record(PersistentStateType::SaveState, StateEmulator::DuckStation),
+        state_record(PersistentStateType::MemoryCard, StateEmulator::Pcsx2),
+    ]));
+    app.router.current = Route::Section(Section::Saves);
+
+    let strings = text(&saves_frame(&context, &mut app, [1280.0, 720.0]));
+    for expected in [
+        "Game save",
+        "Savestate",
+        "Memory card",
+        "Game identity",
+        "SLUS-20312",
+        "Read-only inspection",
+        "Open PS1/PS2 Save Vault",
+    ] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "missing {expected}"
+        );
+    }
+}
+
+#[test]
+fn gui_v2_saves_remains_readable_at_narrow_width() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.saves_states.inventory = Some(saves_inventory(vec![state_record(
+        PersistentStateType::SaveState,
+        StateEmulator::DuckStation,
+    )]));
+    app.router.current = Route::Section(Section::Saves);
+
+    let strings = text(&saves_frame(&context, &mut app, [620.0, 480.0]));
+    assert!(strings.iter().any(|value| value.contains("Saves & States")));
+    assert!(strings.iter().any(|value| value.contains("Savestate")));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Read-only inspection"))
+    );
 }
 
 #[test]
