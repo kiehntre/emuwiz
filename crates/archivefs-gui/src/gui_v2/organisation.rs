@@ -367,6 +367,18 @@ impl App {
                         });
                         ui.add_space(theme::SPACE_SM);
                     }
+                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                        ui.horizontal(|ui| {
+                            motif_plate(ui, 56.0, CardKind::VerifiedGames);
+                            ui.add_space(theme::SPACE_SM);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Fix my MAME library").size(theme::SECTION_TITLE_SIZE).strong());
+                                ui.label("Use verified MAME evidence to review safe set repairs.");
+                                ui.label(RichText::new("Preview required · Evidence must be sufficient · Recovery remains available").strong().color(theme::TEAL));
+                            });
+                        });
+                    });
+                    ui.add_space(theme::SPACE_SM);
                     if ui.button("Advanced organisation tools").clicked() {
                         advanced = true;
                     }
