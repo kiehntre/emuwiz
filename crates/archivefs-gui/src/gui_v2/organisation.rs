@@ -14,6 +14,19 @@ use crate::{
     rom_organisation_page::{self, RomOrganisationPageAction},
 };
 use eframe::egui::{self, RichText};
+use std::path::PathBuf;
+
+use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::mame_arcade_join::{
+    load_verified_mame_0174, refresh_mame_member_evidence,
+};
+use archivefs_core::dat::mame_normalizer::{
+    MameCollectionMode, MameNormalisationPlan, detect_mame_collection_mode,
+    plan_mame_normalisation, plan_mame_normalisation_from_verified_joins,
+};
+use archivefs_core::dat::parsers::parse_dat_file;
+use archivefs_core::{Database, default_database_path};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum OrganisationView {
@@ -21,11 +34,19 @@ pub(super) enum OrganisationView {
     Landing,
     VerifiedGames,
     PlayingLibrary,
+    MameNormalizer,
 }
 
 #[derive(Default)]
 pub(super) struct OrganisationState {
     pub(super) view: OrganisationView,
+    pub(super) mame_root: Option<PathBuf>,
+    pub(super) mame_dat: Option<PathBuf>,
+    pub(super) mame_plan: Option<MameNormalisationPlan>,
+    pub(super) mame_mode: MameCollectionMode,
+    pub(super) mame_detected_mode: Option<MameCollectionMode>,
+    pub(super) mame_message: Option<String>,
+    pub(super) mame_evidence_set: String,
     /// Dismisses the plain-English "how this works" explainer. Session-only
     /// (never persisted): a returning user who already knows the model is
     /// not asked to re-learn it every visit within the same run, but nothing
@@ -248,6 +269,186 @@ fn motif_plate(ui: &mut egui::Ui, side: f32, kind: CardKind) {
     kind.paint(ui, rect.shrink(side * 0.12));
 }
 
+fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
+    ui.label("Wizzy only changes files when the selected DAT proves their identity by checksum.");
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Choose MAME folder…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose MAME folder")
+                .pick_folder()
+        {
+            state.mame_root = Some(path);
+            state.mame_plan = None;
+        }
+        if ui.button("Choose DAT…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("DAT files", &["dat", "xml"])
+                .pick_file()
+        {
+            state.mame_dat = Some(path);
+            state.mame_plan = None;
+        }
+    });
+    ui.label(format!(
+        "MAME folder: {}",
+        state
+            .mame_root
+            .as_deref()
+            .map_or("not selected".into(), |p| p.display().to_string())
+    ));
+    ui.label(format!(
+        "DAT: {}",
+        state
+            .mame_dat
+            .as_deref()
+            .map_or("not selected".into(), |p| p.display().to_string())
+    ));
+    ui.horizontal(|ui| {
+        ui.label("Collection layout:");
+        for (mode, label) in [
+            (MameCollectionMode::Merged, "Merged"),
+            (MameCollectionMode::Split, "Split"),
+            (MameCollectionMode::NonMerged, "Non-merged"),
+            (MameCollectionMode::NotSure, "Not sure"),
+        ] {
+            ui.radio_value(&mut state.mame_mode, mode, label);
+        }
+    });
+    ui.separator();
+    ui.heading("Refresh physical member evidence");
+    ui.label("Read-only: reusable checksum evidence is stored before any repair is considered.");
+    ui.horizontal(|ui| {
+        ui.label("Optional set/family:");
+        ui.text_edit_singleline(&mut state.mame_evidence_set);
+    });
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Refresh selected family").clicked() {
+            let family = state.mame_evidence_set.trim().to_string();
+            if family.is_empty() {
+                state.mame_message = Some("Enter a MAME set name first.".into());
+            } else {
+                refresh_mame_evidence(state, Some(family));
+            }
+        }
+        if ui.button("Refresh selected folder").clicked() {
+            refresh_mame_evidence(state, None);
+        }
+    });
+    if ui.button("Preview fixes").clicked() {
+        match (&state.mame_root, &state.mame_dat) {
+            (Some(root), Some(dat_path)) => match parse_dat_file(dat_path, DatLimits::default()) {
+                Ok(outcome) if state.mame_mode == MameCollectionMode::NotSure => {
+                    state.mame_detected_mode = detect_mame_collection_mode(root, &outcome.dat).ok();
+                    state.mame_message =
+                        Some("Confirm the detected layout, then preview fixes again.".into());
+                }
+                Ok(outcome) => {
+                    match verified_mame_plan(root, dat_path, &outcome.dat, state.mame_mode) {
+                        Ok(plan) => state.mame_plan = Some(plan),
+                        Err(error) => state.mame_message = Some(error),
+                    }
+                }
+                Err(error) => {
+                    state.mame_message = Some(format!("The DAT could not be read: {error}"))
+                }
+            },
+            _ => state.mame_message = Some("Choose both the MAME folder and its DAT first.".into()),
+        }
+    }
+    if let Some(message) = &state.mame_message {
+        ui.label(message);
+    }
+    if let Some(plan) = &state.mame_plan {
+        let summary = &plan.summary;
+        ui.label(format!(
+            "{} sets checked · {} safe · {} need attention",
+            summary.total_sets,
+            summary.safe,
+            summary.needs_attention + summary.collisions + summary.missing_data + summary.unknown
+        ));
+        ui.horizontal(|ui| {
+            if ui.button("Apply verified repairs").clicked()
+                && let Some(root) = &state.mame_root
+            {
+                let journal = root.join(".emuwiz-mame-normaliser.json");
+                state.mame_message =
+                    match archivefs_core::dat::mame_normalizer::apply_mame_normalisation(
+                        plan, &journal,
+                    ) {
+                        Ok(count) => Some(format!("Applied {count} safe set repairs.")),
+                        Err(error) => Some(format!("Repair stopped safely: {error}")),
+                    };
+            }
+            if ui.button("Undo this repair batch").clicked()
+                && let Some(root) = &state.mame_root
+            {
+                let journal = root.join(".emuwiz-mame-normaliser.json");
+                state.mame_message =
+                    match archivefs_core::dat::mame_normalizer::undo_mame_normalisation(&journal) {
+                        Ok(count) => Some(format!("Undid {count} safe set repairs.")),
+                        Err(error) => Some(format!("Undo stopped safely: {error}")),
+                    };
+            }
+        });
+    }
+}
+
+fn verified_mame_plan(
+    root: &std::path::Path,
+    dat_path: &std::path::Path,
+    dat: &archivefs_core::dat::model::ParsedDat,
+    mode: MameCollectionMode,
+) -> Result<MameNormalisationPlan, String> {
+    let digest = Sha256::digest(std::fs::read(dat_path).map_err(|e| e.to_string())?);
+    let dat_sha256 = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if let Ok(path) = default_database_path()
+        && let Ok(database) = Database::open_read_only(&path)
+        && let Ok(joins) = database.mame_arcade_join_paths_for_dat(&dat_sha256)
+        && !joins.is_empty()
+    {
+        return plan_mame_normalisation_from_verified_joins(root, dat, &joins, mode);
+    }
+    plan_mame_normalisation(root, dat, mode)
+}
+
+fn refresh_mame_evidence(state: &mut OrganisationState, requested_set: Option<String>) {
+    let (Some(root), Some(dat_path)) = (&state.mame_root, &state.mame_dat) else {
+        state.mame_message = Some("Choose both the MAME folder and its verified DAT first.".into());
+        return;
+    };
+    match load_verified_mame_0174(dat_path) {
+        Ok(dat) => match default_database_path().and_then(|path| Database::open_or_create(&path)) {
+            Ok(mut database) => match refresh_mame_member_evidence(
+                &mut database,
+                &dat,
+                root,
+                requested_set.as_deref(),
+            ) {
+                Ok(report) => {
+                    state.mame_message = Some(format!(
+                        "Evidence refresh complete: {} sets, {} members; ROM files were not changed.",
+                        report.sets_published, report.members_seen
+                    ))
+                }
+                Err(error) => {
+                    state.mame_message = Some(format!("Evidence refresh stopped safely: {error}"))
+                }
+            },
+            Err(error) => {
+                state.mame_message = Some(format!("Could not open the evidence database: {error}"))
+            }
+        },
+        Err(error) => {
+            state.mame_message = Some(format!(
+                "The selected DAT is not the verified MAME 0.174 Arcade DAT: {error}"
+            ))
+        }
+    }
+}
+
 /// A destination's short heading identity (icon plate + accent-coloured
 /// label) reused above the delegated preview/apply views so a returning
 /// user can tell at a glance which target they are inside without the
@@ -341,7 +542,9 @@ impl App {
                         });
                         ui.add_space(theme::SPACE_SM);
                     }
-                    ui.label(RichText::new("Fix my MAME library").strong().color(theme::TEAL));
+                    if ui.button(RichText::new("Fix my MAME library").strong().color(theme::TEAL)).clicked() {
+                        self.organisation.view = OrganisationView::MameNormalizer;
+                    }
                     ui.label("Source untouched until a reviewed preview is confirmed.");
                     for card in ACTIONS {
                         widgets::workflow_card(ui, card.kind.accent(), |ui| {
@@ -428,6 +631,15 @@ impl App {
                         &mut self.playing_library,
                         self.playing_library_job.is_some(),
                     );
+                }
+                OrganisationView::MameNormalizer => {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("← Organisation").clicked() {
+                            back = true;
+                        }
+                        ui.heading("Fix my MAME library");
+                    });
+                    show_mame_normalizer(ui, &mut self.organisation);
                 }
             });
 
