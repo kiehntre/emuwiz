@@ -18,6 +18,7 @@ use crate::local_mod_package_page::{
     LocalModPackagePageState, show_local_mod_package_panel_with_catalogue,
 };
 use crate::ui::components as widgets;
+use crate::ui::theme;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
@@ -82,8 +83,25 @@ pub(super) fn show_mods_page(
     egui::ScrollArea::vertical()
         .id_salt("v2_mods_native")
         .show(ui, |ui| {
-            ui.heading("Mods & Cheats");
-            ui.label("Inspect changes before installing them. EmuWiz never changes a game until you confirm a safe preview.");
+            widgets::workshop_light_header(
+                ui,
+                "Cheats & Mods workshop",
+                "Tinker, customise and experiment safely — every change is reviewed before it is applied.",
+                |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::status_badge(
+                            ui,
+                            "Original game stays untouched until you confirm",
+                            widgets::StatusTone::Success,
+                        );
+                        widgets::status_badge(
+                            ui,
+                            "Reviewable change history",
+                            widgets::StatusTone::Info,
+                        );
+                    });
+                },
+            );
 
             let tabs = [
                 (Tab::Installed, "Installed"),
@@ -100,23 +118,33 @@ pub(super) fn show_mods_page(
                 }
             });
             ui.separator();
-
-            match state.tab {
-                Tab::Installed => installed(ui, state.history.as_ref(), selected_game),
-                Tab::Add => add_package(ui, &mut state.local, selected_game),
-                Tab::Stack => stack(ui, state.history.as_ref(), selected_game),
-                Tab::Conflicts => conflicts(ui, state.history.as_ref(), selected_game),
-                Tab::Cheats => {
-                    destination = workflows.show_cheats(ui, selected_game, activity);
+            if state.tab == Tab::Cheats && selected_game.is_none() {
+                destination = workflows.show_cheats(ui, selected_game, activity);
+            } else {
+                selected_game_strip(ui, selected_game);
+                workshop_lanes(ui, &mut state.tab);
+                match state.tab {
+                    Tab::Installed => installed(ui, state.history.as_ref(), selected_game),
+                    Tab::Add => add_package(ui, &mut state.local, selected_game),
+                    Tab::Stack => stack(ui, state.history.as_ref(), selected_game),
+                    Tab::Conflicts => conflicts(ui, state.history.as_ref(), selected_game),
+                    Tab::Cheats => {
+                        destination = workflows.show_cheats(ui, selected_game, activity);
+                    }
                 }
             }
 
             if let Some(error) = &state.history_error {
                 ui.collapsing("Advanced details", |ui| ui.label(error));
             }
-            if ui.button("Refresh installed history").clicked() {
-                state.refresh_history();
-            }
+            ui.add_space(theme::SPACE_SM);
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Change history & recovery");
+                ui.label("Review what was changed, and use undo only where EmuWiz reports it is safe.");
+                if ui.button("Refresh history").clicked() {
+                    state.refresh_history();
+                }
+            });
         });
 
     let busy = state.local.is_busy();
@@ -137,6 +165,118 @@ pub(super) fn show_mods_page(
         state.refresh_history();
     }
     destination
+}
+
+fn selected_game_strip(ui: &mut egui::Ui, game: Option<&crate::gui_v2::library::Game>) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("◈").size(28.0).color(theme::TEAL));
+            ui.vertical(|ui| match game {
+                Some(game) => {
+                    ui.label(
+                        egui::RichText::new(&game.title)
+                            .size(theme::SECTION_TITLE_SIZE)
+                            .strong(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        widgets::info_chip(ui, &game.platform);
+                        widgets::status_badge(ui, "Game selected", widgets::StatusTone::Active);
+                    });
+                    ui.label(
+                        "Changes are scoped to this game and its supported emulator locations.",
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("No game on the bench yet")
+                            .size(theme::SECTION_TITLE_SIZE)
+                            .strong(),
+                    );
+                    ui.label(
+                        "Open a game from Games to inspect its cheats, mods and change history.",
+                    );
+                }
+            });
+        });
+    });
+}
+
+fn workshop_lanes(ui: &mut egui::Ui, tab: &mut Tab) {
+    ui.label(
+        egui::RichText::new("Choose your workbench")
+            .size(theme::SECTION_TITLE_SIZE)
+            .strong(),
+    );
+    ui.horizontal_wrapped(|ui| {
+        lane_card(
+            ui,
+            "Cheats",
+            "Gameplay codes you can enable or disable. Preview and apply them through the selected emulator when supported.",
+            *tab == Tab::Cheats,
+            || *tab = Tab::Cheats,
+        );
+        lane_card(
+            ui,
+            "Mods",
+            "Texture packs, patches and replacement files. Inspect local or provider-supplied packages before they touch an emulator folder.",
+            *tab != Tab::Cheats,
+            || *tab = Tab::Installed,
+        );
+    });
+}
+
+fn lane_card(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool, choose: impl FnOnce()) {
+    let width = ((ui.available_width() - theme::SPACE_MD) / 2.0).clamp(260.0, 520.0);
+    let response = egui::Frame::new()
+        .fill(if selected {
+            theme::PRIMARY_ACTION.gamma_multiply(0.24)
+        } else {
+            theme::CARD_SURFACE
+        })
+        .stroke(egui::Stroke::new(
+            if selected { 1.5_f32 } else { 1.0_f32 },
+            if selected {
+                theme::TEAL
+            } else {
+                theme::BORDER_SUBTLE
+            },
+        ))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(width - 20.0);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(if title == "Cheats" { "CODE" } else { "PATCH" })
+                            .color(theme::TEAL)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(title)
+                            .size(theme::SECTION_TITLE_SIZE)
+                            .strong(),
+                    );
+                });
+                ui.label(egui::RichText::new(detail).color(theme::muted(ui)));
+                ui.label(
+                    egui::RichText::new(if selected {
+                        "Selected workbench"
+                    } else {
+                        "Open this workbench"
+                    })
+                    .color(if selected {
+                        theme::TEAL
+                    } else {
+                        theme::muted(ui)
+                    }),
+                );
+            });
+        })
+        .response;
+    if response.interact(egui::Sense::click()).clicked() {
+        choose();
+    }
 }
 
 fn selected_identity(game: Option<&crate::gui_v2::library::Game>) -> Option<String> {
@@ -178,7 +318,7 @@ fn installed(
     };
     let receipts = for_game(history, game);
     if receipts.is_empty() {
-        ui.label("No installed mod transactions were found for this game.");
+        ui.label("Nothing has been installed for this game yet.");
         ui.label("Choose Available packages to inspect a local mod safely.");
         return;
     }
@@ -189,7 +329,21 @@ fn installed(
 
 fn receipt_card(ui: &mut egui::Ui, receipt: &ModReceiptSummary) {
     widgets::card(ui, |ui| {
-        ui.strong(receipt.kind.label());
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(receipt.kind.label());
+            widgets::status_badge(
+                ui,
+                receipt.rollback.label(),
+                if matches!(
+                    receipt.rollback,
+                    archivefs_core::mod_history::ModRollbackStatus::ReadyToUndo
+                ) {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Info
+                },
+            );
+        });
         ui.label(format!(
             "{} · {} changed · {}",
             receipt.platform.as_deref().unwrap_or("Unknown system"),
@@ -205,6 +359,7 @@ fn receipt_card(ui: &mut egui::Ui, receipt: &ModReceiptSummary) {
                 "Potential mod conflict — review related transactions.",
             );
         }
+        ui.label("This receipt records what changed and whether recovery is available.");
         ui.collapsing("Details", |ui| {
             ui.label(format!("Transaction: {}", receipt.transaction_id));
             if let Some(identity) = &receipt.verified_identity {
@@ -237,22 +392,23 @@ fn add_package(
 ) {
     let Some(game) = game else {
         widgets::card(ui, |ui| {
-            ui.heading("Choose a game first");
+            ui.heading("Put a game on the bench first");
             ui.label("Open a game from Games, then choose Mods & Cheats to inspect a compatible package.");
+            ui.label("Browsing is safe: no original files are changed by opening this page.");
         });
         return;
     };
     let Some(identity) = game.archive.identity_report.as_ref() else {
         widgets::card(ui, |ui| {
-            ui.heading("This game needs verified identity");
+            ui.heading("This game needs a verified identity");
             ui.label("EmuWiz will not guess which game a mod belongs to. Verify the game before installing a package.");
         });
         return;
     };
     widgets::card(ui, |ui| {
-        ui.heading("Add a local mod");
+        ui.heading("Inspect a mod package");
         ui.label(format!("Game: {} · {}", game.title, game.platform));
-        ui.label("Choose a package or folder. Inspection is read-only and shows every file, conflict, and compatibility decision before apply.");
+        ui.label("Choose a local package or folder. Inspection is read-only and shows every file, conflict and compatibility decision before apply.");
     });
     show_local_mod_package_panel_with_catalogue(
         ui,
