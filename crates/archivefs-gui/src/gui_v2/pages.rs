@@ -135,6 +135,7 @@ impl App {
             });
         egui::CentralPanel::default().show(context, |ui| {
             self.header(ui);
+            self.toolbar(ui);
             if let Some(notice) = &self.notice {
                 let mut dismiss = false;
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -162,6 +163,9 @@ impl App {
                 Route::Section(Section::Duplicates) => self.duplicates(ui),
                 Route::Section(Section::Problems) => self.problems(ui),
                 Route::Section(Section::Build) => self.organisation_page(ui),
+                Route::Section(Section::Converter | Section::Museum) => {
+                    self.handoff(ui, self.router.current.section())
+                }
                 Route::Section(Section::Setup) => self.setup_doctor(ui),
                 Route::Section(Section::Platforms) => self.platforms(ui),
                 Route::Game(id) => self.game_detail(ui, id),
@@ -208,7 +212,10 @@ impl App {
 
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Back").clicked() {
+            if ui
+                .add_enabled(self.router.can_back(), egui::Button::new("Back"))
+                .clicked()
+            {
                 self.back();
             }
             if ui.button("Home").clicked() {
@@ -241,6 +248,45 @@ impl App {
             self.router.current.section().purpose()
         });
         ui.separator();
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("v2_top_toolbar")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(self.router.can_back(), egui::Button::new("← Back"))
+                            .on_hover_text("Return to the previous GUI v2 page.")
+                            .clicked()
+                        {
+                            self.back();
+                        }
+                        let destinations = [
+                            ("Home", Route::Home),
+                            ("Games", Route::Section(Section::Games)),
+                            ("Platforms", Route::Section(Section::Platforms)),
+                            ("Organisation", Route::Section(Section::Build)),
+                            ("Launch", Route::Section(Section::Launch)),
+                            ("Converter", Route::Section(Section::Converter)),
+                            ("Museum", Route::Section(Section::Museum)),
+                            ("Setup & Doctor", Route::Section(Section::Setup)),
+                        ];
+                        for (label, route) in destinations {
+                            let selected = self.router.current.section() == route.section();
+                            if ui
+                                .add(egui::Button::new(label).selected(selected))
+                                .on_hover_text(format!("Open {label}."))
+                                .clicked()
+                            {
+                                self.go(route);
+                            }
+                        }
+                    });
+                });
+        });
     }
 
     fn setup_doctor(&mut self, ui: &mut egui::Ui) {

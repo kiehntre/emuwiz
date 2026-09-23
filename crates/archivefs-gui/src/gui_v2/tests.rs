@@ -142,6 +142,60 @@ fn gui_v2_navigation_keeps_selection_and_back_history() {
 }
 
 #[test]
+fn gui_v2_top_toolbar_destinations_render_and_share_sidebar_routes() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let output = frame(&context, &mut app, [1280.0, 720.0]);
+    let strings = text(&output);
+
+    for label in [
+        "Home",
+        "Games",
+        "Platforms",
+        "Organisation",
+        "Launch",
+        "Converter",
+        "Museum",
+        "Setup & Doctor",
+    ] {
+        assert!(
+            strings.iter().any(|value| value == label),
+            "missing {label}"
+        );
+    }
+
+    for section in [
+        Section::Games,
+        Section::Platforms,
+        Section::Build,
+        Section::Launch,
+        Section::Converter,
+        Section::Museum,
+        Section::Setup,
+    ] {
+        assert!(routes::SECTIONS.contains(&section));
+        app.go(Route::Section(section));
+        assert_eq!(app.router.current.section(), section);
+    }
+}
+
+#[test]
+fn gui_v2_top_toolbar_back_uses_existing_history_at_narrow_width() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Platforms));
+    assert!(app.router.can_back());
+
+    let output = frame(&context, &mut app, [480.0, 360.0]);
+    let strings = text(&output);
+    assert!(strings.iter().any(|value| value == "← Back"));
+
+    app.back();
+    assert_eq!(app.router.current, Route::Home);
+    assert!(!app.router.can_back());
+}
+
+#[test]
 fn gui_v2_arcade_set_is_a_logical_library_row_with_plain_details() {
     let mut persisted = archive(7, "Pac-Man", Some("Arcade"));
     persisted.archive_kind = "arcade_set_directory".into();

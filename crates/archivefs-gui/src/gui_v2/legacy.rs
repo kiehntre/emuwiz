@@ -12,6 +12,8 @@ pub(super) fn destination(section: Section, selected: bool) -> MainView {
         Section::Check => MainView::CheckGames,
         Section::Problems => MainView::Problems,
         Section::Build => MainView::CanonicalOrganisation,
+        Section::Converter => MainView::DiscConversion,
+        Section::Museum => MainView::Museum,
         Section::Launch if selected => MainView::Selected,
         Section::Launch => MainView::ReadyToPlay,
         Section::Emulators => MainView::EmulatorSetup,

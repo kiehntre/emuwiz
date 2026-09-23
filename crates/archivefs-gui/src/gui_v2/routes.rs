@@ -13,6 +13,8 @@ pub(super) enum Section {
     Check,
     Problems,
     Build,
+    Converter,
+    Museum,
     Launch,
     Emulators,
     Mods,
@@ -35,6 +37,8 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::Check,
     Section::Problems,
     Section::Build,
+    Section::Converter,
+    Section::Museum,
     Section::Launch,
     Section::Emulators,
     Section::Mods,
@@ -59,6 +63,8 @@ impl Section {
             Self::Check => "Check Games",
             Self::Problems => "Problems & Repair",
             Self::Build => "Organisation",
+            Self::Converter => "Converter",
+            Self::Museum => "Museum",
             Self::Launch => "Launch",
             Self::Emulators => "Emulator Setup",
             Self::Mods => "Mods & Cheats",
@@ -87,6 +93,8 @@ impl Section {
             Self::Build => {
                 "Arrange or publish verified games with a preview before anything changes."
             }
+            Self::Converter => "Open the existing verified conversion tools.",
+            Self::Museum => "Browse the existing collection museum by platform.",
             Self::Launch => "Choose a game. EmuWiz checks its setup before starting it.",
             Self::Emulators => {
                 "Find installed emulators and see what they need to play your games."
@@ -113,6 +121,8 @@ impl Section {
             Self::Duplicates => "Review duplicates",
             Self::Problems => "Review problems",
             Self::Build => "Choose an organisation method",
+            Self::Converter => "Open Converter",
+            Self::Museum => "Open Museum",
             Self::Emulators => "Check Emulators",
             Self::Mods => "Choose a game",
             Self::Artwork => "Manage artwork",
@@ -131,6 +141,7 @@ impl Section {
             Self::Duplicates => Some("LIBRARY"),
             Self::Launch => Some("PLAY"),
             Self::Mods => Some("TOOLS"),
+            Self::Converter | Self::Museum => Some("TOOLS"),
             _ => None,
         }
     }
@@ -193,6 +204,10 @@ impl Router {
     }
     pub fn back(&mut self) {
         self.current = self.back.pop().unwrap_or(Route::Home);
+    }
+
+    pub fn can_back(&self) -> bool {
+        !self.back.is_empty()
     }
 }
 
