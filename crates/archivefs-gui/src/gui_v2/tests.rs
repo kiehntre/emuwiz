@@ -2355,47 +2355,46 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
         // tests; this broad sweep verifies the primary action at the normal
         // supported application viewport without conflating page-specific
         // narrow wrapping with route reachability.
-        for size in [[1024.0, 600.0]] {
-            let context = egui::Context::default();
-            let mut app = fixture(&context);
-            app.router.current = Route::Section(section);
-            frame(&context, &mut app, size);
-            let output = frame(&context, &mut app, size);
-            let actions = if section == Section::Setup {
-                vec!["Setup & Doctor"]
-            } else if section == Section::Check {
-                vec!["Choose a platform"]
-            } else if section == Section::Problems {
-                vec![
-                    "Nothing needs attention right now.",
-                    "Checking saved evidence",
-                    "Problems & Repair",
-                ]
-            } else if section == Section::Build {
-                vec![
-                    "Organise verified games",
-                    "Build a clean playing library",
-                    "Organisation",
-                ]
-            } else if section == Section::Sources {
-                vec!["Add source"]
-            } else if section == Section::Dat {
-                vec!["DATs & Verification"]
-            } else if section == Section::Advanced {
-                vec!["Open specialist interface"]
-            } else {
-                vec![section.action()]
-            };
-            assert!(
-                actions.iter().any(|action| {
-                    output
-                        .shapes
-                        .iter()
-                        .any(|shape| visible(&shape.shape, shape.clip_rect, action))
-                }),
-                "primary action is clipped: {section:?} {size:?}"
-            );
-        }
+        let size = [1024.0, 600.0];
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(section);
+        frame(&context, &mut app, size);
+        let output = frame(&context, &mut app, size);
+        let actions = if section == Section::Setup {
+            vec!["Setup & Doctor"]
+        } else if section == Section::Check {
+            vec!["Choose a platform"]
+        } else if section == Section::Problems {
+            vec![
+                "Nothing needs attention right now.",
+                "Checking saved evidence",
+                "Problems & Repair",
+            ]
+        } else if section == Section::Build {
+            vec![
+                "Organise verified games",
+                "Build a clean playing library",
+                "Organisation",
+            ]
+        } else if section == Section::Sources {
+            vec!["Add source"]
+        } else if section == Section::Dat {
+            vec!["DATs & Verification"]
+        } else if section == Section::Advanced {
+            vec!["Open specialist interface"]
+        } else {
+            vec![section.action()]
+        };
+        assert!(
+            actions.iter().any(|action| {
+                output
+                    .shapes
+                    .iter()
+                    .any(|shape| visible(&shape.shape, shape.clip_rect, action))
+            }),
+            "primary action is clipped: {section:?} {size:?}"
+        );
     }
 }
 
