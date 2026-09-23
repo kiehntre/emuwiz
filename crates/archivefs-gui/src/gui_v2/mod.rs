@@ -3,6 +3,7 @@ mod activity;
 mod artwork;
 mod backend;
 mod environment;
+mod imagery;
 mod legacy;
 mod library;
 mod media_sources;
@@ -17,6 +18,7 @@ mod saves_states;
 #[cfg(test)]
 mod tests;
 mod thumbnail;
+mod visual_pages;
 
 use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
 use activity::Activity;
@@ -207,6 +209,7 @@ pub(super) struct App {
     detail_failed: Option<i64>,
     activity: Activity,
     artwork: Artwork,
+    imagery: imagery::Imagery,
     load_job: Option<u64>,
     artwork_job: Option<u64>,
     index_job: Option<u64>,
@@ -269,6 +272,7 @@ impl App {
             detail_failed: None,
             activity: Activity::default(),
             artwork: Artwork::start(context),
+            imagery: imagery::Imagery::default(),
             load_job: None,
             artwork_job: None,
             index_job: None,
@@ -1039,6 +1043,7 @@ impl App {
 
     fn poll(&mut self, context: &egui::Context) {
         self.artwork.begin_frame(context);
+        self.imagery.begin_frame(context);
         for _ in 0..32 {
             let Ok(event) = self.backend.rx.try_recv() else {
                 break;

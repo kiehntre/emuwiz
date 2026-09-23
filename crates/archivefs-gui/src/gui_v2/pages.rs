@@ -4,6 +4,7 @@ use super::{
     activity::Phase,
     artwork::Picture,
     backend::Command,
+    imagery::{EmptyArt, empty_state},
     library::{Game, media_kind_label},
     media_sources::{Kind, Source},
     onboarding,
@@ -249,6 +250,7 @@ impl App {
             &self.library,
             self.welcome_dismissed,
             self.doctor_platform.as_deref(),
+            &mut self.imagery,
         );
         self.handle_onboarding_action(ui.ctx(), action);
     }
@@ -259,38 +261,24 @@ impl App {
             "I can point out safe next steps here; nothing is changed by browsing.",
             &mut self.mrwiz_dismissed,
         );
-        if self.loaded {
-            ui.label(format!(
-                "{} games · {} systems · {} need attention",
-                self.library.games.len(),
-                self.library.platforms.len(),
-                self.library.attention
-            ));
-        } else {
-            ui.label("Loading your existing game list. You can already explore the tasks below.");
-        }
-        if let Some(environment) = self.environment.as_ref() {
-            let ready_count = environment.setup_ready_count(&self.library);
-            let attention_count = environment.setup_attention_count(&self.library);
-            let open_setup = egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.heading("System setup");
-                ui.label(format!(
-                    "{ready_count} ready · {attention_count} need attention"
-                ));
-                ui.button("Open Setup & Doctor").clicked()
-            });
-            if open_setup.inner {
-                self.go(Route::Section(Section::Setup));
-            }
-        }
+        self.home_hero(ui);
         egui::ScrollArea::vertical().id_salt("v2_home").show(ui, |ui| {
             if self.loaded && self.library.games.is_empty() {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.heading("Let's find your games");
-                    ui.label("No games are listed yet. Start by discovering your game folders.");
-                    if primary(ui, "Add my games") { self.go(Route::Section(Section::Sources)); }
-                    ui.label("Next: review the folders found before choosing what to scan.");
-                });
+                if empty_state(
+                    ui,
+                    &mut self.imagery,
+                    EmptyArt::Mascot,
+                    "Let's find your games",
+                    "No games are listed yet. Start by discovering your game folders. Next: review the folders found before choosing what to scan.",
+                    Some("Add my games"),
+                ) {
+                    self.go(Route::Section(Section::Sources));
+                }
+            } else if self.loaded {
+                self.home_systems(ui);
+                self.home_showcase(ui);
+                ui.add_space(theme::SPACE_SM);
+                ui.label(RichText::new("Things you can do").size(theme::SECTION_TITLE_SIZE).strong());
             }
             for (section, title, purpose, action) in HOME_TASKS {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -408,19 +396,26 @@ impl App {
             return;
         }
         if self.indices.is_empty() && !self.filter_inflight && self.filter_dirty.is_none() {
-            ui.heading(if self.library.games.is_empty() {
-                "Your games can go here"
-            } else {
-                "No games match these choices"
-            });
-            ui.label("Try another system or clear the search. If a game folder is missing, add it through Sources.");
-            if primary(
+            let platform = self.filter.platform.clone();
+            if empty_state(
                 ui,
+                &mut self.imagery,
+                if self.library.games.is_empty() || platform.is_empty() {
+                    EmptyArt::Mascot
+                } else {
+                    EmptyArt::Platform(&platform)
+                },
                 if self.library.games.is_empty() {
+                    "Your games can go here"
+                } else {
+                    "No games match these choices"
+                },
+                "Try another system or clear the search. If a game folder is missing, add it through Sources.",
+                Some(if self.library.games.is_empty() {
                     "Add my games"
                 } else {
                     "Show all games"
-                },
+                }),
             ) {
                 if self.library.games.is_empty() {
                     self.go(Route::Section(Section::Sources));
@@ -505,7 +500,7 @@ impl App {
             });
     }
 
-    fn game_link(&mut self, ui: &mut egui::Ui, game: &Game) {
+    pub(super) fn game_link(&mut self, ui: &mut egui::Ui, game: &Game) {
         if ui
             .add_sized(
                 [ui.available_width(), 40.0],
@@ -535,13 +530,14 @@ impl App {
         }
     }
 
-    fn picture(&mut self, ui: &mut egui::Ui, game: &Game, kind: Kind, size: egui::Vec2) {
+    pub(super) fn picture(&mut self, ui: &mut egui::Ui, game: &Game, kind: Kind, size: egui::Vec2) {
         let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
         if !ui.is_rect_visible(rect) {
             return;
         }
         let key = self.artwork.request(game.archive.id, kind);
         if let Some(Picture::Ready { texture, .. }) = self.artwork.pictures.get(&key) {
+            ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
             let aspect = texture.size_vec2();
             let factor = (size.x / aspect.x).min(size.y / aspect.y);
             let target = egui::Rect::from_center_size(rect.center(), aspect * factor);
@@ -552,23 +548,29 @@ impl App {
                 Color32::WHITE,
             );
         } else {
+            // No cover (yet): the game's own platform hardware, dimmed, on the
+            // same plate, so an uncovered shelf still reads as distinct systems.
+            ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
             ui.painter()
-                .rect_filled(rect, 8.0, Color32::from_rgb(38, 51, 69));
-            let letter = game
-                .title
-                .chars()
-                .next()
-                .unwrap_or('?')
-                .to_uppercase()
-                .to_string();
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                letter,
-                egui::FontId::proportional(36.0),
-                Color32::from_rgb(183, 205, 227),
+                .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
+            let labelled = size.x > 90.0 && size.y > 90.0;
+            let side = if labelled {
+                (size.x.min(size.y - 34.0)) * 0.72
+            } else {
+                size.x.min(size.y) * 0.82
+            };
+            let centre = if labelled {
+                rect.center() - egui::vec2(0.0, 12.0)
+            } else {
+                rect.center()
+            };
+            self.imagery.paint_platform(
+                ui,
+                egui::Rect::from_center_size(centre, egui::vec2(side, side)),
+                &game.platform,
+                Color32::from_white_alpha(150),
             );
-            if size.x > 90.0 {
+            if labelled {
                 let label = match self.artwork.pictures.get(&key) {
                     Some(Picture::Missing) => "No picture yet",
                     Some(Picture::Failed(_)) => "Picture unavailable",
@@ -576,59 +578,18 @@ impl App {
                     _ => "Loading picture…",
                 };
                 ui.painter().text(
-                    rect.center_bottom() - egui::vec2(0.0, 13.0),
+                    rect.center_bottom() - egui::vec2(0.0, 10.0),
                     egui::Align2::CENTER_BOTTOM,
                     label,
-                    egui::FontId::proportional(16.0),
-                    Color32::WHITE,
+                    egui::FontId::proportional(theme::METADATA_SIZE),
+                    theme::SECONDARY_TEXT,
                 );
             }
         }
     }
 
     fn platforms(&mut self, ui: &mut egui::Ui) {
-        if self.library.platforms.is_empty() {
-            ui.label("No systems are listed yet. Discover your game folders to get started.");
-            if primary(ui, "Add my games") {
-                self.go(Route::Section(Section::Sources));
-            }
-            return;
-        }
-        let library = self.library.clone();
-        egui::ScrollArea::vertical()
-            .id_salt("v2_platforms")
-            .show(ui, |ui| {
-                for (platform, count) in &library.platforms {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.heading(platform);
-                        ui.label(format!("{count} games available to browse"));
-                        let ready = platform.eq_ignore_ascii_case("Arcade") || *count > 0;
-                        ui.label(if ready {
-                            "Verification data ready · game folder configured"
-                        } else {
-                            "Needs setup"
-                        });
-                        if ui
-                            .button(if ready {
-                                format!("Check {platform}")
-                            } else {
-                                format!("Set up {platform}")
-                            })
-                            .clicked()
-                        {
-                            self.check_platform(platform.clone());
-                        }
-                        if primary(ui, &format!("View {platform} games")) {
-                            self.filter.select_platform(platform.clone());
-                            self.filter.attention_only = false;
-                            self.change_filter();
-                            self.go(Route::Section(Section::Games));
-                        }
-                        ui.label("Next: select a game to see readiness, pictures and actions.");
-                    });
-                }
-            });
+        self.platforms_grid(ui);
     }
 
     fn check_games(&mut self, ui: &mut egui::Ui) {
@@ -891,9 +852,13 @@ impl App {
             && self.canonical_organisation_history.is_empty()
             && !has_cheat_history
         {
-            ui.heading("No repair history yet");
-            ui.label(
+            empty_state(
+                ui,
+                &mut self.imagery,
+                EmptyArt::Mascot,
+                "No repair history yet",
                 "When a supported repair completes, its receipt and undo status will appear here.",
+                None,
             );
             return;
         }
@@ -1061,6 +1026,7 @@ impl App {
             }
             return;
         };
+        self.imagery.note_opened(id);
         let latest_verification = self
             .verification
             .as_ref()
@@ -1068,13 +1034,23 @@ impl App {
             .and_then(|result| result.statuses.get(&id))
             .cloned();
         egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
-            if primary(ui, "Play") { self.go(Route::Task { section: Section::Launch, game: id }); }
-            ui.label("Next: review the existing launch check. Nothing starts until you choose Launch there.");
+            let wide = ui.available_width() >= 760.0;
+            let cover = if wide { egui::vec2(240.0, 320.0) } else { egui::vec2(168.0, 224.0) };
             ui.horizontal_top(|ui| {
-                self.picture(ui, game, Kind::Cover, egui::vec2(150.0, 200.0));
+                self.picture(ui, game, Kind::Cover, cover);
+                ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
-                    ui.strong(&game.platform);
-                    ui.label(format!("Media: {}", media_kind_label(&game.archive.archive_kind)));
+                    ui.horizontal(|ui| {
+                        self.imagery.platform_icon(ui, &game.platform, 52.0);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&game.platform).size(theme::SECTION_TITLE_SIZE).strong());
+                            ui.label(RichText::new(format!("Media: {}", media_kind_label(&game.archive.archive_kind))).color(theme::muted(ui)));
+                        });
+                    });
+                    ui.add_space(theme::SPACE_SM);
+                    if primary(ui, "Play") { self.go(Route::Task { section: Section::Launch, game: id }); }
+                    ui.label("Next: review the existing launch check. Nothing starts until you choose Launch there.");
+                    ui.add_space(theme::SPACE_SM);
                     ui.label(format!("Source: {}", game.archive.relative_path.display()));
                     if let Some(status) = &latest_verification {
                         ui.label(format!("Latest verification: {status}"));
@@ -1090,42 +1066,58 @@ impl App {
                     } else if self.detail_failed == Some(id) {
                         ui.label("Readiness could not be checked. Your game has not been changed.");
                         if ui.button("Retry readiness check").clicked() { self.detail_failed = None; }
-                    } else { ui.spinner(); ui.label("Checking saved information and looking for installed emulators…"); }
+                    } else { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking saved information and looking for installed emulators…"); }); }
+                    ui.add_space(theme::SPACE_SM);
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, section) in [("Verify", Section::Check), ("Artwork & Metadata", Section::Artwork), ("Mods & Cheats", Section::Mods), ("Fix Problems", Section::Problems)] {
+                            if ui.button(label).clicked() {
+                                if section == Section::Check {
+                                    self.check_platform = Some(game.platform.clone());
+                                    self.go(Route::Section(Section::Check));
+                                } else {
+                                    self.go(Route::Task { section, game: id });
+                                }
+                            }
+                        }
+                        if ui.button("Open Folder").clicked() {
+                            let job = self.activity.queue("Opening the game folder", Route::Game(id), false);
+                            self.send(job, Command::OpenFolder(game.archive.absolute_path.clone()));
+                        }
+                    });
                 });
             });
-            ui.horizontal_wrapped(|ui| {
-                for (label, section) in [("Verify", Section::Check), ("Artwork & Metadata", Section::Artwork), ("Mods & Cheats", Section::Mods), ("Fix Problems", Section::Problems)] {
-                    if ui.button(label).clicked() {
-                        if section == Section::Check {
-                            self.check_platform = Some(game.platform.clone());
-                            self.go(Route::Section(Section::Check));
-                        } else {
-                            self.go(Route::Task { section, game: id });
-                        }
-                    }
-                }
-                if ui.button("Open Folder").clicked() {
-                    let job = self.activity.queue("Opening the game folder", Route::Game(id), false);
-                    self.send(job, Command::OpenFolder(game.archive.absolute_path.clone()));
-                }
-            });
             let key = self.artwork.key(id, Kind::Cover);
-            if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&id)) {
-                ui.separator(); ui.strong("About this game"); ui.label(description);
-            }
             if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_))) && ui.button("Retry picture").clicked() { self.artwork.retry(key); }
-            let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&id)).map_or(0, Vec::len);
-            ui.separator(); ui.strong("Screenshots");
-            if count == 0 {
-                ui.label(if self.artwork.index.is_none() { "Looking for screenshots…" } else { "No screenshots available. See Advanced details for the search results." });
+            if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&id)) {
+                ui.add_space(theme::SPACE_MD);
+                ui.label(RichText::new("About this game").size(theme::SECTION_TITLE_SIZE).strong());
+                ui.scope(|ui| {
+                    // Keep long descriptions at a readable line length.
+                    ui.set_max_width(ui.available_width().min(920.0));
+                    ui.label(description);
+                });
             }
-            else if !self.screenshots { if ui.button(format!("Show screenshots ({count})")).clicked() { self.screenshots = true; } }
-            else {
-                for ordinal in 0..count {
-                    self.picture(ui, game, Kind::Screenshot(ordinal), egui::vec2(240.0, 180.0));
-                    let key = self.artwork.key(id, Kind::Screenshot(ordinal));
-                    if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_))) && ui.button(format!("Retry screenshot {}", ordinal + 1)).clicked() { self.artwork.retry(key); }
-                }
+            let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&id)).map_or(0, Vec::len);
+            ui.add_space(theme::SPACE_MD);
+            ui.label(RichText::new("Screenshots").size(theme::SECTION_TITLE_SIZE).strong());
+            if self.artwork.index.is_none() {
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Looking for screenshots…"); });
+            } else if count == 0 {
+                empty_state(ui, &mut self.imagery, EmptyArt::Platform(&game.platform), "No screenshots yet", "No screenshots available. See Advanced details for the search results.", None);
+            } else {
+                // The first screenshot is shown straight away; the rest load
+                // only when asked for, keeping a game visit to two pictures.
+                let shown = if self.screenshots { count } else { 1 };
+                ui.horizontal_wrapped(|ui| {
+                    for ordinal in 0..shown {
+                        ui.vertical(|ui| {
+                            self.picture(ui, game, Kind::Screenshot(ordinal), egui::vec2(320.0, 240.0));
+                            let key = self.artwork.key(id, Kind::Screenshot(ordinal));
+                            if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_))) && ui.button(format!("Retry screenshot {}", ordinal + 1)).clicked() { self.artwork.retry(key); }
+                        });
+                    }
+                });
+                if !self.screenshots && count > 1 && ui.button(format!("Show all screenshots ({count})")).clicked() { self.screenshots = true; }
             }
             ui.collapsing("Advanced details", |ui| {
                 ui.label(if game.identified { "Identified in the saved game list" } else { "Identity is not confirmed" });
@@ -1318,7 +1310,11 @@ impl App {
                     ui.vertical(|ui| {
                         ui.strong("Metadata");
                         if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&game_id)) {
-                            ui.label(description);
+                            ui.scope(|ui| {
+                    // Keep long descriptions at a readable line length.
+                    ui.set_max_width(ui.available_width().min(920.0));
+                    ui.label(description);
+                });
                         } else if let Some(saved) = &game.screenscraper {
                             ui.label(saved.values.synopsis.as_deref().unwrap_or("ScreenScraper metadata is saved for this game."));
                         } else if !game.identified {
@@ -1446,11 +1442,17 @@ impl App {
 
     fn activities(&mut self, ui: &mut egui::Ui) {
         ui.label("Work continues when you leave this page. No estimated completion time is shown unless it is known.");
-        if self.activity.jobs.is_empty() {
-            ui.label("Nothing is running yet. Browse your games to get started.");
-            if primary(ui, "Browse my games") {
-                self.go(Route::Section(Section::Games));
-            }
+        if self.activity.jobs.is_empty()
+            && empty_state(
+                ui,
+                &mut self.imagery,
+                EmptyArt::Mascot,
+                "Nothing is running yet",
+                "Scans, checks and picture loading appear here while they work, with their result afterwards. Browse your games to get started.",
+                Some("Browse my games"),
+            )
+        {
+            self.go(Route::Section(Section::Games));
         }
         let mut destination = None;
         egui::ScrollArea::vertical().id_salt("v2_jobs").show(ui, |ui| {

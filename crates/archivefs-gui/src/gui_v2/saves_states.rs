@@ -6,6 +6,7 @@
 
 use super::{
     App,
+    imagery::{EmptyArt, empty_state},
     routes::{Route, Section},
 };
 #[cfg(not(test))]
@@ -122,8 +123,17 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 
     let Some(inventory) = app.saves_states.inventory.as_ref() else {
-        if !app.saves_states.loading {
-            ui.label("No save inventory has been loaded yet.");
+        if !app.saves_states.loading
+            && empty_state(
+                ui,
+                &mut app.imagery,
+                EmptyArt::Mascot,
+                "No saves checked yet",
+                "EmuWiz has not inspected the configured emulator save locations.",
+                Some("Refresh save locations"),
+            )
+        {
+            app.start_saves_inventory();
         }
         return;
     };
@@ -161,13 +171,21 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         })
         .collect();
     if records.is_empty() {
-        ui.label(if inventory.roots_inspected == 0 {
+        let detail = if inventory.roots_inspected == 0 {
             "Set up an emulator before EmuWiz can find its saves."
         } else if !inventory.warnings.is_empty() {
             "Your configured save location is unavailable or needs review."
         } else {
             "No saves or savestates were found in the configured emulator locations."
-        });
+        };
+        empty_state(
+            ui,
+            &mut app.imagery,
+            EmptyArt::Mascot,
+            "No saves found yet",
+            detail,
+            None,
+        );
     }
     egui::ScrollArea::vertical()
         .id_salt("v2_saves_states_records")

@@ -45,6 +45,7 @@ fn fixture(context: &egui::Context) -> App {
         detail_failed: None,
         activity: Activity::default(),
         artwork: Artwork::start(context.clone()),
+        imagery: super::imagery::Imagery::default(),
         load_job: None,
         artwork_job: None,
         index_job: None,
@@ -2272,4 +2273,347 @@ fn tracked_background_errors_use_native_plain_language() {
     assert!(notice.message.contains("game files were not changed"));
     assert!(!notice.message.contains("Legacy / Advanced"));
     assert_eq!(notice.technical, "database detail");
+}
+
+fn visual_fixture(context: &egui::Context) -> App {
+    let mut app = fixture(context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Crash Test", Some("PSX")),
+        archive(2, "Mario Fixture", Some("SNES")),
+        archive(3, "Mystery Disc", None),
+    ]));
+    app.indices = (0..app.library.games.len()).collect();
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.artwork.index_loading = false;
+    app
+}
+
+fn pump_imagery(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    let start = Instant::now();
+    let mut output = frame(context, app, size);
+    while app.imagery.pending() > 0 && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(5));
+        app.imagery.begin_frame(context);
+        output = frame(context, app, size);
+    }
+    output
+}
+
+#[test]
+fn gui_v2_platforms_page_shows_hardware_art_with_glyph_fallback() {
+    let context = egui::Context::default();
+    let mut app = visual_fixture(&context);
+    app.router.current = Route::Section(Section::Platforms);
+    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 720.0]));
+    for platform in ["PSX", "SNES", "Unknown system"] {
+        assert!(
+            strings.iter().any(|value| value == platform),
+            "{platform}: {strings:?}"
+        );
+    }
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("games available to browse"))
+    );
+    assert_eq!(app.imagery.pending(), 0);
+    // PSX and SNES have bundled hardware; "Unknown system" paints a glyph.
+    assert_eq!(app.imagery.decoded, 2);
+    // Revisiting reuses the cached thumbnails instead of decoding again.
+    let _ = pump_imagery(&context, &mut app, [1920.0, 1080.0]);
+    assert_eq!(app.imagery.decoded, 2);
+}
+
+#[test]
+fn gui_v2_home_shows_library_hero_systems_and_recently_opened_games() {
+    let context = egui::Context::default();
+    let mut app = visual_fixture(&context);
+    app.mrwiz_dismissed = true;
+    app.go(Route::Home);
+    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value == "Your game library"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("3 games · 3 systems"))
+    );
+    assert!(strings.iter().any(|value| value == "Your systems"));
+    assert!(!strings.iter().any(|value| value == "Recently opened"));
+    // Only real systems get a hardware tile.
+    assert!(!strings.iter().any(|value| value == "Unknown system"));
+
+    app.go(Route::Game(2));
+    let _ = frame(&context, &mut app, [1280.0, 720.0]);
+    app.go(Route::Home);
+    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 1080.0]));
+    assert!(strings.iter().any(|value| value == "Recently opened"));
+    assert!(strings.iter().any(|value| value.starts_with("Mario")));
+    assert_eq!(app.imagery.recently_opened(), &[2]);
+}
+
+#[test]
+fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
+    let context = egui::Context::default();
+    let mut app = visual_fixture(&context);
+    app.go(Route::Game(1));
+    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 720.0]));
+    for expected in [
+        "Play",
+        "PSX",
+        "Media: Game image",
+        "Verify",
+        "Open Folder",
+        "No screenshots yet",
+    ] {
+        assert!(
+            strings.iter().any(|value| value == expected),
+            "{expected}: {strings:?}"
+        );
+    }
+    // The missing cover falls back to the PSX hardware, not a blank box.
+    assert_eq!(app.imagery.decoded, 1);
+}
+
+#[test]
+fn gui_v2_empty_states_explain_in_plain_english() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Activity);
+    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Nothing is running yet")
+    );
+    assert!(strings.iter().any(|value| value == "Browse my games"));
+
+    app.router.current = Route::Section(Section::Platforms);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "No systems are listed yet")
+    );
+    assert!(strings.iter().any(|value| value == "Add my games"));
+
+    app.router.current = Route::Section(Section::Games);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Your games can go here")
+    );
+}
+
+/// Real-scale timing harness. Ignored by default: it needs a real catalogue.
+/// Run with `EMUWIZ_V2_PERF_DB=/path/library.sqlite3` (and isolated
+/// `EMUWIZ_DATA_HOME`/`EMUWIZ_CONFIG_HOME`, so preference saves and the
+/// thumbnail cache never touch a live profile):
+/// `cargo test -p archivefs-gui --release gui_v2_real_catalogue_timings -- --ignored --nocapture`
+#[test]
+#[ignore = "needs EMUWIZ_V2_PERF_DB pointing at a real catalogue"]
+fn gui_v2_real_catalogue_timings() {
+    let Some(path) = std::env::var_os("EMUWIZ_V2_PERF_DB") else {
+        eprintln!("EMUWIZ_V2_PERF_DB is not set; skipping");
+        return;
+    };
+    fn tick(context: &egui::Context, app: &mut App, size: [f32; 2]) -> Duration {
+        let start = Instant::now();
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(size[0], size[1]),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                app.poll(context);
+                app.show(context);
+                app.finish_frame();
+            },
+        );
+        start.elapsed()
+    }
+    fn steady(context: &egui::Context, app: &mut App, size: [f32; 2]) -> (f64, f64) {
+        let first = tick(context, app, size).as_secs_f64() * 1000.0;
+        let mut total = 0.0;
+        for _ in 0..30 {
+            total += tick(context, app, size).as_secs_f64() * 1000.0;
+        }
+        (first, total / 30.0)
+    }
+    fn settle(
+        context: &egui::Context,
+        app: &mut App,
+        size: [f32; 2],
+        done: impl Fn(&App) -> bool,
+    ) -> (f64, u32) {
+        let start = Instant::now();
+        let mut frames = 0;
+        let mut worst = Duration::ZERO;
+        while (frames < 2 || !done(app)) && start.elapsed() < Duration::from_secs(30) {
+            worst = worst.max(tick(context, app, size));
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        eprintln!(
+            "PERF   (worst frame while settling: {:.2}ms)",
+            worst.as_secs_f64() * 1000.0
+        );
+        (start.elapsed().as_secs_f64() * 1000.0, frames)
+    }
+    fn states(app: &App) -> String {
+        let mut states = [0usize; 4];
+        for picture in app.artwork.pictures.values() {
+            states[match picture {
+                Picture::Loading => 0,
+                Picture::Missing => 1,
+                Picture::Failed(_) => 2,
+                Picture::Ready { .. } => 3,
+            }] += 1;
+        }
+        format!(
+            "pictures[loading={} missing={} failed={} ready={}]",
+            states[0], states[1], states[2], states[3]
+        )
+    }
+    let pictures_settled = |app: &App| {
+        app.imagery.pending() == 0
+            && app.artwork.active() == 0
+            && !app
+                .artwork
+                .pictures
+                .values()
+                .any(|picture| matches!(picture, Picture::Loading))
+    };
+    let start = Instant::now();
+    let library = backend::load_library(Path::new(&path)).unwrap();
+    let load_ms = start.elapsed().as_millis();
+    let start = Instant::now();
+    let index = MediaIndex::discover(&library);
+    let index_ms = start.elapsed().as_millis();
+    eprintln!(
+        "PERF real load: {} games / {} platforms in {load_ms} ms; index {} covers in {index_ms} ms",
+        library.games.len(),
+        library.platforms.len(),
+        index.covers.len()
+    );
+    let local: Vec<_> = index
+        .covers
+        .iter()
+        .filter(|(_, source)| matches!(source, Source::Local(_)))
+        .map(|(id, _)| *id)
+        .collect();
+    let start = Instant::now();
+    let showcase = super::imagery::select_showcase(&library, &index);
+    eprintln!(
+        "PERF local covers: {} ({} without attention); showcase selection {} games in {}us",
+        local.len(),
+        local
+            .iter()
+            .filter(|id| library.game(**id).is_some_and(|game| !game.attention))
+            .count(),
+        showcase.len(),
+        start.elapsed().as_micros()
+    );
+    let covered = library
+        .games
+        .iter()
+        .find(|game| {
+            index.covers.contains_key(&game.archive.id)
+                && index
+                    .screenshots
+                    .get(&game.archive.id)
+                    .is_some_and(|shots| shots.len() > 1)
+        })
+        .map(|game| game.archive.id);
+    if let Some(game) = covered.and_then(|id| library.game(id)) {
+        eprintln!(
+            "PERF sample game with cover+screenshots: {} {} {}",
+            game.archive.id, game.title, game.platform
+        );
+    }
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(library);
+    app.indices = (0..app.library.games.len()).collect();
+    app.artwork.index = Some(Arc::new(index));
+    app.artwork.index_loading = false;
+    app.environment = Some(super::environment::gather());
+    app.welcome_dismissed = true;
+    app.mrwiz_dismissed = true;
+
+    for size in [[1280.0, 720.0], [1920.0, 1080.0]] {
+        let label = format!("{}x{}", size[0], size[1]);
+        app.go(Route::Home);
+        let first = tick(&context, &mut app, size).as_secs_f64() * 1000.0;
+        let (settled, frames) = settle(&context, &mut app, size, pictures_settled);
+        let (_, after) = steady(&context, &mut app, size);
+        eprintln!(
+            "PERF {label} Home: first={first:.2}ms artwork-settle={settled:.0}ms/{frames}f steady={after:.2}ms {}",
+            states(&app)
+        );
+        app.go(Route::Section(Section::Platforms));
+        let first = tick(&context, &mut app, size).as_secs_f64() * 1000.0;
+        let (settled, frames) = settle(&context, &mut app, size, pictures_settled);
+        let (_, after) = steady(&context, &mut app, size);
+        eprintln!(
+            "PERF {label} Platforms: first={first:.2}ms artwork-settle={settled:.0}ms/{frames}f steady={after:.2}ms {}",
+            states(&app)
+        );
+        app.go(Route::Section(Section::Setup));
+        let (first, avg) = steady(&context, &mut app, size);
+        eprintln!("PERF {label} Setup&Doctor: first={first:.2}ms steady={avg:.2}ms");
+        app.filter = Filter::default();
+        app.indices = (0..app.library.games.len()).collect();
+        app.go(Route::Section(Section::Games));
+        let first = tick(&context, &mut app, size).as_secs_f64() * 1000.0;
+        let (settled, frames) = settle(&context, &mut app, size, pictures_settled);
+        let (_, after) = steady(&context, &mut app, size);
+        eprintln!(
+            "PERF {label} Games(all): first={first:.2}ms artwork-settle={settled:.0}ms/{frames}f steady={after:.2}ms {}",
+            states(&app)
+        );
+    }
+    let size = [1920.0, 1080.0];
+    for platform in ["PSX", "SNES", "MegaDrive"] {
+        app.filter.select_platform(platform.into());
+        app.change_filter();
+        app.filter_dirty = Some(Instant::now() - Duration::from_secs(1));
+        let (switch, frames) = settle(&context, &mut app, size, |app| {
+            !app.filter_inflight && app.filter_dirty.is_none()
+        });
+        let first = tick(&context, &mut app, size).as_secs_f64() * 1000.0;
+        let (settled, art_frames) = settle(&context, &mut app, size, pictures_settled);
+        let (_, avg) = steady(&context, &mut app, size);
+        eprintln!(
+            "PERF platform-switch {platform}: {} rows in {switch:.0}ms/{frames}f first={first:.2}ms steady={avg:.2}ms artwork-settle={settled:.0}ms/{art_frames}f {}",
+            app.indices.len(),
+            states(&app)
+        );
+    }
+    if let Some(id) = covered {
+        app.go(Route::Game(id));
+        let first = tick(&context, &mut app, size).as_secs_f64() * 1000.0;
+        let (settled, frames) = settle(&context, &mut app, size, pictures_settled);
+        let (_, avg) = steady(&context, &mut app, size);
+        eprintln!(
+            "PERF game-select {id}: first={first:.2}ms artwork-settle={settled:.0}ms/{frames}f steady={avg:.2}ms {}",
+            states(&app)
+        );
+    }
+    let mut states = [0usize; 4];
+    for picture in app.artwork.pictures.values() {
+        states[match picture {
+            Picture::Loading => 0,
+            Picture::Missing => 1,
+            Picture::Failed(_) => 2,
+            Picture::Ready { .. } => 3,
+        }] += 1;
+    }
+    eprintln!(
+        "PERF artwork pictures: loading={} missing={} failed={} ready={}",
+        states[0], states[1], states[2], states[3]
+    );
 }

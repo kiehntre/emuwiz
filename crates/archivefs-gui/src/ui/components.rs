@@ -10,7 +10,8 @@ use crate::{ClipboardBackend, open_folder_in_file_manager};
 #[path = "workflow_presentation_tests.rs"]
 mod workflow_presentation_tests;
 
-const EMUWIZ_MASCOT_BADGE_PNG: &[u8] = include_bytes!("../../assets/emuwiz_mascot_badge.png");
+pub(crate) const EMUWIZ_MASCOT_BADGE_PNG: &[u8] =
+    include_bytes!("../../assets/emuwiz_mascot_badge.png");
 const EMUWIZ_MAGIC_DIVIDER_LONG_PNG: &[u8] =
     include_bytes!("../../assets/emuwiz_magic_divider_long.png");
 

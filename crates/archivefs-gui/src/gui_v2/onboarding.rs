@@ -3,7 +3,12 @@
 //! The page is a calm projection over EnvironmentSnapshot and the
 //! already-loaded library. It does not scan, install, migrate, or repair.
 
-use super::{environment::EnvironmentSnapshot, library::Library, routes::Section};
+use super::{
+    environment::EnvironmentSnapshot,
+    imagery::{EmptyArt, Imagery, empty_state},
+    library::Library,
+    routes::Section,
+};
 use crate::ui::theme;
 use eframe::egui;
 
@@ -60,6 +65,7 @@ pub(super) fn show(
     library: &Library,
     welcome_dismissed: bool,
     selected_platform: Option<&str>,
+    imagery: &mut Imagery,
 ) -> Option<Action> {
     let Some(snapshot) = snapshot else {
         ui.heading("Setup & Doctor");
@@ -161,20 +167,33 @@ pub(super) fn show(
 
             ui.heading("Emulators");
             ui.label("EmuWiz only checks installed programs here. It never installs or replaces one silently.");
-            for emulator in &snapshot.lifecycle {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(&emulator.emulator_id);
-                        status(ui, lifecycle_state_label(emulator.state), lifecycle_state_tone(emulator.state));
-                    });
-                    if emulator.installations.is_empty() {
-                        ui.label("Not installed");
-                    } else {
-                        for installation in &emulator.installations {
-                            lifecycle_installation_card(ui, installation);
+            if snapshot.lifecycle.is_empty() {
+                if empty_state(
+                    ui,
+                    imagery,
+                    EmptyArt::Mascot,
+                    "No emulator checks yet",
+                    "Run setup checking to see which supported emulators are installed and ready to configure.",
+                    Some("Check again"),
+                ) {
+                    action = Some(Action::Refresh);
+                }
+            } else {
+                for emulator in &snapshot.lifecycle {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(&emulator.emulator_id);
+                            status(ui, lifecycle_state_label(emulator.state), lifecycle_state_tone(emulator.state));
+                        });
+                        if emulator.installations.is_empty() {
+                            ui.label("Not installed");
+                        } else {
+                            for installation in &emulator.installations {
+                                lifecycle_installation_card(ui, installation);
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
 
             if snapshot.source_needs_attention() {
@@ -216,12 +235,16 @@ pub(super) fn show(
 
             for (platform, count) in &library.platforms {
                 let selected = selected_platform == Some(platform.as_str());
-                if ui
-                    .selectable_label(selected, format!("{platform} · {count} game(s)"))
-                    .clicked()
-                {
-                    action = Some(Action::OpenPlatform(platform.clone()));
-                }
+                ui.horizontal(|ui| {
+                    // A small hardware cue only; the label still names the system.
+                    imagery.platform_icon(ui, platform, 28.0);
+                    if ui
+                        .selectable_label(selected, format!("{platform} · {count} game(s)"))
+                        .clicked()
+                    {
+                        action = Some(Action::OpenPlatform(platform.clone()));
+                    }
+                });
             }
             if library.platforms.is_empty() {
                 ui.label("No games are available yet. Add a Games folder to begin.");
@@ -229,7 +252,7 @@ pub(super) fn show(
             if let Some(platform) = selected_platform
                 && library.platforms.contains_key(platform)
             {
-                platform_details(ui, snapshot, library, platform, &mut action);
+                platform_details(ui, snapshot, library, platform, &mut action, imagery);
             }
         });
     action
@@ -546,6 +569,7 @@ fn platform_details(
     library: &Library,
     platform: &str,
     action: &mut Option<Action>,
+    imagery: &mut Imagery,
 ) {
     let games = library
         .games
@@ -553,8 +577,13 @@ fn platform_details(
         .filter(|game| game.platform == platform)
         .collect::<Vec<_>>();
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.heading(platform);
-        ui.label(format!("{} game(s) in this system", games.len()));
+        ui.horizontal(|ui| {
+            imagery.platform_icon(ui, platform, 64.0);
+            ui.vertical(|ui| {
+                ui.heading(platform);
+                ui.label(format!("{} game(s) in this system", games.len()));
+            });
+        });
         if let Some(projection) = lifecycle_for_platform(snapshot, platform) {
             ui.label(format!(
                 "Emulator: {} · {}",
