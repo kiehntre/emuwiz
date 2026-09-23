@@ -1409,8 +1409,46 @@ fn show_plan(
             )
         })
         .count();
+    // Needs-attention also folds in entries the current mode cannot support
+    // at all - a real backend state (`OrganisationStatus::Unsupported`),
+    // never an invented confidence level.
+    let attention_count = blocked_count
+        + plan
+            .entries
+            .iter()
+            .filter(|entry| entry.status == OrganisationStatus::Unsupported)
+            .count();
+    let already_correct_count = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.status == OrganisationStatus::AlreadyOrganised)
+        .count();
     widgets::card(ui, |ui| {
         ui.label(egui::RichText::new("Preview summary").strong());
+        // At-a-glance grouping so a large result set can be scanned without
+        // reading every row: already correct / will change / blocked or
+        // needs attention, using only the plan's own existing statuses.
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_badge(
+                ui,
+                format!("{already_correct_count} already correct"),
+                widgets::StatusTone::Success,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{suggested_count} will change"),
+                widgets::StatusTone::Info,
+            );
+            widgets::status_badge(
+                ui,
+                format!("{attention_count} blocked or need attention"),
+                if attention_count == 0 {
+                    widgets::StatusTone::Success
+                } else {
+                    widgets::StatusTone::Blocked
+                },
+            );
+        });
         ui.label(format!("{suggested_count} file(s) selected"));
         ui.label(format!("{blocked_count} blocker(s)"));
         ui.label(match plan.mode {
@@ -2371,6 +2409,44 @@ mod tests {
         assert!(rendered_text_contains(&output, "Result: Will create link"));
         // The linked-library preview never shows a rename/move arrow row.
         assert!(!rendered_text_contains(&output, "/sources/Combat.bin → "));
+    }
+
+    /// The preview's at-a-glance grouping (already correct / will change /
+    /// blocked or needs attention) reflects only the plan's own existing
+    /// `OrganisationStatus` counts - no invented confidence level, and the
+    /// underlying entries/filters are unaffected.
+    #[test]
+    fn preview_summary_groups_entries_into_already_correct_will_change_and_attention() {
+        let mut state = RomOrganisationPageState::default();
+        let library_root = test_root("preview-summary-grouping").join("library");
+        state.plan_generation = 1;
+        state.plan = Some(OrganisationPlan {
+            master_root: library_root.clone(),
+            mode: OrganisationMode::MoveRealFile,
+            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+            classifier_version: archivefs_core::dat::classification::CLASSIFIER_VERSION.to_string(),
+            generation: 1,
+            entries: vec![
+                linked_library_plan_entry(OrganisationStatus::Suggested),
+                linked_library_plan_entry(OrganisationStatus::AlreadyOrganised),
+                linked_library_plan_entry(OrganisationStatus::AlreadyOrganised),
+                linked_library_plan_entry(OrganisationStatus::Blocked),
+                linked_library_plan_entry(OrganisationStatus::Unsupported),
+            ],
+        });
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_rom_organisation_page(ui, &mut state);
+            });
+        });
+        assert!(rendered_text_contains(&output, "2 already correct"));
+        assert!(rendered_text_contains(&output, "1 will change"));
+        assert!(rendered_text_contains(
+            &output,
+            "2 blocked or need attention"
+        ));
     }
 
     #[test]
