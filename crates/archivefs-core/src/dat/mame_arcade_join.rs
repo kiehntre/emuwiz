@@ -1179,7 +1179,7 @@ mod tests {
         let modified_time_ns = metadata
             .mtime()
             .saturating_mul(1_000_000_000)
-            .saturating_add(i64::from(metadata.mtime_nsec()));
+            .saturating_add(metadata.mtime_nsec());
         #[cfg(not(unix))]
         let modified_time_ns = 0;
         let row = MamePhysicalMemberEvidence {

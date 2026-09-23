@@ -43,7 +43,7 @@ enum LaunchKind {
 impl NativeWorkflows {
     pub(super) fn new(context: egui::Context) -> Self {
         #[cfg(not(test))]
-        let mut app = ArchiveFsApp::new(context.clone());
+        let mut app = ArchiveFsApp::new_without_initial_load(context.clone());
         #[cfg(test)]
         let mut app = crate::tests::app_for_operation_tests();
         // These are full v2 task pages, not the old shell's simplified
@@ -1153,6 +1153,14 @@ fn lifecycle_setup_panel(
                     "Your selected installation can no longer be found.",
                 );
             }
+            if let Some(notice) =
+                lifecycle_selection_notice(projection.state, projection.selected.is_some())
+            {
+                ui.colored_label(
+                    egui::Color32::from_rgb(235, 178, 76),
+                    notice,
+                );
+            }
             if projection.installations.is_empty() {
                 ui.label("Not installed");
             }
@@ -1173,6 +1181,9 @@ fn lifecycle_setup_panel(
                         installation.version.version.as_deref().unwrap_or("unknown"),
                         update_authority_label(installation.update_authority)
                     ));
+                    if let Some(path) = lifecycle_executable_path(&installation.exact_binding) {
+                        ui.label(format!("Executable: {}", path.display()));
+                    }
                     ui.label(format!(
                         "Health: {} · Launch: {}",
                         local_health_label(installation.local_health),
@@ -1238,6 +1249,17 @@ fn lifecycle_state_label(
         MultipleInstallations => "Multiple installations found",
         ManagedExternally => "Managed by another installer",
     }
+}
+
+fn lifecycle_selection_notice(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+    has_selection: bool,
+) -> Option<&'static str> {
+    (matches!(
+        state,
+        archivefs_core::emulator_lifecycle::LifecycleState::MultipleInstallations
+    ) && !has_selection)
+        .then_some("No installation selected. Choose one explicitly.")
 }
 
 fn installation_type_label(
@@ -1443,4 +1465,38 @@ fn cheat_activity_state(
         ));
     }
     None
+}
+
+#[cfg(test)]
+mod lifecycle_selection_tests {
+    use super::*;
+    use archivefs_core::emulator_lifecycle::{ExactBinding, LifecycleState};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn multiple_installations_without_a_binding_require_explicit_selection() {
+        assert_eq!(
+            lifecycle_selection_notice(LifecycleState::MultipleInstallations, false),
+            Some("No installation selected. Choose one explicitly.")
+        );
+        assert_eq!(
+            lifecycle_selection_notice(LifecycleState::MultipleInstallations, true),
+            None
+        );
+        assert_eq!(
+            lifecycle_selection_notice(LifecycleState::InstalledCurrent, false),
+            None
+        );
+    }
+
+    #[test]
+    fn native_binding_exposes_the_exact_executable_path() {
+        let binding = ExactBinding::NativeExecutable {
+            path: PathBuf::from("/home/test/.local/bin/mame"),
+        };
+        assert_eq!(
+            lifecycle_executable_path(&binding),
+            Some(Path::new("/home/test/.local/bin/mame"))
+        );
+    }
 }

@@ -526,9 +526,9 @@ fn plan_split_rebuilds_from_verified_joins(
         else {
             continue;
         };
-        if (!is_zip(parent_path) && !parent_path.is_dir()
+        if !is_zip(parent_path) && !parent_path.is_dir()
             || (!is_zip(clone_path) && !clone_path.is_dir())
-            || parent_path == clone_path)
+            || parent_path == clone_path
         {
             continue;
         }

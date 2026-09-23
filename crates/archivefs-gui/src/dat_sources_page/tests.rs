@@ -64,8 +64,317 @@ fn row_for_visibility(
         dat_files_read: None,
         dat_files_total: None,
         history_link_available: false,
-        mame_replacement: None,
+        mame_replacement_available: false,
+        current_file_missing_or_invalid: false,
+        mame_replacement_checking: false,
+        mame_replacement_candidate: None,
     }
+}
+
+const MAME_0174_FIXTURE: &str = r#"<?xml version="1.0"?>
+<datafile>
+  <header>
+    <name>MAME</name>
+    <description>MAME Arcade 0.174</description>
+    <version>0.174</version>
+  </header>
+  <machine name="pacman">
+    <description>Pac-Man</description>
+    <rom name="pacman.6e" size="4096" crc="c1e6ab10" sha1="e87e059c5be45753f7e9f17dc8d1d3b96ff8fe0d"/>
+  </machine>
+</datafile>"#;
+
+fn add_saved_mame_source(
+    page: &mut DatSourcesPageState,
+    id: &str,
+    path: PathBuf,
+) -> DatSourceEntry {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, []).unwrap();
+    let mut entry = DatSourceEntry::new(
+        id.to_string(),
+        "MAME 0.174 Arcade DAT".to_string(),
+        path.clone(),
+        DatSourceKind::File,
+    );
+    entry.origin = Some("test fixture".to_string());
+    entry.health.state = Some(DatHealthState::Unreadable);
+    entry.health.arcade_catalogue_revisions =
+        vec![archivefs_core::dat::sources::ArcadeCatalogueRevision {
+            ecosystem: DatEcosystem::MAMEArcade,
+            version: Some(MAME_0174_VERSION.to_string()),
+        }];
+    page.draft.add(entry.clone()).unwrap();
+    page.apply(DatSourcesPageAction::Save);
+    assert_eq!(page.save_state, DatSaveState::Saved);
+    std::fs::remove_file(&path).unwrap();
+    entry
+}
+
+#[test]
+fn mame_file_source_shows_recovery_picker_without_opening_technical_details() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    add_saved_mame_source(
+        &mut page,
+        "fixture-mame",
+        fixture.root.join("missing-mame.dat"),
+    );
+
+    let row = page
+        .view()
+        .rows
+        .into_iter()
+        .find(|row| row.id == "fixture-mame")
+        .unwrap();
+    assert!(row.mame_replacement_available);
+    assert!(row.current_file_missing_or_invalid);
+
+    let mut ui_state = DatSourcesPageUi::default();
+    let output = render(&page.view(), &mut ui_state);
+    assert!(rendered_text_contains(
+        &output,
+        "Current file missing or invalid"
+    ));
+    assert!(rendered_text_contains(&output, "Choose replacement DAT…"));
+}
+
+#[test]
+fn stale_cached_health_cannot_hide_a_zero_byte_mame_source() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let path = fixture.write("zero-byte-mame.dat", "");
+    let mut entry = DatSourceEntry::new(
+        "fixture-mame".to_string(),
+        "MAME 0.174 Arcade DAT".to_string(),
+        path,
+        DatSourceKind::File,
+    );
+    entry.health.state = Some(DatHealthState::Valid);
+    entry.health.observed_size_bytes = Some(53_677_408);
+    entry.health.arcade_catalogue_revisions =
+        vec![archivefs_core::dat::sources::ArcadeCatalogueRevision {
+            ecosystem: DatEcosystem::MAMEArcade,
+            version: Some(MAME_0174_VERSION.to_string()),
+        }];
+    page.draft.add(entry).unwrap();
+    page.apply(DatSourcesPageAction::Save);
+
+    let row = page
+        .view()
+        .rows
+        .into_iter()
+        .find(|row| row.id == "fixture-mame")
+        .unwrap();
+    assert!(row.health_stale);
+    assert!(row.current_file_missing_or_invalid);
+    let output = render(&page.view(), &mut DatSourcesPageUi::default());
+    assert!(rendered_text_contains(
+        &output,
+        "Current file missing or invalid"
+    ));
+    assert!(rendered_text_contains(&output, "Choose replacement DAT…"));
+}
+
+#[test]
+fn cancelled_mame_picker_leaves_source_untouched() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let original_path = fixture.root.join("missing-mame.dat");
+    add_saved_mame_source(&mut page, "fixture-mame", original_path.clone());
+    let before = page.saved.to_config();
+
+    assert_eq!(stage_mame_replacement_pick("fixture-mame", None), None);
+    assert_eq!(page.saved.to_config(), before);
+    assert_eq!(page.draft.get("fixture-mame").unwrap().path, original_path);
+}
+
+#[test]
+fn valid_mame_replacement_candidate_reports_review_evidence() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    add_saved_mame_source(
+        &mut page,
+        "fixture-mame",
+        fixture.root.join("missing-mame.dat"),
+    );
+    let replacement = fixture.write("replacement.xml", MAME_0174_FIXTURE);
+
+    page.apply(DatSourcesPageAction::ChooseMameReplacement {
+        id: "fixture-mame".to_string(),
+        path: replacement.clone(),
+    });
+    run_to_completion(&mut page);
+    let candidate = page.mame_replacement_candidate.as_ref().unwrap();
+    assert!(candidate.is_valid(), "{}", candidate.validation_result());
+    assert_eq!(candidate.path, replacement);
+    assert_eq!(candidate.ecosystem, Some(DatEcosystem::MAMEArcade));
+    assert_eq!(candidate.version.as_deref(), Some(MAME_0174_VERSION));
+    assert_eq!(candidate.size_bytes, Some(MAME_0174_FIXTURE.len() as u64));
+    assert_eq!(candidate.sha256.as_deref().map(str::len), Some(64));
+
+    let mut ui_state = DatSourcesPageUi {
+        show_all_local_dat_sources: true,
+        ..Default::default()
+    };
+    let output = render(&page.view(), &mut ui_state);
+    for text in [
+        "Replacement DAT review",
+        "replacement.xml",
+        "Detected ecosystem: MAME listxml",
+        "Detected MAME version: 0.174",
+        "SHA-256:",
+        "Valid MAME DAT",
+        "Use this DAT",
+    ] {
+        assert!(rendered_text_contains(&output, text), "missing {text}");
+    }
+}
+
+#[test]
+fn zero_byte_and_partial_mame_replacements_are_rejected_plainly() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let entry = add_saved_mame_source(
+        &mut page,
+        "fixture-mame",
+        fixture.root.join("missing-mame.dat"),
+    );
+    let empty = fixture.write("empty.xml", "");
+    let partial = fixture.write("download.xml.part", MAME_0174_FIXTURE);
+
+    for path in [empty, partial] {
+        let candidate = inspect_mame_replacement(&entry, path, DatLimits::default());
+        assert!(!candidate.is_valid());
+        assert_eq!(candidate.validation_result(), "This file is incomplete.");
+    }
+}
+
+#[test]
+fn truncated_mame_xml_is_rejected_before_source_mutation() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let entry = add_saved_mame_source(
+        &mut page,
+        "fixture-mame",
+        fixture.root.join("missing-mame.dat"),
+    );
+    let truncated = fixture.write(
+        "truncated.xml",
+        "<datafile><header><name>MAME</name><version>0.174</version></header><machine>",
+    );
+    let before = page.saved.to_config();
+
+    let candidate = inspect_mame_replacement(&entry, truncated, DatLimits::default());
+    assert!(!candidate.is_valid());
+    assert_eq!(candidate.validation_result(), "This file is incomplete.");
+    assert_eq!(page.saved.to_config(), before);
+}
+
+#[test]
+fn exact_mame_source_rejects_checksum_mismatch() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let entry = add_saved_mame_source(
+        &mut page,
+        "mame-0-174-arcade-xml",
+        fixture.root.join("missing-mame.dat"),
+    );
+    let wrong_hash = fixture.write("mame-0.174.xml", MAME_0174_FIXTURE);
+
+    let candidate = inspect_mame_replacement(&entry, wrong_hash, DatLimits::default());
+    assert!(!candidate.is_valid());
+    assert_eq!(
+        candidate.validation_result(),
+        "This file does not match the expected checksum."
+    );
+}
+
+#[test]
+fn mame_replacement_rejects_html_wrong_ecosystem_and_version_mismatch() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let entry = add_saved_mame_source(
+        &mut page,
+        "fixture-mame",
+        fixture.root.join("missing-mame.dat"),
+    );
+    let html = fixture.write("error.xml", "<!doctype html><html>not found</html>");
+    let wrong_ecosystem = fixture.write(
+        "not-mame.xml",
+        &MAME_0174_FIXTURE
+            .replace("<name>MAME</name>", "<name>Generic</name>")
+            .replace("MAME Arcade 0.174", "Generic Arcade 0.174"),
+    );
+    let wrong_version = fixture.write(
+        "mame-0.175.xml",
+        &MAME_0174_FIXTURE.replace("0.174", "0.175"),
+    );
+
+    let cases = [
+        (html, "This is an HTML page, not a MAME DAT."),
+        (wrong_ecosystem, "This is not a MAME DAT."),
+        (wrong_version, "This DAT does not match MAME 0.174."),
+    ];
+    for (path, expected) in cases {
+        let candidate = inspect_mame_replacement(&entry, path, DatLimits::default());
+        assert!(!candidate.is_valid());
+        assert_eq!(candidate.validation_result(), expected);
+    }
+}
+
+#[test]
+fn successful_mame_repoint_preserves_id_and_unrelated_sources_across_reload() {
+    let fixture = Fixture::new();
+    let mut page = fixture.page();
+    let original_path = fixture.root.join("missing-mame.dat");
+    add_saved_mame_source(&mut page, "fixture-mame", original_path);
+    let unrelated_path = fixture.write("unrelated.dat", LOGIQX);
+    let mut unrelated = DatSourceEntry::new(
+        "unrelated".to_string(),
+        "Unrelated DAT".to_string(),
+        unrelated_path,
+        DatSourceKind::File,
+    );
+    unrelated.enabled = false;
+    unrelated.priority = 321;
+    unrelated.origin = Some("unrelated fixture".to_string());
+    page.draft.add(unrelated.clone()).unwrap();
+    page.apply(DatSourcesPageAction::Save);
+    let unrelated_before = page.saved.get("unrelated").unwrap().clone();
+    let replacement = fixture.write("replacement.xml", MAME_0174_FIXTURE);
+
+    page.apply(DatSourcesPageAction::ChooseMameReplacement {
+        id: "fixture-mame".to_string(),
+        path: replacement.clone(),
+    });
+    run_to_completion(&mut page);
+    // A separate draft edit deliberately remains uncommitted: applying the
+    // replacement writes only this existing source, never the whole draft.
+    page.draft.get_mut("unrelated").unwrap().enabled = true;
+    page.apply(DatSourcesPageAction::UseMameReplacement {
+        id: "fixture-mame".to_string(),
+    });
+
+    let applied = page.saved.get("fixture-mame").unwrap();
+    assert_eq!(applied.id, "fixture-mame");
+    assert_eq!(applied.display_name, "MAME 0.174 Arcade DAT");
+    assert_eq!(applied.path, replacement);
+    assert!(applied.enabled);
+    assert_eq!(applied.priority, 100);
+    assert_eq!(applied.origin.as_deref(), Some("test fixture"));
+    assert_eq!(applied.health.state(), DatHealthState::Valid);
+    assert_eq!(page.saved.get("unrelated"), Some(&unrelated_before));
+    assert!(page.draft.get("unrelated").unwrap().enabled);
+
+    let reloaded = fixture.page();
+    let persisted = reloaded.saved.get("fixture-mame").unwrap();
+    assert_eq!(persisted.id, "fixture-mame");
+    assert_eq!(persisted.path, replacement);
+    assert_eq!(persisted.health.state(), DatHealthState::Valid);
+    assert_eq!(reloaded.saved.get("unrelated"), Some(&unrelated_before));
 }
 
 #[test]
@@ -97,112 +406,9 @@ const LOGIQX: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Bytes whose MD5/SHA-1 are the ones in [`LOGIQX`].
 const SUPER_BIN: &[u8] = b"test";
 
-/// How long a test waits for a worker thread before calling it a failure.
+/// A bounded-fixture worker should settle promptly. This is only a watchdog
+/// for a broken completion path, not part of the behaviour being tested.
 const JOB_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[test]
-fn mame_replacement_rejects_empty_and_partial_files() {
-    let fixture = Fixture::new();
-    let empty = fixture.write("empty.dat", "");
-    let partial = fixture.write("download.dat.part", "not complete");
-
-    let empty_view = inspect_mame_dat_replacement(&empty);
-    assert!(
-        empty_view
-            .validation_error
-            .as_deref()
-            .is_some_and(|error| error.contains("empty"))
-    );
-    let partial_view = inspect_mame_dat_replacement(&partial);
-    assert!(
-        partial_view
-            .validation_error
-            .as_deref()
-            .is_some_and(|error| error.contains("incomplete"))
-    );
-}
-
-#[test]
-fn mame_replacement_rejects_hash_mismatch_without_staging_a_source_change() {
-    let fixture = Fixture::new();
-    let candidate_path = fixture.write(
-        "MAME.0.174.Arcade.XML.dat",
-        "<datafile><header><description>MAME Arcade 0.174</description></header></datafile>",
-    );
-    let view = inspect_mame_dat_replacement(&candidate_path);
-    assert!(!view.valid());
-    assert!(view.sha256.is_some());
-    assert!(view.validation_error.is_some());
-}
-
-#[test]
-fn mame_replacement_rejects_a_different_declared_version() {
-    let fixture = Fixture::new();
-    let candidate_path = fixture.write(
-        "MAME.0.175.Arcade.XML.dat",
-        "<datafile><header><description>MAME Arcade 0.175</description></header></datafile>",
-    );
-    let view = inspect_mame_dat_replacement(&candidate_path);
-    assert_eq!(view.version.as_deref(), Some("0.175"));
-    assert!(
-        view.validation_error
-            .as_deref()
-            .is_some_and(|error| error.contains("version does not match"))
-    );
-}
-
-#[test]
-fn applying_mame_replacement_updates_only_existing_path_after_explicit_action() {
-    let fixture = Fixture::new();
-    let old_path = fixture.write("old.dat", "");
-    let new_path = fixture.write("new.dat", "candidate");
-    let mut page = fixture.page();
-    page.apply(DatSourcesPageAction::AddFile { path: old_path });
-    let id = page.view().rows[0].id.clone();
-    page.mame_replacements.insert(
-        id.clone(),
-        MameDatReplacementView {
-            path: new_path.clone(),
-            file_name: "new.dat".to_string(),
-            size_bytes: Some(9),
-            sha256: Some(archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256.to_string()),
-            ecosystem: Some("MAME Arcade".to_string()),
-            version: Some("0.174".to_string()),
-            validation_error: None,
-        },
-    );
-    page.apply(DatSourcesPageAction::UseMameDatReplacement { id: id.clone() });
-    assert_eq!(page.draft.get(&id).unwrap().path, new_path);
-    assert!(page.is_dirty());
-}
-
-#[test]
-fn cancelling_mame_replacement_leaves_the_draft_path_untouched() {
-    let fixture = Fixture::new();
-    let old_path = fixture.write("old.dat", "");
-    let candidate_path = fixture.write("candidate.dat", "candidate");
-    let mut page = fixture.page();
-    page.apply(DatSourcesPageAction::AddFile {
-        path: old_path.clone(),
-    });
-    let id = page.view().rows[0].id.clone();
-    page.apply(DatSourcesPageAction::Save);
-    page.mame_replacements.insert(
-        id.clone(),
-        MameDatReplacementView {
-            path: candidate_path,
-            file_name: "candidate.dat".to_string(),
-            size_bytes: Some(9),
-            sha256: None,
-            ecosystem: None,
-            version: None,
-            validation_error: Some("rejected".to_string()),
-        },
-    );
-    page.apply(DatSourcesPageAction::CancelMameDatReplacement { id: id.clone() });
-    assert_eq!(page.draft.get(&id).unwrap().path, old_path);
-    assert!(!page.is_dirty());
-}
 
 struct Fixture {
     root: PathBuf,
@@ -294,7 +500,9 @@ fn run_to_completion(page: &mut DatSourcesPageState) {
         if Instant::now() > deadline {
             panic!("a background job did not finish within {JOB_TIMEOUT:?}");
         }
-        std::thread::sleep(Duration::from_millis(5));
+        // The worker has an explicit terminal message; yield until it is
+        // observed instead of adding scheduler-dependent sleeps to the test.
+        std::thread::yield_now();
     }
     // One final drain: the job may have finished between the last poll and the
     // loop's exit test.
@@ -6154,6 +6362,42 @@ fn redump_game_disc_rows_show_the_reviewed_typed_supported_systems() {
     ));
     assert!(rendered_text_contains(&output, "Redump BIOS DATs"));
     assert!(rendered_text_contains(&output, "MAME software list"));
+}
+
+#[test]
+fn managed_expand_and_collapse_commands_override_persistent_row_state_for_all_sources() {
+    let fixture = Fixture::new();
+    let page = fixture.page();
+    let view = page.view();
+    let managed_count = view.managed_rows.len()
+        + view.redump_bios_rows.len()
+        + view.redump_game_rows.len()
+        + view.fbneo_rows.len();
+    assert_eq!(
+        managed_count, 21,
+        "the production managed-source set is covered"
+    );
+
+    let expanded = render(
+        &view,
+        &mut DatSourcesPageUi {
+            managed_sources_expanded: Some(true),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        rendered_text_count(&expanded, "Not configured"),
+        managed_count
+    );
+
+    let collapsed = render(
+        &view,
+        &mut DatSourcesPageUi {
+            managed_sources_expanded: Some(false),
+            ..Default::default()
+        },
+    );
+    assert_eq!(rendered_text_count(&collapsed, "Not configured"), 0);
 }
 
 #[test]

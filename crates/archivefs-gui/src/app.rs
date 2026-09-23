@@ -368,20 +368,46 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn new(context: egui::Context) -> Self {
+        Self::new_with_initial_load(context, true)
+    }
+
+    /// Constructs the legacy workflow host without starting its catalogue
+    /// workers. GUI v2 owns its own library snapshot and creates this host
+    /// lazily for embedded specialist panels; starting both generations of
+    /// catalogue loaders at once duplicates production-scale database work
+    /// and competes with the v2 artwork index worker.
+    #[allow(dead_code)]
+    pub(crate) fn new_without_initial_load(context: egui::Context) -> Self {
+        Self::new_with_initial_load(context, false)
+    }
+
+    fn new_with_initial_load(context: egui::Context, initial_load: bool) -> Self {
         theme::apply(&context);
         let gui_config = GuiConfigSnapshot::load_default();
         let generation = RefreshGeneration::INITIAL;
         let database_generation = DatabaseGeneration::INITIAL;
         let mut history = OperationHistory::default();
-        history.record(HistoryEntry::new(
-            ActivityAction::Refresh,
-            None,
-            ActivityOutcome::Started,
-            "Loading your library.",
-        ));
+        if initial_load {
+            history.record(HistoryEntry::new(
+                ActivityAction::Refresh,
+                None,
+                ActivityOutcome::Started,
+                "Loading your library.",
+            ));
+        }
         Self {
-            state: start_load(context.clone(), generation, None),
-            database_state: start_database_load(context.clone(), database_generation, None, false),
+            state: if initial_load {
+                start_load(context.clone(), generation, None)
+            } else {
+                LoadState::Error("embedded v2 host has no legacy library snapshot".into())
+            },
+            database_state: if initial_load {
+                start_database_load(context.clone(), database_generation, None, false)
+            } else {
+                DatabaseState::NotCreated {
+                    database_path: default_database_path().unwrap_or_default(),
+                }
+            },
             database_generation,
             needs_attention: needs_attention::AttentionWorkspace::default(),
             cheat_reconciliation_review:

@@ -827,8 +827,11 @@ pub fn inspect_discovered_emulator_lifecycles_with_selections(
         .installations
         .iter()
         .filter_map(|installation| {
-            crate::emulator_inventory::probe_version_output(&installation.executable_path)
-                .map(|output| (installation.executable_path.clone(), output))
+            crate::emulator_inventory::probe_version_output(
+                &installation.executable_path,
+                installation.emulator,
+            )
+            .map(|output| (installation.executable_path.clone(), output))
         })
         .collect();
     let flatpak_installations = discover_flatpak().unwrap_or_default();
