@@ -84,6 +84,8 @@ mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
 mod dat;
+mod mame_evidence;
+mod mame_normalise;
 mod media_set;
 mod platform_artwork;
 mod repair;
@@ -92,6 +94,7 @@ mod retroarch_cheat_setup;
 mod retroarch_cheat_sources;
 mod rom_organise;
 mod romm_identity;
+mod saves;
 
 static LOGGER: StderrLogger = StderrLogger;
 static LOGGER_INIT: OnceLock<()> = OnceLock::new();
@@ -228,6 +231,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = cli.args.into_iter();
 
     match command.as_str() {
+        "saves" => saves::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
             let config = load_config()?;
@@ -419,6 +423,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "rom-organise" => {
             rom_organise::run(args.collect())?;
+        }
+        "mame-normalise" => {
+            mame_normalise::run(args.collect())?;
+        }
+        "mame" => {
+            mame_evidence::run(args.collect())?;
         }
         "repair" => {
             repair::run(args.collect())?;
@@ -5963,9 +5973,7 @@ mod tests {
             PathBuf::from("/data/roms")
         );
         let error = resolve_source_identifier_without_catalogue("7", &sources).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("No EmuWiz catalogue exists yet"));
+        assert!(error.to_string().contains("No EmuWiz catalogue exists yet"));
         assert!(error.to_string().contains("library scan first"));
     }
 

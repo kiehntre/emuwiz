@@ -87,6 +87,7 @@ pub(crate) fn is_identity_conferring(kind: IdentityKind) -> bool {
             | IdentityKind::DolphinGameId
             | IdentityKind::LooseRomSha256
             | IdentityKind::LooseRomCanonicalSha256
+            | IdentityKind::MameMachineName
             | IdentityKind::XbeTitleId
             | IdentityKind::XexTitleId
             | IdentityKind::XexMediaId
@@ -176,6 +177,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::AtariLynx => Some("Atari Lynx"),
         IdentityPlatform::AtariJaguar => Some("Atari Jaguar"),
         IdentityPlatform::AtariST => Some("AtariST"),
+        IdentityPlatform::Arcade => Some("Arcade"),
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
         // Modern Nintendo platforms are catalogue foundations only; no
@@ -386,6 +388,10 @@ fn resolved_identity_for_platform(
             Some((platform_id, sha256.to_string(), Vec::new()))
         }
         IdentityPlatform::AtariST => None,
+        IdentityPlatform::Arcade => {
+            let machine = find_value(resolved, IdentityKind::MameMachineName)?;
+            Some((platform_id, machine.to_string(), Vec::new()))
+        }
         // PC Engine CD's IPL boot-record carries no serial/title, so there
         // is no resolvable game key here - exact identity is DAT/hash-driven.
         // The platform is still known (via `launch_platform_id`), so a
@@ -508,6 +514,7 @@ pub fn launch_content_ref_from_archive_record(
             {
                 Some(LaunchContentKind::Cartridge)
             }
+            ArchiveKind::ArcadeSetDirectory => None,
             // `DirectGameImage` covers more than one real platform/format;
             // this bridge does not know which without guessing.
             _ => None,

@@ -26,7 +26,9 @@ pub struct MameLaunchRequest {
     /// Optional point-in-time identity captured with the selection. When
     /// present, preflight rejects a replacement at the same path.
     pub expected_content_identity: Option<CapturedFileIdentity>,
-    pub rom_search_path_configured: bool,
+    /// Exact collection root supplied to MAME with `-rompath`. It is derived
+    /// from the trusted logical-set path, never from a product hard-code.
+    pub rom_search_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +100,21 @@ pub fn preflight_mame_launch(
             )],
         });
     }
+    let search_path_metadata =
+        fs::symlink_metadata(&request.rom_search_path).map_err(|_| MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSearchPathUnconfigured,
+                "the configured MAME ROM/search path is no longer available",
+            )],
+        })?;
+    if search_path_metadata.file_type().is_symlink() || !search_path_metadata.is_dir() {
+        return Err(MameLaunchPreflightError {
+            blockers: vec![LaunchBlocker::new(
+                crate::launch::readiness::LaunchBlockerKind::MameSearchPathUnconfigured,
+                "the configured MAME ROM/search path is not a safe directory",
+            )],
+        });
+    }
     let Some(resolution) = request.set_resolutions.first() else {
         return Err(MameLaunchPreflightError {
             blockers: vec![LaunchBlocker::new(
@@ -118,7 +135,7 @@ pub fn preflight_mame_launch(
         &request.identity,
         &request.set_resolutions,
         Some(executable),
-        request.rom_search_path_configured,
+        Some(&request.rom_search_path),
     );
     match (plan.command, plan.blockers.is_empty()) {
         (Some(command), true) => Ok(command),
@@ -157,6 +174,7 @@ mod tests {
         let expected_content_identity = Some(CapturedFileIdentity::capture(
             &std::fs::symlink_metadata(&selected_content).unwrap(),
         ));
+        let rom_search_path = selected_content.parent().unwrap().to_path_buf();
         MameLaunchRequest {
             identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
                 platform_id: "Arcade".into(),
@@ -185,7 +203,7 @@ mod tests {
             expected_executable: executable,
             selected_content,
             expected_content_identity,
-            rom_search_path_configured: true,
+            rom_search_path,
         }
     }
 
@@ -195,16 +213,15 @@ mod tests {
         let executable = dir.path().join("fake-mame");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s' \"$1\" > \"$0.argv\"\nexit 7\n",
+            "#!/bin/sh\nprintf '%s' \"$3\" > \"$0.argv\"\nexit 7\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let request = request(executable.clone());
         let command = preflight_mame_launch(&request).unwrap();
-        assert_eq!(
-            command.arguments,
-            vec![std::ffi::OsString::from("test;set")]
-        );
+        assert_eq!(command.arguments[0], std::ffi::OsString::from("-rompath"));
+        assert_eq!(command.arguments[1], request.rom_search_path.as_os_str());
+        assert_eq!(command.arguments[2], std::ffi::OsString::from("test;set"));
         let mut process = spawn_mame(&command).unwrap();
         while process.poll().is_none() {
             std::thread::yield_now();

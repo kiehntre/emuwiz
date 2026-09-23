@@ -14,14 +14,14 @@ use crate::dat::rename_apply::identity::capture_identity;
 use crate::dat::rename_apply::model::RollbackResult;
 use crate::dat::sources::now_unix;
 use crate::optical_fingerprint::{
-    compare_optical_fingerprints, fingerprint_chd, fingerprint_cue_bin,
-    CanonicalOpticalFingerprint, OpticalFingerprintComparison,
+    CanonicalOpticalFingerprint, OpticalFingerprintComparison, compare_optical_fingerprints,
+    fingerprint_chd, fingerprint_cue_bin,
 };
 use crate::repair::execute::{
-    apply_repair_transaction, build_repair_transaction, rollback_repair_transaction,
     RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairTransactionResult,
+    apply_repair_transaction, build_repair_transaction, rollback_repair_transaction,
 };
-use crate::repair::plan::{build_repair_plan, RepairPlan, RepairPlanId};
+use crate::repair::plan::{RepairPlan, RepairPlanId, build_repair_plan};
 use crate::repair::proposal::{
     RepairAction, RepairEvidence, RepairEvidenceKind, RepairProposal, RepairProposalId, SafetyState,
 };

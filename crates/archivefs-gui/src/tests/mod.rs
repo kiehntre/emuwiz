@@ -1019,7 +1019,7 @@ fn gamer_shelf_geometry(ctx: &egui::Context) -> ShelfGeometry {
         .unwrap_or_default()
 }
 
-pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
+pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
     ArchiveFsApp {
         state: LoadState::Ready(Box::new(empty_loaded_data("/mount"))),
         database_state: DatabaseState::NotCreated {
@@ -1141,7 +1141,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             master_rom_root: None,
         }),
         screenscraper_page: screenscraper_page::ScreenScraperPageState::default(),
-        screenscraper_enrichment: crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+        screenscraper_enrichment:
+            crate::screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
         romm_ui: RommUiState::default(),
         selected_evidence_ui: SelectedEvidenceUiState::default(),
         gamer_view_scan_review_available: false,
@@ -1189,7 +1190,8 @@ pub(super) fn app_for_operation_tests() -> ArchiveFsApp {
             game_metadata_worker_allowed: false,
             gamer_alpha_jump: crate::gamer_view::AlphaJumpIndex::default(),
             es_de_media: crate::es_de_media_state::EsDeMediaState::default(),
-            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(),
+            launchbox_local_media: crate::launchbox_local_state::LaunchBoxLocalMediaState::default(
+            ),
         },
     }
 }
@@ -1509,6 +1511,7 @@ fn skipped_files_summary(
         ingestion_stats: Default::default(),
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
+        arcade_ingestion: Default::default(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     }

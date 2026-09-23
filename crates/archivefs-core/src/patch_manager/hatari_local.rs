@@ -1134,9 +1134,9 @@ mod tests {
         write(path, b"hatari");
         #[cfg(unix)]
         {
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
         }
     }
     fn profile(config: PathBuf) -> HatariProfile {
@@ -1502,8 +1502,17 @@ mod tests {
         assert!(evidence.ready_with_warnings);
         assert_eq!(evidence.machine.model, HatariMachineModel::Ste);
         assert_eq!(evidence.tos.health, HatariTosHealth::PresentUnverified);
-        assert_eq!(evidence.media_representations, vec![HatariFloppyRepresentation::Stx, HatariFloppyRepresentation::Unknown]);
-        assert_eq!(evidence.executable.as_ref().unwrap().version.as_deref(), Some("2.5.1"));
+        assert_eq!(
+            evidence.media_representations,
+            vec![
+                HatariFloppyRepresentation::Stx,
+                HatariFloppyRepresentation::Unknown
+            ]
+        );
+        assert_eq!(
+            evidence.executable.as_ref().unwrap().version.as_deref(),
+            Some("2.5.1")
+        );
     }
 
     #[test]
@@ -1512,7 +1521,10 @@ mod tests {
         let config = t.path().join("hatari.cfg");
         let exe = t.path().join("hatari");
         executable(&exe);
-        write(&config, b"[System]\nnModelType=0\n[ROM]\nszTosImageFileName=/missing/tos.img\n");
+        write(
+            &config,
+            b"[System]\nnModelType=0\n[ROM]\nszTosImageFileName=/missing/tos.img\n",
+        );
         let profile = HatariProfile {
             profile_id: "test".into(),
             installation_type: HatariInstallationType::Explicit,
@@ -1532,7 +1544,10 @@ mod tests {
         );
         let evidence = assess_hatari_readiness(&profile, &inspection);
         assert!(!evidence.ready);
-        assert_eq!(evidence.first_blocker.as_deref(), Some("configured Hatari TOS image is missing"));
+        assert_eq!(
+            evidence.first_blocker.as_deref(),
+            Some("configured Hatari TOS image is missing")
+        );
     }
 
     #[test]
@@ -1561,7 +1576,10 @@ mod tests {
         );
         let evidence = assess_hatari_readiness(&profile, &inspection);
         assert_eq!(evidence.machine.model, HatariMachineModel::Unknown);
-        assert_eq!(evidence.first_blocker.as_deref(), Some("Hatari machine model is not configured or could not be read"));
+        assert_eq!(
+            evidence.first_blocker.as_deref(),
+            Some("Hatari machine model is not configured or could not be read")
+        );
     }
 
     #[test]

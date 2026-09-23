@@ -585,7 +585,8 @@ fn handle_catalogue_manager_action_review_then_confirm_requires_both_steps() {
         "reviewing an update must never itself start network access"
     );
     assert_eq!(
-        app.catalogue_bsfree_ui.catalogue_review
+        app.catalogue_bsfree_ui
+            .catalogue_review
             .as_ref()
             .map(|review| &review.source_id),
         Some(&"libretro-buildbot-cheats".to_string())
@@ -771,7 +772,11 @@ fn dolphin_catalogue_card_shows_ready_summary_and_flags_an_available_update() {
 fn handle_dolphin_catalogue_manager_action_review_then_confirm_requires_both_steps() {
     let mut app = app_for_operation_tests();
     assert!(app.catalogue_bsfree_ui.dolphin_catalogue_review.is_none());
-    assert!(app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_none());
+    assert!(
+        app.catalogue_bsfree_ui
+            .dolphin_catalogue_retrieval
+            .is_none()
+    );
     let context = egui::Context::default();
 
     app.handle_dolphin_catalogue_manager_action(
@@ -779,7 +784,9 @@ fn handle_dolphin_catalogue_manager_action_review_then_confirm_requires_both_ste
         DolphinCatalogueManagerAction::Review(DolphinCatalogueRetrievalKind::Download),
     );
     assert!(
-        app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_none(),
+        app.catalogue_bsfree_ui
+            .dolphin_catalogue_retrieval
+            .is_none(),
         "reviewing a download must never itself start network access"
     );
     assert_eq!(
@@ -789,7 +796,9 @@ fn handle_dolphin_catalogue_manager_action_review_then_confirm_requires_both_ste
 
     app.handle_dolphin_catalogue_manager_action(&context, DolphinCatalogueManagerAction::Confirm);
     assert!(
-        app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_some(),
+        app.catalogue_bsfree_ui
+            .dolphin_catalogue_retrieval
+            .is_some(),
         "confirming the reviewed action starts the retrieval"
     );
     assert!(
@@ -811,7 +820,11 @@ fn handle_dolphin_catalogue_manager_action_cancel_review_clears_it_without_start
         DolphinCatalogueManagerAction::CancelReview,
     );
     assert!(app.catalogue_bsfree_ui.dolphin_catalogue_review.is_none());
-    assert!(app.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_none());
+    assert!(
+        app.catalogue_bsfree_ui
+            .dolphin_catalogue_retrieval
+            .is_none()
+    );
 }
 
 #[test]

@@ -167,7 +167,7 @@ pub(crate) fn main_view_title(view: MainView) -> &'static str {
         MainView::RepairReview => "Repair Review",
         MainView::RepairHistory => "Repair History",
         MainView::ExactDuplicateReview => "Duplicate Finder",
-        MainView::DiscConversion => "Converter",
+        MainView::DiscConversion => "Disc Conversion",
         MainView::StorageHealth => "Storage Health",
         MainView::TapeInspector => "Tape Inspector",
         MainView::EmulatorSetup => "Emulator Setup",
@@ -780,9 +780,13 @@ pub(crate) fn show_library_shell_header_with_actions(
 ) -> Option<LibraryTab> {
     ui.horizontal_top(|ui| {
         let width = (ui.available_width() - 165.0).max(120.0);
-        ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-            widgets::workflow_header(ui, "My Games", "Browse and manage your games.");
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                widgets::workflow_header(ui, "My Games", "Browse and manage your games.");
+            },
+        );
         actions(ui);
     });
     let tab_options: [(LibraryTab, &str); 5] = [

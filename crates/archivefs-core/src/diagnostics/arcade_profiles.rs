@@ -393,7 +393,7 @@ mod tests {
             &identity("Arcade", "pacman"),
             &[resolution("pacman", SetState::Incomplete)],
             Some(Path::new("/usr/bin/mame")),
-            true,
+            Some(Path::new("/roms")),
         );
         let projection = from_mame_plan(
             Some(&plan),

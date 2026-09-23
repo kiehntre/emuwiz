@@ -229,14 +229,10 @@ fn a_malformed_code_line_is_reported_not_silently_dropped_or_repaired() {
 
 #[test]
 fn count_declared_gecko_block_requires_all_continuation_lines() {
-    let valid = parse_dolphin_ini(
-        "[Gecko]\n$Block\nC2123456 00000001\n60000000 00000000\n",
-    );
+    let valid = parse_dolphin_ini("[Gecko]\n$Block\nC2123456 00000001\n60000000 00000000\n");
     assert!(valid.gecko_codes[0].is_selectable());
 
-    let truncated = parse_dolphin_ini(
-        "[Gecko]\n$Block\nC2123456 00000002\n60000000 00000000\n",
-    );
+    let truncated = parse_dolphin_ini("[Gecko]\n$Block\nC2123456 00000002\n60000000 00000000\n");
     let code = &truncated.gecko_codes[0];
     assert!(!code.is_selectable());
     assert!(code.warnings.iter().any(|warning| {
@@ -272,9 +268,8 @@ fn excessive_declared_continuation_count_is_bounded_and_deterministic() {
 #[test]
 fn structural_failure_cannot_reach_gecko_merge() {
     let document = parse_dolphin_ini("[Gecko]\n$Existing\nAABBCCDD 11223344\n");
-    let provider = parse_dolphin_ini(
-        "[Gecko]\n$Broken block\nC2123456 00000002\n60000000 00000000\n",
-    );
+    let provider =
+        parse_dolphin_ini("[Gecko]\n$Broken block\nC2123456 00000002\n60000000 00000000\n");
     let error = merge_external_gecko_codes(
         &document,
         &provider.gecko_codes,

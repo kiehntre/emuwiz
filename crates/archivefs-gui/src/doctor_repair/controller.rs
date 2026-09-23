@@ -192,22 +192,18 @@ impl ArchiveFsApp {
                 &gathered.linux_emulator_installations,
                 |value| value.as_slice(),
             ),
-            azahar_cemu_readiness: borrowed(
-                &gathered.azahar_cemu_readiness,
-                |value| value.as_slice(),
-            ),
-            melonds_mgba_readiness: borrowed(
-                &gathered.melonds_mgba_readiness,
-                |value| value.as_slice(),
-            ),
-            desmume_mesen_readiness: borrowed(
-                &gathered.desmume_mesen_readiness,
-                |value| value.as_slice(),
-            ),
-            rmg_sameboy_readiness: borrowed(
-                &gathered.rmg_sameboy_readiness,
-                |value| value.as_slice(),
-            ),
+            azahar_cemu_readiness: borrowed(&gathered.azahar_cemu_readiness, |value| {
+                value.as_slice()
+            }),
+            melonds_mgba_readiness: borrowed(&gathered.melonds_mgba_readiness, |value| {
+                value.as_slice()
+            }),
+            desmume_mesen_readiness: borrowed(&gathered.desmume_mesen_readiness, |value| {
+                value.as_slice()
+            }),
+            rmg_sameboy_readiness: borrowed(&gathered.rmg_sameboy_readiness, |value| {
+                value.as_slice()
+            }),
             arcade_dat_version: borrowed(&gathered.arcade_dat_version, |value| value.as_slice()),
             arcade_readiness: borrowed(&gathered.arcade_readiness, |value| value.as_slice()),
             scummvm_readiness: borrowed(&gathered.scummvm_readiness, |value| value),
@@ -702,18 +698,16 @@ pub(crate) fn gather_doctor_inputs(
     let scummvm_readiness = Gathered::Ready(scummvm_readiness);
     let dosbox_staging_readiness = Gathered::Ready(dosbox_staging_readiness);
     let linux_emulator_installations = Gathered::Ready(installations);
-    let azahar_cemu_readiness = Gathered::Ready(
-        archivefs_core::diagnostics::profiles::discover_azahar_cemu_readiness(),
-    );
+    let azahar_cemu_readiness =
+        Gathered::Ready(archivefs_core::diagnostics::profiles::discover_azahar_cemu_readiness());
     let melonds_mgba_readiness = Gathered::Ready(
         archivefs_core::diagnostics::handheld_profiles::discover_melonds_mgba_readiness(),
     );
     let desmume_mesen_readiness = Gathered::Ready(
         archivefs_core::diagnostics::native_profiles::discover_desmume_mesen_readiness(),
     );
-    let rmg_sameboy_readiness = Gathered::Ready(
-        archivefs_core::diagnostics::rmg_sameboy::discover_rmg_sameboy_readiness(),
-    );
+    let rmg_sameboy_readiness =
+        Gathered::Ready(archivefs_core::diagnostics::rmg_sameboy::discover_rmg_sameboy_readiness());
     let remaining_profiles = Gathered::Ready(
         archivefs_core::diagnostics::remaining_profiles::findings_from_remaining_profiles(),
     );

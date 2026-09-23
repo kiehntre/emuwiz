@@ -10,12 +10,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::mod_activation::ActivationReceipt;
 use crate::mod_provider::{ModCompatibilityLevel, ModPackageJoin, ModProviderProvenance};
 use crate::patch_manager::{
     PreviewAdapter, SharedApplyJournal, SharedApplyOutcome, SharedHistoryReport,
     SharedRollbackOutcome, SharedRollbackPreview, discover_shared_apply_history,
     preview_shared_rollback,
 };
+use crate::patch_package_composition::PatchCompositionProvenance;
 use crate::standalone_patch::DerivedPatchProvenance;
 
 pub const MOD_RECEIPT_SCHEMA_VERSION: u32 = 1;
@@ -29,6 +31,8 @@ pub enum ModKind {
     Rpcs3Ordinary,
     LocalPackage,
     StandalonePatch,
+    PatchComposition,
+    ActivationStack,
 }
 
 impl ModKind {
@@ -40,6 +44,8 @@ impl ModKind {
             Self::Rpcs3Ordinary => "RPCS3 ordinary mod",
             Self::LocalPackage => "Local mod package",
             Self::StandalonePatch => "Standalone patch",
+            Self::PatchComposition => "Patch-package composition",
+            Self::ActivationStack => "Mod activation stack",
         }
     }
 }
@@ -131,6 +137,18 @@ pub struct ModReceiptSummary {
     pub provider_provenance: Option<ModProviderProvenance>,
     #[serde(default)]
     pub provider_state: Option<ModProviderHistoryState>,
+    #[serde(default)]
+    pub package_hash: Option<String>,
+    #[serde(default)]
+    pub affected_destinations: Vec<String>,
+    #[serde(default)]
+    pub requested_order: Option<u32>,
+    #[serde(default)]
+    pub effective_order: Option<u32>,
+    #[serde(default)]
+    pub activation_group: Option<String>,
+    #[serde(default)]
+    pub conflict_kinds: Vec<String>,
 }
 
 impl ModReceiptSummary {
@@ -159,9 +177,15 @@ impl ModReceiptSummary {
         let mut replaced = 0;
         let mut unchanged = 0;
         let mut notes = Vec::new();
+        let mut destinations = BTreeSet::new();
         for entry in &journal.entries {
             source_paths.insert(entry.plan_entry.selected_archive.display.clone());
             source_digests.insert(entry.plan_entry.source_digest.clone());
+            destinations.insert(format!(
+                "{}/{}",
+                entry.plan_entry.destination_root.display,
+                entry.plan_entry.destination_relative_path.display
+            ));
             match entry.outcome {
                 SharedApplyOutcome::InstalledNew => created += 1,
                 SharedApplyOutcome::ReplacedExisting => replaced += 1,
@@ -184,7 +208,7 @@ impl ModReceiptSummary {
             game_title: None,
             verified_identity: nonempty(&journal.context.verified_game_identity),
             source_package: source_paths.into_iter().next(),
-            source_fingerprint,
+            source_fingerprint: source_fingerprint.clone(),
             installed_at_unix: journal.timestamp_unix_seconds,
             files_created: created,
             files_replaced: replaced,
@@ -197,6 +221,12 @@ impl ModReceiptSummary {
             notes: dedup_sorted(notes),
             provider_provenance: None,
             provider_state: None,
+            package_hash: source_fingerprint.clone(),
+            affected_destinations: destinations.into_iter().collect(),
+            requested_order: None,
+            effective_order: None,
+            activation_group: None,
+            conflict_kinds: Vec::new(),
         })
     }
 
@@ -236,6 +266,12 @@ impl ModReceiptSummary {
             )],
             provider_provenance: None,
             provider_state: None,
+            package_hash: Some(provenance.patch_sha256.clone()),
+            affected_destinations: vec![provenance.output_path.display().to_string()],
+            requested_order: None,
+            effective_order: None,
+            activation_group: None,
+            conflict_kinds: Vec::new(),
         }
     }
 
@@ -291,6 +327,138 @@ impl ModReceiptSummary {
             return Err(ModProviderHistoryAttachError::ChecksumMismatch);
         }
         self.attach_provider_provenance(provider)
+    }
+
+    pub fn from_patch_composition(provenance: &PatchCompositionProvenance) -> Self {
+        Self {
+            schema_version: MOD_RECEIPT_SCHEMA_VERSION,
+            transaction_id: format!("composition:{}", provenance.output_sha256),
+            kind: ModKind::PatchComposition,
+            platform: None,
+            emulator: None,
+            game_title: None,
+            verified_identity: provenance.verified_identity.clone(),
+            source_package: Some(provenance.package_path.display().to_string()),
+            source_fingerprint: Some(provenance.source_sha256.clone()),
+            installed_at_unix: provenance.applied_at_unix_seconds,
+            files_created: 1,
+            files_replaced: 0,
+            files_unchanged: 0,
+            destination_root: provenance
+                .output_path
+                .parent()
+                .map(|p| p.display().to_string()),
+            journal_path: None,
+            backup_root: None,
+            rollback: ModRollbackStatus::CannotSafelyUndo {
+                reason:
+                    "This derived patch output has provenance but no rollback journal or backup."
+                        .into(),
+            },
+            conflicts: Vec::new(),
+            notes: vec![format!(
+                "Composed {} patch stage(s) without modifying the original source.",
+                provenance.patches.len()
+            )],
+            provider_provenance: None,
+            provider_state: None,
+            package_hash: Some(provenance.package_sha256.clone()),
+            affected_destinations: vec![provenance.output_path.display().to_string()],
+            requested_order: None,
+            effective_order: None,
+            activation_group: None,
+            conflict_kinds: Vec::new(),
+        }
+    }
+
+    pub fn from_patch_composition_with_provider(
+        provenance: &PatchCompositionProvenance,
+        provider: ModProviderProvenance,
+        join: &ModPackageJoin,
+    ) -> Result<Self, ModProviderHistoryAttachError> {
+        Self::from_patch_composition(provenance)
+            .attach_provider_provenance_after_join(provider, join)
+    }
+
+    pub fn from_activation_receipt(receipt: &ActivationReceipt) -> Vec<Self> {
+        receipt
+            .resulting_stack
+            .layers
+            .iter()
+            .filter(|layer| layer.enabled)
+            .map(|layer| Self {
+                schema_version: MOD_RECEIPT_SCHEMA_VERSION,
+                transaction_id: layer.transaction_id.clone().unwrap_or_else(|| {
+                    format!(
+                        "activation:{}:{}",
+                        receipt.timestamp_unix_seconds, layer.mod_id
+                    )
+                }),
+                kind: ModKind::ActivationStack,
+                platform: Some(layer.platform.clone()),
+                emulator: layer.emulator.clone(),
+                game_title: None,
+                verified_identity: Some(layer.game_identity.clone()),
+                source_package: Some(layer.provenance.source.clone()),
+                source_fingerprint: layer.provenance.content_sha256.clone(),
+                installed_at_unix: receipt.timestamp_unix_seconds,
+                files_created: 0,
+                files_replaced: 0,
+                files_unchanged: 0,
+                destination_root: None,
+                journal_path: None,
+                backup_root: None,
+                rollback: if layer.transaction_id.is_some() {
+                    ModRollbackStatus::NeedsReview {
+                        reason: "Use the referenced backend transaction's rollback preview.".into(),
+                    }
+                } else {
+                    ModRollbackStatus::CannotSafelyUndo {
+                        reason: "Activation state has no filesystem rollback journal.".into(),
+                    }
+                },
+                conflicts: Vec::new(),
+                notes: vec![format!("Activation operation: {:?}", receipt.operation)],
+                provider_provenance: None,
+                provider_state: None,
+                package_hash: layer.provenance.content_sha256.clone(),
+                affected_destinations: layer
+                    .affected_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect(),
+                requested_order: layer.requested_order,
+                effective_order: layer.effective_order,
+                activation_group: layer.exclusive_group.clone(),
+                conflict_kinds: receipt
+                    .conflicts
+                    .iter()
+                    .filter(|c| {
+                        c.left_mod_id == layer.mod_id
+                            || c.right_mod_id.as_deref() == Some(layer.mod_id.as_str())
+                    })
+                    .map(|c| format!("{:?}", c.kind))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    pub fn from_activation_receipt_with_providers(
+        receipt: &ActivationReceipt,
+        providers: &BTreeMap<String, (ModProviderProvenance, ModPackageJoin)>,
+    ) -> Result<Vec<Self>, ModProviderHistoryAttachError> {
+        Self::from_activation_receipt(receipt)
+            .into_iter()
+            .map(|row| {
+                if let Some((provider, join)) =
+                    providers.get(row.source_package.as_deref().unwrap_or_default())
+                {
+                    row.attach_provider_provenance_after_join(provider.clone(), join)
+                } else {
+                    Ok(row)
+                }
+            })
+            .collect()
     }
 }
 
@@ -474,7 +642,10 @@ fn system_for_kind(kind: ModKind) -> (Option<String>, Option<String>) {
         ModKind::PpssppTexture => (Some("PSP".into()), Some("PPSSPP".into())),
         ModKind::CemuGraphicPack => (Some("Wii U".into()), Some("Cemu".into())),
         ModKind::Rpcs3Ordinary => (Some("PS3".into()), Some("RPCS3".into())),
-        ModKind::LocalPackage | ModKind::StandalonePatch => (None, None),
+        ModKind::LocalPackage
+        | ModKind::StandalonePatch
+        | ModKind::PatchComposition
+        | ModKind::ActivationStack => (None, None),
     }
 }
 
@@ -585,6 +756,7 @@ fn dedup_sorted(mut values: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mod_activation::{ActivationOperation, ModLayer, ModProvenance, ModStack};
     use crate::mod_catalogue::{ModCatalogueHash, ModCatalogueHashAlgorithm};
     use crate::mod_provider::{ModAcquisitionMode, ModCompatibilityAssessment, ModProviderId};
     use crate::patch_manager::{
@@ -745,6 +917,10 @@ mod tests {
             Some(ModKind::CemuGraphicPack)
         );
         assert_eq!(
+            kind_for_adapter(PreviewAdapter::Ppsspp),
+            Some(ModKind::PpssppTexture)
+        );
+        assert_eq!(
             kind_for_adapter(PreviewAdapter::LocalModPackage),
             Some(ModKind::LocalPackage)
         );
@@ -868,6 +1044,95 @@ mod tests {
     }
 
     #[test]
+    fn provider_patch_composition_and_activation_share_one_history_model() {
+        let provider = provider_provenance(
+            ModAcquisitionMode::DirectPermitted,
+            false,
+            Some("0123456789abcdef0123456789abcdef"),
+            ModCompatibilityLevel::Verified,
+        );
+        let provider_hash = provider.locally_calculated_checksum.clone().unwrap();
+        let join = ModPackageJoin {
+            provider: provider.provider.clone(),
+            provider_file_id: "darkwatch-file".into(),
+            local_checksum: provider_hash,
+            evidence: "matching strong checksum".into(),
+        };
+        let composition = ModReceiptSummary::from_patch_composition_with_provider(
+            &PatchCompositionProvenance {
+                source_path: PathBuf::from("/games/base.iso"),
+                source_sha256: "a".repeat(64),
+                package_path: PathBuf::from("/mods/provider-pack.zip"),
+                package_sha256: "b".repeat(64),
+                patches: Vec::new(),
+                verified_identity: Some("GAME-1".into()),
+                output_path: PathBuf::from("/derived/output.iso"),
+                output_sha256: "c".repeat(64),
+                applied_at_unix_seconds: 2,
+                application: "fixture".into(),
+            },
+            provider.clone(),
+            &join,
+        )
+        .unwrap();
+        assert_eq!(composition.kind, ModKind::PatchComposition);
+        assert_eq!(
+            composition.package_hash.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(
+            composition.provider_state,
+            Some(ModProviderHistoryState::VerifiedProviderFile)
+        );
+
+        let layer = ModLayer {
+            mod_id: "provider-mod".into(),
+            package_id: "provider-pack".into(),
+            game_identity: "GAME-1".into(),
+            platform: "PS2".into(),
+            emulator: Some("PCSX2".into()),
+            mod_type: "ordinary".into(),
+            provenance: ModProvenance {
+                source: "/mods/provider-pack.zip".into(),
+                content_sha256: Some("b".repeat(64)),
+                receipt_id: Some("install-1".into()),
+            },
+            enabled: true,
+            requested_order: Some(1),
+            effective_order: Some(1),
+            affected_paths: vec![PathBuf::from("textures/ui.png")],
+            derived_output: None,
+            exclusive_group: None,
+            patch_chain: None,
+            destination_fingerprint: None,
+            current_destination_fingerprint: None,
+            transaction_id: Some("tx-1".into()),
+            adapter: Some(PreviewAdapter::Pcsx2),
+        };
+        let activation = ActivationReceipt {
+            previous_stack: ModStack::new("GAME-1"),
+            resulting_stack: ModStack {
+                game_identity: "GAME-1".into(),
+                layers: vec![layer],
+                generation: 1,
+            },
+            operation: ActivationOperation::Enable,
+            conflicts: Vec::new(),
+            transaction_ids: vec!["tx-1".into()],
+            timestamp_unix_seconds: 3,
+        };
+        let mut providers = BTreeMap::new();
+        providers.insert("/mods/provider-pack.zip".into(), (provider, join));
+        let rows =
+            ModReceiptSummary::from_activation_receipt_with_providers(&activation, &providers)
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, ModKind::ActivationStack);
+        assert_eq!(rows[0].requested_order, Some(1));
+        assert!(rows[0].provider_provenance.is_some());
+    }
+
+    #[test]
     fn legacy_receipt_without_provider_fields_still_deserializes() {
         let receipt = ModReceiptSummary::from_patch_provenance(&DerivedPatchProvenance {
             base_path: PathBuf::from("/games/base.iso"),
@@ -908,6 +1173,13 @@ mod tests {
             SharedApplyOutcome::ReplacedExisting,
         );
         cemu.context.adapter = PreviewAdapter::CemuGraphicPack;
+        let mut ppsspp = journal(
+            "ppsspp",
+            4,
+            "PSP/GAME/TEXTURE.png",
+            SharedApplyOutcome::InstalledNew,
+        );
+        ppsspp.context.adapter = PreviewAdapter::Ppsspp;
         let mut unchanged = journal(
             "unchanged",
             3,
@@ -940,6 +1212,21 @@ mod tests {
             .unwrap()
             .files_replaced,
             1
+        );
+        assert_eq!(
+            ModReceiptSummary::from_shared_journal(
+                &ppsspp,
+                None,
+                Path::new("/b"),
+                &preview(
+                    "ppsspp",
+                    "PSP/GAME/TEXTURE.png",
+                    SharedRollbackOutcome::Available
+                )
+            )
+            .unwrap()
+            .kind,
+            ModKind::PpssppTexture
         );
         let unchanged_receipt = ModReceiptSummary::from_shared_journal(
             &unchanged,

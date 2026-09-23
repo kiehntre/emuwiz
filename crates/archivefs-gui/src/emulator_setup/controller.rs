@@ -282,7 +282,11 @@ impl ArchiveFsApp {
         ) {
             self.start_retroarch_profile_scan(context.clone());
         }
-        widgets::workflow_header(ui, "Emulators", "Check which emulators are installed and ready.");
+        widgets::workflow_header(
+            ui,
+            "Emulators",
+            "Check which emulators are installed and ready.",
+        );
         let setup_action = emulator_setup_page::show(
             ui,
             &mut self.emulator_readiness.emulator_setup_page,
@@ -780,6 +784,40 @@ impl ArchiveFsApp {
             _ => None,
         });
 
+        // Arcade directory archives are logical MAME sets, not ordinary
+        // files, so their identity comes from the persisted, SHA-bound MAME
+        // join. This is the narrow projection bridge that keeps raw members
+        // (for example ru_04b.img) out of launch identity.
+        let focused_record = live.and_then(|data| {
+            focused.and_then(|path| {
+                data.records
+                    .iter()
+                    .find(|record| record.mount_plan.archive.path == path)
+            })
+        });
+        let mut identity_status = identity_status;
+        let mut mame_set_resolutions = Vec::new();
+        if let Some(focused) = focused
+            && let Ok(database_path) = archivefs_core::default_database_path()
+            && let Ok(database) = archivefs_core::Database::open_read_only(database_path)
+            && let Ok(Some(evidence)) = database.mame_arcade_join_for_archive_path(
+                archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+                focused,
+            )
+            && let Some(resolution) =
+                archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(
+                    &evidence, focused,
+                )
+        {
+            identity_status = archivefs_core::launch::CanonicalIdentityStatus::Resolved(
+                archivefs_core::launch::ResolvedIdentity {
+                    platform_id: "Arcade".to_string(),
+                    game_key: resolution.identity.game_name.clone(),
+                },
+            );
+            mame_set_resolutions.push(resolution);
+        }
+
         match identity_status {
             archivefs_core::launch::CanonicalIdentityStatus::Unknown => {
                 return LaunchReadinessInput::IdentityUnknown;
@@ -790,13 +828,6 @@ impl ArchiveFsApp {
             archivefs_core::launch::CanonicalIdentityStatus::Resolved(_) => {}
         }
 
-        let focused_record = live.and_then(|data| {
-            focused.and_then(|path| {
-                data.records
-                    .iter()
-                    .find(|record| record.mount_plan.archive.path == path)
-            })
-        });
         // Archive safety: only the transient, selection-bound preparation
         // state may provide an inner member. The bridge still refuses it
         // unless the record is genuinely mounted.
@@ -823,6 +854,13 @@ impl ArchiveFsApp {
                     .to_string(),
             },
         };
+        if !mame_set_resolutions.is_empty() {
+            content.resolved_path = focused.map(Path::to_path_buf);
+            content.container = Some(archivefs_core::launch::LaunchContainerKind::PlainFile);
+            content.requires_mount = false;
+            content.provenance =
+                "verified MAME logical-set directory from the persisted DAT join".into();
+        }
 
         // WHDLoad is an additive, content-bound launch seam.  The package
         // and slave are accepted only after the existing bounded LHA
@@ -1119,6 +1157,24 @@ impl ArchiveFsApp {
                 .chain(amiga_whdload_profiles)
                 .collect();
 
+        // MAME has no profile directory; its lifecycle binding is the exact
+        // executable selected through Emulator Setup, while its game
+        // eligibility comes only from the persisted MAME join above.
+        if let Some(executable) = self
+            .emulator_readiness
+            .emulator_setup_overrides
+            .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)
+            && !mame_set_resolutions.is_empty()
+        {
+            standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
+                adapter_id: "mame",
+                profile_id: format!("mame:{}", executable.display()),
+                profile_path: Some(executable.to_path_buf()),
+                eligible: true,
+                firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+            });
+        }
+
         // Fuse is a narrow, read-only ZX Spectrum adapter.  Discovery is
         // additive: no executable means no Fuse candidate, and the generic
         // planner still requires an independently resolved ZX Spectrum
@@ -1336,9 +1392,7 @@ impl ArchiveFsApp {
                     profile_id: profile.profile_id.clone(),
                     profile_path: Some(profile.configuration_path.clone()),
                     eligible: profile.eligible,
-                    firmware: archivefs_core::launch::melonds_firmware_readiness(
-                        &profile.firmware,
-                    ),
+                    firmware: archivefs_core::launch::melonds_firmware_readiness(&profile.firmware),
                 }
             }));
         }
@@ -1368,10 +1422,8 @@ impl ArchiveFsApp {
             if let Some(executable) =
                 archivefs_core::patch_manager::discover_azahar_executable(&roots)
             {
-                let profile = archivefs_core::patch_manager::discover_azahar_profile(
-                    &roots,
-                    executable,
-                );
+                let profile =
+                    archivefs_core::patch_manager::discover_azahar_profile(&roots, executable);
                 standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
                     adapter_id: "azahar",
                     profile_id: format!("azahar:{}", profile.executable.display()),
@@ -1551,13 +1603,14 @@ impl ArchiveFsApp {
                 profile_id: profile.profile_id.clone(),
             })
             .collect();
-        let plan = archivefs_core::launch::build_launch_plan(
+        let mut plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
             &standalone_profiles,
             retroarch_environment,
             &remembered,
         );
+        launch_readiness_page::apply_mame_strict_preflight(&mut plan);
         LaunchReadinessInput::Plan {
             plan,
             retroarch: match &self.emulator_readiness.retroarch_profiles {

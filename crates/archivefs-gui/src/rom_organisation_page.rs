@@ -36,6 +36,7 @@ use crate::rom_organisation_page;
 use crate::ui::{components as widgets, theme};
 
 /// The page's authoritative state.
+#[derive(Clone)]
 pub(crate) struct RomOrganisationPageState {
     master_root_draft: String,
     saved_master_root: Option<PathBuf>,
@@ -49,6 +50,7 @@ pub(crate) struct RomOrganisationPageState {
     mode: OrganisationMode,
     /// Candidate source files collected from the configured source folders.
     sources: Vec<PathBuf>,
+    unavailable_source_roots: Vec<PathBuf>,
     /// The read-only plan, when generated. `generation` is bumped on every
     /// regeneration so a stale review decision can never apply.
     plan: Option<OrganisationPlan>,
@@ -173,6 +175,7 @@ impl Default for RomOrganisationPageState {
             library_root_error: None,
             mode: OrganisationMode::MoveRealFile,
             sources: Vec::new(),
+            unavailable_source_roots: Vec::new(),
             plan: None,
             plan_generation: 0,
             approved: BTreeSet::new(),
@@ -194,6 +197,29 @@ impl Default for RomOrganisationPageState {
 }
 
 impl RomOrganisationPageState {
+    pub(crate) fn input_fingerprint(&self) -> String {
+        format!(
+            "{:?}|{}|{}|{}|{}|{}",
+            self.mode,
+            self.master_root_draft,
+            self.library_root_draft,
+            self.sources.len(),
+            self.unavailable_source_roots.len(),
+            self.sources
+                .iter()
+                .map(|path| path.to_string_lossy().len())
+                .sum::<usize>()
+        )
+    }
+
+    pub(crate) fn applied(&self) -> Option<&archivefs_core::dat::rename_apply::RenameTransaction> {
+        self.applied.as_ref()
+    }
+
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// Loads the configured master root and scans the configured source
     /// folders for candidate files (bounded). Read-only. Also restores the
     /// last persisted approval set, if any (fail-closed: a missing or
@@ -209,6 +235,12 @@ impl RomOrganisationPageState {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
             state.sources = collect_source_files(&config.source_folders);
+            state.unavailable_source_roots = config
+                .source_folders
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
         }
         match load_persisted_approved_set() {
             Ok(Some(set)) => state.approved = set,
@@ -284,6 +316,12 @@ impl RomOrganisationPageState {
     pub(crate) fn rescan_sources(&mut self) {
         if let Ok(config) = Config::load_default() {
             self.sources = collect_source_files(&config.source_folders);
+            self.unavailable_source_roots = config
+                .source_folders
+                .iter()
+                .filter(|path| !path.is_dir())
+                .cloned()
+                .collect();
         }
         self.plan = None;
         self.approved.clear();
@@ -298,6 +336,12 @@ impl RomOrganisationPageState {
     /// rebuild bumps the generation, so any earlier review decision is stale.
     pub(crate) fn generate_plan(&mut self) {
         self.plan_generation += 1;
+        if self.sources.is_empty() && !self.unavailable_source_roots.is_empty() {
+            self.error =
+                Some("source drive may not be mounted; nothing was scanned or changed".to_string());
+            self.plan = None;
+            return;
+        }
         let Some(master_root) = self.effective_root() else {
             self.error = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
                 "choose a linked library folder first".to_string()
@@ -837,15 +881,41 @@ fn apply_playing_library_action(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RomOrganisationPageAction {
+    Preview,
+    Apply,
+    Rollback,
+}
+
 pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
+    if let Some(action) = show_rom_organisation_page_with_busy(ui, state, false, false) {
+        match action {
+            RomOrganisationPageAction::Preview => {
+                state.pending_preview = true;
+                ui.ctx().request_repaint();
+            }
+            RomOrganisationPageAction::Apply => state.apply(),
+            RomOrganisationPageAction::Rollback => state.rollback(),
+        }
+    }
+}
+
+pub(crate) fn show_rom_organisation_page_with_busy(
+    ui: &mut egui::Ui,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+    canonical_only: bool,
+) -> Option<RomOrganisationPageAction> {
+    let mut page_action = None;
     // See `RomOrganisationPageState::pending_preview`: this runs the actual
     // plan generation one frame after the click that requested it, so the
     // busy row below had a chance to render first.
-    if state.pending_preview {
+    if state.pending_preview && !async_busy {
         state.generate_plan();
         state.pending_preview = false;
     }
-    if crate::simple_mode::active(ui.ctx()) && !state.showing_playing_library {
+    if !canonical_only && crate::simple_mode::active(ui.ctx()) && !state.showing_playing_library {
         widgets::workflow_header(
             ui,
             "Make a Playing Library",
@@ -862,9 +932,15 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             ui.label("Use these options when you already use a game-library program such as RomM or ES-DE. Choosing a layout does not write files.");
             show_library_destination_cards(ui, state);
         });
-        return;
+        return page_action;
     }
-    if crate::simple_mode::active(ui.ctx()) {
+    if canonical_only {
+        widgets::workflow_header(
+            ui,
+            "Organise verified games",
+            "Rename files, move them into reviewed platform folders, or create a linked library. Previewing changes nothing.",
+        );
+    } else if crate::simple_mode::active(ui.ctx()) {
         widgets::workflow_header(
             ui,
             "Make a Playing Library › Choose games and folders",
@@ -879,34 +955,36 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     }
     ui.weak("1. Choose output   /   2. Choose destination   /   3. Preview   /   4. Apply");
 
-    ui.horizontal(|ui| {
-        if state.showing_playing_library {
-            if widgets::action_button(
+    if !canonical_only {
+        ui.horizontal(|ui| {
+            if state.showing_playing_library {
+                if widgets::action_button(
+                    ui,
+                    if crate::simple_mode::active(ui.ctx()) {
+                        "← Back to Make a Playing Library"
+                    } else {
+                        "< Back to Organise"
+                    },
+                    widgets::ActionStyle::Quiet,
+                    true,
+                )
+                .clicked()
+                {
+                    state.showing_playing_library = false;
+                }
+            } else if widgets::action_button(
                 ui,
-                if crate::simple_mode::active(ui.ctx()) {
-                    "← Back to Make a Playing Library"
-                } else {
-                    "< Back to Organise"
-                },
-                widgets::ActionStyle::Quiet,
+                "Build Library",
+                widgets::ActionStyle::Primary,
                 true,
             )
             .clicked()
             {
-                state.showing_playing_library = false;
+                state.showing_playing_library = true;
             }
-        } else if widgets::action_button(
-            ui,
-            "Build Library",
-            widgets::ActionStyle::Primary,
-            true,
-        )
-        .clicked()
-        {
-            state.showing_playing_library = true;
-        }
-    });
-    if !state.showing_playing_library {
+        });
+    }
+    if !canonical_only && !state.showing_playing_library {
         ui.label(
             egui::RichText::new(
                 "Playing Library chooses one preferred verified release per game and creates a separate linked library while leaving originals untouched.",
@@ -914,7 +992,7 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             .color(theme::muted(ui)),
         );
     }
-    if !state.showing_playing_library {
+    if !canonical_only && !state.showing_playing_library {
         widgets::section_header(
             ui,
             "Choose output",
@@ -924,13 +1002,13 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
     }
     ui.add_space(8.0);
 
-    if state.showing_playing_library {
+    if !canonical_only && state.showing_playing_library {
         if let Some(action) =
             crate::playing_library_page::show_playing_library_page(ui, &mut state.playing_library)
         {
             apply_playing_library_action(&mut state.playing_library, action);
         }
-        return;
+        return page_action;
     }
 
     if state.mode == OrganisationMode::BuildLinkedLibrary {
@@ -1129,17 +1207,20 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             }
             if widgets::action_button(
                 ui,
-                preview_button_label(state.pending_preview),
+                if async_busy {
+                    "Preparing preview…"
+                } else {
+                    preview_button_label(state.pending_preview)
+                },
                 widgets::ActionStyle::Primary,
-                !state.pending_preview,
+                !state.pending_preview && !async_busy,
             )
             .clicked()
             {
-                state.pending_preview = true;
-                ui.ctx().request_repaint();
+                page_action = Some(RomOrganisationPageAction::Preview);
             }
         });
-        if state.pending_preview {
+        if state.pending_preview || async_busy {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label(
@@ -1154,11 +1235,24 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             ))
             .color(theme::muted(ui)),
         );
+        if !state.unavailable_source_roots.is_empty() {
+            ui.label(
+                egui::RichText::new(
+                    "Source drive may not be mounted. Nothing in an unavailable source will be scanned or changed.",
+                )
+                .color(theme::WARNING),
+            );
+            widgets::technical_details(ui, "unavailable_organisation_sources", |ui| {
+                for path in &state.unavailable_source_roots {
+                    ui.label(path.display().to_string());
+                }
+            });
+        }
     });
 
     if let Some(plan) = state.plan.clone() {
         ui.add_space(8.0);
-        show_plan(ui, &plan, state);
+        show_plan(ui, &plan, state, async_busy, &mut page_action);
     }
 
     if let Some(message) = &state.result_message {
@@ -1169,11 +1263,11 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
                 ui,
                 "Roll back this organisation",
                 widgets::ActionStyle::Secondary,
-                true,
+                !async_busy,
             )
             .clicked()
         {
-            state.rollback();
+            page_action = Some(RomOrganisationPageAction::Rollback);
         }
     }
 
@@ -1194,6 +1288,7 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             widgets::StatusTone::Pending,
         );
     }
+    page_action
 }
 
 const LIBRARY_DESTINATION_CARDS: [(&str, &str, PlayingLibraryDestination); 4] = [
@@ -1296,7 +1391,41 @@ fn show_library_destination_cards(ui: &mut egui::Ui, state: &mut RomOrganisation
     }
 }
 
-fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisationPageState) {
+fn show_plan(
+    ui: &mut egui::Ui,
+    plan: &OrganisationPlan,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+    page_action: &mut Option<RomOrganisationPageAction>,
+) {
+    let suggested_count = plan.suggested().count();
+    let blocked_count = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.status,
+                OrganisationStatus::Conflict | OrganisationStatus::Blocked
+            )
+        })
+        .count();
+    widgets::card(ui, |ui| {
+        ui.label(egui::RichText::new("Preview summary").strong());
+        ui.label(format!("{suggested_count} file(s) selected"));
+        ui.label(format!("{blocked_count} blocker(s)"));
+        ui.label(match plan.mode {
+            OrganisationMode::RenameInPlace => "Original files moved? No — names change in place",
+            OrganisationMode::MoveRealFile => "Original files moved? Yes — into platform folders",
+            OrganisationMode::OrganiseSymlinkOnly => {
+                "Original files moved? No — existing link objects move"
+            }
+            OrganisationMode::BuildLinkedLibrary => {
+                "Original files moved? No — new links are created"
+            }
+        });
+        ui.label("Undo available? Yes, while the journal can safely revalidate every item");
+    });
+
     let entries: Vec<&OrganisationPlanEntry> = plan
         .entries
         .iter()
@@ -1368,35 +1497,46 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
                     }
                 });
             } else {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} → {}",
-                        entry.source_path.display(),
-                        entry.destination_path.display()
-                    ))
-                    .monospace(),
-                );
-                if !entry.platform_display_name.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} · {}",
-                            entry.platform_display_name, entry.platform_source
-                        ))
-                        .color(theme::muted(ui)),
+                ui.vertical(|ui| {
+                    ui.label(format!("Current: {}", entry.source_path.display()));
+                    ui.label(format!("Will become: {}", entry.destination_path.display()));
+                    if !entry.platform_display_name.is_empty() {
+                        ui.label(format!(
+                            "Reason: Verified for {}",
+                            entry.platform_display_name
+                        ));
+                    }
+                    ui.label(match plan.mode {
+                        OrganisationMode::RenameInPlace => "Action: Rename file",
+                        OrganisationMode::MoveRealFile => "Action: Move file",
+                        OrganisationMode::OrganiseSymlinkOnly => "Action: Move existing link",
+                        OrganisationMode::BuildLinkedLibrary => "Action: Create link",
+                    });
+                    if let Some(reason) = &entry.reason {
+                        ui.label(
+                            egui::RichText::new(reason)
+                                .color(widgets::StatusTone::Blocked.color(ui))
+                                .small(),
+                        );
+                    }
+                    widgets::technical_details(
+                        ui,
+                        ("organisation_entry", &entry.source_path),
+                        |ui| {
+                            ui.label(format!("Platform evidence: {}", entry.platform_source));
+                            ui.label(format!("Source path: {}", entry.source_path.display()));
+                            ui.label(format!(
+                                "Destination path: {}",
+                                entry.destination_path.display()
+                            ));
+                        },
                     );
-                }
-                if let Some(reason) = &entry.reason {
-                    ui.label(
-                        egui::RichText::new(format!("({reason})"))
-                            .color(widgets::StatusTone::Blocked.color(ui))
-                            .small(),
-                    );
-                }
+                });
             }
         });
     }
 
-    let suggested = plan.suggested().count();
+    let suggested = suggested_count;
     ui.add_space(8.0);
     let approved = state.approved.len();
     let applyable = suggested > 0 && approved > 0;
@@ -1404,7 +1544,7 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
         ui,
         format!("Apply approved organisation ({approved})"),
         widgets::ActionStyle::Primary,
-        applyable,
+        applyable && !async_busy,
     )
     .clicked()
     {
@@ -1445,7 +1585,7 @@ fn show_plan(ui: &mut egui::Ui, plan: &OrganisationPlan, state: &mut RomOrganisa
                 {
                     state.pending_apply = None;
                     state.confirm_text.clear();
-                    state.apply();
+                    *page_action = Some(RomOrganisationPageAction::Apply);
                 }
                 if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Secondary, true)
                     .clicked()
@@ -1513,6 +1653,21 @@ impl ArchiveFsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_source_is_not_presented_as_an_empty_library() {
+        let mut state = RomOrganisationPageState {
+            unavailable_source_roots: vec![PathBuf::from("/mnt/games")],
+            ..RomOrganisationPageState::default()
+        };
+        state.generate_plan();
+        assert!(
+            state
+                .error()
+                .is_some_and(|error| error.contains("may not be mounted"))
+        );
+        assert!(state.plan.is_none());
+    }
 
     #[test]
     fn simple_playing_library_starts_with_one_handle_and_no_file_operation() {

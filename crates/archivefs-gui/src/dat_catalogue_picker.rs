@@ -92,6 +92,22 @@ pub(crate) struct DatCataloguePickerState {
     simple_platform: Option<String>,
 }
 
+impl Clone for DatCataloguePickerState {
+    fn clone(&self) -> Self {
+        Self {
+            summaries: self.summaries.clone(),
+            snapshot: self.snapshot.clone(),
+            receiver: None,
+            generation: self.generation,
+            loaded: self.loaded,
+            loading: self.loading,
+            error: self.error.clone(),
+            query: self.query.clone(),
+            simple_platform: self.simple_platform.clone(),
+        }
+    }
+}
+
 impl DatCataloguePickerState {
     pub(crate) fn ensure_loaded(&mut self) {
         if !self.loaded && !self.loading && self.error.is_none() {

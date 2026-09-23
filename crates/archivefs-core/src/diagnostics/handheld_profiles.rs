@@ -7,10 +7,9 @@
 use crate::emulator_environment::EncodedPath;
 use crate::launch::readiness::FirmwareReadiness;
 use crate::patch_manager::{
-    MelonDsFirmwareMode, MelonDsFirmwareState, MelonDsProfileDiscoveryRoots,
-    MgbaBiosState, MgbaProfileDiscoveryRoots, discover_melonds_profiles,
-    discover_mgba_profiles, resolve_melonds_native_launch_binding,
-    resolve_mgba_native_launch_binding,
+    MelonDsFirmwareMode, MelonDsFirmwareState, MelonDsProfileDiscoveryRoots, MgbaBiosState,
+    MgbaProfileDiscoveryRoots, discover_melonds_profiles, discover_mgba_profiles,
+    resolve_melonds_native_launch_binding, resolve_mgba_native_launch_binding,
 };
 
 use super::{DoctorCategory, DoctorSeverity, DoctorSubsystem, Finding};
@@ -74,9 +73,7 @@ fn mgba_missing() -> MelonDsMgbaReadiness {
     }
 }
 
-fn melonds_entry(
-    profile: &crate::patch_manager::MelonDsProfile,
-) -> MelonDsMgbaReadiness {
+fn melonds_entry(profile: &crate::patch_manager::MelonDsProfile) -> MelonDsMgbaReadiness {
     let executable = profile.executable_candidates.first();
     let firmware = &profile.firmware;
     let firmware_readiness = melonds_firmware_readiness(firmware);
@@ -104,14 +101,20 @@ fn melonds_entry(
             "not found"
         }
     )];
-    evidence.push(format!("DS readiness: {}", melonds_ds_label(ready, firmware)));
+    evidence.push(format!(
+        "DS readiness: {}",
+        melonds_ds_label(ready, firmware)
+    ));
     evidence.push(
         "DSi readiness: not separately established; the current native launch path supports Nintendo DS only"
             .into(),
     );
     evidence.push(format!("BIOS7: {}", melonds_state_label(firmware.bios7)));
     evidence.push(format!("BIOS9: {}", melonds_state_label(firmware.bios9)));
-    evidence.push(format!("Firmware: {}", melonds_state_label(firmware.firmware)));
+    evidence.push(format!(
+        "Firmware: {}",
+        melonds_state_label(firmware.firmware)
+    ));
     MelonDsMgbaReadiness {
         adapter: "melonDS".into(),
         executable: executable.map(|item| EncodedPath::from_path(&item.path)),
@@ -156,7 +159,8 @@ fn mgba_entry(profile: &crate::patch_manager::MgbaProfile) -> MelonDsMgbaReadine
             }
         ),
         format!("BIOS: {bios}"),
-        "BIOS is optional for ordinary Game Boy, Game Boy Color, and Game Boy Advance launch".into(),
+        "BIOS is optional for ordinary Game Boy, Game Boy Color, and Game Boy Advance launch"
+            .into(),
     ];
     MelonDsMgbaReadiness {
         adapter: "mGBA".into(),
@@ -214,9 +218,7 @@ fn melonds_state_label(state: MelonDsFirmwareState) -> &'static str {
     }
 }
 
-fn melonds_missing_firmware(
-    firmware: &crate::patch_manager::MelonDsFirmwareEvidence,
-) -> String {
+fn melonds_missing_firmware(firmware: &crate::patch_manager::MelonDsFirmwareEvidence) -> String {
     let missing = [
         ("BIOS7", firmware.bios7),
         ("BIOS9", firmware.bios9),
@@ -237,9 +239,7 @@ fn mgba_bios_label(state: MgbaBiosState) -> &'static str {
     }
 }
 
-pub fn findings_from_melonds_mgba_readiness(
-    entries: &[MelonDsMgbaReadiness],
-) -> Vec<Finding> {
+pub fn findings_from_melonds_mgba_readiness(entries: &[MelonDsMgbaReadiness]) -> Vec<Finding> {
     entries
         .iter()
         .map(|entry| {
@@ -312,8 +312,17 @@ mod tests {
             ],
             remediation: "No action.".into(),
         }]);
-        assert!(entries[0].explanation.contains("selected-game launch preflight"));
-        assert!(entries[0].evidence.iter().any(|line| line.contains("DSi readiness: not separately established")));
+        assert!(
+            entries[0]
+                .explanation
+                .contains("selected-game launch preflight")
+        );
+        assert!(
+            entries[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("DSi readiness: not separately established"))
+        );
     }
 
     #[test]
@@ -333,6 +342,11 @@ mod tests {
         }]);
         assert_eq!(entries[0].severity, DoctorSeverity::Info);
         assert!(entries[0].title.contains("ready"));
-        assert!(entries[0].evidence.iter().any(|line| line.contains("optional")));
+        assert!(
+            entries[0]
+                .evidence
+                .iter()
+                .any(|line| line.contains("optional"))
+        );
     }
 }

@@ -343,11 +343,12 @@ fn live_selection_state_does_not_start_automatic_enrichment_for_an_archive() {
     let mut app = app_for_operation_tests();
     app.archive_context.select_only(path);
     app.selected_evidence_ui.selected_evidence_generation = 7;
-    app.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Ready {
-        generation: 7,
-        report: Box::new(report),
-        hasheous: selected_evidence_page::HasheousState::Idle,
-    };
+    app.selected_evidence_ui.selected_evidence =
+        selected_evidence_page::SelectedEvidenceState::Ready {
+            generation: 7,
+            report: Box::new(report),
+            hasheous: selected_evidence_page::HasheousState::Idle,
+        };
 
     app.maybe_start_selected_evidence_enrichment(&egui::Context::default());
 
@@ -376,11 +377,12 @@ fn changing_selection_cancels_and_detaches_the_old_evidence_generation() {
     app.archive_context.select_only(new_path);
     app.selected_evidence_ui.selected_evidence_generation = 3;
     app.selected_evidence_ui.selected_evidence_cancel = Some(Arc::clone(&cancel));
-    app.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
-        generation: 3,
-        path: old_path,
-        receiver,
-    };
+    app.selected_evidence_ui.selected_evidence =
+        selected_evidence_page::SelectedEvidenceState::Loading {
+            generation: 3,
+            path: old_path,
+            receiver,
+        };
 
     app.reconcile_selected_evidence_selection();
 
@@ -403,11 +405,12 @@ fn disconnected_identity_worker_becomes_a_visible_error_instead_of_loading_forev
     drop(sender);
     app.archive_context.select_only(path.clone());
     app.selected_evidence_ui.selected_evidence_generation = 11;
-    app.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Loading {
-        generation: 11,
-        path: path.clone(),
-        receiver,
-    };
+    app.selected_evidence_ui.selected_evidence =
+        selected_evidence_page::SelectedEvidenceState::Loading {
+            generation: 11,
+            path: path.clone(),
+            receiver,
+        };
 
     app.poll_selected_evidence();
 
@@ -435,16 +438,18 @@ fn disconnected_enrichment_worker_is_visible_on_the_ready_selection_card() {
     let mut app = app_for_operation_tests();
     app.archive_context.select_only(path.clone());
     app.selected_evidence_ui.selected_evidence_generation = 13;
-    app.selected_evidence_ui.selected_evidence = selected_evidence_page::SelectedEvidenceState::Ready {
-        generation: 13,
-        report: Box::new(report),
-        hasheous: selected_evidence_page::HasheousState::Idle,
-    };
-    app.selected_evidence_ui.selected_evidence_enrichment = SelectedEvidenceEnrichmentState::Loading {
-        generation: 13,
-        path,
-        receiver,
-    };
+    app.selected_evidence_ui.selected_evidence =
+        selected_evidence_page::SelectedEvidenceState::Ready {
+            generation: 13,
+            report: Box::new(report),
+            hasheous: selected_evidence_page::HasheousState::Idle,
+        };
+    app.selected_evidence_ui.selected_evidence_enrichment =
+        SelectedEvidenceEnrichmentState::Loading {
+            generation: 13,
+            path,
+            receiver,
+        };
 
     app.poll_selected_evidence();
 

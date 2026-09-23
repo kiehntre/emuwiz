@@ -14,14 +14,14 @@ use sha2::{Digest, Sha256};
 
 use super::ppsspp_local::PpssppProfile;
 use super::shared_preview::{
-    build_shared_preview, PreviewAdapter, PreviewIdentity, PreviewIdentityKind,
-    PreviewIdentityState, PreviewMatchStrength, PreviewSourceItem, SharedPreviewReport,
-    SharedPreviewRequest,
+    PreviewAdapter, PreviewIdentity, PreviewIdentityKind, PreviewIdentityState,
+    PreviewMatchStrength, PreviewSourceItem, SharedPreviewReport, SharedPreviewRequest,
+    build_shared_preview,
 };
 use super::shared_transaction::{
-    build_shared_transaction_plan, execute_shared_apply, execute_shared_rollback,
-    generate_shared_operation_id, preview_shared_rollback, SharedApplyOptions, SharedApplyResult,
-    SharedRollbackOptions, SharedRollbackResult, SharedTransactionPlan,
+    SharedApplyOptions, SharedApplyResult, SharedRollbackOptions, SharedRollbackResult,
+    SharedTransactionPlan, build_shared_transaction_plan, execute_shared_apply,
+    execute_shared_rollback, generate_shared_operation_id, preview_shared_rollback,
 };
 use crate::game_identity::{GameIdentityReport, IdentityPlatform};
 
@@ -427,7 +427,7 @@ pub fn build_ppsspp_texture_pack_preview(
             source_path: file.source_path.clone(),
             expected_source_digest: Some(file.sha256.to_ascii_lowercase()),
             destination_relative_paths: vec![
-                PathBuf::from(&request.identity.disc_id).join(&file.destination_filename)
+                PathBuf::from(&request.identity.disc_id).join(&file.destination_filename),
             ],
             match_strength: PreviewMatchStrength::VerifiedExact,
         })

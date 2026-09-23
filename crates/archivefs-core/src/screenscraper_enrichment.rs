@@ -26,7 +26,10 @@ pub enum ScreenScraperBatchLookupRoute {
 pub fn batch_lookup_route(provider_record_id: Option<&str>) -> ScreenScraperBatchLookupRoute {
     provider_record_id
         .and_then(|value| value.parse::<u64>().ok())
-        .map_or(ScreenScraperBatchLookupRoute::Search, ScreenScraperBatchLookupRoute::DirectProviderId)
+        .map_or(
+            ScreenScraperBatchLookupRoute::Search,
+            ScreenScraperBatchLookupRoute::DirectProviderId,
+        )
 }
 
 pub fn validate_explicit_batch_size(selected_count: usize) -> Result<(), String> {
@@ -221,6 +224,9 @@ mod tests {
             batch_lookup_route(Some("not-an-id")),
             ScreenScraperBatchLookupRoute::Search
         );
-        assert_eq!(batch_lookup_route(None), ScreenScraperBatchLookupRoute::Search);
+        assert_eq!(
+            batch_lookup_route(None),
+            ScreenScraperBatchLookupRoute::Search
+        );
     }
 }

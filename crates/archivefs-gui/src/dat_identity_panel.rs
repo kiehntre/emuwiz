@@ -1315,12 +1315,12 @@ mod tests {
             Some("No match")
         );
         assert_eq!(
-            compact_status_label(&[summary(
-                DatVerificationState::AmbiguousMultipleCandidates {
+            compact_status_label(
+                &[summary(DatVerificationState::AmbiguousMultipleCandidates {
                     algorithm: "SHA-1".into(),
                     candidate_count: 2,
-                },
-            )]),
+                },)]
+            ),
             Some("Ambiguous")
         );
     }

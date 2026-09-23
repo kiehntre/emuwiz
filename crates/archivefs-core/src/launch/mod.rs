@@ -96,10 +96,10 @@ pub mod fuse_command;
 pub mod hatari_command;
 pub mod hatari_execution;
 pub mod input_projection;
-pub mod media_handoff;
 pub mod integration;
 pub mod mame_command;
 pub mod mame_execution;
+pub mod media_handoff;
 pub mod melonds_command;
 pub mod melonds_execution;
 pub mod mesen_command;
@@ -392,9 +392,9 @@ pub use retroarch_command::{
 pub use retroarch_resource_projection::{
     RetroArchBiosRequirement, RetroArchProjectionError, RetroArchProjectionReceipt,
     RetroArchResourcePlan, RetroArchResourcePlanError, RetroArchResourceRequest,
-    cleanup_retroarch_projection, command_with_retroarch_resource_plan,
-    materialize_retroarch_resource_plan, plan_retroarch_resource_grants,
-    approved_retroarch_launch_root,
+    approved_retroarch_launch_root, cleanup_retroarch_projection,
+    command_with_retroarch_resource_plan, materialize_retroarch_resource_plan,
+    plan_retroarch_resource_grants,
 };
 pub use rmg_command::{
     RMG_SUPPORTED_PLATFORM_ID, RmgCommand, RmgCommandPlan, RmgCommandSelection,

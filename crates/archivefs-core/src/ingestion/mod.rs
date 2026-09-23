@@ -36,6 +36,7 @@
 //! entry point future callers (CLI/GUI) can adopt; it does not replace
 //! `ArchiveScanner::scan_source` in this change.
 
+pub mod arcade;
 pub mod container;
 pub mod content_registry;
 pub mod cue_bin;
@@ -46,6 +47,10 @@ pub mod structural_probe;
 #[cfg(test)]
 mod tests;
 
+pub use arcade::{
+    ArcadeIngestionDiagnostics, ArcadeSetDirectory, ArcadeSetDiscovery, SupportMaterialKind,
+    discover_extracted_sets, support_material_kind,
+};
 pub use container::{ArchiveFormat, ContainerKind, FolderRole};
 pub use content_registry::ContentKind;
 pub use discovery::{

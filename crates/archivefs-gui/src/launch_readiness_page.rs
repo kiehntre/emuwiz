@@ -66,10 +66,10 @@ use archivefs_core::launch::{
     LaunchCommandSpec, LaunchContainerKind, LaunchExecutionError, LaunchExitReport, LaunchPlan,
     LaunchPreflightErrorKind, LaunchReadiness, LaunchSpawnError, LaunchTarget, LaunchWarning,
     LaunchWarningKind, LaunchedDolphinProcess, LaunchedPcsx2Process, LaunchedRetroArchProcess,
-    PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError, Pcsx2LaunchExitReport,
-    Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest, Pcsx2LaunchSpawnError,
-    RetroArchLaunchRequest, preflight_and_launch_dolphin, preflight_and_launch_pcsx2,
-    preflight_and_launch_retroarch,
+    MameCommandPlan, MameLaunchRequest, PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError,
+    Pcsx2LaunchExitReport, Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest,
+    Pcsx2LaunchSpawnError, RetroArchLaunchRequest, preflight_and_launch_dolphin,
+    preflight_and_launch_pcsx2, preflight_and_launch_retroarch, preflight_mame_launch,
 };
 use archivefs_core::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, Pcsx2ProfileDiscovery,
@@ -572,6 +572,13 @@ impl AmigaWHDLoadLaunchState {
         )
     }
 
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, _, AmigaWHDLoadStage::Failed(error))) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     fn start(&mut self, request: WHDLoadLaunchInput) {
         let path = request
             .target
@@ -603,6 +610,7 @@ impl AmigaWHDLoadLaunchState {
 }
 
 enum StandaloneProcess {
+    Mame(archivefs_core::launch::process_spawn::WatchedProcess),
     DuckStation(LaunchedDuckStationProcess),
     Ppsspp(LaunchedPpssppProcess),
     Rpcs3(LaunchedRpcs3Process),
@@ -642,6 +650,7 @@ impl StandaloneLaunchState {
             },
             StandaloneLaunchStage::Running(mut process) => {
                 let exited = match &mut process {
+                    StandaloneProcess::Mame(p) => p.poll().is_some(),
                     StandaloneProcess::DuckStation(p) => p.poll().is_some(),
                     StandaloneProcess::Ppsspp(p) => p.poll().is_some(),
                     StandaloneProcess::Rpcs3(p) => p.poll().is_some(),
@@ -676,6 +685,13 @@ impl StandaloneLaunchState {
         )
     }
 
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, _, StandaloneLaunchStage::Failed(error))) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
     fn start(&mut self, request: StandaloneLaunchRequest) {
         let (path, adapter) = request.key();
         let (sender, receiver) = mpsc::channel();
@@ -689,6 +705,7 @@ impl StandaloneLaunchState {
 
 #[derive(Clone)]
 pub(crate) enum StandaloneLaunchRequest {
+    Mame(MameLaunchRequest),
     DuckStation(
         DuckStationLaunchRequest,
         archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
@@ -715,6 +732,7 @@ pub(crate) enum StandaloneLaunchRequest {
 impl StandaloneLaunchRequest {
     fn adapter_name(&self) -> &'static str {
         match self {
+            Self::Mame(_) => "MAME",
             Self::DuckStation(_, _, _) => "DuckStation",
             Self::Ppsspp(_, _) => "PPSSPP",
             Self::Rpcs3(_, _) => "RPCS3",
@@ -725,6 +743,7 @@ impl StandaloneLaunchRequest {
 
     fn key(&self) -> (PathBuf, String) {
         match self {
+            Self::Mame(r) => (r.selected_content.clone(), "mame".into()),
             Self::DuckStation(r, _, _) => (r.selected_content_path.clone(), "duckstation".into()),
             Self::Ppsspp(r, _) => (r.selected_content_path.clone(), "ppsspp".into()),
             Self::Rpcs3(r, _) => (r.selected_content_path.clone(), "rpcs3".into()),
@@ -734,6 +753,9 @@ impl StandaloneLaunchRequest {
     }
     fn execute(self) -> Result<StandaloneProcess, String> {
         match self {
+            Self::Mame(r) => archivefs_core::launch::preflight_and_launch_mame(&r)
+                .map(StandaloneProcess::Mame)
+                .map_err(|error| format!("{error:?}")),
             Self::DuckStation(r, roots, firmware) => {
                 preflight_and_launch_duckstation(&r, &roots, &firmware)
                     .map(StandaloneProcess::DuckStation)
@@ -920,6 +942,13 @@ impl RetroArchLaunchState {
         )
     }
 
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, RetroArchLaunchStage::Failed { error })) => Some(format!("{error:?}")),
+            _ => None,
+        }
+    }
+
     pub(crate) fn start(&mut self, request: RetroArchLaunchRequest) {
         let key = RetroArchLaunchKey::from_request(&request);
         let (sender, receiver) = mpsc::channel();
@@ -1083,6 +1112,13 @@ impl DolphinLaunchState {
         )
     }
 
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, DolphinLaunchStage::Failed { error })) => Some(format!("{error:?}")),
+            _ => None,
+        }
+    }
+
     /// Re-derives the Dolphin discovery roots fresh from the environment
     /// inside the background thread (never the roots captured at button-
     /// render time) - the same "never trust cached readiness as execution
@@ -1214,6 +1250,13 @@ impl Pcsx2LaunchState {
                 Pcsx2LaunchStage::Starting { .. } | Pcsx2LaunchStage::Running { .. }
             ))
         )
+    }
+
+    pub(crate) fn failure_detail(&self) -> Option<String> {
+        match &self.tracked {
+            Some((_, Pcsx2LaunchStage::Failed { error })) => Some(format!("{error:?}")),
+            _ => None,
+        }
     }
 
     /// Re-derives the PCSX2 discovery roots fresh from the environment
@@ -2199,7 +2242,7 @@ fn standalone_launch_request(
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,
-        ..
+        profile_path: _,
     } = &candidate.target
     else {
         return None;
@@ -2207,6 +2250,9 @@ fn standalone_launch_request(
     let platform = plan.platform_id.clone()?;
     let game_key = plan.game_key.clone()?;
     match *adapter_id {
+        "mame" => mame_launch_request(plan, candidate)
+            .ok()
+            .map(StandaloneLaunchRequest::Mame),
         "duckstation" => {
             let context = duckstation?;
             let serial = context.verified_ps1_serial.clone()?;
@@ -2328,6 +2374,199 @@ fn standalone_launch_request(
         }
         _ => None,
     }
+}
+
+fn mame_launch_request(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+) -> Result<MameLaunchRequest, LaunchBlocker> {
+    let path = candidate.content.resolved_path.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::MameSetVerdictUnavailable,
+            "the trusted MAME logical-set path is unavailable",
+        )
+    })?;
+    let LaunchTarget::Standalone {
+        adapter_id,
+        profile_path,
+        ..
+    } = &candidate.target
+    else {
+        return Err(mame_blocker(
+            LaunchBlockerKind::MameEmulatorUnavailable,
+            "the MAME launch target is unavailable",
+        ));
+    };
+    if *adapter_id != "mame" {
+        return Err(mame_blocker(
+            LaunchBlockerKind::MameEmulatorUnavailable,
+            "the selected launch target is not MAME",
+        ));
+    }
+    let executable = profile_path.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::MameEmulatorUnavailable,
+            "no exact MAME executable is selected",
+        )
+    })?;
+    let platform_id = plan.platform_id.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::IdentityUnresolved,
+            "the Arcade platform identity is unresolved",
+        )
+    })?;
+    let game_key = plan.game_key.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::IdentityUnresolved,
+            "the MAME logical-set identity is unresolved",
+        )
+    })?;
+    let database_path = archivefs_core::default_database_path().map_err(|error| {
+        mame_blocker(
+            LaunchBlockerKind::MameSetVerdictUnavailable,
+            format!("the MAME audit database path is unavailable: {error}"),
+        )
+    })?;
+    let database = archivefs_core::Database::open_read_only(database_path).map_err(|error| {
+        mame_blocker(
+            LaunchBlockerKind::MameSetVerdictUnavailable,
+            format!("the MAME audit database cannot be read: {error}"),
+        )
+    })?;
+    let evidence = database
+        .mame_arcade_join_for_archive_path(
+            archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+            &path,
+        )
+        .map_err(|error| {
+            mame_blocker(
+                LaunchBlockerKind::MameSetVerdictUnavailable,
+                format!("the exact MAME audit evidence cannot be read: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            mame_blocker(
+                LaunchBlockerKind::MameSetVerdictUnavailable,
+                "no current exact-path MAME audit evidence is available",
+            )
+        })?;
+    let resolution =
+        archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+            .ok_or_else(|| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    "the persisted MAME audit does not authorize this logical set",
+                )
+            })?;
+    let rom_search_path = path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::MameSearchPathUnconfigured,
+            "the trusted MAME collection root cannot be determined",
+        )
+    })?;
+    Ok(MameLaunchRequest {
+        identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id,
+            game_key,
+        }),
+        set_resolutions: vec![resolution],
+        expected_executable: executable,
+        selected_content: path,
+        expected_content_identity: None,
+        rom_search_path,
+    })
+}
+
+fn mame_blocker(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker {
+    LaunchBlocker::new(kind, detail)
+}
+
+/// Reconcile generic launch planning with the actual strict MAME preflight.
+/// A MAME card can only remain Ready when the same typed request used by the
+/// launch button passes core preflight now.
+pub(crate) fn project_mame_strict_readiness(plan: &mut LaunchPlan, strict: &MameCommandPlan) {
+    for candidate in &mut plan.candidates {
+        let LaunchTarget::Standalone { adapter_id, .. } = &candidate.target else {
+            continue;
+        };
+        if *adapter_id != "mame" {
+            continue;
+        }
+        for blocker in &strict.blockers {
+            if !candidate.blockers.contains(blocker) {
+                candidate.blockers.push(blocker.clone());
+            }
+        }
+        candidate.readiness = if !candidate.blockers.is_empty() {
+            LaunchReadiness::Blocked
+        } else if !candidate.warnings.is_empty() {
+            LaunchReadiness::ReadyWithWarnings
+        } else {
+            LaunchReadiness::Ready
+        };
+    }
+    plan.summary.ready = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Ready)
+        .count();
+    plan.summary.ready_with_warnings = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::ReadyWithWarnings)
+        .count();
+    plan.summary.blocked = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Blocked)
+        .count();
+}
+
+pub(crate) fn apply_mame_strict_preflight(plan: &mut LaunchPlan) {
+    for index in 0..plan.candidates.len() {
+        let snapshot = plan.candidates[index].clone();
+        let is_mame = matches!(
+            &snapshot.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        );
+        if !is_mame {
+            continue;
+        }
+        let blockers = match mame_launch_request(plan, &snapshot) {
+            Ok(request) => preflight_mame_launch(&request)
+                .err()
+                .map(|error| error.blockers)
+                .unwrap_or_default(),
+            Err(blocker) => vec![blocker],
+        };
+        if !blockers.is_empty() {
+            block_mame_candidate(plan, index, blockers);
+        }
+    }
+}
+
+fn block_mame_candidate(plan: &mut LaunchPlan, index: usize, blockers: Vec<LaunchBlocker>) {
+    let candidate = &mut plan.candidates[index];
+    candidate.readiness = LaunchReadiness::Blocked;
+    candidate.blockers = blockers;
+    plan.summary.ready = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Ready)
+        .count();
+    plan.summary.ready_with_warnings = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::ReadyWithWarnings)
+        .count();
+    plan.summary.blocked = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Blocked)
+        .count();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2596,7 +2835,19 @@ fn show_candidate(
     let mut open_doctor = false;
     widgets::card(ui, |ui| {
         let (name, profile) = target_labels(&candidate.target);
-        let (readiness_label, readiness_tone) = readiness_label_and_tone(candidate.readiness);
+        let strict_mame_blocked = candidate.readiness == LaunchReadiness::Blocked
+            && matches!(
+                &candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "mame",
+                    ..
+                }
+            );
+        let (readiness_label, readiness_tone) = if strict_mame_blocked {
+            ("Needs attention", widgets::StatusTone::Blocked)
+        } else {
+            readiness_label_and_tone(candidate.readiness)
+        };
 
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, readiness_label, readiness_tone);
@@ -2607,6 +2858,9 @@ fn show_candidate(
                 .small()
                 .color(theme::muted(ui)),
         );
+        if strict_mame_blocked {
+            ui.label("MAME cannot launch this set yet.");
+        }
         ui.label(
             egui::RichText::new(format!(
                 "Preference: {}",

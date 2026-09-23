@@ -970,13 +970,19 @@ mod tests {
             Some(&EmulatorDownloadEntryState::ManualInstallRequired)
         );
 
-        // Lay down a real managed install and re-classify.
+        // Lay down a real managed install and re-classify. A fresh isolated
+        // profile has no emulator-owned first-run evidence yet, so PCSX2 is
+        // installed but still needs its explicit initialization step. The
+        // old expectation passed only when the test inherited a developer's
+        // real PCSX2 configuration from HOME/XDG.
         let spec = emulator_download_spec("pcsx2").unwrap();
         let destination = install_appimage_at(temp.path(), spec, &image(), None).unwrap();
         state.test_refresh_from_root(temp.path());
         assert_eq!(
             state.entry("pcsx2"),
-            Some(&EmulatorDownloadEntryState::Installed(destination))
+            Some(&EmulatorDownloadEntryState::NeedsInitialization(
+                destination
+            ))
         );
     }
 

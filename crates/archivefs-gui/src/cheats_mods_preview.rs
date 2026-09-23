@@ -1419,10 +1419,31 @@ pub(crate) fn show_cheats_mods_page(
     // diagnostics instead of determining whether the page is approachable.
     let beginner_route = workflow.is_some();
     let section = current_enhancement_section(ui.ctx());
-    widgets::workflow_header(ui,
-        if section == EnhancementSection::Mods { "Mods & ROM Hacks" } else { "Cheats" },
-        if section == EnhancementSection::Mods { "Add patches and mods without changing your original game." } else { "Choose a game, find compatible cheats, then review before installing." });
-    if widgets::action_button(ui, if beginner_route { "Change Game" } else { "Choose Game" }, widgets::ActionStyle::Primary, true).clicked() {
+    widgets::workflow_header(
+        ui,
+        if section == EnhancementSection::Mods {
+            "Mods & ROM Hacks"
+        } else {
+            "Cheats"
+        },
+        if section == EnhancementSection::Mods {
+            "Add patches and mods without changing your original game."
+        } else {
+            "Choose a game, find compatible cheats, then review before installing."
+        },
+    );
+    if widgets::action_button(
+        ui,
+        if beginner_route {
+            "Change Game"
+        } else {
+            "Choose Game"
+        },
+        widgets::ActionStyle::Primary,
+        true,
+    )
+    .clicked()
+    {
         action = Some(CheatWorkflowAction::ChooseArchive);
     }
     let active_section = egui::CollapsingHeader::new("Other enhancements")
@@ -1604,7 +1625,12 @@ pub(crate) fn show_cheats_mods_page(
                     Pcsx2ProfilesState::Ready(discovery) => workflow
                         .selected_pcsx2_profile_id
                         .as_deref()
-                        .and_then(|id| discovery.profiles.iter().find(|profile| profile.profile_id == id)),
+                        .and_then(|id| {
+                            discovery
+                                .profiles
+                                .iter()
+                                .find(|profile| profile.profile_id == id)
+                        }),
                     _ => None,
                 };
                 ui.add_space(theme::SECTION_GAP);

@@ -366,6 +366,7 @@ fn update_artifact(
     update: &UpdateResult,
 ) -> Result<UpdateArtifact, String> {
     let id = match installation.emulator {
+        InventoryEmulator::Mame => "mame",
         InventoryEmulator::Dolphin => "dolphin",
         InventoryEmulator::Rpcs3 => "rpcs3",
         InventoryEmulator::Pcsx2 => "pcsx2",

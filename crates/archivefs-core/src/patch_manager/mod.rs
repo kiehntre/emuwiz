@@ -22,8 +22,8 @@ mod azahar_local;
 mod bsfree;
 mod bsfree_gamecube;
 mod bsfree_wii;
-mod cemu_local;
 mod cemu_graphic_pack;
+mod cemu_local;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -178,6 +178,15 @@ pub use bsfree_wii::{
     bsfree_wii_cheats, bsfree_wii_load_confirmed, bsfree_wii_match, bsfree_wii_search,
     build_bsfree_wii_install_preview, classify_bsfree_wii_cheat, stage_bsfree_wii_install,
 };
+pub use cemu_graphic_pack::{
+    CEMU_GRAPHIC_PACK_MAX_FILES, CEMU_GRAPHIC_PACK_MAX_RULES_BYTES,
+    CEMU_GRAPHIC_PACK_MAX_TOTAL_BYTES, CEMU_GRAPHIC_PACK_SOURCE_MODE, CemuGraphicPackApplyResult,
+    CemuGraphicPackArchiveInspection, CemuGraphicPackError, CemuGraphicPackErrorKind,
+    CemuGraphicPackInspection, CemuGraphicPackPlan, apply_cemu_graphic_pack,
+    build_cemu_graphic_pack_plan, build_cemu_graphic_pack_transaction_plan,
+    cemu_graphic_packs_root, inspect_cemu_graphic_pack, inspect_cemu_graphic_pack_zip,
+    preview_cemu_graphic_pack_rollback, rollback_cemu_graphic_pack, verified_cemu_title_id,
+};
 pub use cemu_local::{
     CEMU_MAX_CONFIG_BYTES, CEMU_MAX_META_XML_BYTES, CEMU_MAX_PROFILES, CemuConfigInspection,
     CemuContentForm, CemuContentSupport, CemuDiscoveryError, CemuExecutable, CemuExtractedLayout,
@@ -188,17 +197,6 @@ pub use cemu_local::{
     discover_cemu_profiles, extract_title_identity, form_for_path as cemu_form_for_path,
     inspect_config as cemu_inspect_config, inspect_extracted_layout,
     keys_evidence as cemu_keys_evidence, parse_cemu_version, resolve_cemu_native_launch_binding,
-};
-pub use cemu_graphic_pack::{
-    CEMU_GRAPHIC_PACK_MAX_FILES, CEMU_GRAPHIC_PACK_MAX_RULES_BYTES,
-    CEMU_GRAPHIC_PACK_MAX_TOTAL_BYTES, CEMU_GRAPHIC_PACK_SOURCE_MODE,
-    CemuGraphicPackApplyResult, CemuGraphicPackArchiveInspection,
-    CemuGraphicPackError, CemuGraphicPackErrorKind, CemuGraphicPackInspection,
-    CemuGraphicPackPlan, apply_cemu_graphic_pack, build_cemu_graphic_pack_plan,
-    build_cemu_graphic_pack_transaction_plan, cemu_graphic_packs_root,
-    inspect_cemu_graphic_pack, inspect_cemu_graphic_pack_zip,
-    preview_cemu_graphic_pack_rollback, rollback_cemu_graphic_pack,
-    verified_cemu_title_id,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,
@@ -573,10 +571,10 @@ pub use hatari_local::{
     HatariGameInspection, HatariHealth, HatariIdentityAssociation, HatariIdentityState,
     HatariInputSettings, HatariInspectionWarning, HatariInstallationType, HatariMachineModel,
     HatariMachineSettings, HatariPathState, HatariProfile, HatariProfileDiscovery,
-    HatariProfileDiscoveryRoots, HatariReadinessEvidence, HatariSaveStateInventory, HatariSelectedGame,
-    HatariSelectedGameRequest, HatariStorage, HatariStorageMechanism, HatariTosHealth,
-    HatariTosReference, HatariTosRom, HatariVideoSettings, discover_hatari_profiles,
-    assess_hatari_readiness, inspect_hatari_game, parse_hatari_version,
+    HatariProfileDiscoveryRoots, HatariReadinessEvidence, HatariSaveStateInventory,
+    HatariSelectedGame, HatariSelectedGameRequest, HatariStorage, HatariStorageMechanism,
+    HatariTosHealth, HatariTosReference, HatariTosRom, HatariVideoSettings,
+    assess_hatari_readiness, discover_hatari_profiles, inspect_hatari_game, parse_hatari_version,
 };
 pub use import_safety::{
     ActiveContentDisposition, ActiveContentPolicy, ImportConsentSummary, ImportInspectionState,
@@ -666,17 +664,6 @@ pub use pcsx2_local::{
     inspect_pcsx2_profile_with_activation, match_pcsx2_inventory, parse_pcsx2_version,
     resolve_pcsx2_native_launch_binding,
 };
-pub use pcsx2_texture_pack::{
-    PCSX2_TEXTURE_PACK_FORMAT, PCSX2_TEXTURE_PACK_MAX_FILES,
-    PCSX2_TEXTURE_PACK_MAX_TOTAL_BYTES, PCSX2_TEXTURE_PACK_SOURCE_MODE,
-    Pcsx2TextureIdentity, Pcsx2TexturePackApplyResult, Pcsx2TexturePackError,
-    Pcsx2TexturePackErrorKind, Pcsx2TexturePackFile, Pcsx2TexturePackInspection,
-    Pcsx2TexturePackPlan, Pcsx2TexturePackPreviewRequest,
-    Pcsx2TexturePackRejectedFile, build_pcsx2_texture_pack_preview,
-    build_pcsx2_texture_pack_transaction_plan, execute_pcsx2_texture_pack_apply,
-    inspect_pcsx2_texture_pack, pcsx2_texture_destination_root,
-    verified_pcsx2_texture_identity,
-};
 pub use pcsx2_pnach::{
     MAX_MANAGED_PNACH_BLOCKS, MAX_MANAGED_PNACH_BYTES, ManagedPnachCheat, PnachDocument,
     PnachDocumentError, PnachDocumentErrorKind, PnachPatchLine, RawManagedBlock,
@@ -688,6 +675,15 @@ pub use pcsx2_provider::{
     Pcsx2CheatConfidence, Pcsx2CheatProviderCatalogue, Pcsx2CheatProviderRecord,
     Pcsx2CheatSelection, Pcsx2ProviderTrust, build_pcsx2_cheat_candidates,
     selected_pcsx2_managed_cheats,
+};
+pub use pcsx2_texture_pack::{
+    PCSX2_TEXTURE_PACK_FORMAT, PCSX2_TEXTURE_PACK_MAX_FILES, PCSX2_TEXTURE_PACK_MAX_TOTAL_BYTES,
+    PCSX2_TEXTURE_PACK_SOURCE_MODE, Pcsx2TextureIdentity, Pcsx2TexturePackApplyResult,
+    Pcsx2TexturePackError, Pcsx2TexturePackErrorKind, Pcsx2TexturePackFile,
+    Pcsx2TexturePackInspection, Pcsx2TexturePackPlan, Pcsx2TexturePackPreviewRequest,
+    Pcsx2TexturePackRejectedFile, build_pcsx2_texture_pack_preview,
+    build_pcsx2_texture_pack_transaction_plan, execute_pcsx2_texture_pack_apply,
+    inspect_pcsx2_texture_pack, pcsx2_texture_destination_root, verified_pcsx2_texture_identity,
 };
 pub use ppsspp_local::{
     PPSSPP_MAX_CHEAT_BYTES, PPSSPP_MAX_CHEAT_ENTRIES, PPSSPP_MAX_CONFIG_BYTES,
@@ -774,13 +770,12 @@ pub use rpcs3_local::{
 pub use rpcs3_ordinary_mod::{
     RPCS3_ORDINARY_MOD_MAX_FILES, RPCS3_ORDINARY_MOD_MAX_SFO_BYTES,
     RPCS3_ORDINARY_MOD_MAX_TOTAL_BYTES, RPCS3_ORDINARY_MOD_SOURCE_MODE,
-    Rpcs3OrdinaryModArchiveInspection, Rpcs3OrdinaryModApplyResult,
-    Rpcs3OrdinaryModError, Rpcs3OrdinaryModErrorKind, Rpcs3OrdinaryModInspection,
-    Rpcs3OrdinaryModPlan, apply_rpcs3_ordinary_mod,
-    build_rpcs3_ordinary_mod_plan, build_rpcs3_ordinary_mod_transaction_plan,
-    inspect_rpcs3_ordinary_mod, inspect_rpcs3_ordinary_mod_zip,
-    preview_rpcs3_ordinary_mod_rollback, rollback_rpcs3_ordinary_mod,
-    rpcs3_ordinary_mod_destination_root,
+    Rpcs3OrdinaryModApplyResult, Rpcs3OrdinaryModArchiveInspection, Rpcs3OrdinaryModError,
+    Rpcs3OrdinaryModErrorKind, Rpcs3OrdinaryModInspection, Rpcs3OrdinaryModPlan,
+    apply_rpcs3_ordinary_mod, build_rpcs3_ordinary_mod_plan,
+    build_rpcs3_ordinary_mod_transaction_plan, inspect_rpcs3_ordinary_mod,
+    inspect_rpcs3_ordinary_mod_zip, preview_rpcs3_ordinary_mod_rollback,
+    rollback_rpcs3_ordinary_mod, rpcs3_ordinary_mod_destination_root,
 };
 pub use sameboy_local::{
     SAMEBOY_MAX_CONFIG_BYTES, SAMEBOY_MAX_PROFILES, SameBoyBootRomEvidence, SameBoyBootRomState,
@@ -800,20 +795,23 @@ pub use shared_preview::{
     SharedPreviewReport, SharedPreviewRequest, build_shared_preview,
 };
 pub use shared_transaction::{
-    SHARED_APPLY_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES, SHARED_MAX_CREATED_DIRECTORIES,
-    SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES, SHARED_MAX_HISTORY_JOURNALS, SHARED_MAX_JOURNAL_BYTES,
-    SHARED_MAX_ROLLBACK_ENTRIES, SHARED_MAX_SOURCE_BYTES, SHARED_MAX_TEMP_FILES,
-    SHARED_MAX_TOTAL_WRITTEN_BYTES, SHARED_MAX_WARNINGS, SharedAdapterWriteSupport,
-    SharedApplyConfirmation, SharedApplyContext, SharedApplyEntry, SharedApplyFailure,
-    SharedApplyFailureKind, SharedApplyJournal, SharedApplyOptions, SharedApplyOutcome,
-    SharedApplyResult, SharedApplyStatus, SharedContentVerification, SharedHistoryReport,
-    SharedJournalWarning, SharedPlanEntry, SharedRollbackConfirmation, SharedRollbackEntry,
+    SHARED_APPLY_SCHEMA_VERSION, SHARED_DURABLE_JOURNAL_SCHEMA_VERSION, SHARED_MAX_BACKUP_BYTES,
+    SHARED_MAX_CREATED_DIRECTORIES, SHARED_MAX_ENTRIES, SHARED_MAX_FAILURES,
+    SHARED_MAX_HISTORY_JOURNALS, SHARED_MAX_JOURNAL_BYTES, SHARED_MAX_ROLLBACK_ENTRIES,
+    SHARED_MAX_SOURCE_BYTES, SHARED_MAX_TEMP_FILES, SHARED_MAX_TOTAL_WRITTEN_BYTES,
+    SHARED_MAX_WARNINGS, SharedAdapterWriteSupport, SharedApplyConfirmation, SharedApplyContext,
+    SharedApplyEntry, SharedApplyFailure, SharedApplyFailureKind, SharedApplyJournal,
+    SharedApplyOptions, SharedApplyOutcome, SharedApplyResult, SharedApplyStatus,
+    SharedContentVerification, SharedDurableEntry, SharedDurableJournal, SharedEntryRecoveryState,
+    SharedHistoryReport, SharedJournalWarning, SharedPendingOperation, SharedPendingRecoveryPlan,
+    SharedPlanEntry, SharedRecoveryState, SharedRollbackConfirmation, SharedRollbackEntry,
     SharedRollbackOptions, SharedRollbackOutcome, SharedRollbackPreview, SharedRollbackResult,
     SharedTransactionPath, SharedTransactionPlan, SharedTransactionStage, adapter_write_support,
     build_shared_transaction_plan, default_shared_backup_root, default_shared_history_root,
-    discover_shared_apply_history, execute_shared_apply, execute_shared_rollback,
-    generate_shared_operation_id, preview_shared_rollback,
-    require_dolphin_managed_gamehacking_verification, require_local_mod_package_verification,
+    discover_pending_operations, discover_shared_apply_history, execute_shared_apply,
+    execute_shared_rollback, generate_shared_operation_id, plan_pending_recovery,
+    preview_shared_rollback, require_dolphin_managed_gamehacking_verification,
+    require_local_mod_package_verification,
 };
 pub use snes9x_local::{
     SNES9X_MAX_PROFILES, SNES9X_NATIVE_BINARY_NAMES, Snes9xExecutable, Snes9xInstallationType,
@@ -845,9 +843,8 @@ pub use user_cheat_import::{
 pub use vice_local::{
     VICE_MAX_EXPLICIT_EXECUTABLES, ViceC64ExecutableKind, ViceExecutable, ViceInstallationType,
     ViceLaunchBlocker, ViceLaunchBlockerKind, ViceNativeLaunchBinding, ViceProfile,
-    ViceProfileDiscovery, ViceProfileDiscoveryRoots, ViceReadinessEvidence,
-    assess_vice_readiness, discover_vice_profiles, parse_vice_version,
-    resolve_vice_native_launch_binding,
+    ViceProfileDiscovery, ViceProfileDiscoveryRoots, ViceReadinessEvidence, assess_vice_readiness,
+    discover_vice_profiles, parse_vice_version, resolve_vice_native_launch_binding,
 };
 pub use vita3k_local::{
     VITA3K_MAX_CONFIG_BYTES, VITA3K_MAX_PROFILES, VITA3K_MAX_SFO_BYTES, Vita3kConfigInspection,

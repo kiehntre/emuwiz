@@ -2617,7 +2617,11 @@ fn rendered_images(output: &egui::FullOutput) -> Vec<(egui::TextureId, egui::Rec
 /// image among everything else the frame painted (the platform shelf draws
 /// textured meshes too).
 fn cover_texture_id(app: &ArchiveFsApp, local_path: &str) -> Option<egui::TextureId> {
-    match app.artwork_media.gamer_covers.slot_for(Path::new(local_path), None)? {
+    match app
+        .artwork_media
+        .gamer_covers
+        .slot_for(Path::new(local_path), None)?
+    {
         crate::gamer_artwork::CoverSlot::Ready { texture, .. } => Some(texture.id()),
         _ => None,
     }
@@ -2663,14 +2667,16 @@ fn gamer_view_draws_a_romm_cover_beside_the_game_it_belongs_to() {
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
     let generation = app.artwork_media.gamer_covers.generation();
     assert!(
-        app.artwork_media.gamer_covers
+        app.artwork_media
+            .gamer_covers
             .slot_for(Path::new(&featured_path(0)), None)
             .is_some(),
         "the visible list asked for nothing"
     );
 
     assert!(
-        app.artwork_media.gamer_covers
+        app.artwork_media
+            .gamer_covers
             .absorb(&ctx, cover_reply(generation, &featured_path(0), "101")),
         "the cover was refused"
     );
@@ -2692,8 +2698,10 @@ fn a_cover_is_drawn_inside_the_row_artwork_slot_without_changing_row_height() {
 
     let title_before =
         find_text_position_containing(&run_frames(&mut app, &ctx, 1920.0, 1080.0, 1), "Game 00000");
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
     let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
     let title_after = find_text_position_containing(&output, "Game 00000");
     assert_eq!(
@@ -2703,7 +2711,7 @@ fn a_cover_is_drawn_inside_the_row_artwork_slot_without_changing_row_height() {
 
     // And the cover itself stayed inside the slot it was given: a 20x30
     // cover is scaled to fit 56, never stretched to fill it.
-    let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+    let cover = cover_texture_id(&app, &featured_path_for_app(&app, 0)).expect("a loaded cover");
     let bounds = rendered_images(&output)
         .into_iter()
         .find(|(id, _)| *id == cover)
@@ -2743,10 +2751,12 @@ fn a_game_cover_replaces_the_platform_icon_rather_than_drawing_over_it() {
         "no platform artwork was drawn for a row with no cover"
     );
 
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
     let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
-    let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+    let cover = cover_texture_id(&app, &featured_path_for_app(&app, 0)).expect("a loaded cover");
     let drawn = rendered_images(&after);
 
     assert!(
@@ -2861,7 +2871,8 @@ fn searching_does_not_show_the_previous_records_cover() {
     let (mut app, ctx) = gamer_cover_app(6);
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
+    app.artwork_media
+        .gamer_covers
         .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
 
@@ -2869,7 +2880,8 @@ fn searching_does_not_show_the_previous_records_cover() {
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 2);
     assert!(
         !matches!(
-            app.artwork_media.gamer_covers
+            app.artwork_media
+                .gamer_covers
                 .slot_for(Path::new(&featured_path(4)), None),
             Some(crate::gamer_artwork::CoverSlot::Ready { .. })
         ),
@@ -2877,7 +2889,8 @@ fn searching_does_not_show_the_previous_records_cover() {
     );
     // The loaded cover still belongs to the record it was resolved for.
     assert!(matches!(
-        app.artwork_media.gamer_covers
+        app.artwork_media
+            .gamer_covers
             .slot_for(Path::new(&featured_path(0)), None),
         Some(crate::gamer_artwork::CoverSlot::Ready { .. })
     ));
@@ -2892,7 +2905,8 @@ fn an_identity_refresh_stops_drawing_a_cover_until_the_record_is_confirmed() {
     let (mut app, ctx) = gamer_cover_app(6);
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
+    app.artwork_media
+        .gamer_covers
         .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
     let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
     let before = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
@@ -2946,7 +2960,8 @@ fn a_confirmed_record_gets_its_own_texture_back_without_a_new_upload() {
     let (mut app, ctx) = gamer_cover_app(6);
     run_frames(&mut app, &ctx, 1920.0, 1080.0, 3);
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
+    app.artwork_media
+        .gamer_covers
         .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
     let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
 
@@ -2994,11 +3009,38 @@ fn an_identity_refresh_re_asks_only_the_rows_on_screen() {
 // --- The featured "Selected game" panel --------------------------------
 
 /// The local path the featured-panel fixture uses for one of its records.
+static FEATURED_FIXTURE_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn featured_path(index: usize) -> String {
+    // These paths are identities only: the fixture deliberately does not
+    // create archive files. Include the test thread in the namespace anyway,
+    // because several featured-panel tests run concurrently and the artwork
+    // cache keys are path-based. A process-wide fixed path made one test's
+    // synthetic cover indistinguishable from another test's cover.
+    let thread = format!("{:?}", std::thread::current().id())
+        .trim_start_matches("ThreadId(")
+        .trim_end_matches(')')
+        .to_string();
     std::env::temp_dir()
-        .join(format!("archivefs-featured-g{index:05}.zip"))
+        .join(format!(
+            "archivefs-featured-panel-{}-thread-{thread}-g{index:05}.zip",
+            std::process::id()
+        ))
         .display()
         .to_string()
+}
+
+fn featured_path_for_app(app: &ArchiveFsApp, index: usize) -> String {
+    match &app.state {
+        LoadState::Ready(data) => data.records[index]
+            .mount_plan
+            .archive
+            .path
+            .display()
+            .to_string(),
+        _ => panic!("featured-panel fixture did not load"),
+    }
 }
 
 /// Renders Gamer View with one game selected and returns the frame.
@@ -3014,9 +3056,13 @@ fn featured_panel_frame(
     // when there is a folder to copy. No file is created: only the folder is
     // looked at.
     let folder = std::env::temp_dir();
+    let fixture_id = FEATURED_FIXTURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut records = Vec::new();
     for index in 0..8 {
-        let path = folder.join(format!("archivefs-featured-g{index:05}.zip"));
+        let path = folder.join(format!(
+            "archivefs-featured-panel-{}-{fixture_id}-game-{index:05}.zip",
+            std::process::id()
+        ));
         let mut built = record(&path.display().to_string(), MountState::Pending);
         built.metadata.platform = Some("SNES".to_string());
         built.metadata.title = Some(if index == 0 {
@@ -3027,8 +3073,10 @@ fn featured_panel_frame(
         records.push(built);
     }
     app.state = LoadState::Ready(Box::new(loaded_data_with_records("/mount", records)));
-    app.archive_context
-        .select_only(folder.join("archivefs-featured-g00000.zip"));
+    app.archive_context.select_only(folder.join(format!(
+        "archivefs-featured-panel-{}-{fixture_id}-game-00000.zip",
+        std::process::id()
+    )));
     let ctx = egui::Context::default();
     let output = run_frames(&mut app, &ctx, width, height, 4);
     (app, ctx, output)
@@ -3177,11 +3225,13 @@ fn the_stage_puts_the_artwork_beside_the_title_and_the_actions() {
     // order is title, then the primary action, then the secondary actions.
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
     let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
 
-    let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+    let cover = cover_texture_id(&app, &featured_path_for_app(&app, 0)).expect("a loaded cover");
     // The featured cover is the large one; the row thumbnail is the small one.
     let mut drawn: Vec<egui::Rect> = rendered_images(&output)
         .into_iter()
@@ -3226,10 +3276,12 @@ fn the_stage_puts_the_artwork_beside_the_title_and_the_actions() {
 fn row_thumbnails_survive_the_featured_panel() {
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(1), "102"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 1), "102"),
+    );
     let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
-    let other = cover_texture_id(&app, &featured_path(1)).expect("a loaded cover");
+    let other = cover_texture_id(&app, &featured_path_for_app(&app, 1)).expect("a loaded cover");
     let drawn: Vec<egui::Rect> = rendered_images(&output)
         .into_iter()
         .filter(|(id, _)| *id == other)
@@ -3334,10 +3386,12 @@ fn the_featured_artwork_area_is_not_keyboard_focusable() {
     // would press the key an extra time for nothing.
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
     let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
-    let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+    let cover = cover_texture_id(&app, &featured_path_for_app(&app, 0)).expect("a loaded cover");
     let featured = rendered_images(&output)
         .into_iter()
         .filter(|(id, _)| *id == cover)
@@ -3372,7 +3426,7 @@ fn missing_artwork_keeps_the_panel_geometry_exactly() {
         &ctx,
         crate::gamer_artwork::CoverReply {
             generation,
-            local_path: PathBuf::from(featured_path(0)),
+            local_path: PathBuf::from(featured_path_for_app(&app, 0)),
             provider_game_id: Some("101".to_string()),
             kind: crate::gamer_artwork::GamerArtworkKind::Cover,
             screenshot_count: None,
@@ -3410,7 +3464,7 @@ fn a_failed_cover_keeps_the_panel_geometry_exactly() {
         &ctx,
         crate::gamer_artwork::CoverReply {
             generation,
-            local_path: PathBuf::from(featured_path(0)),
+            local_path: PathBuf::from(featured_path_for_app(&app, 0)),
             provider_game_id: Some("101".to_string()),
             kind: crate::gamer_artwork::GamerArtworkKind::Cover,
             screenshot_count: None,
@@ -3436,8 +3490,10 @@ fn a_cover_arriving_does_not_move_the_title_or_the_actions() {
     let mount = text_rect(&before, "Prepare game").expect("Prepare game");
 
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
     let after = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
     assert_eq!(
         title,
@@ -3455,11 +3511,13 @@ fn a_long_title_does_not_overlap_the_artwork_or_the_actions() {
                     (Rev 1) (Unl) (Demo) (Aftermarket) (Pirate) (Alt 3)";
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, long);
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
     let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
 
-    let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+    let cover = cover_texture_id(&app, &featured_path_for_app(&app, 0)).expect("a loaded cover");
     let featured = rendered_images(&output)
         .into_iter()
         .filter(|(id, _)| *id == cover)
@@ -3562,10 +3620,12 @@ fn the_featured_panel_stays_balanced_at_1920x1080() {
     // a slab: the artwork occupies a meaningful share of the panel's height.
     let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
     let generation = app.artwork_media.gamer_covers.generation();
-    app.artwork_media.gamer_covers
-        .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
     let output = run_frames(&mut app, &ctx, 1920.0, 1080.0, 1);
-    let cover = cover_texture_id(&app, &featured_path(0)).expect("a loaded cover");
+    let cover = cover_texture_id(&app, &featured_path_for_app(&app, 0)).expect("a loaded cover");
     let featured = rendered_images(&output)
         .into_iter()
         .filter(|(id, _)| *id == cover)
@@ -3595,7 +3655,8 @@ fn gamer_view_covers_behave_at_every_supported_resolution() {
         let (mut app, ctx) = gamer_cover_app(60);
         run_frames(&mut app, &ctx, width, height, 3);
         let generation = app.artwork_media.gamer_covers.generation();
-        app.artwork_media.gamer_covers
+        app.artwork_media
+            .gamer_covers
             .absorb(&ctx, cover_reply(generation, &featured_path(0), "101"));
         let output = run_frames(&mut app, &ctx, width, height, 1);
         assert!(

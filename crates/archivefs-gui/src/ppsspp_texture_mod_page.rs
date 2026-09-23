@@ -215,7 +215,8 @@ pub(crate) fn show_ppsspp_texture_mod_panel(
                 && state.rollback_preview.is_none()
                 && let Ok(backups) = default_shared_backup_root()
             {
-                state.rollback_preview = Some(preview_shared_rollback(path, &destination, &backups));
+                state.rollback_preview =
+                    Some(preview_shared_rollback(path, &destination, &backups));
             }
         }
         if let Some(preview) = state.rollback_preview.take() {

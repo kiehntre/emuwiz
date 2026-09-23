@@ -3,7 +3,8 @@
 //! This is deliberately an inventory projection, not an installer or a second
 //! profile/discovery system.  Callers may provide proven candidates (for
 //! example from Doctor/profile evidence); the convenience scanner only checks
-//! a bounded set of executable names on `PATH` and probes `--version`.
+//! a bounded set of executable names on `PATH` and uses each emulator's
+//! bounded version-reporting argument.
 
 use std::env;
 use std::fs;
@@ -24,6 +25,7 @@ pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Ord, PartialOrd)]
 pub enum InventoryEmulator {
+    Mame,
     Dolphin,
     Rpcs3,
     Pcsx2,
@@ -35,6 +37,7 @@ pub enum InventoryEmulator {
 impl InventoryEmulator {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Mame => "MAME",
             Self::Dolphin => "Dolphin",
             Self::Rpcs3 => "RPCS3",
             Self::Pcsx2 => "PCSX2",
@@ -46,6 +49,7 @@ impl InventoryEmulator {
 
     fn executable_names(self) -> &'static [&'static str] {
         match self {
+            Self::Mame => &["mame", "mame64"],
             Self::Dolphin => &["dolphin-emu", "dolphin"],
             Self::Rpcs3 => &["rpcs3"],
             Self::Pcsx2 => &["pcsx2"],
@@ -269,9 +273,18 @@ fn installation_root(path: &Path) -> PathBuf {
     path.parent().unwrap_or(path).to_path_buf()
 }
 
-fn probe_version(path: &Path) -> Option<String> {
+fn version_probe_argument(emulator: InventoryEmulator) -> &'static str {
+    match emulator {
+        // MAME follows its long-standing single-dash CLI convention and
+        // rejects `--version` as an unknown option.
+        InventoryEmulator::Mame => "-version",
+        _ => "--version",
+    }
+}
+
+fn probe_version(path: &Path, emulator: InventoryEmulator) -> Option<String> {
     let mut child = Command::new(path)
-        .arg("--version")
+        .arg(version_probe_argument(emulator))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -295,6 +308,14 @@ fn probe_version(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// Reuse the same bounded emulator-specific version probe used by PATH
+/// inventory callers.
+/// Callers that need provenance can retain this raw output alongside the
+/// resulting inventory projection.
+pub fn probe_version_output(path: &Path, emulator: InventoryEmulator) -> Option<String> {
+    probe_version(path, emulator)
+}
+
 /// Scan only executable names in the current `PATH`; no home-directory crawl.
 pub fn discover_installed_emulators() -> EmulatorInventory {
     let mut candidates = Vec::new();
@@ -306,6 +327,7 @@ pub fn discover_installed_emulators() -> EmulatorInventory {
         .collect();
     for directory in path_entries {
         for emulator in [
+            InventoryEmulator::Mame,
             InventoryEmulator::Dolphin,
             InventoryEmulator::Rpcs3,
             InventoryEmulator::Pcsx2,
@@ -320,7 +342,7 @@ pub fn discover_installed_emulators() -> EmulatorInventory {
                         emulator,
                         installation_root: installation_root(&path),
                         executable_path: path.clone(),
-                        version_output: probe_version(&path),
+                        version_output: probe_version(&path, emulator),
                         installation_type: InstallationType::Unknown,
                         update_capability: UpdateCapability::ManualUnknown,
                         preferred: None,
@@ -363,6 +385,15 @@ mod tests {
         );
         assert_eq!(parse_version_output("nightly abc123"), None);
         assert_eq!(parse_version_output(""), None);
+    }
+
+    #[test]
+    fn mame_uses_its_supported_single_dash_version_flag() {
+        assert_eq!(version_probe_argument(InventoryEmulator::Mame), "-version");
+        assert_eq!(
+            version_probe_argument(InventoryEmulator::Dolphin),
+            "--version"
+        );
     }
     #[test]
     fn channel_is_evidence_based() {

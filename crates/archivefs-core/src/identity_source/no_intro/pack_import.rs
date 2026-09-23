@@ -413,13 +413,10 @@ fn publish_no_intro_pack_at(
         if snapshot_is_complete(&previous_snapshot, &previous.accepted_members) {
             let old_members = &previous.accepted_members;
             for (index, member) in old_members.iter().enumerate() {
-                if accepted_members
-                    .iter()
-                    .any(|candidate| {
-                        candidate.system_name == member.system_name
-                            && candidate.variant == member.variant
-                    })
-                {
+                if accepted_members.iter().any(|candidate| {
+                    candidate.system_name == member.system_name
+                        && candidate.variant == member.variant
+                }) {
                     continue;
                 }
                 let source = previous_snapshot.join("dats").join(format!("{index}.dat"));
@@ -715,7 +712,10 @@ pub fn compare_staged_no_intro_pack_at(
             let installed = active.accepted_members.iter().find(|member| {
                 member.system_name == candidate.system_name && member.variant == candidate.variant
             })?;
-            Some((candidate.upstream_version.as_deref()?, installed.upstream_version.as_deref()?))
+            Some((
+                candidate.upstream_version.as_deref()?,
+                installed.upstream_version.as_deref()?,
+            ))
         })
         .collect::<Vec<_>>();
     if comparable.is_empty() {
@@ -755,7 +755,12 @@ fn compare_no_intro_revision(candidate: &str, installed: &str) -> Option<std::cm
     {
         let candidate = candidate.trim_start_matches('0');
         let installed = installed.trim_start_matches('0');
-        return Some(candidate.len().cmp(&installed.len()).then_with(|| candidate.cmp(installed)));
+        return Some(
+            candidate
+                .len()
+                .cmp(&installed.len())
+                .then_with(|| candidate.cmp(installed)),
+        );
     }
     None
 }

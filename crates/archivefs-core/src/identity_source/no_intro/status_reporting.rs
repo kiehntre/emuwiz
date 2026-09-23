@@ -305,12 +305,8 @@ pub fn report_no_intro_lifecycle(snapshots: &[NoIntroPackSnapshot]) -> ManagedNo
             NoIntroLifecycleHealth::NoCurrent
         } else {
             match current_state.unwrap_or(NoIntroFreshness::Unknown) {
-                NoIntroFreshness::Current => {
-                    NoIntroLifecycleHealth::Healthy
-                }
-                NoIntroFreshness::UpdateAvailable => {
-                    NoIntroLifecycleHealth::Stale
-                }
+                NoIntroFreshness::Current => NoIntroLifecycleHealth::Healthy,
+                NoIntroFreshness::UpdateAvailable => NoIntroLifecycleHealth::Stale,
                 NoIntroFreshness::CheckFailed
                 | NoIntroFreshness::NeverChecked
                 | NoIntroFreshness::Unknown => NoIntroLifecycleHealth::Unknown,
@@ -623,10 +619,7 @@ mod tests {
         let report =
             report_no_intro_lifecycle(&[snapshot("a", 1, "Nintendo - Game Boy", Some("20250101"))]);
         assert_eq!(report.health, NoIntroLifecycleHealth::Unknown);
-        assert_eq!(
-            report.platforms[0].freshness,
-            NoIntroFreshness::Unknown
-        );
+        assert_eq!(report.platforms[0].freshness, NoIntroFreshness::Unknown);
         assert_eq!(report.summary.freshness_unknown, 1);
         assert!(!report.platforms[0].rollback_available);
     }

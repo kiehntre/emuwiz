@@ -250,6 +250,10 @@ pub(crate) fn show_loaded_data(
             .iter()
             .map(|row| (!row.unknown_platform).then_some(row.platform.as_str())),
     );
+    let viewport_height = ui
+        .ctx()
+        .input(|input| input.screen_rect().height())
+        .max(1.0);
     // Wrapping, not a fixed-width strip or a horizontal scroll area: a
     // real library can detect dozens of distinct platforms, and every one
     // of them with a non-zero count must stay reachable without scrolling
@@ -328,7 +332,7 @@ pub(crate) fn show_loaded_data(
             }
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(if viewport_height < 720.0 { 0.0 } else { 4.0 });
     // Natural-height summary: it may grow only with content visible now;
     // no persisted panel height can starve the result table on a later
     // frame or after a window resize.
@@ -396,11 +400,21 @@ pub(crate) fn show_loaded_data(
     let selected_actions = if selected_archive.is_some() {
         egui::CollapsingHeader::new("Selected game")
             .id_salt("library_focused_archive_details")
-            .default_open(true)
+            // On a short window the table is the primary browsing surface;
+            // keep the selected row's actions one click away without letting
+            // their detail panel displace every library row below the fold.
+            .default_open(viewport_height >= 720.0)
             .show(ui, |ui| {
+                // Keep the table reachable on short windows. The selected
+                // game's actions remain available in their own scroll area,
+                // but may not consume the entire viewport and push the
+                // library rows below the fold.
+                let selected_body_height = (ui.available_height() * 0.35)
+                    .min((viewport_height * 0.28).clamp(120.0, 220.0))
+                    .clamp(120.0, 220.0);
                 egui::ScrollArea::vertical()
                     .id_salt("library_selected_archive_scroll")
-                    .max_height((ui.available_height() * 0.35).clamp(120.0, 280.0))
+                    .max_height(selected_body_height)
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         show_selected_archive(
@@ -436,8 +450,11 @@ pub(crate) fn show_loaded_data(
                                 ),
                                 screenscraper_state,
                                 screenscraper_settings,
-                                screenscraper_existing: selected_persisted
-                                    .and_then(|archive| cached.and_then(|snapshot| snapshot.screenscraper_enrichments.get(&archive.id))),
+                                screenscraper_existing: selected_persisted.and_then(|archive| {
+                                    cached.and_then(|snapshot| {
+                                        snapshot.screenscraper_enrichments.get(&archive.id)
+                                    })
+                                }),
                             },
                         )
                     })
@@ -468,7 +485,9 @@ pub(crate) fn show_loaded_data(
         requested_action = Some(AppOperationRequest::OpenDatSources);
     }
     if let Some(action) = selected_actions.metadata_enrichment {
-        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(action)));
+        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(
+            action,
+        )));
     }
 
     if let Some(result) = mount_all_result {
@@ -1234,7 +1253,9 @@ pub(crate) fn show_loaded_data(
         cached,
         selected_archives,
     ) {
-        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(action)));
+        requested_action = Some(AppOperationRequest::ApplyScreenScraperEnrichment(Box::new(
+            action,
+        )));
     }
     if *select_all_visible_requested {
         *selected_archives = select_all_visible(merged_rows, &visible_indices);

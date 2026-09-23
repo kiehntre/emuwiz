@@ -33,26 +33,21 @@ use super::environment::{
     FreeSpacePolicy, StorageAssessment, findings_from_free_space,
     findings_from_read_only_filesystems, not_checked_from_storage,
 };
-use super::handheld_profiles::{
-    MelonDsMgbaReadiness, findings_from_melonds_mgba_readiness,
-};
+use super::handheld_profiles::{MelonDsMgbaReadiness, findings_from_melonds_mgba_readiness};
 use super::managed::{
     ManagedEntryScan, findings_from_managed_entries, not_checked_from_managed_entries,
 };
-use super::native_profiles::{
-    DesmumeMesenReadiness, findings_from_desmume_mesen_readiness,
-};
-use super::rmg_sameboy::{
-    RmgSameBoyReadiness, findings_from_rmg_sameboy_readiness,
-};
+use super::native_profiles::{DesmumeMesenReadiness, findings_from_desmume_mesen_readiness};
 use super::profiles::{
-    AzaharCemuReadiness, LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment, ProfileAssessmentReport,
-    Rpcs3ReadinessAssessment, XemuReadinessAssessment, XeniaReadinessAssessment,
-    findings_from_azahar_cemu_readiness, findings_from_emulator_profiles, findings_from_linux_emulator_installations,
-    findings_from_ppsspp_readiness, findings_from_rpcs3_readiness, findings_from_xemu_readiness,
-    findings_from_xenia_readiness, not_checked_from_emulator_profiles,
+    AzaharCemuReadiness, LinuxEmulatorInstallationEvidence, PpssppReadinessAssessment,
+    ProfileAssessmentReport, Rpcs3ReadinessAssessment, XemuReadinessAssessment,
+    XeniaReadinessAssessment, findings_from_azahar_cemu_readiness, findings_from_emulator_profiles,
+    findings_from_linux_emulator_installations, findings_from_ppsspp_readiness,
+    findings_from_rpcs3_readiness, findings_from_xemu_readiness, findings_from_xenia_readiness,
+    not_checked_from_emulator_profiles,
 };
 use super::repair::{findings_from_index_freshness, findings_from_stale_mount_directories};
+use super::rmg_sameboy::{RmgSameBoyReadiness, findings_from_rmg_sameboy_readiness};
 use super::scummvm_dosbox::{
     DosBoxStagingDoctorReadiness, ScummVmDoctorReadiness, findings_from_dosbox_staging_readiness,
     findings_from_scummvm_readiness,
