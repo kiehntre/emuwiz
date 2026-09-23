@@ -965,13 +965,15 @@ impl App {
                     if summary.is_some() { ui.label(format!("{attention} attention · {warnings} review")); }
                 },
                 |ui| {
-                    if summary.is_some()
-                        && primary(ui, "Review problems")
-                        && self.problem_selected.is_none()
-                    {
-                        self.problem_selected = summary
-                            .as_ref()
-                            .and_then(|summary| summary.problems.first().map(|problem| problem.id.clone()));
+                    if let Some(summary) = summary.as_ref() {
+                        if primary(ui, "Review problems") && self.problem_selected.is_none() {
+                            self.problem_selected = summary
+                                .problems
+                                .first()
+                                .map(|problem| problem.id.clone());
+                        }
+                    } else {
+                        ui.add_enabled(false, egui::Button::new("Checking saved evidence"));
                     }
                 },
             );
