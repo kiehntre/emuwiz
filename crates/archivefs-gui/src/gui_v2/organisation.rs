@@ -342,6 +342,7 @@ impl App {
                         ui.add_space(theme::SPACE_SM);
                     }
                     ui.label(RichText::new("Fix my MAME library").strong().color(theme::TEAL));
+                    ui.label("Source untouched until a reviewed preview is confirmed.");
                     for card in ACTIONS {
                         widgets::workflow_card(ui, card.kind.accent(), |ui| {
                             ui.horizontal(|ui| {
