@@ -1160,10 +1160,12 @@ impl ArchiveFsApp {
         // MAME has no profile directory; its lifecycle binding is the exact
         // executable selected through Emulator Setup, while its game
         // eligibility comes only from the persisted MAME join above.
-        if let Some(executable) = self
+        let selected_mame_executable = self
             .emulator_readiness
             .emulator_setup_overrides
             .executable(crate::emulator_setup_overrides::OverridableEmulator::Mame)
+            .map(Path::to_path_buf);
+        if let Some(executable) = selected_mame_executable.as_deref()
             && !mame_set_resolutions.is_empty()
         {
             standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
@@ -1603,13 +1605,24 @@ impl ArchiveFsApp {
                 profile_id: profile.profile_id.clone(),
             })
             .collect();
-        let plan = archivefs_core::launch::build_launch_plan(
+        let mut plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
             &standalone_profiles,
             retroarch_environment,
             &remembered,
         );
+        if let Some(executable) = selected_mame_executable.as_deref()
+            && let Some(resolution) = mame_set_resolutions.first()
+        {
+            let strict = archivefs_core::launch::build_mame_command_plan(
+                &identity_status,
+                &mame_set_resolutions,
+                Some(executable),
+                launch_readiness_page::mame_rom_search_path_configured(&resolution.archive_path),
+            );
+            launch_readiness_page::project_mame_strict_readiness(&mut plan, &strict);
+        }
         LaunchReadinessInput::Plan {
             plan,
             retroarch: match &self.emulator_readiness.retroarch_profiles {

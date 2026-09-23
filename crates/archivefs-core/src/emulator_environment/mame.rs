@@ -8,7 +8,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::{ExecutableProbe, FsProbe, ReadOnlyHostFilesystem};
 
@@ -37,6 +37,27 @@ impl MameProfile {
     pub fn rom_search_path_configured(&self) -> bool {
         !self.rompath.is_empty()
     }
+
+    /// Whether this profile explicitly searches the directory containing the
+    /// selected logical set. Relative and variable-expanded MAME paths are
+    /// deliberately not guessed here: strict launch readiness needs one
+    /// exact, absolute collection root in the inspected profile.
+    pub fn covers_logical_set(&self, selected_content: &Path) -> bool {
+        let Some(collection_root) = selected_content.parent() else {
+            return false;
+        };
+        self.rompath.iter().any(|configured| {
+            let configured = Path::new(configured);
+            configured.is_absolute() && configured == collection_root
+        })
+    }
+}
+
+/// MAME's conventional per-user configuration path for an explicitly
+/// supplied home directory. Keeping HOME resolution at the caller boundary
+/// makes tests isolated and avoids embedding any user's path in product code.
+pub fn user_mame_config_path(home_directory: &Path) -> PathBuf {
+    home_directory.join(".mame").join(MAME_CONFIG_FILE_NAME)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,5 +277,40 @@ mod tests {
             panic!("profile should parse")
         };
         assert!(!profile.rom_search_path_configured());
+    }
+
+    #[test]
+    fn configured_arcade_root_must_exactly_cover_selected_logical_set() {
+        let profile = MameProfile {
+            config_path: PathBuf::from("/home/test/.mame/mame.ini"),
+            rompath: vec!["/library/arcade".into(), "/library/bios".into()],
+            cfg_directory: None,
+            nvram_directory: None,
+            snapshot_directory: None,
+            hashpath: None,
+        };
+        assert!(profile.covers_logical_set(Path::new("/library/arcade/blackbdb")));
+        assert!(!profile.covers_logical_set(Path::new("/library/mame/blackbdb")));
+    }
+
+    #[test]
+    fn relative_or_variable_rompath_is_not_strict_search_path_evidence() {
+        let profile = MameProfile {
+            config_path: PathBuf::from("/home/test/.mame/mame.ini"),
+            rompath: vec!["roms".into(), "$HOME/roms".into()],
+            cfg_directory: None,
+            nvram_directory: None,
+            snapshot_directory: None,
+            hashpath: None,
+        };
+        assert!(!profile.covers_logical_set(Path::new("/home/test/roms/pacman")));
+    }
+
+    #[test]
+    fn user_config_path_is_derived_from_supplied_home() {
+        assert_eq!(
+            user_mame_config_path(Path::new("/isolated/home")),
+            PathBuf::from("/isolated/home/.mame/mame.ini")
+        );
     }
 }

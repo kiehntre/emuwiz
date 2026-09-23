@@ -41,6 +41,9 @@ use std::thread;
 
 use archivefs_core::dat::firmware_evidence::FirmwareIdentityRecord;
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
+use archivefs_core::emulator_environment::mame::{
+    MameProfileInspection, inspect_mame_profile, user_mame_config_path,
+};
 use archivefs_core::emulator_environment::retroarch::{
     AppImageIdentificationConfidence, DiscoveryEnvironment, ExecutableState, ProfileKind,
     ProfileRef, RetroArchEnvironmentReport,
@@ -66,7 +69,7 @@ use archivefs_core::launch::{
     LaunchCommandSpec, LaunchContainerKind, LaunchExecutionError, LaunchExitReport, LaunchPlan,
     LaunchPreflightErrorKind, LaunchReadiness, LaunchSpawnError, LaunchTarget, LaunchWarning,
     LaunchWarningKind, LaunchedDolphinProcess, LaunchedPcsx2Process, LaunchedRetroArchProcess,
-    MameLaunchRequest, PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError,
+    MameCommandPlan, MameLaunchRequest, PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError,
     Pcsx2LaunchExitReport, Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest,
     Pcsx2LaunchSpawnError, RetroArchLaunchRequest, preflight_and_launch_dolphin,
     preflight_and_launch_pcsx2, preflight_and_launch_retroarch,
@@ -83,6 +86,61 @@ use archivefs_core::ready_to_play::{
 use eframe::egui;
 
 use crate::ui::{components as widgets, theme};
+
+/// Strict ROM-path evidence for the conventional per-user MAME profile.
+/// The profile is inspected read-only and must explicitly cover the selected
+/// logical set's collection root; a non-empty but unrelated path is not a
+/// readiness pass.
+pub(crate) fn mame_rom_search_path_configured(selected_content: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    matches!(
+        inspect_mame_profile(&HostReadOnlyFilesystem, &user_mame_config_path(&home)),
+        MameProfileInspection::Present(profile) if profile.covers_logical_set(selected_content)
+    )
+}
+
+/// Make the generic candidate card agree with MAME's authoritative command
+/// plan. This only adds strict blockers; it cannot turn a generic blocked or
+/// warning candidate into Ready.
+pub(crate) fn project_mame_strict_readiness(plan: &mut LaunchPlan, strict: &MameCommandPlan) {
+    for candidate in &mut plan.candidates {
+        let LaunchTarget::Standalone { adapter_id, .. } = &candidate.target else {
+            continue;
+        };
+        if *adapter_id != "mame" {
+            continue;
+        }
+        for blocker in &strict.blockers {
+            if !candidate.blockers.contains(blocker) {
+                candidate.blockers.push(blocker.clone());
+            }
+        }
+        candidate.readiness = if !candidate.blockers.is_empty() {
+            LaunchReadiness::Blocked
+        } else if !candidate.warnings.is_empty() {
+            LaunchReadiness::ReadyWithWarnings
+        } else {
+            LaunchReadiness::Ready
+        };
+    }
+    plan.summary.ready = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Ready)
+        .count();
+    plan.summary.ready_with_warnings = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::ReadyWithWarnings)
+        .count();
+    plan.summary.blocked = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Blocked)
+        .count();
+}
 
 /// Everything [`show_launch_readiness_panel`] needs, gathered by the caller
 /// from existing App/MainView state before this module ever runs. Every
@@ -2263,6 +2321,7 @@ fn standalone_launch_request(
                 .find(|evidence| evidence.logical_set_name == set_name)?;
             let resolution =
                 archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(evidence, &path)?;
+            let rom_search_path_configured = mame_rom_search_path_configured(&path);
             Some(StandaloneLaunchRequest::Mame(MameLaunchRequest {
                 identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
                     platform_id: platform,
@@ -2272,7 +2331,7 @@ fn standalone_launch_request(
                 expected_executable: executable,
                 selected_content: path,
                 expected_content_identity: None,
-                rom_search_path_configured: false,
+                rom_search_path_configured,
             }))
         }
         "duckstation" => {
@@ -2464,6 +2523,7 @@ fn candidate_emulator_name(candidate: &LaunchCandidate) -> Option<&'static str> 
             "amiberry" => Some("Amiberry"),
             "fsuae" => Some("FS-UAE"),
             "dolphin" => Some("Dolphin"),
+            "mame" => Some("MAME"),
             "scummvm" => Some("ScummVM"),
             "fuse" => Some("Fuse"),
             "tsugaru" => Some("Tsugaru"),
@@ -2683,6 +2743,19 @@ fn show_candidate(
             .small()
             .color(theme::muted(ui)),
         );
+
+        if matches!(
+            &candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        ) && candidate.readiness == LaunchReadiness::Blocked
+        {
+            ui.label(
+                egui::RichText::new("Needs attention: MAME cannot launch this set yet.").strong(),
+            );
+        }
 
         show_launch_recipe(
             ui,

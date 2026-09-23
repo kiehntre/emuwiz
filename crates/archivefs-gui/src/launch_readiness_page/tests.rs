@@ -426,6 +426,36 @@ fn ready_retroarch_candidate_shows_ready_badge() {
 }
 
 #[test]
+fn strict_mame_blocker_replaces_the_false_ready_card_state() {
+    let mut candidate = standalone_candidate_for("mame", LaunchReadiness::Ready);
+    candidate.content = resolved_content("/library/arcade/blackbdb");
+    let mut plan = plan_with(vec![candidate]);
+    let strict = MameCommandPlan {
+        command: None,
+        blockers: vec![LaunchBlocker::new(
+            LaunchBlockerKind::MameSearchPathUnconfigured,
+            "the selected logical set is outside the configured MAME rompath",
+        )],
+    };
+
+    project_mame_strict_readiness(&mut plan, &strict);
+
+    assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+    assert_eq!(plan.summary.ready, 0);
+    assert_eq!(plan.summary.blocked, 1);
+    let output = render(&plan_input(plan));
+    assert!(rendered_text_contains(&output, "Blocked"));
+    assert!(rendered_text_contains(
+        &output,
+        "Needs attention: MAME cannot launch this set yet."
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "outside the configured MAME rompath"
+    ));
+}
+
+#[test]
 fn gamer_action_launches_the_exact_ready_retroarch_request() {
     let action = gamer_play_action(&plan_input(plan_with(vec![ready_candidate()])));
     assert!(matches!(

@@ -542,8 +542,7 @@ fn join_one_indexed(
             dependencies.push(ArcadeDependencyEdge {
                 kind: "Device".into(),
                 target: name.into(),
-                present: by_name.get(name).is_some_and(|g| flag(&g.is_device))
-                    && dirs.contains_key(name),
+                present: device_dependency_present(name, by_name, dirs),
             });
         }
     }
@@ -595,6 +594,39 @@ fn join_one_indexed(
         dat_path: dat.path.to_string_lossy().into_owned(),
         audited_at: audited_at.to_string(),
     }
+}
+
+/// A MAME `<device_ref>` always requires a matching device definition, but
+/// only a device that declares required ROM/disk payload needs a same-named
+/// storage set. CPU/timer/etc. definitions such as `i486` are compiled into
+/// MAME and intentionally have no ROM directory of their own.
+fn device_dependency_present(
+    name: &str,
+    by_name: &BTreeMap<&str, &DatGameEntry>,
+    dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
+) -> bool {
+    let Some(device) = by_name
+        .get(name)
+        .copied()
+        .filter(|game| flag(&game.is_device))
+    else {
+        return false;
+    };
+    let requires_storage = device
+        .roms
+        .iter()
+        .any(|rom| !is_optional(rom) && !is_nodump(rom))
+        || device.disks.iter().any(|disk| {
+            !disk
+                .optional
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("yes"))
+                && !disk
+                    .status
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("nodump"))
+        });
+    !requires_storage || dirs.contains_key(name)
 }
 
 fn member_evidence(
@@ -823,6 +855,94 @@ mod tests {
                 .members
                 .iter()
                 .any(|m| m.name == "extra.bin" && m.kind == MemberEvidenceKind::Extra)
+        );
+    }
+
+    #[test]
+    fn romless_device_definition_is_satisfied_without_a_fake_device_set() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = game("parent");
+        parent.roms.push(DatRomEntry {
+            name: "parent.bin".into(),
+            ..Default::default()
+        });
+        let mut clone = game("clone");
+        clone.clone_of = Some("parent".into());
+        clone.rom_of = Some("parent".into());
+        clone
+            .device_refs
+            .push(crate::dat::model::DatDeviceRefEntry {
+                name: Some("i486".into()),
+            });
+        clone.roms.push(DatRomEntry {
+            name: "clone.bin".into(),
+            ..Default::default()
+        });
+        let mut cpu = game("i486");
+        cpu.is_device = Some("yes".into());
+        cpu.runnable = Some("no".into());
+        let verified = dat(vec![parent, clone, cpu]);
+        let parent_set = set(root.path(), "parent", &["parent.bin"]);
+        let clone_set = set(root.path(), "clone", &["clone.bin"]);
+        let mut by_name = BTreeMap::new();
+        for game in &verified.parsed.games {
+            by_name.insert(game.name.as_str(), game);
+        }
+        let mut dirs = BTreeMap::new();
+        dirs.insert("parent", &parent_set);
+        dirs.insert("clone", &clone_set);
+
+        let evidence = join_one(&verified, &clone_set, &by_name, &dirs, "test");
+        assert_eq!(evidence.clone_of.as_deref(), Some("parent"));
+        assert!(evidence.dependencies.iter().any(|dependency| {
+            dependency.kind == "Device" && dependency.target == "i486" && dependency.present
+        }));
+        assert_eq!(
+            launch_resolution_for_join(&evidence, &clone_set.path)
+                .unwrap()
+                .state,
+            SetState::Complete
+        );
+    }
+
+    #[test]
+    fn device_with_required_payload_stays_missing_without_its_set() {
+        let root = tempfile::tempdir().unwrap();
+        let mut machine = game("machine");
+        machine
+            .device_refs
+            .push(crate::dat::model::DatDeviceRefEntry {
+                name: Some("soundboard".into()),
+            });
+        machine.roms.push(DatRomEntry {
+            name: "game.bin".into(),
+            ..Default::default()
+        });
+        let mut device = game("soundboard");
+        device.is_device = Some("yes".into());
+        device.runnable = Some("no".into());
+        device.roms.push(DatRomEntry {
+            name: "device.bin".into(),
+            ..Default::default()
+        });
+        let verified = dat(vec![machine, device]);
+        let machine_set = set(root.path(), "machine", &["game.bin"]);
+        let mut by_name = BTreeMap::new();
+        for game in &verified.parsed.games {
+            by_name.insert(game.name.as_str(), game);
+        }
+        let mut dirs = BTreeMap::new();
+        dirs.insert("machine", &machine_set);
+
+        let evidence = join_one(&verified, &machine_set, &by_name, &dirs, "test");
+        assert!(evidence.dependencies.iter().any(|dependency| {
+            dependency.kind == "Device" && dependency.target == "soundboard" && !dependency.present
+        }));
+        assert_eq!(
+            launch_resolution_for_join(&evidence, &machine_set.path)
+                .unwrap()
+                .state,
+            SetState::Incomplete
         );
     }
 
