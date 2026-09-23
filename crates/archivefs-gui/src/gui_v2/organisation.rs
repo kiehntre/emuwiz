@@ -546,6 +546,7 @@ impl App {
                         self.organisation.view = OrganisationView::MameNormalizer;
                     }
                     ui.label("Source untouched until a reviewed preview is confirmed.");
+                    ui.label("Build a clean playing library");
                     for card in ACTIONS {
                         widgets::workflow_card(ui, card.kind.accent(), |ui| {
                             ui.horizontal(|ui| {
