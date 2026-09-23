@@ -14,6 +14,14 @@ use crate::{
     rom_organisation_page::{self, RomOrganisationPageAction},
 };
 use eframe::egui::{self, RichText};
+use std::path::PathBuf;
+
+use archivefs_core::dat::limits::DatLimits;
+use archivefs_core::dat::mame_normalizer::{
+    MameCollectionMode, MameFixStatus, MameNormalisationPlan, detect_mame_collection_mode,
+    plan_mame_normalisation,
+};
+use archivefs_core::dat::parsers::parse_dat_file;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum OrganisationView {
@@ -21,11 +29,18 @@ pub(super) enum OrganisationView {
     Landing,
     VerifiedGames,
     PlayingLibrary,
+    MameNormalizer,
 }
 
 #[derive(Default)]
 pub(super) struct OrganisationState {
     pub(super) view: OrganisationView,
+    pub(super) mame_root: Option<PathBuf>,
+    pub(super) mame_dat: Option<PathBuf>,
+    pub(super) mame_plan: Option<MameNormalisationPlan>,
+    pub(super) mame_mode: MameCollectionMode,
+    pub(super) mame_detected_mode: Option<MameCollectionMode>,
+    pub(super) mame_message: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +128,16 @@ impl App {
                         });
                     }
                     ui.add_space(8.0);
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.heading("Fix my MAME library");
+                        ui.label("Use verified DAT checksums to repair MAME set and ROM member names safely.");
+                        ui.label(RichText::new("Preview first · No fuzzy matching · Undo available").strong());
+                        if primary(ui, "Fix my MAME library") {
+                            self.organisation.view = OrganisationView::MameNormalizer;
+                        }
+                    });
+                    ui.add_space(8.0);
                     for card in ACTIONS {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());
@@ -167,6 +192,10 @@ impl App {
                         self.playing_library_job.is_some(),
                     );
                 }
+                OrganisationView::MameNormalizer => {
+                    show_mame_normalizer(ui, &mut self.organisation);
+                    if ui.button("← Organisation").clicked() { back = true; }
+                }
             });
 
         if back {
@@ -207,6 +236,159 @@ impl App {
     }
 }
 
+fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
+    ui.heading("Fix my MAME library");
+    ui.label("Wizzy only changes files when the selected DAT proves their identity by checksum.");
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Choose MAME folder…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .set_title("Choose MAME folder")
+                .pick_folder()
+        {
+            state.mame_root = Some(path);
+            state.mame_plan = None;
+            state.mame_detected_mode = None;
+            state.mame_message = None;
+        }
+        if ui.button("Choose DAT…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("DAT files", &["dat", "xml"])
+                .pick_file()
+        {
+            state.mame_dat = Some(path);
+            state.mame_plan = None;
+            state.mame_detected_mode = None;
+            state.mame_message = None;
+        }
+    });
+    ui.label(format!(
+        "MAME folder: {}",
+        state
+            .mame_root
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not selected".into())
+    ));
+    ui.label(format!(
+        "DAT: {}",
+        state
+            .mame_dat
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not selected".into())
+    ));
+    ui.horizontal(|ui| {
+        ui.label("How is your collection organised?");
+        let previous_mode = state.mame_mode;
+        for (mode, label) in [
+            (MameCollectionMode::Merged, "Merged"),
+            (MameCollectionMode::Split, "Split"),
+            (MameCollectionMode::NonMerged, "Non-merged"),
+            (MameCollectionMode::NotSure, "Not sure"),
+        ] {
+            ui.radio_value(&mut state.mame_mode, mode, label);
+        }
+        if state.mame_mode != previous_mode {
+            state.mame_detected_mode = None;
+            state.mame_plan = None;
+            state.mame_message = None;
+        }
+    });
+    ui.label(match state.mame_mode {
+        MameCollectionMode::Merged => {
+            "Merged: parent archives may also contain clone-specific files."
+        }
+        MameCollectionMode::Split => {
+            "Split: clones keep their own files and may use shared parent files."
+        }
+        MameCollectionMode::NonMerged => {
+            "Non-merged: every set archive contains all files it needs."
+        }
+        MameCollectionMode::NotSure => {
+            "Not sure: EmuWiz can inspect a small sample and suggest a layout."
+        }
+    });
+    if ui.button("Preview fixes").clicked() {
+        match (&state.mame_root, &state.mame_dat) {
+            (Some(root), Some(dat_path)) => match parse_dat_file(dat_path, DatLimits::default()) {
+                Ok(outcome) if state.mame_mode == MameCollectionMode::NotSure => {
+                    match detect_mame_collection_mode(root, &outcome.dat) {
+                        Ok(detected) => {
+                            state.mame_detected_mode = Some(detected);
+                            state.mame_message = Some(format!(
+                                "Your collection looks like {detected:?}. Confirm that layout above, then preview fixes again."
+                            ));
+                        }
+                        Err(error) => {
+                            state.mame_message = Some(format!(
+                                "The collection layout could not be sampled safely: {error}"
+                            ))
+                        }
+                    }
+                }
+                Ok(outcome) => match plan_mame_normalisation(root, &outcome.dat, state.mame_mode) {
+                    Ok(plan) => state.mame_plan = Some(plan),
+                    Err(error) => state.mame_message = Some(error),
+                },
+                Err(error) => {
+                    state.mame_message = Some(format!("The DAT could not be read: {error}"))
+                }
+            },
+            _ => state.mame_message = Some("Choose both the MAME folder and its DAT first.".into()),
+        }
+    }
+    if let Some(message) = &state.mame_message {
+        ui.colored_label(egui::Color32::LIGHT_RED, message);
+    }
+    if let Some(plan) = &state.mame_plan {
+        let s = &plan.summary;
+        ui.separator();
+        ui.label(format!("{} sets checked · {} can be fixed automatically · {} already correct · {} need attention", s.total_sets, s.safe, s.already_correct, s.needs_attention + s.collisions + s.missing_data + s.unknown));
+        if s.split_rebuilds > 0 {
+            ui.label(format!(
+                "{} Split parent/clone families can be rebuilt safely · {} verified members move between archives",
+                s.split_rebuilds, s.moved_members
+            ));
+        }
+        for set in plan
+            .sets
+            .iter()
+            .filter(|set| set.status != MameFixStatus::AlreadyCorrect)
+            .take(12)
+        {
+            ui.label(format!(
+                "{} → {} ({:?})",
+                set.current_path.display(),
+                set.correct_path.display(),
+                set.status
+            ));
+            for member in &set.members {
+                ui.label(format!("  {} → {}", member.current, member.correct));
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Fix library").clicked()
+                && let Some(root) = &state.mame_root
+            {
+                let journal = root.join(".emuwiz-mame-normaliser.json");
+                match archivefs_core::dat::mame_normalizer::apply_mame_normalisation(plan, &journal) {
+                    Ok(count) => state.mame_message = Some(format!("Applied {count} safe set repairs. Verification is complete for staged archives.")),
+                    Err(error) => state.mame_message = Some(format!("Repair stopped safely: {error}")),
+                }
+            }
+            if ui.button("Undo this repair batch").clicked()
+                && let Some(root) = &state.mame_root
+            {
+                let journal = root.join(".emuwiz-mame-normaliser.json");
+                match archivefs_core::dat::mame_normalizer::undo_mame_normalisation(&journal) {
+                    Ok(count) => state.mame_message = Some(format!("Undid {count} safe set repairs.")),
+                    Err(error) => state.mame_message = Some(format!("Undo stopped safely: {error}")),
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +416,13 @@ mod tests {
         assert!(ACTIONS.iter().all(|card| card.semantics.contains("Preview")
             || card.semantics.contains("required")
             || card.semantics.contains("separately")));
+    }
+
+    #[test]
+    fn mame_layout_starts_unconfirmed() {
+        assert_eq!(
+            OrganisationState::default().mame_mode,
+            MameCollectionMode::NotSure
+        );
     }
 }

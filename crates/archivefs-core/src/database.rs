@@ -718,6 +718,47 @@ impl Database {
         .collect()
     }
 
+    /// Loads trusted MAME joins together with the exact persisted source path.
+    /// Normalisation can use this already checksum-backed evidence to avoid
+    /// reopening every member of a large audited collection during preview.
+    pub fn mame_arcade_join_paths_for_dat(
+        &self,
+        dat_sha256: &str,
+    ) -> Result<Vec<(PathBuf, crate::dat::mame_arcade_join::ArcadeJoinEvidence)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT audit.archive_path, expected.metadata_json
+             FROM dat_set_audit_results AS audit
+             JOIN dat_expected_entries AS expected
+               ON expected.dat_source_id = audit.source_id
+              AND expected.canonical_identity = audit.game_name
+             WHERE audit.source_id LIKE ?1 AND audit.dat_revision = ?2
+               AND audit.stale = 0
+             ORDER BY audit.archive_path, audit.game_name",
+            )
+            .map_err(|error| db_error("failed to prepare MAME join path query", error))?;
+        let rows = statement
+            .query_map(params!["mame-arcade:%", dat_sha256], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
+            })
+            .map_err(|error| db_error("failed to query MAME join paths", error))?;
+        rows.map(|row| {
+            let (path, encoded) =
+                row.map_err(|error| db_error("failed to read MAME join path", error))?;
+            let path = PathBuf::from(OsString::from_vec(path));
+            let encoded = encoded
+                .ok_or_else(|| ArchiveFsError::Database("MAME join metadata is missing".into()))?;
+            let evidence = serde_json::from_slice(&encoded).map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "stored MAME Arcade join evidence is malformed: {error}"
+                ))
+            })?;
+            Ok((path, evidence))
+        })
+        .collect()
+    }
+
     /// Loads the one current, SHA-bound MAME join attached to an exact
     /// logical Arcade catalogue path. This is the launch/readiness lookup:
     /// the path must already be an `arcade_set_directory` archive linked by

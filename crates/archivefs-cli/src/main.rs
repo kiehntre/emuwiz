@@ -84,6 +84,7 @@ mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
 mod dat;
+mod mame_normalise;
 mod media_set;
 mod platform_artwork;
 mod repair;
@@ -421,6 +422,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "rom-organise" => {
             rom_organise::run(args.collect())?;
+        }
+        "mame-normalise" => {
+            mame_normalise::run(args.collect())?;
         }
         "repair" => {
             repair::run(args.collect())?;

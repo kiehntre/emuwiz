@@ -462,6 +462,7 @@ fn gui_v2_organisation_is_a_native_plain_english_workflow() {
         "Choose what you want to organise",
         "Organise verified games",
         "Build a clean playing library",
+        "Fix my MAME library",
     ] {
         assert!(strings.iter().any(|value| value == expected), "{expected}");
     }
