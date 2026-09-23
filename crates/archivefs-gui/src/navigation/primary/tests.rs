@@ -71,12 +71,13 @@ fn click(label: &str, view: MainView, overlay: ToolsOverlay, expected: NavClick)
 }
 
 #[test]
-fn seven_primary_destinations_are_visible_and_legacy_rows_are_absent() {
+fn eight_primary_destinations_are_visible_and_legacy_rows_are_absent() {
     let expected = [
         "Home",
         "Library",
         "Setup",
         "Organise & Export",
+        "Tools",
         "Enhance",
         "Health & Recovery",
         "Settings",
@@ -99,6 +100,31 @@ fn seven_primary_destinations_are_visible_and_legacy_rows_are_absent() {
             }
         }
     }
+}
+
+#[test]
+fn workshop_exposes_native_museum_converter_and_tape_destinations() {
+    let expected = [
+        ("Converter", MainView::DiscConversion),
+        ("Tape Inspector", MainView::TapeInspector),
+        ("Museum", MainView::Museum),
+    ];
+    for (label, target) in expected {
+        click(
+            label,
+            MainView::DiscConversion,
+            ToolsOverlay::None,
+            NavClick::View(target),
+        );
+    }
+    assert_eq!(
+        destination(MainView::Museum, ToolsOverlay::None),
+        Destination::Workshop
+    );
+    assert_eq!(
+        destination(MainView::TapeInspector, ToolsOverlay::None),
+        Destination::Workshop
+    );
 }
 
 #[test]

@@ -313,9 +313,10 @@ impl NativeWorkflows {
     ) -> Option<Route> {
         let Some(game) = selected else {
             crate::ui::components::card(ui, |ui| {
-                ui.heading("Choose a game first");
-                ui.label("Open a game from Games, then choose Mods & Cheats to review compatible cheats.");
-                ui.label("No cheat is changed by browsing this page.");
+                ui.label("Choose a game first");
+                ui.heading("Put a game on the bench first");
+                ui.label("Open a game from Games, then choose Mods & Cheats to review its gameplay codes.");
+                ui.label("No cheat is changed by browsing; original game files stay untouched.");
             });
             return None;
         };
@@ -337,10 +338,10 @@ impl NativeWorkflows {
             );
             return None;
         };
-        ui.label(format!("Selected game: {} · {}", game.title, game.platform));
+        ui.label(format!("On the bench: {} · {}", game.title, game.platform));
         ui.label(match workflow.adapter.display_name() {
-            Some(adapter) => format!("Supported cheat target: {adapter}"),
-            None => "Unsupported format for automatic cheat apply".to_string(),
+            Some(adapter) => format!("Cheat controls ready for {adapter}"),
+            None => "This game has no automatic cheat location yet".to_string(),
         });
         let live = match &self.app.state {
             LoadState::Ready(data) => Some(data.as_ref()),

@@ -3,6 +3,7 @@ mod activity;
 mod artwork;
 mod backend;
 mod environment;
+mod imagery;
 mod legacy;
 mod library;
 mod media_sources;
@@ -17,6 +18,7 @@ mod saves_states;
 #[cfg(test)]
 mod tests;
 mod thumbnail;
+mod visual_pages;
 
 use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
 use activity::Activity;
@@ -207,6 +209,7 @@ pub(super) struct App {
     detail_failed: Option<i64>,
     activity: Activity,
     artwork: Artwork,
+    imagery: imagery::Imagery,
     load_job: Option<u64>,
     artwork_job: Option<u64>,
     index_job: Option<u64>,
@@ -221,6 +224,8 @@ pub(super) struct App {
     verification_job: Option<u64>,
     duplicate_report: Option<DuplicateReport>,
     duplicate_job: Option<u64>,
+    problem_summary: Option<Arc<problems::ProblemSummary>>,
+    problem_summary_job: Option<u64>,
     duplicate_ignored: std::collections::HashSet<String>,
     problem_selected: Option<String>,
     repair_preview: Option<DuplicateRepairPreview>,
@@ -269,6 +274,7 @@ impl App {
             detail_failed: None,
             activity: Activity::default(),
             artwork: Artwork::start(context),
+            imagery: imagery::Imagery::default(),
             load_job: None,
             artwork_job: None,
             index_job: None,
@@ -283,6 +289,8 @@ impl App {
             verification_job: None,
             duplicate_report: None,
             duplicate_job: None,
+            problem_summary: None,
+            problem_summary_job: None,
             duplicate_ignored: std::collections::HashSet::new(),
             problem_selected: None,
             repair_preview: None,
@@ -509,6 +517,24 @@ impl App {
             id,
             Command::ScanDuplicates {
                 games: self.library.games.clone(),
+            },
+        );
+    }
+    fn start_problem_summary(&mut self) {
+        if self.problem_summary_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Checking saved problem evidence",
+            Route::Section(Section::Problems),
+            false,
+        );
+        self.problem_summary_job = Some(id);
+        self.send(
+            id,
+            Command::BuildProblemSummary {
+                library: self.library.clone(),
+                duplicates: self.duplicate_report.clone(),
             },
         );
     }
@@ -1039,6 +1065,7 @@ impl App {
 
     fn poll(&mut self, context: &egui::Context) {
         self.artwork.begin_frame(context);
+        self.imagery.begin_frame(context);
         for _ in 0..32 {
             let Ok(event) = self.backend.rx.try_recv() else {
                 break;
@@ -1059,6 +1086,9 @@ impl App {
                 Event::Finished { id, outcome } => {
                     if self.load_job == Some(id) {
                         self.load_job = None;
+                    }
+                    if self.problem_summary_job == Some(id) {
+                        self.problem_summary_job = None;
                     }
                     match outcome {
                         Ok(payload) => {
@@ -1109,6 +1139,7 @@ impl App {
                                         });
                                     }
                                     self.library = library;
+                                    self.problem_summary = None;
                                     self.loaded = true;
                                     self.indices.clear();
                                     self.change_filter();
@@ -1146,6 +1177,11 @@ impl App {
                                 Payload::Duplicates(report) => {
                                     self.duplicate_job = None;
                                     self.duplicate_report = Some(report);
+                                    self.problem_summary = None;
+                                }
+                                Payload::ProblemSummary(summary) => {
+                                    self.problem_summary_job = None;
+                                    self.problem_summary = Some(summary);
                                 }
                                 Payload::DuplicatePreview(preview) => {
                                     self.repair_preview = Some(*preview);

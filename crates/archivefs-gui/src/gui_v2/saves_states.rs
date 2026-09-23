@@ -6,9 +6,13 @@
 
 use super::{
     App,
+    imagery::{EmptyArt, empty_state},
     routes::{Route, Section},
 };
-#[cfg(not(test))]
+use crate::ui::{
+    components::{StatusTone, page_hero, status_badge},
+    theme,
+};
 use archivefs_core::persistent_state_inventory::StateEmulator;
 use archivefs_core::persistent_state_inventory::{
     PersistentStateInventory, PersistentStateRecord, PersistentStateRoot, PersistentStateType,
@@ -100,30 +104,115 @@ fn configured_roots_from_environment() -> Vec<PersistentStateRoot> {
 }
 
 pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
-    ui.heading("Saves & States");
-    ui.label("See which saves are portable, which states are tied to an emulator, and which storage needs care.");
-    ui.label("Browsing is read-only. EmuWiz does not copy, restore or delete anything here.");
-
-    ui.horizontal_wrapped(|ui| {
-        if ui.button("Refresh save locations").clicked() && !app.saves_states.loading {
-            app.start_saves_inventory();
-        }
-        if ui.button("Open PS1/PS2 Save Vault").clicked() {
-            app.go(Route::Section(Section::Emulators));
-        }
-        if app.saves_states.loading {
-            ui.spinner();
-            ui.label("Checking save locations…");
-        }
+    let loading = app.saves_states.loading;
+    let has_inventory = app.saves_states.inventory.is_some();
+    let counts = app.saves_states.inventory.as_ref().map(|inventory| {
+        [
+            inventory
+                .records
+                .iter()
+                .filter(|record| record.state_type == PersistentStateType::NativeSave)
+                .count(),
+            inventory
+                .records
+                .iter()
+                .filter(|record| record.state_type == PersistentStateType::MemoryCard)
+                .count(),
+            inventory
+                .records
+                .iter()
+                .filter(|record| record.state_type == PersistentStateType::SaveState)
+                .count(),
+        ]
     });
+    let mut refresh = false;
+    page_hero(
+        ui,
+        checkpoint_motif,
+        "Saves & States",
+        "Your progress, preserved safely.",
+        Some((
+            if loading {
+                "Inspecting save locations"
+            } else {
+                "Read-only inspection"
+            },
+            if loading {
+                StatusTone::Active
+            } else {
+                StatusTone::Info
+            },
+        )),
+        Some("Checkpoints stay yours. Inspection never changes them."),
+        |ui| {
+            let lines = if let Some([saves, cards, states]) = counts {
+                vec![
+                    "CHECKPOINT INDEX".to_string(),
+                    format!("SAVES   {saves:>3}"),
+                    format!("CARDS   {cards:>3}"),
+                    format!("STATES  {states:>3}"),
+                ]
+            } else {
+                vec![
+                    "CHECKPOINT INDEX".to_string(),
+                    "WAITING FOR INSPECTION".to_string(),
+                ]
+            };
+            crate::ui::components::signal_panel(
+                ui,
+                egui::vec2(180.0, 86.0),
+                &lines,
+                |painter, rect| {
+                    painter.line_segment(
+                        [
+                            egui::pos2(rect.left(), rect.center().y),
+                            egui::pos2(rect.right(), rect.center().y),
+                        ],
+                        egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.35)),
+                    );
+                },
+            );
+        },
+        |ui| {
+            if ui
+                .add(
+                    egui::Button::new(if has_inventory {
+                        "Refresh save locations"
+                    } else {
+                        "Inspect save locations"
+                    })
+                    .fill(theme::PRIMARY_ACTION)
+                    .min_size(egui::vec2(190.0, 40.0)),
+                )
+                .clicked()
+            {
+                refresh = true;
+            }
+            if ui.button("Open PS1/PS2 Save Vault").clicked() {
+                app.go(Route::Section(Section::Emulators));
+            }
+        },
+    );
+    if refresh && !app.saves_states.loading {
+        app.start_saves_inventory();
+    }
 
     if let Some(error) = &app.saves_states.error {
         ui.colored_label(egui::Color32::YELLOW, error);
     }
 
     let Some(inventory) = app.saves_states.inventory.as_ref() else {
-        if !app.saves_states.loading {
-            ui.label("No save inventory has been loaded yet.");
+        if !app.saves_states.loading
+            && empty_state(
+                ui,
+                &mut app.imagery,
+                EmptyArt::Glyph("cartridge"),
+                "No saves checked yet",
+                "EmuWiz is ready to look for game saves, memory cards and savestates in your configured emulator locations. Inspection never changes them.",
+                Some("Refresh save locations"),
+            )
+        {
+            app.start_saves_inventory();
         }
         return;
     };
@@ -161,19 +250,27 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         })
         .collect();
     if records.is_empty() {
-        ui.label(if inventory.roots_inspected == 0 {
+        let detail = if inventory.roots_inspected == 0 {
             "Set up an emulator before EmuWiz can find its saves."
         } else if !inventory.warnings.is_empty() {
             "Your configured save location is unavailable or needs review."
         } else {
-            "No saves or savestates were found in the configured emulator locations."
-        });
+            "EmuWiz looks for game saves, memory cards and savestates in the configured emulator locations. None were found yet; inspection never changes them."
+        };
+        empty_state(
+            ui,
+            &mut app.imagery,
+            EmptyArt::Glyph("cartridge"),
+            "No saves found yet",
+            detail,
+            None,
+        );
     }
     egui::ScrollArea::vertical()
         .id_salt("v2_saves_states_records")
         .show(ui, |ui| {
             for record in records {
-                record_card(ui, record);
+                record_card(ui, record, &mut app.imagery);
             }
         });
     for warning in &inventory.warnings {
@@ -189,23 +286,36 @@ fn summary(ui: &mut egui::Ui, inventory: &PersistentStateInventory) {
             .filter(|r| r.state_type == kind)
             .count()
     };
-    ui.horizontal_wrapped(|ui| {
-        ui.label(format!(
-            "{} game saves",
-            count(PersistentStateType::NativeSave)
-        ));
-        ui.label(format!(
-            "{} memory cards",
-            count(PersistentStateType::MemoryCard)
-        ));
-        ui.label(format!(
-            "{} savestates",
-            count(PersistentStateType::SaveState)
-        ));
-        ui.label(format!(
-            "{} system storage",
-            count(PersistentStateType::NandOrVirtualDisk)
-        ));
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            for (label, value, detail) in [
+                (
+                    "Game saves",
+                    count(PersistentStateType::NativeSave),
+                    "portable progress",
+                ),
+                (
+                    "Memory cards",
+                    count(PersistentStateType::MemoryCard),
+                    "shared save storage",
+                ),
+                (
+                    "Savestates",
+                    count(PersistentStateType::SaveState),
+                    "emulator checkpoints",
+                ),
+                (
+                    "System storage",
+                    count(PersistentStateType::NandOrVirtualDisk),
+                    "accounts and installed data",
+                ),
+            ] {
+                ui.vertical(|ui| {
+                    ui.strong(format!("{value} {label}"));
+                    ui.label(egui::RichText::new(detail).color(theme::muted(ui)).small());
+                });
+            }
+        });
     });
 }
 
@@ -247,12 +357,35 @@ fn record_matches(record: &PersistentStateRecord, search: &str) -> bool {
         })
 }
 
-fn record_card(ui: &mut egui::Ui, record: &PersistentStateRecord) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+fn record_card(
+    ui: &mut egui::Ui,
+    record: &PersistentStateRecord,
+    imagery: &mut super::imagery::Imagery,
+) {
+    let tone = if !record.warnings.is_empty()
+        || matches!(
+            record.portability_class,
+            PortabilityClass::NeedsReview | PortabilityClass::DoNotTouch
+        ) {
+        StatusTone::Warning
+    } else {
+        StatusTone::Success
+    };
+    egui::Frame::new()
+        .fill(theme::CARD_SURFACE)
+        .stroke(theme::border(ui))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
+        .show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
-            ui.strong(state_type_label(record.state_type));
-            ui.label(record.emulator.as_str());
-            ui.label(portability_label(record.portability_class));
+            if let Some(platform) = emulator_platform_artwork(record.emulator) {
+                imagery.platform_icon(ui, platform, 38.0);
+            }
+            ui.vertical(|ui| {
+                ui.strong(state_type_label(record.state_type));
+                ui.label(record.emulator.as_str());
+            });
+            status_badge(ui, portability_label(record.portability_class), tone);
         });
         ui.label(match record.state_type {
             PersistentStateType::NativeSave => "Usually contains your game progress.",
@@ -264,9 +397,18 @@ fn record_card(ui: &mut egui::Ui, record: &PersistentStateRecord) {
             PersistentStateType::Unknown => "EmuWiz could not safely classify this state.",
         });
         if !record.game_identity.is_empty() {
-            ui.label(format!("Matched evidence: {}", record.game_identity.iter().filter_map(|i| i.value.as_deref()).collect::<Vec<_>>().join(", ")));
+            ui.add_space(theme::SPACE_XS);
+            ui.label(egui::RichText::new("Game identity").strong());
+            ui.label(
+                record
+                    .game_identity
+                    .iter()
+                    .filter_map(|i| i.value.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
         } else if matches!(record.state_type, PersistentStateType::NativeSave | PersistentStateType::SaveState) {
-            ui.label("Needs review · EmuWiz cannot prove which game owns this state.");
+            ui.label(egui::RichText::new("Needs review · game ownership is not confirmed.").color(theme::WARNING));
         }
         ui.collapsing("Advanced details", |ui| {
             ui.label(format!("Path: {}", record.path.display()));
@@ -277,6 +419,64 @@ fn record_card(ui: &mut egui::Ui, record: &PersistentStateRecord) {
             for warning in &record.warnings { ui.label(warning); }
         });
     });
+}
+
+fn emulator_platform_artwork(emulator: StateEmulator) -> Option<&'static str> {
+    match emulator {
+        StateEmulator::DuckStation => Some("PSX"),
+        StateEmulator::Pcsx2 => Some("PS2"),
+        StateEmulator::Ppsspp => Some("PSP"),
+        StateEmulator::Dolphin => Some("GameCube"),
+        StateEmulator::Rpcs3 => Some("PS3"),
+        StateEmulator::RetroArch
+        | StateEmulator::Flycast
+        | StateEmulator::Mame
+        | StateEmulator::Hatari
+        | StateEmulator::FsUae
+        | StateEmulator::Xemu
+        | StateEmulator::Xenia
+        | StateEmulator::Cemu
+        | StateEmulator::Vita3k
+        | StateEmulator::Unknown => None,
+    }
+}
+
+fn checkpoint_motif(ui: &mut egui::Ui, size: egui::Vec2) {
+    let rect = egui::Rect::from_min_size(ui.min_rect().min, size).shrink(10.0);
+    let painter = ui.painter();
+    let card = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 5.0, rect.top()),
+        egui::pos2(rect.right() - 2.0, rect.bottom() - 4.0),
+    );
+    painter.rect_filled(card, 6.0, theme::RAISED_SURFACE);
+    painter.rect_stroke(
+        card,
+        6.0,
+        egui::Stroke::new(1.5_f32, theme::TEAL.gamma_multiply(0.8)),
+        egui::StrokeKind::Inside,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(card.left() + 8.0, card.top() + 9.0),
+            egui::pos2(card.right() - 8.0, card.top() + 16.0),
+        ),
+        2.0,
+        theme::TEAL.gamma_multiply(0.7),
+    );
+    for index in 0..3 {
+        painter.circle_filled(
+            egui::pos2(
+                card.left() + 13.0 + index as f32 * 12.0,
+                card.bottom() - 12.0,
+            ),
+            2.5,
+            if index == 1 {
+                theme::AMBER
+            } else {
+                theme::SECONDARY_TEXT
+            },
+        );
+    }
 }
 
 fn state_type_label(value: PersistentStateType) -> &'static str {

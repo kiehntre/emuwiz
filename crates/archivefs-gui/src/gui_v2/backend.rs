@@ -4,6 +4,7 @@ use super::{
         Detail, DuplicateGroup, DuplicateMember, DuplicateReport, Filter, Game, Library,
         SharedLibrary,
     },
+    problems::ProblemSummary,
     routes::{Route, Section},
 };
 use crate::playing_library_page::PlayingLibraryPageState;
@@ -40,6 +41,10 @@ pub(super) enum Command {
         library: SharedLibrary,
         filter: Filter,
         generation: u64,
+    },
+    BuildProblemSummary {
+        library: SharedLibrary,
+        duplicates: Option<DuplicateReport>,
     },
     Detail {
         game: Box<Game>,
@@ -103,6 +108,7 @@ pub(super) enum Payload {
         indices: Vec<usize>,
         generation: u64,
     },
+    ProblemSummary(Arc<ProblemSummary>),
     Detail {
         detail: Detail,
         generation: u64,
@@ -245,6 +251,12 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             indices: library.filter(&filter),
             generation,
         }),
+        Command::BuildProblemSummary {
+            library,
+            duplicates,
+        } => Ok(Payload::ProblemSummary(Arc::new(
+            ProblemSummary::from_library(&library, duplicates.as_ref()),
+        ))),
         Command::Detail { game, generation } => Ok(Payload::Detail {
             detail: load_detail(&game)?,
             generation,

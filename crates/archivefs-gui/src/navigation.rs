@@ -1,4 +1,4 @@
-//! Existing route keys and tab projections. `primary` presents seven task
+//! Existing route keys and tab projections. `primary` presents eight task
 //! destinations without replacing page dispatch or feature-owned state.
 //! The legacy route catalogues remain available to advanced tools and
 //! reachability tests; they are not the rendered primary sidebar.
@@ -500,7 +500,7 @@ pub(crate) fn navigation_destination_selected(current: MainView, candidate: Main
         current == candidate
     }
 }
-/// The seven task destinations are the only primary sidebar rows.
+/// The eight task destinations are the only primary sidebar rows.
 pub(crate) fn show_primary_navigation(
     ui: &mut egui::Ui,
     current: MainView,

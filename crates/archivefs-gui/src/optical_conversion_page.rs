@@ -13,6 +13,7 @@ use crate::ArchiveFsApp;
 use crate::optical_conversion_page;
 use crate::selected_evidence_page;
 use crate::ui::{components as widgets, theme};
+use crate::zip_converter_page::ZipConverterPageState;
 use archivefs_core::psp_reversible_shrink::{
     PspShrinkInspection, PspShrinkResult, PspShrinkTrust, convert_psp_iso_to_cso, inspect_psp_iso,
 };
@@ -194,6 +195,7 @@ pub(crate) struct OpticalConversionPageState {
     hero_load_attempted: bool,
     hero_preview_scroll: bool,
     psp_shrink: PspShrinkPageState,
+    zip_converter: ZipConverterPageState,
 }
 
 #[derive(Default)]
@@ -302,6 +304,7 @@ impl Default for OpticalConversionPageState {
             hero_load_attempted: false,
             hero_preview_scroll: false,
             psp_shrink: PspShrinkPageState::default(),
+            zip_converter: ZipConverterPageState::default(),
         }
     }
 }
@@ -880,6 +883,10 @@ pub(crate) fn show_optical_conversion_page(
     });
     ui.add_space(theme::SPACE_SM);
     show_psp_shrink_card(ui, &mut state.psp_shrink);
+    ui.add_space(theme::SECTION_GAP);
+    widgets::card(ui, |ui| {
+        crate::zip_converter_page::show(ui, &mut state.zip_converter);
+    });
     ui.add_space(theme::SECTION_GAP);
 
     if state.candidates.is_empty() && !state.scanned {

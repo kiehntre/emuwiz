@@ -330,6 +330,7 @@ mod platform_source_actions;
 pub(crate) mod ready_to_play_page;
 pub(crate) mod rpcs3_ordinary_mod_page;
 pub(crate) mod storage_health_page;
+pub(crate) mod zip_converter_page;
 use platform_source_actions::*;
 pub(crate) mod playing_library_page;
 pub(crate) mod problems_repair_page;
