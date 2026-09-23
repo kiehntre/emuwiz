@@ -1603,13 +1603,14 @@ impl ArchiveFsApp {
                 profile_id: profile.profile_id.clone(),
             })
             .collect();
-        let plan = archivefs_core::launch::build_launch_plan(
+        let mut plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
             &standalone_profiles,
             retroarch_environment,
             &remembered,
         );
+        launch_readiness_page::apply_mame_strict_preflight(&mut plan);
         LaunchReadinessInput::Plan {
             plan,
             retroarch: match &self.emulator_readiness.retroarch_profiles {

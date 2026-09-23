@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::dat::dependency::SetDependencyReport;
+use crate::dat::dependency::{
+    DependencyKind, DependencyOutcome, DependencyRequirement, DependencyTarget, SetDependencyReport,
+};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
 use crate::dat::parsers::mame_listxml::parse_mame_listxml;
@@ -139,15 +141,15 @@ pub fn launch_resolution_for_join(
     {
         return None;
     }
+    // Storage completeness and dependency readiness are deliberately
+    // separate. Extras do not make required content absent, and a missing
+    // dependency must not manufacture a second MameSetIncomplete blocker.
     let complete = evidence.members.iter().all(|member| {
         !matches!(
             member.kind,
-            MemberEvidenceKind::Missing | MemberEvidenceKind::Extra
+            MemberEvidenceKind::Missing | MemberEvidenceKind::Unknown
         )
-    }) && evidence
-        .dependencies
-        .iter()
-        .all(|dependency| dependency.present);
+    });
     let state = if complete {
         SetState::Complete
     } else {
@@ -204,21 +206,38 @@ pub fn launch_resolution_for_join(
         disks_required: Vec::new(),
         disks_verified: Vec::new(),
         disks_parent_required: Vec::new(),
-        dependencies: SetDependencyReport {
-            state: if evidence.dependencies.is_empty() {
-                crate::dat::dependency::DependencyState::NotApplicable
-            } else if evidence
+        dependencies: SetDependencyReport::from_requirements(
+            evidence
                 .dependencies
                 .iter()
-                .all(|dependency| dependency.present)
-            {
-                crate::dat::dependency::DependencyState::Satisfied
-            } else {
-                crate::dat::dependency::DependencyState::Missing
-            },
-            requirements: Vec::new(),
-        },
+                .map(dependency_requirement)
+                .collect(),
+        ),
     })
+}
+
+fn dependency_requirement(dependency: &ArcadeDependencyEdge) -> DependencyRequirement {
+    let kind = match dependency.kind.as_str() {
+        "ParentSet" => Some(DependencyKind::ParentSet),
+        "RomSource" => Some(DependencyKind::RomSource),
+        "Device" => Some(DependencyKind::Device),
+        "Bios" => Some(DependencyKind::Bios),
+        _ => None,
+    };
+    DependencyRequirement {
+        // An unknown persisted edge is never accepted. RomSource is used only
+        // as the nearest display category; Unsupported keeps it fail-closed.
+        kind: kind.unwrap_or(DependencyKind::RomSource),
+        target: DependencyTarget::Set {
+            name: dependency.target.clone(),
+        },
+        outcome: match (kind, dependency.present) {
+            (None, _) => DependencyOutcome::Unsupported,
+            (Some(_), true) => DependencyOutcome::Satisfied,
+            (Some(_), false) => DependencyOutcome::Missing,
+        },
+        via_member: None,
+    }
 }
 
 /// Converts an authoritative MAME join into the catalogue's trusted identity
@@ -527,14 +546,26 @@ fn join_one_indexed(
         dependencies.push(ArcadeDependencyEdge {
             kind: "ParentSet".into(),
             target: parent.into(),
-            present: by_name.contains_key(parent) && dirs.contains_key(parent),
+            // cloneof is lineage. It requires a unique catalogue parent, but
+            // does not by itself require a separate parent payload.
+            present: by_name.contains_key(parent),
         });
     }
     if let Some(source) = game.rom_of.as_deref() {
         dependencies.push(ArcadeDependencyEdge {
             kind: "RomSource".into(),
             target: source.into(),
-            present: dirs.contains_key(source),
+            // A split/merged provider is required only for declarations not
+            // already present in the clone. `member_evidence` performs the
+            // exact named-member lookup in that provider.
+            present: game.roms.iter().all(|rom| {
+                rom.merge.is_none()
+                    || present.contains(&rom.name)
+                    || rom
+                        .merge
+                        .as_deref()
+                        .is_some_and(|member| provider_has_member_name(source, member, dirs))
+            }),
         });
     }
     for device in &game.device_refs {
@@ -542,8 +573,10 @@ fn join_one_indexed(
             dependencies.push(ArcadeDependencyEdge {
                 kind: "Device".into(),
                 target: name.into(),
-                present: by_name.get(name).is_some_and(|g| flag(&g.is_device))
-                    && dirs.contains_key(name),
+                present: by_name.get(name).is_some_and(|device| {
+                    flag(&device.is_device)
+                        && (device_has_no_external_payload(device) || dirs.contains_key(name))
+                }),
             });
         }
     }
@@ -595,6 +628,22 @@ fn join_one_indexed(
         dat_path: dat.path.to_string_lossy().into_owned(),
         audited_at: audited_at.to_string(),
     }
+}
+
+/// MAME device declarations such as `i486` describe compiled emulator
+/// hardware and legitimately carry no separate ROM payload. Such a device is
+/// satisfied by the unambiguous `isdevice="yes"` DAT node itself. Devices
+/// declaring any storage or transitive relationship retain the conservative
+/// requirement for a collection entry.
+fn device_has_no_external_payload(device: &DatGameEntry) -> bool {
+    device.roms.is_empty()
+        && device.disks.is_empty()
+        && device.device_refs.is_empty()
+        && device.samples.is_empty()
+        && device.sample_of.is_none()
+        && device.rom_of.is_none()
+        && device.clone_of.is_none()
+        && !device.unsupported_structure
 }
 
 fn member_evidence(
@@ -823,6 +872,103 @@ mod tests {
                 .members
                 .iter()
                 .any(|m| m.name == "extra.bin" && m.kind == MemberEvidenceKind::Extra)
+        );
+    }
+
+    #[test]
+    fn payloadless_mame_device_is_satisfied_without_a_fake_rom_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = game("blackbd");
+        parent.roms.push(DatRomEntry {
+            name: "bios.002".into(),
+            ..Default::default()
+        });
+        let mut i486 = game("i486");
+        i486.is_device = Some("yes".into());
+        i486.runnable = Some("no".into());
+        let mut clone = game("blackbdb");
+        clone.clone_of = Some("blackbd".into());
+        clone.rom_of = Some("blackbd".into());
+        clone
+            .device_refs
+            .push(crate::dat::model::DatDeviceRefEntry {
+                name: Some("i486".into()),
+            });
+        clone.roms.push(DatRomEntry {
+            name: "bios.002".into(),
+            merge: Some("bios.002".into()),
+            ..Default::default()
+        });
+        clone.roms.push(DatRomEntry {
+            name: "ru_04b.img".into(),
+            ..Default::default()
+        });
+        let verified = dat(vec![parent, clone, i486]);
+        let clone_set = set(
+            root.path(),
+            "blackbdb",
+            &["bios.002", "ru_04b.img", "notes.txt"],
+        );
+        let mut by_name = BTreeMap::new();
+        for game in &verified.parsed.games {
+            by_name.insert(game.name.as_str(), game);
+        }
+        // Deliberately no blackbd or i486 directory: all clone bytes are
+        // local, cloneof is lineage, and i486 declares no ROM payload.
+        let mut dirs = BTreeMap::new();
+        dirs.insert("blackbdb", &clone_set);
+        let evidence = join_one(&verified, &clone_set, &by_name, &dirs, "test");
+        assert!(evidence.dependencies.iter().all(|edge| edge.present));
+        let resolution = launch_resolution_for_join(&evidence, &clone_set.path).unwrap();
+        assert_eq!(resolution.state, SetState::Complete);
+        assert_eq!(
+            resolution.dependencies.state,
+            crate::dat::dependency::DependencyState::Satisfied
+        );
+        assert!(resolution.members_optional.is_empty());
+    }
+
+    #[test]
+    fn missing_payload_device_blocks_dependency_without_faking_set_incomplete() {
+        let root = tempfile::tempdir().unwrap();
+        let mut payload_device = game("payloaddev");
+        payload_device.is_device = Some("yes".into());
+        payload_device.runnable = Some("no".into());
+        payload_device.roms.push(DatRomEntry {
+            name: "device.bin".into(),
+            ..Default::default()
+        });
+        let mut host = game("host");
+        host.roms.push(DatRomEntry {
+            name: "host.bin".into(),
+            ..Default::default()
+        });
+        host.device_refs.push(crate::dat::model::DatDeviceRefEntry {
+            name: Some("payloaddev".into()),
+        });
+        let verified = dat(vec![payload_device, host]);
+        let host_set = set(root.path(), "host", &["host.bin"]);
+        let mut by_name = BTreeMap::new();
+        for game in &verified.parsed.games {
+            by_name.insert(game.name.as_str(), game);
+        }
+        let mut dirs = BTreeMap::new();
+        dirs.insert("host", &host_set);
+        let evidence = join_one(&verified, &host_set, &by_name, &dirs, "test");
+        let resolution = launch_resolution_for_join(&evidence, &host_set.path).unwrap();
+        assert_eq!(resolution.state, SetState::Complete);
+        assert_eq!(
+            resolution.dependencies.state,
+            crate::dat::dependency::DependencyState::Missing
+        );
+        let blocked = resolution.dependencies.blocking().collect::<Vec<_>>();
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].kind, DependencyKind::Device);
+        assert_eq!(
+            blocked[0].target,
+            DependencyTarget::Set {
+                name: "payloaddev".into()
+            }
         );
     }
 

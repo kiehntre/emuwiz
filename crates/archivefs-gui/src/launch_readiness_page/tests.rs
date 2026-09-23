@@ -653,6 +653,33 @@ fn standalone_candidate_for(
 }
 
 #[test]
+fn strict_mame_blocker_replaces_false_ready_with_plain_attention_state() {
+    let candidate = standalone_candidate_for("mame", LaunchReadiness::Ready);
+    let mut plan = plan_with(vec![candidate]);
+    plan.platform_id = Some("Arcade".into());
+    plan.game_key = Some("blackbdb".into());
+    block_mame_candidate(
+        &mut plan,
+        0,
+        vec![LaunchBlocker::new(
+            LaunchBlockerKind::MameDependencyBlocked,
+            "MAME dependencies need attention: device i486 (Missing)",
+        )],
+    );
+
+    assert_eq!(plan.candidates[0].readiness, LaunchReadiness::Blocked);
+    assert_eq!(plan.summary.ready, 0);
+    assert_eq!(plan.summary.blocked, 1);
+    let output = render(&plan_input(plan));
+    assert!(rendered_text_contains(&output, "Needs attention"));
+    assert!(rendered_text_contains(
+        &output,
+        "MAME cannot launch this set yet."
+    ));
+    assert!(rendered_text_contains(&output, "device i486 (Missing)"));
+}
+
+#[test]
 fn a_ready_standalone_beside_a_ready_retroarch_core_never_silently_picks_either() {
     // Both eligible, nothing distinguishes them: the planner left both
     // `Undetermined` with a multiple-eligible warning. The Play button must

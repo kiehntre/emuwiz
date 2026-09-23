@@ -69,7 +69,7 @@ use archivefs_core::launch::{
     MameLaunchRequest, PCSX2_SUPPORTED_PLATFORM_ID, Pcsx2LaunchExecutionError,
     Pcsx2LaunchExitReport, Pcsx2LaunchPreflightErrorKind, Pcsx2LaunchRequest,
     Pcsx2LaunchSpawnError, RetroArchLaunchRequest, preflight_and_launch_dolphin,
-    preflight_and_launch_pcsx2, preflight_and_launch_retroarch,
+    preflight_and_launch_pcsx2, preflight_and_launch_retroarch, preflight_mame_launch,
 };
 use archivefs_core::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinLocalProfileDiscovery, Pcsx2ProfileDiscovery,
@@ -2242,7 +2242,7 @@ fn standalone_launch_request(
     let LaunchTarget::Standalone {
         adapter_id,
         profile_id,
-        profile_path,
+        profile_path: _,
     } = &candidate.target
     else {
         return None;
@@ -2250,31 +2250,9 @@ fn standalone_launch_request(
     let platform = plan.platform_id.clone()?;
     let game_key = plan.game_key.clone()?;
     match *adapter_id {
-        "mame" => {
-            let executable = profile_path.clone()?;
-            let set_name = path.file_name()?.to_string_lossy().into_owned();
-            let database_path = archivefs_core::default_database_path().ok()?;
-            let database = archivefs_core::Database::open_read_only(database_path).ok()?;
-            let evidence = database
-                .mame_arcade_join_for_dat(archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256)
-                .ok()?;
-            let evidence = evidence
-                .iter()
-                .find(|evidence| evidence.logical_set_name == set_name)?;
-            let resolution =
-                archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(evidence, &path)?;
-            Some(StandaloneLaunchRequest::Mame(MameLaunchRequest {
-                identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
-                    platform_id: platform,
-                    game_key,
-                }),
-                set_resolutions: vec![resolution],
-                expected_executable: executable,
-                selected_content: path,
-                expected_content_identity: None,
-                rom_search_path_configured: false,
-            }))
-        }
+        "mame" => mame_launch_request(plan, candidate)
+            .ok()
+            .map(StandaloneLaunchRequest::Mame),
         "duckstation" => {
             let context = duckstation?;
             let serial = context.verified_ps1_serial.clone()?;
@@ -2396,6 +2374,161 @@ fn standalone_launch_request(
         }
         _ => None,
     }
+}
+
+fn mame_launch_request(
+    plan: &LaunchPlan,
+    candidate: &LaunchCandidate,
+) -> Result<MameLaunchRequest, LaunchBlocker> {
+    let path = candidate.content.resolved_path.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::MameSetVerdictUnavailable,
+            "the trusted MAME logical-set path is unavailable",
+        )
+    })?;
+    let LaunchTarget::Standalone {
+        adapter_id,
+        profile_path,
+        ..
+    } = &candidate.target
+    else {
+        return Err(mame_blocker(
+            LaunchBlockerKind::MameEmulatorUnavailable,
+            "the MAME launch target is unavailable",
+        ));
+    };
+    if *adapter_id != "mame" {
+        return Err(mame_blocker(
+            LaunchBlockerKind::MameEmulatorUnavailable,
+            "the selected launch target is not MAME",
+        ));
+    }
+    let executable = profile_path.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::MameEmulatorUnavailable,
+            "no exact MAME executable is selected",
+        )
+    })?;
+    let platform_id = plan.platform_id.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::IdentityUnresolved,
+            "the Arcade platform identity is unresolved",
+        )
+    })?;
+    let game_key = plan.game_key.clone().ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::IdentityUnresolved,
+            "the MAME logical-set identity is unresolved",
+        )
+    })?;
+    let database_path = archivefs_core::default_database_path().map_err(|error| {
+        mame_blocker(
+            LaunchBlockerKind::MameSetVerdictUnavailable,
+            format!("the MAME audit database path is unavailable: {error}"),
+        )
+    })?;
+    let database = archivefs_core::Database::open_read_only(database_path).map_err(|error| {
+        mame_blocker(
+            LaunchBlockerKind::MameSetVerdictUnavailable,
+            format!("the MAME audit database cannot be read: {error}"),
+        )
+    })?;
+    let evidence = database
+        .mame_arcade_join_for_archive_path(
+            archivefs_core::dat::mame_arcade_join::MAME_0174_SHA256,
+            &path,
+        )
+        .map_err(|error| {
+            mame_blocker(
+                LaunchBlockerKind::MameSetVerdictUnavailable,
+                format!("the exact MAME audit evidence cannot be read: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            mame_blocker(
+                LaunchBlockerKind::MameSetVerdictUnavailable,
+                "no current exact-path MAME audit evidence is available",
+            )
+        })?;
+    let resolution =
+        archivefs_core::dat::mame_arcade_join::launch_resolution_for_join(&evidence, &path)
+            .ok_or_else(|| {
+                mame_blocker(
+                    LaunchBlockerKind::MameSetVerdictUnavailable,
+                    "the persisted MAME audit does not authorize this logical set",
+                )
+            })?;
+    let rom_search_path = path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        mame_blocker(
+            LaunchBlockerKind::MameSearchPathUnconfigured,
+            "the trusted MAME collection root cannot be determined",
+        )
+    })?;
+    Ok(MameLaunchRequest {
+        identity: CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id,
+            game_key,
+        }),
+        set_resolutions: vec![resolution],
+        expected_executable: executable,
+        selected_content: path,
+        expected_content_identity: None,
+        rom_search_path,
+    })
+}
+
+fn mame_blocker(kind: LaunchBlockerKind, detail: impl Into<String>) -> LaunchBlocker {
+    LaunchBlocker::new(kind, detail)
+}
+
+/// Reconcile generic launch planning with the actual strict MAME preflight.
+/// A MAME card can only remain Ready when the same typed request used by the
+/// launch button passes core preflight now.
+pub(crate) fn apply_mame_strict_preflight(plan: &mut LaunchPlan) {
+    for index in 0..plan.candidates.len() {
+        let snapshot = plan.candidates[index].clone();
+        let is_mame = matches!(
+            &snapshot.target,
+            LaunchTarget::Standalone {
+                adapter_id: "mame",
+                ..
+            }
+        );
+        if !is_mame {
+            continue;
+        }
+        let blockers = match mame_launch_request(plan, &snapshot) {
+            Ok(request) => preflight_mame_launch(&request)
+                .err()
+                .map(|error| error.blockers)
+                .unwrap_or_default(),
+            Err(blocker) => vec![blocker],
+        };
+        if !blockers.is_empty() {
+            block_mame_candidate(plan, index, blockers);
+        }
+    }
+}
+
+fn block_mame_candidate(plan: &mut LaunchPlan, index: usize, blockers: Vec<LaunchBlocker>) {
+    let candidate = &mut plan.candidates[index];
+    candidate.readiness = LaunchReadiness::Blocked;
+    candidate.blockers = blockers;
+    plan.summary.ready = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Ready)
+        .count();
+    plan.summary.ready_with_warnings = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::ReadyWithWarnings)
+        .count();
+    plan.summary.blocked = plan
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.readiness == LaunchReadiness::Blocked)
+        .count();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2664,7 +2797,19 @@ fn show_candidate(
     let mut open_doctor = false;
     widgets::card(ui, |ui| {
         let (name, profile) = target_labels(&candidate.target);
-        let (readiness_label, readiness_tone) = readiness_label_and_tone(candidate.readiness);
+        let strict_mame_blocked = candidate.readiness == LaunchReadiness::Blocked
+            && matches!(
+                &candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "mame",
+                    ..
+                }
+            );
+        let (readiness_label, readiness_tone) = if strict_mame_blocked {
+            ("Needs attention", widgets::StatusTone::Blocked)
+        } else {
+            readiness_label_and_tone(candidate.readiness)
+        };
 
         ui.horizontal_wrapped(|ui| {
             widgets::status_badge(ui, readiness_label, readiness_tone);
@@ -2675,6 +2820,9 @@ fn show_candidate(
                 .small()
                 .color(theme::muted(ui)),
         );
+        if strict_mame_blocked {
+            ui.label("MAME cannot launch this set yet.");
+        }
         ui.label(
             egui::RichText::new(format!(
                 "Preference: {}",
