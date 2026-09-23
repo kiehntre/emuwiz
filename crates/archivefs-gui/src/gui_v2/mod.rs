@@ -224,6 +224,8 @@ pub(super) struct App {
     verification_job: Option<u64>,
     duplicate_report: Option<DuplicateReport>,
     duplicate_job: Option<u64>,
+    problem_summary: Option<Arc<problems::ProblemSummary>>,
+    problem_summary_job: Option<u64>,
     duplicate_ignored: std::collections::HashSet<String>,
     problem_selected: Option<String>,
     repair_preview: Option<DuplicateRepairPreview>,
@@ -287,6 +289,8 @@ impl App {
             verification_job: None,
             duplicate_report: None,
             duplicate_job: None,
+            problem_summary: None,
+            problem_summary_job: None,
             duplicate_ignored: std::collections::HashSet::new(),
             problem_selected: None,
             repair_preview: None,
@@ -513,6 +517,24 @@ impl App {
             id,
             Command::ScanDuplicates {
                 games: self.library.games.clone(),
+            },
+        );
+    }
+    fn start_problem_summary(&mut self) {
+        if self.problem_summary_job.is_some() {
+            return;
+        }
+        let id = self.activity.queue(
+            "Checking saved problem evidence",
+            Route::Section(Section::Problems),
+            false,
+        );
+        self.problem_summary_job = Some(id);
+        self.send(
+            id,
+            Command::BuildProblemSummary {
+                library: self.library.clone(),
+                duplicates: self.duplicate_report.clone(),
             },
         );
     }
@@ -1065,6 +1087,9 @@ impl App {
                     if self.load_job == Some(id) {
                         self.load_job = None;
                     }
+                    if self.problem_summary_job == Some(id) {
+                        self.problem_summary_job = None;
+                    }
                     match outcome {
                         Ok(payload) => {
                             self.activity.finish(
@@ -1114,6 +1139,7 @@ impl App {
                                         });
                                     }
                                     self.library = library;
+                                    self.problem_summary = None;
                                     self.loaded = true;
                                     self.indices.clear();
                                     self.change_filter();
@@ -1151,6 +1177,11 @@ impl App {
                                 Payload::Duplicates(report) => {
                                     self.duplicate_job = None;
                                     self.duplicate_report = Some(report);
+                                    self.problem_summary = None;
+                                }
+                                Payload::ProblemSummary(summary) => {
+                                    self.problem_summary_job = None;
+                                    self.problem_summary = Some(summary);
                                 }
                                 Payload::DuplicatePreview(preview) => {
                                     self.repair_preview = Some(*preview);

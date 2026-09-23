@@ -4,6 +4,7 @@ use super::{
     artwork::{Artwork, Picture},
     library::{DuplicateGroup, DuplicateMember, DuplicateReport, Game, media_kind_label},
     media_sources::{Kind, MediaIndex, Source},
+    problems::ProblemSummary,
 };
 use archivefs_core::PersistedArchive;
 use archivefs_core::game_identity::{
@@ -67,6 +68,8 @@ fn fixture(context: &egui::Context) -> App {
         verification_job: None,
         duplicate_report: None,
         duplicate_job: None,
+        problem_summary: None,
+        problem_summary_job: None,
         duplicate_ignored: std::collections::HashSet::new(),
         problem_selected: None,
         repair_preview: None,
@@ -1143,6 +1146,7 @@ fn gui_v2_problems_page_is_native_and_plain_english() {
         "Missing Pac-Man",
         Some("Arcade"),
     )]));
+    app.problem_summary = Some(Arc::new(ProblemSummary::from_library(&app.library, None)));
     app.problem_selected = Some("missing-1".into());
     app.router.current = Route::Section(Section::Problems);
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
@@ -1157,6 +1161,27 @@ fn gui_v2_problems_page_is_native_and_plain_english() {
         !strings
             .iter()
             .any(|value| value.contains("existing interface"))
+    );
+}
+
+#[test]
+fn gui_v2_problems_page_has_loading_and_healthy_states() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Problems);
+    let loading = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        loading
+            .iter()
+            .any(|value| value.contains("Checking the saved catalogue evidence"))
+    );
+
+    app.problem_summary = Some(Arc::new(ProblemSummary::default()));
+    let healthy = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        healthy
+            .iter()
+            .any(|value| value.contains("Nothing currently needs your attention."))
     );
 }
 
@@ -2959,6 +2984,18 @@ fn gui_v2_real_catalogue_timings() {
         eprintln!(
             "PERF {label} Games(all): first={first:.2}ms artwork-settle={settled:.0}ms/{frames}f steady={after:.2}ms {}",
             states(&app)
+        );
+        app.go(Route::Section(Section::Problems));
+        let first = tick(&context, &mut app, size).as_secs_f64() * 1000.0;
+        let (settled, frames) = settle(&context, &mut app, size, |app| {
+            app.problem_summary.is_some() && app.problem_summary_job.is_none()
+        });
+        let (_, after) = steady(&context, &mut app, size);
+        eprintln!(
+            "PERF {label} Problems: first={first:.2}ms full={settled:.0}ms/{frames}f warm={after:.2}ms findings={}",
+            app.problem_summary
+                .as_ref()
+                .map_or(0, |summary| summary.problems.len())
         );
     }
     let size = [1920.0, 1080.0];

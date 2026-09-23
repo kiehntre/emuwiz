@@ -5,6 +5,7 @@
 //! the saved library state and the existing exact-duplicate proof.
 
 use super::library::{DuplicateReport, Game, Library};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
 pub(super) enum Severity {
@@ -23,7 +24,7 @@ impl Severity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
 pub(super) enum Category {
     Files,
     Duplicates,
@@ -59,6 +60,7 @@ pub(super) struct Problem {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProblemSummary {
     pub(super) problems: Vec<Problem>,
+    pub(super) category_indices: BTreeMap<Category, Vec<usize>>,
 }
 
 impl ProblemSummary {
@@ -101,7 +103,17 @@ impl ProblemSummary {
                 &b.id,
             ))
         });
-        Self { problems }
+        let mut category_indices = BTreeMap::new();
+        for (index, problem) in problems.iter().enumerate() {
+            category_indices
+                .entry(problem.category)
+                .or_insert_with(Vec::new)
+                .push(index);
+        }
+        Self {
+            problems,
+            category_indices,
+        }
     }
 
     pub(super) fn count(&self, severity: Severity) -> usize {

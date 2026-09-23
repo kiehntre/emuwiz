@@ -8,10 +8,13 @@ use super::{
     library::{DuplicateGroup, Game, media_kind_label},
     media_sources::{Kind, Source},
     onboarding,
-    problems::{Category, Problem, ProblemSummary, Severity},
+    problems::{Category, Problem, Severity},
     routes::{HOME_TASKS, Route, SECTIONS, Section},
 };
-use crate::ui::{components::mrwiz_tip, theme};
+use crate::ui::{
+    components::{StatusTone, mrwiz_tip, page_hero},
+    theme,
+};
 use archivefs_core::dat::rename_apply::model::TransactionState;
 use eframe::egui::{self, Color32, RichText};
 
@@ -931,9 +934,47 @@ impl App {
     }
 
     fn problems(&mut self, ui: &mut egui::Ui) {
-        let summary = ProblemSummary::from_library(&self.library, self.duplicate_report.as_ref());
+        if self.problem_summary.is_none() {
+            self.start_problem_summary();
+        }
         egui::ScrollArea::vertical().id_salt("v2_problems").show(ui, |ui| {
-            ui.label("Here is what needs attention, with the safest next action. Opening this page is read-only.");
+            let summary = self.problem_summary.clone();
+            let (attention, warnings) = summary
+                .as_ref()
+                .map(|summary| (summary.count(Severity::NeedsAttention), summary.count(Severity::Warning)))
+                .unwrap_or_default();
+            let mascot = self.imagery.mascot(ui.ctx()).cloned();
+            page_hero(
+                ui,
+                move |ui, size| {
+                    let rect = ui.min_rect().shrink(5.0);
+                    ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
+                    ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.65)), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(rect.shrink(10.0), 3.0, egui::Stroke::new(1.0_f32, theme::PRIMARY_ACTION.gamma_multiply(0.65)), egui::StrokeKind::Inside);
+                    if let Some(mascot) = mascot {
+                        ui.put(rect.shrink(7.0), egui::Image::new(&mascot).fit_to_exact_size(size - egui::vec2(14.0, 14.0)));
+                    }
+                },
+                "Problems & Repair",
+                "Read-only diagnostic bench for the things EmuWiz can prove.",
+                Some((if summary.is_none() { "Checking saved evidence" } else if attention > 0 { "Needs attention" } else { "Ready for review" }, if summary.is_none() { StatusTone::Active } else if attention > 0 { StatusTone::Warning } else { StatusTone::Success })),
+                Some("Read-only first. Preview any supported repair before it changes a file."),
+                |ui| {
+                    ui.label("CRT STATUS");
+                    ui.monospace(if summary.is_none() { "CHECKING..." } else { "SIGNAL STABLE" });
+                    if summary.is_some() { ui.label(format!("{attention} attention · {warnings} review")); }
+                },
+                |ui| {
+                    if summary.is_some()
+                        && primary(ui, "Review problems")
+                        && self.problem_selected.is_none()
+                    {
+                        self.problem_selected = summary
+                            .as_ref()
+                            .and_then(|summary| summary.problems.first().map(|problem| problem.id.clone()));
+                    }
+                },
+            );
             if let Some(message) = self.repair_result.clone() {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.strong("Repair complete");
@@ -944,10 +985,16 @@ impl App {
             if let Some(preview) = self.repair_preview.clone() {
                 self.duplicate_preview(ui, &preview);
             }
+            let Some(summary) = summary else {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label("Checking the saved catalogue evidence… You can keep browsing while this finishes."); });
+                });
+                return;
+            };
             if summary.problems.is_empty() {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.heading("Nothing needs attention right now.");
-                    ui.label("EmuWiz has no saved file, identity, or duplicate findings to show.");
+                    ui.heading("Nothing currently needs your attention.");
+                    ui.label("No saved file, identity, or duplicate findings are currently recorded.");
                     if primary(ui, "Verify my games") { self.go(Route::Section(Section::Check)); }
                 });
                 return;
@@ -957,21 +1004,26 @@ impl App {
                 ui.label(format!("Warnings: {}", summary.count(Severity::Warning)));
                 ui.label(format!("Informational: {}", summary.count(Severity::Informational)));
             });
-            if primary(ui, "Review problems") && self.problem_selected.is_none() {
-                self.problem_selected = summary.problems.first().map(|problem| problem.id.clone());
-            }
             if self.duplicate_report.is_none() {
                 ui.label("Exact duplicates have not been checked in this session.");
                 if ui.button("Check for exact duplicates").clicked() { self.start_duplicate_scan(); }
             }
             let mut selected = self.problem_selected.clone();
             for category in [Category::Files, Category::Duplicates, Category::Identity, Category::Verification] {
-                let entries: Vec<_> = summary.problems.iter().filter(|problem| problem.category == category).collect();
-                if entries.is_empty() { continue; }
+                let Some(entries) = summary.category_indices.get(&category) else { continue; };
                 ui.separator();
                 ui.heading(category.label());
-                for problem in entries {
-                    let is_selected = selected.as_deref() == Some(problem.id.as_str());
+                if let Some(&problem_index) = entries
+                    .iter()
+                    .find(|&&index| selected.as_deref() == Some(summary.problems[index].id.as_str()))
+                {
+                    egui::Frame::group(ui.style())
+                        .show(ui, |ui| self.problem_details(ui, &summary.problems[problem_index]));
+                }
+                egui::ScrollArea::vertical().id_salt(("v2_problem_rows", category)).show_rows(ui, 82.0, entries.len(), |ui, range| {
+                    for index in range {
+                        let problem = &summary.problems[entries[index]];
+                        let is_selected = selected.as_deref() == Some(problem.id.as_str());
                     egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal_wrapped(|ui| {
@@ -992,9 +1044,9 @@ impl App {
                         {
                             self.start_duplicate_preview(index);
                         }
-                        if is_selected { self.problem_details(ui, problem); }
                     });
-                }
+                    }
+                });
             }
             self.problem_selected = selected;
         });
