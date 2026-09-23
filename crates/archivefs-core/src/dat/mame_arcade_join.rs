@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -128,6 +130,288 @@ pub struct ArcadeJoinReport {
     pub evidence: Vec<ArcadeJoinEvidence>,
     pub summary: ArcadeJoinSummary,
     pub layout_estimate: String,
+}
+
+pub const MAME_MEMBER_EVIDENCE_VERSION: &str = "mame-member-evidence-v1";
+
+/// One physical member observation.  A row is actionable only when its
+/// checksum matched exactly one DAT member; filenames alone never make it so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MamePhysicalMemberEvidence {
+    pub logical_set_name: String,
+    pub source_path: PathBuf,
+    pub current_name: String,
+    pub file_size: u64,
+    pub modified_time_ns: i64,
+    pub sha1: Option<String>,
+    pub crc32: Option<String>,
+    pub target_set_name: Option<String>,
+    pub target_member_name: Option<String>,
+    pub actionable: bool,
+    pub failure_reason: Option<String>,
+    pub evidence_version: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MameEvidenceRefreshReport {
+    pub root: PathBuf,
+    pub requested_set: Option<String>,
+    pub sets_considered: usize,
+    pub sets_published: usize,
+    pub members_seen: usize,
+    pub members_reused: usize,
+    pub members_rehashed: usize,
+    pub members_actionable: usize,
+    pub members_failed: usize,
+    pub cache_rows_published: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MameEvidenceCacheStatus {
+    pub dat_source_id: String,
+    pub physical_rows: usize,
+    pub actionable_rows: usize,
+    pub logical_sets: usize,
+}
+
+/// Refreshes only the requested set's parent/clone family, or all extracted
+/// sets below `root` when no set is supplied.  Each set is hashed and
+/// published independently, so an interrupted full refresh resumes from its
+/// already-published cache rows.
+pub fn refresh_mame_member_evidence(
+    database: &mut crate::Database,
+    dat: &VerifiedMameDat,
+    root: &Path,
+    requested_set: Option<&str>,
+) -> Result<MameEvidenceRefreshReport, String> {
+    let discovered = discover_extracted_sets(root)
+        .map_err(|error| format!("discover MAME extracted sets: {error}"))?;
+    let selected = requested_set.map(|name| {
+        let family_parent = dat
+            .parsed
+            .games
+            .iter()
+            .find(|game| game.name == name)
+            .and_then(|game| game.clone_of.as_deref())
+            .unwrap_or(name);
+        dat.parsed
+            .games
+            .iter()
+            .filter(|game| {
+                game.name == family_parent
+                    || game.clone_of.as_deref() == Some(family_parent)
+            })
+            .map(|game| game.name.clone())
+            .collect::<BTreeSet<_>>()
+    });
+    let dat_source_id = format!("mame-arcade:{}:{}", dat.version, dat.sha256);
+    let mut report = MameEvidenceRefreshReport {
+        root: root.to_path_buf(),
+        requested_set: requested_set.map(str::to_owned),
+        ..Default::default()
+    };
+
+    for set in discovered.sets.iter().filter(|set| {
+        selected
+            .as_ref()
+            .is_none_or(|names| names.contains(&set.set_name))
+    }) {
+        report.sets_considered += 1;
+        let Some(game) = dat
+            .parsed
+            .games
+            .iter()
+            .find(|game| game.name == set.set_name)
+        else {
+            continue;
+        };
+        if dat
+            .parsed
+            .games
+            .iter()
+            .filter(|candidate| candidate.name == game.name)
+            .count()
+            != 1
+        {
+            continue;
+        }
+        let observed_at = now_utc_string();
+        let mut rows = Vec::with_capacity(set.members.len());
+        for path in &set.members {
+            report.members_seen += 1;
+            let current_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_file() => metadata,
+                Ok(_) => {
+                    report.members_failed += 1;
+                    rows.push(failed_member_evidence(
+                        &set.set_name,
+                        path,
+                        &current_name,
+                        "not a regular file",
+                        &observed_at,
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    report.members_failed += 1;
+                    rows.push(failed_member_evidence(
+                        &set.set_name,
+                        path,
+                        &current_name,
+                        &format!("stat failed: {error}"),
+                        &observed_at,
+                    ));
+                    continue;
+                }
+            };
+            let file_size = metadata.len();
+            #[cfg(unix)]
+            let modified_time_ns = metadata.mtime().saturating_mul(1_000_000_000)
+                .saturating_add(metadata.mtime_nsec());
+            #[cfg(not(unix))]
+            let modified_time_ns = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX))
+                .unwrap_or(0);
+            if let Some(cached) = database
+                .cached_mame_member_evidence(
+                    &dat_source_id,
+                    path,
+                    &current_name,
+                    file_size,
+                    modified_time_ns,
+                )
+                .map_err(|error| error.to_string())?
+            {
+                report.members_reused += 1;
+                if cached.actionable {
+                    report.members_actionable += 1;
+                } else {
+                    report.members_failed += 1;
+                }
+                rows.push(cached);
+                continue;
+            }
+            report.members_rehashed += 1;
+            let (sha1, crc32) = match hash_member(path) {
+                Ok(hashes) => hashes,
+                Err(error) => {
+                    report.members_failed += 1;
+                    rows.push(failed_member_evidence(
+                        &set.set_name,
+                        path,
+                        &current_name,
+                        &format!("read failed: {error}"),
+                        &observed_at,
+                    ));
+                    continue;
+                }
+            };
+            let matches = game
+                .roms
+                .iter()
+                .filter(|rom| !is_optional(rom) && !is_nodump(rom))
+                .filter(|rom| {
+                    rom.sha1
+                        .as_deref()
+                        .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha1))
+                        || rom
+                            .crc32
+                            .as_deref()
+                            .is_some_and(|expected| expected.eq_ignore_ascii_case(&crc32))
+                })
+                .collect::<Vec<_>>();
+            let (target_member_name, failure_reason) = if matches.len() == 1 {
+                (Some(matches[0].name.clone()), None)
+            } else if matches.is_empty() {
+                (None, Some("checksum does not match this DAT set".to_string()))
+            } else {
+                (None, Some("checksum is ambiguous within this DAT set".to_string()))
+            };
+            let actionable = target_member_name.is_some();
+            if actionable {
+                report.members_actionable += 1;
+            } else {
+                report.members_failed += 1;
+            }
+            rows.push(MamePhysicalMemberEvidence {
+                logical_set_name: set.set_name.clone(),
+                source_path: path.clone(),
+                current_name,
+                file_size,
+                modified_time_ns,
+                sha1: Some(sha1),
+                crc32: Some(crc32),
+                target_set_name: actionable.then(|| game.name.clone()),
+                target_member_name,
+                actionable,
+                failure_reason,
+                evidence_version: MAME_MEMBER_EVIDENCE_VERSION.to_string(),
+                observed_at: observed_at.clone(),
+            });
+        }
+        report.cache_rows_published += database
+            .persist_mame_member_evidence_set(&dat_source_id, &set.set_name, &rows)
+            .map_err(|error| error.to_string())?;
+        report.sets_published += 1;
+    }
+    Ok(report)
+}
+
+fn failed_member_evidence(
+    set_name: &str,
+    path: &Path,
+    current_name: &str,
+    reason: &str,
+    observed_at: &str,
+) -> MamePhysicalMemberEvidence {
+    let metadata = fs::symlink_metadata(path).ok();
+    MamePhysicalMemberEvidence {
+        logical_set_name: set_name.to_string(),
+        source_path: path.to_path_buf(),
+        current_name: current_name.to_string(),
+        file_size: metadata.as_ref().map_or(0, fs::Metadata::len),
+        modified_time_ns: 0,
+        sha1: None,
+        crc32: None,
+        target_set_name: None,
+        target_member_name: None,
+        actionable: false,
+        failure_reason: Some(reason.to_string()),
+        evidence_version: MAME_MEMBER_EVIDENCE_VERSION.to_string(),
+        observed_at: observed_at.to_string(),
+    }
+}
+
+fn hash_member(path: &Path) -> std::io::Result<(String, String)> {
+    let mut file = fs::File::open(path)?;
+    let mut sha1 = sha1::Sha1::new();
+    let mut crc32 = crate::identity_source::hashing::Crc32::new();
+    let mut buffer = [0_u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        sha1.update(&buffer[..read]);
+        crc32.update(&buffer[..read]);
+    }
+    Ok((encode_hex(&sha1.finalize()), crc32.finish_hex()))
+}
+
+fn now_utc_string() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    format!("unix:{seconds}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -876,6 +1160,72 @@ mod tests {
             sha256: MAME_0174_SHA256.into(),
             version: MAME_0174_VERSION.into(),
         }
+    }
+
+    #[test]
+    fn member_evidence_cache_reuses_exact_fingerprint_and_rejects_stale_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let member_path = directory.path().join("wrong-name.bin");
+        fs::write(&member_path, b"cache fixture").unwrap();
+        let metadata = fs::metadata(&member_path).unwrap();
+        #[cfg(unix)]
+        let modified_time_ns = metadata.mtime().saturating_mul(1_000_000_000)
+            .saturating_add(i64::from(metadata.mtime_nsec()));
+        #[cfg(not(unix))]
+        let modified_time_ns = 0;
+        let row = MamePhysicalMemberEvidence {
+            logical_set_name: "fixture".into(),
+            source_path: member_path.clone(),
+            current_name: "wrong-name.bin".into(),
+            file_size: metadata.len(),
+            modified_time_ns,
+            sha1: Some("a".repeat(40)),
+            crc32: Some("b".repeat(8)),
+            target_set_name: Some("fixture".into()),
+            target_member_name: Some("correct.bin".into()),
+            actionable: true,
+            failure_reason: None,
+            evidence_version: MAME_MEMBER_EVIDENCE_VERSION.into(),
+            observed_at: "test".into(),
+        };
+        let mut database = crate::Database::open_or_create(directory.path().join("library.sqlite3"))
+            .unwrap();
+        database
+            .persist_mame_member_evidence_set("mame-arcade:test", "fixture", &[row])
+            .unwrap();
+        assert!(database
+            .cached_mame_member_evidence(
+                "mame-arcade:test",
+                &member_path,
+                "wrong-name.bin",
+                metadata.len(),
+                modified_time_ns,
+            )
+            .unwrap()
+            .is_some());
+        assert!(database
+            .cached_mame_member_evidence(
+                "mame-arcade:test",
+                &member_path,
+                "wrong-name.bin",
+                metadata.len() + 1,
+                modified_time_ns,
+            )
+            .unwrap()
+            .is_none());
+        database
+            .persist_mame_member_evidence_set("mame-arcade:test", "fixture", &[])
+            .unwrap();
+        assert!(database
+            .cached_mame_member_evidence(
+                "mame-arcade:test",
+                &member_path,
+                "wrong-name.bin",
+                metadata.len(),
+                modified_time_ns,
+            )
+            .unwrap()
+            .is_none());
     }
 
     fn set(root: &Path, name: &str, members: &[&str]) -> ArcadeSetDirectory {

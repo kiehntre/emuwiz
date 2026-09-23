@@ -217,6 +217,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "persist trusted catalogue-wide media topology evidence with producer and source provenance",
         sql: include_str!("migrations/0020_media_topology_evidence.sql"),
     },
+    Migration {
+        version: 21,
+        description: "persist versioned physical MAME member evidence with source fingerprints for incremental refresh",
+        sql: include_str!("migrations/0021_mame_member_evidence.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -418,6 +423,184 @@ impl Database {
     /// identity update, so 256 sets means no more than 768 row writes in one
     /// transaction.
     pub const MAME_ARCADE_AUDIT_BATCH_SIZE: usize = 256;
+
+    /// Returns a previously published physical-member observation only when
+    /// its exact source path/name and cheap filesystem fingerprint still
+    /// match.  Hashes remain authoritative; size/mtime only decide whether a
+    /// hash may be reused.
+    pub fn cached_mame_member_evidence(
+        &self,
+        dat_source_id: &str,
+        source_path: &Path,
+        current_name: &str,
+        file_size: u64,
+        modified_time_ns: i64,
+    ) -> Result<Option<crate::dat::mame_arcade_join::MamePhysicalMemberEvidence>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT logical_set_name, source_path, current_name, file_size,
+                        modified_time_ns, sha1, crc32, target_set_name,
+                        target_member_name, actionable, failure_reason,
+                        evidence_version, observed_at
+                 FROM mame_member_evidence
+                 WHERE dat_source_id = ?1 AND source_path = ?2 AND current_name = ?3
+                   AND file_size = ?4 AND modified_time_ns = ?5
+                   AND evidence_version = ?6
+                 LIMIT 1",
+                params![
+                    dat_source_id,
+                    source_path.as_os_str().as_bytes(),
+                    current_name,
+                    i64::try_from(file_size).unwrap_or(i64::MAX),
+                    modified_time_ns,
+                    crate::dat::mame_arcade_join::MAME_MEMBER_EVIDENCE_VERSION,
+                ],
+                |row| {
+                    Ok(crate::dat::mame_arcade_join::MamePhysicalMemberEvidence {
+                        logical_set_name: row.get(0)?,
+                        source_path: PathBuf::from(OsString::from_vec(row.get::<_, Vec<u8>>(1)?)),
+                        current_name: row.get(2)?,
+                        file_size: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                        modified_time_ns: row.get(4)?,
+                        sha1: row.get(5)?,
+                        crc32: row.get(6)?,
+                        target_set_name: row.get(7)?,
+                        target_member_name: row.get(8)?,
+                        actionable: row.get::<_, i64>(9)? != 0,
+                        failure_reason: row.get(10)?,
+                        evidence_version: row.get(11)?,
+                        observed_at: row.get(12)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read MAME member evidence cache", error))?;
+        Ok(row)
+    }
+
+    pub fn mame_member_evidence_status(
+        &self,
+        dat_sha256: &str,
+    ) -> Result<crate::dat::mame_arcade_join::MameEvidenceCacheStatus> {
+        let dat_source_id = format!("mame-arcade:0.174:{dat_sha256}");
+        let (physical_rows, actionable_rows, logical_sets): (i64, i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(actionable), 0), COUNT(DISTINCT logical_set_name)
+                 FROM mame_member_evidence WHERE dat_source_id = ?1",
+                params![dat_source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| db_error("failed to read MAME member evidence status", error))?;
+        Ok(crate::dat::mame_arcade_join::MameEvidenceCacheStatus {
+            dat_source_id,
+            physical_rows: usize::try_from(physical_rows).unwrap_or(0),
+            actionable_rows: usize::try_from(actionable_rows).unwrap_or(0),
+            logical_sets: usize::try_from(logical_sets).unwrap_or(0),
+        })
+    }
+
+    /// Publishes one fully refreshed logical set atomically.  This is the
+    /// resumability boundary: completed sets survive an interrupted refresh,
+    /// while the set currently being rebuilt is never partially replaced.
+    pub fn persist_mame_member_evidence_set(
+        &mut self,
+        dat_source_id: &str,
+        logical_set_name: &str,
+        rows: &[crate::dat::mame_arcade_join::MamePhysicalMemberEvidence],
+    ) -> Result<usize> {
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|error| db_error("failed to start MAME member evidence transaction", error))?;
+        tx.execute(
+            "DELETE FROM mame_member_evidence
+             WHERE dat_source_id = ?1 AND logical_set_name = ?2",
+            params![dat_source_id, logical_set_name],
+        )
+        .map_err(|error| db_error("failed to retire stale MAME member evidence", error))?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO mame_member_evidence
+                 (dat_source_id, logical_set_name, source_path, current_name,
+                  file_size, modified_time_ns, sha1, crc32, target_set_name,
+                  target_member_name, actionable, failure_reason,
+                  evidence_version, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    dat_source_id,
+                    row.logical_set_name,
+                    row.source_path.as_os_str().as_bytes(),
+                    row.current_name,
+                    i64::try_from(row.file_size).unwrap_or(i64::MAX),
+                    row.modified_time_ns,
+                    row.sha1,
+                    row.crc32,
+                    row.target_set_name,
+                    row.target_member_name,
+                    i64::from(row.actionable),
+                    row.failure_reason,
+                    row.evidence_version,
+                    row.observed_at,
+                ],
+            )
+            .map_err(|error| db_error("failed to persist MAME member evidence", error))?;
+        }
+
+        let metadata = tx
+            .query_row(
+                "SELECT metadata_json FROM dat_expected_entries
+                 WHERE dat_source_id = ?1 AND canonical_identity = ?2",
+                params![dat_source_id, logical_set_name],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read MAME join for member evidence", error))?;
+        if let Some(Some(encoded)) = metadata {
+            let mut evidence: crate::dat::mame_arcade_join::ArcadeJoinEvidence =
+                serde_json::from_slice(&encoded).map_err(|error| {
+                    ArchiveFsError::Database(format!(
+                        "stored MAME join evidence is malformed for {logical_set_name}: {error}"
+                    ))
+                })?;
+            for member in &mut evidence.members {
+                let matches = rows
+                    .iter()
+                    .filter(|row| {
+                        row.actionable
+                            && row.target_set_name.as_deref() == Some(logical_set_name)
+                            && row.target_member_name.as_deref() == Some(member.name.as_str())
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() == 1 {
+                    let row = matches[0];
+                    member.kind = crate::dat::mame_arcade_join::MemberEvidenceKind::Present;
+                    member.current_name = Some(row.current_name.clone());
+                    member.observed_sha1 = row.sha1.clone();
+                    member.observed_crc32 = row.crc32.clone();
+                } else {
+                    member.current_name = None;
+                    member.observed_sha1 = None;
+                    member.observed_crc32 = None;
+                }
+            }
+            let encoded = serde_json::to_vec(&evidence).map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "failed to encode MAME join evidence for {logical_set_name}: {error}"
+                ))
+            })?;
+            tx.execute(
+                "UPDATE dat_expected_entries SET metadata_json = ?3, updated_at = ?4
+                 WHERE dat_source_id = ?1 AND canonical_identity = ?2",
+                params![dat_source_id, logical_set_name, encoded, now_utc_string()],
+            )
+            .map_err(|error| db_error("failed to update MAME join member evidence", error))?;
+        }
+        tx.commit()
+            .map_err(|error| db_error("failed to publish MAME member evidence", error))?;
+        Ok(rows.len())
+    }
 
     /// Replaces one complete, version-bound Arcade join in the existing DAT
     /// audit tables. The source id includes the exact DAT digest, so a later

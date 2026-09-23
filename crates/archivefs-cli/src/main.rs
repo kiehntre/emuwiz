@@ -85,6 +85,7 @@ mod cheat_source;
 mod cheatbase;
 mod dat;
 mod mame_normalise;
+mod mame_evidence;
 mod media_set;
 mod platform_artwork;
 mod repair;
@@ -425,6 +426,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "mame-normalise" => {
             mame_normalise::run(args.collect())?;
+        }
+        "mame" => {
+            mame_evidence::run(args.collect())?;
         }
         "repair" => {
             repair::run(args.collect())?;

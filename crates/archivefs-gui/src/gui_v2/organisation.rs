@@ -21,7 +21,11 @@ use archivefs_core::dat::mame_normalizer::{
     MameCollectionMode, MameFixStatus, MameNormalisationPlan, detect_mame_collection_mode,
     plan_mame_normalisation,
 };
+use archivefs_core::dat::mame_arcade_join::{
+    load_verified_mame_0174, refresh_mame_member_evidence,
+};
 use archivefs_core::dat::parsers::parse_dat_file;
+use archivefs_core::{Database, default_database_path};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum OrganisationView {
@@ -41,6 +45,7 @@ pub(super) struct OrganisationState {
     pub(super) mame_mode: MameCollectionMode,
     pub(super) mame_detected_mode: Option<MameCollectionMode>,
     pub(super) mame_message: Option<String>,
+    pub(super) mame_evidence_set: String,
 }
 
 #[derive(Clone, Copy)]
@@ -308,6 +313,30 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             "Not sure: EmuWiz can inspect a small sample and suggest a layout."
         }
     });
+    ui.separator();
+    ui.heading("Refresh physical member evidence");
+    ui.label("Read-only: hashes extracted directory members and stores reusable, versioned location evidence. It never changes ROM files.");
+    ui.horizontal(|ui| {
+        ui.label("Optional set/family:");
+        ui.text_edit_singleline(&mut state.mame_evidence_set);
+    });
+    ui.horizontal_wrapped(|ui| {
+        let family = state.mame_evidence_set.trim().to_string();
+        if ui.button("Refresh selected family").clicked() {
+            if family.is_empty() {
+                state.mame_message = Some("Enter a MAME set name first; this action scans only that parent/clone family.".into());
+            } else {
+                refresh_mame_evidence(state, Some(family));
+            }
+        }
+        if ui.button("Refresh selected folder").clicked() {
+            refresh_mame_evidence(state, None);
+        }
+        if ui.button("Refresh whole Arcade library").clicked() {
+            state.mame_message = Some("This may inspect the full configured Arcade source. Confirm the selected folder and start deliberately.".into());
+            refresh_mame_evidence(state, None);
+        }
+    });
     if ui.button("Preview fixes").clicked() {
         match (&state.mame_root, &state.mame_dat) {
             (Some(root), Some(dat_path)) => match parse_dat_file(dat_path, DatLimits::default()) {
@@ -386,6 +415,41 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                 }
             }
         });
+    }
+}
+
+fn refresh_mame_evidence(state: &mut OrganisationState, requested_set: Option<String>) {
+    let (Some(root), Some(dat_path)) = (&state.mame_root, &state.mame_dat) else {
+        state.mame_message = Some("Choose both the MAME folder and its verified DAT first.".into());
+        return;
+    };
+    match load_verified_mame_0174(dat_path) {
+        Ok(dat) => match default_database_path()
+            .and_then(|path| Database::open_or_create(&path))
+        {
+            Ok(mut database) => match refresh_mame_member_evidence(
+                &mut database,
+                &dat,
+                root,
+                requested_set.as_deref(),
+            ) {
+                Ok(report) => {
+                    state.mame_plan = None;
+                    state.mame_message = Some(format!(
+                        "Evidence refresh complete: {} sets, {} members; {} reused, {} rehashed, {} actionable, {} failed. ROM files were not changed.",
+                        report.sets_published,
+                        report.members_seen,
+                        report.members_reused,
+                        report.members_rehashed,
+                        report.members_actionable,
+                        report.members_failed
+                    ));
+                }
+                Err(error) => state.mame_message = Some(format!("Evidence refresh stopped safely: {error}")),
+            },
+            Err(error) => state.mame_message = Some(format!("Could not open the evidence database: {error}")),
+        },
+        Err(error) => state.mame_message = Some(format!("The selected DAT is not the verified MAME 0.174 Arcade DAT: {error}")),
     }
 }
 
