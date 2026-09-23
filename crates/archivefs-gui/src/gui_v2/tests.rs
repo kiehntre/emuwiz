@@ -959,6 +959,75 @@ fn gui_v2_duplicate_badge_keeps_separate_files_visible() {
 }
 
 #[test]
+fn gui_v2_duplicates_empty_state_explains_safe_review() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Duplicates);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Nothing has been compared yet"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Find duplicates"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("never deletes anything"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("not filenames alone"))
+    );
+}
+
+#[test]
+fn gui_v2_duplicates_find_action_keeps_existing_scan_route() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.start_duplicate_scan();
+    assert!(app.duplicate_job.is_some());
+    let job = app.activity.jobs.values().next().expect("scan activity");
+    assert_eq!(job.result, Route::Section(Section::Duplicates));
+}
+
+#[test]
+fn gui_v2_duplicates_readiness_wording_uses_backend_states() {
+    use archivefs_core::repair::GroupQuarantineReadiness;
+
+    assert_eq!(
+        super::pages::duplicate_readiness_label(&GroupQuarantineReadiness::Safe),
+        "Exact duplicate · safe to preview"
+    );
+    assert_eq!(
+        super::pages::duplicate_readiness_label(&GroupQuarantineReadiness::NeedsReview(
+            "choice".into()
+        )),
+        "Review needed · no automatic action"
+    );
+    assert_eq!(
+        super::pages::duplicate_readiness_label(&GroupQuarantineReadiness::Blocked(
+            "blocked".into()
+        )),
+        "Blocked from automatic action"
+    );
+}
+
+#[test]
+fn gui_v2_duplicates_empty_state_fits_narrow_width() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Duplicates);
+    let strings = text(&frame(&context, &mut app, [620.0, 720.0]));
+    assert!(strings.iter().any(|value| value.contains("Duplicates")));
+}
+
+#[test]
 fn gui_v2_verification_result_has_per_game_identity_status() {
     let mut result = VerificationResult {
         platform: "Arcade".into(),

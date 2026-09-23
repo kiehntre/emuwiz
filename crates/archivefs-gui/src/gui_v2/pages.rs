@@ -5,7 +5,7 @@ use super::{
     artwork::Picture,
     backend::Command,
     imagery::{EmptyArt, empty_state},
-    library::{Game, media_kind_label},
+    library::{DuplicateGroup, Game, media_kind_label},
     media_sources::{Kind, Source},
     onboarding,
     problems::{Category, Problem, ProblemSummary, Severity},
@@ -741,6 +741,14 @@ impl App {
     }
 
     fn duplicates(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("v2_duplicates_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.duplicates_content(ui));
+    }
+
+    fn duplicates_content(&mut self, ui: &mut egui::Ui) {
+        self.duplicates_hero(ui);
         mrwiz_tip(
             ui,
             "I found exact copies only when the backend proves their bytes match.",
@@ -751,8 +759,22 @@ impl App {
             if self.duplicate_job.is_some() {
                 ui.spinner();
                 ui.label("Hashing candidate files safely…");
-            } else if primary(ui, "Find exact duplicates") {
-                self.start_duplicate_scan();
+            } else {
+                let clicked = if ui.available_width() < 560.0 {
+                    self.duplicate_narrow_empty_state(ui)
+                } else {
+                    empty_state(
+                        ui,
+                        &mut self.imagery,
+                        EmptyArt::Mascot,
+                        "Nothing has been compared yet",
+                        "Wizzy compares file evidence and verified hashes, not filenames alone. Finding duplicates never deletes anything; results are reviewed before any recoverable quarantine.",
+                        Some("Find duplicates"),
+                    )
+                };
+                if clicked {
+                    self.start_duplicate_scan();
+                }
             }
             return;
         }
@@ -769,6 +791,17 @@ impl App {
             }
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.heading(format!("{} · {} copies", group.kind, group.members.len()));
+                if let Some(readiness) = self.duplicate_readiness(group) {
+                    ui.label(RichText::new(readiness).strong().color(
+                        if readiness.starts_with("Blocked") {
+                            theme::WARNING
+                        } else if readiness.starts_with("Review") {
+                            theme::TEAL
+                        } else {
+                            theme::SUCCESS
+                        },
+                    ));
+                }
                 ui.label(format!("{} bytes · {}", group.size_bytes, group.sha256));
                 for member in &group.members {
                     ui.label(format!("{} · {} · {} bytes", member.title, member.path.display(), member.size_bytes));
@@ -776,11 +809,125 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Keep both").clicked() { self.duplicate_ignored.insert(key.clone()); }
                     if ui.button("Ignore group").clicked() { self.duplicate_ignored.insert(key.clone()); }
-                    if ui.button("Quarantine duplicate").clicked() { self.go(Route::Section(Section::Problems)); }
+                    if self.duplicate_readiness(group).is_none_or(|readiness| readiness.starts_with("Exact duplicate"))
+                        && ui.button("Quarantine duplicate").clicked()
+                    {
+                        self.go(Route::Section(Section::Problems));
+                    }
                 });
-                ui.label("Quarantine is recoverable and must be reviewed in Problems & Repair; there is no delete action here.");
+                ui.label(if self.duplicate_readiness(group).is_some_and(|readiness| readiness.starts_with("Blocked")) {
+                    "This group is blocked from automatic action; review the evidence before deciding what to do."
+                } else {
+                    "Quarantine is recoverable and must be reviewed in Problems & Repair; there is no delete action here."
+                });
             });
         }
+    }
+
+    fn duplicate_readiness(&self, group: &DuplicateGroup) -> Option<&'static str> {
+        self.duplicate_report
+            .as_ref()
+            .and_then(|report| report.exact_groups.get(group.exact_index))
+            .map(|group| &group.readiness)
+            .map(duplicate_readiness_label)
+    }
+
+    fn duplicates_hero(&mut self, ui: &mut egui::Ui) {
+        let wide = ui.available_width() >= 620.0;
+        egui::Frame::new()
+            .fill(theme::CARD_SURFACE)
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                theme::PRIMARY_ACTION.gamma_multiply(0.45),
+            ))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let mascot_side = if wide { 78.0 } else { 58.0 };
+                    let (mascot_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(mascot_side, mascot_side),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(texture) = self.imagery.mascot(ui.ctx()) {
+                        ui.painter().image(
+                            texture.id(),
+                            mascot_rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    ui.add_space(theme::SPACE_MD);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Duplicates")
+                                .size(theme::PAGE_TITLE_SIZE)
+                                .strong(),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Mr Wiz checks the copy in the mirror before anything moves.",
+                            )
+                            .color(theme::muted(ui)),
+                        );
+                    });
+                    if wide {
+                        ui.add_space(theme::SPACE_LG);
+                        let (motif, _) =
+                            ui.allocate_exact_size(egui::vec2(126.0, 66.0), egui::Sense::hover());
+                        let painter = ui.painter();
+                        let left = egui::Rect::from_min_size(
+                            motif.left_top() + egui::vec2(2.0, 11.0),
+                            egui::vec2(48.0, 44.0),
+                        );
+                        let right = egui::Rect::from_min_size(
+                            motif.left_top() + egui::vec2(70.0, 11.0),
+                            egui::vec2(48.0, 44.0),
+                        );
+                        painter.rect_filled(left, 6.0, theme::DEEP_BACKGROUND);
+                        painter.rect_stroke(
+                            left,
+                            6.0,
+                            egui::Stroke::new(2.0_f32, theme::PRIMARY_ACTION),
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.rect_filled(right, 6.0, theme::DEEP_BACKGROUND);
+                        painter.rect_stroke(
+                            right,
+                            6.0,
+                            egui::Stroke::new(2.0_f32, theme::TEAL),
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.line_segment(
+                            [left.center(), right.center()],
+                            egui::Stroke::new(1.5_f32, theme::SECONDARY_TEXT),
+                        );
+                        painter.circle_filled(
+                            left.center(),
+                            8.0,
+                            theme::PRIMARY_ACTION.gamma_multiply(0.7),
+                        );
+                        painter.circle_filled(right.center(), 8.0, theme::TEAL.gamma_multiply(0.7));
+                    }
+                });
+            });
+        ui.add_space(theme::SPACE_SM);
+    }
+
+    fn duplicate_narrow_empty_state(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut clicked = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                if let Some(texture) = self.imagery.mascot(ui.ctx()) {
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(58.0, 58.0)));
+                }
+                ui.heading("Nothing has been compared yet");
+                ui.label("Wizzy compares verified file evidence, not filenames alone.");
+                ui.label("Finding duplicates never deletes anything; review comes first.");
+                clicked = primary(ui, "Find duplicates");
+            });
+        });
+        clicked
     }
 
     fn problems(&mut self, ui: &mut egui::Ui) {
@@ -1555,5 +1702,17 @@ impl App {
                 self.legacy(Section::Settings);
             }
         });
+    }
+}
+
+pub(super) fn duplicate_readiness_label(
+    readiness: &archivefs_core::repair::GroupQuarantineReadiness,
+) -> &'static str {
+    use archivefs_core::repair::GroupQuarantineReadiness;
+
+    match readiness {
+        GroupQuarantineReadiness::Safe => "Exact duplicate · safe to preview",
+        GroupQuarantineReadiness::NeedsReview(_) => "Review needed · no automatic action",
+        GroupQuarantineReadiness::Blocked(_) => "Blocked from automatic action",
     }
 }
