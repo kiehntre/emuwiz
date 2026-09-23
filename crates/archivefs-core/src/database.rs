@@ -8775,7 +8775,10 @@ mod tests {
                     members: vec![ArcadeMemberEvidence {
                         name: format!("{name}.rom"),
                         kind: MemberEvidenceKind::Present,
+                        current_name: Some(format!("{name}.rom")),
                         checksum: Some("fixture".to_string()),
+                        observed_sha1: None,
+                        observed_crc32: None,
                     }],
                     dependencies: if is_clone {
                         vec![ArcadeDependencyEdge {

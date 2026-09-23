@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -52,9 +53,20 @@ pub enum MemberEvidenceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArcadeMemberEvidence {
+    /// DAT target member name.
     pub name: String,
     pub kind: MemberEvidenceKind,
+    /// Exact current member name in the containing set/archive.  This is
+    /// populated only after the bytes have matched the DAT identity.
+    #[serde(default)]
+    pub current_name: Option<String>,
     pub checksum: Option<String>,
+    /// Checksum observed from the current physical member.  It is retained
+    /// separately from `checksum` because the latter is the DAT target.
+    #[serde(default)]
+    pub observed_sha1: Option<String>,
+    #[serde(default)]
+    pub observed_crc32: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,6 +511,7 @@ fn join_one_indexed(
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .collect::<BTreeSet<_>>();
+    let physical = physical_member_evidence(&set.members);
     let expected = game
         .roms
         .iter()
@@ -510,7 +523,7 @@ fn join_one_indexed(
         .collect::<BTreeSet<_>>();
     let mut members = expected
         .iter()
-        .map(|r| member_evidence(r, &present, game, by_name, dirs))
+        .map(|r| member_evidence(r, &present, &physical, game, by_name, dirs))
         .collect::<Vec<_>>();
     for extra in present
         .iter()
@@ -519,7 +532,16 @@ fn join_one_indexed(
         members.push(ArcadeMemberEvidence {
             name: extra.clone(),
             kind: MemberEvidenceKind::Extra,
+            current_name: Some(extra.clone()),
             checksum: None,
+            observed_sha1: physical
+                .iter()
+                .find(|member| member.name == *extra)
+                .map(|member| member.sha1.clone()),
+            observed_crc32: physical
+                .iter()
+                .find(|member| member.name == *extra)
+                .map(|member| member.crc32.clone()),
         });
     }
     let mut dependencies = Vec::new();
@@ -632,16 +654,33 @@ fn device_dependency_present(
 fn member_evidence(
     rom: &DatRomEntry,
     present: &BTreeSet<String>,
+    physical: &[PhysicalMemberEvidence],
     game: &DatGameEntry,
     by_name: &BTreeMap<&str, &DatGameEntry>,
     dirs: &BTreeMap<&str, &ArcadeSetDirectory>,
 ) -> ArcadeMemberEvidence {
     let checksum = rom.sha1.clone().or_else(|| rom.crc32.clone());
+    if let Some(location) = exact_member_location(rom, physical) {
+        return ArcadeMemberEvidence {
+            name: rom.name.clone(),
+            kind: MemberEvidenceKind::Present,
+            current_name: Some(location.name.clone()),
+            checksum,
+            observed_sha1: Some(location.sha1.clone()),
+            observed_crc32: Some(location.crc32.clone()),
+        };
+    }
+    // Keep the old completeness semantics for a filename match whose bytes
+    // cannot be proved.  The absence of `current_name` makes it explicitly
+    // non-actionable to the normaliser; filenames never become identity.
     if present.contains(&rom.name) {
         return ArcadeMemberEvidence {
             name: rom.name.clone(),
             kind: MemberEvidenceKind::Present,
+            current_name: None,
             checksum,
+            observed_sha1: None,
+            observed_crc32: None,
         };
     }
     if let Some(merge) = rom.merge.as_deref()
@@ -650,7 +689,10 @@ fn member_evidence(
         return ArcadeMemberEvidence {
             name: rom.name.clone(),
             kind: MemberEvidenceKind::MergedFromParent,
+            current_name: None,
             checksum,
+            observed_sha1: None,
+            observed_crc32: None,
         };
     }
     if let Some(source) = game.rom_of.as_deref().or(game.clone_of.as_deref())
@@ -659,13 +701,81 @@ fn member_evidence(
         return ArcadeMemberEvidence {
             name: rom.name.clone(),
             kind: MemberEvidenceKind::MergedFromParent,
+            current_name: None,
             checksum,
+            observed_sha1: None,
+            observed_crc32: None,
         };
     }
     ArcadeMemberEvidence {
         name: rom.name.clone(),
         kind: MemberEvidenceKind::Missing,
+        current_name: None,
         checksum,
+        observed_sha1: None,
+        observed_crc32: None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PhysicalMemberEvidence {
+    name: String,
+    sha1: String,
+    crc32: String,
+}
+
+fn physical_member_evidence(paths: &[PathBuf]) -> Vec<PhysicalMemberEvidence> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let mut file = fs::File::open(path).ok()?;
+            let mut sha1 = sha1::Sha1::new();
+            let mut crc32 = crate::identity_source::hashing::Crc32::new();
+            let mut buffer = [0_u8; 256 * 1024];
+            loop {
+                let read = file.read(&mut buffer).ok()?;
+                if read == 0 {
+                    break;
+                }
+                sha1.update(&buffer[..read]);
+                crc32.update(&buffer[..read]);
+            }
+            Some(PhysicalMemberEvidence {
+                name,
+                sha1: encode_hex(&sha1.finalize()),
+                crc32: crc32.finish_hex(),
+            })
+        })
+        .collect()
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn exact_member_location<'a>(
+    rom: &DatRomEntry,
+    physical: &'a [PhysicalMemberEvidence],
+) -> Option<&'a PhysicalMemberEvidence> {
+    let matches = physical
+        .iter()
+        .filter(|member| {
+            (rom.sha1.is_some() || rom.crc32.is_some())
+                && rom
+                    .sha1
+                    .as_deref()
+                    .is_none_or(|expected| expected.eq_ignore_ascii_case(&member.sha1))
+                && rom
+                    .crc32
+                    .as_deref()
+                    .is_none_or(|expected| expected.eq_ignore_ascii_case(&member.crc32))
+        })
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Some(matches[0])
+    } else {
+        None
     }
 }
 
@@ -856,6 +966,56 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "extra.bin" && m.kind == MemberEvidenceKind::Extra)
         );
+    }
+
+    #[test]
+    fn exact_member_location_is_persisted_only_for_unique_checksum_match() {
+        let root = tempfile::tempdir().unwrap();
+        let bytes = b"verified rom bytes";
+        let mut digest = sha1::Sha1::new();
+        digest.update(bytes);
+        let sha1 = encode_hex(&digest.finalize());
+        let mut machine = game("machine");
+        machine.roms.push(DatRomEntry {
+            name: "dat-name.bin".into(),
+            sha1: Some(sha1.clone()),
+            ..Default::default()
+        });
+        let verified = dat(vec![machine]);
+        let set = set(root.path(), "machine", &["wrong-name.bin"]);
+        fs::write(root.path().join("machine").join("wrong-name.bin"), bytes).unwrap();
+        let mut by_name = BTreeMap::new();
+        by_name.insert("machine", &verified.parsed.games[0]);
+        let mut dirs = BTreeMap::new();
+        dirs.insert("machine", &set);
+
+        let evidence = join_one(&verified, &set, &by_name, &dirs, "test");
+        let member = evidence
+            .members
+            .iter()
+            .find(|member| member.name == "dat-name.bin")
+            .unwrap();
+        assert_eq!(member.current_name.as_deref(), Some("wrong-name.bin"));
+        assert_eq!(member.observed_sha1.as_deref(), Some(sha1.as_str()));
+
+        fs::write(root.path().join("machine").join("duplicate.bin"), bytes).unwrap();
+        let duplicate_set = ArcadeSetDirectory {
+            path: set.path.clone(),
+            set_name: set.set_name.clone(),
+            members: vec![
+                root.path().join("machine").join("wrong-name.bin"),
+                root.path().join("machine").join("duplicate.bin"),
+            ],
+        };
+        dirs.insert("machine", &duplicate_set);
+        let evidence = join_one(&verified, &duplicate_set, &by_name, &dirs, "test");
+        let member = evidence
+            .members
+            .iter()
+            .find(|member| member.name == "dat-name.bin")
+            .unwrap();
+        assert!(member.current_name.is_none());
+        assert!(member.observed_sha1.is_none());
     }
 
     #[test]

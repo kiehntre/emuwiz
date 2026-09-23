@@ -451,6 +451,11 @@ pub fn plan_mame_normalisation_from_verified_joins(
         });
     }
     apply_layout_completeness(dat, mode, &mut planned);
+    let split_rebuilds = if mode == MameCollectionMode::Split {
+        plan_split_rebuilds_from_verified_joins(dat, &by_path, &mut planned)
+    } else {
+        Vec::new()
+    };
     let sets = planned
         .into_iter()
         .map(|planned| planned.fix)
@@ -472,6 +477,11 @@ pub fn plan_mame_normalisation_from_verified_joins(
             summary.outer_renames += 1;
         }
     }
+    summary.split_rebuilds = split_rebuilds.len();
+    summary.moved_members = split_rebuilds
+        .iter()
+        .map(|rebuild| rebuild.moved_members)
+        .sum();
     Ok(MameNormalisationPlan {
         root: root.to_path_buf(),
         mode,
@@ -479,9 +489,186 @@ pub fn plan_mame_normalisation_from_verified_joins(
             .first()
             .map(|(_, evidence)| evidence.dat_version.clone()),
         sets,
-        split_rebuilds: Vec::new(),
+        split_rebuilds,
         summary,
     })
+}
+
+/// Uses persisted join metadata as the member-location index. This is the
+/// production fast path: it never hashes the whole library again, and it
+/// refuses to form a rebuild unless every member has one exact DAT checksum
+/// location.
+fn plan_split_rebuilds_from_verified_joins(
+    dat: &ParsedDat,
+    joins: &BTreeMap<PathBuf, &ArcadeJoinEvidence>,
+    planned: &mut [PlannedSet],
+) -> Vec<MameSplitRebuild> {
+    let index = DatIndex::build(dat);
+    let mut rebuilds = Vec::new();
+    let mut used_archives = BTreeSet::new();
+    for clone in dat.games.iter().filter(|game| game.clone_of.is_some()) {
+        let Some(parent_name) = clone.clone_of.as_deref() else {
+            continue;
+        };
+        let Some(parent_game) = dat.games.iter().find(|game| game.name == parent_name) else {
+            continue;
+        };
+        let Some((parent_path, parent_evidence)) = joins
+            .iter()
+            .find(|(_, evidence)| evidence.dat_set_name.as_deref() == Some(parent_name))
+        else {
+            continue;
+        };
+        let Some((clone_path, clone_evidence)) = joins
+            .iter()
+            .find(|(_, evidence)| evidence.dat_set_name.as_deref() == Some(clone.name.as_str()))
+        else {
+            continue;
+        };
+        if !is_zip(parent_path) || !is_zip(clone_path) || parent_path == clone_path {
+            continue;
+        }
+        if used_archives.contains(parent_path) || used_archives.contains(clone_path) {
+            continue;
+        }
+        let Some(mut located) = located_members_from_join(parent_path, parent_evidence, &index)
+        else {
+            continue;
+        };
+        let Some(mut clone_located) = located_members_from_join(clone_path, clone_evidence, &index)
+        else {
+            continue;
+        };
+        located.append(&mut clone_located);
+        if located.is_empty()
+            || located.iter().any(|member| {
+                !dat_rom_for_game(parent_game, &member.rom) && !dat_rom_for_game(clone, &member.rom)
+            })
+        {
+            continue;
+        }
+        let parent_target = parent_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{parent_name}.zip"));
+        let clone_target = clone_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{}.zip", clone.name));
+        if (parent_target.exists() && parent_target != *parent_path && parent_target != *clone_path)
+            || (clone_target.exists()
+                && clone_target != *parent_path
+                && clone_target != *clone_path)
+        {
+            continue;
+        }
+        let Some(parent_members) =
+            desired_split_members(parent_game, clone, &located, &parent_target, false)
+        else {
+            continue;
+        };
+        let Some(clone_members) =
+            desired_split_members(clone, parent_game, &located, &clone_target, true)
+        else {
+            continue;
+        };
+        let moved_members = parent_members
+            .iter()
+            .chain(clone_members.iter())
+            .filter(|member| member.source_path != member.destination_path)
+            .count();
+        if *parent_path == parent_target
+            && *clone_path == clone_target
+            && moved_members == 0
+            && archive_matches(parent_path, &parent_members)
+            && archive_matches(clone_path, &clone_members)
+        {
+            continue;
+        }
+        let Some(parent_position) = planned
+            .iter()
+            .position(|set| set.fix.current_path == *parent_path)
+        else {
+            continue;
+        };
+        let Some(clone_position) = planned
+            .iter()
+            .position(|set| set.fix.current_path == *clone_path)
+        else {
+            continue;
+        };
+        for position in [parent_position, clone_position] {
+            planned[position].fix.status = MameFixStatus::Safe;
+            planned[position].fix.members.clear();
+            planned[position].fix.missing_members.clear();
+            planned[position].fix.reason =
+                Some("safe Split parent/clone rebuild from persisted member locations".into());
+        }
+        used_archives.insert(parent_path.clone());
+        used_archives.insert(clone_path.clone());
+        rebuilds.push(MameSplitRebuild {
+            parent_path: parent_path.clone(),
+            parent_target,
+            clone_path: clone_path.clone(),
+            clone_target,
+            parent_members,
+            clone_members,
+            moved_members,
+        });
+    }
+    rebuilds
+}
+
+fn located_members_from_join(
+    path: &Path,
+    evidence: &ArcadeJoinEvidence,
+    index: &DatIndex,
+) -> Option<Vec<LocatedRom>> {
+    let mut located = Vec::new();
+    for member in evidence
+        .members
+        .iter()
+        .filter(|member| member.kind == MemberEvidenceKind::Present)
+    {
+        let current_name = member.current_name.as_deref()?;
+        let checksum = member.observed_sha1.as_deref()?;
+        let candidates = index.lookup_sha1(checksum).iter().collect::<Vec<_>>();
+        if candidates.is_empty()
+            || candidates
+                .iter()
+                .map(|candidate| candidate.rom_name.as_str())
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 1
+        {
+            return None;
+        }
+        if member.checksum.as_deref().is_none_or(|expected| {
+            !candidates.iter().all(|candidate| {
+                candidate
+                    .checksums
+                    .iter()
+                    .any(|checksum| checksum.value.eq_ignore_ascii_case(expected))
+            })
+        }) {
+            return None;
+        }
+        let mut archive = zip::ZipArchive::new(File::open(path).ok()?).ok()?;
+        let mut source = archive.by_name(current_name).ok()?;
+        let mut bytes = Vec::new();
+        source.read_to_end(&mut bytes).ok()?;
+        let digest = hashes(&bytes);
+        if digest.sha1 != checksum {
+            return None;
+        }
+        located.push(LocatedRom {
+            archive: path.to_path_buf(),
+            current: current_name.to_string(),
+            rom: candidates[0].clone(),
+            sha256: digest.sha256,
+        });
+    }
+    Some(located)
 }
 
 #[derive(Debug, Clone)]
@@ -1446,6 +1633,7 @@ fn rename_directory_members(root: &Path, fixes: &[MameMemberFix]) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dat::mame_arcade_join::ArcadeMemberEvidence;
     use crate::dat::model::{DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource};
     use tempfile::tempdir;
 
@@ -1718,6 +1906,134 @@ mod tests {
         let plan = plan_mame_normalisation(root, &dat, MameCollectionMode::Split).expect("plan");
         assert_eq!(plan.summary.split_rebuilds, 0);
         assert_eq!(plan.summary.safe, 0);
+    }
+
+    fn persisted_join(
+        name: &str,
+        clone_of: Option<&str>,
+        members: &[(&str, &[u8])],
+    ) -> ArcadeJoinEvidence {
+        ArcadeJoinEvidence {
+            logical_set_name: name.into(),
+            dat_set_name: Some(name.into()),
+            class: if clone_of.is_some() {
+                ArcadeJoinClass::CloneSet
+            } else {
+                ArcadeJoinClass::ParentSet
+            },
+            description: None,
+            manufacturer: None,
+            year: None,
+            clone_of: clone_of.map(str::to_owned),
+            rom_of: clone_of.map(str::to_owned),
+            parent_description: None,
+            runnable: Some("yes".into()),
+            mechanical: false,
+            is_bios: false,
+            is_device: false,
+            expected_member_count: members.len(),
+            members: members
+                .iter()
+                .map(|(name, bytes)| ArcadeMemberEvidence {
+                    name: (*name).into(),
+                    kind: MemberEvidenceKind::Present,
+                    current_name: Some((*name).into()),
+                    checksum: Some(hashes(bytes).sha1),
+                    observed_sha1: Some(hashes(bytes).sha1),
+                    observed_crc32: Some(hashes(bytes).crc),
+                })
+                .collect(),
+            dependencies: Vec::new(),
+            launchable_normal_game: true,
+            dat_version: "0.264".into(),
+            dat_sha256: "fixture".into(),
+            dat_path: "fixture.dat".into(),
+            audited_at: "fixture".into(),
+        }
+    }
+
+    #[test]
+    fn persisted_member_locations_feed_the_split_rebuild_planner() {
+        let directory = tempdir().expect("fixture directory");
+        let root = directory.path();
+        write_fixture_zip(
+            &root.join("parent.zip"),
+            &[("wrong_clone.bin", b"clone bytes")],
+        );
+        write_fixture_zip(
+            &root.join("clone.zip"),
+            &[("wrong_shared.bin", b"shared bytes")],
+        );
+        let dat = parent_clone_dat_with_hashes();
+        let joins = vec![
+            (
+                root.join("parent.zip"),
+                persisted_join("parent", None, &[("wrong_clone.bin", b"clone bytes")]),
+            ),
+            (
+                root.join("clone.zip"),
+                persisted_join(
+                    "clone",
+                    Some("parent"),
+                    &[("wrong_shared.bin", b"shared bytes")],
+                ),
+            ),
+        ];
+        let plan = plan_mame_normalisation_from_verified_joins(
+            root,
+            &dat,
+            &joins,
+            MameCollectionMode::Split,
+        )
+        .expect("verified join plan");
+        assert_eq!(plan.summary.split_rebuilds, 1);
+        assert_eq!(plan.summary.moved_members, 2);
+        assert!(
+            plan.split_rebuilds[0]
+                .parent_members
+                .iter()
+                .any(|member| member.correct == "shared.bin")
+        );
+        assert!(
+            plan.split_rebuilds[0]
+                .clone_members
+                .iter()
+                .any(|member| member.correct == "clone.bin")
+        );
+    }
+
+    #[test]
+    fn persisted_member_location_checksum_mismatch_is_not_actionable() {
+        let directory = tempdir().expect("fixture directory");
+        let root = directory.path();
+        write_fixture_zip(
+            &root.join("parent.zip"),
+            &[("wrong_shared.bin", b"shared bytes")],
+        );
+        write_fixture_zip(
+            &root.join("clone.zip"),
+            &[("wrong_clone.bin", b"clone bytes")],
+        );
+        let dat = parent_clone_dat_with_hashes();
+        let mut clone = persisted_join("clone", Some("parent"), &[("clone.bin", b"clone bytes")]);
+        clone.members[0].checksum = Some("0".repeat(40));
+        let joins = vec![
+            (
+                root.join("parent.zip"),
+                persisted_join("parent", None, &[("shared.bin", b"shared bytes")]),
+            ),
+            (root.join("clone.zip"), clone),
+        ];
+
+        let plan = plan_mame_normalisation_from_verified_joins(
+            root,
+            &dat,
+            &joins,
+            MameCollectionMode::Split,
+        )
+        .expect("verified join plan");
+        assert_eq!(plan.summary.split_rebuilds, 0);
+        assert_eq!(plan.summary.moved_members, 0);
     }
 
     #[test]
