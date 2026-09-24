@@ -44,6 +44,9 @@ use crate::n64_header_evidence::parse_n64_header;
 use crate::neogeocd_boot_evidence::{MAX_IPL_TXT_BYTES, parse_ipl_txt};
 use crate::nes_header_evidence::{INES_HEADER_BYTES, InesHeaderFact, parse_ines_header};
 use crate::ngp_header_evidence::{NGP_HEADER_BYTES, NgpSystemFlag, parse_ngp_header};
+use crate::nintendo3ds_retail::{
+    self, ThreeDsEncryption, ThreeDsRetailEvidence, ThreeDsRetailFormat, ThreeDsTitleKind,
+};
 use crate::param_sfo::parse_param_sfo;
 use crate::pcengine_cd_boot_evidence::{
     PCE_CD_IPL_HEADER_BYTES, PCE_CD_IPL_SECTOR_OFFSET, parse_pce_cd_ipl,
@@ -284,6 +287,11 @@ pub enum IdentityKind {
     /// The established PC-FX custom disc-identification hash. It is derived
     /// from PC-FX sector/header/boot content, never from a filename.
     PcfxDiscHash,
+    ThreeDsTitleId,
+    ThreeDsProductCode,
+    ThreeDsEncryption,
+    ThreeDsClassification,
+    ThreeDsPartition,
 }
 
 impl fmt::Display for IdentityKind {
@@ -323,6 +331,11 @@ impl fmt::Display for IdentityKind {
             Self::TapeFormat => "Commodore tape format",
             Self::T64Directory => "T64 directory",
             Self::PcfxDiscHash => "PC-FX disc hash",
+            Self::ThreeDsTitleId => "Nintendo 3DS title ID",
+            Self::ThreeDsProductCode => "Nintendo 3DS product code",
+            Self::ThreeDsEncryption => "Nintendo 3DS encryption state",
+            Self::ThreeDsClassification => "Nintendo 3DS title classification",
+            Self::ThreeDsPartition => "Nintendo 3DS partition metadata",
         };
         f.write_str(value)
     }
@@ -587,6 +600,8 @@ pub enum IdentityImageFormat {
     /// This observes package identity only; it is not an installed or
     /// directly runnable PS3 title.
     Pkg,
+    ThreeDsCci,
+    ThreeDsCia,
     Deferred,
     Unsupported,
 }
@@ -947,6 +962,11 @@ fn inspect_game_identity_with_platform_trust(
         return report;
     }
 
+    if platform == IdentityPlatform::ThreeDS {
+        inspect_three_ds_retail_identity(&mut report, trusted);
+        return report;
+    }
+
     // Original-Xbox identity is gated on trusted platform evidence even
     // though the structural XBE/XDVDFS family shares filesystem signatures
     // with Xbox 360 - an untrusted/scanner-guessed "Xbox" hint must never
@@ -1156,6 +1176,136 @@ fn inspect_game_identity_with_platform_trust(
         ),
     }
     report
+}
+
+fn inspect_three_ds_retail_identity(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+    let extension = report
+        .archive_path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let format = match extension.as_str() {
+        "3ds" | "cci" => ThreeDsRetailFormat::Cci,
+        "cia" => ThreeDsRetailFormat::Cia,
+        _ => {
+            add_unavailable(
+                report,
+                IdentityStatus::Unsupported,
+                "Nintendo 3DS identity supports only NCSD .3ds/.cci and CIA containers",
+            );
+            return;
+        }
+    };
+    let file = match open_read_only_regular(&report.archive_path, trusted) {
+        Ok(file) => file,
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Missing,
+                &format!("Nintendo 3DS media could not be read: {error}"),
+            );
+            return;
+        }
+    };
+    let length = match file.metadata().map(|m| m.len()) {
+        Ok(length) => length,
+        Err(error) => {
+            add_unavailable(
+                report,
+                IdentityStatus::Missing,
+                &format!("Nintendo 3DS media size is unavailable: {error}"),
+            );
+            return;
+        }
+    };
+    let mut file = file;
+    let parsed = match format {
+        ThreeDsRetailFormat::Cci => nintendo3ds_retail::parse_cci(&mut file, length),
+        ThreeDsRetailFormat::Cia => nintendo3ds_retail::parse_cia(&mut file, length),
+    };
+    match parsed {
+        Ok(observation) => apply_three_ds_observation(report, observation),
+        Err(error) => {
+            report.format = match format {
+                ThreeDsRetailFormat::Cci => IdentityImageFormat::ThreeDsCci,
+                ThreeDsRetailFormat::Cia => IdentityImageFormat::ThreeDsCia,
+            };
+            add_unavailable(
+                report,
+                IdentityStatus::Invalid,
+                &format!("Nintendo 3DS container failed bounded structural validation: {error}"),
+            );
+        }
+    }
+}
+
+fn apply_three_ds_observation(report: &mut GameIdentityReport, observation: ThreeDsRetailEvidence) {
+    report.bytes_read = match observation.format {
+        ThreeDsRetailFormat::Cci => 0x200 + (observation.partitions.len() as u64 * 0x200),
+        ThreeDsRetailFormat::Cia => 0x20 + 0x54,
+    };
+    report.format = match observation.format {
+        ThreeDsRetailFormat::Cci => IdentityImageFormat::ThreeDsCci,
+        ThreeDsRetailFormat::Cia => IdentityImageFormat::ThreeDsCia,
+    };
+    let method = match observation.format {
+        ThreeDsRetailFormat::Cci => "bounded NCSD/NCCH retail headers",
+        ThreeDsRetailFormat::Cia => "bounded CIA/TMD metadata",
+    };
+    let status = IdentityStatus::Verified;
+    if let Some(value) = observation.title_id.clone() {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::ThreeDsTitleId,
+            status,
+            Some(value),
+            IdentityConfidence::StructuredMetadata,
+            "title ID read from a validated Nintendo 3DS container header",
+            method,
+        ));
+    }
+    if let Some(value) = observation.product_code.clone() {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::ThreeDsProductCode,
+            status,
+            Some(value),
+            IdentityConfidence::StructuredMetadata,
+            "product code read from a validated NCCH header",
+            method,
+        ));
+    }
+    report.evidence.push(evidence(
+        report,
+        IdentityKind::ThreeDsEncryption,
+        status,
+        Some(
+            match observation.encryption {
+                ThreeDsEncryption::Encrypted => "encrypted",
+                ThreeDsEncryption::Unencrypted => "unencrypted",
+                ThreeDsEncryption::Unknown => "unknown",
+            }
+            .into(),
+        ),
+        IdentityConfidence::StructuredMetadata,
+        "encryption state is reported from container/header flags; no decryption was attempted",
+        method,
+    ));
+    report.evidence.push(evidence(report, IdentityKind::ThreeDsClassification, status, Some(match observation.title_kind { ThreeDsTitleKind::Base => "base title", ThreeDsTitleKind::Update => "update", ThreeDsTitleKind::Dlc => "DLC", ThreeDsTitleKind::System => "system", ThreeDsTitleKind::Manual => "manual", ThreeDsTitleKind::Child => "child content", ThreeDsTitleKind::Unknown => "unknown" }.into()), IdentityConfidence::StructuredMetadata, "classification is derived from structural title/content category evidence, not the filename", method));
+    if !observation.partitions.is_empty() {
+        report.evidence.push(evidence(
+            report,
+            IdentityKind::ThreeDsPartition,
+            status,
+            Some(format!("{} partition(s)", observation.partitions.len())),
+            IdentityConfidence::StructuredMetadata,
+            "partition bounds and NCCH headers were checked without reading partition bodies",
+            method,
+        ));
+    }
+    report.warnings.extend(observation.warnings);
+    report.complete = true;
 }
 
 fn inspect_commodore_tap_identity(report: &mut GameIdentityReport, trusted: &TrustedRoots) {

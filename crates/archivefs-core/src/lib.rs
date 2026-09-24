@@ -73,6 +73,7 @@ pub mod mame_input_requirements;
 pub mod managed_appimage_bootstrap;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
+pub mod nintendo3ds_retail;
 /// Shared read-only projections of workflow journals into operation receipts
 /// and conservative recovery capabilities.
 pub mod operation;

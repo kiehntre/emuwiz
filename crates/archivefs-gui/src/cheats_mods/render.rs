@@ -592,6 +592,8 @@ pub(crate) fn dolphin_identity_format_label(format: IdentityImageFormat) -> &'st
         | IdentityImageFormat::ZipContainingXbe
         | IdentityImageFormat::XboxDiscImage
         | IdentityImageFormat::Pkg
+        | IdentityImageFormat::ThreeDsCci
+        | IdentityImageFormat::ThreeDsCia
         | IdentityImageFormat::ScummVmDirectory
         | IdentityImageFormat::Pbp
         | IdentityImageFormat::Unsupported => "This file",
