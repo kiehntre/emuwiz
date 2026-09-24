@@ -135,28 +135,6 @@ pub(crate) fn info_chip_row(ui: &mut egui::Ui, labels: &[&str]) {
     });
 }
 
-/// A deliberately small, deterministic MrWiz placeholder. It is presentation
-/// only: no network, modal, or assistant state is involved.
-pub(crate) fn mrwiz_tip(ui: &mut egui::Ui, message: &str, dismissed: &mut bool) {
-    if *dismissed {
-        return;
-    }
-    egui::Frame::new()
-        .fill(theme::TEAL.gamma_multiply(0.10))
-        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.55)))
-        .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("MrWiz tip:");
-                ui.label(message);
-                if ui.small_button("Dismiss").clicked() {
-                    *dismissed = true;
-                }
-            });
-        });
-}
-
 /// A page header with a leading icon, for the major navigation pages. The
 /// icon is a secondary cue; the text label always accompanies it.
 pub(crate) fn page_header_with_icon(ui: &mut egui::Ui, icon: &str, title: &str, purpose: &str) {

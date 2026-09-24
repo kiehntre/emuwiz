@@ -47,11 +47,6 @@ pub(super) struct OrganisationState {
     pub(super) mame_detected_mode: Option<MameCollectionMode>,
     pub(super) mame_message: Option<String>,
     pub(super) mame_evidence_set: String,
-    /// Dismisses the plain-English "how this works" explainer. Session-only
-    /// (never persisted): a returning user who already knows the model is
-    /// not asked to re-learn it every visit within the same run, but nothing
-    /// backend-facing depends on this flag - it only hides a text panel.
-    pub(super) intro_dismissed: bool,
 }
 
 /// The visual identity for one organisation target. Purely presentational:
@@ -517,14 +512,6 @@ impl App {
                         |_ui| {},
                         |_ui| {},
                     );
-                    if !self.organisation.intro_dismissed {
-                        widgets::mrwiz_tip(
-                            ui,
-                            "Your source library stays exactly where it is. I always show you a preview before anything happens. The destination or output library is separate from your source, and nothing is ever reorganised silently.",
-                            &mut self.organisation.intro_dismissed,
-                        );
-                        ui.add_space(theme::SPACE_XS);
-                    }
                     if self.playing_library.attention_snapshot().items().next().is_some() {
                         widgets::banner(
                             ui,

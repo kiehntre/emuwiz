@@ -3,6 +3,7 @@ mod activity;
 mod artwork;
 mod backend;
 mod environment;
+mod guidance;
 mod imagery;
 mod legacy;
 mod library;
@@ -251,7 +252,7 @@ pub(super) struct App {
     environment_job: Option<u64>,
     welcome_dismissed: bool,
     doctor_platform: Option<String>,
-    mrwiz_dismissed: bool,
+    guidance: guidance::GuidanceState,
     saves_states: saves_states::SavesStatesState,
 }
 
@@ -315,7 +316,7 @@ impl App {
             environment_job: None,
             welcome_dismissed: false,
             doctor_platform: None,
-            mrwiz_dismissed: false,
+            guidance: guidance::GuidanceState::default(),
             saves_states: saves_states::SavesStatesState::default(),
         };
         let environment_job = app.activity.queue(

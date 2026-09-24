@@ -12,7 +12,7 @@ use super::{
     routes::{HOME_TASKS, Route, SECTIONS, Section},
 };
 use crate::ui::{
-    components::{StatusTone, mrwiz_tip, page_hero},
+    components::{StatusTone, page_hero},
     theme,
 };
 use archivefs_core::dat::rename_apply::model::TransactionState;
@@ -119,19 +119,23 @@ impl App {
                                 ui.strong(group);
                             }
                             let selected = self.router.current.section() == *section;
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 40.0],
-                                    egui::Button::new(section.title()).selected(selected).wrap(),
-                                )
-                                .clicked()
-                            {
-                                self.go(if *section == Section::Home {
-                                    Route::Home
-                                } else {
-                                    Route::Section(*section)
-                                });
-                            }
+                            ui.push_id(("v2_sidebar_section", *section), |ui| {
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 40.0],
+                                        egui::Button::new(section.title())
+                                            .selected(selected)
+                                            .wrap(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.go(if *section == Section::Home {
+                                        Route::Home
+                                    } else {
+                                        Route::Section(*section)
+                                    });
+                                }
+                            });
                         }
                         ui.label("Tab: move focus\nEnter: open\nAlt+Left: back");
                     });
@@ -153,47 +157,67 @@ impl App {
                     self.notice = None;
                 }
             }
-            match self.router.current.clone() {
-                Route::Home | Route::Section(Section::Home) => self.home(ui),
-                Route::Section(Section::Games | Section::Launch) => self.games(ui),
-                Route::Section(Section::Saves) => self.saves_states(ui),
-                Route::Section(Section::Emulators) => self.emulator_setup(ui),
-                Route::Section(Section::Sources) => self.sources(ui),
-                Route::Section(Section::Dat) => self.dat_sources(ui),
-                Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
-                Route::Section(Section::Mods) => self.mods_page(ui, None),
-                Route::Section(Section::Check) => self.check_games(ui),
-                Route::Section(Section::Duplicates) => self.duplicates(ui),
-                Route::Section(Section::Problems) => self.problems(ui),
-                Route::Section(Section::Build) => self.organisation_page(ui),
-                Route::Section(Section::Converter | Section::Museum) => {
-                    self.handoff(ui, self.router.current.section())
-                }
-                Route::Section(Section::Setup) => self.setup_doctor(ui),
-                Route::Section(Section::Platforms) => self.platforms(ui),
-                Route::Game(id) => self.game_detail(ui, id),
-                Route::Section(Section::Activity) => self.activities(ui),
-                Route::Section(Section::History) => self.history(ui),
-                Route::Section(Section::Settings) => self.settings(ui),
-                Route::Section(Section::Advanced) => self.advanced(ui),
-                Route::Task {
-                    section: Section::Build,
-                    ..
-                } => self.organisation_page(ui),
-                Route::Task {
-                    section: Section::Mods,
-                    game,
-                } => self.mods_page(ui, Some(game)),
-                Route::Task {
-                    section: Section::Launch,
-                    game,
-                } => self.launch(ui, game),
-                Route::Task {
-                    section: Section::Artwork,
-                    game,
-                } => self.artwork_metadata(ui, Some(game)),
-                Route::Task { section, .. } => self.handoff(ui, section),
-            }
+            let route = self.router.current.clone();
+            let guidance = self.guidance_context(&route);
+            let show_guidance = ui.ctx().input(|input| input.screen_rect().height()) >= 720.0;
+            egui::ScrollArea::vertical()
+                .id_salt(("v2_page_content", route.section()))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    match route {
+                        Route::Home | Route::Section(Section::Home) => self.home(ui),
+                        Route::Section(Section::Games | Section::Launch) => self.games(ui),
+                        Route::Section(Section::Saves) => self.saves_states(ui),
+                        Route::Section(Section::Emulators) => self.emulator_setup(ui),
+                        Route::Section(Section::Firmware) => self.firmware(ui),
+                        Route::Section(Section::Sources) => self.sources(ui),
+                        Route::Section(Section::Dat) => self.dat_sources(ui),
+                        Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
+                        Route::Section(Section::Mods) => self.mods_page(ui, None),
+                        Route::Section(Section::Check) => self.check_games(ui),
+                        Route::Section(Section::Duplicates) => self.duplicates(ui),
+                        Route::Section(Section::Problems) => self.problems(ui),
+                        Route::Section(Section::Build) => self.organisation_page(ui),
+                        Route::Section(Section::Converter) => self.converter(ui),
+                        Route::Section(Section::Tape) => self.tape_inspector(ui, None),
+                        Route::Section(Section::Museum) => self.museum(ui),
+                        Route::Section(Section::Setup) => self.setup_doctor(ui),
+                        Route::Section(Section::Platforms) => self.platforms(ui),
+                        Route::Game(id) => self.game_detail(ui, id),
+                        Route::Section(Section::Activity) => self.activities(ui),
+                        Route::Section(Section::History) => self.history(ui),
+                        Route::Section(Section::Settings) => self.settings(ui),
+                        Route::Section(Section::Advanced) => self.advanced(ui),
+                        Route::Task {
+                            section: Section::Build,
+                            ..
+                        } => self.organisation_page(ui),
+                        Route::Task {
+                            section: Section::Mods,
+                            game,
+                        } => self.mods_page(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Launch,
+                            game,
+                        } => self.launch(ui, game),
+                        Route::Task {
+                            section: Section::Artwork,
+                            game,
+                        } => self.artwork_metadata(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Advanced,
+                            game,
+                        } => self.archive_inspector(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Tape,
+                            game,
+                        } => self.tape_inspector(ui, Some(game)),
+                        Route::Task { section, .. } => self.handoff(ui, section),
+                    }
+                    if show_guidance {
+                        super::guidance::show(ui, &mut self.guidance, guidance);
+                    }
+                });
         });
         if self.confirm_scan {
             egui::Window::new("Scan your game folders?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(context, |ui| {
@@ -204,6 +228,49 @@ impl App {
                 if ui.button("Cancel — keep browsing").clicked() { self.confirm_scan = false; }
             });
         }
+    }
+
+    fn guidance_context(&self, route: &Route) -> super::guidance::GuidanceContext {
+        use super::guidance::{GuidanceContext, GuidancePage};
+        let page = match route {
+            Route::Home => GuidancePage::Home,
+            Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
+            Route::Section(Section::Sources) => GuidancePage::Sources,
+            Route::Section(Section::Launch)
+            | Route::Task {
+                section: Section::Launch,
+                ..
+            } => GuidancePage::Launch,
+            Route::Section(Section::Problems) | Route::Section(Section::Check) => {
+                GuidancePage::ProblemsRepair
+            }
+            Route::Section(Section::Build) => GuidancePage::Organisation,
+            Route::Section(Section::Mods) => GuidancePage::CheatsMods,
+            Route::Section(Section::Museum) => GuidancePage::Museum,
+            Route::Section(Section::Tape)
+            | Route::Task {
+                section: Section::Tape,
+                ..
+            } => GuidancePage::TapeInspector,
+            Route::Task {
+                section: Section::Advanced,
+                ..
+            } => GuidancePage::ArchiveInspector,
+            Route::Section(Section::Dat) => GuidancePage::DatManagement,
+            Route::Section(Section::Firmware) => GuidancePage::BiosFirmware,
+            Route::Section(Section::Emulators) => GuidancePage::EmulatorSetup,
+            _ => GuidancePage::Home,
+        };
+        let mut context = GuidanceContext::new(page);
+        match route {
+            Route::Home => context.evidence.has_games = Some(!self.library.games.is_empty()),
+            Route::Game(id) | Route::Task { game: id, .. } => {
+                context.evidence.launch_identity_verified =
+                    self.library.game(*id).map(|game| game.identified);
+            }
+            _ => {}
+        }
+        context
     }
 
     fn saves_states(&mut self, ui: &mut egui::Ui) {
@@ -305,38 +372,35 @@ impl App {
     }
 
     fn home(&mut self, ui: &mut egui::Ui) {
-        mrwiz_tip(
-            ui,
-            "I can point out safe next steps here; nothing is changed by browsing.",
-            &mut self.mrwiz_dismissed,
-        );
         self.home_hero(ui);
-        egui::ScrollArea::vertical().id_salt("v2_home").show(ui, |ui| {
-            if self.loaded && self.library.games.is_empty() {
-                if empty_state(
-                    ui,
-                    &mut self.imagery,
-                    EmptyArt::Mascot,
-                    "Let's find your games",
-                    "No games are listed yet. Start by discovering your game folders. Next: review the folders found before choosing what to scan.",
-                    Some("Add my games"),
-                ) {
-                    self.go(Route::Section(Section::Sources));
-                }
-            } else if self.loaded {
-                self.home_systems(ui);
-                self.home_showcase(ui);
-                ui.add_space(theme::SPACE_SM);
-                ui.label(RichText::new("Things you can do").size(theme::SECTION_TITLE_SIZE).strong());
+        if self.loaded && self.library.games.is_empty() {
+            if empty_state(
+                ui,
+                &mut self.imagery,
+                EmptyArt::Mascot,
+                "Let's find your games",
+                "No games are listed yet. Start by discovering your game folders. Next: review the folders found before choosing what to scan.",
+                Some("Add my games"),
+            ) {
+                self.go(Route::Section(Section::Sources));
             }
-            for (section, title, purpose, action) in HOME_TASKS {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(ui.available_width()); ui.heading(*title); ui.label(*purpose);
-                    if primary(ui, action) { self.go(Route::Section(*section)); }
-                    ui.label(match section { Section::Games | Section::Launch | Section::Mods => "Next: choose a platform or game.", _ => "Next: review setup and continue in the existing workflow. Nothing changes by opening it." });
-                });
-            }
-        });
+        } else if self.loaded {
+            self.home_systems(ui);
+            self.home_showcase(ui);
+            ui.add_space(theme::SPACE_SM);
+            ui.label(
+                RichText::new("Things you can do")
+                    .size(theme::SECTION_TITLE_SIZE)
+                    .strong(),
+            );
+        }
+        for (section, title, purpose, action) in HOME_TASKS {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width()); ui.heading(*title); ui.label(*purpose);
+                if primary(ui, action) { self.go(Route::Section(*section)); }
+                ui.label(match section { Section::Games | Section::Launch | Section::Mods => "Next: choose a platform or game.", _ => "Next: review setup and continue in the existing workflow. Nothing changes by opening it." });
+            });
+        }
     }
 
     fn games(&mut self, ui: &mut egui::Ui) {
@@ -641,6 +705,137 @@ impl App {
         self.platforms_grid(ui);
     }
 
+    /// Native v2 Museum projection. This deliberately uses the same loaded
+    /// `Library` and artwork worker as Games and Game Details; it must never
+    /// open the legacy `ArchiveFsApp` or maintain a second catalogue.
+    fn museum(&mut self, ui: &mut egui::Ui) {
+        if self.artwork.index.is_none() && !self.artwork.index_loading {
+            self.refresh_artwork_index();
+        }
+
+        let library = self.library.clone();
+        ui.heading("Museum");
+        ui.label("Browse the current v2 catalogue by platform, cover and title. Nothing here changes your files.");
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} catalogued games", library.games.len()));
+            ui.label(format!("{} platforms", library.platforms.len()));
+            if self.artwork.index_loading {
+                ui.spinner();
+                ui.label("Finding existing artwork…");
+            }
+        });
+
+        if library.games.is_empty() {
+            if empty_state(
+                ui,
+                &mut self.imagery,
+                EmptyArt::Mascot,
+                "No games in the current catalogue",
+                "Museum is using the same catalogue as Games. Add or scan a game folder to browse platforms, titles and artwork here.",
+                Some("Open Sources"),
+            ) {
+                self.go(Route::Section(Section::Sources));
+            }
+            return;
+        }
+
+        let selected_platform = self.filter.platform.clone();
+        ui.separator();
+        ui.strong("Browse platforms");
+        ui.horizontal_wrapped(|ui| {
+            let all_selected = selected_platform.is_empty();
+            if ui
+                .selectable_label(
+                    all_selected,
+                    format!("All systems ({})", library.games.len()),
+                )
+                .clicked()
+            {
+                self.filter.select_platform(String::new());
+                self.interacted = true;
+            }
+            for (platform, count) in &library.platforms {
+                if ui
+                    .selectable_label(
+                        selected_platform == *platform,
+                        format!("{platform} ({count})"),
+                    )
+                    .clicked()
+                {
+                    self.filter.select_platform(platform.clone());
+                    self.interacted = true;
+                }
+            }
+        });
+
+        if selected_platform.is_empty() {
+            ui.add_space(theme::SPACE_SM);
+            ui.strong("Choose a platform to browse its titles");
+            ui.label("The counts above come directly from the loaded v2 catalogue and stay consistent with Games.");
+            return;
+        }
+
+        let games: Vec<_> = library
+            .games
+            .iter()
+            .filter(|game| game.platform == selected_platform)
+            .collect();
+        ui.add_space(theme::SPACE_SM);
+        ui.horizontal_wrapped(|ui| {
+            ui.heading(&selected_platform);
+            ui.label(format!("{} title(s) in the current catalogue", games.len()));
+            if ui.button("Open this platform in Games").clicked() {
+                self.go(Route::Section(Section::Games));
+            }
+        });
+
+        let columns = ((ui.available_width() + 16.0) / 210.0).floor().max(1.0) as usize;
+        let card_width = ((ui.available_width() - 16.0 * columns.saturating_sub(1) as f32)
+            / columns as f32)
+            .max(160.0);
+        let rows = games.len().div_ceil(columns);
+        egui::ScrollArea::vertical()
+            .id_salt(("v2_museum_titles", &selected_platform))
+            .show_rows(ui, 300.0, rows, |ui, visible| {
+                for row in visible {
+                    ui.horizontal(|ui| {
+                        for column in 0..columns {
+                            let Some(game) = games.get(row * columns + column) else {
+                                continue;
+                            };
+                            ui.push_id(("museum-game", game.archive.id), |ui| {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    self.picture(
+                                        ui,
+                                        game,
+                                        Kind::Cover,
+                                        egui::vec2(card_width, 180.0),
+                                    );
+                                    ui.strong(&game.title);
+                                    ui.label(game.status());
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("Details").clicked() {
+                                            self.go(Route::Game(game.archive.id));
+                                        }
+                                        if primary(ui, "Play") {
+                                            self.go(Route::Task {
+                                                section: Section::Launch,
+                                                game: game.archive.id,
+                                            });
+                                        }
+                                    });
+                                });
+                            });
+                            if column + 1 < columns {
+                                ui.add_space(16.0);
+                            }
+                        }
+                    });
+                    ui.add_space(16.0);
+                }
+            });
+    }
+
     fn check_games(&mut self, ui: &mut egui::Ui) {
         let platform = self.check_platform.clone();
         check_scroll(ui, platform.as_deref(), |ui| self.check_games_content(ui));
@@ -752,11 +947,6 @@ impl App {
 
     fn duplicates_content(&mut self, ui: &mut egui::Ui) {
         self.duplicates_hero(ui);
-        mrwiz_tip(
-            ui,
-            "I found exact copies only when the backend proves their bytes match.",
-            &mut self.mrwiz_dismissed,
-        );
         ui.label("Only byte-identical files are called exact duplicates. Different regions, revisions and titles remain separate unless the backend proves identical content.");
         if self.duplicate_report.is_none() {
             if self.duplicate_job.is_some() {
@@ -1326,6 +1516,22 @@ impl App {
                                 }
                             }
                         }
+                        if crate::tape_analysis_page::is_tape_path(&game.archive.absolute_path)
+                            && ui.button("Inspect tape").clicked()
+                        {
+                            self.go(Route::Task {
+                                section: Section::Tape,
+                                game: id,
+                            });
+                        }
+                        if super::archive_inspector::is_supported_archive(&game.archive.archive_kind)
+                            && ui.button("Inspect archive").clicked()
+                        {
+                            self.go(Route::Task {
+                                section: Section::Advanced,
+                                game: id,
+                            });
+                        }
                         if ui.button("Open Folder").clicked() {
                             let job = self.activity.queue("Opening the game folder", Route::Game(id), false);
                             self.send(job, Command::OpenFolder(game.archive.absolute_path.clone()));
@@ -1406,17 +1612,7 @@ impl App {
     }
 
     fn launch(&mut self, ui: &mut egui::Ui, game_id: i64) {
-        let Some((title, platform, identified, media, path)) =
-            self.library.game(game_id).map(|game| {
-                (
-                    game.title.clone(),
-                    game.platform.clone(),
-                    game.identified,
-                    media_kind_label(&game.archive.archive_kind).to_string(),
-                    game.archive.absolute_path.clone(),
-                )
-            })
-        else {
+        let Some(game) = self.library.game(game_id).cloned() else {
             ui.label("This game is no longer in the current library.");
             if primary(ui, "Return to games") {
                 self.go(Route::Section(Section::Games));
@@ -1424,21 +1620,44 @@ impl App {
             return;
         };
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.heading(title);
-            ui.label(format!("Platform: {platform}"));
-            ui.label(format!("Media: {media}"));
-            ui.label(if identified {
-                "Verified identity is available"
-            } else {
-                "Game identity needs review"
+            ui.horizontal_top(|ui| {
+                // Launch reuses the same bounded cover/platform pipeline as
+                // Games and Game Details. It never performs its own artwork
+                // lookup or eagerly scans the catalogue.
+                self.picture(ui, &game, Kind::Cover, egui::vec2(128.0, 172.0));
+                ui.add_space(theme::SPACE_MD);
+                ui.vertical(|ui| {
+                    ui.heading(&game.title);
+                    ui.horizontal(|ui| {
+                        self.imagery.platform_icon(ui, &game.platform, 40.0);
+                        ui.vertical(|ui| {
+                            ui.label(format!("Platform: {}", game.platform));
+                            ui.label(format!(
+                                "Media: {}",
+                                media_kind_label(&game.archive.archive_kind)
+                            ));
+                        });
+                    });
+                    ui.label(if game.identified {
+                        "Verified identity is available"
+                    } else {
+                        "Game identity needs review"
+                    });
+                });
             });
         });
         ui.add_space(12.0);
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
-        if workflows.show_launch(ui, game_id, &path, &mut self.activity) {
-            self.go(Route::Section(Section::Emulators));
+        if let Some(route) = workflows.show_launch(
+            ui,
+            game_id,
+            &game.archive.absolute_path,
+            game.archive.identity_report.as_ref(),
+            &mut self.activity,
+        ) {
+            self.go(route);
         }
     }
 
@@ -1450,6 +1669,13 @@ impl App {
         egui::ScrollArea::vertical()
             .id_salt("v2_native_emulator_setup")
             .show(ui, |ui| workflows.show_setup(ui, environment.as_ref()));
+    }
+
+    fn firmware(&mut self, ui: &mut egui::Ui) {
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.show_firmware(ui);
     }
 
     fn sources(&mut self, ui: &mut egui::Ui) {
@@ -1467,11 +1693,42 @@ impl App {
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
+        let archive_games: Vec<_> = self
+            .library
+            .games
+            .iter()
+            .filter(|game| {
+                super::archive_inspector::is_supported_archive(&game.archive.archive_kind)
+            })
+            .map(|game| {
+                (
+                    game.archive.id,
+                    game.title.clone(),
+                    game.archive.archive_kind.clone(),
+                )
+            })
+            .collect();
+        let mut inspect_game = None;
         check_scroll(ui, None, |ui| {
             ui.heading("Advanced tools");
             ui.label("These tools are for specialist inspection and troubleshooting. Normal organisation, identification data and setup have their own native pages.");
             if primary(ui, "Open specialist interface") {
                 self.legacy(Section::Advanced);
+            }
+            ui.separator();
+            ui.strong("Archive Inspector");
+            ui.label("Review ZIP, 7z and RAR member metadata without extracting anything.");
+            if archive_games.is_empty() {
+                ui.label("No archive-backed games are currently in the catalogue.");
+            } else {
+                for (id, title, kind) in &archive_games {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("{title} · {}", media_kind_label(kind)));
+                        if ui.button("Inspect contents").clicked() {
+                            inspect_game = Some(*id);
+                        }
+                    });
+                }
             }
             ui.separator();
             ui.strong("Specialist tools");
@@ -1484,13 +1741,34 @@ impl App {
             if ui.button("Open Organisation").clicked() {
                 self.go(Route::Section(Section::Build));
             }
+            if ui.button("Open Tape Inspector").clicked() {
+                self.go(Route::Section(Section::Tape));
+            }
             ui.collapsing("Advanced details", |ui| {
                 ui.label("The specialist interface preserves legacy mount, media, storage and history tools. Opening it changes nothing.");
             });
         });
+        if let Some(game) = inspect_game {
+            self.go(Route::Task {
+                section: Section::Advanced,
+                game,
+            });
+        }
+    }
+
+    fn archive_inspector(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        let target = game_id.and_then(|id| {
+            self.library.game(id).and_then(|game| {
+                super::archive_inspector::ArchiveInspectorTarget::from_game(id, game)
+            })
+        });
+        super::archive_inspector::show(ui, &mut self.archive_inspector, target);
     }
 
     fn artwork_metadata(&mut self, ui: &mut egui::Ui, selected: Option<i64>) {
+        if self.artwork.index.is_none() && !self.artwork.index_loading {
+            self.refresh_artwork_index();
+        }
         let library = self.library.clone();
         let mut metadata_changed = false;
         egui::ScrollArea::vertical()
@@ -1518,7 +1796,7 @@ impl App {
                     let workflows = self.native_workflows.get_or_insert_with(|| {
                         super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
                     });
-                    workflows.show_metadata_tools(ui, None, &mut self.activity);
+                    workflows.show_artwork_provider_setup(ui, &mut self.activity);
                     if library.games.is_empty() {
                         ui.label("No games are available yet. Add or scan a source first.");
                         if primary(ui, "Open Sources") {
@@ -1665,6 +1943,14 @@ impl App {
     }
 
     fn handoff(&mut self, ui: &mut egui::Ui, section: Section) {
+        // Launch is a native v2 workflow. Keep a stale or converted launch
+        // task from ever falling through to the deliberate legacy subprocess
+        // handoff; explicit legacy actions for every other section remain
+        // available below.
+        if let Some(route) = native_route_for_handoff(section, self.router.current.game()) {
+            self.go(route);
+            return;
+        }
         egui::ScrollArea::vertical().id_salt(("v2_task", section)).show(ui, |ui| {
             ui.heading("This workflow is available in the existing interface");
             ui.label("This task opens the existing interface in a separate window. GUI v2 stays open so you can return safely.");
@@ -1687,6 +1973,26 @@ impl App {
         });
     }
 
+    fn converter(&mut self, ui: &mut egui::Ui) {
+        crate::optical_conversion_page::show_optical_conversion_page(ui, &mut self.converter);
+    }
+
+    fn tape_inspector(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        let selected = game_id.and_then(|id| {
+            self.library.game(id).map(|game| {
+                (
+                    game.title.as_str(),
+                    game.archive.absolute_path.as_path(),
+                    game.platform.as_str(),
+                )
+            })
+        });
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.show_tape(ui, selected);
+    }
+
     fn activities(&mut self, ui: &mut egui::Ui) {
         ui.label("Work continues when you leave this page. No estimated completion time is shown unless it is known.");
         if self.activity.jobs.is_empty()
@@ -1706,7 +2012,7 @@ impl App {
             for (id, job) in self.activity.jobs.iter().rev() {
                 ui.push_id(id, |ui| { egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_width(ui.available_width()); ui.heading(&job.title);
-                    ui.strong(match job.phase { Phase::Queued => "Queued", Phase::Running => "Working", Phase::Complete => "Complete", Phase::Failed => "Needs attention", Phase::Cancelled => "Cancelled safely" });
+                    ui.strong(job.phase.label());
                     ui.label(&job.summary);
                     ui.label(format!("Elapsed: {} seconds", job.elapsed().as_secs()));
                     if let Some((done, total)) = job.progress { ui.label(format!("{done} / {total} requests finished (including off-screen cancellations)")); }
@@ -1757,6 +2063,15 @@ impl App {
             }
         });
     }
+}
+
+pub(super) fn native_route_for_handoff(section: Section, game: Option<i64>) -> Option<Route> {
+    (section == Section::Launch).then(|| {
+        game.map_or(Route::Section(Section::Games), |game| Route::Task {
+            section: Section::Launch,
+            game,
+        })
+    })
 }
 
 pub(super) fn duplicate_readiness_label(

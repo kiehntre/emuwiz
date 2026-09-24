@@ -94,7 +94,7 @@ fn fixture(context: &egui::Context) -> App {
         environment_job: None,
         welcome_dismissed: false,
         doctor_platform: None,
-        mrwiz_dismissed: false,
+        guidance: super::guidance::GuidanceState::default(),
         saves_states: super::saves_states::SavesStatesState::default(),
     }
 }
@@ -780,7 +780,7 @@ fn gui_v2_organisation_flow_survives_navigation_away_and_back() {
 /// this harness renders a single `egui::Context::run` frame, so - exactly
 /// like a real (multi-frame, scrollable) session's first paint - content
 /// past the first frame's laid-out height is not yet drawn. The extra
-/// height accounts for the new hero and explainer panel pushing the five
+/// height accounts for the new hero and contextual guidance pushing the five
 /// cards further down than the previous plain-list layout.
 #[test]
 fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actions() {
@@ -791,16 +791,11 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
     assert!(
         strings
             .iter()
-            .any(|value| value.contains("stays exactly where it is"))
-    );
-    assert!(
-        strings
-            .iter()
             .any(|value| value.contains("preview before anything happens")
                 || value.contains("Nothing changes until"))
     );
     // All five action cards must still be present and clickable alongside
-    // the explainer - it must never bury the primary actions.
+    // the contextual guidance - it must never bury the primary actions.
     for title in [
         "Organise verified games",
         "Build a clean playing library",
@@ -810,14 +805,8 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
     ] {
         assert!(strings.iter().any(|value| value == title), "{title}");
     }
-    // Dismissing hides the explainer without touching any action.
-    app.organisation.intro_dismissed = true;
+    // Re-rendering keeps the contextual guidance local and the actions intact.
     let strings_after = text(&frame(&context, &mut app, [1280.0, 1800.0]));
-    assert!(
-        !strings_after
-            .iter()
-            .any(|value| value.contains("stays exactly where it is"))
-    );
     assert!(
         strings_after
             .iter()
@@ -2751,7 +2740,6 @@ fn gui_v2_platforms_page_shows_hardware_art_with_glyph_fallback() {
 fn gui_v2_home_shows_library_hero_systems_and_recently_opened_games() {
     let context = egui::Context::default();
     let mut app = visual_fixture(&context);
-    app.mrwiz_dismissed = true;
     app.go(Route::Home);
     let strings = text(&pump_imagery(&context, &mut app, [1280.0, 720.0]));
     assert!(strings.iter().any(|value| value == "Your game library"));
@@ -2965,7 +2953,6 @@ fn gui_v2_real_catalogue_timings() {
     app.artwork.index_loading = false;
     app.environment = Some(super::environment::gather());
     app.welcome_dismissed = true;
-    app.mrwiz_dismissed = true;
 
     for size in [[1280.0, 720.0], [1920.0, 1080.0]] {
         let label = format!("{}x{}", size[0], size[1]);
