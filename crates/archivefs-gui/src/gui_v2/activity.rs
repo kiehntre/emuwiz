@@ -16,6 +16,18 @@ pub(super) enum Phase {
     Cancelled,
 }
 
+impl Phase {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::Queued => "Waiting to start",
+            Self::Running => "In progress",
+            Self::Complete => "Finished",
+            Self::Failed => "Needs attention",
+            Self::Cancelled => "Stopped",
+        }
+    }
+}
+
 pub(super) struct Job {
     pub title: String,
     pub phase: Phase,

@@ -17,6 +17,7 @@ pub(super) fn destination(section: Section, selected: bool) -> MainView {
         Section::Launch if selected => MainView::Selected,
         Section::Launch => MainView::ReadyToPlay,
         Section::Emulators => MainView::EmulatorSetup,
+        Section::Firmware => MainView::BiosProjection,
         Section::Mods => MainView::CheatsMods,
         Section::Artwork => MainView::Settings,
         Section::Sources => MainView::SourcesDiscovery,

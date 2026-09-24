@@ -96,7 +96,113 @@ fn fixture(context: &egui::Context) -> App {
         doctor_platform: None,
         guidance: super::guidance::GuidanceState::default(),
         saves_states: super::saves_states::SavesStatesState::default(),
+        converter: crate::optical_conversion_page::OpticalConversionPageState::default(),
+        archive_inspector: super::archive_inspector::ArchiveInspectorPageState::default(),
     }
+}
+
+#[test]
+fn gui_v2_converter_is_a_native_workflow() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Converter);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    for expected in ["Disc Conversion", "CUE/BIN → CHD"] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "missing native converter content: {expected}"
+        );
+    }
+}
+
+#[test]
+fn converter_route_does_not_use_legacy_handoff() {
+    assert_eq!(
+        super::pages::native_route_for_handoff(Section::Converter, None),
+        None
+    );
+}
+
+#[test]
+fn museum_route_is_native_and_does_not_use_the_legacy_handoff() {
+    assert_eq!(
+        super::pages::native_route_for_handoff(Section::Museum, None),
+        None
+    );
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Museum Game", Some("SNES"))]));
+    app.router.current = Route::Section(Section::Museum);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value == "Museum"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("1 catalogued games"))
+    );
+    assert!(strings.iter().any(|value| value.contains("SNES (1)")));
+}
+
+#[test]
+fn museum_empty_state_reflects_the_current_v2_catalogue() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Museum);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("No games in the current catalogue"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("No library loaded yet"))
+    );
+}
+
+#[test]
+fn museum_platform_selection_browses_titles_and_keeps_catalogue_counts() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "SNES One", Some("SNES")),
+        archive(2, "SNES Two", Some("SNES")),
+        archive(3, "Mega Drive One", Some("Mega Drive")),
+    ]));
+    app.filter.select_platform("SNES".into());
+    app.router.current = Route::Section(Section::Museum);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value.contains("SNES One")));
+    assert!(strings.iter().any(|value| value.contains("SNES Two")));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("2 title(s) in the current catalogue"))
+    );
+    assert!(!strings.iter().any(|value| value.contains("Mega Drive One")));
+}
+
+#[test]
+fn museum_titles_offer_details_and_play_routes() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(
+        41,
+        "Play From Museum",
+        Some("SNES"),
+    )]));
+    app.filter.select_platform("SNES".into());
+    app.router.current = Route::Section(Section::Museum);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value == "Details"));
+    assert!(strings.iter().any(|value| value == "Play"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("No picture yet") || value.contains("Loading picture"))
+    );
 }
 
 fn frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
@@ -674,6 +780,25 @@ fn gui_v2_organisation_is_a_native_plain_english_workflow() {
 }
 
 #[test]
+fn gui_v2_organisation_advanced_options_stay_native() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    let strings = text(&frame(&context, &mut app, [1280.0, 1800.0]));
+    for expected in ["Advanced organisation options", "Fix my MAME library"] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "{expected}"
+        );
+    }
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("Legacy / Advanced interface"))
+    );
+}
+
+#[test]
 fn gui_v2_organisation_sidebar_title_and_all_normal_flows_are_reachable() {
     assert_eq!(Section::Build.title(), "Organisation");
     let context = egui::Context::default();
@@ -1011,7 +1136,7 @@ fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
         assert!(!section.action().is_empty());
         assert_eq!(Route::Section(*section).section(), *section);
     }
-    assert_eq!(unique.len(), 21);
+    assert_eq!(unique.len(), 23);
 }
 
 #[test]
@@ -1383,6 +1508,25 @@ fn gui_v2_play_route_is_native_and_starts_readiness_without_legacy_handoff() {
 }
 
 #[test]
+fn gui_v2_launch_handoff_cannot_spawn_the_legacy_problems_workflow() {
+    assert_eq!(
+        super::pages::native_route_for_handoff(Section::Launch, Some(41)),
+        Some(Route::Task {
+            section: Section::Launch,
+            game: 41,
+        })
+    );
+    assert_eq!(
+        super::pages::native_route_for_handoff(Section::Launch, None),
+        Some(Route::Section(Section::Games))
+    );
+    assert_eq!(
+        super::pages::native_route_for_handoff(Section::Problems, Some(41)),
+        None
+    );
+}
+
+#[test]
 fn gui_v2_emulator_setup_route_is_native_and_not_a_legacy_handoff() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
@@ -1399,6 +1543,27 @@ fn gui_v2_emulator_setup_route_is_native_and_not_a_legacy_handoff() {
         !strings
             .iter()
             .any(|text| text.contains("existing interface"))
+    );
+    assert!(app.native_workflows.is_some());
+}
+
+#[test]
+fn gui_v2_firmware_route_is_native_and_recovery_stays_on_firmware_page() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Firmware);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|text| text == "BIOS / Firmware"));
+    assert!(
+        strings
+            .iter()
+            .any(|text| text.contains("Review the firmware"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|text| text.contains("Legacy / Advanced interface"))
     );
     assert!(app.native_workflows.is_some());
 }
@@ -1736,6 +1901,21 @@ fn gui_v2_activity_covers_all_states_and_never_invents_eta() {
     activity.jobs[&id].request_cancel();
     activity.finish(id, "Cancelled".into(), None);
     assert_eq!(activity.jobs[&id].phase, Phase::Cancelled);
+}
+
+#[test]
+fn gui_v2_activity_status_labels_use_plain_english() {
+    assert_eq!(Phase::Queued.label(), "Waiting to start");
+    assert_eq!(Phase::Running.label(), "In progress");
+    assert_eq!(Phase::Complete.label(), "Finished");
+    assert_eq!(Phase::Failed.label(), "Needs attention");
+    assert_eq!(Phase::Cancelled.label(), "Stopped");
+
+    use crate::activity_history::ActivityOutcome;
+    assert_eq!(ActivityOutcome::Completed.to_string(), "Finished");
+    assert_eq!(ActivityOutcome::Failed.to_string(), "Could not complete");
+    assert_eq!(ActivityOutcome::Cancelled.to_string(), "Stopped");
+    assert_eq!(ActivityOutcome::Rejected.to_string(), "Review required");
 }
 
 #[test]
@@ -2085,6 +2265,69 @@ fn gui_v2_platform_selection_clears_old_filters_and_counts_all_sources() {
 }
 
 #[test]
+fn gui_v2_scummvm_aliases_share_one_selector_count_and_filter() {
+    let library = Library::new(vec![
+        archive(1, "Monkey Island", Some("scumm")),
+        archive(2, "Broken Sword", Some("ScummVM")),
+        archive(3, "DOS game", Some("DOS")),
+    ]);
+
+    assert_eq!(library.platforms.get("ScummVM"), Some(&2));
+    assert!(!library.platforms.contains_key("scumm"));
+    assert!(!library.platforms.contains_key("DOSBox"));
+    let filter = Filter {
+        platform: "ScummVM".into(),
+        ..Default::default()
+    };
+    let selected = library.filter(&filter);
+    assert_eq!(selected.len(), 2);
+    assert!(selected.iter().all(|index| {
+        library.games[*index].platform == "ScummVM" && library.games[*index].platform != "DOS"
+    }));
+}
+
+#[test]
+fn gui_v2_catalogue_projection_reconciles_aliases_unknowns_and_missing_rows() {
+    let mut missing_amiga = archive(1, "Amiga disk", Some("commodoreamiga"));
+    missing_amiga.last_verified_missing_at = Some("2026-09-24".into());
+    let unknown = archive(2, "Unassigned tape", None);
+    let registry_only = archive(3, "Future registry id", Some("Future Platform"));
+    let archives = vec![missing_amiga, unknown, registry_only];
+    let projection = super::library::project_platforms(&archives);
+
+    assert_eq!(projection["Amiga"].total, 1);
+    assert_eq!(projection["Amiga"].assigned, 1);
+    assert_eq!(projection["Amiga"].missing, 1);
+    assert_eq!(projection["Unknown system"].total, 1);
+    assert_eq!(projection["Unknown system"].assigned, 0);
+    assert_eq!(projection["Future Platform"].total, 1);
+    assert_eq!(projection.values().map(|item| item.total).sum::<usize>(), 3);
+
+    let library = Library::new(archives);
+    assert_eq!(library.platforms["Amiga"], 1);
+    assert_eq!(library.platforms["Unknown system"], 1);
+    assert_eq!(library.platforms["Future Platform"], 1);
+    assert_eq!(
+        library
+            .filter(&Filter {
+                platform: "Amiga".into(),
+                ..Default::default()
+            })
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn gui_v2_scummvm_platform_keeps_native_readiness_adapter() {
+    let game = Game::from_archive(archive(1, "Monkey Island", Some("scummvm")));
+    let compatibility = archivefs_core::launch::launch_compatibility_for_platform(&game.platform)
+        .expect("ScummVM has a native readiness mapping");
+    assert_eq!(game.platform, "ScummVM");
+    assert_eq!(compatibility.standalone_adapters, &["scummvm"]);
+}
+
+#[test]
 fn gui_v2_pending_filter_does_not_present_stale_games_or_count() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
@@ -2261,6 +2504,7 @@ fn gui_v2_accidental_exploration_never_runs_scan_or_legacy() {
     }
     assert!(app.activity.jobs.values().all(|job| {
         job.title == "Refreshing artwork providers"
+            || job.title == "Refreshing metadata and artwork"
             || job.title == "Checking emulator readiness"
             || job.title == "Checking save locations"
             || job.title == "Checking saved problem evidence"
@@ -2438,13 +2682,10 @@ fn gui_v2_sources_route_hosts_the_native_source_manager() {
     let output = frame(&context, &mut app, [1280.0, 820.0]);
     let strings = text(&output);
 
-    assert!(strings.iter().any(|value| value == "Related source tools"));
-    assert!(strings.iter().any(|value| value == "Game Folders"));
-    assert!(
-        strings
-            .iter()
-            .any(|value| value == "Verification Data / DATs")
-    );
+    assert!(strings.iter().any(|value| value == "Sources"));
+    assert!(strings.iter().any(|value| value == "Add game folder"));
+    assert!(strings.iter().any(|value| value == "Configured folders"));
+    assert!(strings.iter().any(|value| value == "Discovery"));
     assert!(
         !strings
             .iter()
@@ -2474,6 +2715,38 @@ fn gui_v2_dat_management_is_the_native_normal_route() {
     assert_eq!(
         app.native_workflows.as_ref().unwrap().app.view,
         crate::navigation::MainView::DatSources
+    );
+}
+
+#[test]
+fn gui_v2_dat_page_explains_bounded_no_intro_import_without_legacy_handoff() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Dat);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Installed and imported DATs")
+    );
+    assert!(strings.iter().any(|value| value == "No-Intro pack import"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Download the pack externally"))
+    );
+    assert!(strings.iter().any(|value| value == "Choose No-Intro ZIP"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("content-addressed snapshot"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("separate window"))
     );
 }
 
@@ -2577,6 +2850,35 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
             .iter()
             .any(|value| value.contains("Original path:")),
         "advanced details start closed"
+    );
+}
+
+#[test]
+fn gui_v2_artwork_route_contains_native_provider_setup_without_legacy_handoff() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.router.current = Route::Section(Section::Artwork);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+
+    for label in [
+        "Artwork and metadata providers",
+        "Local artwork",
+        "RomM",
+        "ES-DE",
+        "ScreenScraper",
+    ] {
+        assert!(
+            strings.iter().any(|value| value == label),
+            "missing {label}"
+        );
+    }
+    assert!(strings.iter().any(|value| value.contains("Credentials:")));
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("separate window"))
     );
 }
 

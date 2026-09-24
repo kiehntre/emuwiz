@@ -338,7 +338,15 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                         Some("Confirm the detected layout, then preview fixes again.".into());
                 }
                 Ok(outcome) => {
-                    match verified_mame_plan(root, dat_path, &outcome.dat, state.mame_mode) {
+                    let requested_set = (!state.mame_evidence_set.trim().is_empty())
+                        .then_some(state.mame_evidence_set.trim());
+                    match verified_mame_plan(
+                        root,
+                        dat_path,
+                        &outcome.dat,
+                        state.mame_mode,
+                        requested_set,
+                    ) {
                         Ok(plan) => state.mame_plan = Some(plan),
                         Err(error) => state.mame_message = Some(error),
                     }
@@ -361,6 +369,24 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             summary.safe,
             summary.needs_attention + summary.collisions + summary.missing_data + summary.unknown
         ));
+        for set in &plan.sets {
+            if !set.missing_members.is_empty() {
+                ui.collapsing(
+                    format!("Evidence needing review: {}", set.current_path.display()),
+                    |ui| {
+                        if !set.missing_members.is_empty() {
+                            ui.label(format!(
+                                "Missing DAT members: {}",
+                                set.missing_members.join(", ")
+                            ));
+                        }
+                        if let Some(reason) = &set.reason {
+                            ui.label(reason);
+                        }
+                    },
+                );
+            }
+        }
         ui.horizontal(|ui| {
             if ui.button("Apply verified repairs").clicked()
                 && let Some(root) = &state.mame_root
@@ -393,6 +419,7 @@ fn verified_mame_plan(
     dat_path: &std::path::Path,
     dat: &archivefs_core::dat::model::ParsedDat,
     mode: MameCollectionMode,
+    requested_set: Option<&str>,
 ) -> Result<MameNormalisationPlan, String> {
     let digest = Sha256::digest(std::fs::read(dat_path).map_err(|e| e.to_string())?);
     let dat_sha256 = digest
@@ -405,6 +432,9 @@ fn verified_mame_plan(
         && !joins.is_empty()
     {
         return plan_mame_normalisation_from_verified_joins(root, dat, &joins, mode);
+    }
+    if requested_set.is_some() {
+        return Err("no persisted verified MAME evidence is available for this family; refresh that family before previewing".into());
     }
     plan_mame_normalisation(root, dat, mode)
 }
@@ -484,7 +514,6 @@ fn sub_view_heading(ui: &mut egui::Ui, kind: CardKind, label: &str) {
 impl App {
     pub(super) fn organisation_page(&mut self, ui: &mut egui::Ui) {
         let mut selected = None;
-        let mut advanced = false;
         let mut back = false;
         let mut canonical_action = None;
         let mut playing_action = None;
@@ -572,9 +601,19 @@ impl App {
                         });
                     });
                     ui.add_space(theme::SPACE_SM);
-                    if ui.button("Advanced organisation tools").clicked() {
-                        advanced = true;
-                    }
+                    ui.collapsing("Advanced organisation options", |ui| {
+                        ui.label("These options stay inside the native v2 workflow; the old Build window is not used.");
+                        ui.label("Required normal option: choose a destination, then preview and explicitly confirm the safe transaction.");
+                        ui.label("Advanced but supported: adjust 1G1R region, language, revision and Beta/Proto/Demo/Sample preferences inside Playing Library.");
+                        if ui.button("Open 1G1R preferences").clicked() {
+                            selected = Some(Some(PlayingLibraryDestination::Generic));
+                        }
+                        ui.label("RomM, ES-DE and RetroDECK each retain their own visibility/publication checks and recovery actions.");
+                        ui.label("Specialist/deferred: obsolete duplicate controls from the former Build shell are not reproduced here.");
+                        if ui.button("Review organisation history").clicked() {
+                            open_history = true;
+                        }
+                    });
                 }
                 OrganisationView::VerifiedGames => {
                     self.invalidate_changed_canonical_organisation_plan();
@@ -642,9 +681,6 @@ impl App {
                     self.organisation.view = OrganisationView::PlayingLibrary;
                 }
             }
-        }
-        if advanced {
-            self.legacy(Section::Build);
         }
         if review_pending {
             self.organisation.view = OrganisationView::PlayingLibrary;

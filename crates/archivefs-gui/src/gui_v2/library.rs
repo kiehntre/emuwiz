@@ -22,6 +22,52 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) const UNKNOWN_PLATFORM: &str = "Unknown system";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlatformProjection {
+    pub(crate) total: usize,
+    pub(crate) assigned: usize,
+    pub(crate) missing: usize,
+}
+
+/// Projects the persisted catalogue rows into the one platform-count view
+/// shared by GUI v2 and the legacy Museum handoff. Every row is counted,
+/// including unassigned and missing rows; health affects the badges shown for
+/// a row, never whether the row exists in a platform projection.
+pub(crate) fn project_platforms(
+    archives: &[PersistedArchive],
+) -> BTreeMap<String, PlatformProjection> {
+    let mut platforms = BTreeMap::new();
+    for archive in archives {
+        let platform = canonical_platform_name(archive.platform.as_deref());
+        let entry = platforms
+            .entry(platform)
+            .or_insert_with(PlatformProjection::default);
+        entry.total += 1;
+        entry.assigned += usize::from(
+            archive
+                .platform
+                .as_deref()
+                .is_some_and(|platform| !platform.trim().is_empty()),
+        );
+        entry.missing += usize::from(archive.last_verified_missing_at.is_some());
+    }
+    platforms
+}
+
+/// Resolves a persisted platform ID or alias without rewriting the stored
+/// catalogue. Unknown assigned IDs remain visible verbatim; only an absent
+/// assignment becomes the explicit unknown bucket.
+pub(crate) fn canonical_platform_name(platform: Option<&str>) -> String {
+    let Some(raw) = platform.filter(|raw| !raw.trim().is_empty()) else {
+        return UNKNOWN_PLATFORM.to_string();
+    };
+    archivefs_core::canonical_platform_for_alias(raw)
+        .unwrap_or(raw)
+        .to_string()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct DuplicateMember {
     pub path: std::path::PathBuf,
@@ -62,10 +108,7 @@ pub(super) struct Game {
 impl Game {
     pub fn from_archive(archive: PersistedArchive) -> Self {
         let title = archive.display_name.clone();
-        let platform = archive
-            .platform
-            .clone()
-            .unwrap_or_else(|| "Unknown system".into());
+        let platform = canonical_platform_name(archive.platform.as_deref());
         let identified = archive.identity_report.as_ref().is_some_and(|report| {
             matches!(
                 canonical_identity_from_game_report(report).0,
@@ -113,15 +156,19 @@ pub(super) struct Library {
 
 impl Library {
     pub fn new(archives: Vec<PersistedArchive>) -> Self {
+        let platform_projection = project_platforms(&archives);
         let mut games: Vec<_> = archives.into_iter().map(Game::from_archive).collect();
         games.sort_by_cached_key(|game| (game.title.to_lowercase(), game.archive.id));
         let mut library = Self {
             games,
             ..Self::default()
         };
+        library.platforms = platform_projection
+            .into_iter()
+            .map(|(platform, projection)| (platform, projection.total))
+            .collect();
         for (index, game) in library.games.iter().enumerate() {
             library.by_id.insert(game.archive.id, index);
-            *library.platforms.entry(game.platform.clone()).or_default() += 1;
             let root = game
                 .archive
                 .absolute_path
@@ -175,6 +222,23 @@ impl Filter {
 }
 
 pub(super) type SharedLibrary = Arc<Library>;
+
+#[cfg(test)]
+mod tests {
+    use super::canonical_platform_name;
+
+    #[test]
+    fn scummvm_aliases_project_to_the_canonical_selector_identity() {
+        for alias in ["scumm", "scummvm", "sci", "sierrasci"] {
+            assert_eq!(canonical_platform_name(Some(alias)), "ScummVM");
+        }
+    }
+
+    #[test]
+    fn dos_does_not_project_as_scummvm() {
+        assert_eq!(canonical_platform_name(Some("DOS")), "DOS");
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct Detail {

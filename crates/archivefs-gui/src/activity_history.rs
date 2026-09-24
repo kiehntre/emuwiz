@@ -292,11 +292,11 @@ impl std::fmt::Display for ActivityOutcome {
             Self::Offered => "Offered",
             Self::Retried => "Retried",
             Self::Confirmed => "Confirmed",
-            Self::Cancelled => "Cancelled",
+            Self::Cancelled => "Stopped",
             Self::Skipped => "Skipped",
-            Self::Completed => "Completed",
-            Self::Failed => "Failed",
-            Self::Rejected => "Rejected",
+            Self::Completed => "Finished",
+            Self::Failed => "Could not complete",
+            Self::Rejected => "Review required",
             Self::OfflineUsable => "Offline",
         })
     }

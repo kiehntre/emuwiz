@@ -1,12 +1,13 @@
 //! Native EmuWiz GUI v2 presentation layer.
 mod activity;
+mod archive_inspector;
 mod artwork;
 mod backend;
 mod environment;
 mod guidance;
 mod imagery;
 mod legacy;
-mod library;
+pub(crate) mod library;
 mod media_sources;
 mod mods;
 mod native_workflows;
@@ -17,10 +18,13 @@ mod problems;
 mod routes;
 mod saves_states;
 #[cfg(test)]
+mod tape_tests;
+#[cfg(test)]
 mod tests;
 mod thumbnail;
 mod visual_pages;
 
+use crate::optical_conversion_page::OpticalConversionPageState;
 use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
 use activity::Activity;
 use artwork::Artwork;
@@ -254,6 +258,8 @@ pub(super) struct App {
     doctor_platform: Option<String>,
     guidance: guidance::GuidanceState,
     saves_states: saves_states::SavesStatesState,
+    archive_inspector: archive_inspector::ArchiveInspectorPageState,
+    converter: OpticalConversionPageState,
 }
 
 impl App {
@@ -318,6 +324,8 @@ impl App {
             doctor_platform: None,
             guidance: guidance::GuidanceState::default(),
             saves_states: saves_states::SavesStatesState::default(),
+            archive_inspector: archive_inspector::ArchiveInspectorPageState::default(),
+            converter: OpticalConversionPageState::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1146,14 +1154,14 @@ impl App {
                                     self.change_filter();
                                     self.detail = None;
                                     self.detail_failed = None;
-                                    self.artwork.reload(self.library.clone());
-                                    let id = self.activity.queue(
-                                        "Finding existing artwork",
-                                        Route::Section(Section::Games),
-                                        false,
-                                    );
-                                    self.activity.start(id);
-                                    self.index_job = Some(id);
+                                    // Artwork discovery walks every provider snapshot and every
+                                    // catalogue row.  It is useful when the Artwork page is
+                                    // opened, but it is not needed to make Home or Games usable.
+                                    // Starting it here made a 132k-game load overlap the library
+                                    // projection and could retain several full provider indexes.
+                                    self.artwork.index = None;
+                                    self.artwork.index_loading = false;
+                                    self.index_job = None;
                                 }
                                 Payload::Filter {
                                     indices,

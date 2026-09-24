@@ -165,11 +165,7 @@ mod app_polling;
 mod app_reactions;
 mod app_shell;
 mod archive_context;
-pub mod gui_v2;
 use archive_context::ArchiveContext;
-/// The intended normal EmuWiz product surface. Legacy modular workflows are
-/// reached through explicit handoff from this module while parity is completed.
-pub mod gui_v2;
 mod archive_inspector_controller;
 mod artwork_media_state;
 mod catalogue_bsfree_ui_state;
@@ -177,6 +173,9 @@ mod cheats_mods;
 mod cheats_mods_preview;
 #[allow(dead_code)]
 mod es_de_media_state;
+/// The intended normal EmuWiz product surface. Legacy modular workflows are
+/// reached through explicit handoff from this module while parity is completed.
+pub mod gui_v2;
 #[allow(dead_code)]
 mod launchbox_local_state;
 mod onboarding;

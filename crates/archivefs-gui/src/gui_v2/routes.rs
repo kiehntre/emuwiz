@@ -14,9 +14,11 @@ pub(super) enum Section {
     Problems,
     Build,
     Converter,
+    Tape,
     Museum,
     Launch,
     Emulators,
+    Firmware,
     Mods,
     Artwork,
     Sources,
@@ -38,9 +40,11 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::Problems,
     Section::Build,
     Section::Converter,
+    Section::Tape,
     Section::Museum,
     Section::Launch,
     Section::Emulators,
+    Section::Firmware,
     Section::Mods,
     Section::Artwork,
     Section::Sources,
@@ -64,9 +68,11 @@ impl Section {
             Self::Problems => "Problems & Repair",
             Self::Build => "Organisation",
             Self::Converter => "Converter",
+            Self::Tape => "Tape Inspector",
             Self::Museum => "Museum",
             Self::Launch => "Launch",
             Self::Emulators => "Emulator Setup",
+            Self::Firmware => "BIOS / Firmware",
             Self::Mods => "Mods & Cheats",
             Self::Artwork => "Artwork & Metadata",
             Self::Sources => "Sources",
@@ -94,10 +100,14 @@ impl Section {
                 "Arrange or publish verified games with a preview before anything changes."
             }
             Self::Converter => "Open the existing verified conversion tools.",
+            Self::Tape => "Inspect supported tape images without changing them.",
             Self::Museum => "Browse the existing collection museum by platform.",
             Self::Launch => "Choose a game. EmuWiz checks its setup before starting it.",
             Self::Emulators => {
                 "Find installed emulators and see what they need to play your games."
+            }
+            Self::Firmware => {
+                "Review required BIOS and firmware without changing emulator settings."
             }
             Self::Mods => {
                 "Find improvements for a game and preview every change before installing."
@@ -122,8 +132,10 @@ impl Section {
             Self::Problems => "Review problems",
             Self::Build => "Choose an organisation method",
             Self::Converter => "Open Converter",
+            Self::Tape => "Inspect tape media",
             Self::Museum => "Open Museum",
             Self::Emulators => "Check Emulators",
+            Self::Firmware => "Inspect BIOS / Firmware",
             Self::Mods => "Choose a game",
             Self::Artwork => "Manage artwork",
             Self::Sources => "Find game folders",
@@ -141,7 +153,7 @@ impl Section {
             Self::Duplicates => Some("LIBRARY"),
             Self::Launch => Some("PLAY"),
             Self::Mods => Some("TOOLS"),
-            Self::Converter | Self::Museum => Some("TOOLS"),
+            Self::Converter | Self::Tape | Self::Museum => Some("TOOLS"),
             _ => None,
         }
     }

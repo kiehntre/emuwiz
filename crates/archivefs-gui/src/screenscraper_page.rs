@@ -31,7 +31,7 @@ pub(crate) enum ScreenScraperUiStatus {
 }
 
 impl ScreenScraperUiStatus {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::NotConfigured => "Not configured",
             Self::Testing => "Testing connection…",
@@ -114,6 +114,22 @@ impl Default for ScreenScraperPageState {
 }
 
 impl ScreenScraperPageState {
+    pub(crate) fn status(&self) -> ScreenScraperUiStatus {
+        self.status
+    }
+
+    pub(crate) fn last_success_unix_seconds(&self) -> Option<u64> {
+        self.last_success_unix_seconds
+    }
+
+    pub(crate) fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        self.credentials().is_some()
+    }
+
     pub(crate) fn credentials(&self) -> Option<ScreenScraperCredentials> {
         let developer_id = self.developer_id.trim();
         let developer_password = ScreenScraperSecret::parse(&self.developer_password).ok()?;

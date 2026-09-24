@@ -222,6 +222,8 @@ pub(crate) fn ready_to_play_result(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LaunchReadinessPageAction {
     OpenDoctor,
+    Navigate(crate::navigation::NavClick),
+    ReviewDetails,
 }
 
 /// Exact AppImage paths selected from the same RetroArch discovery report as
