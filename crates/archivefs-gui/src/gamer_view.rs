@@ -1168,10 +1168,64 @@ pub(crate) fn show_gamer_details_panel(
         }
         ui.label("Screenshot references are read from the imported RomM identity matched to this exact archive path. Only RomM-hosted references are eligible for loading; public scraper references are retained as provenance and are not fetched.");
     });
+    show_resolved_metadata_evidence(ui, &record.metadata, enrichment);
     let game_info_action = show_game_information_provenance(ui, enrichment);
     show_howlongtobeat(ui, enrichment);
     show_retroachievements(ui, archive_path);
     game_info_action
+}
+
+/// Displays the shared resolver's winning fields and conflicts alongside the
+/// existing game-information panel. The resolver is fed only with values
+/// already present in the local catalogue or cache; opening Details never
+/// performs provider I/O.
+fn show_resolved_metadata_evidence(
+    ui: &mut egui::Ui,
+    local: &archivefs_core::ArchiveMetadata,
+    enrichment: Option<&crate::game_metadata::GameMetadataResult>,
+) {
+    use crate::game_metadata::GameMetadataResult;
+
+    let Some(cached) = enrichment.and_then(|result| match result {
+        GameMetadataResult::Found(found) => Some(&found.metadata),
+        GameMetadataResult::NotFound | GameMetadataResult::Unavailable => None,
+    }) else {
+        return;
+    };
+    let resolved = crate::game_metadata::resolve_metadata_evidence(local, cached);
+    if resolved.fields.is_empty() && resolved.conflicts.is_empty() {
+        return;
+    }
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
+        "Resolved metadata evidence",
+        Some("Provider-neutral, cache-only selection with provenance."),
+    );
+    egui::Grid::new("gamer_resolved_metadata_evidence")
+        .num_columns(3)
+        .striped(true)
+        .show(ui, |ui| {
+            for (field, candidate) in &resolved.fields {
+                ui.label(format!("{field:?}"));
+                ui.label(&candidate.value);
+                ui.small(format!(
+                    "{} · {}",
+                    candidate.provenance.provider.label(),
+                    candidate.provenance.detail
+                ));
+                ui.end_row();
+            }
+        });
+    if !resolved.conflicts.is_empty() {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!(
+                "{} conflicting lower-precedence value(s) retained as evidence",
+                resolved.conflicts.len()
+            ),
+        );
+    }
 }
 
 /// Optional completion times imported into the local RomM identity cache.

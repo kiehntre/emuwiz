@@ -24,6 +24,12 @@ pub enum MediaLaunchAdapter {
     RetroArch,
     FsUae,
     Hatari,
+    Dreamcast,
+    Saturn,
+    GameCube,
+    PcEngineCd,
+    SegaCd,
+    ScummVm,
     Other(String),
 }
 
@@ -32,6 +38,7 @@ pub enum MediaLaunchMechanism {
     M3uPlaylist,
     VerifiedStartMedia,
     SingleMedia,
+    Unsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,10 +68,12 @@ pub fn media_launch_summary(handoff: &MediaLaunchHandoff) -> Option<String> {
         MediaFamily::Floppy => "disk",
         MediaFamily::Tape => "tape",
     };
-    let ending = if handoff.mechanism == MediaLaunchMechanism::M3uPlaylist {
-        "complete set will be launched"
-    } else {
-        "complete set available"
+    let ending = match handoff.mechanism {
+        MediaLaunchMechanism::M3uPlaylist => "complete set will be launched",
+        MediaLaunchMechanism::Unsupported => "multi-disc launch needs adapter support",
+        MediaLaunchMechanism::VerifiedStartMedia | MediaLaunchMechanism::SingleMedia => {
+            "complete set available"
+        }
     };
     Some(format!(
         "{}-{noun} game · {ending}",
@@ -104,7 +113,19 @@ fn source_paths(plan: &MediaSwapPlan) -> Result<Vec<PathBuf>, MediaLaunchHandoff
         }
         paths.push(plain_media(step)?);
     }
-    if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+    let ordinals = plan
+        .ordered_media
+        .iter()
+        .filter_map(|step| step.ordinal.as_ref().map(|ordinal| ordinal.number))
+        .collect::<std::collections::BTreeSet<_>>();
+    let known_ordinals = plan
+        .ordered_media
+        .iter()
+        .filter(|step| step.ordinal.is_some())
+        .count();
+    if paths.windows(2).any(|pair| pair[0] == pair[1])
+        || (known_ordinals > 1 && ordinals.len() != known_ordinals)
+    {
         return Err(refusal("The media set contains a duplicate member"));
     }
     Ok(paths)
@@ -124,8 +145,26 @@ fn adapter_name(adapter: &MediaLaunchAdapter) -> &str {
         MediaLaunchAdapter::RetroArch => "RetroArch",
         MediaLaunchAdapter::FsUae => "FS-UAE",
         MediaLaunchAdapter::Hatari => "Hatari",
+        MediaLaunchAdapter::Dreamcast => "Dreamcast emulator",
+        MediaLaunchAdapter::Saturn => "Saturn emulator",
+        MediaLaunchAdapter::GameCube => "GameCube emulator",
+        MediaLaunchAdapter::PcEngineCd => "PC Engine CD emulator",
+        MediaLaunchAdapter::SegaCd => "Sega CD emulator",
+        MediaLaunchAdapter::ScummVm => "ScummVM",
         MediaLaunchAdapter::Other(name) => name,
     }
+}
+
+fn explicitly_unsupported(adapter: &MediaLaunchAdapter) -> bool {
+    matches!(
+        adapter,
+        MediaLaunchAdapter::Dreamcast
+            | MediaLaunchAdapter::Saturn
+            | MediaLaunchAdapter::GameCube
+            | MediaLaunchAdapter::PcEngineCd
+            | MediaLaunchAdapter::SegaCd
+            | MediaLaunchAdapter::ScummVm
+    )
 }
 
 /// Builds the handoff from the already-resolved topology and writes only an
@@ -183,6 +222,21 @@ pub fn prepare_multimedia_launch(
             ordered_media: paths,
             descriptor: None,
             explanation: "Single-media launch is unchanged".into(),
+        });
+    }
+
+    if explicitly_unsupported(&adapter) {
+        return Ok(MediaLaunchHandoff {
+            explanation: format!(
+                "{} has no reviewed multi-media launch adapter yet; no automatic disc composition was attempted",
+                adapter_name(&adapter)
+            ),
+            adapter,
+            family,
+            mechanism: MediaLaunchMechanism::Unsupported,
+            launch_path: start,
+            ordered_media: paths,
+            descriptor: None,
         });
     }
 
@@ -355,9 +409,9 @@ pub fn retroarch_multimedia_profile(core_id: impl Into<String>) -> MediaProfile 
 mod tests {
     use super::*;
     use crate::media_set::{
-        EvidenceKind, ExpectedCount, IdentityKey, MediaAvailability, MediaEvidence, MediaFamily,
-        MediaOrdinal, MediaRecord, MediaRole, MediaSource, OrdinalUnit, SideLayout, index_media,
-        resolve_index,
+        ConflictKind, EvidenceKind, ExpectedCount, IdentityKey, MediaAvailability, MediaEvidence,
+        MediaFamily, MediaOrdinal, MediaRecord, MediaRole, MediaSetConflict, MediaSource,
+        OrdinalUnit, SideLayout, index_media, resolve_index,
     };
     use std::fs::File;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -480,6 +534,98 @@ mod tests {
             assert_eq!(handoff.mechanism, MediaLaunchMechanism::VerifiedStartMedia);
             assert!(handoff.descriptor.is_none());
         }
+    }
+
+    #[test]
+    fn reviewed_but_unimplemented_platform_is_explicitly_unsupported() {
+        let root = temp_root("unsupported");
+        let set = fixture(&root, MediaFamily::Optical, 2);
+        let handoff = prepare_multimedia_launch(
+            &set,
+            &duckstation_multimedia_profile(),
+            MediaLaunchAdapter::Dreamcast,
+            &root.join("cache"),
+        )
+        .unwrap();
+        assert_eq!(handoff.mechanism, MediaLaunchMechanism::Unsupported);
+        assert!(handoff.descriptor.is_none());
+        assert!(handoff.explanation.contains("no reviewed"));
+    }
+
+    #[test]
+    fn duplicate_disc_ordinals_are_refused_even_with_distinct_paths() {
+        let root = temp_root("duplicate-ordinal");
+        let mut set = fixture(&root, MediaFamily::Optical, 2);
+        set.members[1].ordinal = set.members[0].ordinal.clone();
+        set.members[1].representations[0].ordinal = set.members[0].ordinal.clone();
+        assert!(
+            prepare_multimedia_launch(
+                &set,
+                &duckstation_multimedia_profile(),
+                MediaLaunchAdapter::DuckStation,
+                &root.join("cache"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn four_disc_set_preserves_explicit_order_in_managed_playlist() {
+        let root = temp_root("four-disc");
+        let set = fixture(&root, MediaFamily::Optical, 4);
+        let handoff = prepare_multimedia_launch(
+            &set,
+            &duckstation_multimedia_profile(),
+            MediaLaunchAdapter::DuckStation,
+            &root.join("cache"),
+        )
+        .unwrap();
+        let text = fs::read_to_string(handoff.descriptor.unwrap()).unwrap();
+        assert_eq!(handoff.ordered_media.len(), 4);
+        assert!(text.contains("Disc 4"));
+        assert!(text.contains("Game 4.cue"));
+    }
+
+    #[test]
+    fn conflicting_region_evidence_is_refused_before_launch() {
+        let root = temp_root("region-conflict");
+        let mut set = fixture(&root, MediaFamily::Optical, 2);
+        set.state = MediaSetState::ConflictingSet;
+        set.conflicts.push(MediaSetConflict {
+            kind: ConflictKind::VariantConflict,
+            detail: "region mismatch between discs".into(),
+            blocking: true,
+        });
+        assert!(
+            prepare_multimedia_launch(
+                &set,
+                &duckstation_multimedia_profile(),
+                MediaLaunchAdapter::DuckStation,
+                &root.join("cache"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn filename_only_or_uncertain_grouping_is_not_launchable() {
+        let root = temp_root("uncertain-grouping");
+        let mut set = fixture(&root, MediaFamily::Optical, 2);
+        set.state = MediaSetState::UnverifiedSet;
+        set.conflicts.push(MediaSetConflict {
+            kind: ConflictKind::UnprovenGrouping,
+            detail: "relationship inferred from filenames only".into(),
+            blocking: true,
+        });
+        assert!(
+            prepare_multimedia_launch(
+                &set,
+                &duckstation_multimedia_profile(),
+                MediaLaunchAdapter::DuckStation,
+                &root.join("cache"),
+            )
+            .is_err()
+        );
     }
 
     #[test]

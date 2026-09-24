@@ -1810,6 +1810,48 @@ fn show_plan(
         );
         return false;
     }
+    if let Some(topology) = &plan.media_topology {
+        widgets::card(ui, |ui| {
+            ui.strong("Multi-disc launch composition");
+            let total = topology
+                .media_sequence
+                .iter()
+                .filter_map(|step| step.ordinal.as_ref().map(|ordinal| ordinal.number))
+                .max()
+                .unwrap_or(topology.media_sequence.len() as u16);
+            if topology.missing_media.is_empty() {
+                ui.label(format!("Complete set · {total} disc(s) in verified order"));
+            } else {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "Incomplete set · {} required disc(s) missing",
+                        topology.missing_media.len()
+                    ),
+                );
+            }
+            ui.label(&topology.explanation);
+            for (index, step) in topology.media_sequence.iter().enumerate() {
+                let ordinal = step
+                    .ordinal
+                    .as_ref()
+                    .map(|ordinal| format!("Disc {}", ordinal.number))
+                    .unwrap_or_else(|| format!("Medium {}", index + 1));
+                let side = step
+                    .side
+                    .as_ref()
+                    .map(|side| format!(" · Side {}", side.number))
+                    .unwrap_or_default();
+                ui.label(format!("{ordinal}{side}"));
+                if let Some(source) = &step.preferred_representation {
+                    ui.small(format!("Source evidence: {}", source.path.display()));
+                }
+            }
+            for missing in &topology.missing_media {
+                ui.colored_label(ui.visuals().warn_fg_color, &missing.detail);
+            }
+        });
+    }
     for candidate in &plan.candidates {
         ui.add_space(6.0);
         open_doctor |= show_candidate(

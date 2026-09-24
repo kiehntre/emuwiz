@@ -71,6 +71,8 @@ pub mod library_visibility;
 /// Conservative static input requirements projected from MAME metadata.
 pub mod mame_input_requirements;
 pub mod managed_appimage_bootstrap;
+/// Provider-neutral, cache-first artwork and metadata evidence resolution.
+pub mod metadata_aggregation;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
 pub mod nintendo3ds_retail;
@@ -574,6 +576,7 @@ pub mod mod_download_transport;
 
 /// Read-only list-first inspection of archived local mod packages.
 pub mod archived_mod_package;
+pub mod bezel_decorations;
 
 /// Bounded, read-only inspection and immutable-base planning for standalone
 /// IPS/BPS/UPS/VCDIFF/PPF patch files. No patch application is performed.

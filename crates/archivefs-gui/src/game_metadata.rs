@@ -38,6 +38,188 @@ use archivefs_core::identity_source::cache::IdentityCache;
 use archivefs_core::identity_source::model::HowLongToBeatDurations;
 use eframe::egui;
 
+/// Projects the already-loaded local catalogue and cache-only provider values
+/// into the shared provider-neutral resolver.  This is presentation data only:
+/// it performs no provider lookup and never participates in identity.
+pub(crate) fn resolve_metadata_evidence(
+    local: &ArchiveMetadata,
+    cached: &ArchiveMetadata,
+) -> archivefs_core::metadata_aggregation::ResolvedMetadata {
+    use archivefs_core::metadata_aggregation::{
+        AggregationInput, MetadataCandidate, MetadataField, Provenance, Provider, ProviderStatus,
+        SourceClass,
+    };
+
+    let mut metadata = Vec::new();
+    let add = |metadata: &mut Vec<MetadataCandidate>,
+               field,
+               value: Option<&String>,
+               provider,
+               source_class,
+               detail: &str| {
+        if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            metadata.push(MetadataCandidate {
+                field,
+                value: value.clone(),
+                provenance: Provenance {
+                    provider,
+                    source_class,
+                    retrieved_at_unix_seconds: 0,
+                    detail: detail.to_string(),
+                    cache_path: None,
+                },
+            });
+        }
+    };
+    let add_year = |metadata: &mut Vec<MetadataCandidate>,
+                    value: Option<u16>,
+                    provider,
+                    source_class,
+                    detail: &str| {
+        if let Some(value) = value {
+            metadata.push(MetadataCandidate {
+                field: MetadataField::ReleaseDate,
+                value: value.to_string(),
+                provenance: Provenance {
+                    provider,
+                    source_class,
+                    retrieved_at_unix_seconds: 0,
+                    detail: detail.to_string(),
+                    cache_path: None,
+                },
+            });
+        }
+    };
+
+    add(
+        &mut metadata,
+        MetadataField::Title,
+        local.title.as_ref(),
+        Provider::Local,
+        SourceClass::LocalEvidence,
+        "local catalogue",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Platform,
+        local.platform.as_ref(),
+        Provider::Local,
+        SourceClass::LocalEvidence,
+        "local catalogue",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Region,
+        local.region.as_ref(),
+        Provider::Local,
+        SourceClass::LocalEvidence,
+        "local catalogue",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Developer,
+        local.developer.as_ref(),
+        Provider::Local,
+        SourceClass::LocalEvidence,
+        "local catalogue",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Publisher,
+        local.publisher.as_ref(),
+        Provider::Local,
+        SourceClass::LocalEvidence,
+        "local catalogue",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Genre,
+        local.genre.as_ref(),
+        Provider::Local,
+        SourceClass::LocalEvidence,
+        "local catalogue",
+    );
+    add_year(
+        &mut metadata,
+        local.release_year,
+        Provider::Local,
+        SourceClass::LocalEvidence,
+        "local catalogue",
+    );
+
+    add(
+        &mut metadata,
+        MetadataField::Description,
+        cached.synopsis.as_ref(),
+        Provider::Romm,
+        SourceClass::ProviderCache,
+        "RomM cache",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Developer,
+        cached.developer.as_ref(),
+        Provider::Romm,
+        SourceClass::ProviderCache,
+        "RomM cache",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Publisher,
+        cached.publisher.as_ref(),
+        Provider::Romm,
+        SourceClass::ProviderCache,
+        "RomM cache",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Genre,
+        cached.genre.as_ref(),
+        Provider::Romm,
+        SourceClass::ProviderCache,
+        "RomM cache",
+    );
+    add(
+        &mut metadata,
+        MetadataField::Platform,
+        cached.platform.as_ref(),
+        Provider::Romm,
+        SourceClass::ProviderCache,
+        "RomM cache",
+    );
+    add_year(
+        &mut metadata,
+        cached.release_year,
+        Provider::Romm,
+        SourceClass::ProviderCache,
+        "RomM cache",
+    );
+
+    let mut provider_status = vec![ProviderStatus {
+        provider: Provider::Local,
+        active: true,
+        detail: "Selected local catalogue evidence".to_string(),
+    }];
+    if cached.synopsis.is_some()
+        || cached.genre.is_some()
+        || cached.developer.is_some()
+        || cached.publisher.is_some()
+        || cached.platform.is_some()
+        || cached.release_year.is_some()
+    {
+        provider_status.push(ProviderStatus {
+            provider: Provider::Romm,
+            active: true,
+            detail: "Read-only cached RomM enrichment".to_string(),
+        });
+    }
+    archivefs_core::metadata_aggregation::resolve(AggregationInput {
+        metadata,
+        artwork: Vec::new(),
+        provider_status,
+    })
+}
+
 /// What the worker found for one lookup.
 #[derive(Debug, Clone)]
 pub(crate) enum GameMetadataResult {
