@@ -105,33 +105,38 @@ pub(crate) fn show_doctor_page(
             ..Default::default()
         });
 
-    widgets::workflow_header(ui, "Health & Recovery", "Find and fix things that need attention.");
-    widgets::card(
+    widgets::workflow_header(
         ui,
-        |ui| match displayed {
-            Some(_) if health.blocking > 0 => {
-                widgets::status_badge(ui, "Action required", widgets::StatusTone::Blocked)
-            }
-            Some(_) if health.warnings > 0 => {
-                widgets::status_badge(ui, "Needs review", widgets::StatusTone::Warning)
-            }
-            Some(_) if health.unknown > 0 => {
-                widgets::status_badge(ui, "Checks incomplete", widgets::StatusTone::Pending)
-            }
-            Some(_) => widgets::status_badge(
-                ui,
-                "No current problems found",
-                widgets::StatusTone::Success,
-            ),
-            None => widgets::status_badge(ui, "Not checked yet", widgets::StatusTone::Pending),
-        },
+        "Health & Recovery",
+        "Find and fix things that need attention.",
     );
+    widgets::card(ui, |ui| match displayed {
+        Some(_) if health.blocking > 0 => {
+            widgets::status_badge(ui, "Action required", widgets::StatusTone::Blocked)
+        }
+        Some(_) if health.warnings > 0 => {
+            widgets::status_badge(ui, "Needs review", widgets::StatusTone::Warning)
+        }
+        Some(_) if health.unknown > 0 => {
+            widgets::status_badge(ui, "Checks incomplete", widgets::StatusTone::Pending)
+        }
+        Some(_) => widgets::status_badge(
+            ui,
+            "No current problems found",
+            widgets::StatusTone::Success,
+        ),
+        None => widgets::status_badge(ui, "Not checked yet", widgets::StatusTone::Pending),
+    });
     {
         if displayed.is_some() {
             ui.add_space(8.0);
             let health_grid = doctor_health_grid_layout(ui.available_width());
             let metrics = [
-                ("Things to fix", health.blocking, widgets::StatusTone::Blocked),
+                (
+                    "Things to fix",
+                    health.blocking,
+                    widgets::StatusTone::Blocked,
+                ),
                 ("Warnings", health.warnings, widgets::StatusTone::Warning),
                 (
                     "Informational",

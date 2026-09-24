@@ -32,6 +32,7 @@ use archivefs_core::diagnostics::profiles::DiscoveredProfilesOverrides;
 /// found for it in this audit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OverridableEmulator {
+    Mame,
     Pcsx2,
     Rpcs3,
     Ppsspp,
@@ -41,7 +42,8 @@ pub(crate) enum OverridableEmulator {
 }
 
 impl OverridableEmulator {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
+        Self::Mame,
         Self::Pcsx2,
         Self::Rpcs3,
         Self::Ppsspp,
@@ -55,6 +57,7 @@ impl OverridableEmulator {
     /// uses for every candidate card.
     pub(crate) fn adapter_id(self) -> &'static str {
         match self {
+            Self::Mame => "mame",
             Self::Pcsx2 => "pcsx2",
             Self::Rpcs3 => "rpcs3",
             Self::Ppsspp => "ppsspp",
@@ -90,6 +93,7 @@ impl OverridableEmulator {
 
     fn executable_override_file_name(self) -> Option<&'static str> {
         match self {
+            Self::Mame => Some("mame_executable_override.txt"),
             Self::Pcsx2 => Some("pcsx2_executable_override.txt"),
             Self::Rpcs3 => Some("rpcs3_executable_override.txt"),
             Self::Ppsspp => Some("ppsspp_executable_override.txt"),
@@ -101,6 +105,7 @@ impl OverridableEmulator {
 
     fn configuration_folder_override_file_name(self) -> Option<&'static str> {
         match self {
+            Self::Mame => None,
             Self::Pcsx2 => None,
             Self::Rpcs3 => Some("rpcs3_configuration_folder_override.txt"),
             Self::Ppsspp => Some("ppsspp_configuration_folder_override.txt"),
@@ -115,6 +120,7 @@ impl OverridableEmulator {
 /// projection of the on-disk files above, loaded once at startup.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EmulatorPathOverrides {
+    pub(crate) mame_executable: Option<PathBuf>,
     pub(crate) pcsx2_executable: Option<PathBuf>,
     pub(crate) rpcs3_executable: Option<PathBuf>,
     pub(crate) rpcs3_configuration_folder: Option<PathBuf>,
@@ -143,6 +149,7 @@ impl EmulatorPathOverrides {
 
     pub(crate) fn executable(&self, emulator: OverridableEmulator) -> Option<&Path> {
         match emulator {
+            OverridableEmulator::Mame => self.mame_executable.as_deref(),
             OverridableEmulator::Pcsx2 => self.pcsx2_executable.as_deref(),
             OverridableEmulator::Rpcs3 => self.rpcs3_executable.as_deref(),
             OverridableEmulator::Ppsspp => self.ppsspp_executable.as_deref(),
@@ -154,6 +161,7 @@ impl EmulatorPathOverrides {
 
     pub(crate) fn configuration_folder(&self, emulator: OverridableEmulator) -> Option<&Path> {
         match emulator {
+            OverridableEmulator::Mame => None,
             OverridableEmulator::Pcsx2 => None,
             OverridableEmulator::Rpcs3 => self.rpcs3_configuration_folder.as_deref(),
             OverridableEmulator::Ppsspp => self.ppsspp_configuration_folder.as_deref(),
@@ -165,6 +173,7 @@ impl EmulatorPathOverrides {
 
     fn set_executable_in_memory(&mut self, emulator: OverridableEmulator, value: Option<PathBuf>) {
         match emulator {
+            OverridableEmulator::Mame => self.mame_executable = value,
             OverridableEmulator::Pcsx2 => self.pcsx2_executable = value,
             OverridableEmulator::Rpcs3 => self.rpcs3_executable = value,
             OverridableEmulator::Ppsspp => self.ppsspp_executable = value,
@@ -180,6 +189,7 @@ impl EmulatorPathOverrides {
         value: Option<PathBuf>,
     ) {
         match emulator {
+            OverridableEmulator::Mame => {}
             OverridableEmulator::Pcsx2 => {}
             OverridableEmulator::Rpcs3 => self.rpcs3_configuration_folder = value,
             OverridableEmulator::Ppsspp => self.ppsspp_configuration_folder = value,
@@ -222,6 +232,7 @@ impl EmulatorPathOverrides {
     /// one place these two shapes are translated, so they can never drift.
     pub(crate) fn as_core_overrides(&self) -> DiscoveredProfilesOverrides {
         DiscoveredProfilesOverrides {
+            mame_executable: self.mame_executable.clone(),
             dolphin_configuration_root: self.dolphin_configuration_folder.clone(),
             pcsx2_executable: self.pcsx2_executable.clone(),
             ppsspp_executable: self.ppsspp_executable.clone(),

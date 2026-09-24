@@ -322,6 +322,9 @@ mod tests {
             executable: None,
         });
         assert!(!evidence.ready);
-        assert_eq!(evidence.first_blocker.as_deref(), Some("VICE executable is missing"));
+        assert_eq!(
+            evidence.first_blocker.as_deref(),
+            Some("VICE executable is missing")
+        );
     }
 }

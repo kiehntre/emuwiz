@@ -234,7 +234,10 @@ fn managed_preview_compares_first_install_newer_same_older_and_unknown_release()
         .stage_release_pack(&inventory, &selections, 123)
         .unwrap();
     assert_eq!(
-        store.preview_activation(&first).unwrap().revision_comparison,
+        store
+            .preview_activation(&first)
+            .unwrap()
+            .revision_comparison,
         TosecRevisionComparison::NoActiveRelease
     );
     store.activate(&first, None).unwrap();
@@ -251,7 +254,10 @@ fn managed_preview_compares_first_install_newer_same_older_and_unknown_release()
         .stage_release_pack(&newer_inventory, &selections, 124)
         .unwrap();
     assert_eq!(
-        store.preview_activation(&newer).unwrap().revision_comparison,
+        store
+            .preview_activation(&newer)
+            .unwrap()
+            .revision_comparison,
         TosecRevisionComparison::Newer
     );
     let active_hash = store.active_record().unwrap().unwrap().sha256;
@@ -273,7 +279,10 @@ fn managed_preview_compares_first_install_newer_same_older_and_unknown_release()
         .stage_release_pack(&older_inventory, &selections, 126)
         .unwrap();
     assert_eq!(
-        store.preview_activation(&older).unwrap().revision_comparison,
+        store
+            .preview_activation(&older)
+            .unwrap()
+            .revision_comparison,
         TosecRevisionComparison::Older
     );
 
@@ -284,7 +293,10 @@ fn managed_preview_compares_first_install_newer_same_older_and_unknown_release()
         .stage_release_pack(&unknown_inventory, &selections, 127)
         .unwrap();
     assert_eq!(
-        store.preview_activation(&unknown).unwrap().revision_comparison,
+        store
+            .preview_activation(&unknown)
+            .unwrap()
+            .revision_comparison,
         TosecRevisionComparison::Unknown
     );
 }

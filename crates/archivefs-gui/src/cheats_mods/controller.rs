@@ -86,13 +86,17 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_bsfree_operation(&mut self, context: &egui::Context) {
-        let result = self.catalogue_bsfree_ui.bsfree_operation.as_ref().and_then(|running| {
-            running
-                .receiver
-                .try_recv()
-                .ok()
-                .map(|result| (running.operation.clone(), result))
-        });
+        let result = self
+            .catalogue_bsfree_ui
+            .bsfree_operation
+            .as_ref()
+            .and_then(|running| {
+                running
+                    .receiver
+                    .try_recv()
+                    .ok()
+                    .map(|result| (running.operation.clone(), result))
+            });
         let Some((operation, result)) = result else {
             return;
         };
@@ -125,9 +129,15 @@ impl ArchiveFsApp {
                 self.catalogue_bsfree_ui.bsfree_ui.cheats = Some(Ok(cheats));
             }
             Err(message) => match operation {
-                BsFreeOperation::LoadSystems => self.catalogue_bsfree_ui.bsfree_ui.platforms = Some(Err(message)),
-                BsFreeOperation::Search(_) => self.catalogue_bsfree_ui.bsfree_ui.search_result = Some(Err(message)),
-                BsFreeOperation::LoadGame { .. } => self.catalogue_bsfree_ui.bsfree_ui.cheats = Some(Err(message)),
+                BsFreeOperation::LoadSystems => {
+                    self.catalogue_bsfree_ui.bsfree_ui.platforms = Some(Err(message))
+                }
+                BsFreeOperation::Search(_) => {
+                    self.catalogue_bsfree_ui.bsfree_ui.search_result = Some(Err(message))
+                }
+                BsFreeOperation::LoadGame { .. } => {
+                    self.catalogue_bsfree_ui.bsfree_ui.cheats = Some(Err(message))
+                }
                 BsFreeOperation::LoadStatus => {
                     self.catalogue_bsfree_ui.bsfree_manager = BsFreeManagerState::Failed(message)
                 }
@@ -153,7 +163,8 @@ impl ArchiveFsApp {
             return;
         }
         let (sender, receiver) = mpsc::channel();
-        self.catalogue_bsfree_ui.dolphin_catalogue_manager = DolphinCatalogueManagerState::Loading(receiver);
+        self.catalogue_bsfree_ui.dolphin_catalogue_manager =
+            DolphinCatalogueManagerState::Loading(receiver);
         thread::spawn(move || {
             let result = default_dolphin_catalogue_cache_root().and_then(|root| {
                 let catalogue = match load_dolphin_catalogue(&root)? {
@@ -173,13 +184,20 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_dolphin_catalogue_retrieval(&mut self, context: egui::Context) {
-        if self.catalogue_bsfree_ui.dolphin_catalogue_retrieval.is_some() {
+        if self
+            .catalogue_bsfree_ui
+            .dolphin_catalogue_retrieval
+            .is_some()
+        {
             return;
         }
         let Some(kind) = self.catalogue_bsfree_ui.dolphin_catalogue_review.take() else {
             return;
         };
-        self.catalogue_bsfree_ui.dolphin_catalogue_generation = self.catalogue_bsfree_ui.dolphin_catalogue_generation.wrapping_add(1);
+        self.catalogue_bsfree_ui.dolphin_catalogue_generation = self
+            .catalogue_bsfree_ui
+            .dolphin_catalogue_generation
+            .wrapping_add(1);
         let generation = self.catalogue_bsfree_ui.dolphin_catalogue_generation;
         let cancellation = CheatSourceCancellation::default();
         let worker_cancellation = cancellation.clone();
@@ -194,15 +212,16 @@ impl ArchiveFsApp {
                 dolphin_catalogue_retrieval_kind_verb(kind)
             ),
         ));
-        self.catalogue_bsfree_ui.dolphin_catalogue_retrieval = Some(RunningDolphinCatalogueRetrieval {
-            generation,
-            kind,
-            cancellation,
-            receiver,
-            progress_receiver,
-            progress: None,
-            cancellation_requested: false,
-        });
+        self.catalogue_bsfree_ui.dolphin_catalogue_retrieval =
+            Some(RunningDolphinCatalogueRetrieval {
+                generation,
+                kind,
+                cancellation,
+                receiver,
+                progress_receiver,
+                progress: None,
+                cancellation_requested: false,
+            });
         let progress_context = context.clone();
         let progress = CheatSourceProgressReporter::new(move |event| {
             let _ = progress_sender.send(event);
@@ -232,7 +251,11 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn start_dolphin_catalogue_update_check(&mut self, context: egui::Context) {
-        if self.catalogue_bsfree_ui.dolphin_catalogue_update_check.is_some() {
+        if self
+            .catalogue_bsfree_ui
+            .dolphin_catalogue_update_check
+            .is_some()
+        {
             return;
         }
         let (sender, receiver) = mpsc::channel();
@@ -271,7 +294,11 @@ impl ArchiveFsApp {
                 self.catalogue_bsfree_ui.dolphin_catalogue_review = None;
             }
             DolphinCatalogueManagerAction::CancelRunning => {
-                if let Some(running) = self.catalogue_bsfree_ui.dolphin_catalogue_retrieval.as_mut() {
+                if let Some(running) = self
+                    .catalogue_bsfree_ui
+                    .dolphin_catalogue_retrieval
+                    .as_mut()
+                {
                     running.cancellation.cancel();
                     running.cancellation_requested = true;
                 }
@@ -311,14 +338,17 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn poll_dolphin_catalogue_manager(&mut self, context: &egui::Context) {
-        if let DolphinCatalogueManagerState::Loading(receiver) = &self.catalogue_bsfree_ui.dolphin_catalogue_manager {
+        if let DolphinCatalogueManagerState::Loading(receiver) =
+            &self.catalogue_bsfree_ui.dolphin_catalogue_manager
+        {
             match receiver.try_recv() {
                 Ok(Ok(snapshot)) => {
                     self.catalogue_bsfree_ui.dolphin_catalogue_manager =
                         DolphinCatalogueManagerState::Ready(Box::new(snapshot));
                 }
                 Ok(Err(error)) => {
-                    self.catalogue_bsfree_ui.dolphin_catalogue_manager = DolphinCatalogueManagerState::Failed(error);
+                    self.catalogue_bsfree_ui.dolphin_catalogue_manager =
+                        DolphinCatalogueManagerState::Failed(error);
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
@@ -345,7 +375,11 @@ impl ArchiveFsApp {
                 }
             }
         }
-        if let Some(running) = self.catalogue_bsfree_ui.dolphin_catalogue_retrieval.as_mut() {
+        if let Some(running) = self
+            .catalogue_bsfree_ui
+            .dolphin_catalogue_retrieval
+            .as_mut()
+        {
             for progress in running.progress_receiver.try_iter() {
                 running.progress = Some(progress);
             }
@@ -410,7 +444,8 @@ impl ArchiveFsApp {
         }
         self.catalogue_bsfree_ui.dolphin_catalogue_last_result = Some(result);
         self.catalogue_bsfree_ui.dolphin_catalogue_update_available = None;
-        self.catalogue_bsfree_ui.dolphin_catalogue_manager = DolphinCatalogueManagerState::NotLoaded;
+        self.catalogue_bsfree_ui.dolphin_catalogue_manager =
+            DolphinCatalogueManagerState::NotLoaded;
         self.start_dolphin_catalogue_status_load(context.clone());
     }
 
@@ -545,7 +580,9 @@ impl ArchiveFsApp {
             }
             _ => None,
         };
-        let (selected_dolphin_profile_id, dolphin_profile_selection) = match &self.emulator_readiness.dolphin_profiles
+        let (selected_dolphin_profile_id, dolphin_profile_selection) = match &self
+            .emulator_readiness
+            .dolphin_profiles
         {
             DolphinProfilesState::Ready(discovery) => {
                 let selection =
@@ -559,7 +596,10 @@ impl ArchiveFsApp {
             }
             _ => (None, None),
         };
-        let (selected_xenia_profile_id, xenia_profile_selection) = match &self.emulator_readiness.xenia_profiles {
+        let (selected_xenia_profile_id, xenia_profile_selection) = match &self
+            .emulator_readiness
+            .xenia_profiles
+        {
             XeniaProfilesState::Ready(discovery) => {
                 let candidates = xenia_profile_candidates(discovery);
                 let selection = select_emulator_profile(
@@ -708,7 +748,10 @@ impl ArchiveFsApp {
             .is_some_and(|workflow| workflow.adapter == CheatEmulatorAdapter::Xenia)
         {
             self.seed_explicit_root_from_remembered_profile("xenia");
-            if matches!(self.emulator_readiness.xenia_profiles, XeniaProfilesState::NotScanned) {
+            if matches!(
+                self.emulator_readiness.xenia_profiles,
+                XeniaProfilesState::NotScanned
+            ) {
                 self.start_xenia_profile_scan();
             }
         }
@@ -867,7 +910,8 @@ impl ArchiveFsApp {
             return;
         }
         let archive_path = workflow.archive_path.clone();
-        let outcome = build_cheat_candidate_request(workflow, &self.emulator_readiness.retroarch_profiles);
+        let outcome =
+            build_cheat_candidate_request(workflow, &self.emulator_readiness.retroarch_profiles);
         match outcome {
             Ok((key, catalogue_root, archive)) => {
                 let worker_key = key.clone();
@@ -3421,7 +3465,8 @@ impl ArchiveFsApp {
     pub(crate) fn gamecube_gamehacking_profile(&self) -> Option<DolphinProfile> {
         let workflow = self.cheat_workflow.as_ref()?;
         let profile_id = workflow.selected_dolphin_profile_id.as_ref()?;
-        let DolphinProfilesState::Ready(discovery) = &self.emulator_readiness.dolphin_profiles else {
+        let DolphinProfilesState::Ready(discovery) = &self.emulator_readiness.dolphin_profiles
+        else {
             return None;
         };
         discovery
@@ -4596,20 +4641,21 @@ impl ArchiveFsApp {
     pub(crate) fn poll_cheat_workflow(&mut self, context: &egui::Context) {
         let identity_page_is_current = self.view == MainView::CheatsMods;
         let mut automatic_candidate: Option<String> = None;
-        let dolphin_profile_paths: HashMap<String, PathBuf> = match &self.emulator_readiness.dolphin_profiles {
-            DolphinProfilesState::Ready(discovery) => discovery
-                .profiles
-                .iter()
-                .filter(|profile| profile.eligible)
-                .map(|profile| {
-                    (
-                        profile.profile_id.clone(),
-                        profile.configuration_path.clone(),
-                    )
-                })
-                .collect(),
-            _ => HashMap::new(),
-        };
+        let dolphin_profile_paths: HashMap<String, PathBuf> =
+            match &self.emulator_readiness.dolphin_profiles {
+                DolphinProfilesState::Ready(discovery) => discovery
+                    .profiles
+                    .iter()
+                    .filter(|profile| profile.eligible)
+                    .map(|profile| {
+                        (
+                            profile.profile_id.clone(),
+                            profile.configuration_path.clone(),
+                        )
+                    })
+                    .collect(),
+                _ => HashMap::new(),
+            };
         let Some(workflow) = self.cheat_workflow.as_mut() else {
             return;
         };

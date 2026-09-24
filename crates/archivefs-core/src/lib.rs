@@ -26,24 +26,20 @@ pub mod amiga_disk;
 /// Bounded WHDLoad `.slave` discovery inside LHA/LZH archives, reusing the
 /// existing archive-member reader and WHDLoad slave parser.
 pub mod amiga_whdload_archive;
-/// Read-only per-set compatibility against pinned installed MAME evidence.
-pub mod arcade_mame_compatibility;
-/// Read-only impact projection for refreshed imported MAME authority.
-pub mod mame_authority_impact;
-/// Deterministic collection statistics over evaluated MAME evidence.
-pub mod mame_collection_stats;
-/// Read-only per-set compatibility against an explicitly pinned FBNeo source.
-pub mod arcade_fbneo_compatibility;
-/// Read-only orchestration of independent MAME and FBNeo compatibility results.
-pub mod arcade_compatibility;
-/// Deterministic emulator recommendation from existing arcade evidence.
-pub mod arcade_recommendation;
 /// App-directory resolution with legacy ArchiveFS compatibility. See the
 /// module for the reuse-not-migrate strategy that keeps existing user data
 /// reachable during the EmuWiz rename.
 pub mod app_dirs;
 /// Bounded, read-only Apple II disk structural evidence.
 pub mod apple2_disk;
+/// Read-only orchestration of independent MAME and FBNeo compatibility results.
+pub mod arcade_compatibility;
+/// Read-only per-set compatibility against an explicitly pinned FBNeo source.
+pub mod arcade_fbneo_compatibility;
+/// Read-only per-set compatibility against pinned installed MAME evidence.
+pub mod arcade_mame_compatibility;
+/// Deterministic emulator recommendation from existing arcade evidence.
+pub mod arcade_recommendation;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
 pub mod atari_tape;
 pub mod attention;
@@ -59,18 +55,24 @@ pub mod diagnostics;
 pub mod dragon_coco_tape;
 pub mod emulator_download;
 pub mod emulator_inventory;
+/// Provider-neutral, read-only emulator installation lifecycle projection.
+pub mod emulator_lifecycle;
 pub mod emulator_update;
-/// Manifest-backed ownership and side-by-side managed AppImage installs.
-pub mod managed_emulator_install;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
 /// Typed library presentation visibility, separate from source ownership and
 /// subsystem evidence availability.
 pub mod library_visibility;
+/// Read-only impact projection for refreshed imported MAME authority.
+pub mod mame_authority_impact;
+/// Deterministic collection statistics over evaluated MAME evidence.
+pub mod mame_collection_stats;
 /// Conservative static input requirements projected from MAME metadata.
 pub mod mame_input_requirements;
 pub mod managed_appimage_bootstrap;
+/// Manifest-backed ownership and side-by-side managed AppImage installs.
+pub mod managed_emulator_install;
 /// Provider-neutral, cache-first artwork and metadata evidence resolution.
 pub mod metadata_aggregation;
 /// Bounded MSX standard cassette WAV evidence.
@@ -82,10 +84,11 @@ pub mod operation;
 /// Bounded Oric media structure and read-only source bindings.
 pub mod oric_media;
 pub mod oric_tape;
-/// Optional, read-only RetroAchievements game metadata and bounded cache.
-pub mod retroachievements;
 /// Pure per-game launch-readiness projection over existing gathered evidence.
 pub mod ready_to_play;
+/// Optional, read-only RetroAchievements game metadata and bounded cache.
+pub mod retroachievements;
+pub mod retrobios_provider;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
 /// Bounded PCM/WAV pulse evidence for tape recordings.
@@ -125,6 +128,10 @@ pub use inspector::{
 pub mod archive_member_resolver;
 pub mod archive_workflow;
 pub mod memory_card_inventory;
+pub mod persistent_state_inventory;
+pub mod save_state_orchestration;
+/// Verified ZIP creation and extraction for the Converter page.
+pub mod zip_converter;
 pub use archive_member_resolver::{
     ArchiveMemberResolution, MAX_PREPARE_CANDIDATES, MAX_PREPARE_MEMBER_COMPONENTS,
     MAX_PREPARE_MEMBER_PATH_BYTES, PreparedMemberCandidate, prepared_member_path,
@@ -348,9 +355,9 @@ pub mod ps2_boot_evidence;
 /// Pure, read-only PSP boot/layout evidence (`PSP_GAME/` + `PARAM.SFO`).
 pub mod psp_boot_evidence;
 
+pub mod psp_game_slimmer;
 /// PSP ISO to CSO v1 conversion with byte-exact reversible verification.
 pub mod psp_reversible_shrink;
-pub mod psp_game_slimmer;
 
 /// Strict, local-first Game Slimmer profile knowledge and read-only matching.
 pub mod game_slimmer_profiles;
@@ -552,6 +559,10 @@ pub mod patch_manager;
 /// cheat/emulator patch manager: it never applies a change or creates history.
 pub mod mod_package;
 
+/// Read-only inspection and shared-transaction planning for ordinary folder
+/// and ZIP mod packages. No package content is executed or flattened.
+pub mod archive_mod_package;
+
 /// Unified read-only projection of installed mod receipts, including optional
 /// provider provenance attached only after a strong local-package join.
 pub mod mod_history;
@@ -562,9 +573,13 @@ pub mod mod_catalogue;
 /// This module never scrapes, downloads, extracts, or installs third-party
 /// content; those concerns remain with the existing local safety machinery.
 pub mod mod_provider;
+/// Conservative, metadata-only ModDB project and release provider.
+pub mod moddb;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 
+/// Shared, fail-closed activation planning for enabled mod stacks and previews.
+pub mod mod_activation;
 /// Pure review projection for provider-neutral catalogue records.
 pub mod mod_catalogue_review;
 /// Local, immutable handoff from downloaded bytes to existing mod inspectors.
@@ -578,6 +593,8 @@ pub mod mod_download_transport;
 pub mod archived_mod_package;
 pub mod bezel_decorations;
 
+pub mod patch_output_recovery;
+pub mod patch_package_composition;
 /// Bounded, read-only inspection and immutable-base planning for standalone
 /// IPS/BPS/UPS/VCDIFF/PPF patch files. No patch application is performed.
 pub mod standalone_patch;
@@ -3642,7 +3659,10 @@ pub fn scan_source_folder_at(
             ))
         })?;
 
-    scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)
+    let summary =
+        scan_and_persist_folders(&mut database, std::slice::from_ref(&folder), triggered_by)?;
+    refresh_configured_mame_arcade_identity(&mut database, &[target.to_path_buf()])?;
+    Ok(summary)
 }
 
 /// Scans every *enabled* configured source folder independently - a
@@ -3680,7 +3700,68 @@ pub fn scan_all_enabled_sources_at(
         .filter(|folder| enabled_paths.contains(&folder.path))
         .collect();
 
-    scan_and_persist_folders(&mut database, &enabled_folders, triggered_by)
+    let summary = scan_and_persist_folders(&mut database, &enabled_folders, triggered_by)?;
+    let paths = enabled_folders
+        .iter()
+        .map(|folder| folder.path.clone())
+        .collect::<Vec<_>>();
+    refresh_configured_mame_arcade_identity(&mut database, &paths)?;
+    Ok(summary)
+}
+
+/// Refreshes the existing persisted MAME Arcade join after a successful
+/// source scan. The DAT registry remains the authority: absent, invalid, or
+/// non-MAME sources are simply not launch-authorizing and never produce
+/// guessed identity. Raw members are only used by the bounded join to build
+/// one logical set record.
+fn refresh_configured_mame_arcade_identity(
+    database: &mut Database,
+    roots: &[PathBuf],
+) -> Result<()> {
+    let config_path = dat::sources::default_dat_sources_config_path()?;
+    let config = dat::sources::load_dat_sources_config_from(config_path)?;
+    let Some(source) = config
+        .sources
+        .unwrap_or_default()
+        .into_iter()
+        .find(|source| source.id == "mame-0-174-arcade-xml" && source.enabled.unwrap_or(true))
+    else {
+        return Ok(());
+    };
+    let dat = dat::mame_arcade_join::load_verified_mame_0174(Path::new(&source.path))
+        .map_err(ArchiveFsError::Config)?;
+    let audited_at = format!("{:?}", std::time::SystemTime::now());
+    for root in roots {
+        let arcade_root = if root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("arcade"))
+        {
+            root.clone()
+        } else {
+            root.join("arcade")
+        };
+        if !arcade_root.is_dir() {
+            continue;
+        }
+        let join_started = std::time::Instant::now();
+        let report =
+            dat::mame_arcade_join::join_extracted_arcade_root(&dat, &arcade_root, &audited_at)
+                .map_err(ArchiveFsError::Config)?;
+        log::info!(
+            "MAME Arcade join prepared {} logical sets from {} in {:?}",
+            report.evidence.len(),
+            arcade_root.display(),
+            join_started.elapsed()
+        );
+        let persist_started = std::time::Instant::now();
+        let rows = database.persist_mame_arcade_join(&report)?;
+        log::info!(
+            "MAME Arcade audit persisted {rows} rows from {} in {:?}",
+            arcade_root.display(),
+            persist_started.elapsed()
+        );
+    }
+    Ok(())
 }
 
 /// Resolves a CLI-style `<id-or-path>` argument to a configured source
@@ -3865,6 +3946,10 @@ pub enum ArchiveKind {
     /// A supported game image that is catalogued directly rather than
     /// requiring an archive wrapper. Scanning never mounts or modifies it.
     DirectGameImage,
+    /// One extracted MAME/FBNeo ROM set directory. Its member files remain
+    /// source-level evidence; the directory is the single logical catalogue
+    /// item and is never a mount input.
+    ArcadeSetDirectory,
 }
 
 impl ArchiveKind {
@@ -3875,6 +3960,7 @@ impl ArchiveKind {
             "rar" => Some(Self::Rar),
             "megadrive_rom" => Some(Self::MegaDriveRom),
             "direct_game_image" => Some(Self::DirectGameImage),
+            "arcade_set_directory" => Some(Self::ArcadeSetDirectory),
             _ => None,
         }
     }
@@ -3886,6 +3972,7 @@ impl ArchiveKind {
             Self::Rar => "rar",
             Self::MegaDriveRom => "megadrive_rom",
             Self::DirectGameImage => "direct_game_image",
+            Self::ArcadeSetDirectory => "arcade_set_directory",
         }
     }
 }
@@ -3895,7 +3982,10 @@ impl ArchiveKind {
     /// Loose cartridge ROMs remain selectable library content but never
     /// become queue or mount candidates.
     pub fn is_mount_input(self) -> bool {
-        !matches!(self, Self::MegaDriveRom | Self::DirectGameImage)
+        !matches!(
+            self,
+            Self::MegaDriveRom | Self::DirectGameImage | Self::ArcadeSetDirectory
+        )
     }
 }
 
@@ -4107,6 +4197,18 @@ pub struct Archive {
 }
 
 impl Archive {
+    pub(crate) fn from_arcade_set_directory(path: &Path, source_root: &Path) -> Option<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .ok()
+            .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())?;
+        Some(Self {
+            path: path.to_path_buf(),
+            kind: ArchiveKind::ArcadeSetDirectory,
+            identity: ArchiveIdentity::from_path(path, source_root, Some(&metadata)),
+            health: ArchiveHealth::Pending,
+        })
+    }
+
     fn from_scan_fingerprint(
         path: &Path,
         source_root: &Path,
@@ -5483,11 +5585,16 @@ impl ArchiveScanDiscovery {
     fn record_scan_error(&mut self, path: PathBuf, message: impl Into<String>) {
         self.scan_errors_total = self.scan_errors_total.saturating_add(1);
         if self.scan_errors.len() < MAX_RETAINED_SCAN_ERRORS {
-            self.scan_errors.push(ScanError { path, message: message.into() });
+            self.scan_errors.push(ScanError {
+                path,
+                message: message.into(),
+            });
         }
     }
 
-    pub fn is_complete(&self) -> bool { self.scan_errors_total == 0 }
+    pub fn is_complete(&self) -> bool {
+        self.scan_errors_total == 0
+    }
 
     pub fn scan_errors_truncated(&self) -> bool {
         self.scan_errors_total > self.scan_errors.len()
@@ -5572,9 +5679,13 @@ impl<'a> ArchiveScanner<'a> {
             )?;
         }
         discovery.skipped_files.sort_by(|left, right| {
-            left.path.cmp(&right.path).then_with(|| left.reason.label().cmp(right.reason.label()))
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.reason.label().cmp(right.reason.label()))
         });
-        discovery.non_archive_fingerprints.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        discovery
+            .non_archive_fingerprints
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         discovery
             .archives
             .sort_by(|left, right| left.path.cmp(&right.path));
@@ -5656,18 +5767,30 @@ impl<'a> ArchiveScanner<'a> {
             let before = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        ArchiveFsError::io(directory.clone(), error).to_string(),
+                    );
                     continue;
                 }
             };
             if before.file_type().is_symlink() || !before.is_dir() {
-                discovery.record_scan_error(directory.clone(), format!("source directory changed or became unsafe during scan: {}", directory.display()));
+                discovery.record_scan_error(
+                    directory.clone(),
+                    format!(
+                        "source directory changed or became unsafe during scan: {}",
+                        directory.display()
+                    ),
+                );
                 continue;
             }
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(error) => {
-                    discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        ArchiveFsError::io(directory.clone(), error).to_string(),
+                    );
                     continue;
                 }
             };
@@ -5678,7 +5801,10 @@ impl<'a> ArchiveScanner<'a> {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(error) => {
-                        discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                        discovery.record_scan_error(
+                            directory.clone(),
+                            ArchiveFsError::io(directory.clone(), error).to_string(),
+                        );
                         continue;
                     }
                 };
@@ -5687,7 +5813,10 @@ impl<'a> ArchiveScanner<'a> {
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(error) => {
-                        discovery.record_scan_error(path.clone(), ArchiveFsError::io(path.clone(), error).to_string());
+                        discovery.record_scan_error(
+                            path.clone(),
+                            ArchiveFsError::io(path.clone(), error).to_string(),
+                        );
                         continue;
                     }
                 };
@@ -5728,7 +5857,13 @@ impl<'a> ArchiveScanner<'a> {
                     )
                 {
                     if archive.identity.size_bytes.is_none() {
-                        discovery.record_scan_error(path.clone(), format!("archive changed or became unreadable during scan: {}", path.display()));
+                        discovery.record_scan_error(
+                            path.clone(),
+                            format!(
+                                "archive changed or became unreadable during scan: {}",
+                                path.display()
+                            ),
+                        );
                         continue;
                     }
                     debug!("discovered archive {}", archive.path.display());
@@ -5766,13 +5901,15 @@ impl<'a> ArchiveScanner<'a> {
                             reason,
                         });
                     }
-                    if discovery.non_archive_fingerprints.len() < MAX_RETAINED_NON_ARCHIVE_FINGERPRINTS
+                    if discovery.non_archive_fingerprints.len()
+                        < MAX_RETAINED_NON_ARCHIVE_FINGERPRINTS
                         && !self.non_archive_fingerprint_is_current(
-                        &path,
-                        source_root,
-                        source_id,
-                        fingerprints,
-                    ) && let Ok(metadata) = fs::metadata(&path)
+                            &path,
+                            source_root,
+                            source_id,
+                            fingerprints,
+                        )
+                        && let Ok(metadata) = fs::metadata(&path)
                     {
                         let modified_time_ns = metadata
                             .modified()
@@ -5808,7 +5945,10 @@ impl<'a> ArchiveScanner<'a> {
             let after = match fs::symlink_metadata(&directory) {
                 Ok(metadata) => metadata,
                 Err(error) => {
-                    discovery.record_scan_error(directory.clone(), ArchiveFsError::io(directory.clone(), error).to_string());
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        ArchiveFsError::io(directory.clone(), error).to_string(),
+                    );
                     continue;
                 }
             };
@@ -5816,7 +5956,13 @@ impl<'a> ArchiveScanner<'a> {
                 || !after.is_dir()
                 || filesystem_identity(&before) != filesystem_identity(&after)
             {
-                discovery.record_scan_error(directory.clone(), format!("source directory changed during scan: {}", directory.display()));
+                discovery.record_scan_error(
+                    directory.clone(),
+                    format!(
+                        "source directory changed during scan: {}",
+                        directory.display()
+                    ),
+                );
             }
             child_directories.reverse();
             directories.extend(child_directories);
@@ -6010,7 +6156,12 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
     let metadata = fs::symlink_metadata(&archive.path)
         .map_err(|error| ArchiveFsError::io(archive.path.clone(), error))?;
     let identity = filesystem_identity(&metadata);
-    if !metadata.is_file()
+    let expected_shape = if archive.kind == ArchiveKind::ArcadeSetDirectory {
+        metadata.is_dir()
+    } else {
+        metadata.is_file()
+    };
+    if !expected_shape
         || archive.identity.filesystem_device != Some(identity.device)
         || archive.identity.filesystem_inode != Some(identity.inode)
         || archive.identity.size_bytes != Some(metadata.len())
@@ -13076,7 +13227,12 @@ mod tests {
             .scan_archives_with_summary()
             .unwrap();
         assert!(!discovery.is_complete());
-        assert!(discovery.scan_errors.iter().any(|error| error.message.contains("directory depth limit")));
+        assert!(
+            discovery
+                .scan_errors
+                .iter()
+                .any(|error| error.message.contains("directory depth limit"))
+        );
     }
 
     #[test]
@@ -13111,8 +13267,18 @@ mod tests {
             .scan_archives_with_summary()
             .unwrap();
         assert!(!discovery.is_complete());
-        assert!(discovery.archives.iter().any(|archive| archive.path == root.join("valid.zip")));
-        assert!(discovery.scan_errors.iter().any(|error| error.message.contains("directory depth limit")));
+        assert!(
+            discovery
+                .archives
+                .iter()
+                .any(|archive| archive.path == root.join("valid.zip"))
+        );
+        assert!(
+            discovery
+                .scan_errors
+                .iter()
+                .any(|error| error.message.contains("directory depth limit"))
+        );
         let _ = fs::remove_dir_all(root);
     }
 

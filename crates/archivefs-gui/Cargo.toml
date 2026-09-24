@@ -15,10 +15,10 @@ autobins = false
 name = "archivefs_gui"
 path = "src/lib.rs"
 
-# Binary naming during the EmuWiz rename (staged): `emuwiz` and
-# `emuwiz-gui` are the primary names; `archivefs-gui` remains as a legacy
-# compatibility alias so existing launchers keep working. All three run the
-# exact same code - each is a thin launcher that calls `archivefs_gui::run()`.
+# Binary naming during the EmuWiz rename: `emuwiz` is the shipped native GUI
+# v2 application. `emuwiz-gui` and `archivefs-gui` remain compatibility aliases
+# and intentionally launch that same application. The separate `emuwiz-v2`
+# target remains available for developer/build compatibility.
 [[bin]]
 name = "emuwiz"
 path = "src/bin/emuwiz.rs"
@@ -76,7 +76,7 @@ arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 # exact crate/version is already present through the GUI dependency graph;
 # a direct dependency makes the deliberately limited PNG API explicit and
 # avoids adding the much larger SVG/resvg parser stack for this milestone.
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 # Native folder picker for "Add Folder" on the Sources page. Default
 # features enable the "xdg-portal" backend, which talks to the
 # xdg-desktop-portal D-Bus FileChooser directly (GNOME/KDE both implement
@@ -88,7 +88,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11.0"
 time = { version = "0.3.53", features = ["local-offset"] }
+tempfile = "3"
 
 [dev-dependencies]
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
-tempfile = "3"

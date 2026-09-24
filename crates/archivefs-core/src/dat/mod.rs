@@ -32,15 +32,15 @@
 //! - Every parse warning includes byte offset and source context.
 //! - Unknown status values are preserved rather than discarded.
 
-pub mod archive;
 pub mod acquisition;
+pub mod archive;
 pub mod audit;
 pub mod authority;
 pub mod catalogue_selection;
 pub mod classification;
-pub mod custom_dat;
 pub mod coverage;
 pub mod coverage_expectations;
+pub mod custom_dat;
 pub mod dependency;
 pub mod disk_audit;
 pub mod divergence;
@@ -52,7 +52,11 @@ pub mod index;
 pub mod library_identity_projection;
 pub mod library_identity_summary;
 pub mod limits;
+pub mod mame_arcade_join;
 pub mod mame_input_metadata;
+/// Checksum-driven MAME set normalisation. Planning is read-only; applying is
+/// explicit, staged, no-clobber, and journaled for undo.
+pub mod mame_normalizer;
 pub mod managed_sources;
 pub mod model;
 /// Neo Geo MVS/AES multi-ROM set coherence: a thin, read-only projection

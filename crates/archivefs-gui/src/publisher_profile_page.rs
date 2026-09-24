@@ -489,9 +489,11 @@ pub(crate) fn show_publisher_profile_page(
     );
     if !execution_complete {
         ui.label(
-            egui::RichText::new("Preview first. Applying requires a separate review and confirmation.")
-                .strong()
-                .color(theme::muted(ui)),
+            egui::RichText::new(
+                "Preview first. Applying requires a separate review and confirmation.",
+            )
+            .strong()
+            .color(theme::muted(ui)),
         );
     }
     ui.add_space(8.0);

@@ -225,7 +225,8 @@ pub(crate) struct ArchiveFsApp {
     /// Session-only ScreenScraper metadata-provider settings and connection
     /// status. Credentials are deliberately never loaded from disk.
     pub(crate) screenscraper_page: screenscraper_page::ScreenScraperPageState,
-    pub(crate) screenscraper_enrichment: screenscraper_enrichment_page::ScreenScraperEnrichmentState,
+    pub(crate) screenscraper_enrichment:
+        screenscraper_enrichment_page::ScreenScraperEnrichmentState,
     /// The last authoritative RomM snapshot. `None` until the first status load,
     /// so the card shows "reading" rather than a screenful of zeroes.
     pub(crate) romm_ui: RommUiState,
@@ -367,20 +368,46 @@ impl ArchiveFsApp {
     }
 
     pub(crate) fn new(context: egui::Context) -> Self {
+        Self::new_with_initial_load(context, true)
+    }
+
+    /// Constructs the legacy workflow host without starting its catalogue
+    /// workers. GUI v2 owns its own library snapshot and creates this host
+    /// lazily for embedded specialist panels; starting both generations of
+    /// catalogue loaders at once duplicates production-scale database work
+    /// and competes with the v2 artwork index worker.
+    #[allow(dead_code)]
+    pub(crate) fn new_without_initial_load(context: egui::Context) -> Self {
+        Self::new_with_initial_load(context, false)
+    }
+
+    fn new_with_initial_load(context: egui::Context, initial_load: bool) -> Self {
         theme::apply(&context);
         let gui_config = GuiConfigSnapshot::load_default();
         let generation = RefreshGeneration::INITIAL;
         let database_generation = DatabaseGeneration::INITIAL;
         let mut history = OperationHistory::default();
-        history.record(HistoryEntry::new(
-            ActivityAction::Refresh,
-            None,
-            ActivityOutcome::Started,
-            "Loading your library.",
-        ));
+        if initial_load {
+            history.record(HistoryEntry::new(
+                ActivityAction::Refresh,
+                None,
+                ActivityOutcome::Started,
+                "Loading your library.",
+            ));
+        }
         Self {
-            state: start_load(context.clone(), generation, None),
-            database_state: start_database_load(context.clone(), database_generation, None, false),
+            state: if initial_load {
+                start_load(context.clone(), generation, None)
+            } else {
+                LoadState::Error("embedded v2 host has no legacy library snapshot".into())
+            },
+            database_state: if initial_load {
+                start_database_load(context.clone(), database_generation, None, false)
+            } else {
+                DatabaseState::NotCreated {
+                    database_path: default_database_path().unwrap_or_default(),
+                }
+            },
             database_generation,
             needs_attention: needs_attention::AttentionWorkspace::default(),
             cheat_reconciliation_review:
@@ -440,7 +467,8 @@ impl ArchiveFsApp {
             catalogue_bsfree_ui: CatalogueBsFreeUiState::default(),
             gui_config,
             screenscraper_page: screenscraper_page::ScreenScraperPageState::default(),
-            screenscraper_enrichment: screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
+            screenscraper_enrichment:
+                screenscraper_enrichment_page::ScreenScraperEnrichmentState::default(),
             romm_ui: RommUiState::default(),
             selected_evidence_ui: SelectedEvidenceUiState::default(),
             gamer_view_scan_review_available: false,
@@ -728,17 +756,24 @@ impl ArchiveFsApp {
                 self.screenscraper_enrichment.mark_applied_for(archive_id);
                 self.feedback = Some(ActionFeedback {
                     succeeded: true,
-                    message: "Metadata was applied explicitly. Identity and source files were unchanged.".into(),
+                    message:
+                        "Metadata was applied explicitly. Identity and source files were unchanged."
+                            .into(),
                     cleanup: None,
                     warning: None,
-                    more_information: Some(format!("ScreenScraper provider record {}", receipt.provider_record_id)),
+                    more_information: Some(format!(
+                        "ScreenScraper provider record {}",
+                        receipt.provider_record_id
+                    )),
                 });
                 self.start_database_action(context, false);
             }
             Err(error) => {
                 self.feedback = Some(ActionFeedback {
                     succeeded: false,
-                    message: "Metadata could not be applied; the previous library state was preserved.".into(),
+                    message:
+                        "Metadata could not be applied; the previous library state was preserved."
+                            .into(),
                     cleanup: None,
                     warning: Some(error.to_string()),
                     more_information: None,

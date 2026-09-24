@@ -1641,6 +1641,7 @@ fn gamer_view_first_scan_message_uses_plain_language() {
         ingestion_stats: Default::default(),
         ingestion_skip_reasons: Default::default(),
         ingestion_platform_counts: Default::default(),
+        arcade_ingestion: Default::default(),
         ingestion_skipped: Vec::new(),
         ingestion_recognised_sample: Vec::new(),
     };
@@ -2455,10 +2456,7 @@ fn emulator_setup_candidates_are_visible_without_running_doctor() {
     assert!(rendered_text_contains(&output, "Not checked"));
     app.view = MainView::Doctor;
     let on_diagnostics = render_problems_repair_app(&mut app);
-    assert!(rendered_text_contains(
-        &on_diagnostics,
-        "Check My Setup"
-    ));
+    assert!(rendered_text_contains(&on_diagnostics, "Check My Setup"));
 }
 
 #[test]

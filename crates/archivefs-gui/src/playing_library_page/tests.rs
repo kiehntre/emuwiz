@@ -870,7 +870,7 @@ fn romm_preview_shows_slug_counts_visibility_and_keeps_details_collapsed() {
         "reviewed RomM platform `gba`"
     ));
     assert!(rendered_text_contains(&output, "1 game(s), 1 file(s)"));
-    assert!(rendered_text_contains(&output, "Visibility: Unverified"));
+    assert!(rendered_text_contains(&output, "Visibility: Needs setup"));
     assert!(rendered_text_contains(&output, "Apply is blocked"));
     assert!(!rendered_text_contains(&output, "Launcher:"));
 }

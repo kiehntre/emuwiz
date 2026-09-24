@@ -3464,6 +3464,7 @@ fn collection_discovery_panel_speaks_plain_language_not_internal_type_names() {
         ingestion_stats,
         ingestion_skip_reasons,
         ingestion_platform_counts,
+        arcade_ingestion: Default::default(),
         ingestion_skipped: vec![ingestion_item(
             "Unknown.bin",
             None,

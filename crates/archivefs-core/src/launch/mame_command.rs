@@ -4,7 +4,7 @@
 //! never expands an archive, rebuilds a set, or turns filenames into identity.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::dat::dependency::DependencyState;
 use crate::dat::set::{SetResolution, SetState};
@@ -94,7 +94,7 @@ pub fn build_mame_command_plan(
     identity: &CanonicalIdentityStatus,
     set_resolutions: &[SetResolution],
     executable: Option<&std::path::Path>,
-    rom_search_path_configured: bool,
+    rom_search_path: Option<&Path>,
 ) -> MameCommandPlan {
     let mut blockers = Vec::new();
     match identity {
@@ -168,12 +168,31 @@ pub fn build_mame_command_plan(
         if !resolution.dependencies.state.permits_complete()
             && resolution.dependencies.state != DependencyState::NotApplicable
         {
+            let blocked = resolution
+                .dependencies
+                .blocking()
+                .map(|requirement| {
+                    let target = match &requirement.target {
+                        crate::dat::dependency::DependencyTarget::Set { name } => name.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    format!(
+                        "{} {target} ({:?})",
+                        requirement.kind.label(),
+                        requirement.outcome
+                    )
+                })
+                .collect::<Vec<_>>();
             blockers.push(blocker(
                 LaunchBlockerKind::MameDependencyBlocked,
-                format!(
-                    "MAME dependency state is {:?}",
-                    resolution.dependencies.state
-                ),
+                if blocked.is_empty() {
+                    format!(
+                        "MAME dependency state is {:?}",
+                        resolution.dependencies.state
+                    )
+                } else {
+                    format!("MAME dependencies need attention: {}", blocked.join(", "))
+                },
             ));
         }
     }
@@ -183,10 +202,18 @@ pub fn build_mame_command_plan(
             "no discovered MAME executable binding is available",
         ));
     }
-    if !rom_search_path_configured {
+    let rom_search_path = rom_search_path.filter(|path| path.is_absolute());
+    if rom_search_path.is_none() {
         blockers.push(blocker(
             LaunchBlockerKind::MameSearchPathUnconfigured,
-            "the MAME ROM/search path arrangement is not explicitly configured",
+            "the exact MAME ROM/search path is not configured",
+        ));
+    } else if let (Some(resolution), Some(rom_search_path)) = (resolution, rom_search_path)
+        && resolution.archive_path.parent() != Some(rom_search_path)
+    {
+        blockers.push(blocker(
+            LaunchBlockerKind::MameSearchPathUnconfigured,
+            "the selected MAME set is not directly inside the configured ROM/search path",
         ));
     }
     if !blockers.is_empty() {
@@ -194,11 +221,16 @@ pub fn build_mame_command_plan(
     }
     let resolution = resolution.expect("resolution exists when no blockers exist");
     let executable = executable.expect("executable exists when no blockers exist");
+    let rom_search_path = rom_search_path.expect("ROM search path exists when no blockers exist");
     let set_name = resolution.identity.game_name.trim().to_string();
     MameCommandPlan {
         command: Some(MameCommand {
             executable: executable.to_path_buf(),
-            arguments: vec![OsString::from(set_name.as_str())],
+            arguments: vec![
+                OsString::from("-rompath"),
+                rom_search_path.as_os_str().to_os_string(),
+                OsString::from(set_name.as_str()),
+            ],
             working_directory: None,
             set_name,
             selected_content: resolution.archive_path.clone(),

@@ -37,8 +37,8 @@ use std::sync::mpsc::Receiver;
 use archivefs_core::memory_card_inventory::{
     MemoryCardHealth, MemoryCardInventory, Ps2ClusterChainHealth, Ps2DirectoryEntry,
     Ps2DirectoryEntryKind, Ps2FileExportError, Ps2FileExportPlan, Ps2FileExportResult,
-    Ps2InventoryWarning, Ps2PsuExportError, Ps2PsuExportPlan, Ps2PsuExportResult, Ps2SaveDirectory,
-    Ps2SaveFile, Ps2PsuRestoreError, Ps2PsuRestorePlan, Ps2PsuRestoreResult,
+    Ps2InventoryWarning, Ps2PsuExportError, Ps2PsuExportPlan, Ps2PsuExportResult,
+    Ps2PsuRestoreError, Ps2PsuRestorePlan, Ps2PsuRestoreResult, Ps2SaveDirectory, Ps2SaveFile,
     apply_ps2_file_export, apply_ps2_psu_export, apply_ps2_psu_restore, plan_ps2_file_export,
     plan_ps2_psu_export, plan_ps2_psu_restore, undo_ps2_psu_restore,
 };
@@ -236,14 +236,27 @@ pub(crate) fn show_save_vault_landing(
     state: &Pcsx2StatusState,
     save_vault: &mut Pcsx2SaveVaultState,
 ) -> Option<Pcsx2StatusAction> {
-    widgets::workflow_header(ui, "PS2 Save Vault", "Inspect, export and restore saves with a verified backup before changes.");
+    widgets::workflow_header(
+        ui,
+        "PS2 Save Vault",
+        "Inspect, export and restore saves with a verified backup before changes.",
+    );
     let mut action = None;
-    if widgets::action_button(ui, "Check PCSX2 Cards", widgets::ActionStyle::Primary,
-        !matches!(state, Pcsx2StatusState::Loading { .. })).clicked() {
+    if widgets::action_button(
+        ui,
+        "Check PCSX2 Cards",
+        widgets::ActionStyle::Primary,
+        !matches!(state, Pcsx2StatusState::Loading { .. }),
+    )
+    .clicked()
+    {
         action = Some(Pcsx2StatusAction::Load);
     }
     let cards = match state {
-        Pcsx2StatusState::Ready { outcome: Pcsx2StatusOutcome::Found { memory_cards, .. }, .. } => memory_cards.as_slice(),
+        Pcsx2StatusState::Ready {
+            outcome: Pcsx2StatusOutcome::Found { memory_cards, .. },
+            ..
+        } => memory_cards.as_slice(),
         _ => &[],
     };
     ui.label("Choose a card, then select a save to export. Restore and undo retain their review and safety checks.");
@@ -935,7 +948,10 @@ fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
         Ps2PsuRestoreError::ExistingSave(name) => {
             format!("Save already exists on this card: {name}")
         }
-        Ps2PsuRestoreError::InsufficientSpace { required, available } => format!(
+        Ps2PsuRestoreError::InsufficientSpace {
+            required,
+            available,
+        } => format!(
             "Not enough free space: the restore needs {required} blocks, but only {available} are available."
         ),
         Ps2PsuRestoreError::VerificationFailed(detail) => {
@@ -954,7 +970,10 @@ fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
             "The memory card changed since preview; inspect it again before restoring.".into()
         }
         Ps2PsuRestoreError::BackupExists(path) => {
-            format!("Backup already exists, so EmuWiz will not overwrite it: {}", path.display())
+            format!(
+                "Backup already exists, so EmuWiz will not overwrite it: {}",
+                path.display()
+            )
         }
         Ps2PsuRestoreError::InvalidPlan(detail) => format!("Restore was refused: {detail}"),
         Ps2PsuRestoreError::Io(detail) => format!("Restore could not be completed: {detail}"),
@@ -1095,7 +1114,13 @@ fn show_memory_card_contents(
             if card.health == MemoryCardHealth::Healthy
                 && card.ps2_inventory.is_some()
                 && card.ps2_geometry.is_some()
-                && widgets::action_button(ui, "Restore PSU save…", widgets::ActionStyle::Secondary, true).clicked()
+                && widgets::action_button(
+                    ui,
+                    "Restore PSU save…",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
             {
                 let source_psu = rfd::FileDialog::new()
                     .set_title("Choose a local PSU save to restore")
@@ -1113,14 +1138,31 @@ fn show_memory_card_contents(
                         .save_file();
                     if let Some(backup_path) = backup_path {
                         match plan_ps2_psu_restore(card, &source_psu, &backup_path, false) {
-                            Ok(plan) => ui.data_mut(|data| data.insert_temp(psu_restore_dialog_id(), PsuRestoreDialogState::Confirm(Box::new(plan)))),
-                            Err(Ps2PsuRestoreError::ExistingSave(message)) => ui.data_mut(|data| data.insert_temp(psu_restore_dialog_id(), PsuRestoreDialogState::Conflict {
-                                card: Box::new(card.clone()),
-                                source_psu,
-                                backup_path,
-                                message: format!("Save already exists: {message}"),
-                            })),
-                            Err(error) => ui.data_mut(|data| data.insert_temp(psu_restore_dialog_id(), PsuRestoreDialogState::Refused(psu_restore_error_message(&error)))),
+                            Ok(plan) => ui.data_mut(|data| {
+                                data.insert_temp(
+                                    psu_restore_dialog_id(),
+                                    PsuRestoreDialogState::Confirm(Box::new(plan)),
+                                )
+                            }),
+                            Err(Ps2PsuRestoreError::ExistingSave(message)) => ui.data_mut(|data| {
+                                data.insert_temp(
+                                    psu_restore_dialog_id(),
+                                    PsuRestoreDialogState::Conflict {
+                                        card: Box::new(card.clone()),
+                                        source_psu,
+                                        backup_path,
+                                        message: format!("Save already exists: {message}"),
+                                    },
+                                )
+                            }),
+                            Err(error) => ui.data_mut(|data| {
+                                data.insert_temp(
+                                    psu_restore_dialog_id(),
+                                    PsuRestoreDialogState::Refused(psu_restore_error_message(
+                                        &error,
+                                    )),
+                                )
+                            }),
                         };
                     }
                 }
@@ -1143,8 +1185,8 @@ fn show_memory_card_contents(
                 card.card_size_bytes
             ));
             widgets::technical_details(ui, ("card-geometry", card_index), |ui| {
-            if let Some(geometry) = &card.ps2_geometry {
-                ui.label(format!(
+                if let Some(geometry) = &card.ps2_geometry {
+                    ui.label(format!(
                     "Filesystem: PS2 v{} · {}",
                     geometry.version.as_deref().unwrap_or("unknown"),
                     match geometry.representation {
@@ -1153,7 +1195,7 @@ fn show_memory_card_contents(
                         archivefs_core::memory_card_inventory::Ps2PageRepresentation::Unknown => "page representation unknown",
                     }
                 ));
-            }
+                }
             });
             if !card.warnings.is_empty() {
                 widgets::banner(

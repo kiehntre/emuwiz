@@ -1658,6 +1658,25 @@ fn detect_logiqx_ecosystem(
     if contains("fbneo") || contains("fb neo") || contains("finalburn neo") {
         return DatEcosystem::FBNeo;
     }
+    // Older MAME exports use ordinary Logiqx `<datafile>` XML rather than a
+    // `<mame build=...>` root.  Their publisher identity is still explicit in
+    // the internal header (`<name>MAME</name>` / `MAME Arcade ...`), so retain
+    // that declared ecosystem instead of reducing a genuine arcade catalogue
+    // to Generic Logiqx.  Keep this narrower than the substring checks above:
+    // an unrelated DAT mentioning MAME compatibility in prose is not thereby
+    // a MAME catalogue.
+    let declares_mame_arcade = name
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("MAME"))
+        || description.as_deref().is_some_and(|value| {
+            value
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("mame arcade ")
+        });
+    if declares_mame_arcade {
+        return DatEcosystem::MAMEArcade;
+    }
 
     DatEcosystem::GenericLogiqx
 }

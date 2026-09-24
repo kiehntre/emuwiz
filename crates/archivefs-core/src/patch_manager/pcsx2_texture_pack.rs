@@ -536,9 +536,7 @@ pub fn execute_pcsx2_texture_pack_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::patch_manager::pcsx2_local::{
-        Pcsx2InstallationType, Pcsx2ProfileScope,
-    };
+    use crate::patch_manager::pcsx2_local::{Pcsx2InstallationType, Pcsx2ProfileScope};
 
     fn pack() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -658,7 +656,11 @@ mod tests {
     #[test]
     fn clean_create_is_previewed() {
         let root = pack();
-        fs::rename(root.path().join("pack/a.png"), root.path().join("pack/pack-a.png")).unwrap();
+        fs::rename(
+            root.path().join("pack/a.png"),
+            root.path().join("pack/pack-a.png"),
+        )
+        .unwrap();
         let plan = plan_for(root.path());
         assert_eq!(plan.create_count(), 2);
         assert_eq!(plan.replace_count(), 0);
@@ -670,8 +672,16 @@ mod tests {
     fn already_installed_is_detected() {
         let root = pack();
         fs::create_dir_all(root.path().join("config/textures/SLUS-12345")).unwrap();
-        fs::copy(root.path().join("pack/a.png"), root.path().join("config/textures/SLUS-12345/a.png")).unwrap();
-        fs::copy(root.path().join("pack/b.webp"), root.path().join("config/textures/SLUS-12345/b.webp")).unwrap();
+        fs::copy(
+            root.path().join("pack/a.png"),
+            root.path().join("config/textures/SLUS-12345/a.png"),
+        )
+        .unwrap();
+        fs::copy(
+            root.path().join("pack/b.webp"),
+            root.path().join("config/textures/SLUS-12345/b.webp"),
+        )
+        .unwrap();
         let plan = plan_for(root.path());
         assert_eq!(plan.already_installed_count(), 2);
         assert_eq!(plan.create_count(), 0);
@@ -681,18 +691,38 @@ mod tests {
     fn different_destination_requires_explicit_replacement() {
         let root = pack();
         fs::create_dir_all(root.path().join("config/textures/SLUS-12345")).unwrap();
-        fs::write(root.path().join("config/textures/SLUS-12345/a.png"), b"foreign").unwrap();
+        fs::write(
+            root.path().join("config/textures/SLUS-12345/a.png"),
+            b"foreign",
+        )
+        .unwrap();
         let plan = plan_for(root.path());
         assert_eq!(plan.replace_count(), 1);
-        assert!(plan.report.entries.iter().any(|entry| entry.explicit_replacement_permission_required));
+        assert!(
+            plan.report
+                .entries
+                .iter()
+                .any(|entry| entry.explicit_replacement_permission_required)
+        );
     }
 
     #[test]
     fn preview_order_is_deterministic() {
         let root = pack();
         let plan = plan_for(root.path());
-        let names = plan.report.entries.iter().map(|entry| entry.destination_relative_path.clone()).collect::<Vec<_>>();
-        assert_eq!(names, vec![Some(PathBuf::from("SLUS-12345/a.png")), Some(PathBuf::from("SLUS-12345/b.webp"))]);
+        let names = plan
+            .report
+            .entries
+            .iter()
+            .map(|entry| entry.destination_relative_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                Some(PathBuf::from("SLUS-12345/a.png")),
+                Some(PathBuf::from("SLUS-12345/b.webp"))
+            ]
+        );
     }
 
     #[test]

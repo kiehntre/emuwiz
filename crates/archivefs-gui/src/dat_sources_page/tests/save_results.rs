@@ -91,9 +91,14 @@ fn save_open_failure_survives_successful_parsing_and_job_teardown() {
 fn mid_save_database_error_is_failure_and_keeps_technical_detail() {
     let (fixture, mut page, roms) = audit_fixture();
     let path = database(&fixture, Some(&roms));
-    rusqlite::Connection::open(&path).unwrap().execute_batch(
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch(
         "CREATE TRIGGER fail_dat_identity BEFORE INSERT ON library_dat_identities BEGIN SELECT RAISE(ABORT, 'fixture identity write rejected'); END;"
     ).unwrap();
+    // The worker opens the same fixture database to persist the audit. Close
+    // the schema-editing handle before starting it so this test owns no idle
+    // connection that can extend SQLite's lock lifetime under suite load.
+    drop(connection);
     page.database_path = Some(path);
     audit(&mut page, "collection", &roms);
     let saved = result(&page, DatSaveOperation::Audit, "collection");

@@ -9,8 +9,8 @@ use archivefs_core::identity_source::managed_snapshot::{
 };
 use archivefs_core::identity_source::model::IdentityProvider;
 use archivefs_core::identity_source::providers::{
-    check_provider, verify, DetectionClass, ManagedProviderStore, ProviderIdentityResult,
-    ProviderSnapshot,
+    DetectionClass, ManagedProviderStore, ProviderIdentityResult, ProviderSnapshot, check_provider,
+    verify,
 };
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -437,9 +437,18 @@ fn show_identity_result(ui: &mut egui::Ui, result: &ProviderIdentityResult) {
 fn confidence_copy(class: DetectionClass) -> (&'static str, &'static str) {
     match class {
         DetectionClass::OfficialExact => ("Exact", "Official evidence proves the release."),
-        DetectionClass::OfficialFallback => ("Fallback", "The official detector recognised the game through fallback detection."),
-        DetectionClass::OfficialDetectionCoverageGap => ("Coverage gap", "Official software recognises it, but the available reference data cannot prove the exact release."),
-        DetectionClass::EmuwizDerivedProbable => ("Probable", "EmuWiz has strong supporting evidence but not exact official proof."),
+        DetectionClass::OfficialFallback => (
+            "Fallback",
+            "The official detector recognised the game through fallback detection.",
+        ),
+        DetectionClass::OfficialDetectionCoverageGap => (
+            "Coverage gap",
+            "Official software recognises it, but the available reference data cannot prove the exact release.",
+        ),
+        DetectionClass::EmuwizDerivedProbable => (
+            "Probable",
+            "EmuWiz has strong supporting evidence but not exact official proof.",
+        ),
         DetectionClass::Unknown => ("Unknown", "There is not enough evidence yet."),
     }
 }

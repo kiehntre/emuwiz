@@ -2,16 +2,11 @@
 name = "archivefs-cli"
 version.workspace = true
 edition.workspace = true
+autobins = false
 
-# Binary naming during the EmuWiz rename (staged): `emuwiz-cli` is the
-# primary name; `archivefs-cli` remains as a legacy compatibility alias so
-# existing scripts keep working. Both run the exact same code.
+# `archivefs-cli` remains a legacy compatibility alias created by install.sh.
 [[bin]]
 name = "emuwiz-cli"
-path = "src/main.rs"
-
-[[bin]]
-name = "archivefs-cli"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,6 +14,7 @@ archivefs-core = { path = "../archivefs-core" }
 log = "0.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11.0"
 
 [dev-dependencies]
 tempfile = "3"

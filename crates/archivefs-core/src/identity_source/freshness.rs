@@ -305,7 +305,10 @@ mod tests {
             DatFreshnessFailureReason::Network,
         );
         assert_eq!(result.state, DatFreshnessState::CheckFailed);
-        assert_eq!(result.evidence.active_snapshot_version.as_deref(), Some("abc"));
+        assert_eq!(
+            result.evidence.active_snapshot_version.as_deref(),
+            Some("abc")
+        );
     }
 
     #[test]
@@ -328,9 +331,7 @@ mod tests {
     #[test]
     fn screen_scraper_has_no_freshness_source() {
         assert_eq!(
-            tosec_active_import_freshness(None)
-                .evidence
-                .provider,
+            tosec_active_import_freshness(None).evidence.provider,
             DatFreshnessProvider::Tosec
         );
     }
@@ -356,14 +357,22 @@ mod tests {
         let descriptor = ManagedDatSourceDescriptor::mame_software_list("amstrad").unwrap();
         let mut state = ManagedDatState::new(
             &descriptor,
-            ManagedDatSnapshot::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-                .unwrap(),
+            ManagedDatSnapshot::new(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
         )
         .unwrap();
-        assert_eq!(managed_dat_freshness(Some(&state)).state, DatFreshnessState::Unknown);
+        assert_eq!(
+            managed_dat_freshness(Some(&state)).state,
+            DatFreshnessState::Unknown
+        );
         state.upstream_revision = Some("bbbbbbbb".into());
         state.last_checked_at_unix_seconds = Some(42);
-        assert_eq!(managed_dat_freshness(Some(&state)).state, DatFreshnessState::Unknown);
+        assert_eq!(
+            managed_dat_freshness(Some(&state)).state,
+            DatFreshnessState::Unknown
+        );
         assert_eq!(
             managed_dat_freshness_after_successful_check(Some(&state)).state,
             DatFreshnessState::Current
@@ -381,7 +390,10 @@ mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(managed_dat_freshness(Some(&state)).state, DatFreshnessState::Unknown);
+        assert_eq!(
+            managed_dat_freshness(Some(&state)).state,
+            DatFreshnessState::Unknown
+        );
     }
 
     #[test]

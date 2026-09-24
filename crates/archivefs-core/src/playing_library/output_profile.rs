@@ -12,7 +12,7 @@ use crate::dat::identity::{DatPlatformConfidence, DatPlatformIdentity};
 use crate::dat::rename_apply::journal::list_journals;
 use crate::dat::rename_apply::model::{EntryState, TransactionOperation, TransactionState};
 use crate::library_views::{
-    classify_library_view_object, LibraryViewObjectClassification, LibraryViewObjectKind,
+    LibraryViewObjectClassification, LibraryViewObjectKind, classify_library_view_object,
 };
 
 use super::{DestinationConflict, ElectedGame, LinkedLibraryOperation, PlayingLibraryPlan};
@@ -411,12 +411,14 @@ mod tests {
             projected.operations[0].destination_path,
             root.join("unknown/Game With Spaces.zip")
         );
-        assert!(project_generic_playing_library(
-            &plan(root),
-            &identity("../escape"),
-            root.to_path_buf()
-        )
-        .is_err());
+        assert!(
+            project_generic_playing_library(
+                &plan(root),
+                &identity("../escape"),
+                root.to_path_buf()
+            )
+            .is_err()
+        );
     }
 
     #[test]

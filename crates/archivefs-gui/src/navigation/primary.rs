@@ -10,12 +10,13 @@ pub(crate) enum Destination {
     Library,
     Setup,
     Organise,
+    Workshop,
     Enhance,
     Health,
     Settings,
 }
 
-pub(crate) const PRIMARY: [(Destination, &str, NavClick); 7] = [
+pub(crate) const PRIMARY: [(Destination, &str, NavClick); 8] = [
     (Destination::Home, "Home", NavClick::View(MainView::Home)),
     (
         Destination::Library,
@@ -31,6 +32,11 @@ pub(crate) const PRIMARY: [(Destination, &str, NavClick); 7] = [
         Destination::Organise,
         "Organise & Export",
         NavClick::View(MainView::CanonicalOrganisation),
+    ),
+    (
+        Destination::Workshop,
+        "Tools",
+        NavClick::View(MainView::DiscConversion),
     ),
     (
         Destination::Enhance,
@@ -72,8 +78,8 @@ pub(crate) fn destination(view: MainView, overlay: ToolsOverlay) -> Destination 
         | MainView::LibraryViews
         | MainView::Selected
         | MainView::DatSources
-        | MainView::MediaSets
-        | MainView::Museum => Destination::Library,
+        | MainView::MediaSets => Destination::Library,
+        MainView::Museum => Destination::Workshop,
         MainView::Sources
         | MainView::SourcesDiscovery
         | MainView::EmulatorSetup
@@ -82,8 +88,8 @@ pub(crate) fn destination(view: MainView, overlay: ToolsOverlay) -> Destination 
         MainView::CanonicalOrganisation
         | MainView::PublisherProfiles
         | MainView::IdentifyRename
-        | MainView::ExactDuplicateReview
-        | MainView::DiscConversion => Destination::Organise,
+        | MainView::ExactDuplicateReview => Destination::Organise,
+        MainView::DiscConversion => Destination::Workshop,
         MainView::CheatsMods | MainView::CheatSources => Destination::Enhance,
         MainView::NeedsAttention
         | MainView::Problems
@@ -94,8 +100,8 @@ pub(crate) fn destination(view: MainView, overlay: ToolsOverlay) -> Destination 
         | MainView::LibraryViewHistory
         | MainView::Mount
         | MainView::ActiveMounts
-        | MainView::StorageHealth
-        | MainView::TapeInspector => Destination::Health,
+        | MainView::StorageHealth => Destination::Health,
+        MainView::TapeInspector => Destination::Workshop,
         MainView::Settings | MainView::About => Destination::Settings,
     }
 }
@@ -127,7 +133,15 @@ pub(crate) fn entries(group: Destination) -> &'static [NavEntry] {
                     nav_quick_rename("Clean & Rename"),
                     nav_view(MainView::CanonicalOrganisation, "Build Libraries"),
                     nav_view(MainView::ExactDuplicateReview, "Duplicates"),
+                ]
+            }
+        }
+        Destination::Workshop => {
+            const {
+                &[
                     nav_view(MainView::DiscConversion, "Converter"),
+                    nav_view(MainView::TapeInspector, "Tape Inspector"),
+                    nav_view(MainView::Museum, "Museum"),
                 ]
             }
         }
@@ -238,10 +252,8 @@ pub(crate) fn advanced_entries(group: Destination) -> Vec<NavEntry> {
         })
         .collect();
     match group {
-        Destination::Library => entries.push(nav_view(MainView::Museum, "Museum")),
         Destination::Health => entries.extend([
             nav_view(MainView::StorageHealth, "Storage Health"),
-            nav_view(MainView::TapeInspector, "Tape Inspector"),
             nav_view(MainView::RepairHistory, "Repair History"),
         ]),
         Destination::Settings => entries.extend([

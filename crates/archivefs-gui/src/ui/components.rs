@@ -10,7 +10,8 @@ use crate::{ClipboardBackend, open_folder_in_file_manager};
 #[path = "workflow_presentation_tests.rs"]
 mod workflow_presentation_tests;
 
-const EMUWIZ_MASCOT_BADGE_PNG: &[u8] = include_bytes!("../../assets/emuwiz_mascot_badge.png");
+pub(crate) const EMUWIZ_MASCOT_BADGE_PNG: &[u8] =
+    include_bytes!("../../assets/emuwiz_mascot_badge.png");
 const EMUWIZ_MAGIC_DIVIDER_LONG_PNG: &[u8] =
     include_bytes!("../../assets/emuwiz_magic_divider_long.png");
 
@@ -132,6 +133,28 @@ pub(crate) fn info_chip_row(ui: &mut egui::Ui, labels: &[&str]) {
             info_chip(ui, label);
         }
     });
+}
+
+/// A deliberately small, deterministic MrWiz placeholder. It is presentation
+/// only: no network, modal, or assistant state is involved.
+pub(crate) fn mrwiz_tip(ui: &mut egui::Ui, message: &str, dismissed: &mut bool) {
+    if *dismissed {
+        return;
+    }
+    egui::Frame::new()
+        .fill(theme::TEAL.gamma_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.55)))
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("MrWiz tip:");
+                ui.label(message);
+                if ui.small_button("Dismiss").clicked() {
+                    *dismissed = true;
+                }
+            });
+        });
 }
 
 /// A page header with a leading icon, for the major navigation pages. The
@@ -560,7 +583,10 @@ pub(crate) fn aligned_card<R>(
     })
 }
 
-pub(crate) fn full_width_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub(crate) fn full_width_card<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     aligned_card(ui, ui.available_width(), 0.0, add_contents)
 }
 
@@ -579,7 +605,9 @@ pub(crate) fn folder_picker(ui: &mut egui::Ui, label: &str, value: &mut String) 
         ui.horizontal(|ui| {
             let width = (ui.available_width() - 96.0 - ui.spacing().item_spacing.x).max(1.0);
             ui.add_sized(egui::vec2(width, 30.0), egui::TextEdit::singleline(value));
-            if ui.add_sized(egui::vec2(96.0, 30.0), egui::Button::new("Browse…")).clicked()
+            if ui
+                .add_sized(egui::vec2(96.0, 30.0), egui::Button::new("Browse…"))
+                .clicked()
                 && let Some(path) = rfd::FileDialog::new().set_title(label).pick_folder()
             {
                 *value = path.display().to_string();
@@ -1068,6 +1096,7 @@ pub(crate) fn archive_kind_name(kind: ArchiveKind) -> &'static str {
         ArchiveKind::Rar => "RAR",
         ArchiveKind::MegaDriveRom => "Mega Drive ROM",
         ArchiveKind::DirectGameImage => "Game image",
+        ArchiveKind::ArcadeSetDirectory => "Arcade set",
     }
 }
 

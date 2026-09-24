@@ -673,10 +673,12 @@ mod tests {
         assert_eq!(sets[0].members.len(), 2);
         assert_eq!(sets[0].expected_count, None);
         assert_eq!(sets[0].state, MediaSetState::UnverifiedSet);
-        assert!(sets[0]
-            .members
-            .iter()
-            .all(|member| member.ordinal.is_some()));
+        assert!(
+            sets[0]
+                .members
+                .iter()
+                .all(|member| member.ordinal.is_some())
+        );
     }
 
     #[test]

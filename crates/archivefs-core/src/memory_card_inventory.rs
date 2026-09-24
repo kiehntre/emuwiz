@@ -617,15 +617,30 @@ impl std::fmt::Display for Ps2PsuRestoreError {
             Self::InvalidPlan(detail) => write!(formatter, "invalid PS2 restore plan: {detail}"),
             Self::SourceChanged => write!(formatter, "PSU source changed after review"),
             Self::CardChanged => write!(formatter, "memory card changed after review"),
-            Self::ExistingSave(name) => write!(formatter, "save already exists on the card: {name}"),
-            Self::InsufficientSpace { required, available } => write!(
+            Self::ExistingSave(name) => {
+                write!(formatter, "save already exists on the card: {name}")
+            }
+            Self::InsufficientSpace {
+                required,
+                available,
+            } => write!(
                 formatter,
                 "not enough free memory-card space: requires {required} clusters, only {available} available"
             ),
-            Self::BackupExists(path) => write!(formatter, "backup already exists: {}", path.display()),
-            Self::BackupVerificationFailed => write!(formatter, "memory-card backup failed verification"),
-            Self::VerificationFailed(detail) => write!(formatter, "restored memory card failed verification: {detail}"),
-            Self::StaleUndo => write!(formatter, "undo refused because the card changed after restore"),
+            Self::BackupExists(path) => {
+                write!(formatter, "backup already exists: {}", path.display())
+            }
+            Self::BackupVerificationFailed => {
+                write!(formatter, "memory-card backup failed verification")
+            }
+            Self::VerificationFailed(detail) => write!(
+                formatter,
+                "restored memory card failed verification: {detail}"
+            ),
+            Self::StaleUndo => write!(
+                formatter,
+                "undo refused because the card changed after restore"
+            ),
             Self::Io(detail) => write!(formatter, "PS2 restore I/O failed: {detail}"),
         }
     }
@@ -677,7 +692,10 @@ fn validate_backup_path(path: &Path, card: &Path) -> Result<(), Ps2PsuRestoreErr
     if !path.is_absolute()
         || path == card
         || path.components().any(|component| {
-            matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
         })
     {
         return Err(Ps2PsuRestoreError::InvalidPlan(
@@ -694,74 +712,106 @@ fn validate_backup_path(path: &Path, card: &Path) -> Result<(), Ps2PsuRestoreErr
 fn parse_ps2_psu(path: &Path) -> Result<(Ps2PsuRestoreInput, String), Ps2PsuRestoreError> {
     validate_restore_path(path, None)?;
     let metadata = fs::metadata(path).map_err(restore_error)?;
-    if metadata.len() > PS2_PSU_MAX_OUTPUT_BYTES || metadata.len() < (PS2_DIRECTORY_ENTRY_BYTES * 4) as u64 {
-        return Err(Ps2PsuRestoreError::InvalidPlan("PSU size is outside the bounded restore range".into()));
+    if metadata.len() > PS2_PSU_MAX_OUTPUT_BYTES
+        || metadata.len() < (PS2_DIRECTORY_ENTRY_BYTES * 4) as u64
+    {
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "PSU size is outside the bounded restore range".into(),
+        ));
     }
     let bytes = fs::read(path).map_err(restore_error)?;
     let source_sha256 = sha256_hex(&bytes);
     let entry = |index: usize| -> Result<Vec<u8>, Ps2PsuRestoreError> {
-        let start = index.checked_mul(PS2_DIRECTORY_ENTRY_BYTES).ok_or_else(|| {
-            Ps2PsuRestoreError::InvalidPlan("PSU entry offset overflowed".into())
-        })?;
-        let end = start.checked_add(PS2_DIRECTORY_ENTRY_BYTES).ok_or_else(|| {
-            Ps2PsuRestoreError::InvalidPlan("PSU entry range overflowed".into())
-        })?;
-        bytes.get(start..end).map(|value| value.to_vec()).ok_or_else(|| {
-            Ps2PsuRestoreError::InvalidPlan("PSU directory entries are truncated".into())
-        })
+        let start = index
+            .checked_mul(PS2_DIRECTORY_ENTRY_BYTES)
+            .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU entry offset overflowed".into()))?;
+        let end = start
+            .checked_add(PS2_DIRECTORY_ENTRY_BYTES)
+            .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU entry range overflowed".into()))?;
+        bytes
+            .get(start..end)
+            .map(|value| value.to_vec())
+            .ok_or_else(|| {
+                Ps2PsuRestoreError::InvalidPlan("PSU directory entries are truncated".into())
+            })
     };
     let root = entry(0)?;
     let root_entry = ps2_entry(&root, 0);
     if root_entry.kind != Ps2DirectoryEntryKind::Directory || root_entry.length < 2 {
-        return Err(Ps2PsuRestoreError::InvalidPlan("PSU root entry is not a valid directory".into()));
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "PSU root entry is not a valid directory".into(),
+        ));
     }
     let count = root_entry.length as usize;
     if count > PS2_PSU_MAX_FILES + 2 {
-        return Err(Ps2PsuRestoreError::InvalidPlan("PSU contains too many entries".into()));
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "PSU contains too many entries".into(),
+        ));
     }
     let dot = entry(1)?;
     let dotdot = entry(2)?;
     for (raw, expected) in [(&dot, "."), (&dotdot, "..")] {
         let parsed = ps2_entry(raw, 0);
         if parsed.kind != Ps2DirectoryEntryKind::Directory || parsed.display_name != expected {
-            return Err(Ps2PsuRestoreError::InvalidPlan(format!("PSU is missing the {expected} directory entry")));
+            return Err(Ps2PsuRestoreError::InvalidPlan(format!(
+                "PSU is missing the {expected} directory entry"
+            )));
         }
     }
     let mut files = Vec::new();
     let mut names = HashSet::new();
-    let mut data_offset = (count + 1).checked_mul(PS2_DIRECTORY_ENTRY_BYTES).ok_or_else(|| {
-        Ps2PsuRestoreError::InvalidPlan("PSU data offset overflowed".into())
-    })?;
+    let mut data_offset = (count + 1)
+        .checked_mul(PS2_DIRECTORY_ENTRY_BYTES)
+        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU data offset overflowed".into()))?;
     for index in 3..=count {
         let raw = entry(index)?;
         let parsed = ps2_entry(&raw, 0);
         if parsed.kind != Ps2DirectoryEntryKind::RegularFile || !parsed.warnings.is_empty() {
-            return Err(Ps2PsuRestoreError::InvalidPlan("PSU contains an invalid or unsupported file entry".into()));
+            return Err(Ps2PsuRestoreError::InvalidPlan(
+                "PSU contains an invalid or unsupported file entry".into(),
+            ));
         }
-        let name = psu_name_bytes(&parsed.raw_name).map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
+        let name = psu_name_bytes(&parsed.raw_name)
+            .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
         if !names.insert(name.to_vec()) {
-            return Err(Ps2PsuRestoreError::InvalidPlan("PSU contains duplicate file names".into()));
+            return Err(Ps2PsuRestoreError::InvalidPlan(
+                "PSU contains duplicate file names".into(),
+            ));
         }
         let length = parsed.length as usize;
-        let padded = length.div_ceil(PS2_PSU_CLUSTER_BYTES as usize) * PS2_PSU_CLUSTER_BYTES as usize;
-        let end = data_offset.checked_add(padded).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU data range overflowed".into()))?;
-        let data_end = data_offset.checked_add(length).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU file range overflowed".into()))?;
+        let padded =
+            length.div_ceil(PS2_PSU_CLUSTER_BYTES as usize) * PS2_PSU_CLUSTER_BYTES as usize;
+        let end = data_offset
+            .checked_add(padded)
+            .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU data range overflowed".into()))?;
+        let data_end = data_offset
+            .checked_add(length)
+            .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PSU file range overflowed".into()))?;
         if end > bytes.len() {
-            return Err(Ps2PsuRestoreError::InvalidPlan("PSU file data is truncated".into()));
+            return Err(Ps2PsuRestoreError::InvalidPlan(
+                "PSU file data is truncated".into(),
+            ));
         }
         files.push((raw, bytes[data_offset..data_end].to_vec()));
         data_offset = end;
     }
     if data_offset != bytes.len() {
-        return Err(Ps2PsuRestoreError::InvalidPlan("PSU contains unexpected trailing bytes".into()));
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "PSU contains unexpected trailing bytes".into(),
+        ));
     }
-    Ok((Ps2PsuRestoreInput { root, dot, dotdot, files }, source_sha256))
+    Ok((
+        Ps2PsuRestoreInput {
+            root,
+            dot,
+            dotdot,
+            files,
+        },
+        source_sha256,
+    ))
 }
 
-fn restore_chain_set(
-    occupied: &mut HashSet<u32>,
-    chain: &Ps2ClusterChainHealth,
-) {
+fn restore_chain_set(occupied: &mut HashSet<u32>, chain: &Ps2ClusterChainHealth) {
     occupied.extend(chain.clusters.iter().copied());
 }
 
@@ -779,7 +829,11 @@ fn restore_occupied_clusters(
         {
             continue;
         }
-        if let Some(save) = inventory.save_directories.iter().find(|save| save.entry.raw_entry_offset == entry.raw_entry_offset) {
+        if let Some(save) = inventory
+            .save_directories
+            .iter()
+            .find(|save| save.entry.raw_entry_offset == entry.raw_entry_offset)
+        {
             restore_chain_set(&mut occupied, &save.chain_health);
             for file in &save.files {
                 restore_chain_set(&mut occupied, &file.chain_health);
@@ -789,10 +843,17 @@ fn restore_occupied_clusters(
     occupied
 }
 
-fn restore_write_logical_cluster(bytes: &mut [u8], geometry: &Ps2Geometry, absolute: u32, data: &[u8]) -> Result<(), Ps2PsuRestoreError> {
+fn restore_write_logical_cluster(
+    bytes: &mut [u8],
+    geometry: &Ps2Geometry,
+    absolute: u32,
+    data: &[u8],
+) -> Result<(), Ps2PsuRestoreError> {
     let cluster_bytes = ps2_cluster_bytes(geometry);
     if data.len() != cluster_bytes || absolute >= geometry.clusters_per_card {
-        return Err(Ps2PsuRestoreError::InvalidPlan("logical cluster write is outside card geometry".into()));
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "logical cluster write is outside card geometry".into(),
+        ));
     }
     let stride = geometry.page_stride_bytes as usize;
     let page_data = geometry.page_data_bytes as usize;
@@ -800,41 +861,65 @@ fn restore_write_logical_cluster(bytes: &mut [u8], geometry: &Ps2Geometry, absol
     for page in 0..geometry.pages_per_cluster as usize {
         let source = page * page_data;
         let offset = (first_page + page) * stride;
-        let target = bytes.get_mut(offset..offset + page_data).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("logical cluster write is truncated".into()))?;
+        let target = bytes.get_mut(offset..offset + page_data).ok_or_else(|| {
+            Ps2PsuRestoreError::InvalidPlan("logical cluster write is truncated".into())
+        })?;
         target.copy_from_slice(&data[source..source + page_data]);
     }
     Ok(())
 }
 
-fn restore_set_fat(bytes: &mut [u8], geometry: &Ps2Geometry, relative: u32, value: u32) -> Result<(), Ps2PsuRestoreError> {
+fn restore_set_fat(
+    bytes: &mut [u8],
+    geometry: &Ps2Geometry,
+    relative: u32,
+    value: u32,
+) -> Result<(), Ps2PsuRestoreError> {
     let available = geometry.alloc_end.saturating_sub(geometry.alloc_offset);
     if relative >= available {
-        return Err(Ps2PsuRestoreError::InvalidPlan("FAT update is outside allocation area".into()));
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "FAT update is outside allocation area".into(),
+        ));
     }
     let entries_per_cluster = ps2_cluster_bytes(geometry) / 4;
     let indirect_index = relative as usize / entries_per_cluster;
     let indirect_slot = indirect_index / entries_per_cluster;
     let ifc_offset = 0x50usize + indirect_slot * 4;
-    let ifc_cluster = le_u32(bytes, ifc_offset).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT index is unavailable".into()))?;
-    let fat_cluster = ps2_logical_cluster(bytes, geometry, ifc_cluster).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT cluster is unavailable".into()))?;
+    let ifc_cluster = le_u32(bytes, ifc_offset)
+        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT index is unavailable".into()))?;
+    let fat_cluster = ps2_logical_cluster(bytes, geometry, ifc_cluster)
+        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT cluster is unavailable".into()))?;
     let fat_offset = (relative as usize % entries_per_cluster) * 4;
-    let _ = fat_cluster.get(fat_offset..fat_offset + 4).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT entry is unavailable".into()))?;
+    let _ = fat_cluster
+        .get(fat_offset..fat_offset + 4)
+        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT entry is unavailable".into()))?;
     let mut updated = fat_cluster;
     updated[fat_offset..fat_offset + 4].copy_from_slice(&value.to_le_bytes());
     restore_write_logical_cluster(bytes, geometry, ifc_cluster, &updated)
 }
 
-fn restore_set_entry(bytes: &mut [u8], geometry: &Ps2Geometry, offset: u64, raw: &[u8]) -> Result<(), Ps2PsuRestoreError> {
+fn restore_set_entry(
+    bytes: &mut [u8],
+    geometry: &Ps2Geometry,
+    offset: u64,
+    raw: &[u8],
+) -> Result<(), Ps2PsuRestoreError> {
     if raw.len() != PS2_DIRECTORY_ENTRY_BYTES {
-        return Err(Ps2PsuRestoreError::InvalidPlan("directory entry has the wrong size".into()));
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "directory entry has the wrong size".into(),
+        ));
     }
     let cluster_bytes = ps2_cluster_bytes(geometry) as u64;
     let absolute = offset / cluster_bytes;
     let within = (offset % cluster_bytes) as usize;
-    let mut cluster = ps2_logical_cluster(bytes, geometry, absolute as u32).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("directory cluster is unavailable".into()))?;
+    let mut cluster = ps2_logical_cluster(bytes, geometry, absolute as u32).ok_or_else(|| {
+        Ps2PsuRestoreError::InvalidPlan("directory cluster is unavailable".into())
+    })?;
     let end = within + raw.len();
     if end > cluster.len() {
-        return Err(Ps2PsuRestoreError::InvalidPlan("directory entry crosses cluster boundary".into()));
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "directory entry crosses cluster boundary".into(),
+        ));
     }
     cluster[within..end].copy_from_slice(raw);
     restore_write_logical_cluster(bytes, geometry, absolute as u32, &cluster)
@@ -860,13 +945,19 @@ fn restore_link_chain(
 
 fn restore_write_card_atomically(path: &Path, bytes: &[u8]) -> Result<(), Ps2PsuRestoreError> {
     validate_restore_path(path, None)?;
-    let parent = path.parent().ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("card has no parent".into()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("card has no parent".into()))?;
     let temporary = create_restore_temporary(parent)?;
     if let Err(error) = fs::write(&temporary, bytes) {
         let _ = fs::remove_file(&temporary);
         return Err(restore_error(error));
     }
-    let file = fs::OpenOptions::new().read(true).write(true).open(&temporary).map_err(restore_error)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(restore_error)?;
     if let Err(error) = file.sync_all() {
         let _ = fs::remove_file(&temporary);
         return Err(restore_error(error));
@@ -881,14 +972,23 @@ fn restore_write_card_atomically(path: &Path, bytes: &[u8]) -> Result<(), Ps2Psu
 
 fn create_restore_temporary(parent: &Path) -> Result<PathBuf, Ps2PsuRestoreError> {
     for number in 0..32u32 {
-        let path = parent.join(format!(".emuwiz-ps2-restore-{}-{number}.tmp", std::process::id()));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        let path = parent.join(format!(
+            ".emuwiz-ps2-restore-{}-{number}.tmp",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(_) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(restore_error(error)),
         }
     }
-    Err(Ps2PsuRestoreError::Io("could not allocate an owned restore temporary".into()))
+    Err(Ps2PsuRestoreError::Io(
+        "could not allocate an owned restore temporary".into(),
+    ))
 }
 
 pub fn plan_ps2_psu_restore(
@@ -897,17 +997,32 @@ pub fn plan_ps2_psu_restore(
     backup_path: &Path,
     replace_existing: bool,
 ) -> Result<Ps2PsuRestorePlan, Ps2PsuRestoreError> {
-    if card.format != MemoryCardFormat::Ps2 || !card.shared_container || card.health != MemoryCardHealth::Healthy {
-        return Err(Ps2PsuRestoreError::InvalidPlan("only a healthy, supported PS2 card can be modified".into()));
+    if card.format != MemoryCardFormat::Ps2
+        || !card.shared_container
+        || card.health != MemoryCardHealth::Healthy
+    {
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "only a healthy, supported PS2 card can be modified".into(),
+        ));
     }
-    let geometry = card.ps2_geometry.clone().ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PS2 card geometry is unavailable".into()))?;
-    let inventory = card.ps2_inventory.as_ref().ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PS2 card inventory is unavailable".into()))?;
-    validate_source_path(&card.path).map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
+    let geometry = card.ps2_geometry.clone().ok_or_else(|| {
+        Ps2PsuRestoreError::InvalidPlan("PS2 card geometry is unavailable".into())
+    })?;
+    let inventory = card.ps2_inventory.as_ref().ok_or_else(|| {
+        Ps2PsuRestoreError::InvalidPlan("PS2 card inventory is unavailable".into())
+    })?;
+    validate_source_path(&card.path)
+        .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     validate_backup_path(backup_path, &card.path)?;
     let (parsed, source_psu_sha256) = parse_ps2_psu(source_psu)?;
     let root_entry = ps2_entry(&parsed.root, 0);
-    let save_name = psu_name_bytes(&root_entry.raw_name).map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?.to_vec();
-    let existing = inventory.save_directories.iter().find(|save| psu_name_bytes(&save.entry.raw_name).ok() == Some(save_name.as_slice()));
+    let save_name = psu_name_bytes(&root_entry.raw_name)
+        .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?
+        .to_vec();
+    let existing = inventory
+        .save_directories
+        .iter()
+        .find(|save| psu_name_bytes(&save.entry.raw_name).ok() == Some(save_name.as_slice()));
     if existing.is_some() && !replace_existing {
         return Err(Ps2PsuRestoreError::ExistingSave(root_entry.display_name));
     }
@@ -915,16 +1030,27 @@ pub fn plan_ps2_psu_restore(
     let available = geometry.alloc_end.saturating_sub(geometry.alloc_offset);
     let records = parsed.files.len() + 2;
     let cluster_bytes = ps2_cluster_bytes(&geometry) as u64;
-    let directory_clusters = (records as u64 * PS2_DIRECTORY_ENTRY_BYTES as u64).div_ceil(cluster_bytes);
-    let file_clusters = parsed.files.iter().map(|(_, data)| (data.len() as u64).div_ceil(cluster_bytes)).sum::<u64>();
-    let root_capacity = inventory.root_chain_health.clusters.len() as u64 * (cluster_bytes as usize / PS2_DIRECTORY_ENTRY_BYTES) as u64;
-    let root_needs_cluster = existing.is_none() && inventory.root_entries.len() as u64 >= root_capacity;
+    let directory_clusters =
+        (records as u64 * PS2_DIRECTORY_ENTRY_BYTES as u64).div_ceil(cluster_bytes);
+    let file_clusters = parsed
+        .files
+        .iter()
+        .map(|(_, data)| (data.len() as u64).div_ceil(cluster_bytes))
+        .sum::<u64>();
+    let root_capacity = inventory.root_chain_health.clusters.len() as u64
+        * (cluster_bytes as usize / PS2_DIRECTORY_ENTRY_BYTES) as u64;
+    let root_needs_cluster =
+        existing.is_none() && inventory.root_entries.len() as u64 >= root_capacity;
     let required_clusters = directory_clusters + file_clusters + u64::from(root_needs_cluster);
     let free_clusters = (available as u64).saturating_sub(occupied.len() as u64);
     if required_clusters > free_clusters {
-        return Err(Ps2PsuRestoreError::InsufficientSpace { required: required_clusters as u32, available: free_clusters as u32 });
+        return Err(Ps2PsuRestoreError::InsufficientSpace {
+            required: required_clusters as u32,
+            available: free_clusters as u32,
+        });
     }
-    let card_bytes = read_source_card(&card.path).map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
+    let card_bytes =
+        read_source_card(&card.path).map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
     Ok(Ps2PsuRestorePlan {
         source_card_path: card.path.clone(),
         source_psu_path: source_psu.to_path_buf(),
@@ -948,19 +1074,31 @@ pub fn plan_ps2_psu_restore(
 pub fn apply_ps2_psu_restore(
     plan: &Ps2PsuRestorePlan,
 ) -> Result<Ps2PsuRestoreResult, Ps2PsuRestoreError> {
-    validate_source_path(&plan.source_card_path).map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
+    validate_source_path(&plan.source_card_path)
+        .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     validate_backup_path(&plan.backup_path, &plan.source_card_path)?;
     let source_psu_bytes = fs::read(&plan.source_psu_path).map_err(restore_error)?;
     if sha256_hex(&source_psu_bytes) != plan.source_psu_sha256 {
         return Err(Ps2PsuRestoreError::SourceChanged);
     }
-    let original = read_source_card(&plan.source_card_path).map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
-    if sha256_hex(&original) != plan.target_card_sha256 || original.len() as u64 != plan.target_card_size_bytes {
+    let original = read_source_card(&plan.source_card_path)
+        .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
+    if sha256_hex(&original) != plan.target_card_sha256
+        || original.len() as u64 != plan.target_card_size_bytes
+    {
         return Err(Ps2PsuRestoreError::CardChanged);
     }
-    let backup_file = fs::OpenOptions::new().write(true).create_new(true).open(&plan.backup_path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists { Ps2PsuRestoreError::BackupExists(plan.backup_path.clone()) } else { restore_error(error) }
-    })?;
+    let backup_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&plan.backup_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ps2PsuRestoreError::BackupExists(plan.backup_path.clone())
+            } else {
+                restore_error(error)
+            }
+        })?;
     let mut backup_file = backup_file;
     let backup_write = (|| {
         backup_file.write_all(&original).map_err(restore_error)?;
@@ -980,51 +1118,96 @@ pub fn apply_ps2_psu_restore(
 
     let result = (|| {
         let card = inspect_memory_card(&plan.source_card_path).map_err(Ps2PsuRestoreError::Io)?;
-        let inventory = card.ps2_inventory.as_ref().ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("PS2 card inventory disappeared".into()))?;
+        let inventory = card.ps2_inventory.as_ref().ok_or_else(|| {
+            Ps2PsuRestoreError::InvalidPlan("PS2 card inventory disappeared".into())
+        })?;
         let mut bytes = original.clone();
-        let replacing = plan.existing_entry_offset.and_then(|offset| inventory.save_directories.iter().find(|save| save.entry.raw_entry_offset == offset));
+        let replacing = plan.existing_entry_offset.and_then(|offset| {
+            inventory
+                .save_directories
+                .iter()
+                .find(|save| save.entry.raw_entry_offset == offset)
+        });
         let occupied = restore_occupied_clusters(inventory, replacing);
-        let available = plan.geometry.alloc_end.saturating_sub(plan.geometry.alloc_offset);
+        let available = plan
+            .geometry
+            .alloc_end
+            .saturating_sub(plan.geometry.alloc_offset);
         let cluster_bytes = ps2_cluster_bytes(&plan.geometry) as u64;
         let records = plan.parsed.files.len() + 2;
-        let directory_clusters = (records as u64 * PS2_DIRECTORY_ENTRY_BYTES as u64).div_ceil(cluster_bytes) as usize;
-        let file_clusters = plan.parsed.files.iter().map(|(_, data)| (data.len() as u64).div_ceil(cluster_bytes) as usize).sum::<usize>();
-        let root_capacity = inventory.root_chain_health.clusters.len() * (cluster_bytes as usize / PS2_DIRECTORY_ENTRY_BYTES);
-        let root_needs_cluster = plan.existing_entry_offset.is_none() && inventory.root_entries.len() >= root_capacity;
+        let directory_clusters =
+            (records as u64 * PS2_DIRECTORY_ENTRY_BYTES as u64).div_ceil(cluster_bytes) as usize;
+        let file_clusters = plan
+            .parsed
+            .files
+            .iter()
+            .map(|(_, data)| (data.len() as u64).div_ceil(cluster_bytes) as usize)
+            .sum::<usize>();
+        let root_capacity = inventory.root_chain_health.clusters.len()
+            * (cluster_bytes as usize / PS2_DIRECTORY_ENTRY_BYTES);
+        let root_needs_cluster =
+            plan.existing_entry_offset.is_none() && inventory.root_entries.len() >= root_capacity;
         let needed = directory_clusters + file_clusters + usize::from(root_needs_cluster);
-        let free = (0..available).filter(|cluster| !occupied.contains(cluster)).collect::<Vec<_>>();
+        let free = (0..available)
+            .filter(|cluster| !occupied.contains(cluster))
+            .collect::<Vec<_>>();
         if free.len() < needed {
-            return Err(Ps2PsuRestoreError::InsufficientSpace { required: needed as u32, available: free.len() as u32 });
+            return Err(Ps2PsuRestoreError::InsufficientSpace {
+                required: needed as u32,
+                available: free.len() as u32,
+            });
         }
         let mut allocation = free.into_iter().take(needed);
         let root_extra = root_needs_cluster.then(|| allocation.next().expect("checked allocation"));
-        let directory_chain = (0..directory_clusters).map(|_| allocation.next().expect("checked allocation")).collect::<Vec<_>>();
+        let directory_chain = (0..directory_clusters)
+            .map(|_| allocation.next().expect("checked allocation"))
+            .collect::<Vec<_>>();
         let mut file_chains = Vec::new();
         for (_, data) in &plan.parsed.files {
             let count = (data.len() as u64).div_ceil(cluster_bytes) as usize;
-            file_chains.push((0..count).map(|_| allocation.next().expect("checked allocation")).collect::<Vec<_>>());
+            file_chains.push(
+                (0..count)
+                    .map(|_| allocation.next().expect("checked allocation"))
+                    .collect::<Vec<_>>(),
+            );
         }
         if let Some(old) = replacing {
             for &cluster in &old.chain_health.clusters {
                 restore_set_fat(&mut bytes, &plan.geometry, cluster, 0xffff_ffff)?;
             }
-            for file in &old.files { for &cluster in &file.chain_health.clusters { restore_set_fat(&mut bytes, &plan.geometry, cluster, 0xffff_ffff)?; } }
+            for file in &old.files {
+                for &cluster in &file.chain_health.clusters {
+                    restore_set_fat(&mut bytes, &plan.geometry, cluster, 0xffff_ffff)?;
+                }
+            }
         }
         if let Some(extra) = root_extra {
-            let last = *inventory.root_chain_health.clusters.last().ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("root directory chain is empty".into()))?;
+            let last = *inventory.root_chain_health.clusters.last().ok_or_else(|| {
+                Ps2PsuRestoreError::InvalidPlan("root directory chain is empty".into())
+            })?;
             restore_set_fat(&mut bytes, &plan.geometry, last, 0x8000_0000 | extra)?;
             restore_set_fat(&mut bytes, &plan.geometry, extra, 0x7fff_ffff)?;
         }
         restore_link_chain(&mut bytes, &plan.geometry, &directory_chain)?;
-        for chain in &file_chains { restore_link_chain(&mut bytes, &plan.geometry, chain)?; }
+        for chain in &file_chains {
+            restore_link_chain(&mut bytes, &plan.geometry, chain)?;
+        }
 
         let root_slot_offset = if let Some(offset) = plan.existing_entry_offset {
             offset
-        } else if let Some(entry) = inventory.root_entries.iter().find(|entry| entry.kind == Ps2DirectoryEntryKind::Unused) {
+        } else if let Some(entry) = inventory
+            .root_entries
+            .iter()
+            .find(|entry| entry.kind == Ps2DirectoryEntryKind::Unused)
+        {
             entry.raw_entry_offset
         } else {
-            let cluster = root_extra.ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("root directory has no free slot".into()))?;
-            (plan.geometry.alloc_offset as u64 + cluster as u64) * cluster_bytes + (root_capacity % (cluster_bytes as usize / PS2_DIRECTORY_ENTRY_BYTES)) as u64 * PS2_DIRECTORY_ENTRY_BYTES as u64
+            let cluster = root_extra.ok_or_else(|| {
+                Ps2PsuRestoreError::InvalidPlan("root directory has no free slot".into())
+            })?;
+            (plan.geometry.alloc_offset as u64 + cluster as u64) * cluster_bytes
+                + (root_capacity % (cluster_bytes as usize / PS2_DIRECTORY_ENTRY_BYTES)) as u64
+                    * PS2_DIRECTORY_ENTRY_BYTES as u64
         };
         let mut root_raw = plan.parsed.root.clone();
         restore_set_entry_u32(&mut root_raw, 0x10, directory_chain[0]);
@@ -1032,43 +1215,98 @@ pub fn apply_ps2_psu_restore(
         restore_set_entry_u32(&mut root_raw, 4, records as u32);
         restore_set_entry(&mut bytes, &plan.geometry, root_slot_offset, &root_raw)?;
         if plan.existing_entry_offset.is_none() {
-            let mut first_raw = ps2_logical_cluster(&bytes, &plan.geometry, plan.geometry.rootdir_cluster).ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("root directory is unavailable".into()))?;
-            let root_count = if root_extra.is_some() || !inventory.root_entries.iter().any(|entry| entry.kind == Ps2DirectoryEntryKind::Unused) {
+            let mut first_raw =
+                ps2_logical_cluster(&bytes, &plan.geometry, plan.geometry.rootdir_cluster)
+                    .ok_or_else(|| {
+                        Ps2PsuRestoreError::InvalidPlan("root directory is unavailable".into())
+                    })?;
+            let root_count = if root_extra.is_some()
+                || !inventory
+                    .root_entries
+                    .iter()
+                    .any(|entry| entry.kind == Ps2DirectoryEntryKind::Unused)
+            {
                 inventory.root_entries.len() as u32 + 1
             } else {
                 inventory.root_entries.len() as u32
             };
             restore_set_entry_u32(&mut first_raw, 4, root_count);
-            restore_write_logical_cluster(&mut bytes, &plan.geometry, plan.geometry.rootdir_cluster, &first_raw)?;
+            restore_write_logical_cluster(
+                &mut bytes,
+                &plan.geometry,
+                plan.geometry.rootdir_cluster,
+                &first_raw,
+            )?;
         }
         let mut directory_bytes = vec![0u8; directory_clusters * cluster_bytes as usize];
         let mut records_raw = vec![plan.parsed.dot.clone(), plan.parsed.dotdot.clone()];
         for ((raw, _), chain) in plan.parsed.files.iter().zip(&file_chains) {
             let mut updated = raw.clone();
-            restore_set_entry_u32(&mut updated, 0x10, chain.first().copied().unwrap_or(u32::MAX));
+            restore_set_entry_u32(
+                &mut updated,
+                0x10,
+                chain.first().copied().unwrap_or(u32::MAX),
+            );
             restore_set_entry_u32(&mut updated, 0x14, directory_chain[0]);
             records_raw.push(updated);
         }
-        for (index, raw) in records_raw.iter().enumerate() { directory_bytes[index * PS2_DIRECTORY_ENTRY_BYTES..(index + 1) * PS2_DIRECTORY_ENTRY_BYTES].copy_from_slice(raw); }
-        for (index, &cluster) in directory_chain.iter().enumerate() { restore_write_logical_cluster(&mut bytes, &plan.geometry, plan.geometry.alloc_offset + cluster, &directory_bytes[index * cluster_bytes as usize..(index + 1) * cluster_bytes as usize])?; }
+        for (index, raw) in records_raw.iter().enumerate() {
+            directory_bytes
+                [index * PS2_DIRECTORY_ENTRY_BYTES..(index + 1) * PS2_DIRECTORY_ENTRY_BYTES]
+                .copy_from_slice(raw);
+        }
+        for (index, &cluster) in directory_chain.iter().enumerate() {
+            restore_write_logical_cluster(
+                &mut bytes,
+                &plan.geometry,
+                plan.geometry.alloc_offset + cluster,
+                &directory_bytes
+                    [index * cluster_bytes as usize..(index + 1) * cluster_bytes as usize],
+            )?;
+        }
         for ((_, data), chain) in plan.parsed.files.iter().zip(&file_chains) {
             for (index, &cluster) in chain.iter().enumerate() {
                 let mut payload = vec![0u8; cluster_bytes as usize];
                 let start = index * cluster_bytes as usize;
                 let end = (start + payload.len()).min(data.len());
-                if start < end { payload[..end - start].copy_from_slice(&data[start..end]); }
-                restore_write_logical_cluster(&mut bytes, &plan.geometry, plan.geometry.alloc_offset + cluster, &payload)?;
+                if start < end {
+                    payload[..end - start].copy_from_slice(&data[start..end]);
+                }
+                restore_write_logical_cluster(
+                    &mut bytes,
+                    &plan.geometry,
+                    plan.geometry.alloc_offset + cluster,
+                    &payload,
+                )?;
             }
         }
         restore_write_card_atomically(&plan.source_card_path, &bytes)?;
         let after = inspect_memory_card(&plan.source_card_path).map_err(Ps2PsuRestoreError::Io)?;
-        if after.card_size_bytes != plan.target_card_size_bytes || after.health != MemoryCardHealth::Healthy || !restore_contains_expected(&after, plan) {
+        if after.card_size_bytes != plan.target_card_size_bytes
+            || after.health != MemoryCardHealth::Healthy
+            || !restore_contains_expected(&after, plan)
+        {
             restore_write_card_atomically(&plan.source_card_path, &original)?;
-            return Err(Ps2PsuRestoreError::VerificationFailed("card structure or restored save did not match the reviewed package".into()));
+            return Err(Ps2PsuRestoreError::VerificationFailed(
+                "card structure or restored save did not match the reviewed package".into(),
+            ));
         }
-        Ok(Ps2PsuRestoreResult { source_card_path: plan.source_card_path.clone(), source_psu_path: plan.source_psu_path.clone(), backup_path: plan.backup_path.clone(), backup_sha256, original_card_sha256: plan.target_card_sha256.clone(), post_restore_card_sha256: sha256_hex(&bytes), card_size_bytes: bytes.len() as u64, save_display_name: plan.save_display_name.clone(), file_count: plan.file_count })
+        Ok(Ps2PsuRestoreResult {
+            source_card_path: plan.source_card_path.clone(),
+            source_psu_path: plan.source_psu_path.clone(),
+            backup_path: plan.backup_path.clone(),
+            backup_sha256,
+            original_card_sha256: plan.target_card_sha256.clone(),
+            post_restore_card_sha256: sha256_hex(&bytes),
+            card_size_bytes: bytes.len() as u64,
+            save_display_name: plan.save_display_name.clone(),
+            file_count: plan.file_count,
+        })
     })();
-    if result.is_err() && sha256_hex(&read_source_card(&plan.source_card_path).unwrap_or_default()) != plan.target_card_sha256 {
+    if result.is_err()
+        && sha256_hex(&read_source_card(&plan.source_card_path).unwrap_or_default())
+            != plan.target_card_sha256
+    {
         let _ = restore_write_card_atomically(&plan.source_card_path, &original);
     }
     result
@@ -1083,20 +1321,26 @@ fn restore_contains_expected(card: &MemoryCardInventory, plan: &Ps2PsuRestorePla
     }) else {
         return false;
     };
-    if save.files.len() != plan.file_count || !save.files.iter().all(|file| file.chain_health.complete) {
+    if save.files.len() != plan.file_count
+        || !save.files.iter().all(|file| file.chain_health.complete)
+    {
         return false;
     }
     let Ok(bytes) = read_source_card(&plan.source_card_path) else {
         return false;
     };
     save.files.iter().all(|file| {
-        plan.parsed.files.iter().find(|(raw, data)| {
-            psu_name_bytes(&ps2_entry(raw, 0).raw_name).ok()
+        plan.parsed
+            .files
+            .iter()
+            .find(|(raw, data)| {
+                psu_name_bytes(&ps2_entry(raw, 0).raw_name).ok()
                     == psu_name_bytes(&file.entry.raw_name).ok()
-                && file.declared_size_bytes == data.len() as u64
-                && read_file_chain_bytes(&bytes, &plan.geometry, file)
-                    .is_some_and(|actual| actual == *data)
-        }).is_some()
+                    && file.declared_size_bytes == data.len() as u64
+                    && read_file_chain_bytes(&bytes, &plan.geometry, file)
+                        .is_some_and(|actual| actual == *data)
+            })
+            .is_some()
     })
 }
 
@@ -1120,9 +1364,11 @@ fn read_file_chain_bytes(
 }
 
 pub fn undo_ps2_psu_restore(result: &Ps2PsuRestoreResult) -> Result<(), Ps2PsuRestoreError> {
-    validate_source_path(&result.source_card_path).map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
+    validate_source_path(&result.source_card_path)
+        .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     validate_restore_parent(&result.backup_path)?;
-    let current = read_source_card(&result.source_card_path).map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
+    let current = read_source_card(&result.source_card_path)
+        .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
     if sha256_hex(&current) != result.post_restore_card_sha256 {
         return Err(Ps2PsuRestoreError::StaleUndo);
     }
@@ -1131,12 +1377,19 @@ pub fn undo_ps2_psu_restore(result: &Ps2PsuRestoreResult) -> Result<(), Ps2PsuRe
         return Err(Ps2PsuRestoreError::BackupVerificationFailed);
     }
     let backup = fs::read(&result.backup_path).map_err(restore_error)?;
-    if sha256_hex(&backup) != result.original_card_sha256 || sha256_hex(&backup) != result.backup_sha256 {
+    if sha256_hex(&backup) != result.original_card_sha256
+        || sha256_hex(&backup) != result.backup_sha256
+    {
         return Err(Ps2PsuRestoreError::BackupVerificationFailed);
     }
     restore_write_card_atomically(&result.source_card_path, &backup)?;
-    let restored = read_source_card(&result.source_card_path).map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
-    if sha256_hex(&restored) != result.original_card_sha256 { return Err(Ps2PsuRestoreError::VerificationFailed("undo did not restore the original card bytes".into())); }
+    let restored = read_source_card(&result.source_card_path)
+        .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
+    if sha256_hex(&restored) != result.original_card_sha256 {
+        return Err(Ps2PsuRestoreError::VerificationFailed(
+            "undo did not restore the original card bytes".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2909,7 +3162,10 @@ mod tests {
         assert_eq!(result.original_card_sha256, sha256_hex(&before));
         assert_eq!(result.card_size_bytes, before.len() as u64);
         assert_eq!(fs::read(&card_path).unwrap().len(), before.len());
-        assert_eq!(sha256_hex(&fs::read(&backup).unwrap()), result.backup_sha256);
+        assert_eq!(
+            sha256_hex(&fs::read(&backup).unwrap()),
+            result.backup_sha256
+        );
         assert_ne!(result.post_restore_card_sha256, result.original_card_sha256);
         undo_ps2_psu_restore(&result).unwrap();
         assert_eq!(fs::read(&card_path).unwrap(), before);
@@ -2956,22 +3212,40 @@ mod tests {
         let mut unhealthy = card.clone();
         unhealthy.health = MemoryCardHealth::StructuralWarning;
         assert!(matches!(
-            plan_ps2_psu_restore(&unhealthy, &source_psu, &dir.path().join("unhealthy.card"), true),
+            plan_ps2_psu_restore(
+                &unhealthy,
+                &source_psu,
+                &dir.path().join("unhealthy.card"),
+                true
+            ),
             Err(Ps2PsuRestoreError::InvalidPlan(_))
         ));
 
         let mut no_space = card.clone();
         no_space.ps2_geometry.as_mut().unwrap().alloc_end = 44;
         assert!(matches!(
-            plan_ps2_psu_restore(&no_space, &source_psu, &dir.path().join("no-space.card"), true),
+            plan_ps2_psu_restore(
+                &no_space,
+                &source_psu,
+                &dir.path().join("no-space.card"),
+                true
+            ),
             Err(Ps2PsuRestoreError::InsufficientSpace { .. })
         ));
 
         let backup = dir.path().join("before-restore.card");
         let plan = plan_ps2_psu_restore(&card, &source_psu, &backup, true).unwrap();
         let result = apply_ps2_psu_restore(&plan).unwrap();
-        fs::OpenOptions::new().append(true).open(&card_path).unwrap().write_all(b"changed").unwrap();
-        assert!(matches!(undo_ps2_psu_restore(&result), Err(Ps2PsuRestoreError::StaleUndo)));
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&card_path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(matches!(
+            undo_ps2_psu_restore(&result),
+            Err(Ps2PsuRestoreError::StaleUndo)
+        ));
     }
 
     #[test]

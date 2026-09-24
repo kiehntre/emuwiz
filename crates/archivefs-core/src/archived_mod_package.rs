@@ -369,7 +369,8 @@ mod tests {
         let (dir, path) = zip_fixture(&[("patch.ips", b"PATCHEOF")]);
         let outside = dir.path().join("outside");
         fs::write(&outside, b"sentinel").unwrap();
-        let legacy_temp = std::env::temp_dir().join(format!("emuwiz-mod-inspect-{}", std::process::id()));
+        let legacy_temp =
+            std::env::temp_dir().join(format!("emuwiz-mod-inspect-{}", std::process::id()));
         let _ = fs::remove_dir_all(&legacy_temp);
         fs::create_dir(&legacy_temp).unwrap();
         symlink(&outside, legacy_temp.join("patch-0")).unwrap();

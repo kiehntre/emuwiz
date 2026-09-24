@@ -167,10 +167,11 @@ CARGO_TARGET_DIR=/home/davedap/.cache/emuwiz-cargo-target \
 CARGO_INCREMENTAL=0 cargo build --release -p archivefs-gui
 ```
 
-The primary release executable is
+The primary release GUI executable is
 `/home/davedap/.cache/emuwiz-cargo-target/release/emuwiz`.
-The package also builds `emuwiz-gui` and the legacy `archivefs-gui` alias.
-All three use the same GUI library.
+It launches the native GUI v2 experience. The package also builds
+`emuwiz-gui` and the legacy `archivefs-gui` compatibility aliases; all three
+resolve to the same v2 application.
 
 Run as `davedap`, using the existing XFCE/Sunshine X11 session (not a new
 display or D-Bus session):

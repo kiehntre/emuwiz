@@ -196,7 +196,6 @@ pub fn add_screenscraper(
         detail: format!("cached record {}", enrichment.provider_game_id),
     });
 }
-
 /// Resolves each field and asset independently.  This is the important
 /// distinction from a provider-level winner: a cover may come from Local,
 /// screenshots from ES-DE, and description from a cached ScreenScraper record.
@@ -470,7 +469,6 @@ mod tests {
             artwork_cache_key("id", Provider::EsDe, AssetKind::CoverFront, "ref")
         );
     }
-
     #[test]
     fn screenscraper_adapter_adds_descriptive_fields_only() {
         use crate::identity_source::screenscraper::{
