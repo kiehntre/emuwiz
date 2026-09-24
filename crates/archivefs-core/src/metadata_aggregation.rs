@@ -138,6 +138,65 @@ pub struct AggregationInput {
     pub provider_status: Vec<ProviderStatus>,
 }
 
+/// Projects an already-retrieved ScreenScraper result into the shared
+/// provider-neutral model. This function performs no network I/O and does not
+/// project identity contributions or URL-only media references into identity
+/// or local artwork.
+pub fn add_screenscraper(
+    input: &mut AggregationInput,
+    enrichment: &crate::identity_source::screenscraper::ScreenScraperEnrichment,
+) {
+    use crate::identity_source::screenscraper::EnrichedField;
+
+    let add =
+        |input: &mut AggregationInput, field: MetadataField, value: Option<&EnrichedField>| {
+            if let Some(value) = value.filter(|value| !value.value.trim().is_empty()) {
+                input.metadata.push(MetadataCandidate {
+                    field,
+                    value: value.value.clone(),
+                    provenance: Provenance {
+                        provider: Provider::ScreenScraper,
+                        source_class: SourceClass::ProviderCache,
+                        retrieved_at_unix_seconds: value.provenance.retrieved_at_unix_seconds,
+                        detail: format!(
+                            "record {} · {}",
+                            value.provenance.provider_record_id, value.provenance.match_basis
+                        ),
+                        cache_path: None,
+                    },
+                });
+            }
+        };
+    add(input, MetadataField::Title, enrichment.title.as_ref());
+    add(
+        input,
+        MetadataField::Description,
+        enrichment.description.as_ref(),
+    );
+    add(
+        input,
+        MetadataField::ReleaseDate,
+        enrichment.release_date.as_ref(),
+    );
+    add(
+        input,
+        MetadataField::Developer,
+        enrichment.developer.as_ref(),
+    );
+    add(
+        input,
+        MetadataField::Publisher,
+        enrichment.publisher.as_ref(),
+    );
+    add(input, MetadataField::Genre, enrichment.genre.as_ref());
+    add(input, MetadataField::Region, enrichment.region.as_ref());
+    input.provider_status.push(ProviderStatus {
+        provider: Provider::ScreenScraper,
+        active: true,
+        detail: format!("cached record {}", enrichment.provider_game_id),
+    });
+}
+
 /// Resolves each field and asset independently.  This is the important
 /// distinction from a provider-level winner: a cover may come from Local,
 /// screenshots from ES-DE, and description from a cached ScreenScraper record.
@@ -410,5 +469,51 @@ mod tests {
             artwork_cache_key("id", Provider::Romm, AssetKind::CoverFront, "ref"),
             artwork_cache_key("id", Provider::EsDe, AssetKind::CoverFront, "ref")
         );
+    }
+
+    #[test]
+    fn screenscraper_adapter_adds_descriptive_fields_only() {
+        use crate::identity_source::screenscraper::{
+            EnrichedField, IdentityContribution, MetadataProvenance, ScreenScraperEnrichment,
+        };
+        let field = |value: &str| EnrichedField {
+            value: value.into(),
+            provenance: MetadataProvenance {
+                provider: "ScreenScraper",
+                provider_record_id: "42".into(),
+                retrieved_at_unix_seconds: 7,
+                match_basis: "hash match".into(),
+            },
+        };
+        let enrichment = ScreenScraperEnrichment {
+            identity_contribution: IdentityContribution::None,
+            provider_game_id: "42".into(),
+            title: Some(field("Provider title")),
+            alternative_title: None,
+            description: Some(field("Description")),
+            release_date: None,
+            developer: None,
+            publisher: None,
+            genre: Some(field("RPG")),
+            players: None,
+            rating: None,
+            region: None,
+            language: None,
+            external_url: None,
+            media_references: Vec::new(),
+        };
+        let mut input = AggregationInput::default();
+        add_screenscraper(&mut input, &enrichment);
+        let resolved = resolve(input);
+        assert_eq!(
+            resolved.fields[&MetadataField::Title].value,
+            "Provider title"
+        );
+        assert_eq!(resolved.fields[&MetadataField::Genre].value, "RPG");
+        assert!(resolved
+            .fields
+            .values()
+            .all(|candidate| candidate.provenance.provider == Provider::ScreenScraper));
+        assert!(resolved.fields.get(&MetadataField::Platform).is_none());
     }
 }
