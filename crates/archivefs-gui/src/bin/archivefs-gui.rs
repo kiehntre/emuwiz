@@ -1,10 +1,5 @@
-//! Thin launcher for the `archivefs-gui` executable.
-//!
-//! All three shipped GUI binaries are identical and exist only so existing
-//! launchers keep working during the EmuWiz rename. The GUI itself lives in
-//! the `archivefs_gui` library, so it compiles once rather than once per
-//! binary name.
+//! Compatibility launcher for the authoritative native EmuWiz GUI v2.
 
 fn main() -> eframe::Result<()> {
-    archivefs_gui::run()
+    archivefs_gui::gui_v2::run()
 }

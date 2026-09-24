@@ -37,6 +37,11 @@ path = "src/bin/archivefs-gui.rs"
 # Nothing to test in a launcher; the suite lives in the library target.
 test = false
 
+[[bin]]
+name = "emuwiz-v2"
+path = "src/bin/emuwiz-v2.rs"
+test = false
+
 [dependencies]
 archivefs-core = { path = "../archivefs-core" }
 log = "0.4"

@@ -166,6 +166,9 @@ mod app_reactions;
 mod app_shell;
 mod archive_context;
 use archive_context::ArchiveContext;
+/// The intended normal EmuWiz product surface. Legacy modular workflows are
+/// reached through explicit handoff from this module while parity is completed.
+pub mod gui_v2;
 mod archive_inspector_controller;
 mod artwork_media_state;
 mod catalogue_bsfree_ui_state;
