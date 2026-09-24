@@ -510,10 +510,12 @@ mod tests {
             "Provider title"
         );
         assert_eq!(resolved.fields[&MetadataField::Genre].value, "RPG");
-        assert!(resolved
-            .fields
-            .values()
-            .all(|candidate| candidate.provenance.provider == Provider::ScreenScraper));
+        assert!(
+            resolved
+                .fields
+                .values()
+                .all(|candidate| candidate.provenance.provider == Provider::ScreenScraper)
+        );
         assert!(resolved.fields.get(&MetadataField::Platform).is_none());
     }
 }
