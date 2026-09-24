@@ -2565,6 +2565,29 @@ pub(super) fn show_settings_page(
     ui.add_space(theme::SECTION_GAP);
     widgets::section_header(
         ui,
+        "5. Artwork & metadata aggregation",
+        Some(
+            "Independent local and provider evidence is combined per field; no provider is required.",
+        ),
+    );
+    widgets::card(ui, |ui| {
+        ui.label("Active evidence sources");
+        ui.horizontal_wrapped(|ui| {
+            for provider in archivefs_core::metadata_aggregation::Provider::ALL {
+                ui.label(egui::RichText::new(provider.label()).strong());
+            }
+        });
+        ui.label("Local artwork and cached provider media remain usable when a provider is unavailable. Refresh is explicit through the existing source/provider workflows; opening this page never fetches media.");
+        ui.label("DAT and verified platform identity remain authoritative. Conflicting descriptive values are retained as provenance rather than silently overwriting stronger local facts.");
+        ui.collapsing("Fallback policy", |ui| {
+            ui.label("Local override → verified identity/local evidence → cached provider evidence → bundled fallback");
+            ui.label("Cover, screenshot, logo, hero, title, description, release date, developer, publisher, genre, region, and platform are resolved independently.");
+        });
+    });
+
+    ui.add_space(theme::SECTION_GAP);
+    widgets::section_header(
+        ui,
         &crate::ui::icons::with_icon(crate::ui::icons::ARTWORK, "6. Platform artwork"),
         Some(
             "Manage local, upgrade-stable artwork overrides. EmuWiz never identifies a machine \

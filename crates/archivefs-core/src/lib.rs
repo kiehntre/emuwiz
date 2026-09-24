@@ -73,6 +73,8 @@ pub mod mame_input_requirements;
 pub mod managed_appimage_bootstrap;
 /// Manifest-backed ownership and side-by-side managed AppImage installs.
 pub mod managed_emulator_install;
+/// Provider-neutral, cache-first artwork and metadata evidence resolution.
+pub mod metadata_aggregation;
 /// Bounded MSX standard cassette WAV evidence.
 pub mod msx_tape;
 /// Shared read-only projections of workflow journals into operation receipts
