@@ -11,6 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use super::hackhash_identity::HackHashOutputHashes;
+use crate::standalone_patch::StandalonePatchFormat;
 use url::Url;
 
 use super::managed_snapshot::{
@@ -100,6 +103,53 @@ pub struct HackHashPatch {
     pub patch_type: Option<String>,
     pub filename: Option<String>,
     pub sha1: Option<String>,
+}
+
+/// Native inspection state recorded after a HackHash-derived output is
+/// prepared.  HackHash remains external evidence; this state is the result of
+/// EmuWiz inspecting the produced bytes independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HackHashVerificationState {
+    ProviderOutputAndNativeInspection,
+    ProviderOutputNativeIdentityUnavailable,
+    ProviderOutputNativeIdentityConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HackHashNativeInspection {
+    pub complete: bool,
+    pub platform: String,
+    pub format: String,
+    pub evidence: Vec<String>,
+    pub warnings: Vec<String>,
+    pub hashes: HackHashOutputHashes,
+}
+
+/// Durable transformation chain for one generated HackHash output.  This is
+/// stored in the shared transaction journal, alongside the rollback receipt,
+/// rather than in the transient GUI state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HackHashPatchProvenance {
+    pub base_path: std::path::PathBuf,
+    pub base_identity: Option<String>,
+    pub base_sha256: String,
+    pub patch_path: std::path::PathBuf,
+    pub patch_sha256: String,
+    pub patch_format: StandalonePatchFormat,
+    pub patch_source: String,
+    pub expected_output: HackHashOutputHashes,
+    pub actual_output: HackHashOutputHashes,
+    pub output_path: std::path::PathBuf,
+    pub output_sha256: String,
+    pub hack_titles: Vec<String>,
+    pub family_versions: Vec<String>,
+    pub provider_snapshot_sha256: String,
+    pub provider_provenance: String,
+    pub transaction_id: String,
+    pub timestamp_unix_seconds: u64,
+    pub verification_state: HackHashVerificationState,
+    pub native_inspection: HackHashNativeInspection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

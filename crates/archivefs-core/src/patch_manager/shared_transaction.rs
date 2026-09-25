@@ -25,6 +25,7 @@ use super::shared_preview::{
     SharedPreviewReport,
 };
 use crate::default_database_path;
+use crate::identity_source::hackhash::HackHashPatchProvenance;
 
 pub const SHARED_APPLY_SCHEMA_VERSION: u32 = 1;
 /// Version for the durable intent/checkpoint envelope.  It is deliberately
@@ -315,6 +316,8 @@ pub enum SharedContentVerification {
         expected_output_hash: String,
         provider_snapshot_hash: String,
         tool: String,
+        #[serde(default)]
+        provenance: Option<HackHashPatchProvenance>,
     },
     DolphinManagedGameHacking {
         expected_managed_names: Vec<String>,

@@ -46,6 +46,7 @@ pub(super) struct HackHashPageState {
     selected_output: Option<PathBuf>,
     apply_plan: Option<HackHashPatchApplyPlan>,
     apply_result: Option<HackHashPatchApplyResult>,
+    undo_status: Option<archivefs_core::patch_manager::SharedApplyStatus>,
     confirmation: String,
     error: Option<String>,
     remote_url: String,
@@ -224,6 +225,7 @@ impl HackHashPageState {
                         self.selected_patch_inspection = Some(inspection);
                         self.apply_plan = None;
                         self.apply_result = None;
+                        self.undo_status = None;
                         self.error = None;
                     }
                     Err(error) => self.error = Some(format!("Patch hash: {error:?}")),
@@ -243,6 +245,7 @@ impl HackHashPageState {
         self.selected_output = Some(path);
         self.apply_plan = None;
         self.apply_result = None;
+        self.undo_status = None;
     }
 
     fn build_apply_plan(
@@ -301,6 +304,7 @@ impl HackHashPageState {
         ) {
             Ok(result) => {
                 self.apply_result = Some(result);
+                self.undo_status = None;
                 self.error = None;
                 let _ = output;
             }
@@ -535,10 +539,56 @@ impl HackHashPageState {
             } else {
                 ui.label("Apply disabled: exact ReadyToPatch evidence and an explicit output destination are required.");
             }
+            let mut rollback_status = None;
             if let Some(result) = &self.apply_result {
                 ui.label(format!("Apply result: {:?}", result.shared.journal.status));
+                ui.separator();
+                ui.strong("Patch result provenance");
+                ui.label(format!(
+                    "Based on: {}",
+                    result.provenance.base_path.display()
+                ));
+                ui.label(format!("Base hash: {}", result.provenance.base_sha256));
+                ui.label(format!("Patch: {}", result.provenance.patch_path.display()));
+                ui.label(format!(
+                    "Patch identity: {} · {:?}",
+                    result.provenance.patch_sha256, result.provenance.patch_format
+                ));
+                ui.label(format!(
+                    "Result: {}",
+                    result.provenance.output_path.display()
+                ));
+                ui.label(format!("Output hash: {}", result.provenance.output_sha256));
+                ui.label(format!(
+                    "Hack/version: {}",
+                    if result.provenance.family_versions.is_empty() {
+                        result.provenance.hack_titles.join(", ")
+                    } else {
+                        result.provenance.family_versions.join(", ")
+                    }
+                ));
+                ui.label(format!(
+                    "Provider snapshot: {}",
+                    result.provenance.provider_snapshot_sha256
+                ));
+                ui.label(format!(
+                    "Output verified against expected provider hash: {}",
+                    result.provenance.actual_output == result.provenance.expected_output
+                ));
+                ui.label(format!(
+                    "Native identity result: {:?} · {} · {}",
+                    result.provenance.verification_state,
+                    result.provenance.native_inspection.platform,
+                    result.provenance.native_inspection.format
+                ));
+                for warning in &result.provenance.native_inspection.warnings {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
                 if result.shared.journal_path.is_some() {
-                    ui.label("History entry available; the generated output can be undone.");
+                    ui.label(format!(
+                        "History/undo: transaction {}",
+                        result.provenance.transaction_id
+                    ));
                     if ui.button("Undo generated output").clicked() {
                         if let (Ok(history), Ok(backup), Some(root)) = (
                             default_shared_history_root(),
@@ -546,10 +596,19 @@ impl HackHashPageState {
                             self.selected_output.as_ref().and_then(|path| path.parent()),
                         ) {
                             let rollback = undo_hackhash_patch(result, root, history, backup);
-                            ui.label(format!("Undo result: {:?}", rollback.status));
+                            rollback_status = Some(rollback.status);
                         }
                     }
                 }
+                if let Some(status) = self.undo_status {
+                    ui.label(format!("Undo result: {status:?}"));
+                    if status == archivefs_core::patch_manager::SharedApplyStatus::Success {
+                        ui.label("Generated output removed; the provenance remains attached to the rolled-back history entry.");
+                    }
+                }
+            }
+            if rollback_status.is_some() {
+                self.undo_status = rollback_status;
             }
             return;
         }
