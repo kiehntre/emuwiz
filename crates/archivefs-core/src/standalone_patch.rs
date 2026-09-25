@@ -613,6 +613,95 @@ pub fn apply_standalone_patch(
     })
 }
 
+/// Prepare a bounded patched output without publishing it anywhere.
+///
+/// HackHash's transactional applier uses this byte-producing primitive and
+/// hands the result to the shared transaction executor.  Keeping preparation
+/// separate from publication ensures the standalone output publisher cannot
+/// accidentally become a second writer for a HackHash apply.
+pub fn prepare_standalone_patch_output(
+    plan: &StandalonePatchApplyPlan,
+) -> Result<PreparedPatchOutput, StandalonePatchError> {
+    let base =
+        fs::read(&plan.reviewed.base_path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    if base.len() as u64 > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    let base_hash = hex_digest(&base);
+    if plan.reviewed.base_sha256.as_deref() != Some(base_hash.as_str()) {
+        return Err(StandalonePatchError::Malformed(
+            "base changed since review".into(),
+        ));
+    }
+    let inspection = inspect_standalone_patch(&plan.reviewed.patch_path)?;
+    if inspection.patch_sha256 != plan.reviewed.patch_sha256 {
+        return Err(StandalonePatchError::Malformed(
+            "patch changed since review".into(),
+        ));
+    }
+    let patch =
+        fs::read(&plan.reviewed.patch_path).map_err(|e| StandalonePatchError::Io(e.to_string()))?;
+    let patch_input = match plan.reviewed.header_adjustment {
+        HeaderAdjustment::None => base.as_slice(),
+        HeaderAdjustment::Strip512ByteCopierHeader => base.get(512..).ok_or_else(|| {
+            StandalonePatchError::Malformed("selected base has no complete 512-byte header".into())
+        })?,
+    };
+    if inspection
+        .source_crc32
+        .is_some_and(|expected| crc32(patch_input) != expected)
+    {
+        return Err(StandalonePatchError::Malformed(
+            "base CRC differs from reviewed patch source checksum".into(),
+        ));
+    }
+    let (output, application) = match inspection.format {
+        StandalonePatchFormat::Ips => (apply_ips(patch_input, &patch)?, "EmuWiz IPS applier"),
+        StandalonePatchFormat::Bps => (apply_bps(patch_input, &patch)?, "EmuWiz BPS applier"),
+        StandalonePatchFormat::Ups => (apply_ups(patch_input, &patch)?, "EmuWiz UPS applier"),
+        StandalonePatchFormat::Ppf => (apply_ppf3(patch_input, &patch)?, "EmuWiz PPF3 applier"),
+        StandalonePatchFormat::XdeltaVcdiff => (
+            apply_xdelta3(
+                &plan.reviewed.base_path,
+                &plan.reviewed.patch_path,
+                plan.reviewed.base_path.parent().ok_or_else(|| {
+                    StandalonePatchError::UnsafeOutput("base has no parent".into())
+                })?,
+                &patch,
+            )?,
+            "xdelta3 external applier",
+        ),
+        StandalonePatchFormat::Unknown => {
+            return Err(StandalonePatchError::Unsupported(
+                "format is inspection-only".into(),
+            ));
+        }
+    };
+    if output.len() as u64 > MAX_APPLY_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    if inspection
+        .target_size
+        .is_some_and(|size| size != output.len() as u64)
+    {
+        return Err(StandalonePatchError::Malformed(
+            "output size differs from patch declaration".into(),
+        ));
+    }
+    if inspection
+        .target_crc32
+        .is_some_and(|crc| crc32(&output) != crc)
+    {
+        return Err(StandalonePatchError::Malformed(
+            "output CRC mismatch".into(),
+        ));
+    }
+    Ok(PreparedPatchOutput {
+        bytes: output,
+        application: application.into(),
+    })
+}
+
 fn current_source_hash(path: &Path, expected: &str) -> Result<String, PatchOutputRecoveryError> {
     let bytes = fs::read(path).map_err(|error| PatchOutputRecoveryError::Io(error.to_string()))?;
     let hash = hex_digest(&bytes);

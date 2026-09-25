@@ -5,12 +5,16 @@ use archivefs_core::identity_source::hackhash::{
     HACKHASH_PARSER_SCHEMA_VERSION, HackHashExport, HackHashFetchResult, HackHashFetchState,
     HackHashStore, HackHashValidatedImport,
 };
+use archivefs_core::identity_source::hackhash_apply::{
+    HackHashPatchApplyPlan, HackHashPatchApplyResult, apply_hackhash_patch,
+    build_hackhash_patch_apply_plan, undo_hackhash_patch,
+};
 use archivefs_core::identity_source::hackhash_identity::{
     HackHashEvidenceClass, HackHashIdentityResult, HackHashObservedHashes, match_snapshot,
 };
 use archivefs_core::identity_source::hackhash_readiness::{
     HackHashBaseIdentityState, HackHashPatchExecutorAvailability, HackHashPatchReadinessRequest,
-    assess_hackhash_patch_readiness,
+    HackHashPatchReadinessStatus, assess_hackhash_patch_readiness,
 };
 use archivefs_core::identity_source::hashing::hash_file;
 use archivefs_core::identity_source::managed_snapshot::{
@@ -19,6 +23,7 @@ use archivefs_core::identity_source::managed_snapshot::{
 use archivefs_core::identity_source::model::IdentityProvider;
 use archivefs_core::identity_source::settings::default_identity_root;
 use archivefs_core::identity_source::verification::VerificationStore;
+use archivefs_core::patch_manager::{default_shared_backup_root, default_shared_history_root};
 use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::standalone_patch::{StandalonePatchInspection, inspect_standalone_patch};
 use eframe::egui;
@@ -34,9 +39,14 @@ pub(super) struct HackHashPageState {
     active_export: Option<HackHashExport>,
     selected_identity: Option<HackHashIdentityResult>,
     selected_base_hashes: Option<HackHashObservedHashes>,
+    selected_base_path: Option<PathBuf>,
     selected_patch: Option<PathBuf>,
     selected_patch_hashes: Option<HackHashObservedHashes>,
     selected_patch_inspection: Option<StandalonePatchInspection>,
+    selected_output: Option<PathBuf>,
+    apply_plan: Option<HackHashPatchApplyPlan>,
+    apply_result: Option<HackHashPatchApplyResult>,
+    confirmation: String,
     error: Option<String>,
     remote_url: String,
     update: Option<UpdateCheck>,
@@ -165,6 +175,7 @@ impl HackHashPageState {
     pub(super) fn inspect_selected_rom(&mut self, path: &std::path::Path) {
         self.selected_identity = None;
         self.selected_base_hashes = None;
+        self.selected_base_path = Some(path.to_path_buf());
         let (Some(snapshot), Some(export)) = (&self.active, &self.active_export) else {
             return;
         };
@@ -211,12 +222,89 @@ impl HackHashPageState {
                             Some(&hashes.crc32),
                         ));
                         self.selected_patch_inspection = Some(inspection);
+                        self.apply_plan = None;
+                        self.apply_result = None;
                         self.error = None;
                     }
                     Err(error) => self.error = Some(format!("Patch hash: {error:?}")),
                 }
             }
             Err(error) => self.error = Some(format!("Patch inspection: {error}")),
+        }
+    }
+
+    fn choose_output(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose HackHash patched-ROM destination")
+            .save_file()
+        else {
+            return;
+        };
+        self.selected_output = Some(path);
+        self.apply_plan = None;
+        self.apply_result = None;
+    }
+
+    fn build_apply_plan(
+        &mut self,
+        readiness: &archivefs_core::identity_source::hackhash_readiness::HackHashPatchReadinessEvidence,
+    ) {
+        let (Some(base), Some(inspection), Some(output), Some(snapshot)) = (
+            self.selected_base_path.as_ref(),
+            self.selected_patch_inspection.as_ref(),
+            self.selected_output.as_ref(),
+            self.active.as_ref(),
+        ) else {
+            return;
+        };
+        let Some(root) = output.parent() else {
+            self.error = Some("The selected output has no managed parent directory.".into());
+            return;
+        };
+        match archivefs_core::standalone_patch::build_standalone_patch_apply_plan(
+            inspection, base, output, root,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|standalone| {
+            build_hackhash_patch_apply_plan(readiness, standalone, root, output, &snapshot.sha256)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(plan) => {
+                self.apply_plan = Some(plan);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(format!("HackHash apply preview: {error}")),
+        }
+    }
+
+    fn apply(&mut self) {
+        let (Some(plan), Some(snapshot), Some(output)) = (
+            self.apply_plan.as_ref(),
+            self.active.as_ref(),
+            self.selected_output.as_ref(),
+        ) else {
+            return;
+        };
+        let (Ok(history), Ok(backup)) =
+            (default_shared_history_root(), default_shared_backup_root())
+        else {
+            self.error = Some("Shared transaction history storage is unavailable.".into());
+            return;
+        };
+        match apply_hackhash_patch(
+            plan,
+            &snapshot.sha256,
+            &plan.expected_output,
+            &self.confirmation,
+            history,
+            backup,
+        ) {
+            Ok(result) => {
+                self.apply_result = Some(result);
+                self.error = None;
+                let _ = output;
+            }
+            Err(error) => self.error = Some(error.to_string()),
         }
     }
 
@@ -350,6 +438,7 @@ impl HackHashPageState {
             } else {
                 ui.label("Patch: none selected");
             }
+            let mut current_readiness = None;
             if let (Some(base_hashes), Some(patch_hashes), Some(inspection), Some(export)) = (
                 &self.selected_base_hashes,
                 &self.selected_patch_hashes,
@@ -362,13 +451,14 @@ impl HackHashPageState {
                     patch_hashes: patch_hashes.clone(),
                     patch_format: inspection.format,
                     patch_inspection_state: inspection.state,
-                    executor: HackHashPatchExecutorAvailability::StandaloneOnly,
+                    executor: HackHashPatchExecutorAvailability::Transactional,
                     snapshot_state: result.snapshot_state,
                     snapshot_sha256: Some(&result.snapshot_sha256),
                     provider_provenance: "active immutable HackHash snapshot",
                     export,
                     identity: &result,
                 });
+                current_readiness = Some(readiness.clone());
                 ui.label(format!(
                     "Base ROM: {}",
                     readiness
@@ -406,6 +496,60 @@ impl HackHashPageState {
             } else {
                 ui.label("Status: NOT READY");
                 ui.label("Why: select a valid local patch to compare its hash and format against the active evidence.");
+            }
+            ui.separator();
+            ui.strong("Safe patch apply");
+            if ui.button("Choose output destination").clicked() {
+                self.choose_output();
+            }
+            if let Some(output) = &self.selected_output {
+                ui.label(format!("Output destination: {}", output.display()));
+            }
+            if current_readiness.as_ref().is_some_and(|readiness| {
+                readiness.status == HackHashPatchReadinessStatus::ReadyToPatch
+            }) && self.selected_output.is_some()
+            {
+                if self.apply_plan.is_none() {
+                    if ui.button("Preview Apply").clicked() {
+                        if let Some(readiness) = current_readiness.as_ref() {
+                            self.build_apply_plan(readiness);
+                        }
+                    }
+                } else {
+                    ui.label("Planned change: create one managed patched-ROM output; base and patch remain unchanged.");
+                    ui.label("Apply is transactional, atomic, and recorded in shared history.");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.confirmation)
+                            .hint_text("Type APPLY HACKHASH PATCH"),
+                    );
+                    if ui
+                        .add_enabled(
+                            self.confirmation == "APPLY HACKHASH PATCH",
+                            egui::Button::new("Apply"),
+                        )
+                        .clicked()
+                    {
+                        self.apply();
+                    }
+                }
+            } else {
+                ui.label("Apply disabled: exact ReadyToPatch evidence and an explicit output destination are required.");
+            }
+            if let Some(result) = &self.apply_result {
+                ui.label(format!("Apply result: {:?}", result.shared.journal.status));
+                if result.shared.journal_path.is_some() {
+                    ui.label("History entry available; the generated output can be undone.");
+                    if ui.button("Undo generated output").clicked() {
+                        if let (Ok(history), Ok(backup), Some(root)) = (
+                            default_shared_history_root(),
+                            default_shared_backup_root(),
+                            self.selected_output.as_ref().and_then(|path| path.parent()),
+                        ) {
+                            let rollback = undo_hackhash_patch(result, root, history, backup);
+                            ui.label(format!("Undo result: {:?}", rollback.status));
+                        }
+                    }
+                }
             }
             return;
         }

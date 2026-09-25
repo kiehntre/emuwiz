@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::hackhash::{HackHashExport, HackHashRecord};
 use super::hackhash_identity::{
-    HackHashIdentityResult, HackHashObservedHashes, HackHashSnapshotState,
+    HackHashIdentityResult, HackHashObservedHashes, HackHashOutputHashes, HackHashSnapshotState,
 };
 use crate::standalone_patch::{PatchInspectionState, StandalonePatchFormat};
 
@@ -51,6 +51,7 @@ pub struct HackHashPatchReadinessEvidence {
     pub patch_hash_match: bool,
     pub patch_format: StandalonePatchFormat,
     pub expected_output_hashes: Vec<String>,
+    pub expected_output: Option<HackHashOutputHashes>,
     pub hack_titles: Vec<String>,
     pub versions: Vec<String>,
     pub family_versions: Vec<String>,
@@ -93,6 +94,7 @@ pub fn assess_hackhash_patch_readiness(
         patch_hash_match: false,
         patch_format: request.patch_format,
         expected_output_hashes: Vec::new(),
+        expected_output: None,
         hack_titles: Vec::new(),
         versions: Vec::new(),
         family_versions: Vec::new(),
@@ -207,6 +209,14 @@ pub fn assess_hackhash_patch_readiness(
                     .map_or_else(|| record.description.clone(), |base| base.name.clone()),
             );
         }
+    }
+    if patch_matches.len() == 1 {
+        let record = patch_matches[0];
+        result.expected_output = Some(HackHashOutputHashes {
+            sha1: record.sha1.clone(),
+            md5: record.md5.clone(),
+            crc32: record.crc32.clone(),
+        });
     }
     result.expected_output_hashes.sort();
     result.expected_output_hashes.dedup();

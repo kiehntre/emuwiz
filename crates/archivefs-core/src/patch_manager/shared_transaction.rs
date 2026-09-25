@@ -33,6 +33,9 @@ pub const SHARED_APPLY_SCHEMA_VERSION: u32 = 1;
 pub const SHARED_DURABLE_JOURNAL_SCHEMA_VERSION: u32 = 1;
 pub const SHARED_MAX_ENTRIES: usize = 128;
 pub const SHARED_MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+/// ROM-sized generated outputs use a separate bounded in-memory lane. The
+/// ordinary shared source lane remains deliberately small for config files.
+pub const SHARED_MAX_MATERIALIZED_BYTES: u64 = 512 * 1024 * 1024;
 pub const SHARED_MAX_TOTAL_WRITTEN_BYTES: u64 = 32 * 1024 * 1024;
 pub const SHARED_MAX_BACKUP_BYTES: u64 = 32 * 1024 * 1024;
 pub const SHARED_MAX_JOURNAL_BYTES: u64 = 2 * 1024 * 1024;
@@ -303,6 +306,16 @@ pub enum SharedContentVerification {
     CemuGraphicPack,
     Rpcs3OrdinaryMod,
     RetroArchBezel,
+    HackHashPatch {
+        base_hash: String,
+        patch_hash: String,
+        expected_output_sha1: String,
+        expected_output_md5: String,
+        expected_output_crc32: String,
+        expected_output_hash: String,
+        provider_snapshot_hash: String,
+        tool: String,
+    },
     DolphinManagedGameHacking {
         expected_managed_names: Vec<String>,
         require_managed_section: bool,
@@ -345,6 +358,17 @@ pub struct SharedApplyOptions {
     pub current_context: SharedApplyContext,
     pub history_root: PathBuf,
     pub backup_root: PathBuf,
+}
+
+/// Generated output handed directly to the shared atomic writer. No staging
+/// file is created outside the shared journal.
+#[derive(Debug, Clone)]
+pub struct SharedMaterializedOutput {
+    pub source_path: PathBuf,
+    pub source_digest: String,
+    pub output_digest: String,
+    pub bytes: Vec<u8>,
+    pub guard_paths: Vec<(PathBuf, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -895,6 +919,22 @@ pub fn execute_shared_apply(
     plan: &SharedTransactionPlan,
     options: &SharedApplyOptions,
 ) -> SharedApplyResult {
+    execute_shared_apply_internal(plan, options, None)
+}
+
+pub fn execute_shared_materialized_apply(
+    plan: &SharedTransactionPlan,
+    options: &SharedApplyOptions,
+    materialized: &SharedMaterializedOutput,
+) -> SharedApplyResult {
+    execute_shared_apply_internal(plan, options, Some(materialized))
+}
+
+fn execute_shared_apply_internal(
+    plan: &SharedTransactionPlan,
+    options: &SharedApplyOptions,
+    materialized: Option<&SharedMaterializedOutput>,
+) -> SharedApplyResult {
     let effective_dry_run = options.dry_run
         || options
             .confirmation
@@ -1128,6 +1168,7 @@ pub fn execute_shared_apply(
             replacement_approved,
             &mut written,
             &mut backup_bytes,
+            materialized,
             &mut checkpoint,
         );
         journal.entries.push(applied_entry.clone());
@@ -1284,6 +1325,7 @@ fn apply_one(
     replacement_approved: bool,
     written: &mut u64,
     backup_bytes: &mut u64,
+    materialized: Option<&SharedMaterializedOutput>,
     checkpoint: &mut dyn FnMut(SharedEntryRecoveryState, &SharedApplyEntry) -> bool,
 ) -> SharedApplyEntry {
     let mut result = SharedApplyEntry {
@@ -1344,7 +1386,12 @@ fn apply_one(
             "source is outside approved adapter scope",
         );
     }
-    let source_hash = match stable_hash(&source, SHARED_MAX_SOURCE_BYTES) {
+    let source_hash_limit = if materialized.is_some() {
+        SHARED_MAX_MATERIALIZED_BYTES
+    } else {
+        SHARED_MAX_SOURCE_BYTES
+    };
+    let source_hash = match stable_hash(&source, source_hash_limit) {
         Ok(value) => value,
         Err(kind) => {
             return fail_result(
@@ -1366,7 +1413,46 @@ fn apply_one(
             "source digest changed since approved preview",
         );
     }
-    if source_hash.bytes > SHARED_MAX_TOTAL_WRITTEN_BYTES.saturating_sub(*written) {
+    let materialized = materialized.filter(|value| value.source_path == source);
+    if let Some(value) = materialized {
+        if value.source_digest != source_hash.digest
+            || value.bytes.len() as u64 > SHARED_MAX_MATERIALIZED_BYTES
+            || digest_bytes(&value.bytes) != value.output_digest
+        {
+            return fail_result(
+                result,
+                SharedApplyOutcome::SourceChanged,
+                SharedApplyFailureKind::SourceChanged,
+                Some(&source),
+                "materialized output or source precondition changed",
+            );
+        }
+        for (guard, expected) in &value.guard_paths {
+            let observed = match stable_hash(guard, SHARED_MAX_MATERIALIZED_BYTES) {
+                Ok(observed) => observed.digest,
+                Err(kind) => {
+                    return fail_result(
+                        result,
+                        SharedApplyOutcome::SourceChanged,
+                        kind,
+                        Some(guard),
+                        "materialized output guard could not be revalidated",
+                    );
+                }
+            };
+            if &observed != expected {
+                return fail_result(
+                    result,
+                    SharedApplyOutcome::SourceChanged,
+                    SharedApplyFailureKind::SourceChanged,
+                    Some(guard),
+                    "materialized output guard changed since review",
+                );
+            }
+        }
+    }
+    let output_bytes = materialized.map_or(source_hash.bytes, |value| value.bytes.len() as u64);
+    if output_bytes > SHARED_MAX_TOTAL_WRITTEN_BYTES.saturating_sub(*written) {
         return fail_result(
             result,
             SharedApplyOutcome::WriteFailed,
@@ -1382,6 +1468,7 @@ fn apply_one(
                 | SharedContentVerification::CemuGraphicPack
                 | SharedContentVerification::Rpcs3OrdinaryMod
                 | SharedContentVerification::RetroArchBezel
+                | SharedContentVerification::HackHashPatch { .. }
         )
     );
     let assessment = if nested_mod_package {
@@ -1603,12 +1690,25 @@ fn apply_one(
             "destination mutation intent checkpoint failed",
         );
     }
-    match atomic_write(
-        &source,
-        &destination,
-        &source_hash.digest,
-        plan.proposed_action == PreviewProposedAction::Install,
-    ) {
+    let output_digest = materialized.map_or_else(
+        || source_hash.digest.clone(),
+        |value| value.output_digest.clone(),
+    );
+    let write_result = match materialized {
+        Some(value) => atomic_write_bytes(
+            &value.bytes,
+            &destination,
+            &output_digest,
+            plan.proposed_action == PreviewProposedAction::Install,
+        ),
+        None => atomic_write(
+            &source,
+            &destination,
+            &output_digest,
+            plan.proposed_action == PreviewProposedAction::Install,
+        ),
+    };
+    match write_result {
         Ok(temp) => {
             result.temporary_path = Some(SharedTransactionPath::from_path(&temp));
             if !checkpoint(SharedEntryRecoveryState::DestinationReplaced, &result) {
@@ -1622,7 +1722,7 @@ fn apply_one(
             }
             match verify_entry_content(plan, &destination) {
                 Ok(()) => {
-                    result.final_destination_digest = Some(source_hash.digest);
+                    result.final_destination_digest = Some(output_digest.clone());
                     result.verification_succeeded = true;
                     result.outcome = if plan.proposed_action == PreviewProposedAction::Install {
                         SharedApplyOutcome::InstalledNew
@@ -1639,7 +1739,7 @@ fn apply_one(
                             "verified destination checkpoint failed",
                         );
                     }
-                    *written += source_hash.bytes;
+                    *written += output_bytes;
                 }
                 Err(detail) => {
                     let restore = restore_after_failed_verification(plan, &result, &destination);
@@ -1681,6 +1781,19 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
     let Some(contract) = &plan.content_verification else {
         return Ok(());
     };
+    if let SharedContentVerification::HackHashPatch {
+        expected_output_hash,
+        ..
+    } = contract
+    {
+        let observed = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)
+            .map_err(|kind| format!("live patched ROM could not be re-read: {kind:?}"))?;
+        return if observed.digest == *expected_output_hash {
+            Ok(())
+        } else {
+            Err("live patched ROM hash differs from the prepared output".into())
+        };
+    }
     let bytes = read_bounded(destination, SHARED_MAX_SOURCE_BYTES)
         .map_err(|kind| format!("live target could not be re-read: {kind:?}"))?;
     let text =
@@ -1732,7 +1845,8 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
         SharedContentVerification::LocalModPackage
         | SharedContentVerification::CemuGraphicPack
         | SharedContentVerification::Rpcs3OrdinaryMod
-        | SharedContentVerification::RetroArchBezel => Ok(()),
+        | SharedContentVerification::RetroArchBezel
+        | SharedContentVerification::HackHashPatch { .. } => Ok(()),
     }
 }
 
@@ -2312,6 +2426,18 @@ fn atomic_write(
     if digest_bytes(&bytes) != expected {
         return Err((SharedApplyFailureKind::SourceChanged, None));
     }
+    atomic_write_bytes(&bytes, destination, expected, no_replace)
+}
+
+fn atomic_write_bytes(
+    bytes: &[u8],
+    destination: &Path,
+    expected: &str,
+    no_replace: bool,
+) -> Result<PathBuf, (SharedApplyFailureKind, Option<PathBuf>)> {
+    if bytes.len() as u64 > SHARED_MAX_MATERIALIZED_BYTES {
+        return Err((SharedApplyFailureKind::ResourceLimitReached, None));
+    }
     let parent = destination
         .parent()
         .ok_or((SharedApplyFailureKind::DestinationUnsafe, None))?;
@@ -2326,7 +2452,7 @@ fn atomic_write(
             .create_new(true)
             .open(&temp)
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
-        file.write_all(&bytes)
+        file.write_all(bytes)
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         if should_inject(FaultPoint::Flush) {
             return Err(SharedApplyFailureKind::WriteFailed);
@@ -2334,7 +2460,7 @@ fn atomic_write(
         file.sync_all()
             .map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         set_permissions(&file).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
-        let temp_hash = stable_hash(&temp, SHARED_MAX_SOURCE_BYTES)?;
+        let temp_hash = stable_hash(&temp, SHARED_MAX_MATERIALIZED_BYTES)?;
         if should_inject(FaultPoint::Verification) || temp_hash.digest != expected {
             return Err(SharedApplyFailureKind::VerificationFailed);
         }
@@ -2348,7 +2474,7 @@ fn atomic_write(
             fs::rename(&temp, destination).map_err(|_| SharedApplyFailureKind::WriteFailed)?;
         }
         sync_directory(parent);
-        let final_hash = stable_hash(destination, SHARED_MAX_SOURCE_BYTES)?;
+        let final_hash = stable_hash(destination, SHARED_MAX_MATERIALIZED_BYTES)?;
         if final_hash.digest != expected {
             return Err(SharedApplyFailureKind::VerificationFailed);
         }
@@ -3769,6 +3895,14 @@ fn failure(kind: SharedApplyFailureKind, path: Option<&Path>, detail: &str) -> S
         path: path.map(SharedTransactionPath::from_path),
         detail: detail.to_owned(),
     }
+}
+
+pub fn seal_shared_transaction_plan(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
 }
 
 fn plan_digest(plan: &SharedTransactionPlan) -> Result<String, SharedApplyFailure> {
