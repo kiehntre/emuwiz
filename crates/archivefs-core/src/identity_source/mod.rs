@@ -31,6 +31,7 @@ pub mod cache;
 pub mod fbneo;
 pub mod freshness;
 pub mod hackhash;
+pub mod hackhash_identity;
 pub mod hasheous;
 pub mod hashing;
 pub use freshness::{

@@ -1499,6 +1499,9 @@ impl App {
             .filter(|result| result.platform == game.platform)
             .and_then(|result| result.statuses.get(&id))
             .cloned();
+        self.hackhash
+            .inspect_selected_rom(&game.archive.absolute_path);
+        self.hackhash.show_selected_rom_evidence(ui);
         egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
             let wide = ui.available_width() >= 760.0;
             let cover = if wide { egui::vec2(240.0, 320.0) } else { egui::vec2(168.0, 224.0) };

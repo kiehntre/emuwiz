@@ -5,9 +5,15 @@ use archivefs_core::identity_source::hackhash::{
     HACKHASH_PARSER_SCHEMA_VERSION, HackHashExport, HackHashFetchResult, HackHashFetchState,
     HackHashStore, HackHashValidatedImport,
 };
+use archivefs_core::identity_source::hackhash_identity::{
+    HackHashEvidenceClass, HackHashIdentityResult, HackHashObservedHashes, match_snapshot,
+};
 use archivefs_core::identity_source::managed_snapshot::{
     ActivationPreview, HttpsManagedSourceTransport, ManagedSourceSnapshot, UpdateCheck,
 };
+use archivefs_core::identity_source::model::IdentityProvider;
+use archivefs_core::identity_source::settings::default_identity_root;
+use archivefs_core::identity_source::verification::VerificationStore;
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -19,6 +25,7 @@ pub(super) struct HackHashPageState {
     preview: Option<ActivationPreview>,
     active: Option<ManagedSourceSnapshot>,
     active_export: Option<HackHashExport>,
+    selected_identity: Option<HackHashIdentityResult>,
     error: Option<String>,
     remote_url: String,
     update: Option<UpdateCheck>,
@@ -144,6 +151,30 @@ impl HackHashPageState {
         }
     }
 
+    pub(super) fn inspect_selected_rom(&mut self, path: &std::path::Path) {
+        self.selected_identity = None;
+        let (Some(snapshot), Some(export)) = (&self.active, &self.active_export) else {
+            return;
+        };
+        let Ok(root) = default_identity_root() else {
+            return;
+        };
+        // This reads only an existing, fingerprint-checked explicit hash cache;
+        // opening or hashing the ROM is never part of ordinary browsing.
+        let cache = VerificationStore::new(&root, IdentityProvider::Romm).load();
+        let Some(hashes) = cache.get(path) else {
+            return;
+        };
+        let observed =
+            HackHashObservedHashes::new(Some(&hashes.sha1), Some(&hashes.md5), Some(&hashes.crc32));
+        self.selected_identity = Some(match_snapshot(
+            snapshot,
+            export,
+            &observed,
+            archivefs_core::identity_source::hackhash_identity::HackHashSnapshotState::Active,
+        ));
+    }
+
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
         ui.heading("HackHash provider snapshot");
         ui.label("HackHash is external community evidence. Network access occurs only after you press Check for update or Fetch candidate.");
@@ -256,6 +287,48 @@ impl HackHashPageState {
         ui.collapsing("Evidence boundary", |ui| {
             ui.label("Hash matches are indexed as HackHash external evidence. They never become EmuWiz native Verified identity and conflicting local/No-Intro/Redump evidence is retained.");
         });
+    }
+
+    /// Render the selected-ROM evidence surface.  Hash acquisition remains an
+    /// explicit inspection action owned by the caller; browsing a game never
+    /// reads or hashes its media.
+    pub(super) fn show_selected_rom_evidence(&self, ui: &mut egui::Ui) {
+        if let Some(result) = &self.selected_identity {
+            Self::show_identity_result(ui, result);
+            return;
+        }
+        ui.separator();
+        ui.strong("External hack evidence");
+        ui.label("HackHash");
+        ui.label("No locally inspected output hashes are available for this ROM.");
+        ui.label("Inspect hashes explicitly to compare patched output evidence.");
+        ui.label("HackHash is external community evidence and never native Verified identity.");
+    }
+
+    pub(super) fn show_identity_result(ui: &mut egui::Ui, result: &HackHashIdentityResult) {
+        ui.separator();
+        ui.strong("External hack evidence");
+        ui.label("HackHash");
+        for item in &result.matches {
+            let label = match item.evidence_class {
+                HackHashEvidenceClass::ExactPatchedOutput => "Exact patched-output hash match",
+                HackHashEvidenceClass::ProbableHackFamily => "Probable hack-family relationship",
+                HackHashEvidenceClass::BaseRomRelationship => "Known base-ROM relationship",
+                HackHashEvidenceClass::KnownPatchRelationship => "Known patch relationship",
+                HackHashEvidenceClass::ConflictingExternalClaims => "Conflicting external claims",
+            };
+            ui.label(label);
+            ui.label(format!("{} v{}", item.hack_title, item.version));
+            ui.label(format!(
+                "Provider snapshot: {}",
+                item.provider_snapshot_sha256
+            ));
+            ui.label(&item.provider_provenance);
+        }
+        for conflict in &result.conflicts {
+            ui.colored_label(ui.visuals().warn_fg_color, &conflict.reason);
+        }
+        ui.label("HackHash is external community evidence and never native Verified identity.");
     }
 }
 

@@ -53,7 +53,7 @@ pub struct HackHashRecord {
     pub details: HackHashDetails,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HackHashDetails {
     pub hack_name: String,
