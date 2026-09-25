@@ -61,6 +61,8 @@ pub enum MetadataField {
     Developer,
     Publisher,
     Genre,
+    Players,
+    Rating,
     Region,
     Platform,
 }
@@ -189,6 +191,10 @@ pub fn add_screenscraper(
         enrichment.publisher.as_ref(),
     );
     add(input, MetadataField::Genre, enrichment.genre.as_ref());
+    add(input, MetadataField::Players, enrichment.players.as_ref());
+    if let Some(value) = enrichment.rating.as_ref() {
+        add(input, MetadataField::Rating, Some(value));
+    }
     add(input, MetadataField::Region, enrichment.region.as_ref());
     input.provider_status.push(ProviderStatus {
         provider: Provider::ScreenScraper,

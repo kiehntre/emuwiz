@@ -1920,6 +1920,32 @@ impl App {
     ) {
         ui.strong("Sources");
         let index = self.artwork.index.as_ref();
+        if let Some(resolved) = index.and_then(|index| index.resolved.get(&game)) {
+            if let Some(candidate) = resolved
+                .artwork
+                .get(&archivefs_core::metadata_aggregation::AssetKind::CoverFront)
+            {
+                ui.label(format!(
+                    "Resolved cover: {}",
+                    candidate.provenance.provider.label()
+                ));
+                if candidate.cached {
+                    ui.label("Resolved asset is available from the local cache (including stale-cache policy where permitted).");
+                }
+            }
+            if !resolved.conflicts.is_empty() {
+                ui.label(format!(
+                    "{} descriptive conflict(s) retained for inspection.",
+                    resolved.conflicts.len()
+                ));
+            }
+            if resolved.artwork.values().any(|candidate| {
+                candidate.provenance.source_class
+                    == archivefs_core::metadata_aggregation::SourceClass::LocalOverride
+            }) {
+                ui.label("Local artwork override is active.");
+            }
+        }
         if let Some(source) = index.and_then(|index| index.covers.get(&game)) {
             ui.label(match source {
                 Source::Local(path) => format!("Local file · {}", path.display()),

@@ -5,6 +5,10 @@ use archivefs_core::identity_source::{
     settings::{ProviderSettings, SettingsLocation, default_identity_root},
     status::IdentitySourceApi,
 };
+use archivefs_core::metadata_aggregation::{
+    self, AggregationInput, ArtworkCandidate, AssetKind, MetadataCandidate, MetadataField,
+    Provenance, Provider, ProviderStatus, SourceClass,
+};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
@@ -70,6 +74,10 @@ pub(super) struct MediaIndex {
     pub elapsed_ms: u128,
     pub warnings: Vec<String>,
     pub descriptions: HashMap<i64, String>,
+    /// The provider-neutral result used by every GUI-v2 presentation surface.
+    /// `covers`/`screenshots` below are delivery schedules derived from this
+    /// result, not an independent precedence table.
+    pub resolved: HashMap<i64, metadata_aggregation::ResolvedMetadata>,
     pub diagnostics: HashMap<i64, String>,
 }
 
@@ -163,6 +171,41 @@ impl MediaIndex {
         for game in &library.games {
             let id = game.archive.id;
             let path = &game.archive.absolute_path;
+            let mut metadata = Vec::new();
+            let mut artwork_candidates = Vec::<(ArtworkCandidate, Source)>::new();
+            let add_metadata = |metadata: &mut Vec<MetadataCandidate>,
+                                field,
+                                value: Option<String>,
+                                provider,
+                                detail: &str| {
+                if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                    metadata.push(MetadataCandidate {
+                        field,
+                        value,
+                        provenance: Provenance {
+                            provider,
+                            source_class: SourceClass::ProviderCache,
+                            retrieved_at_unix_seconds: 0,
+                            detail: detail.into(),
+                            cache_path: None,
+                        },
+                    });
+                }
+            };
+            add_metadata(
+                &mut metadata,
+                MetadataField::Title,
+                Some(game.title.clone()),
+                Provider::Local,
+                "local catalogue",
+            );
+            add_metadata(
+                &mut metadata,
+                MetadataField::Platform,
+                Some(game.platform.clone()),
+                Provider::Local,
+                "verified/local platform projection",
+            );
             let mut sources = format!(
                 "ES-DE: {}. LaunchBox: {}.",
                 if esde.is_some() {
@@ -183,15 +226,95 @@ impl MediaIndex {
             {
                 sources.push_str(" ES-DE matched this game.");
                 if let Some(path) = entry.entry.media.cover {
-                    index.covers.insert(id, Source::Local(path));
+                    artwork_candidates.push((
+                        ArtworkCandidate {
+                            kind: AssetKind::CoverFront,
+                            path: path.clone(),
+                            cached: true,
+                            provenance: Provenance {
+                                provider: Provider::EsDe,
+                                source_class: SourceClass::ProviderCache,
+                                retrieved_at_unix_seconds: 0,
+                                detail: entry.entry.provenance.clone(),
+                                cache_path: Some(path.clone()),
+                            },
+                        },
+                        Source::Local(path),
+                    ));
                 }
                 if let Some(path) = entry.entry.media.screenshot {
-                    index
-                        .screenshots
-                        .entry(id)
-                        .or_default()
-                        .push(Source::Local(path));
+                    artwork_candidates.push((
+                        ArtworkCandidate {
+                            kind: AssetKind::Screenshot,
+                            path: path.clone(),
+                            cached: true,
+                            provenance: Provenance {
+                                provider: Provider::EsDe,
+                                source_class: SourceClass::ProviderCache,
+                                retrieved_at_unix_seconds: 0,
+                                detail: entry.entry.provenance.clone(),
+                                cache_path: Some(path.clone()),
+                            },
+                        },
+                        Source::Local(path),
+                    ));
                 }
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Title,
+                    entry.entry.name.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Description,
+                    entry.entry.description.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::ReleaseDate,
+                    entry.entry.release_date.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Developer,
+                    entry.entry.developer.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Publisher,
+                    entry.entry.publisher.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Genre,
+                    entry.entry.genre.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Players,
+                    entry.entry.players.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Rating,
+                    entry.entry.rating.clone(),
+                    Provider::EsDe,
+                    "ES-DE gamelist cache",
+                );
             }
             if let Some(provider) = &launchbox
                 && let Some(found) = provider.lookup(None, Some(path), Some(&game.platform), None)
@@ -202,62 +325,250 @@ impl MediaIndex {
                     .cover
                     .and_then(|reference| reference.hosted_reference)
                 {
-                    index
-                        .covers
-                        .entry(id)
-                        .or_insert_with(|| Source::Local(path.into()));
+                    let path: PathBuf = path.into();
+                    artwork_candidates.push((
+                        ArtworkCandidate {
+                            kind: AssetKind::CoverFront,
+                            path: path.clone(),
+                            cached: true,
+                            provenance: Provenance {
+                                provider: Provider::Local,
+                                source_class: SourceClass::LocalEvidence,
+                                retrieved_at_unix_seconds: 0,
+                                detail: "local provider artwork".into(),
+                                cache_path: Some(path.clone()),
+                            },
+                        },
+                        Source::Local(path),
+                    ));
                 }
                 for reference in snapshot.screenshots.into_iter().take(8) {
                     if let Some(path) = reference.hosted_reference {
-                        index
-                            .screenshots
-                            .entry(id)
-                            .or_default()
-                            .push(Source::Local(path.into()));
+                        let path: PathBuf = path.into();
+                        artwork_candidates.push((
+                            ArtworkCandidate {
+                                kind: AssetKind::Screenshot,
+                                path: path.clone(),
+                                cached: true,
+                                provenance: Provenance {
+                                    provider: Provider::Local,
+                                    source_class: SourceClass::LocalEvidence,
+                                    retrieved_at_unix_seconds: 0,
+                                    detail: "local provider artwork".into(),
+                                    cache_path: Some(path.clone()),
+                                },
+                            },
+                            Source::Local(path),
+                        ));
                     }
                 }
             }
             if let Some(record) = records.get(path) {
-                let description = [
-                    record.synopsis.clone().unwrap_or_default(),
-                    record.genres.join(" · "),
-                    record
-                        .players
-                        .as_ref()
-                        .map(|players| format!("Players: {players}"))
-                        .unwrap_or_default(),
-                    record
-                        .release_year
-                        .map(|year| format!("Released: {year}"))
-                        .unwrap_or_default(),
-                ]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-                if !description.is_empty() {
-                    index.descriptions.insert(id, description);
-                }
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Description,
+                    record.synopsis.clone(),
+                    Provider::Romm,
+                    "RomM identity cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Genre,
+                    (!record.genres.is_empty()).then(|| record.genres.join(" · ")),
+                    Provider::Romm,
+                    "RomM identity cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Players,
+                    record.players.clone(),
+                    Provider::Romm,
+                    "RomM identity cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Rating,
+                    record.rating.map(|value| value.to_string()),
+                    Provider::Romm,
+                    "RomM identity cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::ReleaseDate,
+                    record.release_year.map(|value| value.to_string()),
+                    Provider::Romm,
+                    "RomM identity cache",
+                );
             }
             let local_count = index.screenshots.get(&id).map_or(0, Vec::len);
             if let Some(record) = records.get(path)
                 && let Some(artwork) = &record.artwork
             {
-                index.covers.entry(id).or_insert_with(|| Source::Remote {
-                    record: record.clone(),
-                    kind: Kind::Cover,
-                });
-                for ordinal in 0..artwork.screenshots.len().min(8) {
+                artwork_candidates.push((
+                    ArtworkCandidate {
+                        kind: AssetKind::CoverFront,
+                        path: PathBuf::from(format!("romm://{}/cover", record.provider_game_id)),
+                        cached: false,
+                        provenance: Provenance {
+                            provider: Provider::Romm,
+                            source_class: SourceClass::ProviderCache,
+                            retrieved_at_unix_seconds: record.imported_at_unix_seconds.max(0)
+                                as u64,
+                            detail: "RomM identity cache".into(),
+                            cache_path: None,
+                        },
+                    },
+                    Source::Remote {
+                        record: record.clone(),
+                        kind: Kind::Cover,
+                    },
+                ));
+                for ordinal in 0..record
+                    .artwork
+                    .as_ref()
+                    .map_or(0, |art| art.screenshots.len())
+                    .min(8)
+                {
+                    artwork_candidates.push((
+                        ArtworkCandidate {
+                            kind: AssetKind::Screenshot,
+                            path: PathBuf::from(format!(
+                                "romm://{}/screenshot/{ordinal}",
+                                record.provider_game_id
+                            )),
+                            cached: false,
+                            provenance: Provenance {
+                                provider: Provider::Romm,
+                                source_class: SourceClass::ProviderCache,
+                                retrieved_at_unix_seconds: record.imported_at_unix_seconds.max(0)
+                                    as u64,
+                                detail: "RomM identity cache".into(),
+                                cache_path: None,
+                            },
+                        },
+                        Source::Remote {
+                            record: record.clone(),
+                            kind: Kind::Screenshot(ordinal),
+                        },
+                    ));
+                }
+            }
+            if let Some(saved) = &game.screenscraper {
+                let values = &saved.values;
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Title,
+                    values.title.clone(),
+                    Provider::ScreenScraper,
+                    "accepted ScreenScraper cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Description,
+                    values.synopsis.clone(),
+                    Provider::ScreenScraper,
+                    "accepted ScreenScraper cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Developer,
+                    values.developer.clone(),
+                    Provider::ScreenScraper,
+                    "accepted ScreenScraper cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Publisher,
+                    values.publisher.clone(),
+                    Provider::ScreenScraper,
+                    "accepted ScreenScraper cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Genre,
+                    values.genre.clone(),
+                    Provider::ScreenScraper,
+                    "accepted ScreenScraper cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::Players,
+                    values.players.clone(),
+                    Provider::ScreenScraper,
+                    "accepted ScreenScraper cache",
+                );
+                add_metadata(
+                    &mut metadata,
+                    MetadataField::ReleaseDate,
+                    values.release_year.map(|value| value.to_string()),
+                    Provider::ScreenScraper,
+                    "accepted ScreenScraper cache",
+                );
+            }
+            let resolved = metadata_aggregation::resolve(AggregationInput {
+                metadata,
+                artwork: artwork_candidates
+                    .iter()
+                    .map(|(candidate, _)| candidate.clone())
+                    .collect(),
+                provider_status: vec![
+                    ProviderStatus {
+                        provider: Provider::Local,
+                        active: true,
+                        detail: "local catalogue".into(),
+                    },
+                    ProviderStatus {
+                        provider: Provider::EsDe,
+                        active: esde.is_some(),
+                        detail: "ES-DE cache".into(),
+                    },
+                    ProviderStatus {
+                        provider: Provider::Romm,
+                        active: records.contains_key(path),
+                        detail: "RomM cache".into(),
+                    },
+                    ProviderStatus {
+                        provider: Provider::ScreenScraper,
+                        active: game.screenscraper.is_some(),
+                        detail: "accepted ScreenScraper cache".into(),
+                    },
+                    ProviderStatus {
+                        provider: Provider::Bundled,
+                        active: true,
+                        detail: "bundled fallback".into(),
+                    },
+                ],
+                ..Default::default()
+            });
+            if let Some(candidate) = resolved.artwork.get(&AssetKind::CoverFront) {
+                if let Some((_, source)) = artwork_candidates
+                    .iter()
+                    .find(|(item, _)| item.kind == candidate.kind && item.path == candidate.path)
+                {
+                    index.covers.insert(id, source.clone());
+                }
+            }
+            for (ordinal, candidate) in resolved
+                .artwork
+                .values()
+                .filter(|candidate| candidate.kind == AssetKind::Screenshot)
+                .enumerate()
+            {
+                if let Some((_, source)) = artwork_candidates
+                    .iter()
+                    .find(|(item, _)| item.kind == candidate.kind && item.path == candidate.path)
+                {
                     index
                         .screenshots
                         .entry(id)
                         .or_default()
-                        .push(Source::Remote {
-                            record: record.clone(),
-                            kind: Kind::Screenshot(ordinal),
-                        });
+                        .insert(ordinal, source.clone());
                 }
             }
+            if let Some(description) = resolved.fields.get(&MetadataField::Description) {
+                index.descriptions.insert(id, description.value.clone());
+            }
+            index.resolved.insert(id, resolved);
             if ambiguous.contains(path) {
                 sources.push_str(" Competing RomM records were refused.");
             }
