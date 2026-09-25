@@ -3,6 +3,7 @@ mod activity;
 mod archive_inspector;
 mod artwork;
 mod backend;
+mod bezel;
 mod environment;
 mod guidance;
 mod imagery;
@@ -260,6 +261,7 @@ pub(super) struct App {
     saves_states: saves_states::SavesStatesState,
     archive_inspector: archive_inspector::ArchiveInspectorPageState,
     converter: OpticalConversionPageState,
+    bezel: bezel::BezelPanelState,
 }
 
 impl App {
@@ -326,6 +328,7 @@ impl App {
             saves_states: saves_states::SavesStatesState::default(),
             archive_inspector: archive_inspector::ArchiveInspectorPageState::default(),
             converter: OpticalConversionPageState::default(),
+            bezel: bezel::BezelPanelState::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",

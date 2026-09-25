@@ -98,6 +98,7 @@ fn fixture(context: &egui::Context) -> App {
         saves_states: super::saves_states::SavesStatesState::default(),
         converter: crate::optical_conversion_page::OpticalConversionPageState::default(),
         archive_inspector: super::archive_inspector::ArchiveInspectorPageState::default(),
+        bezel: super::bezel::BezelPanelState::default(),
     }
 }
 
@@ -114,6 +115,19 @@ fn gui_v2_converter_is_a_native_workflow() {
             "missing native converter content: {expected}"
         );
     }
+}
+
+#[test]
+fn artwork_route_exposes_local_first_bezel_preview() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Bezel Game", Some("SNES"))]));
+    app.router.current = Route::Task {
+        section: Section::Artwork,
+        game: 1,
+    };
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value == "Bezel & decorations"));
 }
 
 #[test]

@@ -1859,6 +1859,9 @@ impl App {
                 };
                 ui.heading(&game.title);
                 ui.label(&game.platform);
+                self.bezel.selected_game = Some(game.title.clone());
+                super::bezel::show(ui, &mut self.bezel);
+                ui.separator();
                 ui.horizontal_top(|ui| {
                     self.picture(ui, game, Kind::Cover, egui::vec2(180.0, 240.0));
                     ui.vertical(|ui| {
