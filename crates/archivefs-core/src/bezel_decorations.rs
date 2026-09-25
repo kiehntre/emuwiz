@@ -104,13 +104,23 @@ pub struct DecorationResolution {
 /// User-owned local bezel roots. These are deliberately separate from ROM
 /// source roots: discovery never treats game folders as decoration folders
 /// unless the user explicitly adds them here.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocalBezelConfig {
     pub roots: Vec<PathBuf>,
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
     #[serde(default = "default_max_assets")]
     pub max_assets: usize,
+}
+
+impl Default for LocalBezelConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            max_depth: DEFAULT_MAX_BEZEL_DEPTH,
+            max_assets: DEFAULT_MAX_BEZEL_ASSETS,
+        }
+    }
 }
 
 fn default_max_depth() -> usize {
