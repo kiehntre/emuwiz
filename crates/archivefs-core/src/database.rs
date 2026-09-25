@@ -9220,7 +9220,7 @@ mod tests {
     }
 
     fn create_representative_older_database(path: &Path, schema_version: usize) {
-        assert!(matches!(schema_version, 3 | 4 | 7 | 16));
+        assert!(matches!(schema_version, 3 | 4 | 7 | 16 | 20));
         let mut connection = open_connection(path).unwrap();
         apply_migrations(&mut connection, &MIGRATIONS[..schema_version]).unwrap();
         connection
@@ -9315,16 +9315,16 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 20);
-        assert_eq!(report.applied_versions, vec![17, 18, 19, 20]);
+        assert_eq!(report.to_version, 21);
+        assert_eq!(report.applied_versions, vec![17, 18, 19, 20, 21]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 20);
+        assert_eq!(upgraded.schema_version().unwrap(), 21);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
-        assert_eq!(pending_schema_migration_versions(19).unwrap(), vec![20]);
+        assert_eq!(pending_schema_migration_versions(19).unwrap(), vec![20, 21]);
 
         let quick_check: String = upgraded
             .connection
@@ -9332,6 +9332,38 @@ mod tests {
             .unwrap();
         assert_eq!(quick_check, "ok");
         upgraded.close().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn schema_twenty_upgrade_adds_mame_member_evidence_without_rewriting_existing_rows() {
+        let root = temp_dir("schema-twenty-upgrade-mame-member-evidence");
+        let database_path = root.join("library.sqlite3");
+        create_representative_older_database(&database_path, 20);
+
+        let report = upgrade_library_database(&database_path).unwrap();
+        assert_eq!(report.from_version, 20);
+        assert_eq!(report.to_version, 21);
+        assert_eq!(report.applied_versions, vec![21]);
+
+        let upgraded = Database::open_or_create(&database_path).unwrap();
+        assert_eq!(upgraded.schema_version().unwrap(), 21);
+        assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
+        assert_eq!(upgraded.load_archives().unwrap().len(), 1);
+        let table_count: i64 = upgraded
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'mame_member_evidence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+        upgraded.close().unwrap();
+
+        let reopened = Database::open_read_only(&database_path).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), 21);
+        reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 
@@ -10176,6 +10208,7 @@ mod tests {
                 "dat_set_audit_results",
                 "discovery_details",
                 "library_dat_identities",
+                "mame_member_evidence",
                 "media_topology_evidence",
                 "mod_catalogue_records",
                 "platform_aliases",
@@ -10274,6 +10307,15 @@ mod tests {
 
         assert!(error.to_string().contains("999"));
         assert!(error.to_string().contains("newer"));
+
+        let connection = Connection::open(&db_path).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            999
+        );
+        connection.close().unwrap();
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -18593,7 +18635,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 20);
+            assert_eq!(latest_known_version(MIGRATIONS), 21);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")
