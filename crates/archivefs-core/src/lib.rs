@@ -45,6 +45,8 @@ pub mod atari_tape;
 pub mod attention;
 /// Bounded BBC Micro/Acorn standard cassette WAV evidence.
 pub mod bbc_tape;
+/// Fail-closed typed bezel apply planning. Mutation remains adapter-gated.
+pub mod bezel_apply;
 /// Read-only master BIOS inventory and emulator projection planning.
 pub mod bios_projection;
 mod database;

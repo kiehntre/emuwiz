@@ -6,6 +6,9 @@
 //! bezel must therefore remain an honest preview until an emulator-specific
 //! adapter can prove its config format, ownership and rollback contract.
 
+use archivefs_core::bezel_apply::{
+    BezelApplyPlan, BezelApplyRequest, BezelPlanError, build_bezel_apply_plan,
+};
 use archivefs_core::bezel_decorations::{
     BezelMatchContext, DecorationAsset, DecorationEvidence, DecorationResolution, DecorationScope,
     DecorationSource, DecorationTarget, LocalBezelCatalogue, LocalBezelConfig, LocalBezelImageInfo,
@@ -27,6 +30,9 @@ pub(super) struct BezelPanelState {
     preview_id: Option<String>,
     preview_texture: Option<egui::TextureHandle>,
     preview_error: Option<String>,
+    apply_plan: Option<BezelApplyPlan>,
+    apply_error: Option<BezelPlanError>,
+    apply_confirmation: bool,
 }
 
 impl Default for BezelPanelState {
@@ -50,6 +56,9 @@ impl Default for BezelPanelState {
             preview_id: None,
             preview_texture: None,
             preview_error: None,
+            apply_plan: None,
+            apply_error: None,
+            apply_confirmation: false,
         }
     }
 }
@@ -72,6 +81,9 @@ impl BezelPanelState {
         self.preview_id = None;
         self.preview_texture = None;
         self.preview_error = None;
+        self.apply_plan = None;
+        self.apply_error = None;
+        self.apply_confirmation = false;
     }
 
     pub(super) fn set_game(&mut self, title: &str, platform: &str) {
@@ -137,6 +149,50 @@ impl BezelPanelState {
 
     pub(super) fn apply_supported(&self) -> bool {
         false
+    }
+
+    fn preview_apply(&mut self) {
+        self.apply_plan = None;
+        self.apply_error = None;
+        self.apply_confirmation = false;
+        let Some(asset) = self.resolution.selected.clone() else {
+            self.apply_error = Some(BezelPlanError {
+                refusal: archivefs_core::bezel_apply::BezelPlanRefusal::InvalidIdentity,
+                path: None,
+                detail: "a resolved bezel asset is required before planning apply".into(),
+            });
+            return;
+        };
+        let Some(image) = self.catalogue.images.get(&asset.id).cloned() else {
+            self.apply_error = Some(BezelPlanError {
+                refusal: archivefs_core::bezel_apply::BezelPlanRefusal::MissingSourceAsset,
+                path: None,
+                detail:
+                    "the selected local bezel image is not available in the validated catalogue"
+                        .into(),
+            });
+            return;
+        };
+        let identity = match &asset.evidence {
+            DecorationEvidence::VerifiedIdentity { identity }
+            | DecorationEvidence::CanonicalDatIdentity { identity } => identity.clone(),
+            _ => self.selected_game.clone().unwrap_or_default(),
+        };
+        let request = BezelApplyRequest {
+            source_asset: asset,
+            source_image: image,
+            resolved_identity: identity,
+            platform: self.selected_platform.clone().unwrap_or_default(),
+            emulator: self.target.emulator.clone(),
+            core: self.target.core.clone(),
+            config_path: None,
+            overlay_root: None,
+            approved_roots: self.config.roots.clone(),
+        };
+        match build_bezel_apply_plan(&request) {
+            Ok(plan) => self.apply_plan = Some(plan),
+            Err(error) => self.apply_error = Some(error),
+        }
     }
 }
 
@@ -254,10 +310,47 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
     }
 
     ui.separator();
+    if ui.button("Preview Apply").clicked() {
+        state.preview_apply();
+    }
+    if let Some(error) = &state.apply_error {
+        ui.collapsing("Apply plan refusal", |ui| {
+            ui.label(&error.detail);
+            ui.monospace(format!("Refusal: {:?}", error.refusal));
+            if let Some(path) = &error.path {
+                ui.monospace(path.display().to_string());
+            }
+        });
+    }
+    if let Some(plan) = &state.apply_plan {
+        ui.collapsing("Planned changes", |ui| {
+            ui.label(format!("Plan: {}", plan.plan_id));
+            ui.label(format!("Source: {}", plan.source.path.display()));
+            ui.label(format!("SHA-256: {}", plan.source.sha256));
+            ui.label(format!("Target: {}", plan.target.emulator));
+            ui.label(format!("Files to change: {}", plan.files.len()));
+            ui.label(format!("Config entries: {}", plan.config_entries.len()));
+            for warning in &plan.warnings {
+                ui.small(warning);
+            }
+            for refusal in &plan.refusals {
+                ui.small(format!("Blocked: {refusal:?}"));
+            }
+            ui.checkbox(
+                &mut state.apply_confirmation,
+                "I reviewed this plan and explicitly confirm it",
+            );
+            ui.add_enabled(false, egui::Button::new("Apply (adapter unavailable)"));
+            ui.small(format!(
+                "Undo/history: unavailable — {}",
+                plan.rollback.reason
+            ));
+        });
+    }
     if state.apply_supported() {
         ui.label("Apply is available after confirmation.");
     } else {
-        ui.label("Preview only / apply unsupported");
+        ui.label("Preview Apply is available; mutation is currently refused.");
     }
     ui.small("No emulator-specific bezel configuration adapter is currently proven. Source artwork and ROMs are untouched.");
 }
