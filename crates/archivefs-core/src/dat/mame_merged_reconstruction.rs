@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use super::mame_arcade_join::ArcadeJoinEvidence;
 use super::model::{DatRomEntry, ParsedDat};
 
+/// Durable journal marker used by GUI-v2 and recovery history to distinguish
+/// MAME reconstruction transactions from the other rename-based workflows.
+pub const MAME_RECONSTRUCTION_WORKFLOW: &str = "mame_merged_reconstruction";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconstructionMemberRequirement {
     pub owner_set: String,
@@ -320,7 +324,9 @@ pub fn apply_staged_reconstruction_output(
     staging_root: &Path,
     journal_dir: &Path,
 ) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
-    use crate::dat::rename_apply::executor::{ApplyExecution, HardConflictMode, apply_transaction};
+    use crate::dat::rename_apply::executor::{
+        ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
+    };
     use crate::dat::rename_apply::identity::capture_identity;
     use crate::dat::rename_apply::model::{
         EntryState, RenameTransaction, TransactionEntry, TransactionState,
@@ -375,6 +381,14 @@ pub fn apply_staged_reconstruction_output(
         recovery_resolved_at_unix: None,
         unknown: Default::default(),
     };
+    transaction.unknown.insert(
+        "workflow".into(),
+        serde_json::Value::String(MAME_RECONSTRUCTION_WORKFLOW.into()),
+    );
+    transaction.unknown.insert(
+        "mame_parent".into(),
+        serde_json::Value::String(plan.parent.clone()),
+    );
     let mut approved = BTreeSet::new();
     approved.insert(source_key);
     let cancel = AtomicBool::new(false);
@@ -389,7 +403,18 @@ pub fn apply_staged_reconstruction_output(
         directory_policy: DirectoryPolicy::SameFilesystem,
         allow_symlink_source: false,
     })
-    .map_err(|e| e.to_string())
+    .map_err(|error| match error {
+        ApplyError::HardConflicts(conflicts) => format!(
+            "reconstruction preflight refused {} path(s): {}",
+            conflicts.len(),
+            conflicts
+                .into_iter()
+                .map(|(path, reasons)| format!("{} ({})", path.display(), reasons.join(", ")))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+        other => other.to_string(),
+    })
 }
 
 fn is_non_physical(rom: &DatRomEntry) -> bool {
@@ -430,6 +455,9 @@ fn evidence_identity(sha1: Option<&str>, crc32: Option<&str>) -> Option<String> 
 mod tests {
     use super::*;
     use crate::dat::model::{DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatSource};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    static NEXT_PUBLISH_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     fn dat(games: Vec<DatGameEntry>) -> ParsedDat {
         ParsedDat {
@@ -558,5 +586,107 @@ mod tests {
         assert!(!plan.ready_to_apply);
         assert_eq!(plan.duplicate_candidates, vec!["a"]);
         assert_eq!(plan.missing_members, vec!["b"]);
+    }
+
+    fn publish_fixture(expected_sha1: &str) -> (MameMergedReconstructionPlan, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "emuwiz-mame-publish-{}-{}-{}",
+            std::process::id(),
+            crate::dat::sources::now_unix(),
+            NEXT_PUBLISH_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source_root = root.join("source-set");
+        std::fs::create_dir_all(&source_root).unwrap();
+        let member_path = source_root.join("member.bin");
+        std::fs::write(&member_path, b"mame member").unwrap();
+        let plan = MameMergedReconstructionPlan {
+            dat_version: "test".into(),
+            dat_sha256: "digest".into(),
+            parent: "parent".into(),
+            clones: vec!["clone".into()],
+            destination: root.join("parent.zip"),
+            required_members: vec![ReconstructionMemberRequirement {
+                owner_set: "parent".into(),
+                member_name: "member.bin".into(),
+                size_bytes: Some(b"mame member".len() as u64),
+                sha1: Some(expected_sha1.into()),
+                crc32: None,
+            }],
+            sources: vec![ReconstructionMemberSource {
+                archive_path: source_root,
+                member_path: member_path.clone(),
+                current_name: "member.bin".into(),
+                target_name: "member.bin".into(),
+                observed_sha1: Some(expected_sha1.into()),
+                observed_crc32: None,
+            }],
+            missing_members: Vec::new(),
+            duplicate_candidates: Vec::new(),
+            hash_mismatches: Vec::new(),
+            unresolved_ownership: Vec::new(),
+            collisions: Vec::new(),
+            ready_to_apply: true,
+            reasons: Vec::new(),
+        };
+        (plan, root, member_path)
+    }
+
+    #[test]
+    fn staged_publish_journals_the_output_and_leaves_source_member_untouched() {
+        use crate::dat::rename_apply::journal::list_journals;
+        use sha1::{Digest, Sha1};
+
+        let digest = Sha1::digest(b"mame member")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (plan, root, member_path) = publish_fixture(&digest);
+        let staging = root.join("staging");
+        let journal = root.join("journal");
+        let outcome = apply_staged_reconstruction_output(&plan, &staging, &journal)
+            .unwrap_or_else(|error| panic!("publication fixture failed: {error}"));
+
+        assert!(plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        assert_eq!(
+            outcome.transaction.state,
+            crate::dat::rename_apply::model::TransactionState::Applied
+        );
+        let (journals, problems) = list_journals(&journal);
+        assert!(problems.is_empty());
+        assert_eq!(journals.len(), 1);
+        assert_eq!(
+            journals[0].unknown["workflow"],
+            MAME_RECONSTRUCTION_WORKFLOW
+        );
+        let mut transaction = outcome.transaction;
+        let rollback = crate::dat::rename_apply::rollback_transaction(
+            &mut transaction,
+            &journal,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(
+            rollback.transaction.state,
+            crate::dat::rename_apply::model::TransactionState::RolledBack
+        );
+        assert!(!plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_staged_verification_never_publishes_the_destination() {
+        let (mut plan, root, member_path) =
+            publish_fixture("0000000000000000000000000000000000000000");
+        plan.sources[0].observed_sha1 = Some("0000000000000000000000000000000000000000".into());
+        let staging = root.join("staging");
+        let journal = root.join("journal");
+        let error = apply_staged_reconstruction_output(&plan, &staging, &journal).unwrap_err();
+
+        assert!(error.contains("staged SHA-1 mismatch"));
+        assert!(!plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        let _ = std::fs::remove_dir_all(root);
     }
 }

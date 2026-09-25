@@ -1287,6 +1287,7 @@ impl App {
         if self.repair_history.is_empty()
             && self.playing_library_history.is_empty()
             && self.canonical_organisation_history.is_empty()
+            && self.organisation.mame_history.is_empty()
             && !has_cheat_history
         {
             empty_state(
@@ -1356,6 +1357,34 @@ impl App {
                         _ => "Needs review — recovery state is recorded in the journal",
                     });
                     ui.collapsing("Advanced Details", |ui| {
+                        ui.label(format!("State: {}", transaction.state.label()));
+                    });
+                });
+            }
+        }
+        if !self.organisation.mame_history.is_empty() {
+            ui.heading("MAME reconstructions");
+            for transaction in self.organisation.mame_history.iter().rev() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.heading("MAME merged reconstruction");
+                    ui.label(format!(
+                        "{} · {} · {} output",
+                        transaction.transaction_id,
+                        transaction.state.label(),
+                        transaction.entries.len()
+                    ));
+                    if let Some(entry) = transaction.entries.first() {
+                        ui.label(format!("Destination: {}", entry.destination_path.display()));
+                    }
+                    ui.label(format!("Recorded: {}", transaction.created_at_unix));
+                    ui.label(match transaction.state {
+                        TransactionState::Applied => "Verified publication complete; undo is available from Organisation.",
+                        TransactionState::RolledBack => "Already undone; the source archives were untouched.",
+                        _ => "Needs review — recovery state is recorded in the shared journal.",
+                    });
+                    ui.collapsing("Advanced Details", |ui| {
+                        ui.label("Shared reconstruction journal; source archives are never rollback targets.");
                         ui.label(format!("State: {}", transaction.state.label()));
                     });
                 });

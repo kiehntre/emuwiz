@@ -122,6 +122,7 @@ pub(super) enum Payload {
         duplicates: Vec<DuplicateRepairRecord>,
         playing_libraries: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
         organisations: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
+        mame_reconstructions: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     },
     Preferences(Preferences),
     Done,
@@ -471,6 +472,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 let mut duplicates = Vec::new();
                 let mut playing_libraries = Vec::new();
                 let mut organisations = Vec::new();
+                let mut mame_reconstructions = Vec::new();
                 for transaction in transactions {
                     let is_duplicate = transaction.entries.iter().any(|entry| {
                         entry.destination_path.components().any(|component| {
@@ -484,12 +486,22 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                             &archivefs_core::dat::rename_apply::model::TransactionOperation::CreateSymlink { .. }
                         )
                     });
+                    let is_mame_reconstruction = transaction
+                        .unknown
+                        .get("workflow")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(
+                            archivefs_core::dat::mame_merged_reconstruction::
+                                MAME_RECONSTRUCTION_WORKFLOW,
+                        );
                     if is_duplicate {
                         duplicates.push(DuplicateRepairRecord {
                             trusted_root: PathBuf::from(&transaction.source_scan_root),
                             transaction,
                             journal_dir: journal_dir.clone(),
                         });
+                    } else if is_mame_reconstruction {
+                        mame_reconstructions.push(transaction);
                     } else if is_playing_library {
                         playing_libraries.push(transaction);
                     } else {
@@ -500,6 +512,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                     duplicates,
                     playing_libraries,
                     organisations,
+                    mame_reconstructions,
                 })
             }
         }

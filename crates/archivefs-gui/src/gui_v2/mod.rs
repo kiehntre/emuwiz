@@ -1220,10 +1220,12 @@ impl App {
                                     duplicates,
                                     playing_libraries,
                                     organisations,
+                                    mame_reconstructions,
                                 } => {
                                     self.repair_history = duplicates;
                                     self.playing_library_history = playing_libraries;
                                     self.canonical_organisation_history = organisations;
+                                    self.organisation.mame_history = mame_reconstructions;
                                 }
                                 Payload::Preferences(preferences) => {
                                     self.welcome_dismissed = preferences.welcome_dismissed;

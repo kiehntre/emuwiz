@@ -20,10 +20,17 @@ use archivefs_core::dat::mame_arcade_join::{
     load_verified_mame_0174, refresh_mame_member_evidence,
 };
 use archivefs_core::dat::mame_merged_reconstruction::{
-    MameMergedReconstructionPlan, build_merged_reconstruction_plan,
+    MAME_RECONSTRUCTION_WORKFLOW, MameMergedReconstructionPlan, apply_staged_reconstruction_output,
+    build_merged_reconstruction_plan,
 };
+use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionState};
+use archivefs_core::dat::rename_apply::{
+    default_rename_transaction_dir, rollback_transaction_confined,
+};
+use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{Database, default_database_path};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum OrganisationView {
@@ -34,7 +41,6 @@ pub(super) enum OrganisationView {
     MameNormalizer,
 }
 
-#[derive(Default)]
 pub(super) struct OrganisationState {
     pub(super) view: OrganisationView,
     pub(super) mame_root: Option<PathBuf>,
@@ -42,6 +48,35 @@ pub(super) struct OrganisationState {
     pub(super) mame_plan: Option<MameMergedReconstructionPlan>,
     pub(super) mame_message: Option<String>,
     pub(super) mame_evidence_set: String,
+    pub(super) mame_confirmation: String,
+    pub(super) mame_publish_pending: bool,
+    pub(super) mame_undo_pending: Option<String>,
+    pub(super) mame_history: Vec<RenameTransaction>,
+}
+
+impl Default for OrganisationState {
+    fn default() -> Self {
+        Self {
+            view: OrganisationView::Landing,
+            mame_root: None,
+            mame_dat: None,
+            mame_plan: None,
+            mame_message: None,
+            mame_evidence_set: String::new(),
+            mame_confirmation: String::new(),
+            mame_publish_pending: false,
+            mame_undo_pending: None,
+            mame_history: Vec::new(),
+        }
+    }
+}
+
+pub(super) fn mame_publish_confirmation_phrase(outputs: usize) -> String {
+    format!("PUBLISH MAME {outputs} OUTPUTS")
+}
+
+fn mame_undo_confirmation_phrase(parent: &str) -> String {
+    format!("UNDO MAME {parent}")
 }
 
 /// The visual identity for one organisation target. Purely presentational:
@@ -353,9 +388,9 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             }
         }
         ui.label(if plan.ready_to_apply {
-            "Safe to apply after explicit confirmation."
+            "Ready to publish after explicit confirmation."
         } else {
-            "Apply blocked: evidence is not sufficient."
+            "Publish blocked: evidence is not sufficient."
         });
         for reason in &plan.reasons {
             ui.label(format!("• {reason}"));
@@ -370,6 +405,92 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                 ));
             }
         });
+        if plan.ready_to_apply {
+            if !state.mame_publish_pending {
+                if ui.button("Publish reconstructed merged output").clicked() {
+                    state.mame_publish_pending = true;
+                    state.mame_confirmation.clear();
+                }
+            } else {
+                ui.group(|ui| {
+                    ui.strong("Confirm publication");
+                    let phrase = mame_publish_confirmation_phrase(1);
+                    ui.label(format!(
+                        "Type {phrase} exactly to create the destination ZIP."
+                    ));
+                    ui.text_edit_singleline(&mut state.mame_confirmation);
+                    let confirmed = state.mame_confirmation == phrase;
+                    if ui
+                        .add_enabled(confirmed, egui::Button::new("Publish now"))
+                        .clicked()
+                    {
+                        state.publish_mame();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        state.mame_publish_pending = false;
+                        state.mame_confirmation.clear();
+                    }
+                });
+            }
+        }
+    }
+    if !state.mame_history.is_empty() {
+        ui.separator();
+        ui.heading("MAME reconstruction history");
+        let history = state.mame_history.clone();
+        for transaction in history.iter().rev() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(format!(
+                    "{} · {} · {} output",
+                    transaction.transaction_id,
+                    transaction.state.label(),
+                    transaction.entries.len()
+                ));
+                if let Some(entry) = transaction.entries.first() {
+                    ui.label(format!("Destination: {}", entry.destination_path.display()));
+                }
+                ui.label(format!("Recorded: {}", transaction.created_at_unix));
+                ui.label(match transaction.state {
+                    TransactionState::Applied => "Verified publication complete; undo is available.",
+                    TransactionState::RolledBack => "Rolled back; the generated destination is removed.",
+                    _ => "Recovery is required before this transaction can be considered complete.",
+                });
+                if transaction.is_rollbackable() {
+                    if state.mame_undo_pending.as_deref() != Some(transaction.transaction_id.as_str())
+                        && ui.button("Undo published MAME output").clicked()
+                    {
+                        state.mame_undo_pending = Some(transaction.transaction_id.clone());
+                        state.mame_confirmation.clear();
+                    }
+                    if state.mame_undo_pending.as_deref() == Some(transaction.transaction_id.as_str()) {
+                        let phrase = mame_undo_confirmation_phrase(
+                            transaction
+                                .unknown
+                                .get("mame_parent")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("SET"),
+                        );
+                        ui.label(format!("Type {phrase} exactly to confirm undo."));
+                        ui.text_edit_singleline(&mut state.mame_confirmation);
+                        let confirmed = state.mame_confirmation == phrase;
+                        if ui
+                            .add_enabled(confirmed, egui::Button::new("Undo now"))
+                            .clicked()
+                        {
+                            state.undo_mame(&transaction.transaction_id);
+                        }
+                        if ui.button("Cancel undo").clicked() {
+                            state.mame_undo_pending = None;
+                            state.mame_confirmation.clear();
+                        }
+                    }
+                }
+                ui.collapsing("Advanced transaction details", |ui| {
+                    ui.label(format!("State: {}", transaction.state.label()));
+                    ui.label("The shared journal is the recovery record; source archives are never rollback targets.");
+                });
+            });
+        }
     }
 }
 
@@ -398,6 +519,153 @@ fn current_mame_reconstruction_plan(
         );
     }
     build_merged_reconstruction_plan(root, &dat.parsed, &joins, requested_set, &dat_sha256)
+}
+
+fn mame_staging_root(root: &std::path::Path) -> PathBuf {
+    root.join(".emuwiz-mame-staging")
+}
+
+fn is_mame_reconstruction(transaction: &RenameTransaction) -> bool {
+    transaction
+        .unknown
+        .get("workflow")
+        .and_then(serde_json::Value::as_str)
+        == Some(MAME_RECONSTRUCTION_WORKFLOW)
+}
+
+fn load_mame_history() -> Vec<RenameTransaction> {
+    let Ok(journal_dir) = default_rename_transaction_dir() else {
+        return Vec::new();
+    };
+    let (transactions, _) = archivefs_core::dat::rename_apply::list_journals(&journal_dir);
+    transactions
+        .into_iter()
+        .filter(is_mame_reconstruction)
+        .collect()
+}
+
+impl OrganisationState {
+    pub(super) fn publish_mame(&mut self) {
+        let (Some(plan), Some(root), Some(dat_path)) = (
+            self.mame_plan.clone(),
+            self.mame_root.clone(),
+            self.mame_dat.clone(),
+        ) else {
+            self.mame_message = Some("Preview a MAME reconstruction before publishing it.".into());
+            return;
+        };
+        if !plan.ready_to_apply {
+            self.mame_message =
+                Some("Publish is blocked until every reconstruction problem is resolved.".into());
+            return;
+        }
+        let current =
+            match current_mame_reconstruction_plan(&root, &dat_path, self.mame_evidence_set.trim())
+            {
+                Ok(current) => current,
+                Err(error) => {
+                    self.mame_message = Some(format!("The reviewed plan is stale: {error}"));
+                    return;
+                }
+            };
+        if current != plan {
+            self.mame_message = Some(
+                "The reviewed MAME plan is stale because its evidence or destination changed. Preview again before publishing.".into(),
+            );
+            self.mame_plan = Some(current);
+            return;
+        }
+        let journal_dir = match default_rename_transaction_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                self.mame_message = Some(format!(
+                    "MAME publication could not start because its recovery journal is unavailable: {error}"
+                ));
+                return;
+            }
+        };
+        let staging_root = mame_staging_root(&root);
+        match apply_staged_reconstruction_output(&plan, &staging_root, &journal_dir) {
+            Ok(outcome) => {
+                let transaction = outcome.transaction;
+                self.mame_history
+                    .retain(|item| item.transaction_id != transaction.transaction_id);
+                self.mame_history.push(transaction);
+                self.mame_confirmation.clear();
+                self.mame_publish_pending = false;
+                self.mame_message = Some(format!(
+                    "Published {} with staged verification complete. The source archives were not changed; recovery is available from this transaction's journal.",
+                    plan.destination.display()
+                ));
+            }
+            Err(error) => {
+                self.mame_history = load_mame_history();
+                self.mame_message = Some(format!(
+                    "MAME publication stopped safely before claiming success: {error}"
+                ));
+            }
+        }
+    }
+
+    pub(super) fn undo_mame(&mut self, transaction_id: &str) {
+        let Some(index) = self
+            .mame_history
+            .iter()
+            .position(|transaction| transaction.transaction_id == transaction_id)
+        else {
+            self.mame_message =
+                Some("That MAME transaction is no longer in the recovery journal.".into());
+            return;
+        };
+        let mut transaction = self.mame_history[index].clone();
+        if !transaction.is_rollbackable() {
+            self.mame_message = Some(format!(
+                "Undo is unavailable for this MAME transaction; its recorded state is {}.",
+                transaction.state.label()
+            ));
+            return;
+        }
+        let Some(destination_parent) = transaction
+            .entries
+            .first()
+            .and_then(|entry| entry.destination_path.parent())
+            .map(PathBuf::from)
+        else {
+            self.mame_message =
+                Some("Undo is unavailable because the journal has no destination.".into());
+            return;
+        };
+        let staging_root = PathBuf::from(&transaction.source_scan_root);
+        let journal_dir = match default_rename_transaction_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                self.mame_message = Some(format!("MAME recovery journal is unavailable: {error}"));
+                return;
+            }
+        };
+        let cancel = AtomicBool::new(false);
+        match rollback_transaction_confined(
+            &mut transaction,
+            &journal_dir,
+            &cancel,
+            &TrustedRoots::from_paths([staging_root.as_path(), &destination_parent]),
+        ) {
+            Ok(outcome) => {
+                self.mame_history[index] = outcome.transaction;
+                self.mame_confirmation.clear();
+                self.mame_undo_pending = None;
+                self.mame_message = Some(
+                    "MAME reconstruction was rolled back safely; the source archives were not touched.".into(),
+                );
+            }
+            Err(error) => {
+                self.mame_history = load_mame_history();
+                self.mame_message = Some(format!(
+                    "MAME undo stopped safely and needs review: {error}"
+                ));
+            }
+        }
+    }
 }
 
 fn refresh_mame_evidence(state: &mut OrganisationState, requested_set: Option<String>) {
@@ -480,6 +748,7 @@ impl App {
         let mut playing_action = None;
         let mut review_pending = false;
         let mut open_history = false;
+        let mut open_mame_history = false;
 
         egui::ScrollArea::vertical()
             .id_salt("v2_organisation")
@@ -517,6 +786,18 @@ impl App {
                                 open_history = true;
                             }
                         });
+                        ui.add_space(theme::SPACE_SM);
+                    }
+                    if !self.organisation.mame_history.is_empty() {
+                        widgets::banner(
+                            ui,
+                            "MAME reconstruction history is available",
+                            "Review publication and recovery state before starting another reconstruction.",
+                            widgets::StatusTone::Info,
+                        );
+                        if ui.button("Review MAME history").clicked() {
+                            open_mame_history = true;
+                        }
                         ui.add_space(theme::SPACE_SM);
                     }
                     if ui.button(RichText::new("Fix my MAME library").strong().color(theme::TEAL)).clicked() {
@@ -649,6 +930,9 @@ impl App {
         if open_history {
             self.go(Route::Section(Section::History));
         }
+        if open_mame_history {
+            self.organisation.view = OrganisationView::MameNormalizer;
+        }
         if let Some(action) = canonical_action {
             match action {
                 RomOrganisationPageAction::Preview => self
@@ -775,5 +1059,79 @@ mod tests {
                 }
             });
         });
+    }
+
+    fn mame_plan(ready: bool) -> MameMergedReconstructionPlan {
+        MameMergedReconstructionPlan {
+            dat_version: "fixture".into(),
+            dat_sha256: "fixture".into(),
+            parent: "pacman".into(),
+            clones: vec!["puckman".into()],
+            destination: PathBuf::from("/mame/pacman.zip"),
+            required_members: Vec::new(),
+            sources: Vec::new(),
+            missing_members: if ready {
+                Vec::new()
+            } else {
+                vec!["missing.bin".into()]
+            },
+            duplicate_candidates: Vec::new(),
+            hash_mismatches: Vec::new(),
+            unresolved_ownership: Vec::new(),
+            collisions: Vec::new(),
+            ready_to_apply: ready,
+            reasons: if ready {
+                Vec::new()
+            } else {
+                vec!["required ROM members are missing".into()]
+            },
+        }
+    }
+
+    fn rendered_mame_text(state: &mut OrganisationState) -> Vec<String> {
+        let context = egui::Context::default();
+        context
+            .run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    show_mame_normalizer(ui, state);
+                });
+            })
+            .shapes
+            .iter()
+            .flat_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => vec![text.galley.text().to_string()],
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mame_ready_preview_exposes_publish_but_blocked_preview_does_not() {
+        let mut ready = OrganisationState {
+            mame_plan: Some(mame_plan(true)),
+            ..OrganisationState::default()
+        };
+        let ready_text = rendered_mame_text(&mut ready).join("\n");
+        assert!(ready_text.contains("Publish reconstructed merged output"));
+
+        let mut blocked = OrganisationState {
+            mame_plan: Some(mame_plan(false)),
+            ..OrganisationState::default()
+        };
+        let blocked_text = rendered_mame_text(&mut blocked).join("\n");
+        assert!(blocked_text.contains("Publish blocked"));
+        assert!(!blocked_text.contains("Publish reconstructed merged output"));
+    }
+
+    #[test]
+    fn mame_publish_confirmation_is_deterministic_and_not_a_yes_no_prompt() {
+        assert_eq!(
+            mame_publish_confirmation_phrase(1),
+            "PUBLISH MAME 1 OUTPUTS"
+        );
+        assert_eq!(
+            mame_publish_confirmation_phrase(3),
+            "PUBLISH MAME 3 OUTPUTS"
+        );
     }
 }
