@@ -64,6 +64,8 @@
 //! Parsing fails closed: a buffer shorter than [`IP_BIN_META_BYTES`]
 //! returns `None` rather than a partial/guessed struct.
 
+use serde::{Deserialize, Serialize};
+
 use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
 
@@ -71,6 +73,90 @@ use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, Conten
 /// interprets. `IP.BIN` itself continues for much longer (boot code,
 /// license screen data), none of which this module touches.
 pub const IP_BIN_META_BYTES: usize = 0x100;
+
+/// How confidently one fixed-width IP.BIN field can be interpreted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpBinFieldValidity {
+    Valid,
+    Warning,
+    Invalid,
+    Unknown,
+}
+
+/// Whether a future writer could change a field without changing the source
+/// identity or coordinating another structure. This is descriptive only:
+/// this task implements no writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpBinMutationSafety {
+    SafeInStagedRebuild,
+    PreserveOnly,
+    UnsafeWithoutFilesystemCoordination,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DreamcastIpBinField {
+    pub value: String,
+    pub raw_bytes: Vec<u8>,
+    pub validity: IpBinFieldValidity,
+    pub warnings: Vec<String>,
+    pub provenance: String,
+    pub contributes_to_identity: bool,
+    pub informational_only: bool,
+    pub mutation_safety: IpBinMutationSafety,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DreamcastVgaCompatibility {
+    Declared,
+    NotDeclared,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IpBinChecksumStatus {
+    NotProven,
+    NotPresentInInspectedMetadata,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DreamcastIpBinValidationStatus {
+    Valid,
+    ValidWithWarnings,
+    Invalid,
+    Truncated,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DreamcastIpBinInspection {
+    pub validation_status: DreamcastIpBinValidationStatus,
+    pub hardware_id: DreamcastIpBinField,
+    pub maker_id: DreamcastIpBinField,
+    pub device_information: DreamcastIpBinField,
+    pub area_symbols: DreamcastIpBinField,
+    pub peripheral_flags: DreamcastIpBinField,
+    pub product_number: DreamcastIpBinField,
+    pub product_version: DreamcastIpBinField,
+    pub release_date: DreamcastIpBinField,
+    pub boot_filename: DreamcastIpBinField,
+    pub software_maker_name: DreamcastIpBinField,
+    pub software_title: DreamcastIpBinField,
+    pub vga_compatibility: DreamcastVgaCompatibility,
+    pub checksum_status: IpBinChecksumStatus,
+    pub warnings: Vec<String>,
+    pub conflicts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DreamcastIpBinInspectionError {
+    pub status: DreamcastIpBinValidationStatus,
+    pub message: String,
+}
 
 const HARDWARE_ID: (usize, usize) = (0x00, 0x10);
 const MAKER_ID: (usize, usize) = (0x10, 0x10);
@@ -140,6 +226,433 @@ pub fn parse_ip_bin_meta(bytes: &[u8]) -> Option<IpBinMetaFact> {
         software_maker_name: field(bytes, SOFTWARE_MAKER_NAME),
         software_name: field(bytes, SOFTWARE_NAME),
     })
+}
+
+/// Performs preservation-safe validation over the bounded metadata area.
+///
+/// This function never interprets the rest of the bootstrap, never computes a
+/// claimed checksum, and never changes the supplied bytes. Unknown peripheral
+/// bits remain visible as warnings rather than being assigned invented names.
+pub fn inspect_ip_bin_meta(
+    bytes: &[u8],
+) -> Result<DreamcastIpBinInspection, DreamcastIpBinInspectionError> {
+    if bytes.len() < IP_BIN_META_BYTES {
+        return Err(DreamcastIpBinInspectionError {
+            status: DreamcastIpBinValidationStatus::Truncated,
+            message: format!(
+                "IP.BIN metadata is truncated: {} bytes available, {} required",
+                bytes.len(),
+                IP_BIN_META_BYTES
+            ),
+        });
+    }
+    let fact = parse_ip_bin_meta(bytes).expect("length checked above");
+    let mut warnings = Vec::new();
+    let mut invalid = false;
+    let hardware = validated_field(
+        "hardware ID",
+        &bytes[HARDWARE_ID.0..HARDWARE_ID.0 + HARDWARE_ID.1],
+        &fact.hardware_id,
+        fact.hardware_id_recognized,
+        true,
+        false,
+        IpBinMutationSafety::PreserveOnly,
+        "bounded IP.BIN hardware ID field",
+    );
+    if !fact.hardware_id_recognized {
+        invalid = true;
+        warnings.push("IP.BIN hardware signature is not a recognised Dreamcast marker".into());
+    }
+    let maker = validated_field(
+        "maker ID",
+        &bytes[MAKER_ID.0..MAKER_ID.0 + MAKER_ID.1],
+        &fact.maker_id,
+        !fact.maker_id.is_empty(),
+        false,
+        true,
+        IpBinMutationSafety::PreserveOnly,
+        "bounded IP.BIN maker ID field",
+    );
+    let device = validated_field(
+        "device information",
+        &bytes[DEVICE_INFO.0..DEVICE_INFO.0 + DEVICE_INFO.1],
+        &fact.device_info,
+        !fact.device_info.is_empty(),
+        false,
+        true,
+        IpBinMutationSafety::Unknown,
+        "bounded IP.BIN device information field",
+    );
+    let (area_validity, area_warnings) = validate_area_symbols(&fact.area_symbols);
+    warnings.extend(area_warnings.iter().cloned());
+    let area = field_with(
+        fact.area_symbols.clone(),
+        raw(bytes, AREA_SYMBOLS),
+        area_validity,
+        area_warnings,
+        "IP.BIN area-symbol field",
+        true,
+        false,
+        IpBinMutationSafety::SafeInStagedRebuild,
+    );
+    let (peripheral_validity, peripheral_warnings, vga) = validate_peripherals(&fact.peripherals);
+    warnings.extend(peripheral_warnings.iter().cloned());
+    let peripheral = field_with(
+        fact.peripherals.clone(),
+        raw(bytes, PERIPHERALS),
+        peripheral_validity,
+        peripheral_warnings,
+        "IP.BIN peripheral bitfield; known VGA bit is decoded, other unknown bits remain raw",
+        false,
+        false,
+        IpBinMutationSafety::SafeInStagedRebuild,
+    );
+    let (product_validity, product_warnings) = validate_product_number(&fact.product_number);
+    warnings.extend(product_warnings.iter().cloned());
+    let product = field_with(
+        fact.product_number.clone(),
+        raw(bytes, PRODUCT_NUMBER),
+        product_validity,
+        product_warnings,
+        "IP.BIN product-number field",
+        fact.hardware_id_recognized && !fact.product_number.is_empty(),
+        false,
+        IpBinMutationSafety::SafeInStagedRebuild,
+    );
+    let (version_validity, version_warnings) = validate_version(&fact.product_version);
+    warnings.extend(version_warnings.iter().cloned());
+    let version = field_with(
+        fact.product_version.clone(),
+        raw(bytes, PRODUCT_VERSION),
+        version_validity,
+        version_warnings,
+        "IP.BIN product-version field",
+        false,
+        true,
+        IpBinMutationSafety::SafeInStagedRebuild,
+    );
+    let (date_validity, date_warnings) = validate_date(&fact.release_date);
+    warnings.extend(date_warnings.iter().cloned());
+    let date = field_with(
+        fact.release_date.clone(),
+        raw(bytes, RELEASE_DATE),
+        date_validity,
+        date_warnings,
+        "IP.BIN release-date field",
+        false,
+        true,
+        IpBinMutationSafety::SafeInStagedRebuild,
+    );
+    let (boot_validity, boot_warnings) = validate_boot_filename(&fact.boot_filename);
+    warnings.extend(boot_warnings.iter().cloned());
+    let boot = field_with(
+        fact.boot_filename.clone(),
+        raw(bytes, BOOT_FILENAME),
+        boot_validity,
+        boot_warnings,
+        "IP.BIN boot-filename field; filesystem target not checked by this byte-only API",
+        false,
+        true,
+        IpBinMutationSafety::UnsafeWithoutFilesystemCoordination,
+    );
+    let maker_name = informational_field(
+        fact.software_maker_name.clone(),
+        raw(bytes, SOFTWARE_MAKER_NAME),
+        "IP.BIN software-maker field",
+    );
+    let title = informational_field(
+        fact.software_name.clone(),
+        raw(bytes, SOFTWARE_NAME),
+        "IP.BIN software-title field",
+    );
+    if maker.validity == IpBinFieldValidity::Invalid
+        || device.validity == IpBinFieldValidity::Invalid
+        || area.validity == IpBinFieldValidity::Invalid
+        || peripheral.validity == IpBinFieldValidity::Invalid
+        || product.validity == IpBinFieldValidity::Invalid
+        || version.validity == IpBinFieldValidity::Invalid
+        || date.validity == IpBinFieldValidity::Invalid
+        || boot.validity == IpBinFieldValidity::Invalid
+    {
+        invalid = true;
+    }
+    let validation_status = if invalid {
+        DreamcastIpBinValidationStatus::Invalid
+    } else if !warnings.is_empty() {
+        DreamcastIpBinValidationStatus::ValidWithWarnings
+    } else {
+        DreamcastIpBinValidationStatus::Valid
+    };
+    Ok(DreamcastIpBinInspection {
+        validation_status,
+        hardware_id: hardware,
+        maker_id: maker,
+        device_information: device,
+        area_symbols: area,
+        peripheral_flags: peripheral,
+        product_number: product,
+        product_version: version,
+        release_date: date,
+        boot_filename: boot,
+        software_maker_name: maker_name,
+        software_title: title,
+        vga_compatibility: vga,
+        checksum_status: IpBinChecksumStatus::NotProven,
+        warnings,
+        conflicts: Vec::new(),
+    })
+}
+
+/// Adds a conflict against stronger, already-resolved evidence. The stronger
+/// evidence remains authoritative; this function only makes disagreement
+/// visible.
+pub fn add_stronger_evidence_conflicts(
+    inspection: &mut DreamcastIpBinInspection,
+    stronger_product_code: Option<&str>,
+    stronger_region_symbols: Option<&str>,
+) {
+    if let Some(stronger) = stronger_product_code
+        && !inspection.product_number.value.is_empty()
+        && !inspection
+            .product_number
+            .value
+            .eq_ignore_ascii_case(stronger)
+    {
+        inspection.conflicts.push(format!(
+            "IP.BIN product code {} conflicts with stronger disc evidence {}",
+            inspection.product_number.value, stronger
+        ));
+    }
+    if let Some(stronger) = stronger_region_symbols
+        && !inspection.area_symbols.value.is_empty()
+        && inspection.area_symbols.value != stronger
+    {
+        inspection.conflicts.push(format!(
+            "IP.BIN region symbols {} conflict with stronger disc evidence {}",
+            inspection.area_symbols.value, stronger
+        ));
+    }
+}
+
+fn raw(bytes: &[u8], range: (usize, usize)) -> Vec<u8> {
+    bytes[range.0..range.0 + range.1].to_vec()
+}
+
+fn field_with(
+    value: String,
+    raw_bytes: Vec<u8>,
+    validity: IpBinFieldValidity,
+    warnings: Vec<String>,
+    provenance: &str,
+    contributes_to_identity: bool,
+    informational_only: bool,
+    mutation_safety: IpBinMutationSafety,
+) -> DreamcastIpBinField {
+    DreamcastIpBinField {
+        value,
+        raw_bytes,
+        validity,
+        warnings,
+        provenance: provenance.into(),
+        contributes_to_identity,
+        informational_only,
+        mutation_safety,
+    }
+}
+
+fn informational_field(value: String, raw_bytes: Vec<u8>, provenance: &str) -> DreamcastIpBinField {
+    field_with(
+        value,
+        raw_bytes,
+        IpBinFieldValidity::Valid,
+        Vec::new(),
+        provenance,
+        false,
+        true,
+        IpBinMutationSafety::SafeInStagedRebuild,
+    )
+}
+
+fn validated_field(
+    label: &str,
+    raw_bytes: &[u8],
+    value: &str,
+    required: bool,
+    contributes_to_identity: bool,
+    informational_only: bool,
+    mutation_safety: IpBinMutationSafety,
+    provenance: &str,
+) -> DreamcastIpBinField {
+    let mut warnings = Vec::new();
+    let mut validity = IpBinFieldValidity::Valid;
+    if !raw_bytes.is_ascii() {
+        validity = IpBinFieldValidity::Invalid;
+        warnings.push(format!("{label} contains non-ASCII bytes"));
+    }
+    if required && value.is_empty() {
+        validity = IpBinFieldValidity::Invalid;
+        warnings.push(format!("{label} is blank"));
+    }
+    field_with(
+        value.to_string(),
+        raw_bytes.to_vec(),
+        validity,
+        warnings,
+        provenance,
+        contributes_to_identity,
+        informational_only,
+        mutation_safety,
+    )
+}
+
+fn validate_area_symbols(value: &str) -> (IpBinFieldValidity, Vec<String>) {
+    let mut warnings = Vec::new();
+    let unknown: String = value
+        .chars()
+        .filter(|character| !matches!(character, 'J' | 'U' | 'E' | 'A' | 'K'))
+        .collect();
+    if !unknown.is_empty() {
+        warnings.push(format!("unknown IP.BIN area symbols: {unknown}"));
+        (IpBinFieldValidity::Warning, warnings)
+    } else if value.is_empty() {
+        warnings.push("IP.BIN area symbols are blank".into());
+        (IpBinFieldValidity::Warning, warnings)
+    } else {
+        (IpBinFieldValidity::Valid, warnings)
+    }
+}
+
+fn validate_peripherals(
+    value: &str,
+) -> (IpBinFieldValidity, Vec<String>, DreamcastVgaCompatibility) {
+    if value.is_empty() {
+        return (
+            IpBinFieldValidity::Warning,
+            vec!["IP.BIN peripheral flags are blank".into()],
+            DreamcastVgaCompatibility::Unknown,
+        );
+    }
+    if value.len() > 8 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN peripheral flags are not bounded hexadecimal".into()],
+            DreamcastVgaCompatibility::Unknown,
+        );
+    }
+    let parsed = u32::from_str_radix(value, 16).ok();
+    let Some(bits) = parsed else {
+        return (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN peripheral flags could not be decoded".into()],
+            DreamcastVgaCompatibility::Unknown,
+        );
+    };
+    let unknown = bits & !((1_u32 << 21) - 1);
+    let mut warnings = Vec::new();
+    if unknown != 0 {
+        warnings.push(format!(
+            "IP.BIN contains unknown peripheral bits 0x{unknown:08X}"
+        ));
+    }
+    // The independent bodgit/dreamcast model assigns bit 1 to VGA. We expose
+    // only that corroborated meaning and keep all other bits unnamed here.
+    let vga = if bits & (1 << 1) != 0 {
+        DreamcastVgaCompatibility::Declared
+    } else {
+        DreamcastVgaCompatibility::NotDeclared
+    };
+    (
+        if warnings.is_empty() {
+            IpBinFieldValidity::Valid
+        } else {
+            IpBinFieldValidity::Warning
+        },
+        warnings,
+        vga,
+    )
+}
+
+fn validate_product_number(value: &str) -> (IpBinFieldValidity, Vec<String>) {
+    if value.is_empty() {
+        return (
+            IpBinFieldValidity::Warning,
+            vec!["IP.BIN product number is blank".into()],
+        );
+    }
+    if value.len() > 10 || !value.bytes().all(|byte| byte.is_ascii_graphic()) || value.contains(' ')
+    {
+        return (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN product number is not a compact printable identifier".into()],
+        );
+    }
+    (IpBinFieldValidity::Valid, Vec::new())
+}
+
+fn validate_version(value: &str) -> (IpBinFieldValidity, Vec<String>) {
+    if value.is_empty() {
+        return (
+            IpBinFieldValidity::Warning,
+            vec!["IP.BIN product version is blank".into()],
+        );
+    }
+    let valid = value.len() >= 3
+        && value.as_bytes()[0] == b'V'
+        && value[1..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.');
+    if valid {
+        (IpBinFieldValidity::Valid, Vec::new())
+    } else {
+        (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN product version has an unexpected format".into()],
+        )
+    }
+}
+
+fn validate_date(value: &str) -> (IpBinFieldValidity, Vec<String>) {
+    if value.is_empty() {
+        return (
+            IpBinFieldValidity::Warning,
+            vec!["IP.BIN release date is blank".into()],
+        );
+    }
+    if value.len() != 8 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN release date is not YYYYMMDD".into()],
+        );
+    }
+    let month = value[4..6].parse::<u32>().unwrap_or_default();
+    let day = value[6..8].parse::<u32>().unwrap_or_default();
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN release date has an impossible month or day".into()],
+        );
+    }
+    (IpBinFieldValidity::Valid, Vec::new())
+}
+
+fn validate_boot_filename(value: &str) -> (IpBinFieldValidity, Vec<String>) {
+    if value.is_empty() {
+        return (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN boot filename is blank".into()],
+        );
+    }
+    if value.contains('/')
+        || value.contains('\\')
+        || value.contains("..")
+        || value.bytes().any(|byte| byte < 0x20 || byte > 0x7E)
+    {
+        return (
+            IpBinFieldValidity::Invalid,
+            vec!["IP.BIN boot filename is suspicious or unsafe".into()],
+        );
+    }
+    (IpBinFieldValidity::Valid, Vec::new())
 }
 
 /// Turns a parsed [`IpBinMetaFact`] into neutral evidence.
@@ -354,5 +867,89 @@ mod tests {
                 .iter()
                 .any(|item| item.kind == ContentEvidenceKind::ProductCode)
         );
+    }
+
+    #[test]
+    fn inspection_validates_fields_and_decodes_vga_without_mutating_bytes() {
+        let mut data = synthetic_ip_bin();
+        put(&mut data, PERIPHERALS, b"00000000");
+        let before = data.clone();
+        let inspection = inspect_ip_bin_meta(&data).unwrap();
+        assert_eq!(
+            inspection.validation_status,
+            DreamcastIpBinValidationStatus::Valid
+        );
+        assert_eq!(inspection.product_number.value, "T-8109N");
+        assert_eq!(
+            inspection.vga_compatibility,
+            DreamcastVgaCompatibility::NotDeclared
+        );
+        assert_eq!(inspection.checksum_status, IpBinChecksumStatus::NotProven);
+        assert_eq!(data, before);
+        assert_eq!(inspection.product_number.raw_bytes.len(), 10);
+    }
+
+    #[test]
+    fn inspection_reports_bad_date_regions_peripherals_and_boot_target() {
+        let mut data = synthetic_ip_bin();
+        put(&mut data, RELEASE_DATE, b"20241340        ");
+        put(&mut data, AREA_SYMBOLS, b"JX      ");
+        put(&mut data, PERIPHERALS, b"ZZZZZZZZ");
+        put(&mut data, BOOT_FILENAME, b"../BAD.BIN       ");
+        let inspection = inspect_ip_bin_meta(&data).unwrap();
+        assert_eq!(
+            inspection.validation_status,
+            DreamcastIpBinValidationStatus::Invalid
+        );
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("release date"))
+        );
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("area symbols"))
+        );
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("peripheral"))
+        );
+        assert!(
+            inspection
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("boot filename"))
+        );
+    }
+
+    #[test]
+    fn inspection_handles_vga_and_unknown_peripheral_bits_conservatively() {
+        let mut data = synthetic_ip_bin();
+        put(&mut data, PERIPHERALS, b"00200002");
+        let inspection = inspect_ip_bin_meta(&data).unwrap();
+        assert_eq!(
+            inspection.vga_compatibility,
+            DreamcastVgaCompatibility::Declared
+        );
+        assert!(
+            inspection
+                .peripheral_flags
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unknown peripheral bits"))
+        );
+    }
+
+    #[test]
+    fn stronger_evidence_conflicts_are_exposed_without_overriding_it() {
+        let mut inspection = inspect_ip_bin_meta(&synthetic_ip_bin()).unwrap();
+        add_stronger_evidence_conflicts(&mut inspection, Some("OTHER"), Some("J"));
+        assert_eq!(inspection.conflicts.len(), 2);
+        assert_eq!(inspection.product_number.value, "T-8109N");
     }
 }

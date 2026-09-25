@@ -4,6 +4,7 @@ mod archive_inspector;
 mod artwork;
 mod backend;
 mod bezel;
+mod dreamcast_ipbin;
 mod environment;
 mod guidance;
 mod hackhash;

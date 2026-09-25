@@ -2885,6 +2885,29 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
 }
 
 #[test]
+fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(9, "Rez", Some("Dreamcast"))]));
+    app.router.current = Route::Game(9);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Dreamcast boot metadata")
+    );
+    assert!(strings.iter().any(|value| {
+        value.contains("Read-only facts from the bounded Dreamcast IP.BIN inspection")
+    }));
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("existing interface"))
+    );
+}
+
+#[test]
 fn gui_v2_artwork_route_contains_native_provider_setup_without_legacy_handoff() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
