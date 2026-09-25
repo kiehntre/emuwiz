@@ -15,6 +15,46 @@ const MAX_CUE_BYTES: u64 = 256 * 1024;
 /// The maximum number of `FILE` references resolved from one CUE sheet
 /// (multi-track/multi-session discs may reference more than one).
 const MAX_CUE_FILE_REFERENCES: usize = 99;
+pub const CUE_FRAMES_PER_SECOND: u64 = 75;
+pub const CUE_FRAME_BYTES: u64 = 2352;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CueTimestamp {
+    pub frames: u64,
+}
+
+impl CueTimestamp {
+    pub fn parse(raw: &str) -> Result<Self, CueError> {
+        let mut fields = raw.split(':');
+        let minutes = fields
+            .next()
+            .ok_or_else(|| CueError::Malformed("timestamp has no minutes".into()))?
+            .parse::<u64>()
+            .map_err(|_| CueError::Malformed("timestamp minutes are malformed".into()))?;
+        let seconds = fields
+            .next()
+            .ok_or_else(|| CueError::Malformed("timestamp has no seconds".into()))?
+            .parse::<u64>()
+            .map_err(|_| CueError::Malformed("timestamp seconds are malformed".into()))?;
+        let frames = fields
+            .next()
+            .ok_or_else(|| CueError::Malformed("timestamp has no frames".into()))?
+            .parse::<u64>()
+            .map_err(|_| CueError::Malformed("timestamp frames are malformed".into()))?;
+        if fields.next().is_some() || seconds >= 60 || frames >= CUE_FRAMES_PER_SECOND {
+            return Err(CueError::Malformed(
+                "timestamp is outside MSF bounds".into(),
+            ));
+        }
+        let total = minutes
+            .checked_mul(60)
+            .and_then(|value| value.checked_add(seconds))
+            .and_then(|value| value.checked_mul(CUE_FRAMES_PER_SECOND))
+            .and_then(|value| value.checked_add(frames))
+            .ok_or_else(|| CueError::Malformed("timestamp overflows frame arithmetic".into()))?;
+        Ok(Self { frames: total })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CueError {
@@ -63,6 +103,17 @@ pub enum CueDataTrackMode {
 pub struct CueDataTrack {
     pub path: PathBuf,
     pub mode: CueDataTrackMode,
+    pub disc_track_count: u32,
+    pub index_01_frame: u64,
+    pub data_frame_count: u64,
+    pub pregap: CuePregap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CuePregap {
+    None,
+    InFile { start_frame: u64, frames: u64 },
+    Synthetic { frames: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +127,10 @@ pub struct CueTrack {
     pub number: u32,
     pub mode: CueTrackMode,
     pub path: PathBuf,
-    pub index_01: Option<String>,
+    pub index_00: Option<CueTimestamp>,
+    pub index_01: Option<CueTimestamp>,
+    pub pregap: Option<CueTimestamp>,
+    pub postgap: Option<CueTimestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,26 +213,48 @@ pub fn resolve_cue_layout(cue_path: &Path) -> Result<CueLayout, CueError> {
     let canonical_base =
         std::fs::canonicalize(base).map_err(|error| CueError::Io(error.to_string()))?;
     let mut current_file: Option<PathBuf> = None;
-    let mut current_track: Option<(u32, CueTrackMode, Option<String>)> = None;
+    let mut current_track: Option<(
+        u32,
+        CueTrackMode,
+        Option<CueTimestamp>,
+        Option<CueTimestamp>,
+        Option<CueTimestamp>,
+        Option<CueTimestamp>,
+    )> = None;
     let mut tracks = Vec::new();
 
     let finish = |current_file: &mut Option<PathBuf>,
-                  current_track: &mut Option<(u32, CueTrackMode, Option<String>)>,
+                  current_track: &mut Option<(
+        u32,
+        CueTrackMode,
+        Option<CueTimestamp>,
+        Option<CueTimestamp>,
+        Option<CueTimestamp>,
+        Option<CueTimestamp>,
+    )>,
                   tracks: &mut Vec<CueTrack>|
      -> Result<(), CueError> {
-        if let Some((number, mode, index_01)) = current_track.take() {
+        if let Some((number, mode, index_00, index_01, pregap, postgap)) = current_track.take() {
             let path = current_file
                 .as_ref()
                 .cloned()
                 .ok_or_else(|| CueError::Malformed("TRACK has no FILE".into()))?;
-            if !matches!(mode, CueTrackMode::Audio) && index_01.is_none() {
-                return Err(CueError::Malformed("data TRACK has no INDEX 01".into()));
+            if index_01.is_none() {
+                return Err(CueError::Malformed("TRACK has no INDEX 01".into()));
+            }
+            if let (Some(index_00), Some(index_01)) = (index_00, index_01) {
+                if index_00 >= index_01 {
+                    return Err(CueError::Malformed("INDEX 00 must precede INDEX 01".into()));
+                }
             }
             tracks.push(CueTrack {
                 number,
                 mode,
                 path,
+                index_00,
                 index_01,
+                pregap,
+                postgap,
             });
         }
         Ok(())
@@ -218,30 +294,97 @@ pub fn resolve_cue_layout(cue_path: &Path) -> Result<CueLayout, CueError> {
                 "AUDIO" => CueTrackMode::Audio,
                 unsupported => return Err(CueError::UnsupportedTrackMode(unsupported.into())),
             };
-            current_track = Some((number, mode, None));
+            current_track = Some((number, mode, None, None, None, None));
+            continue;
+        }
+        if line.len() >= 6 && line[..6].eq_ignore_ascii_case("PREGAP") {
+            let timestamp = CueTimestamp::parse(line[6..].trim())?;
+            let Some((_, _, _, _, pregap, _)) = current_track.as_mut() else {
+                return Err(CueError::Malformed("PREGAP has no TRACK".into()));
+            };
+            if pregap.replace(timestamp).is_some() {
+                return Err(CueError::Malformed("TRACK has duplicate PREGAP".into()));
+            }
+            continue;
+        }
+        if line.len() >= 7 && line[..7].eq_ignore_ascii_case("POSTGAP") {
+            let timestamp = CueTimestamp::parse(line[7..].trim())?;
+            let Some((_, _, _, _, _, postgap)) = current_track.as_mut() else {
+                return Err(CueError::Malformed("POSTGAP has no TRACK".into()));
+            };
+            if postgap.replace(timestamp).is_some() {
+                return Err(CueError::Malformed("TRACK has duplicate POSTGAP".into()));
+            }
             continue;
         }
         if line.len() >= 5 && line[..5].eq_ignore_ascii_case("INDEX") {
             let mut fields = line.split_whitespace();
             let _ = fields.next();
-            if fields.next() == Some("01") {
-                let timestamp = fields
-                    .next()
-                    .ok_or_else(|| CueError::Malformed("INDEX 01 has no timestamp".into()))?;
-                if timestamp.split(':').count() != 3 {
-                    return Err(CueError::Malformed(
-                        "INDEX 01 timestamp is malformed".into(),
-                    ));
+            let index = fields
+                .next()
+                .ok_or_else(|| CueError::Malformed("INDEX has no number".into()))?;
+            let timestamp = fields
+                .next()
+                .ok_or_else(|| CueError::Malformed("INDEX has no timestamp".into()))?;
+            let timestamp = CueTimestamp::parse(timestamp)?;
+            let Some((_, _, index_00, index_01, _, _)) = current_track.as_mut() else {
+                return Err(CueError::Malformed("INDEX has no TRACK".into()));
+            };
+            match index.parse::<u8>() {
+                Ok(0) => {
+                    if index_00.replace(timestamp).is_some() {
+                        return Err(CueError::Malformed("TRACK has duplicate INDEX 00".into()));
+                    }
                 }
-                if let Some((_, _, index_01)) = current_track.as_mut() {
-                    *index_01 = Some(timestamp.to_string());
+                Ok(1) => {
+                    if index_01.replace(timestamp).is_some() {
+                        return Err(CueError::Malformed("TRACK has duplicate INDEX 01".into()));
+                    }
                 }
+                Ok(_) => {}
+                Err(_) => return Err(CueError::Malformed("INDEX number is malformed".into())),
             }
         }
     }
     finish(&mut current_file, &mut current_track, &mut tracks)?;
     if tracks.is_empty() {
         return Err(CueError::NoFileReferences);
+    }
+    for track in &tracks {
+        let index_01 = track
+            .index_01
+            .ok_or_else(|| CueError::Malformed("TRACK has no INDEX 01".into()))?;
+        let frame_bytes = match track.mode {
+            CueTrackMode::Data(CueDataTrackMode::Mode1_2048) => 2048,
+            CueTrackMode::Data(CueDataTrackMode::Mode1_2352)
+            | CueTrackMode::Data(CueDataTrackMode::Mode2_2352)
+            | CueTrackMode::Audio => CUE_FRAME_BYTES,
+        };
+        let offset = index_01
+            .frames
+            .checked_mul(frame_bytes)
+            .ok_or_else(|| CueError::Malformed("INDEX 01 byte offset overflows".into()))?;
+        let length = std::fs::metadata(&track.path)
+            .map_err(|error| CueError::Io(error.to_string()))?
+            .len();
+        if offset > length {
+            return Err(CueError::Malformed(format!(
+                "INDEX 01 is outside FILE for track {}",
+                track.number
+            )));
+        }
+        if let Some(index_00) = track.index_00 {
+            let pregap_offset = index_00
+                .frames
+                .checked_mul(frame_bytes)
+                .ok_or_else(|| CueError::Malformed("INDEX 00 byte offset overflows".into()))?;
+            if pregap_offset >= offset || pregap_offset > length {
+                return Err(CueError::Malformed(format!(
+                    "INDEX 00 is outside FILE for track {}",
+                    track.number
+                )));
+            }
+        }
     }
     Ok(CueLayout {
         cue_path: cue_path.to_path_buf(),
@@ -358,10 +501,7 @@ pub fn resolve_data_track(cue_path: &Path) -> Result<CueDataTrack, CueError> {
         .tracks
         .iter()
         .filter_map(|track| match track.mode {
-            CueTrackMode::Data(mode) => Some(CueDataTrack {
-                path: track.path.clone(),
-                mode,
-            }),
+            CueTrackMode::Data(mode) => Some((track, mode)),
             CueTrackMode::Audio => None,
         })
         .collect();
@@ -372,7 +512,68 @@ pub fn resolve_data_track(cue_path: &Path) -> Result<CueDataTrack, CueError> {
             Err(CueError::AmbiguousDataTracks)
         };
     }
-    Ok(data_tracks.into_iter().next().expect("length checked"))
+    let (track, mode) = data_tracks.into_iter().next().expect("length checked");
+    let index_01 = track
+        .index_01
+        .ok_or_else(|| CueError::Malformed("TRACK has no INDEX 01".into()))?;
+    let frame_bytes = frame_bytes(&track.mode);
+    let length = std::fs::metadata(&track.path)
+        .map_err(|error| CueError::Io(error.to_string()))?
+        .len();
+    if !length.is_multiple_of(frame_bytes) {
+        return Err(CueError::Malformed(
+            "FILE is not a whole-sector stream".into(),
+        ));
+    }
+    let file_frames = length / frame_bytes;
+    let boundary = layout
+        .tracks
+        .iter()
+        .filter(|candidate| candidate.path == track.path)
+        .filter_map(|candidate| {
+            let candidate_start = candidate.index_01?.frames;
+            (candidate_start > index_01.frames).then(|| {
+                candidate
+                    .index_00
+                    .map(|index| index.frames)
+                    .unwrap_or(candidate_start)
+            })
+        })
+        .min()
+        .unwrap_or(file_frames);
+    if boundary <= index_01.frames || boundary > file_frames {
+        return Err(CueError::Malformed(
+            "track boundary is outside its FILE".into(),
+        ));
+    }
+    let pregap = match (track.index_00, track.pregap) {
+        (Some(index_00), _) => CuePregap::InFile {
+            start_frame: index_00.frames,
+            frames: index_01.frames - index_00.frames,
+        },
+        (None, Some(pregap)) => CuePregap::Synthetic {
+            frames: pregap.frames,
+        },
+        (None, None) => CuePregap::None,
+    };
+    Ok(CueDataTrack {
+        path: track.path.clone(),
+        mode,
+        disc_track_count: u32::try_from(layout.tracks.len())
+            .map_err(|_| CueError::Malformed("too many tracks".into()))?,
+        index_01_frame: index_01.frames,
+        data_frame_count: boundary - index_01.frames,
+        pregap,
+    })
+}
+
+fn frame_bytes(mode: &CueTrackMode) -> u64 {
+    match mode {
+        CueTrackMode::Data(CueDataTrackMode::Mode1_2048) => 2048,
+        CueTrackMode::Data(CueDataTrackMode::Mode1_2352)
+        | CueTrackMode::Data(CueDataTrackMode::Mode2_2352)
+        | CueTrackMode::Audio => CUE_FRAME_BYTES,
+    }
 }
 
 /// Extracts the quoted filename from a CUE `FILE "name.bin" BINARY` line.
@@ -573,5 +774,120 @@ mod tests {
         // the dedup check (`!files.contains`) itself.
         let files = resolve_cue_all_files(&cue).unwrap();
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn index_00_is_an_in_file_pregap_and_index_01_is_the_data_start() {
+        let cue = write_temp(
+            "index00.cue",
+            "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:02:00\n",
+        );
+        std::fs::write(cue.with_file_name("disc.bin"), vec![0_u8; 2048 * 152]).unwrap();
+        let track = resolve_data_track(&cue).unwrap();
+        assert_eq!(track.index_01_frame, 150);
+        assert_eq!(track.data_frame_count, 2);
+        assert_eq!(
+            track.pregap,
+            CuePregap::InFile {
+                start_frame: 0,
+                frames: 150
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_pregap_is_synthetic_and_does_not_shift_file_offset() {
+        let cue = write_temp(
+            "synthetic-pregap.cue",
+            "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nPREGAP 00:02:00\nINDEX 01 00:00:00\n",
+        );
+        std::fs::write(cue.with_file_name("disc.bin"), vec![0_u8; 2048 * 2]).unwrap();
+        let track = resolve_data_track(&cue).unwrap();
+        assert_eq!(track.index_01_frame, 0);
+        assert_eq!(track.data_frame_count, 2);
+        assert_eq!(track.pregap, CuePregap::Synthetic { frames: 150 });
+    }
+
+    #[test]
+    fn one_file_track_boundaries_stop_at_next_index_00() {
+        let cue = write_temp(
+            "one-file.cue",
+            "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 00 00:02:00\nINDEX 01 00:03:00\n",
+        );
+        std::fs::write(cue.with_file_name("disc.bin"), vec![0_u8; 2352 * 300]).unwrap();
+        let track = resolve_data_track(&cue).unwrap();
+        assert_eq!(track.index_01_frame, 0);
+        assert_eq!(track.data_frame_count, 150);
+    }
+
+    #[test]
+    fn malformed_or_missing_index_01_fails_closed() {
+        let missing = write_temp(
+            "missing-index01.cue",
+            "FILE \"disc.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 00 00:00:00\n",
+        );
+        std::fs::write(missing.with_file_name("disc.bin"), vec![0_u8; 2352]).unwrap();
+        assert!(matches!(
+            resolve_cue_layout(&missing),
+            Err(CueError::Malformed(_))
+        ));
+
+        let decreasing = write_temp(
+            "decreasing-index.cue",
+            "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:02\nINDEX 01 00:00:01\n",
+        );
+        std::fs::write(decreasing.with_file_name("disc.bin"), vec![0_u8; 2048 * 2]).unwrap();
+        assert!(matches!(
+            resolve_cue_layout(&decreasing),
+            Err(CueError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn index_00_outside_the_referenced_file_is_refused() {
+        let cue = write_temp(
+            "outside-index00.cue",
+            "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:01:00\nINDEX 01 00:02:00\n",
+        );
+        std::fs::write(cue.with_file_name("disc.bin"), vec![0_u8; 2048]).unwrap();
+        assert!(matches!(
+            resolve_cue_layout(&cue),
+            Err(CueError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn data_after_audio_uses_its_own_file_relative_indexes() {
+        let cue = write_temp(
+            "data-after-audio.cue",
+            "FILE \"audio.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nFILE \"data.bin\" BINARY\nTRACK 02 MODE1/2048\nPREGAP 00:01:00\nINDEX 00 00:00:00\nINDEX 01 00:00:01\n",
+        );
+        std::fs::write(cue.with_file_name("audio.bin"), vec![0_u8; 2352]).unwrap();
+        std::fs::write(cue.with_file_name("data.bin"), vec![0_u8; 2048 * 2]).unwrap();
+        let track = resolve_data_track(&cue).unwrap();
+        assert!(track.path.ends_with("data.bin"));
+        assert_eq!(track.index_01_frame, 1);
+        assert_eq!(track.data_frame_count, 1);
+        assert_eq!(
+            track.pregap,
+            CuePregap::InFile {
+                start_frame: 0,
+                frames: 1
+            }
+        );
+    }
+
+    #[test]
+    fn multiple_file_tracks_do_not_share_offsets() {
+        let cue = write_temp(
+            "separate-files.cue",
+            "FILE \"track01.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nFILE \"track02.bin\" BINARY\nTRACK 02 MODE1/2048\nINDEX 01 00:00:00\n",
+        );
+        std::fs::write(cue.with_file_name("track01.bin"), vec![0_u8; 2352]).unwrap();
+        std::fs::write(cue.with_file_name("track02.bin"), vec![0_u8; 2048 * 3]).unwrap();
+        let track = resolve_data_track(&cue).unwrap();
+        assert!(track.path.ends_with("track02.bin"));
+        assert_eq!(track.index_01_frame, 0);
+        assert_eq!(track.data_frame_count, 3);
     }
 }

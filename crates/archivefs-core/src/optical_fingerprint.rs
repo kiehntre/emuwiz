@@ -14,9 +14,11 @@ use sha2::{Digest, Sha256};
 
 use crate::chd_identity::{ChdMetadataFact, ChdMetadataOutcome, observe_chd_identity_file};
 use crate::chd_logical_media::open_chd_track_logical_media_file;
-use crate::ingestion::cue_bin::{CueError, CueTrackMode, resolve_cue_layout};
+use crate::ingestion::cue_bin::{CueDataTrackMode, CueError, resolve_data_track};
 use crate::logical_media::LogicalMedia;
-use crate::raw_cd_logical_media::open_cooked_cd_file_logical_media;
+use crate::raw_cd_logical_media::{
+    open_cooked_cd_file_logical_media_range, open_raw_cd_file_logical_media_range,
+};
 
 pub const OPTICAL_FINGERPRINT_SCHEMA: &str = "emuwiz.optical-fingerprint.v1";
 pub const LOGICAL_SECTOR_SIZE: u32 = 2048;
@@ -117,30 +119,41 @@ fn hash_logical_media<M: LogicalMedia>(
 pub fn fingerprint_cue_bin(
     path: &Path,
 ) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
-    let layout = resolve_cue_layout(path).map_err(OpticalFingerprintError::Cue)?;
-    let track = layout
-        .supported_single_mode1_2048()
-        .map_err(|error| match error {
-            CueError::AmbiguousDataTracks => {
-                OpticalFingerprintError::UnsupportedCueLayout("multiple tracks or files".into())
-            }
-            other => OpticalFingerprintError::Cue(other),
-        })?;
-    if !matches!(
-        track.mode,
-        CueTrackMode::Data(crate::ingestion::cue_bin::CueDataTrackMode::Mode1_2048)
-    ) {
-        return Err(OpticalFingerprintError::UnsupportedCueLayout(
-            "only MODE1/2048 is supported".into(),
-        ));
-    }
-    let media = open_cooked_cd_file_logical_media(&track.path)
-        .map_err(|error| OpticalFingerprintError::Io(error.to_string()))?;
-    let (canonical_sha256, sectors) = hash_logical_media(&media)?;
+    let track = resolve_data_track(path).map_err(|error| match error {
+        CueError::AmbiguousDataTracks => {
+            OpticalFingerprintError::UnsupportedCueLayout("multiple data tracks".into())
+        }
+        other => OpticalFingerprintError::Cue(other),
+    })?;
+    let (canonical_sha256, sectors) = match track.mode {
+        CueDataTrackMode::Mode1_2048 => {
+            let media = open_cooked_cd_file_logical_media_range(
+                &track.path,
+                track.index_01_frame,
+                track.data_frame_count,
+            )
+            .map_err(|error| OpticalFingerprintError::Io(error.to_string()))?;
+            hash_logical_media(&media)?
+        }
+        CueDataTrackMode::Mode1_2352 => {
+            let media = open_raw_cd_file_logical_media_range(
+                &track.path,
+                track.index_01_frame,
+                track.data_frame_count,
+            )
+            .map_err(|error| OpticalFingerprintError::Io(error.to_string()))?;
+            hash_logical_media(&media)?
+        }
+        CueDataTrackMode::Mode2_2352 => {
+            return Err(OpticalFingerprintError::UnsupportedCueLayout(
+                "MODE2/2352 logical form is not yet proven for identity".into(),
+            ));
+        }
+    };
     Ok(CanonicalOpticalFingerprint {
         schema: OPTICAL_FINGERPRINT_SCHEMA,
         structure: OpticalDiscStructure {
-            track_count: 1,
+            track_count: track.disc_track_count,
             logical_sector_size: LOGICAL_SECTOR_SIZE,
             logical_sector_count: sectors,
             track_mode: OpticalTrackMode::Mode1_2048,
@@ -370,6 +383,48 @@ mod tests {
     }
 
     #[test]
+    fn cue_index_01_excludes_in_file_pregap_from_identity() {
+        let (dir, cue) = cue_fixture(&[0x11, 0x22]);
+        let expected = fingerprint_cue_bin(&cue).unwrap();
+        let prefixed_cue = dir.path().join("prefixed.cue");
+        let prefixed_bin = dir.path().join("prefixed.bin");
+        let mut bytes = vec![0xEE; 150 * 2048];
+        bytes.extend(std::fs::read(dir.path().join("track with ü.bin")).unwrap());
+        std::fs::write(&prefixed_bin, bytes).unwrap();
+        std::fs::write(
+            &prefixed_cue,
+            "FILE \"prefixed.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:02:00\n",
+        )
+        .unwrap();
+        let actual = fingerprint_cue_bin(&prefixed_cue).unwrap();
+        assert_eq!(actual.canonical_sha256, expected.canonical_sha256);
+        assert_eq!(actual.structure.logical_sector_count, 2);
+    }
+
+    #[test]
+    fn mode1_2352_identity_starts_at_index_01() {
+        let dir = tempfile::tempdir().unwrap();
+        let cue = dir.path().join("raw.cue");
+        let bin = dir.path().join("raw.bin");
+        let mut bytes = Vec::new();
+        for value in [0xEE, 0x11, 0x22] {
+            bytes.extend_from_slice(&sector(value));
+        }
+        std::fs::write(&bin, bytes).unwrap();
+        std::fs::write(
+            &cue,
+            "FILE \"raw.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 00 00:00:00\nINDEX 01 00:00:01\n",
+        )
+        .unwrap();
+        let fingerprint = fingerprint_cue_bin(&cue).unwrap();
+        let mut expected = Sha256::new();
+        expected.update(vec![0x11; 2048]);
+        expected.update(vec![0x22; 2048]);
+        assert_eq!(fingerprint.canonical_sha256, hex(expected.finalize()));
+        assert_eq!(fingerprint.structure.logical_sector_count, 2);
+    }
+
+    #[test]
     fn unsupported_cue_and_chd_layouts_fail_closed() {
         let (dir, cue) = cue_fixture(&[0x11]);
         std::fs::write(
@@ -390,6 +445,7 @@ mod tests {
         assert!(matches!(
             fingerprint_cue_bin(&cue),
             Err(OpticalFingerprintError::Io(_))
+                | Err(OpticalFingerprintError::Cue(CueError::Malformed(_)))
         ));
     }
 }
