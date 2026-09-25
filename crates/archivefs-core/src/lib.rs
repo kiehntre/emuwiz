@@ -74,6 +74,8 @@ pub mod mame_collection_analyser;
 pub mod mame_collection_stats;
 /// Conservative static input requirements projected from MAME metadata.
 pub mod mame_input_requirements;
+/// Read-only MAME family curation and playing-library projection.
+pub mod mame_playing_library;
 pub mod managed_appimage_bootstrap;
 /// Manifest-backed ownership and side-by-side managed AppImage installs.
 pub mod managed_emulator_install;

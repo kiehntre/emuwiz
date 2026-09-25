@@ -1,8 +1,19 @@
 //! Read-only MAME collection health presentation.
 
+use archivefs_core::mame_playing_library::MamePlayingLibraryPlan;
 use eframe::egui;
 
 pub(super) fn show(ui: &mut egui::Ui) {
+    show_with_playing_library_plan(ui, None);
+}
+
+/// Renders the read-only MAME playing-library projection when an inspection
+/// workflow supplies one. `None` is the normal current state until a MAME
+/// catalogue/inventory report has been loaded; it never invents metrics.
+pub(super) fn show_with_playing_library_plan(
+    ui: &mut egui::Ui,
+    plan: Option<&MamePlayingLibraryPlan>,
+) {
     egui::CollapsingHeader::new("MAME Collection Health")
         .default_open(false)
         .show(ui, |ui| {
@@ -30,5 +41,39 @@ pub(super) fn show(ui: &mut egui::Ui) {
             if ui.button("Export report").clicked() {
                 ui.ctx().copy_text("MAME collection health export is available after an inspection report is loaded.".into());
             }
+            ui.separator();
+            ui.strong("MAME Playing Library preview");
+            ui.label("Curates one practical representative per authoritative parent/clone family while retaining meaningful control-panel and regional variants.");
+            if let Some(plan) = plan {
+                egui::Grid::new("mame_playing_library_preview")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Archival collection"); ui.label(format!("{} sets", plan.archival_set_count)); ui.end_row();
+                        ui.label("Proposed playing set"); ui.label(plan.projected_set_count.to_string()); ui.end_row();
+                        ui.label("Estimated storage"); ui.label(format_bytes(plan.projected_storage_bytes)); ui.end_row();
+                        ui.label("Estimated savings"); ui.label(format_bytes(plan.projected_savings_bytes)); ui.end_row();
+                        ui.label("Ambiguities"); ui.label(plan.unresolved_cases.len().to_string()); ui.end_row();
+                    });
+                ui.label(format!("Preference rules are applied; {} sets excluded; {} BIOS/device support sets retained.", plan.excluded_sets.len(), plan.required_support_sets.len()));
+                ui.label("Preview only: the archival collection is never mutated by this planner.");
+            } else {
+                ui.label("Load a MAME catalogue and complete collection report to preview selected sets, storage, savings, exclusions, dependencies, and ambiguities.");
+                ui.label("No apply, copy, delete, rename, or source-update action is available here.");
+            }
         });
+}
+
+fn format_bytes(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "unknown".into();
+    };
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut amount = value as f64;
+    let mut unit = 0;
+    while amount >= 1024.0 && unit + 1 < UNITS.len() {
+        amount /= 1024.0;
+        unit += 1;
+    }
+    format!("{amount:.1} {}", UNITS[unit])
 }
