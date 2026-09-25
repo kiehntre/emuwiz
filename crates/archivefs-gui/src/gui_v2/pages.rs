@@ -73,6 +73,45 @@ impl App {
     fn romm_library_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("RomM library");
         ui.label("Read-only provider browsing. Local EmuWiz evidence is never replaced by RomM metadata.");
+        let busy = self.romm_library.operation.is_some();
+        let mut refresh = false;
+        let mut preview = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Refresh RomM data"))
+                .clicked()
+            {
+                refresh = true;
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Preview import (25 records)"))
+                .clicked()
+            {
+                preview = true;
+            }
+            if busy {
+                ui.label("RomM operation in progress…");
+            }
+        });
+        if refresh {
+            self.start_romm_library_operation(
+                crate::gui_v2::romm_library::RommLibraryOperation::Refresh,
+            );
+        }
+        if preview {
+            self.start_romm_library_operation(
+                crate::gui_v2::romm_library::RommLibraryOperation::PreviewImport,
+            );
+        }
+        if let Some(error) = &self.romm_library.operation_error {
+            ui.colored_label(theme::WARNING, error);
+        }
+        if let Some(summary) = &self.romm_library.last_preview {
+            ui.label(format!(
+                "Import preview: {} record(s), {} platform(s); nothing was published.",
+                summary.records, summary.platforms
+            ));
+        }
         let Some(snapshot) = self.romm_library.snapshot.as_ref() else {
             ui.label(if self.romm_library.loading {
                 "Loading the cached RomM snapshot…"
@@ -82,12 +121,30 @@ impl App {
             return;
         };
         ui.label(&snapshot.status);
+        if let Some(cache) = &snapshot.cache {
+            ui.label(format!(
+                "Last refreshed: {} · Cached platforms: {} · Cached games: {}",
+                cache.imported_at_unix_seconds,
+                cache.platforms.len(),
+                cache.records.len()
+            ));
+        }
+        if let Some(delta) = self.romm_library.last_delta {
+            ui.label(format!(
+                "Changes since previous refresh: +{} game(s), −{} game(s), {} unchanged; +{} platform(s), −{} platform(s).",
+                delta.added_games,
+                delta.removed_games,
+                delta.unchanged_games,
+                delta.added_platforms,
+                delta.removed_platforms
+            ));
+        }
         if snapshot.cache.is_none() {
             ui.colored_label(
                 theme::WARNING,
                 "RomM is unavailable, unauthenticated, or has no usable cached library.",
             );
-            ui.label("Open Sources → RomM to configure or refresh it. Existing local games remain available.");
+            ui.label("Configure RomM in Sources if needed. Existing local games remain available.");
             return;
         }
         ui.horizontal_wrapped(|ui| {

@@ -38,6 +38,9 @@ pub(super) enum Command {
     },
     EnvironmentCheck,
     LoadRommLibrary,
+    RommOperation {
+        operation: Box<crate::romm_source::RommOperation>,
+    },
     Filter {
         library: SharedLibrary,
         filter: Filter,
@@ -106,6 +109,11 @@ pub(super) enum Payload {
     Library(SharedLibrary),
     Environment(crate::gui_v2::environment::EnvironmentSnapshot),
     RommLibrary(crate::gui_v2::romm_library::RommBrowserSnapshot),
+    RommOperation {
+        operation: crate::romm_source::RommOperation,
+        outcome: Box<crate::romm_source::RommOperationOutcome>,
+        snapshot: Option<crate::gui_v2::romm_library::RommBrowserSnapshot>,
+    },
     Filter {
         indices: Vec<usize>,
         generation: u64,
@@ -232,6 +240,48 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         Command::LoadRommLibrary => Ok(Payload::RommLibrary(
             crate::gui_v2::romm_library::load_snapshot()?,
         )),
+        Command::RommOperation { operation } => {
+            let operation = *operation;
+            let outcome = crate::romm_source::worker::run_romm_operation(
+                &operation,
+                &Ok(Vec::new()),
+                None,
+                0,
+                &Arc::new(AtomicBool::new(false)),
+                &|event| match event {
+                    crate::romm_source::RommProgressEvent::Import(progress) => {
+                        let _ = answers.send(Event::Progress {
+                            id,
+                            done: progress.records_fetched as u64,
+                            total: progress.reported_total.unwrap_or(0),
+                            item: format!("Fetched {} RomM record(s)", progress.records_fetched),
+                        });
+                    }
+                    crate::romm_source::RommProgressEvent::Note(note) => {
+                        let _ = answers.send(Event::Progress {
+                            id,
+                            done: 0,
+                            total: 0,
+                            item: note,
+                        });
+                    }
+                    _ => {}
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let snapshot = matches!(
+                operation,
+                crate::romm_source::RommOperation::Refresh
+                    | crate::romm_source::RommOperation::FullImport
+            )
+            .then(crate::gui_v2::romm_library::load_snapshot)
+            .transpose()?;
+            Ok(Payload::RommOperation {
+                operation,
+                outcome: Box::new(outcome),
+                snapshot,
+            })
+        }
         Command::Load { scan } => {
             let scan_warning = if scan {
                 let summary = archivefs_core::scan_all_enabled_sources_default()

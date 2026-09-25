@@ -1,5 +1,6 @@
 //! Native GUI-v2 browsing of the read-only RomM identity snapshot.
 
+use crate::romm_source::RommImportSummary;
 use archivefs_core::identity_source::{
     cache::IdentityCache,
     matching::LocalPresence,
@@ -9,7 +10,7 @@ use std::path::Path;
 
 pub(crate) const MAX_VISIBLE: usize = 200;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RommBrowserSnapshot {
     pub cache: Option<IdentityCache>,
     pub status: String,
@@ -31,7 +32,7 @@ pub(crate) enum PresenceFilter {
     Missing,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RommBrowserState {
     pub snapshot: Option<RommBrowserSnapshot>,
     pub search: String,
@@ -40,6 +41,67 @@ pub(crate) struct RommBrowserState {
     pub selected: Option<String>,
     pub page: usize,
     pub loading: bool,
+    pub operation: Option<(u64, RommLibraryOperation)>,
+    pub operation_error: Option<String>,
+    pub last_import: Option<RommImportSummary>,
+    pub last_preview: Option<RommImportSummary>,
+    pub last_delta: Option<RommCacheDelta>,
+    pub refresh_baseline: Option<IdentityCache>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RommLibraryOperation {
+    Refresh,
+    PreviewImport,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RommCacheDelta {
+    pub added_games: usize,
+    pub removed_games: usize,
+    pub unchanged_games: usize,
+    pub added_platforms: usize,
+    pub removed_platforms: usize,
+}
+
+impl RommCacheDelta {
+    pub(crate) fn between(before: Option<&IdentityCache>, after: &IdentityCache) -> Self {
+        let before_games: std::collections::BTreeSet<_> = before
+            .into_iter()
+            .flat_map(|cache| {
+                cache
+                    .records
+                    .iter()
+                    .map(|record| record.provider_game_id.as_str())
+            })
+            .collect();
+        let after_games: std::collections::BTreeSet<_> = after
+            .records
+            .iter()
+            .map(|record| record.provider_game_id.as_str())
+            .collect();
+        let before_platforms: std::collections::BTreeSet<_> = before
+            .into_iter()
+            .flat_map(|cache| {
+                cache
+                    .platforms
+                    .iter()
+                    .map(|platform| platform.provider_slug.as_str())
+            })
+            .collect();
+        let after_platforms: std::collections::BTreeSet<_> = after
+            .platforms
+            .iter()
+            .map(|platform| platform.provider_slug.as_str())
+            .collect();
+        Self {
+            added_games: after_games.difference(&before_games).count(),
+            removed_games: before_games.difference(&after_games).count(),
+            unchanged_games: after_games.intersection(&before_games).count(),
+            added_platforms: after_platforms.difference(&before_platforms).count(),
+            removed_platforms: before_platforms.difference(&after_platforms).count(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +241,69 @@ pub(crate) fn load_snapshot() -> Result<RommBrowserSnapshot, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cache(ids: &[&str], platforms: &[&str]) -> IdentityCache {
+        IdentityCache {
+            format_version: archivefs_core::identity_source::cache::CACHE_FORMAT_VERSION,
+            provider: archivefs_core::identity_source::model::IdentityProvider::Romm,
+            server_id: "https://romm.example".into(),
+            server_version: None,
+            source_fingerprint: "fixture".into(),
+            imported_at_unix_seconds: 1,
+            platforms: platforms
+                .iter()
+                .map(
+                    |slug| archivefs_core::identity_source::romm::normalise::NormalisedPlatform {
+                        provider_platform_id: None,
+                        provider_slug: (*slug).into(),
+                        provider_name: Some((*slug).into()),
+                        canonical: None,
+                        rom_count: None,
+                    },
+                )
+                .collect(),
+            records: ids
+                .iter()
+                .map(
+                    |id| archivefs_core::identity_source::model::ExternalIdentityRecord {
+                        provider: archivefs_core::identity_source::model::IdentityProvider::Romm,
+                        server_id: "https://romm.example".into(),
+                        provider_platform_id: None,
+                        provider_game_id: (*id).into(),
+                        provider_file_id: None,
+                        provider_path: format!("gb/{id}.gb"),
+                        archivefs_path: None,
+                        title: Some((*id).into()),
+                        platform_candidate: None,
+                        provider_platform_name: None,
+                        regions: Vec::new(),
+                        revision: None,
+                        hashes: Vec::new(),
+                        file_size_bytes: None,
+                        metadata_provider_ids: Vec::new(),
+                        artwork: None,
+                        related_files: Vec::new(),
+                        sibling_game_ids: Vec::new(),
+                        imported_at_unix_seconds: 1,
+                        provider_updated_at: None,
+                        verification: ExternalVerification::Unmatched,
+                        conflicts: Vec::new(),
+                        evidence: Vec::new(),
+                        synopsis: None,
+                        genres: Vec::new(),
+                        players: None,
+                        rating: None,
+                        release_year: None,
+                        howlongtobeat: None,
+                    },
+                )
+                .collect(),
+            rejected_hashes: Vec::new(),
+            unknown_platforms: Vec::new(),
+            server_reported_total: None,
+        }
+    }
+
     #[test]
     fn empty_snapshot_is_safe() {
         let state = RommBrowserState {
@@ -187,5 +312,36 @@ mod tests {
         };
         assert!(state.platforms().is_empty());
         assert!(state.filtered_games().is_empty());
+    }
+
+    #[test]
+    fn refresh_delta_reports_added_removed_and_unchanged_records() {
+        let before = cache(&["same", "removed"], &["gb", "old"]);
+        let after = cache(&["same", "added"], &["gb", "new"]);
+        assert_eq!(
+            RommCacheDelta::between(Some(&before), &after),
+            RommCacheDelta {
+                added_games: 1,
+                removed_games: 1,
+                unchanged_games: 1,
+                added_platforms: 1,
+                removed_platforms: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn first_refresh_is_all_new_and_never_requires_a_previous_cache() {
+        let after = cache(&["one", "two"], &["gb"]);
+        assert_eq!(
+            RommCacheDelta::between(None, &after),
+            RommCacheDelta {
+                added_games: 2,
+                removed_games: 0,
+                unchanged_games: 0,
+                added_platforms: 1,
+                removed_platforms: 0,
+            }
+        );
     }
 }

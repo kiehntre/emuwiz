@@ -366,6 +366,103 @@ impl App {
             true
         }
     }
+
+    fn start_romm_library_operation(&mut self, operation: romm_library::RommLibraryOperation) {
+        if self.romm_library.operation.is_some() {
+            return;
+        }
+        let (romm_operation, label) = match operation {
+            romm_library::RommLibraryOperation::Refresh => (
+                crate::romm_source::RommOperation::Refresh,
+                "Refreshing RomM data",
+            ),
+            romm_library::RommLibraryOperation::PreviewImport => (
+                crate::romm_source::RommOperation::SampleImport {
+                    records: crate::romm_source::SAMPLE_IMPORT_RECORDS,
+                },
+                "Previewing RomM import",
+            ),
+        };
+        let id = self
+            .activity
+            .queue(label, Route::Section(Section::Romm), false);
+        self.romm_library.operation = Some((id, operation));
+        self.romm_library.operation_error = None;
+        if matches!(operation, romm_library::RommLibraryOperation::Refresh) {
+            self.romm_library.refresh_baseline = self
+                .romm_library
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.cache.clone());
+        }
+        if !self.send(
+            id,
+            Command::RommOperation {
+                operation: Box::new(romm_operation),
+            },
+        ) {
+            self.romm_library.operation = None;
+        }
+    }
+
+    fn handle_romm_library_operation(
+        &mut self,
+        operation: crate::romm_source::RommOperation,
+        outcome: crate::romm_source::RommOperationOutcome,
+        snapshot: Option<romm_library::RommBrowserSnapshot>,
+    ) {
+        let Some((job_id, kind)) = self.romm_library.operation.take() else {
+            return;
+        };
+        match (kind, operation, outcome) {
+            (
+                romm_library::RommLibraryOperation::Refresh,
+                crate::romm_source::RommOperation::Refresh,
+                crate::romm_source::RommOperationOutcome::Import(summary),
+            ) => {
+                self.romm_library.last_import = Some(*summary.clone());
+                if let Some(snapshot) = snapshot {
+                    if let Some(cache) = snapshot.cache.as_ref() {
+                        self.romm_library.last_delta = Some(romm_library::RommCacheDelta::between(
+                            self.romm_library.refresh_baseline.as_ref(),
+                            cache,
+                        ));
+                    }
+                    self.romm_library.snapshot = Some(romm_library::RommBrowserSnapshot {
+                        status: format!("Cached from {}", snapshot.status),
+                        cache: snapshot.cache.clone(),
+                    });
+                }
+                self.romm_library.refresh_baseline = None;
+                self.activity.finish(
+                    job_id,
+                    format!(
+                        "RomM cache refreshed: {} game(s), {} platform(s). Local identity and ROM files were not changed.",
+                        summary.records, summary.platforms
+                    ),
+                    None,
+                );
+            }
+            (
+                romm_library::RommLibraryOperation::PreviewImport,
+                crate::romm_source::RommOperation::SampleImport { .. },
+                crate::romm_source::RommOperationOutcome::Sample(summary),
+            ) => {
+                self.romm_library.last_preview = Some(*summary);
+                self.activity.finish(
+                    job_id,
+                    "RomM import preview ready. Nothing was published and local identity was not changed.".into(),
+                    None,
+                );
+            }
+            (_, _, other) => {
+                let error = "RomM returned an unexpected operation result; the cached browser state was kept.".to_string();
+                self.romm_library.operation_error = Some(error.clone());
+                self.activity
+                    .finish(job_id, error, Some(format!("Unexpected result: {other:?}")));
+            }
+        }
+    }
     fn load(&mut self, scan: bool) {
         if self.load_job.is_some() {
             return;
@@ -1131,6 +1228,15 @@ impl App {
                                     self.romm_library.loading = false;
                                     self.romm_library_job = None;
                                 }
+                                Payload::RommOperation {
+                                    operation,
+                                    outcome,
+                                    snapshot,
+                                } => {
+                                    self.handle_romm_library_operation(
+                                        operation, *outcome, snapshot,
+                                    );
+                                }
                                 Payload::PersistentStateInventory {
                                     inventory,
                                     generation,
@@ -1321,6 +1427,16 @@ impl App {
                             if self.romm_library_job == Some(id) {
                                 self.romm_library_job = None;
                                 self.romm_library.loading = false;
+                            }
+                            if self
+                                .romm_library
+                                .operation
+                                .as_ref()
+                                .is_some_and(|(job, _)| *job == id)
+                            {
+                                self.romm_library.operation = None;
+                                self.romm_library.refresh_baseline = None;
+                                self.romm_library.operation_error = Some(error.clone());
                             }
                             self.detail_failed = self.detail_pending.take();
                             self.filter_inflight = false;
