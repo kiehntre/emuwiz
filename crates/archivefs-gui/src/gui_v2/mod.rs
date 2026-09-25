@@ -6,6 +6,7 @@ mod backend;
 mod bezel;
 mod environment;
 mod guidance;
+mod hackhash;
 mod imagery;
 mod legacy;
 pub(crate) mod library;
@@ -262,6 +263,7 @@ pub(super) struct App {
     archive_inspector: archive_inspector::ArchiveInspectorPageState,
     converter: OpticalConversionPageState,
     bezel: bezel::BezelPanelState,
+    hackhash: hackhash::HackHashPageState,
 }
 
 impl App {
@@ -329,6 +331,7 @@ impl App {
             archive_inspector: archive_inspector::ArchiveInspectorPageState::default(),
             converter: OpticalConversionPageState::default(),
             bezel: bezel::BezelPanelState::default(),
+            hackhash: hackhash::HackHashPageState::new(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",

@@ -99,6 +99,7 @@ fn fixture(context: &egui::Context) -> App {
         converter: crate::optical_conversion_page::OpticalConversionPageState::default(),
         archive_inspector: super::archive_inspector::ArchiveInspectorPageState::default(),
         bezel: super::bezel::BezelPanelState::default(),
+        hackhash: super::hackhash::HackHashPageState::default(),
     }
 }
 

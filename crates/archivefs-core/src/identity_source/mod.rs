@@ -30,6 +30,7 @@ pub mod artwork;
 pub mod cache;
 pub mod fbneo;
 pub mod freshness;
+pub mod hackhash;
 pub mod hasheous;
 pub mod hashing;
 pub use freshness::{

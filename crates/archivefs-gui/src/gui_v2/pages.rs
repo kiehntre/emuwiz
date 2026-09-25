@@ -1712,6 +1712,8 @@ impl App {
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
         workflows.show_sources(ui, &mut self.activity);
+        ui.separator();
+        self.hackhash.show(ui);
     }
 
     fn dat_sources(&mut self, ui: &mut egui::Ui) {
