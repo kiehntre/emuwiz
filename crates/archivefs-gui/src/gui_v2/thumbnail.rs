@@ -211,3 +211,38 @@ pub(super) fn trim_cache(root: &Path) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_image_generates_derived_cache_without_changing_source() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("bezel.png");
+        let image = image::RgbaImage::from_pixel(640, 480, image::Rgba([10, 20, 30, 255]));
+        image.save(&source).unwrap();
+        let before = fs::read(&source).unwrap();
+
+        let first = load_local(&source, cache_dir.path()).unwrap();
+        assert!(first.image.size[0] <= WIDTH as usize);
+        assert!(first.image.size[1] <= HEIGHT as usize);
+        assert!(!first.timings.cache_hit);
+        assert_eq!(fs::read(&source).unwrap(), before);
+        assert_eq!(fs::read_dir(cache_dir.path()).unwrap().count(), 1);
+
+        let second = load_local(&source, cache_dir.path()).unwrap();
+        assert!(second.timings.cache_hit);
+        assert_eq!(fs::read(&source).unwrap(), before);
+    }
+
+    #[test]
+    fn malformed_local_image_is_refused_without_panicking() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("broken.png");
+        fs::write(&source, b"not an image").unwrap();
+        assert!(load_local(&source, cache_dir.path()).is_err());
+    }
+}

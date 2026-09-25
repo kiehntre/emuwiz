@@ -1859,7 +1859,7 @@ impl App {
                 };
                 ui.heading(&game.title);
                 ui.label(&game.platform);
-                self.bezel.selected_game = Some(game.title.clone());
+                self.bezel.set_game(&game.title, &game.platform);
                 super::bezel::show(ui, &mut self.bezel);
                 ui.separator();
                 ui.horizontal_top(|ui| {
