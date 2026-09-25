@@ -16,7 +16,8 @@ use url::Url;
 use super::managed_snapshot::{
     ActivationPreview, ActivationResult, ManagedSourceDescriptor, ManagedSourceKind,
     ManagedSourceMetadata, ManagedSourceReference, ManagedSourceSnapshot, ManagedSourceStore,
-    ManagedSourceTrust, ValidatedCandidate, ValidationReport,
+    ManagedSourceTransport, ManagedSourceTrust, SourceResponseMetadata, UpdateCheck,
+    ValidatedCandidate, ValidationReport,
 };
 use crate::{ArchiveFsError, Result};
 
@@ -218,6 +219,18 @@ pub struct HackHashValidatedImport {
     pub index: HackHashIndex,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HackHashFetchState {
+    Changed,
+    AlreadyCurrent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HackHashFetchResult {
+    pub import: HackHashValidatedImport,
+    pub state: HackHashFetchState,
+}
+
 #[derive(Debug, Clone)]
 pub struct HackHashStore {
     store: ManagedSourceStore,
@@ -286,6 +299,107 @@ impl HackHashStore {
         })
     }
 
+    /// Performs a metadata-only check after an explicit user action. It does
+    /// not download or stage a response.
+    pub fn check_for_update(
+        &self,
+        url: &str,
+        transport: &dyn ManagedSourceTransport,
+    ) -> Result<UpdateCheck> {
+        let active = self.active_snapshot()?;
+        let metadata = transport
+            .metadata(url, &[])
+            .map_err(|detail| config(format!("HackHash update check failed: {detail}")))?;
+        validate_response_metadata(&metadata)?;
+        if metadata.status == 304 {
+            return Ok(UpdateCheck::Unchanged {
+                metadata: metadata.into(),
+            });
+        }
+        if !(200..300).contains(&metadata.status) {
+            return Err(config(format!(
+                "HackHash update check returned HTTP {}",
+                metadata.status
+            )));
+        }
+        let metadata: ManagedSourceMetadata = metadata.into();
+        let unchanged = active.as_ref().is_some_and(|snapshot| {
+            metadata.etag.is_some() && metadata.etag == snapshot.etag
+                || metadata.last_modified.is_some()
+                    && metadata.last_modified == snapshot.last_modified
+        });
+        Ok(if unchanged {
+            UpdateCheck::Unchanged { metadata }
+        } else {
+            UpdateCheck::Available { metadata }
+        })
+    }
+
+    /// Downloads only after the caller explicitly asks, validates the whole
+    /// detailed JSON document, and publishes an immutable candidate. The
+    /// active snapshot is never changed here.
+    pub fn fetch_candidate(
+        &self,
+        url: &str,
+        transport: &dyn ManagedSourceTransport,
+    ) -> Result<HackHashFetchResult> {
+        let staged = self.store.fetch_candidate_from(url, transport)?;
+        if let Some(content_type) = staged.metadata.content_type.clone() {
+            if !is_json_content_type(&content_type) {
+                self.store.discard_staged(staged);
+                return Err(config(format!(
+                    "HackHash response has non-JSON Content-Type: {content_type}"
+                )));
+            }
+        }
+        let staged_path = staged.path.clone();
+        let bytes = match fs::read(&staged_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.store.discard_staged(staged);
+                return Err(ArchiveFsError::io("HackHash staged candidate", error));
+            }
+        };
+        let validation = match parse_detailed_export(&bytes) {
+            Ok(validation) => validation,
+            Err(error) => {
+                self.store.discard_staged(staged);
+                return Err(config(error.to_string()));
+            }
+        };
+        let record_count = validation.export.machines.len();
+        let candidate = match self.store.validate_candidate(
+            staged,
+            ValidationReport {
+                valid: true,
+                summary: format!("HackHash detailed export with {record_count} records"),
+                record_count: Some(record_count as u64),
+                warnings: validation.warnings.clone(),
+            },
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => return Err(error),
+        };
+        let active = self.active_snapshot()?;
+        let state = if active
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.sha256 == candidate.snapshot.sha256)
+        {
+            HackHashFetchState::AlreadyCurrent
+        } else {
+            HackHashFetchState::Changed
+        };
+        let index = HackHashIndex::build(&validation.export);
+        Ok(HackHashFetchResult {
+            import: HackHashValidatedImport {
+                candidate,
+                validation,
+                index,
+            },
+            state,
+        })
+    }
+
     pub fn preview_activation(
         &self,
         import: &HackHashValidatedImport,
@@ -306,6 +420,10 @@ impl HackHashStore {
         self.store.active_snapshot()
     }
 
+    pub fn list_snapshots(&self) -> Result<Vec<ManagedSourceSnapshot>> {
+        self.store.list_snapshots()
+    }
+
     pub fn active_export(
         &self,
     ) -> Result<Option<(ManagedSourceSnapshot, HackHashExport, HackHashIndex)>> {
@@ -318,6 +436,27 @@ impl HackHashStore {
         let index = HackHashIndex::build(&validation.export);
         Ok(Some((snapshot, validation.export, index)))
     }
+}
+
+fn is_json_content_type(value: &str) -> bool {
+    let media_type = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    media_type == "application/json" || media_type.ends_with("+json")
+}
+
+fn validate_response_metadata(metadata: &SourceResponseMetadata) -> Result<()> {
+    if let Some(content_type) = metadata.content_type.as_deref() {
+        if !is_json_content_type(content_type) {
+            return Err(config(format!(
+                "HackHash response has non-JSON Content-Type: {content_type}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl HackHashIndex {
@@ -617,6 +756,7 @@ fn config(message: impl Into<String>) -> ArchiveFsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn record(sha1: &str, version: &str) -> HackHashRecord {
@@ -776,6 +916,188 @@ mod tests {
         assert_eq!(
             store.active_snapshot().unwrap().unwrap().sha256,
             second.candidate.snapshot.sha256
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[derive(Clone)]
+    struct FetchFixture {
+        body: Vec<u8>,
+        status: u16,
+        content_type: Option<String>,
+        failure: Option<String>,
+    }
+
+    impl ManagedSourceTransport for FetchFixture {
+        fn metadata(
+            &self,
+            _: &str,
+            _: &[(String, String)],
+        ) -> std::result::Result<SourceResponseMetadata, String> {
+            if let Some(failure) = &self.failure {
+                return Err(failure.clone());
+            }
+            Ok(SourceResponseMetadata {
+                status: self.status,
+                content_length: Some(self.body.len() as u64),
+                content_type: self.content_type.clone(),
+                ..Default::default()
+            })
+        }
+
+        fn fetch(
+            &self,
+            _: &str,
+            _: &[(String, String)],
+            maximum_size: u64,
+            destination: &mut dyn Write,
+        ) -> std::result::Result<SourceResponseMetadata, String> {
+            if let Some(failure) = &self.failure {
+                return Err(failure.clone());
+            }
+            if !(200..300).contains(&self.status) {
+                return Err(format!("HTTP {}", self.status));
+            }
+            if self.body.len() as u64 > maximum_size {
+                return Err("response exceeded configured size limit".into());
+            }
+            destination
+                .write_all(&self.body)
+                .map_err(|error| error.to_string())?;
+            Ok(SourceResponseMetadata {
+                status: self.status,
+                content_length: Some(self.body.len() as u64),
+                content_type: self.content_type.clone(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn fixture(body: Vec<u8>) -> FetchFixture {
+        FetchFixture {
+            body,
+            status: 200,
+            content_type: Some("application/json; charset=utf-8".into()),
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn explicit_fetch_validates_before_candidate_and_activation() {
+        let root = std::env::temp_dir().join(format!(
+            "hackhash-fetch-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = HackHashStore::new(root.clone()).unwrap();
+        let result = store
+            .fetch_candidate(
+                "https://example.test/hackhash.json",
+                &fixture(bytes(vec![record(&"a".repeat(40), "1.0")])),
+            )
+            .unwrap();
+        assert_eq!(result.state, HackHashFetchState::Changed);
+        assert!(store.active_snapshot().unwrap().is_none());
+        let preview = store.preview_activation(&result.import).unwrap();
+        assert!(preview.changed);
+        assert!(
+            !result
+                .import
+                .index
+                .evidence_for_patched_sha1(&result.import.validation.export, &"a".repeat(40))[0]
+                .native_verified
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identical_fetch_is_content_addressed_and_keeps_activation_explicit() {
+        let root = std::env::temp_dir().join(format!(
+            "hackhash-dedup-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = HackHashStore::new(root.clone()).unwrap();
+        let body = bytes(vec![record(&"a".repeat(40), "1.0")]);
+        let first = store
+            .fetch_candidate("https://example.test/hackhash.json", &fixture(body.clone()))
+            .unwrap();
+        let first_hash = first.import.candidate.snapshot.sha256.clone();
+        store.activate_snapshot(&first.import, None).unwrap();
+        let second = store
+            .fetch_candidate("https://example.test/hackhash.json", &fixture(body))
+            .unwrap();
+        assert_eq!(second.state, HackHashFetchState::AlreadyCurrent);
+        assert_eq!(second.import.candidate.snapshot.sha256, first_hash);
+        assert_eq!(store.list_snapshots().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_http_oversized_and_timeout_failures_preserve_active_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "hackhash-failure-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = HackHashStore::new(root.clone()).unwrap();
+        let active = store
+            .import_bytes(&bytes(vec![record(&"a".repeat(40), "1.0")]))
+            .unwrap();
+        let active = store.activate_snapshot(&active, None).unwrap().active;
+        assert!(
+            store
+                .fetch_candidate("https://example.test/x", &fixture(b"{truncated".to_vec()))
+                .is_err()
+        );
+        assert!(
+            store
+                .fetch_candidate(
+                    "https://example.test/x",
+                    &FetchFixture {
+                        body: vec![b'x'; (HACKHASH_MAX_EXPORT_BYTES + 1) as usize],
+                        status: 200,
+                        content_type: Some("application/json".into()),
+                        failure: None,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .fetch_candidate(
+                    "https://example.test/x",
+                    &FetchFixture {
+                        body: Vec::new(),
+                        status: 503,
+                        content_type: None,
+                        failure: None,
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .fetch_candidate(
+                    "https://example.test/x",
+                    &FetchFixture {
+                        body: Vec::new(),
+                        status: 200,
+                        content_type: None,
+                        failure: Some("timeout".into()),
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.active_snapshot().unwrap().unwrap().sha256,
+            active.sha256
         );
         let _ = fs::remove_dir_all(root);
     }

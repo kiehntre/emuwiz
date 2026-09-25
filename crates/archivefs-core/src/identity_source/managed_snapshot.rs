@@ -121,6 +121,8 @@ pub struct ManagedSourceMetadata {
     pub content_length: Option<u64>,
     /// Optional digest supplied by a trusted manifest or provider adapter.
     pub expected_sha256: Option<String>,
+    /// Response media type, when supplied by a remote transport.
+    pub content_type: Option<String>,
 }
 
 /// One immutable, content-addressed snapshot record.
@@ -230,6 +232,7 @@ pub struct SourceResponseMetadata {
     pub last_modified: Option<String>,
     pub content_length: Option<u64>,
     pub provider_version: Option<String>,
+    pub content_type: Option<String>,
 }
 
 /// Narrow transport seam. Tests inject a fixture; production uses the HTTPS
@@ -332,6 +335,7 @@ impl ManagedSourceTransport for HttpsManagedSourceTransport {
         }
         Ok(SourceResponseMetadata {
             content_length: Some(total),
+            content_type: metadata.content_type,
             ..metadata
         })
     }
@@ -393,6 +397,7 @@ impl HttpsManagedSourceTransport {
                     last_modified: header("last-modified"),
                     content_length,
                     provider_version: header("x-provider-version"),
+                    content_type: header("content-type"),
                 },
                 response,
             ));
@@ -571,6 +576,16 @@ impl ManagedSourceStore {
         transport: &dyn ManagedSourceTransport,
     ) -> Result<StagedCandidate> {
         let url = self.descriptor.source_url()?;
+        self.fetch_candidate_from(url, transport)
+    }
+
+    /// Fetches an explicitly supplied URL using this store's bounded staging
+    /// and hashing rules. The URL is never persisted as a local-source path.
+    pub fn fetch_candidate_from(
+        &self,
+        url: &str,
+        transport: &dyn ManagedSourceTransport,
+    ) -> Result<StagedCandidate> {
         let directory = self.prepare_staging_dir()?;
         let path = unique_temp_path(&directory, "candidate")?;
         let mut file = OpenOptions::new()
@@ -591,6 +606,10 @@ impl ManagedSourceStore {
             .map_err(|error| ArchiveFsError::io(path.clone(), error))?;
         drop(file);
         self.hash_staged(path, response.into())
+    }
+
+    pub fn discard_staged(&self, staged: StagedCandidate) {
+        let _ = fs::remove_file(staged.path);
     }
 
     pub fn validate_candidate(
@@ -1000,6 +1019,7 @@ impl From<SourceResponseMetadata> for ManagedSourceMetadata {
             last_modified: value.last_modified,
             content_length: value.content_length,
             expected_sha256: None,
+            content_type: value.content_type,
         }
     }
 }

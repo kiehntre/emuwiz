@@ -2,9 +2,12 @@
 
 use archivefs_core::app_dirs;
 use archivefs_core::identity_source::hackhash::{
-    HACKHASH_PARSER_SCHEMA_VERSION, HackHashExport, HackHashStore, HackHashValidatedImport,
+    HACKHASH_PARSER_SCHEMA_VERSION, HackHashExport, HackHashFetchResult, HackHashFetchState,
+    HackHashStore, HackHashValidatedImport,
 };
-use archivefs_core::identity_source::managed_snapshot::{ActivationPreview, ManagedSourceSnapshot};
+use archivefs_core::identity_source::managed_snapshot::{
+    ActivationPreview, HttpsManagedSourceTransport, ManagedSourceSnapshot, UpdateCheck,
+};
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -17,6 +20,9 @@ pub(super) struct HackHashPageState {
     active: Option<ManagedSourceSnapshot>,
     active_export: Option<HackHashExport>,
     error: Option<String>,
+    remote_url: String,
+    update: Option<UpdateCheck>,
+    fetch_state: Option<HackHashFetchState>,
 }
 
 impl HackHashPageState {
@@ -38,6 +44,7 @@ impl HackHashPageState {
             Err(error) => state.error = Some(error.to_string()),
         }
         state.store = Some(store);
+        state.remote_url = String::new();
         state
     }
 
@@ -77,6 +84,46 @@ impl HackHashPageState {
         }
     }
 
+    fn check_for_update(&mut self) {
+        let url = self.remote_url.trim();
+        if url.is_empty() {
+            self.error = Some("Enter the URL of a HackHash detailed JSON export first.".into());
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            self.error = Some("HackHash snapshot storage is unavailable.".into());
+            return;
+        };
+        match store.check_for_update(url, &HttpsManagedSourceTransport::default()) {
+            Ok(update) => {
+                self.update = Some(update);
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
+    fn fetch_candidate(&mut self) {
+        let url = self.remote_url.trim();
+        if url.is_empty() {
+            self.error = Some("Enter the URL of a HackHash detailed JSON export first.".into());
+            return;
+        }
+        let Some(store) = self.store.as_ref() else {
+            self.error = Some("HackHash snapshot storage is unavailable.".into());
+            return;
+        };
+        match store.fetch_candidate(url, &HttpsManagedSourceTransport::default()) {
+            Ok(HackHashFetchResult { import, state }) => {
+                self.staged = Some(import);
+                self.fetch_state = Some(state);
+                self.preview = None;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error.to_string()),
+        }
+    }
+
     fn activate(&mut self) {
         let (Some(store), Some(staged)) = (self.store.as_ref(), self.staged.as_ref()) else {
             return;
@@ -99,7 +146,8 @@ impl HackHashPageState {
 
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
         ui.heading("HackHash provider snapshot");
-        ui.label("Offline supplemental evidence only. EmuWiz never logs in, uploads ROMs, or contacts HackHash here.");
+        ui.label("HackHash is external community evidence. Network access occurs only after you press Check for update or Fetch candidate.");
+        ui.label("EmuWiz sends only this export URL; it never uploads ROMs, sends ROM paths or local ROM hashes, logs in, or invents authentication.");
         ui.label(format!("Parser schema: {HACKHASH_PARSER_SCHEMA_VERSION}"));
         if let Some(active) = &self.active {
             ui.label(format!(
@@ -129,9 +177,18 @@ impl HackHashPageState {
             ui.separator();
             ui.strong("Validated export waiting for review");
             ui.label(format!(
-                "{} records",
+                "Candidate: {} · retrieved {} · {} records",
+                staged.candidate.snapshot.sha256,
+                staged.candidate.snapshot.retrieved_at_unix_seconds,
                 staged.validation.export.machines.len()
             ));
+            ui.label(
+                if self.fetch_state == Some(HackHashFetchState::AlreadyCurrent) {
+                    "Candidate content is already current. Activation is still explicit."
+                } else {
+                    "Candidate content differs from the active snapshot."
+                },
+            );
             if !staged.validation.warnings.is_empty() {
                 ui.label(format!(
                     "{} validation warning(s)",
@@ -157,6 +214,14 @@ impl HackHashPageState {
             );
         }
         ui.horizontal_wrapped(|ui| {
+            ui.label("Detailed JSON URL:");
+            ui.add(egui::TextEdit::singleline(&mut self.remote_url).desired_width(360.0));
+            if ui.button("Check for update").clicked() {
+                self.check_for_update();
+            }
+            if ui.button("Fetch candidate").clicked() {
+                self.fetch_candidate();
+            }
             if ui.button("Choose detailed JSON").clicked() {
                 self.choose_and_validate();
             }
@@ -179,6 +244,15 @@ impl HackHashPageState {
                 self.activate();
             }
         });
+        if let Some(update) = &self.update {
+            ui.label(match update {
+                UpdateCheck::Available { .. } => {
+                    "Update metadata says a candidate may be available; fetch is still explicit."
+                }
+                UpdateCheck::Unchanged { .. } => "Update metadata says the source is unchanged.",
+                UpdateCheck::Offline { .. } => "No network check performed.",
+            });
+        }
         ui.collapsing("Evidence boundary", |ui| {
             ui.label("Hash matches are indexed as HackHash external evidence. They never become EmuWiz native Verified identity and conflicting local/No-Intro/Redump evidence is retained.");
         });
