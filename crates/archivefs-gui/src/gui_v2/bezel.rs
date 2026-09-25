@@ -141,7 +141,6 @@ impl BezelPanelState {
 }
 
 pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
-    ui.heading("Bezel & decorations");
     ui.label("Local-first preview. Bezel resolution is separate from ordinary artwork.");
 
     ui.horizontal_wrapped(|ui| {

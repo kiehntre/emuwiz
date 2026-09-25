@@ -1862,7 +1862,10 @@ impl App {
                 ui.heading(&game.title);
                 ui.label(&game.platform);
                 self.bezel.set_game(&game.title, &game.platform);
-                super::bezel::show(ui, &mut self.bezel);
+                egui::CollapsingHeader::new("Bezel & decorations")
+                    .id_salt(("v2_bezel_panel", game_id))
+                    .default_open(false)
+                    .show(ui, |ui| super::bezel::show(ui, &mut self.bezel));
                 ui.separator();
                 ui.horizontal_top(|ui| {
                     self.picture(ui, game, Kind::Cover, egui::vec2(180.0, 240.0));
