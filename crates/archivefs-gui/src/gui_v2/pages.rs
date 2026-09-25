@@ -375,7 +375,8 @@ impl App {
             }
             let route = self.router.current.clone();
             let guidance = self.guidance_context(&route);
-            let show_guidance = ui.ctx().input(|input| input.screen_rect().height()) >= 720.0;
+            let show_guidance = self.beginner_hints_enabled
+                && ui.ctx().input(|input| input.screen_rect().height()) >= 720.0;
             egui::ScrollArea::vertical()
                 .id_salt(("v2_page_content", route.section()))
                 .auto_shrink([false, false])
@@ -2326,6 +2327,23 @@ impl App {
 
     fn settings(&mut self, ui: &mut egui::Ui) {
         ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
+        ui.separator();
+        ui.heading("Beginner guidance");
+        ui.label("These hints explain EmuWiz terms and suggest next steps. They never remove controls or advanced routes.");
+        if ui
+            .checkbox(&mut self.beginner_hints_enabled, "Show beginner hints")
+            .changed()
+        {
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        ui.collapsing("What is this?", |ui| {
+            ui.label("DAT — a versioned release catalogue used as identity evidence.");
+            ui.label("BIOS / firmware — system software an emulator may require.");
+            ui.label("Provenance — where a fact came from and when it was observed.");
+            ui.label("Verified evidence comes from matching local checks; external evidence comes from a provider and cannot silently override stronger local identity.");
+            ui.label("MAME preservation keeps original set relationships; a playing library is a reviewed frontend-oriented projection.");
+        });
+        ui.label("Advanced tools remain available in the sidebar and through Advanced Details, even when hints are disabled.");
         if primary(ui, "Return Home") {
             self.go(Route::Home);
         }

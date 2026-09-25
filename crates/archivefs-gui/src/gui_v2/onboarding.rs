@@ -448,14 +448,51 @@ fn welcome(ui: &mut egui::Ui) -> Option<Action> {
         .id_salt("v2_first_run")
         .show(ui, |ui| {
             ui.heading("Welcome to EmuWiz");
-            ui.label("EmuWiz can find your games, check what each file is, and help you get them ready to play.");
-            ui.label("You do not need to set everything up today. Start with one Games folder and return whenever you like.");
-            ui.add_space(10.0);
+            ui.label("EmuWiz helps you understand, preserve, and play a game collection without changing original files unexpectedly.");
+            ui.label("The usual path is: add a source → scan and inspect → identify releases → review problems → prepare an emulator or a playing library.");
+            ui.label("Metadata, artwork, cheats, and mods are optional. Preservation keeps what you own; a playing library is a reviewed view arranged for a frontend.");
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.heading("Get started");
-                ui.label("Set up the basics so EmuWiz can find and check your games.");
+                ui.label("Set up the basics so EmuWiz can find and check your games. You can dismiss this immediately; nothing is locked or hidden.");
                 if button(ui, "Get started") {
                     action = Some(Action::DismissWelcome);
+                }
+            });
+            ui.add_space(10.0);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("What EmuWiz can do");
+                for (title, explanation) in [
+                    ("Scan / inspect", "Read configured folders and inspect archives, media, and structure. Browsing does not rename or delete files."),
+                    ("Identify", "Compare local evidence with trusted catalogues and show why a release is or is not verified."),
+                    ("Repair / organise", "Preview safe repairs or a reviewed organisation plan before anything changes."),
+                    ("Metadata / artwork", "Optionally add descriptions, covers, screenshots, and provider context without replacing stronger identity evidence."),
+                    ("Emulators", "Check installed emulators, firmware, and launch readiness; EmuWiz does not silently install software."),
+                    ("Cheats / mods", "Find optional improvements for a selected game and preview changes separately from identity."),
+                ] {
+                    ui.collapsing(title, |ui| { ui.label(explanation); });
+                }
+            });
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Suggested first steps");
+                ui.label("You can take these in any order, skip optional steps, or use the sidebar directly.");
+                if ui.button("1 · Add a library / source").clicked() { action = Some(Action::Open(Section::Sources)); }
+                if ui.button("2 · Inspect my collection").clicked() { action = Some(Action::Open(Section::Games)); }
+                if ui.button("3 · Review problems").clicked() { action = Some(Action::Open(Section::Problems)); }
+                if ui.button("4 · Configure an emulator").clicked() { action = Some(Action::Open(Section::Emulators)); }
+                if ui.button("Optional · Metadata and providers").clicked() { action = Some(Action::Open(Section::Artwork)); }
+            });
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("What is this?");
+                for (term, explanation) in [
+                    ("DAT", "A versioned catalogue of known releases and their identity details; it is evidence, not a copy of your game."),
+                    ("BIOS / firmware", "System software an emulator may require before a game can start. EmuWiz reports requirements and evidence; it does not provide copyrighted firmware."),
+                    ("Parent / clone", "A MAME preservation relationship: a clone may depend on shared parent data. It is not automatically the same release."),
+                    ("CHD", "A compressed-disk container used by some systems. Inspecting it explains its contents; conversion is a separate, reviewed action."),
+                    ("Provenance", "Where a fact came from and when it was observed, so local evidence and provider metadata stay distinguishable."),
+                    ("Verified vs external evidence", "Verified means EmuWiz found matching local evidence. External means a provider reported a match; it never silently overrides stronger local identity."),
+                    ("MAME preservation vs playing library", "Preservation keeps the original set and relationships. A playing library is a reviewed projection that selects or links usable games for a frontend."),
+                ] {
+                    ui.collapsing(term, |ui| { ui.label(explanation); });
                 }
             });
             egui::Frame::group(ui.style()).show(ui, |ui| {

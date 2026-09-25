@@ -260,6 +260,7 @@ pub(super) struct App {
     environment: Option<environment::EnvironmentSnapshot>,
     environment_job: Option<u64>,
     welcome_dismissed: bool,
+    beginner_hints_enabled: bool,
     doctor_platform: Option<String>,
     guidance: guidance::GuidanceState,
     saves_states: saves_states::SavesStatesState,
@@ -330,6 +331,7 @@ impl App {
             environment: None,
             environment_job: None,
             welcome_dismissed: false,
+            beginner_hints_enabled: true,
             doctor_platform: None,
             guidance: guidance::GuidanceState::default(),
             saves_states: saves_states::SavesStatesState::default(),
@@ -1353,6 +1355,8 @@ impl App {
                                 }
                                 Payload::Preferences(preferences) => {
                                     self.welcome_dismissed = preferences.welcome_dismissed;
+                                    self.beginner_hints_enabled =
+                                        preferences.beginner_hints_enabled;
                                     let mut preferences = preferences;
                                     preferences.route = migrate_route(preferences.route);
                                     if !self.interacted {
@@ -1531,6 +1535,7 @@ impl App {
                     route: self.router.current.clone(),
                     filter: self.filter.clone(),
                     welcome_dismissed: self.welcome_dismissed,
+                    beginner_hints_enabled: self.beginner_hints_enabled,
                 }),
             );
         }

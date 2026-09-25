@@ -23,13 +23,30 @@ use std::{
     time::Instant,
 };
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Preferences {
     pub route: Route,
     pub filter: Filter,
     #[serde(default)]
     pub welcome_dismissed: bool,
+    #[serde(default = "default_beginner_hints_enabled")]
+    pub beginner_hints_enabled: bool,
+}
+
+fn default_beginner_hints_enabled() -> bool {
+    true
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            route: Route::default(),
+            filter: Filter::default(),
+            welcome_dismissed: false,
+            beginner_hints_enabled: true,
+        }
+    }
 }
 
 pub(super) enum Command {

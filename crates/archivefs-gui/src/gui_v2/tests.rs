@@ -93,6 +93,7 @@ fn fixture(context: &egui::Context) -> App {
         environment: None,
         environment_job: None,
         welcome_dismissed: false,
+        beginner_hints_enabled: true,
         doctor_platform: None,
         guidance: super::guidance::GuidanceState::default(),
         saves_states: super::saves_states::SavesStatesState::default(),
@@ -1202,15 +1203,42 @@ fn gui_v2_fresh_profile_opens_plain_language_welcome() {
     let mut app = fixture(&context);
     app.environment = Some(environment::EnvironmentSnapshot::default());
     app.router.current = Route::Section(Section::Setup);
-    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    let strings = text(&frame(&context, &mut app, [1280.0, 1200.0]));
     assert!(strings.iter().any(|value| value == "Welcome to EmuWiz"));
     assert!(strings.iter().any(|value| value == "Get started"));
+    assert!(strings.iter().any(|value| value == "Suggested first steps"));
+    assert!(strings.iter().any(|value| value == "Scan / inspect"));
     assert!(
         strings
             .iter()
             .any(|value| value.contains("Set up the basics"))
     );
     assert!(strings.iter().all(|value| value != "DAT registry"));
+}
+
+#[test]
+fn gui_v2_beginner_hints_can_be_disabled_without_hiding_advanced_tools() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.beginner_hints_enabled = false;
+    app.router.current = Route::Section(Section::Games);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().all(|value| value != "Mr Wiz"));
+
+    app.router.current = Route::Section(Section::Advanced);
+    assert_eq!(app.router.current, Route::Section(Section::Advanced));
+}
+
+#[test]
+fn gui_v2_settings_explain_beginner_terms_without_removing_advanced_access() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Settings);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(strings.iter().any(|value| value == "Beginner guidance"));
+    assert!(strings.iter().any(|value| value == "Show beginner hints"));
 }
 
 #[test]
@@ -1901,13 +1929,20 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
                 ..Default::default()
             },
             welcome_dismissed: false,
+            beginner_hints_enabled: true,
         },
     )
     .unwrap();
     let restored: Preferences = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     assert_eq!(restored.route, Route::Game(22));
     assert_eq!(restored.filter.search, "Zelda");
+    assert!(restored.beginner_hints_enabled);
     assert_eq!(fs::read_to_string(old).unwrap(), "advanced");
+}
+
+#[test]
+fn gui_v2_preferences_default_beginner_hints_on() {
+    assert!(Preferences::default().beginner_hints_enabled);
 }
 
 #[test]
