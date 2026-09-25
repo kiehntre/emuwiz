@@ -160,6 +160,18 @@ impl EmulatorDownloadPageState {
 
     /// [`Self::refresh`] against an explicit install root (test seam).
     fn refresh_from_root(&mut self, root: Option<&std::path::Path>) {
+        self.refresh_from_root_with_initialization(root, |spec| {
+            managed_appimage_is_initialized(spec).unwrap_or(false)
+        });
+    }
+
+    fn refresh_from_root_with_initialization<F>(
+        &mut self,
+        root: Option<&std::path::Path>,
+        is_initialized: F,
+    ) where
+        F: Fn(&EmulatorDownloadSpec) -> bool,
+    {
         self.refreshed = true;
         for spec in EMULATOR_DOWNLOAD_CATALOGUE {
             let keep = matches!(
@@ -183,9 +195,7 @@ impl EmulatorDownloadPageState {
                 EmulatorDownloadEntryState::ManualInstallRequired
             } else if let Some(binary) = root.and_then(|root| managed_appimage_install(root, spec))
             {
-                if matches!(spec.id, "ppsspp" | "pcsx2")
-                    && !managed_appimage_is_initialized(spec).unwrap_or(false)
-                {
+                if matches!(spec.id, "ppsspp" | "pcsx2") && !is_initialized(spec) {
                     EmulatorDownloadEntryState::NeedsInitialization(binary)
                 } else {
                     EmulatorDownloadEntryState::Installed(binary)
@@ -888,7 +898,10 @@ impl EmulatorDownloadPageState {
     }
 
     pub(crate) fn test_refresh_from_root(&mut self, root: &std::path::Path) {
-        self.refresh_from_root(Some(root));
+        // Keep this seam independent of the developer's real HOME/XDG
+        // configuration. Production refresh still performs the real evidence
+        // lookup through `managed_appimage_is_initialized`.
+        self.refresh_from_root_with_initialization(Some(root), |_| false);
     }
 
     fn test_ingest(&mut self, id: &str, result: TaskResult) {
@@ -983,6 +996,29 @@ mod tests {
             Some(&EmulatorDownloadEntryState::NeedsInitialization(
                 destination
             ))
+        );
+    }
+
+    #[test]
+    fn initialized_managed_bootstrap_emulators_are_installed() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = EmulatorDownloadPageState::default();
+        let pcsx2 = emulator_download_spec("pcsx2").unwrap();
+        let ppsspp = emulator_download_spec("ppsspp").unwrap();
+        let pcsx2_path = install_appimage_at(temp.path(), pcsx2, &image(), None).unwrap();
+        let ppsspp_path = install_appimage_at(temp.path(), ppsspp, &image(), None).unwrap();
+
+        state.refresh_from_root_with_initialization(Some(temp.path()), |spec| {
+            matches!(spec.id, "pcsx2" | "ppsspp")
+        });
+
+        assert_eq!(
+            state.entry("pcsx2"),
+            Some(&EmulatorDownloadEntryState::Installed(pcsx2_path))
+        );
+        assert_eq!(
+            state.entry("ppsspp"),
+            Some(&EmulatorDownloadEntryState::Installed(ppsspp_path))
         );
     }
 
