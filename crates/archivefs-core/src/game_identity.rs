@@ -878,11 +878,46 @@ pub fn inspect_catalogued_game_identity_in_roots(
     inspect_game_identity_with_platform_trust(path, platform_hint, true, trusted)
 }
 
+/// Catalogue inspection with a caller-owned aggregate budget.  The normal
+/// public inspectors retain the historical per-image ceiling; media-set
+/// inspection uses this seam so a set can charge the bytes it actually reads
+/// instead of reserving the whole per-image ceiling up front.
+pub fn inspect_catalogued_game_identity_in_roots_with_budget(
+    path: &Path,
+    platform_hint: Option<&str>,
+    trusted: &TrustedRoots,
+    max_bytes_read: u64,
+) -> GameIdentityReport {
+    inspect_game_identity_with_platform_trust_and_budget(
+        path,
+        platform_hint,
+        true,
+        trusted,
+        Some(max_bytes_read.min(MAX_BYTES_READ)),
+    )
+}
+
 fn inspect_game_identity_with_platform_trust(
     path: &Path,
     platform_hint: Option<&str>,
     trusted_platform: bool,
     trusted: &TrustedRoots,
+) -> GameIdentityReport {
+    inspect_game_identity_with_platform_trust_and_budget(
+        path,
+        platform_hint,
+        trusted_platform,
+        trusted,
+        None,
+    )
+}
+
+fn inspect_game_identity_with_platform_trust_and_budget(
+    path: &Path,
+    platform_hint: Option<&str>,
+    trusted_platform: bool,
+    trusted: &TrustedRoots,
+    native_budget: Option<u64>,
 ) -> GameIdentityReport {
     let platform = IdentityPlatform::from_catalogue(platform_hint);
     let mut report = GameIdentityReport {
@@ -1121,12 +1156,20 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::NeoGeoCd
             ) =>
         {
-            inspect_cue(&mut report, trusted);
+            inspect_cue(
+                &mut report,
+                trusted,
+                native_budget.unwrap_or(MAX_BYTES_READ),
+            );
         }
         "iso" | "gcm"
             if platform != IdentityPlatform::Xbox360 && platform != IdentityPlatform::Xbox =>
         {
-            inspect_direct_iso(&mut report, trusted)
+            inspect_direct_iso(
+                &mut report,
+                trusted,
+                native_budget.unwrap_or(MAX_BYTES_READ),
+            )
         }
         "pbp"
             if matches!(
@@ -1143,7 +1186,11 @@ fn inspect_game_identity_with_platform_trust(
         "iso" | "xiso" if platform == IdentityPlatform::Xbox => {
             inspect_direct_xbox_disc(&mut report, trusted);
         }
-        "zip" => inspect_zip_iso(&mut report, trusted),
+        "zip" => inspect_zip_iso(
+            &mut report,
+            trusted,
+            native_budget.unwrap_or(MAX_BYTES_READ),
+        ),
         "rvz" if matches!(platform, IdentityPlatform::GameCube | IdentityPlatform::Wii) => {
             inspect_rvz(&mut report, trusted);
         }
@@ -1167,7 +1214,7 @@ fn inspect_game_identity_with_platform_trust(
                     | IdentityPlatform::NeoGeoCd
             ) =>
         {
-            inspect_disc_chd(&mut report, trusted);
+            inspect_disc_chd(&mut report, trusted, native_budget);
         }
         "chd" | "cso" | "rvz" | "wbfs" | "ciso" | "gcz" | "7z" | "rar" => {
             report.format = IdentityImageFormat::Deferred;
@@ -1251,7 +1298,7 @@ fn inspect_three_ds_retail_identity(report: &mut GameIdentityReport, trusted: &T
 fn apply_three_ds_observation(report: &mut GameIdentityReport, observation: ThreeDsRetailEvidence) {
     report.bytes_read = match observation.format {
         ThreeDsRetailFormat::Cci => 0x200 + (observation.partitions.len() as u64 * 0x200),
-        ThreeDsRetailFormat::Cia => 0x20 + 0x54,
+        ThreeDsRetailFormat::Cia => 0x20 + 0x194 + (observation.partitions.len() as u64 * 0x200),
     };
     report.format = match observation.format {
         ThreeDsRetailFormat::Cci => IdentityImageFormat::ThreeDsCci,
@@ -1259,7 +1306,7 @@ fn apply_three_ds_observation(report: &mut GameIdentityReport, observation: Thre
     };
     let method = match observation.format {
         ThreeDsRetailFormat::Cci => "bounded NCSD/NCCH retail headers",
-        ThreeDsRetailFormat::Cia => "bounded CIA/TMD metadata",
+        ThreeDsRetailFormat::Cia => "bounded CIA/TMD and embedded NCCH metadata",
     };
     let status = IdentityStatus::Verified;
     if let Some(value) = observation.title_id.clone() {
@@ -2170,7 +2217,11 @@ fn retain_warning(report: &mut GameIdentityReport, warning: &str) {
     }
 }
 
-fn inspect_direct_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+fn inspect_direct_iso(
+    report: &mut GameIdentityReport,
+    trusted: &TrustedRoots,
+    max_bytes_read: u64,
+) {
     report.format = IdentityImageFormat::Iso;
     let file = match open_read_only_regular(&report.archive_path, trusted) {
         Ok(file) => file,
@@ -2190,6 +2241,7 @@ fn inspect_direct_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         file,
         len,
         bytes_read: 0,
+        max_bytes_read,
     };
     inspect_iso_source(report, &mut source, None, None);
     report.bytes_read = source.bytes_read;
@@ -2230,7 +2282,7 @@ fn inspect_direct_pkg(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
     report.complete = true;
 }
 
-fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots, max_bytes_read: u64) {
     report.format = IdentityImageFormat::Iso;
     let track = match resolve_data_track(&report.archive_path) {
         Ok(track) => track,
@@ -2246,7 +2298,7 @@ fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
     let member_path = relative_member_path(report, &track.path);
     let mut source = match track.mode {
         CueDataTrackMode::Mode1_2048 => match open_cooked_cd_file_logical_media(&track.path) {
-            Ok(media) => CueMediaSource::Cooked(MediaSource::new(media)),
+            Ok(media) => CueMediaSource::Cooked(MediaSource::with_limit(media, max_bytes_read)),
             Err(error) => {
                 add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
                 return;
@@ -2254,7 +2306,7 @@ fn inspect_cue(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
         },
         CueDataTrackMode::Mode1_2352 | CueDataTrackMode::Mode2_2352 => {
             match open_raw_cd_file_logical_media(&track.path) {
-                Ok(media) => CueMediaSource::Raw(MediaSource::new(media)),
+                Ok(media) => CueMediaSource::Raw(MediaSource::with_limit(media, max_bytes_read)),
                 Err(error) => {
                     add_unavailable(report, IdentityStatus::Invalid, &error.to_string());
                     return;
@@ -2331,7 +2383,7 @@ fn inspect_gdi(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
     report.bytes_read = source.bytes_read();
 }
 
-fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
+fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots, max_bytes_read: u64) {
     report.format = IdentityImageFormat::ZipContainingIso;
     report.nested_container_depth = 1;
     let file = match open_read_only_regular(&report.archive_path, trusted) {
@@ -2431,6 +2483,7 @@ fn inspect_zip_iso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         member_index: index,
         len: member_size,
         bytes_read: 0,
+        max_bytes_read,
     };
     inspect_iso_source(report, &mut source, Some(member_path), Some(index));
     report.bytes_read = source.bytes_read();
@@ -2456,6 +2509,7 @@ fn inspect_direct_xex(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         file,
         len,
         bytes_read: 0,
+        max_bytes_read: MAX_BYTES_READ,
     };
     inspect_xex_header(report, &mut source, None, None);
     report.bytes_read = source.bytes_read;
@@ -2790,6 +2844,7 @@ fn inspect_direct_xbe(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         file,
         len,
         bytes_read: 0,
+        max_bytes_read: MAX_BYTES_READ,
     };
     inspect_xbe_header(report, &mut source, None, None);
     report.bytes_read = source.bytes_read;
@@ -4794,6 +4849,7 @@ fn inspect_rvz(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         file,
         len,
         bytes_read: 0,
+        max_bytes_read: MAX_BYTES_READ,
     };
     let mut magic = [0_u8; 4];
     if source.read_exact_at(0, &mut magic).is_err() {
@@ -4871,6 +4927,7 @@ fn inspect_ciso(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         file,
         len,
         bytes_read: 0,
+        max_bytes_read: MAX_BYTES_READ,
     };
     let mut magic = [0_u8; 4];
     if source.read_exact_at(0, &mut magic).is_err() {
@@ -5168,6 +5225,7 @@ fn inspect_wbfs(report: &mut GameIdentityReport, trusted: &TrustedRoots) {
         file,
         len,
         bytes_read: 0,
+        max_bytes_read: MAX_BYTES_READ,
     };
     let evidence_start = report.evidence.len();
     match wbfs_disc_header_offset(&mut source) {
@@ -5666,9 +5724,21 @@ fn inspect_ps1_iso(
 /// duplicated here; only the control flow that turns their results into
 /// [`IdentityStatus`] values is (necessarily) written twice, once per
 /// underlying media abstraction.
-fn inspect_disc_chd(report: &mut GameIdentityReport, _trusted: &TrustedRoots) {
+fn inspect_disc_chd(
+    report: &mut GameIdentityReport,
+    _trusted: &TrustedRoots,
+    aggregate_budget: Option<u64>,
+) {
     report.format = IdentityImageFormat::Chd;
-    let bytes = match read_bounded_chd_bytes(&report.archive_path) {
+    let bytes = match aggregate_budget.map_or_else(
+        || read_bounded_chd_bytes(&report.archive_path),
+        |budget| {
+            crate::disc_evidence_collector::read_bounded_chd_bytes_with_limit(
+                &report.archive_path,
+                budget,
+            )
+        },
+    ) {
         Ok(bytes) => bytes,
         Err(refusal) => {
             push_disc_chd_refusal(report, &refusal);
@@ -6404,6 +6474,7 @@ trait ByteSource {
 struct MediaSource<M> {
     media: M,
     bytes_read: u64,
+    max_bytes_read: u64,
 }
 
 enum CueMediaSource {
@@ -6436,9 +6507,14 @@ impl ByteSource for CueMediaSource {
 
 impl<M> MediaSource<M> {
     fn new(media: M) -> Self {
+        Self::with_limit(media, MAX_BYTES_READ)
+    }
+
+    fn with_limit(media: M, max_bytes_read: u64) -> Self {
         Self {
             media,
             bytes_read: 0,
+            max_bytes_read,
         }
     }
 }
@@ -6453,6 +6529,9 @@ impl<M: crate::logical_media::LogicalMedia> ByteSource for MediaSource<M> {
     }
 
     fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        if self.bytes_read.saturating_add(buffer.len() as u64) > self.max_bytes_read {
+            return Err(io::Error::other("identity read budget reached"));
+        }
         self.media
             .read_at(offset, buffer)
             .map_err(|error| io::Error::new(io::ErrorKind::UnexpectedEof, error.to_string()))?;
@@ -6465,6 +6544,7 @@ struct FileSource {
     file: File,
     len: u64,
     bytes_read: u64,
+    max_bytes_read: u64,
 }
 
 /// Random-access facade over one preflighted ZIP member.
@@ -6478,6 +6558,7 @@ struct ZipMemberSource {
     member_index: usize,
     len: u64,
     bytes_read: u64,
+    max_bytes_read: u64,
 }
 
 impl ByteSource for ZipMemberSource {
@@ -6499,8 +6580,8 @@ impl ByteSource for ZipMemberSource {
                 "read exceeds ZIP member",
             ));
         }
-        if self.bytes_read.saturating_add(work) > MAX_BYTES_READ {
-            return Err(io::Error::other("64 MiB ZIP member read limit reached"));
+        if self.bytes_read.saturating_add(work) > self.max_bytes_read {
+            return Err(io::Error::other("identity read budget reached"));
         }
 
         let mut entry = self
@@ -6529,8 +6610,8 @@ impl ByteSource for FileSource {
         self.bytes_read
     }
     fn read_exact_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
-        if self.bytes_read.saturating_add(buffer.len() as u64) > MAX_BYTES_READ {
-            return Err(io::Error::other("64 MiB identity read limit reached"));
+        if self.bytes_read.saturating_add(buffer.len() as u64) > self.max_bytes_read {
+            return Err(io::Error::other("identity read budget reached"));
         }
         let end = offset
             .checked_add(buffer.len() as u64)
@@ -6701,9 +6782,15 @@ fn add_unavailable(report: &mut GameIdentityReport, status: IdentityStatus, diag
         | IdentityPlatform::Commodore64
         | IdentityPlatform::Vic20
         | IdentityPlatform::WiiU
-        | IdentityPlatform::ThreeDS
         | IdentityPlatform::Switch
         | IdentityPlatform::Other => &[],
+        IdentityPlatform::ThreeDS => &[
+            IdentityKind::ThreeDsTitleId,
+            IdentityKind::ThreeDsProductCode,
+            IdentityKind::ThreeDsEncryption,
+            IdentityKind::ThreeDsClassification,
+            IdentityKind::ThreeDsPartition,
+        ],
     };
     for kind in kinds {
         report.evidence.push(evidence(
@@ -8751,6 +8838,85 @@ mod tests {
         assert_eq!(report.platform, IdentityPlatform::PlayStation);
         assert_eq!(report.verified_ps1_serial(), Some("SLUS-12345"));
         assert!(report.complete);
+    }
+
+    #[test]
+    fn bounded_native_budget_scales_across_two_three_and_four_ps1_discs() {
+        let directory = FixtureDir::new("ps1-budget-set");
+        for count in [2_usize, 3, 4] {
+            let mut paths = Vec::new();
+            for disc in 1..=count {
+                let path = write_fixture(
+                    &directory,
+                    &format!("Orbit (Disc {disc} of {count}).iso"),
+                    &ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true),
+                );
+                let direct = inspect_catalogued_game_identity(&path, Some("PSX"));
+                assert_eq!(direct.verified_ps1_serial(), Some("SLUS-12345"));
+                paths.push(path);
+            }
+
+            let records = crate::media_set::inspect_paths(
+                &paths,
+                Some("PSX"),
+                &TrustedRoots::none(),
+                &crate::media_set::InspectionLimits {
+                    max_read_bytes: 1024 * 1024,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(records.len(), count);
+            assert!(records.iter().all(|record| {
+                record.evidence.iter().any(|evidence| {
+                    evidence.provenance.kind == crate::media_set::EvidenceKind::VerifiedNative
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn aggregate_native_budget_is_hard_and_duplicate_paths_are_cached() {
+        let directory = FixtureDir::new("ps1-budget-cap");
+        let path = write_fixture(
+            &directory,
+            "Orbit (Disc 1 of 2).iso",
+            &ps1_iso(b"SLUS_123.45;1", b"BOOT=cdrom:\\SLUS_123.45;1\r\n", true),
+        );
+        let direct = inspect_catalogued_game_identity(&path, Some("PSX"));
+        assert!(direct.bytes_read > 0);
+        let records = crate::media_set::inspect_paths(
+            &[path.clone(), path],
+            Some("PSX"),
+            &TrustedRoots::none(),
+            &crate::media_set::InspectionLimits {
+                max_read_bytes: direct.bytes_read,
+                ..Default::default()
+            },
+        );
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0]
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("native inspection"))
+        );
+    }
+
+    #[test]
+    fn oversized_problematic_member_stays_inside_its_sub_budget() {
+        let directory = FixtureDir::new("ps1-budget-oversized");
+        let path = directory.0.join("broken (Disc 1 of 2).iso");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_BYTES_READ + 1).unwrap();
+        let budget = 4096;
+        let report = inspect_catalogued_game_identity_in_roots_with_budget(
+            &path,
+            Some("PSX"),
+            &TrustedRoots::none(),
+            budget,
+        );
+        assert!(report.bytes_read <= budget);
+        assert_eq!(report.verified_ps1_serial(), None);
     }
 
     #[test]

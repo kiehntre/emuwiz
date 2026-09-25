@@ -232,13 +232,15 @@ pub fn inspect_paths(
         }
         match record.family {
             Some(MediaFamily::Optical)
-                if limits.native_optical
-                    && limits.max_read_bytes.saturating_sub(bytes)
-                        >= crate::game_identity::MAX_BYTES_READ =>
+                if limits.native_optical && limits.max_read_bytes.saturating_sub(bytes) > 0 =>
             {
-                let native = crate::game_identity::inspect_catalogued_game_identity_in_roots(
-                    &path, platform, trusted,
-                );
+                let native =
+                    crate::game_identity::inspect_catalogued_game_identity_in_roots_with_budget(
+                        &path,
+                        platform,
+                        trusted,
+                        limits.max_read_bytes.saturating_sub(bytes),
+                    );
                 bytes = bytes.saturating_add(native.bytes_read);
                 attach_native_identity(&mut record, &native);
             }

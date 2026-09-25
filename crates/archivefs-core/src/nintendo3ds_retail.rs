@@ -59,9 +59,9 @@ mod tests {
     fn cia_reads_tmd_title_id_without_reading_content() {
         let mut data = vec![0u8; 0x400];
         data[0..4].copy_from_slice(&0x20u32.to_le_bytes());
-        data[0x10..0x14].copy_from_slice(&0x100u32.to_le_bytes());
+        data[0x10..0x14].copy_from_slice(&0x200u32.to_le_bytes());
         data[0x18..0x20].copy_from_slice(&0u64.to_le_bytes());
-        data[0x40 + 0x4c..0x40 + 0x54].copy_from_slice(&0x0004000e12345678u64.to_le_bytes());
+        data[0x40 + 0x18c..0x40 + 0x194].copy_from_slice(&0x0004000e12345678u64.to_be_bytes());
         let length = data.len() as u64;
         let observation = parse_cia(&mut Cursor::new(&mut data), length).unwrap();
         assert_eq!(observation.title_id.as_deref(), Some("0004000E12345678"));
@@ -137,6 +137,11 @@ fn title_id(data: &[u8], offset: usize) -> Option<String> {
     Some(format!("{:016X}", u64le(data, offset)?))
 }
 
+fn tmd_title_id(data: &[u8], offset: usize) -> Option<String> {
+    let raw = data.get(offset..offset.checked_add(8)?)?;
+    Some(raw.iter().map(|byte| format!("{byte:02X}")).collect())
+}
+
 fn product_code(data: &[u8], offset: usize) -> Option<String> {
     let raw = data.get(offset..offset.checked_add(16)?)?;
     let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
@@ -168,6 +173,9 @@ fn classify_content(index: usize, title: Option<&str>, content: Option<u8>) -> T
         }
         if id.starts_with("0004008C") {
             return ThreeDsTitleKind::Dlc;
+        }
+        if id.starts_with("00040000") {
+            return ThreeDsTitleKind::Base;
         }
     }
     match content {
@@ -320,15 +328,54 @@ pub fn parse_cia<R: Read + Seek>(
     if end > file_len {
         return Err("CIA section exceeds the image".into());
     }
-    if tmd < 0x54 {
+    if tmd < 0x194 {
         return Err("CIA TMD is too small for a title ID".into());
     }
-    let mut tmd_header = [0u8; 0x54];
+    let mut tmd_header = [0u8; 0x194];
     reader
         .seek(SeekFrom::Start(tmd_start))
         .map_err(|e| e.to_string())?;
     reader
         .read_exact(&mut tmd_header)
         .map_err(|e| e.to_string())?;
-    Ok(ThreeDsRetailEvidence { format: ThreeDsRetailFormat::Cia, title_id: title_id(&tmd_header, 0x4c), product_code: None, title_kind: classify_content(0, title_id(&tmd_header, 0x4c).as_deref(), None), title_version: None, encryption: ThreeDsEncryption::Encrypted, partitions: Vec::new(), region_flags: None, warnings: vec!["CIA is an installable package; content is encrypted and is not a direct launch target. Region and product code were not inferred.".into()] })
+    let tmd_title_id = tmd_title_id(&tmd_header, 0x18c);
+    let mut partitions = Vec::new();
+    if content >= NCCH_HEADER {
+        let mut ncch = [0u8; NCCH_HEADER as usize];
+        reader
+            .seek(SeekFrom::Start(content_start))
+            .map_err(|e| e.to_string())?;
+        reader.read_exact(&mut ncch).map_err(|e| e.to_string())?;
+        if &ncch[0x100..0x104] == b"NCCH" {
+            partitions.push(parse_ncch_header(&ncch, 0, content_start, content)?);
+        }
+    }
+    let title_id = partitions
+        .first()
+        .and_then(|partition| partition.title_id.clone())
+        .or(tmd_title_id);
+    let encryption = partitions
+        .first()
+        .map(|partition| partition.encryption)
+        .unwrap_or(ThreeDsEncryption::Encrypted);
+    Ok(ThreeDsRetailEvidence {
+        format: ThreeDsRetailFormat::Cia,
+        title_kind: classify_content(
+            0,
+            title_id.as_deref(),
+            partitions.first().and_then(|partition| partition.content_type),
+        ),
+        title_id,
+        product_code: partitions
+            .first()
+            .and_then(|partition| partition.product_code.clone()),
+        title_version: None,
+        encryption,
+        partitions,
+        region_flags: None,
+        warnings: vec![
+            "CIA is an installable package and is not a direct launch target; no decryption was attempted."
+                .into(),
+        ],
+    })
 }

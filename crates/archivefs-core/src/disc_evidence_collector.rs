@@ -122,12 +122,22 @@ pub fn collect_chd_evidence(path: &Path) -> Result<Vec<ContentEvidence>, DiscCol
 /// Exposed so [`crate::game_identity`]'s authoritative PS1 CHD path can
 /// share this exact bound rather than declaring its own.
 pub fn read_bounded_chd_bytes(path: &Path) -> Result<Vec<u8>, DiscCollectionRefusal> {
+    read_bounded_chd_bytes_with_limit(path, MAX_CHD_BYTES)
+}
+
+/// Like [`read_bounded_chd_bytes`], but also respects a caller-owned aggregate
+/// inspection budget before allocating or reading the container.
+pub fn read_bounded_chd_bytes_with_limit(
+    path: &Path,
+    maximum: u64,
+) -> Result<Vec<u8>, DiscCollectionRefusal> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| DiscCollectionRefusal::NotReadable(error.to_string()))?;
-    if metadata.len() > MAX_CHD_BYTES {
+    let maximum = maximum.min(MAX_CHD_BYTES);
+    if metadata.len() > maximum {
         return Err(DiscCollectionRefusal::TooLarge {
             bytes: metadata.len(),
-            maximum: MAX_CHD_BYTES,
+            maximum,
         });
     }
     std::fs::read(path).map_err(|error| DiscCollectionRefusal::NotReadable(error.to_string()))
