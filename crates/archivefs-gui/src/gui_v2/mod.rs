@@ -17,6 +17,7 @@ mod onboarding;
 mod organisation;
 mod pages;
 mod problems;
+mod romm_library;
 mod routes;
 mod saves_states;
 #[cfg(test)]
@@ -264,6 +265,8 @@ pub(super) struct App {
     converter: OpticalConversionPageState,
     bezel: bezel::BezelPanelState,
     hackhash: hackhash::HackHashPageState,
+    romm_library: romm_library::RommBrowserState,
+    romm_library_job: Option<u64>,
 }
 
 impl App {
@@ -332,6 +335,8 @@ impl App {
             converter: OpticalConversionPageState::default(),
             bezel: bezel::BezelPanelState::default(),
             hackhash: hackhash::HackHashPageState::new(),
+            romm_library: romm_library::RommBrowserState::default(),
+            romm_library_job: None,
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1121,6 +1126,11 @@ impl App {
                                         self.router.current = Route::Section(Section::Setup);
                                     }
                                 }
+                                Payload::RommLibrary(snapshot) => {
+                                    self.romm_library.snapshot = Some(snapshot);
+                                    self.romm_library.loading = false;
+                                    self.romm_library_job = None;
+                                }
                                 Payload::PersistentStateInventory {
                                     inventory,
                                     generation,
@@ -1308,6 +1318,10 @@ impl App {
                             if self.undo_job == Some(id) {
                                 self.undo_job = None;
                             }
+                            if self.romm_library_job == Some(id) {
+                                self.romm_library_job = None;
+                                self.romm_library.loading = false;
+                            }
                             self.detail_failed = self.detail_pending.take();
                             self.filter_inflight = false;
                             let title = self.activity.jobs.get(&id).map(|job| job.title.clone());
@@ -1356,6 +1370,17 @@ impl App {
                     generation: self.filter_generation,
                 },
             );
+        }
+        if self.router.current.section() == Section::Romm
+            && self.romm_library.snapshot.is_none()
+            && self.romm_library_job.is_none()
+        {
+            let id =
+                self.activity
+                    .queue("Loading RomM library", Route::Section(Section::Romm), false);
+            self.romm_library.loading = true;
+            self.romm_library_job = Some(id);
+            self.send(id, Command::LoadRommLibrary);
         }
         if let Some(id) = self.router.current.game()
             && self.detail_pending.is_none()

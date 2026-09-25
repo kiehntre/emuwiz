@@ -24,6 +24,7 @@ pub(super) fn destination(section: Section, selected: bool) -> MainView {
         Section::Dat => MainView::DatSources,
         Section::History => MainView::HistoryLogs,
         Section::Advanced => MainView::Library,
+        Section::Romm => MainView::Sources,
         Section::Setup => MainView::Doctor,
         Section::Settings => MainView::Settings,
         _ => MainView::Library,

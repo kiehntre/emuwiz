@@ -9,6 +9,7 @@ use super::{
     media_sources::{Kind, Source},
     onboarding,
     problems::{Category, Problem, Severity},
+    romm_library::PresenceFilter,
     routes::{HOME_TASKS, Route, SECTIONS, Section},
 };
 use crate::ui::{
@@ -69,6 +70,164 @@ fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(
 }
 
 impl App {
+    fn romm_library_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("RomM library");
+        ui.label("Read-only provider browsing. Local EmuWiz evidence is never replaced by RomM metadata.");
+        let Some(snapshot) = self.romm_library.snapshot.as_ref() else {
+            ui.label(if self.romm_library.loading {
+                "Loading the cached RomM snapshot…"
+            } else {
+                "No RomM snapshot loaded."
+            });
+            return;
+        };
+        ui.label(&snapshot.status);
+        if snapshot.cache.is_none() {
+            ui.colored_label(
+                theme::WARNING,
+                "RomM is unavailable, unauthenticated, or has no usable cached library.",
+            );
+            ui.label("Open Sources → RomM to configure or refresh it. Existing local games remain available.");
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Search");
+            if ui
+                .text_edit_singleline(&mut self.romm_library.search)
+                .changed()
+            {
+                self.romm_library.page = 0;
+            }
+            ui.label("Platform");
+            let current = self
+                .romm_library
+                .platform
+                .clone()
+                .unwrap_or_else(|| "All platforms".into());
+            egui::ComboBox::from_id_salt("romm_platform")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(self.romm_library.platform.is_none(), "All platforms")
+                        .clicked()
+                    {
+                        self.romm_library.platform = None;
+                    }
+                    for platform in self.romm_library.platforms() {
+                        let value = platform
+                            .canonical
+                            .clone()
+                            .unwrap_or_else(|| platform.slug.clone());
+                        if ui
+                            .selectable_label(
+                                self.romm_library.platform.as_deref() == Some(value.as_str()),
+                                &value,
+                            )
+                            .clicked()
+                        {
+                            self.romm_library.platform = Some(value);
+                        }
+                    }
+                });
+            ui.label("Local state");
+            egui::ComboBox::from_id_salt("romm_presence")
+                .selected_text(match self.romm_library.presence {
+                    PresenceFilter::Any => "Any",
+                    PresenceFilter::Present => "Present",
+                    PresenceFilter::Missing => "Missing",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.romm_library.presence,
+                        PresenceFilter::Any,
+                        "Any",
+                    );
+                    ui.selectable_value(
+                        &mut self.romm_library.presence,
+                        PresenceFilter::Present,
+                        "Present",
+                    );
+                    ui.selectable_value(
+                        &mut self.romm_library.presence,
+                        PresenceFilter::Missing,
+                        "Missing",
+                    );
+                });
+        });
+        let rows = self.romm_library.filtered_games();
+        ui.label(format!(
+            "{} matching game(s) · deterministic title/id order · showing at most {}",
+            rows.len(),
+            crate::gui_v2::romm_library::MAX_VISIBLE
+        ));
+        for row in rows {
+            let selected = self.romm_library.selected.as_deref() == Some(row.id.as_str());
+            if ui
+                .selectable_label(
+                    selected,
+                    format!("{} · {} · RomM id {}", row.title, row.platform, row.id),
+                )
+                .clicked()
+            {
+                self.romm_library.selected = Some(row.id.clone());
+            }
+            ui.small(format!(
+                "RomM slug/name: {} · local: {} · {} file(s) · artwork: {}",
+                row.platform_slug,
+                row.local_path.as_deref().unwrap_or("unmapped"),
+                row.files,
+                if row.artwork { "available" } else { "none" }
+            ));
+        }
+        if let Some(record) = self.romm_library.selected_record() {
+            ui.separator();
+            ui.heading("Selected game");
+            ui.label(format!(
+                "RomM metadata: {}",
+                record.title.as_deref().unwrap_or("(untitled)")
+            ));
+            ui.label(format!(
+                "RomM id {} · platform id {} · slug/name {}",
+                record.provider_game_id,
+                record.provider_platform_id.as_deref().unwrap_or("-"),
+                record.provider_platform_name.as_deref().unwrap_or("-")
+            ));
+            ui.label(format!(
+                "RomM path: {} · file id {} · size {}",
+                record.provider_path,
+                record.provider_file_id.as_deref().unwrap_or("-"),
+                record
+                    .file_size_bytes
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
+            ui.label(format!(
+                "Local EmuWiz evidence: {} · local path {}",
+                record.verification.label(),
+                record
+                    .archivefs_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "unmapped".into())
+            ));
+            ui.label(format!(
+                "Provenance: {} · artwork reference: {} · related files: {}",
+                record.server_id,
+                if record.artwork.is_some() {
+                    "present"
+                } else {
+                    "none"
+                },
+                record.related_files.len()
+            ));
+            if record.platform_candidate.is_none() {
+                ui.colored_label(
+                    theme::WARNING,
+                    "RomM platform is unmapped; native identity is unchanged.",
+                );
+            }
+        }
+    }
     pub(super) fn show(&mut self, context: &egui::Context) {
         if context.input(|input| {
             input.key_pressed(egui::Key::Escape)
@@ -171,6 +330,7 @@ impl App {
                         Route::Section(Section::Emulators) => self.emulator_setup(ui),
                         Route::Section(Section::Firmware) => self.firmware(ui),
                         Route::Section(Section::Sources) => self.sources(ui),
+                        Route::Section(Section::Romm) => self.romm_library_page(ui),
                         Route::Section(Section::Dat) => self.dat_sources(ui),
                         Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
                         Route::Section(Section::Mods) => self.mods_page(ui, None),

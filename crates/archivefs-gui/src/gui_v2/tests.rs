@@ -100,6 +100,8 @@ fn fixture(context: &egui::Context) -> App {
         archive_inspector: super::archive_inspector::ArchiveInspectorPageState::default(),
         bezel: super::bezel::BezelPanelState::default(),
         hackhash: super::hackhash::HackHashPageState::default(),
+        romm_library: super::romm_library::RommBrowserState::default(),
+        romm_library_job: None,
     }
 }
 
@@ -116,6 +118,20 @@ fn gui_v2_converter_is_a_native_workflow() {
             "missing native converter content: {expected}"
         );
     }
+}
+
+#[test]
+fn gui_v2_romm_browser_has_explicit_empty_failure_state() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.romm_library.snapshot = Some(super::romm_library::RommBrowserSnapshot::unavailable(
+        "no cache",
+    ));
+    app.router.current = Route::Section(Section::Romm);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value == "RomM library"));
+    assert!(strings.iter().any(|value| value.contains("unavailable")));
+    assert!(strings.iter().any(|value| value.contains("Local EmuWiz")));
 }
 
 #[test]

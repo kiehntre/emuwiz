@@ -37,6 +37,7 @@ pub(super) enum Command {
         scan: bool,
     },
     EnvironmentCheck,
+    LoadRommLibrary,
     Filter {
         library: SharedLibrary,
         filter: Filter,
@@ -104,6 +105,7 @@ pub(super) enum Command {
 pub(super) enum Payload {
     Library(SharedLibrary),
     Environment(crate::gui_v2::environment::EnvironmentSnapshot),
+    RommLibrary(crate::gui_v2::romm_library::RommBrowserSnapshot),
     Filter {
         indices: Vec<usize>,
         generation: u64,
@@ -227,6 +229,9 @@ impl Backend {
 fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload, String> {
     match command {
         Command::EnvironmentCheck => Ok(Payload::Environment(crate::gui_v2::environment::gather())),
+        Command::LoadRommLibrary => Ok(Payload::RommLibrary(
+            crate::gui_v2::romm_library::load_snapshot()?,
+        )),
         Command::Load { scan } => {
             let scan_warning = if scan {
                 let summary = archivefs_core::scan_all_enabled_sources_default()

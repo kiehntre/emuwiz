@@ -22,6 +22,7 @@ pub(super) enum Section {
     Mods,
     Artwork,
     Sources,
+    Romm,
     Dat,
     Activity,
     History,
@@ -48,6 +49,7 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::Mods,
     Section::Artwork,
     Section::Sources,
+    Section::Romm,
     Section::Dat,
     Section::Activity,
     Section::History,
@@ -76,6 +78,7 @@ impl Section {
             Self::Mods => "Mods & Cheats",
             Self::Artwork => "Artwork & Metadata",
             Self::Sources => "Sources",
+            Self::Romm => "RomM Library",
             Self::Dat => "DAT Management",
             Self::Activity => "Activity",
             Self::History => "History",
@@ -114,6 +117,7 @@ impl Section {
             }
             Self::Artwork => "Find covers, screenshots and information for your games.",
             Self::Sources => "Find your game folders and choose which ones to include.",
+            Self::Romm => "Browse the read-only RomM library snapshot and its provenance.",
             Self::Dat => {
                 "Manage the trusted game identification data EmuWiz uses to check releases."
             }
@@ -139,6 +143,7 @@ impl Section {
             Self::Mods => "Choose a game",
             Self::Artwork => "Manage artwork",
             Self::Sources => "Find game folders",
+            Self::Romm => "Browse RomM library",
             Self::Dat => "Manage identification data",
             Self::History => "Review previous changes",
             Self::Advanced => "Open specialist tools",
@@ -154,6 +159,7 @@ impl Section {
             Self::Launch => Some("PLAY"),
             Self::Mods => Some("TOOLS"),
             Self::Converter | Self::Tape | Self::Museum => Some("TOOLS"),
+            Self::Romm => Some("LIBRARY"),
             _ => None,
         }
     }
