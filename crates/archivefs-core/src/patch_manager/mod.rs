@@ -1,5 +1,8 @@
 //! Patch, cheat, preview, and shared transaction foundations.
 //!
+//! RetroArch bezel ownership is exported below only after the same shared
+//! transaction contract used by the other write-capable adapters.
+//!
 //! The original read-only PCSX2 metadata adapter remains available in
 //! `pcsx2.rs`. The install-capable PCSX2 path is deliberately separate:
 //! `pcsx2_identity`, `pcsx2_provider`, `pcsx2_pnach`, and
@@ -93,6 +96,7 @@ mod ppsspp_texture_pack;
 mod resolved_emulator_profile;
 mod retrieval;
 mod retroarch;
+mod retroarch_bezel;
 mod retroarch_cheat_library;
 mod retroarch_cheat_setup;
 mod retroarch_inventory;
@@ -719,6 +723,10 @@ pub use retroarch::{
     RetroArchAdvisorySummary, RetroArchProfileOutcome,
     preview_retroarch_patch_and_cheat_destinations,
 };
+pub use retroarch_bezel::{
+    RetroArchBezelApplyError, RetroArchBezelApplyOptions, apply_retroarch_bezel_plan,
+    prepare_retroarch_bezel_plan,
+};
 pub use retroarch_cheat_library::{
     RETROARCH_CHEAT_LIBRARY_MAX_DEPTH, RETROARCH_CHEAT_LIBRARY_MAX_ENTRIES,
     RETROARCH_LOCAL_MAX_DIRECTORIES, RETROARCH_LOCAL_MAX_FILE_BYTES, RETROARCH_LOCAL_MAX_FILES,
@@ -811,7 +819,7 @@ pub use shared_transaction::{
     discover_pending_operations, discover_shared_apply_history, execute_shared_apply,
     execute_shared_rollback, generate_shared_operation_id, plan_pending_recovery,
     preview_shared_rollback, require_dolphin_managed_gamehacking_verification,
-    require_local_mod_package_verification,
+    require_local_mod_package_verification, require_retroarch_bezel_verification,
 };
 pub use snes9x_local::{
     SNES9X_MAX_PROFILES, SNES9X_NATIVE_BINARY_NAMES, Snes9xExecutable, Snes9xInstallationType,

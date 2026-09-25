@@ -2024,6 +2024,13 @@ impl App {
                 };
                 ui.heading(&game.title);
                 ui.label(&game.platform);
+                let workflows = self.native_workflows.get_or_insert_with(|| {
+                    super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+                });
+                let retroarch_scope = workflows.retroarch_bezel_scope();
+                if let Some((config, overlays, core)) = retroarch_scope {
+                    self.bezel.set_retroarch_scope(Some(config), Some(overlays), core);
+                }
                 self.bezel.set_game(&game.title, &game.platform);
                 egui::CollapsingHeader::new("Bezel & decorations")
                     .id_salt(("v2_bezel_panel", game_id))

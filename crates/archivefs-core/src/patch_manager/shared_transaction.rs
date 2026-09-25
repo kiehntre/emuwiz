@@ -302,6 +302,7 @@ pub enum SharedContentVerification {
     LocalModPackage,
     CemuGraphicPack,
     Rpcs3OrdinaryMod,
+    RetroArchBezel,
     DolphinManagedGameHacking {
         expected_managed_names: Vec<String>,
         require_managed_section: bool,
@@ -867,6 +868,29 @@ pub fn require_rpcs3_ordinary_mod_verification(
     Ok(())
 }
 
+/// Marks a RetroArch bezel transaction as using the reviewed nested override
+/// path contract and reseals its digest before apply.
+pub fn require_retroarch_bezel_verification(
+    plan: &mut SharedTransactionPlan,
+) -> Result<(), SharedApplyFailure> {
+    if plan.context.adapter != PreviewAdapter::RetroArch
+        || plan.context.source_mode != "retroarch_bezel"
+        || plan.entries.is_empty()
+    {
+        return Err(failure(
+            SharedApplyFailureKind::InvalidPlan,
+            None,
+            "RetroArch bezel verification requires a RetroArch bezel transaction",
+        ));
+    }
+    for entry in &mut plan.entries {
+        entry.content_verification = Some(SharedContentVerification::RetroArchBezel);
+    }
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
 pub fn execute_shared_apply(
     plan: &SharedTransactionPlan,
     options: &SharedApplyOptions,
@@ -1357,6 +1381,7 @@ fn apply_one(
             SharedContentVerification::LocalModPackage
                 | SharedContentVerification::CemuGraphicPack
                 | SharedContentVerification::Rpcs3OrdinaryMod
+                | SharedContentVerification::RetroArchBezel
         )
     );
     let assessment = if nested_mod_package {
@@ -1706,7 +1731,8 @@ fn verify_entry_content(plan: &SharedPlanEntry, destination: &Path) -> Result<()
         }
         SharedContentVerification::LocalModPackage
         | SharedContentVerification::CemuGraphicPack
-        | SharedContentVerification::Rpcs3OrdinaryMod => Ok(()),
+        | SharedContentVerification::Rpcs3OrdinaryMod
+        | SharedContentVerification::RetroArchBezel => Ok(()),
     }
 }
 

@@ -14,6 +14,7 @@ use crate::{
     Pcsx2FirmwareEvidenceState, Pcsx2LaunchProfilesState, RetroArchProfilesState, app_polling,
     identity_sources_page, launch_readiness_page, selected_evidence_page,
 };
+use archivefs_core::emulator_environment::retroarch::PathPurpose;
 use archivefs_core::{SourceAvailability, SourceFolderView, SourceScanStatus};
 use eframe::egui;
 use std::path::{Path, PathBuf};
@@ -145,6 +146,39 @@ fn discovery_container_label(container: &archivefs_core::ingestion::ContainerKin
 }
 
 impl NativeWorkflows {
+    pub(super) fn retroarch_bezel_scope(&self) -> Option<(PathBuf, PathBuf, Option<String>)> {
+        let RetroArchProfilesState::Ready(discovery) =
+            &self.app.emulator_readiness.retroarch_profiles
+        else {
+            return None;
+        };
+        let mut profiles = discovery.environment.profiles.iter().filter(|profile| {
+            profile.config_file.path.display.starts_with('/')
+                && !profile.config_file.path.lossy
+                && profile.config_file.probe
+                    == archivefs_core::emulator_environment::FsProbe::PresentFile
+        });
+        let profile = profiles.next()?;
+        if profiles.next().is_some() {
+            return None;
+        }
+        let overlay = profile
+            .paths
+            .iter()
+            .find(|path| path.purpose == PathPurpose::Overlays)?
+            .resolved_path
+            .as_ref()?;
+        if overlay.lossy {
+            return None;
+        }
+        let core = (profile.cores.len() == 1).then(|| profile.cores[0].core_stem.clone());
+        Some((
+            PathBuf::from(profile.config_file.path.display.clone()),
+            PathBuf::from(overlay.display.clone()),
+            core,
+        ))
+    }
+
     pub(super) fn new(context: egui::Context) -> Self {
         #[cfg(not(test))]
         let mut app = ArchiveFsApp::new_without_initial_load(context.clone());

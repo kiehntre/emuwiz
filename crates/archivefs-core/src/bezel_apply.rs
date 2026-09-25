@@ -144,6 +144,11 @@ pub enum BezelPlanRefusal {
     MissingRetroArchOverlayRoot,
     DestinationOutsideApprovedRoot,
     RetroArchConfigWriterMissing,
+    RetroArchCoreRequired,
+    RetroArchConfigScopeInvalid,
+    RetroArchOverlayOutsideConfigRoot,
+    RetroArchUnsafeName,
+    RetroArchDestinationUnsafe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +386,22 @@ fn plan_digest(plan: &BezelApplyPlan) -> Result<String, BezelPlanError> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
+}
+
+pub(crate) fn reseal_bezel_apply_plan(plan: &mut BezelApplyPlan) -> Result<(), BezelPlanError> {
+    plan.plan_id.clear();
+    plan.plan_id = plan_digest(plan)?;
+    Ok(())
+}
+
+pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn error(refusal: BezelPlanRefusal, path: Option<PathBuf>, detail: &str) -> BezelPlanError {

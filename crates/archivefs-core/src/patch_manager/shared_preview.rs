@@ -444,7 +444,9 @@ fn preview_one(
     let Some((directory, filename)) = two_safe_components(&relative).or_else(|| {
         (matches!(
             request.adapter,
-            PreviewAdapter::CemuGraphicPack | PreviewAdapter::Rpcs3OrdinaryMod
+            PreviewAdapter::RetroArch
+                | PreviewAdapter::CemuGraphicPack
+                | PreviewAdapter::Rpcs3OrdinaryMod
         ))
         .then(|| (OsString::new(), OsString::new()))
     }) else {
@@ -504,7 +506,9 @@ fn preview_one(
 
     let assessment = if matches!(
         request.adapter,
-        PreviewAdapter::CemuGraphicPack | PreviewAdapter::Rpcs3OrdinaryMod
+        PreviewAdapter::RetroArch
+            | PreviewAdapter::CemuGraphicPack
+            | PreviewAdapter::Rpcs3OrdinaryMod
     ) {
         assess_nested_destination(&request.destination_root, &relative)
     } else {

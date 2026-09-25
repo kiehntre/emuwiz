@@ -1,13 +1,10 @@
 //! GUI-v2 presentation for the local-first bezel/decorations resolver.
 //!
-//! This page intentionally has no write path yet.  RetroArch discovery in the
-//! current architecture is read-only and the shared write adapter is for
-//! verified materialized mods/cheats, not emulator overlay configuration.  A
-//! bezel must therefore remain an honest preview until an emulator-specific
-//! adapter can prove its config format, ownership and rollback contract.
+//! RetroArch apply is limited to the exact discovered config scope and uses
+//! the core shared transaction/history executor for all mutation.
 
 use archivefs_core::bezel_apply::{
-    BezelApplyPlan, BezelApplyRequest, BezelPlanError, build_bezel_apply_plan,
+    BezelApplyPlan, BezelApplyRequest, BezelApplyStatus, BezelPlanError,
 };
 use archivefs_core::bezel_decorations::{
     BezelMatchContext, DecorationAsset, DecorationEvidence, DecorationResolution, DecorationScope,
@@ -15,8 +12,13 @@ use archivefs_core::bezel_decorations::{
     discover_local_bezel_catalogue, load_local_bezel_config, resolve_decoration,
     resolve_local_bezel_catalogue, save_local_bezel_config,
 };
+use archivefs_core::patch_manager::{
+    RetroArchBezelApplyOptions, apply_retroarch_bezel_plan, default_shared_backup_root,
+    default_shared_history_root, prepare_retroarch_bezel_plan,
+};
 use eframe::egui;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 pub(super) struct BezelPanelState {
@@ -32,7 +34,10 @@ pub(super) struct BezelPanelState {
     preview_error: Option<String>,
     apply_plan: Option<BezelApplyPlan>,
     apply_error: Option<BezelPlanError>,
+    apply_result: Option<String>,
     apply_confirmation: bool,
+    retroarch_config_path: Option<PathBuf>,
+    retroarch_overlay_root: Option<PathBuf>,
 }
 
 impl Default for BezelPanelState {
@@ -58,7 +63,10 @@ impl Default for BezelPanelState {
             preview_error: None,
             apply_plan: None,
             apply_error: None,
+            apply_result: None,
             apply_confirmation: false,
+            retroarch_config_path: None,
+            retroarch_overlay_root: None,
         }
     }
 }
@@ -83,6 +91,7 @@ impl BezelPanelState {
         self.preview_error = None;
         self.apply_plan = None;
         self.apply_error = None;
+        self.apply_result = None;
         self.apply_confirmation = false;
     }
 
@@ -90,6 +99,17 @@ impl BezelPanelState {
         self.selected_game = Some(title.to_string());
         self.selected_platform = Some(platform.to_string());
         self.resolve();
+    }
+
+    pub(super) fn set_retroarch_scope(
+        &mut self,
+        config: Option<PathBuf>,
+        overlays: Option<PathBuf>,
+        core: Option<String>,
+    ) {
+        self.retroarch_config_path = config;
+        self.retroarch_overlay_root = overlays;
+        self.target.core = core;
     }
 
     fn refresh_catalogue(&mut self) {
@@ -148,12 +168,15 @@ impl BezelPanelState {
     }
 
     pub(super) fn apply_supported(&self) -> bool {
-        false
+        self.apply_plan
+            .as_ref()
+            .is_some_and(|plan| plan.status == BezelApplyStatus::Ready)
     }
 
     fn preview_apply(&mut self) {
         self.apply_plan = None;
         self.apply_error = None;
+        self.apply_result = None;
         self.apply_confirmation = false;
         let Some(asset) = self.resolution.selected.clone() else {
             self.apply_error = Some(BezelPlanError {
@@ -185,13 +208,69 @@ impl BezelPanelState {
             platform: self.selected_platform.clone().unwrap_or_default(),
             emulator: self.target.emulator.clone(),
             core: self.target.core.clone(),
-            config_path: None,
-            overlay_root: None,
-            approved_roots: self.config.roots.clone(),
+            config_path: self.retroarch_config_path.clone(),
+            overlay_root: self.retroarch_overlay_root.clone(),
+            approved_roots: self
+                .config
+                .roots
+                .iter()
+                .cloned()
+                .chain(
+                    self.retroarch_config_path
+                        .as_ref()
+                        .and_then(|path| path.parent())
+                        .map(PathBuf::from),
+                )
+                .collect(),
         };
-        match build_bezel_apply_plan(&request) {
+        match prepare_retroarch_bezel_plan(&request) {
             Ok(plan) => self.apply_plan = Some(plan),
             Err(error) => self.apply_error = Some(error),
+        }
+    }
+
+    fn apply(&mut self) {
+        let Some(plan) = self.apply_plan.as_ref() else {
+            return;
+        };
+        let history = match default_shared_history_root() {
+            Ok(path) => path,
+            Err(error) => {
+                self.apply_result = Some(format!("Apply refused: {error:?}"));
+                return;
+            }
+        };
+        let backup = match default_shared_backup_root() {
+            Ok(path) => path,
+            Err(error) => {
+                self.apply_result = Some(format!("Apply refused: {error:?}"));
+                return;
+            }
+        };
+        let operation_id = archivefs_core::patch_manager::generate_shared_operation_id();
+        match apply_retroarch_bezel_plan(
+            plan,
+            &RetroArchBezelApplyOptions {
+                general_approved: true,
+                replacement_approved: !plan.conflicts.is_empty(),
+                operation_id,
+                timestamp_unix_seconds: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |duration| duration.as_secs()),
+                history_root: history,
+                backup_root: backup,
+            },
+        ) {
+            Ok(result) => {
+                self.apply_result = Some(format!(
+                    "Apply {:?}; history journal: {}",
+                    result.journal.status,
+                    result
+                        .journal_path
+                        .map_or_else(|| "not written".into(), |path| path.display().to_string())
+                ))
+            }
+            Err(error) => self.apply_result = Some(format!("Apply refused: {error}")),
         }
     }
 }
@@ -322,14 +401,27 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
             }
         });
     }
-    if let Some(plan) = &state.apply_plan {
+    if let Some(plan) = state.apply_plan.clone() {
         ui.collapsing("Planned changes", |ui| {
             ui.label(format!("Plan: {}", plan.plan_id));
             ui.label(format!("Source: {}", plan.source.path.display()));
             ui.label(format!("SHA-256: {}", plan.source.sha256));
             ui.label(format!("Target: {}", plan.target.emulator));
+            if let Some(destination) = &plan.target.destination_root {
+                ui.label(format!("Overlay destination: {}", destination.display()));
+            }
             ui.label(format!("Files to change: {}", plan.files.len()));
             ui.label(format!("Config entries: {}", plan.config_entries.len()));
+            for file in &plan.files {
+                ui.monospace(format!(
+                    "{}{}",
+                    if file.exists { "change " } else { "create " },
+                    file.path.display()
+                ));
+            }
+            for conflict in &plan.conflicts {
+                ui.colored_label(egui::Color32::YELLOW, format!("Conflict: {conflict}"));
+            }
             for warning in &plan.warnings {
                 ui.small(warning);
             }
@@ -340,19 +432,29 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
                 &mut state.apply_confirmation,
                 "I reviewed this plan and explicitly confirm it",
             );
-            ui.add_enabled(false, egui::Button::new("Apply (adapter unavailable)"));
-            ui.small(format!(
-                "Undo/history: unavailable — {}",
-                plan.rollback.reason
-            ));
+            if ui
+                .add_enabled(
+                    state.apply_confirmation && state.apply_supported(),
+                    egui::Button::new("Apply bezel configuration"),
+                )
+                .clicked()
+            {
+                state.apply();
+            }
+            ui.small(format!("Undo/history: {}", plan.rollback.reason));
         });
+    }
+    if let Some(result) = &state.apply_result {
+        ui.colored_label(egui::Color32::LIGHT_GREEN, result);
     }
     if state.apply_supported() {
         ui.label("Apply is available after confirmation.");
     } else {
-        ui.label("Preview Apply is available; mutation is currently refused.");
+        ui.label("Preview Apply is available; Apply requires a discovered RetroArch scope and explicit confirmation.");
     }
-    ui.small("No emulator-specific bezel configuration adapter is currently proven. Source artwork and ROMs are untouched.");
+    ui.small(
+        "Source artwork and ROMs are untouched; retroarch.cfg is never edited by this workflow.",
+    );
 }
 
 fn paint_preview(
