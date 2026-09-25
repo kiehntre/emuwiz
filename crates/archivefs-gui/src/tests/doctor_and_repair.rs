@@ -708,12 +708,31 @@ fn history_text_search_matches_message_action_and_outcome_case_insensitively() {
     let by_outcome = visible_history_entries(
         &history,
         &HistoryLogFilters {
-            text_query: "failed".to_string(),
+            // Search follows the user-facing outcome label, not the Rust
+            // enum variant name. Keep the mixed case here so this also
+            // protects the case-insensitive matching contract.
+            text_query: "COULD NOT COMPLETE".to_string(),
             ..HistoryLogFilters::default()
         },
     );
     assert_eq!(by_outcome.len(), 1);
     assert_eq!(by_outcome[0].outcome, ActivityOutcome::Failed);
+
+    let multiple_matches = visible_history_entries(
+        &history,
+        &HistoryLogFilters {
+            text_query: "mount".to_string(),
+            ..HistoryLogFilters::default()
+        },
+    );
+    assert_eq!(
+        multiple_matches
+            .iter()
+            .map(|entry| entry.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["unrelated entry", "Mounted Chrono Trigger"],
+        "multiple matches retain newest-first history order"
+    );
 
     let none_match = visible_history_entries(
         &history,
