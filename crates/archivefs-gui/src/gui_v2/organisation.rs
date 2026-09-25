@@ -16,15 +16,12 @@ use crate::{
 use eframe::egui::{self, RichText};
 use std::path::PathBuf;
 
-use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::mame_arcade_join::{
     load_verified_mame_0174, refresh_mame_member_evidence,
 };
-use archivefs_core::dat::mame_normalizer::{
-    MameCollectionMode, MameNormalisationPlan, detect_mame_collection_mode,
-    plan_mame_normalisation, plan_mame_normalisation_from_verified_joins,
+use archivefs_core::dat::mame_merged_reconstruction::{
+    MameMergedReconstructionPlan, build_merged_reconstruction_plan,
 };
-use archivefs_core::dat::parsers::parse_dat_file;
 use archivefs_core::{Database, default_database_path};
 use sha2::{Digest, Sha256};
 
@@ -42,9 +39,7 @@ pub(super) struct OrganisationState {
     pub(super) view: OrganisationView,
     pub(super) mame_root: Option<PathBuf>,
     pub(super) mame_dat: Option<PathBuf>,
-    pub(super) mame_plan: Option<MameNormalisationPlan>,
-    pub(super) mame_mode: MameCollectionMode,
-    pub(super) mame_detected_mode: Option<MameCollectionMode>,
+    pub(super) mame_plan: Option<MameMergedReconstructionPlan>,
     pub(super) mame_message: Option<String>,
     pub(super) mame_evidence_set: String,
 }
@@ -265,7 +260,7 @@ fn motif_plate(ui: &mut egui::Ui, side: f32, kind: CardKind) {
 }
 
 fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
-    ui.label("Wizzy only changes files when the selected DAT proves their identity by checksum.");
+    ui.label("Merged reconstruction is read-only until an explicitly reviewed staged apply.");
     ui.horizontal_wrapped(|ui| {
         if ui.button("Choose MAME folder…").clicked()
             && let Some(path) = rfd::FileDialog::new()
@@ -298,17 +293,6 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             .as_deref()
             .map_or("not selected".into(), |p| p.display().to_string())
     ));
-    ui.horizontal(|ui| {
-        ui.label("Collection layout:");
-        for (mode, label) in [
-            (MameCollectionMode::Merged, "Merged"),
-            (MameCollectionMode::Split, "Split"),
-            (MameCollectionMode::NonMerged, "Non-merged"),
-            (MameCollectionMode::NotSure, "Not sure"),
-        ] {
-            ui.radio_value(&mut state.mame_mode, mode, label);
-        }
-    });
     ui.separator();
     ui.heading("Refresh physical member evidence");
     ui.label("Read-only: reusable checksum evidence is stored before any repair is considered.");
@@ -329,31 +313,15 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             refresh_mame_evidence(state, None);
         }
     });
-    if ui.button("Preview fixes").clicked() {
+    if ui.button("Preview merged reconstruction").clicked() {
         match (&state.mame_root, &state.mame_dat) {
-            (Some(root), Some(dat_path)) => match parse_dat_file(dat_path, DatLimits::default()) {
-                Ok(outcome) if state.mame_mode == MameCollectionMode::NotSure => {
-                    state.mame_detected_mode = detect_mame_collection_mode(root, &outcome.dat).ok();
-                    state.mame_message =
-                        Some("Confirm the detected layout, then preview fixes again.".into());
-                }
-                Ok(outcome) => {
-                    let requested_set = (!state.mame_evidence_set.trim().is_empty())
-                        .then_some(state.mame_evidence_set.trim());
-                    match verified_mame_plan(
-                        root,
-                        dat_path,
-                        &outcome.dat,
-                        state.mame_mode,
-                        requested_set,
-                    ) {
-                        Ok(plan) => state.mame_plan = Some(plan),
-                        Err(error) => state.mame_message = Some(error),
-                    }
-                }
-                Err(error) => {
-                    state.mame_message = Some(format!("The DAT could not be read: {error}"))
-                }
+            (Some(root), Some(dat_path)) => match current_mame_reconstruction_plan(
+                root,
+                dat_path,
+                state.mame_evidence_set.trim(),
+            ) {
+                Ok(plan) => state.mame_plan = Some(plan),
+                Err(error) => state.mame_message = Some(error),
             },
             _ => state.mame_message = Some("Choose both the MAME folder and its DAT first.".into()),
         }
@@ -362,81 +330,74 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
         ui.label(message);
     }
     if let Some(plan) = &state.mame_plan {
-        let summary = &plan.summary;
         ui.label(format!(
-            "{} sets checked · {} safe · {} need attention",
-            summary.total_sets,
-            summary.safe,
-            summary.needs_attention + summary.collisions + summary.missing_data + summary.unknown
+            "Parent: {} · clones: {}",
+            plan.parent,
+            plan.clones.join(", ")
         ));
-        for set in &plan.sets {
-            if !set.missing_members.is_empty() {
-                ui.collapsing(
-                    format!("Evidence needing review: {}", set.current_path.display()),
-                    |ui| {
-                        if !set.missing_members.is_empty() {
-                            ui.label(format!(
-                                "Missing DAT members: {}",
-                                set.missing_members.join(", ")
-                            ));
-                        }
-                        if let Some(reason) = &set.reason {
-                            ui.label(reason);
-                        }
-                    },
-                );
+        ui.label(format!("Destination: {}", plan.destination.display()));
+        ui.label(format!(
+            "{} required members · {} verified sources",
+            plan.required_members.len(),
+            plan.sources.len()
+        ));
+        for (label, values) in [
+            ("Missing", &plan.missing_members),
+            ("Duplicate candidates", &plan.duplicate_candidates),
+            ("Bad hashes", &plan.hash_mismatches),
+            ("Unresolved ownership", &plan.unresolved_ownership),
+            ("Collisions", &plan.collisions),
+        ] {
+            if !values.is_empty() {
+                ui.label(format!("{label}: {}", values.join(", ")));
             }
         }
-        ui.horizontal(|ui| {
-            if ui.button("Apply verified repairs").clicked()
-                && let Some(root) = &state.mame_root
-            {
-                let journal = root.join(".emuwiz-mame-normaliser.json");
-                state.mame_message =
-                    match archivefs_core::dat::mame_normalizer::apply_mame_normalisation(
-                        plan, &journal,
-                    ) {
-                        Ok(count) => Some(format!("Applied {count} safe set repairs.")),
-                        Err(error) => Some(format!("Repair stopped safely: {error}")),
-                    };
-            }
-            if ui.button("Undo this repair batch").clicked()
-                && let Some(root) = &state.mame_root
-            {
-                let journal = root.join(".emuwiz-mame-normaliser.json");
-                state.mame_message =
-                    match archivefs_core::dat::mame_normalizer::undo_mame_normalisation(&journal) {
-                        Ok(count) => Some(format!("Undid {count} safe set repairs.")),
-                        Err(error) => Some(format!("Undo stopped safely: {error}")),
-                    };
+        ui.label(if plan.ready_to_apply {
+            "Safe to apply after explicit confirmation."
+        } else {
+            "Apply blocked: evidence is not sufficient."
+        });
+        for reason in &plan.reasons {
+            ui.label(format!("• {reason}"));
+        }
+        ui.collapsing("Verified ownership", |ui| {
+            for source in &plan.sources {
+                ui.label(format!(
+                    "{} ← {}::{}",
+                    source.target_name,
+                    source.archive_path.display(),
+                    source.current_name
+                ));
             }
         });
     }
 }
 
-fn verified_mame_plan(
+fn current_mame_reconstruction_plan(
     root: &std::path::Path,
     dat_path: &std::path::Path,
-    dat: &archivefs_core::dat::model::ParsedDat,
-    mode: MameCollectionMode,
-    requested_set: Option<&str>,
-) -> Result<MameNormalisationPlan, String> {
+    requested_set: &str,
+) -> Result<MameMergedReconstructionPlan, String> {
+    if requested_set.is_empty() {
+        return Err("Enter a parent or clone set name before previewing.".into());
+    }
+    let dat = load_verified_mame_0174(dat_path)?;
     let digest = Sha256::digest(std::fs::read(dat_path).map_err(|e| e.to_string())?);
     let dat_sha256 = digest
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    if let Ok(path) = default_database_path()
-        && let Ok(database) = Database::open_read_only(&path)
-        && let Ok(joins) = database.mame_arcade_join_paths_for_dat(&dat_sha256)
-        && !joins.is_empty()
-    {
-        return plan_mame_normalisation_from_verified_joins(root, dat, &joins, mode);
+    let database_path = default_database_path().map_err(|e| e.to_string())?;
+    let database = Database::open_read_only(&database_path).map_err(|e| e.to_string())?;
+    let joins = database
+        .mame_arcade_join_paths_for_dat(&dat_sha256)
+        .map_err(|e| e.to_string())?;
+    if joins.is_empty() {
+        return Err(
+            "no persisted verified MAME evidence is available; refresh this family first".into(),
+        );
     }
-    if requested_set.is_some() {
-        return Err("no persisted verified MAME evidence is available for this family; refresh that family before previewing".into());
-    }
-    plan_mame_normalisation(root, dat, mode)
+    build_merged_reconstruction_plan(root, &dat.parsed, &joins, requested_set, &dat_sha256)
 }
 
 fn refresh_mame_evidence(state: &mut OrganisationState, requested_set: Option<String>) {

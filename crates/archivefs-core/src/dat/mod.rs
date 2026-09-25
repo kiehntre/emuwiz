@@ -54,6 +54,7 @@ pub mod library_identity_summary;
 pub mod limits;
 pub mod mame_arcade_join;
 pub mod mame_input_metadata;
+pub mod mame_merged_reconstruction;
 /// Checksum-driven MAME set normalisation. Planning is read-only; applying is
 /// explicit, staged, no-clobber, and journaled for undo.
 pub mod mame_normalizer;
