@@ -8,12 +8,19 @@ use archivefs_core::identity_source::hackhash::{
 use archivefs_core::identity_source::hackhash_identity::{
     HackHashEvidenceClass, HackHashIdentityResult, HackHashObservedHashes, match_snapshot,
 };
+use archivefs_core::identity_source::hackhash_readiness::{
+    HackHashBaseIdentityState, HackHashPatchExecutorAvailability, HackHashPatchReadinessRequest,
+    assess_hackhash_patch_readiness,
+};
+use archivefs_core::identity_source::hashing::hash_file;
 use archivefs_core::identity_source::managed_snapshot::{
     ActivationPreview, HttpsManagedSourceTransport, ManagedSourceSnapshot, UpdateCheck,
 };
 use archivefs_core::identity_source::model::IdentityProvider;
 use archivefs_core::identity_source::settings::default_identity_root;
 use archivefs_core::identity_source::verification::VerificationStore;
+use archivefs_core::safe_read::TrustedRoots;
+use archivefs_core::standalone_patch::{StandalonePatchInspection, inspect_standalone_patch};
 use eframe::egui;
 use std::path::PathBuf;
 
@@ -26,6 +33,10 @@ pub(super) struct HackHashPageState {
     active: Option<ManagedSourceSnapshot>,
     active_export: Option<HackHashExport>,
     selected_identity: Option<HackHashIdentityResult>,
+    selected_base_hashes: Option<HackHashObservedHashes>,
+    selected_patch: Option<PathBuf>,
+    selected_patch_hashes: Option<HackHashObservedHashes>,
+    selected_patch_inspection: Option<StandalonePatchInspection>,
     error: Option<String>,
     remote_url: String,
     update: Option<UpdateCheck>,
@@ -153,6 +164,7 @@ impl HackHashPageState {
 
     pub(super) fn inspect_selected_rom(&mut self, path: &std::path::Path) {
         self.selected_identity = None;
+        self.selected_base_hashes = None;
         let (Some(snapshot), Some(export)) = (&self.active, &self.active_export) else {
             return;
         };
@@ -167,12 +179,45 @@ impl HackHashPageState {
         };
         let observed =
             HackHashObservedHashes::new(Some(&hashes.sha1), Some(&hashes.md5), Some(&hashes.crc32));
+        self.selected_base_hashes = Some(observed.clone());
         self.selected_identity = Some(match_snapshot(
             snapshot,
             export,
             &observed,
             archivefs_core::identity_source::hackhash_identity::HackHashSnapshotState::Active,
         ));
+    }
+
+    fn choose_patch(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose local HackHash patch")
+            .add_filter(
+                "Patch",
+                &["ips", "bps", "ups", "xdelta", "vcdiff", "ppf", "aps"],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+        match inspect_standalone_patch(&path) {
+            Ok(inspection) => {
+                let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                match hash_file(&path, &TrustedRoots::from_paths([parent]), None) {
+                    Ok(hashes) => {
+                        self.selected_patch = Some(path);
+                        self.selected_patch_hashes = Some(HackHashObservedHashes::new(
+                            Some(&hashes.sha1),
+                            Some(&hashes.md5),
+                            Some(&hashes.crc32),
+                        ));
+                        self.selected_patch_inspection = Some(inspection);
+                        self.error = None;
+                    }
+                    Err(error) => self.error = Some(format!("Patch hash: {error:?}")),
+                }
+            }
+            Err(error) => self.error = Some(format!("Patch inspection: {error}")),
+        }
     }
 
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
@@ -292,9 +337,76 @@ impl HackHashPageState {
     /// Render the selected-ROM evidence surface.  Hash acquisition remains an
     /// explicit inspection action owned by the caller; browsing a game never
     /// reads or hashes its media.
-    pub(super) fn show_selected_rom_evidence(&self, ui: &mut egui::Ui) {
-        if let Some(result) = &self.selected_identity {
-            Self::show_identity_result(ui, result);
+    pub(super) fn show_selected_rom_evidence(&mut self, ui: &mut egui::Ui) {
+        if let Some(result) = self.selected_identity.clone() {
+            Self::show_identity_result(ui, &result);
+            ui.separator();
+            ui.strong("Hack readiness");
+            if ui.button("Choose local patch").clicked() {
+                self.choose_patch();
+            }
+            if let Some(path) = &self.selected_patch {
+                ui.label(format!("Patch: {}", path.display()));
+            } else {
+                ui.label("Patch: none selected");
+            }
+            if let (Some(base_hashes), Some(patch_hashes), Some(inspection), Some(export)) = (
+                &self.selected_base_hashes,
+                &self.selected_patch_hashes,
+                &self.selected_patch_inspection,
+                &self.active_export,
+            ) {
+                let readiness = assess_hackhash_patch_readiness(&HackHashPatchReadinessRequest {
+                    base_identity_state: HackHashBaseIdentityState::Identified,
+                    base_hashes: base_hashes.clone(),
+                    patch_hashes: patch_hashes.clone(),
+                    patch_format: inspection.format,
+                    patch_inspection_state: inspection.state,
+                    executor: HackHashPatchExecutorAvailability::StandaloneOnly,
+                    snapshot_state: result.snapshot_state,
+                    snapshot_sha256: Some(&result.snapshot_sha256),
+                    provider_provenance: "active immutable HackHash snapshot",
+                    export,
+                    identity: &result,
+                });
+                ui.label(format!(
+                    "Base ROM: {}",
+                    readiness
+                        .expected_base_identity
+                        .as_deref()
+                        .unwrap_or("not matched")
+                ));
+                ui.label(format!(
+                    "Hack/version: {}",
+                    readiness
+                        .hack_titles
+                        .iter()
+                        .zip(&readiness.versions)
+                        .map(|(title, version)| format!("{title} v{version}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                ui.label(format!(
+                    "Expected output: {}",
+                    readiness.expected_output_hashes.join("; ")
+                ));
+                ui.label(format!("Evidence: {}", readiness.provider_provenance));
+                ui.label(format!("Status: {:?}", readiness.status));
+                ui.label(format!("Why: {}", readiness.explanation));
+                for reason in readiness
+                    .refusal_reasons
+                    .iter()
+                    .chain(&readiness.missing_evidence)
+                {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("Missing/refusal: {reason}"),
+                    );
+                }
+            } else {
+                ui.label("Status: NOT READY");
+                ui.label("Why: select a valid local patch to compare its hash and format against the active evidence.");
+            }
             return;
         }
         ui.separator();
@@ -302,6 +414,9 @@ impl HackHashPageState {
         ui.label("HackHash");
         ui.label("No locally inspected output hashes are available for this ROM.");
         ui.label("Inspect hashes explicitly to compare patched output evidence.");
+        if ui.button("Choose local patch").clicked() {
+            self.choose_patch();
+        }
         ui.label("HackHash is external community evidence and never native Verified identity.");
     }
 

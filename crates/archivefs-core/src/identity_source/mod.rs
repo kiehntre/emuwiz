@@ -32,6 +32,7 @@ pub mod fbneo;
 pub mod freshness;
 pub mod hackhash;
 pub mod hackhash_identity;
+pub mod hackhash_readiness;
 pub mod hasheous;
 pub mod hashing;
 pub use freshness::{
