@@ -29,6 +29,9 @@ const GB_DAT_NEWER: &str = r#"<?xml version="1.0"?>
 const GB_DAT_SAME_REVISION: &str = r#"<?xml version="1.0"?>
 <datafile><header><name>Nintendo - Game Boy</name><version>20260101</version><author>No-Intro</author></header>
 <game name="Test"><rom name="test.gb" size="1" crc="EEEEEEEE"/></game></datafile>"#;
+const GB_DAT_RENAMED: &str = r#"<?xml version="1.0"?>
+<datafile><header><name>Nintendo - Game Boy</name><version>20260101</version><author>No-Intro</author></header>
+<game name="Renamed"><rom name="renamed.gb" size="1" crc="AAAAAAAA"/></game></datafile>"#;
 
 fn write_zip(path: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
     let file = fs::File::create(path).unwrap();
@@ -131,6 +134,33 @@ fn staged_snapshot_compares_by_content_and_same_content_is_deterministic() {
     assert_eq!(
         compare_staged_no_intro_pack_at(&storage).unwrap(),
         Some(NoIntroPackComparison::SameSnapshot)
+    );
+}
+
+#[test]
+fn delta_is_hash_led_and_reports_metadata_and_renames_deterministically() {
+    let dir = tempdir().unwrap();
+    let storage = dir.path().join("store");
+    let first_pack = write_zip(
+        &dir.path().join("first.zip"),
+        &[("gb.dat", GB_DAT.as_bytes())],
+    );
+    import_no_intro_pack_at(&first_pack, &storage).unwrap();
+    let candidate_pack = write_zip(
+        &dir.path().join("candidate.zip"),
+        &[("gb.dat", GB_DAT_RENAMED.as_bytes())],
+    );
+    stage_no_intro_pack_at(&candidate_pack, &storage).unwrap();
+    let active = load_current_no_intro_pack_at(&storage).unwrap().unwrap();
+    let candidate = load_staged_no_intro_pack_at(&storage).unwrap().unwrap();
+    let delta = compare_no_intro_sources(&active, &candidate);
+    assert_eq!(delta.entries_added, 0);
+    assert_eq!(delta.entries_removed, 0);
+    assert_eq!(delta.hash_changes, 0);
+    assert_eq!(delta.renamed_canonical_entries, 1);
+    assert_eq!(
+        delta.metadata_changes,
+        vec!["Nintendo - Game Boy|Unknown".to_string()]
     );
 }
 

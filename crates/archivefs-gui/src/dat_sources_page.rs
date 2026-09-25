@@ -101,10 +101,12 @@ use archivefs_core::dat::updates::{
 };
 use archivefs_core::identity_source::no_intro::{
     NO_INTRO_DATOMATIC_DOWNLOAD_PAGE, NoIntroPackClassification, NoIntroPackComparison,
-    NoIntroPackImportStatus, NoIntroPackInspection, activate_staged_no_intro_pack_at,
-    compare_staged_no_intro_pack_at, inspect_no_intro_pack, load_current_no_intro_pack_summary,
-    load_no_intro_pack_snapshots_at, load_staged_no_intro_pack_summary_at,
-    report_no_intro_lifecycle, rollback_no_intro_pack_at, stage_no_intro_pack,
+    NoIntroPackDelta, NoIntroPackImportStatus, NoIntroPackInspection,
+    activate_staged_no_intro_pack_at, compare_no_intro_sources, compare_staged_no_intro_pack_at,
+    inspect_no_intro_pack, load_current_no_intro_pack, load_current_no_intro_pack_summary,
+    load_no_intro_pack_snapshots_at, load_staged_no_intro_pack_at,
+    load_staged_no_intro_pack_summary_at, report_no_intro_lifecycle, rollback_no_intro_pack_at,
+    stage_no_intro_pack,
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
@@ -798,6 +800,7 @@ pub(crate) struct DatSourcesPageView {
     pub(crate) no_intro_inspection: Option<NoIntroPackInspection>,
     pub(crate) no_intro_staged: Option<NoIntroPackInspection>,
     pub(crate) no_intro_staged_comparison: Option<NoIntroPackComparison>,
+    pub(crate) no_intro_delta: Option<NoIntroPackDelta>,
     pub(crate) no_intro_installed: Option<NoIntroPackInspection>,
     /// Read-only managed No-Intro lifecycle report. This is loaded once when
     /// the page state opens; rendering never walks DATs or reconstructs it.
@@ -3063,6 +3066,7 @@ pub(crate) struct DatSourcesPageState {
     no_intro_inspection: Option<NoIntroPackInspection>,
     no_intro_staged: Option<NoIntroPackInspection>,
     no_intro_staged_comparison: Option<NoIntroPackComparison>,
+    no_intro_delta: Option<NoIntroPackDelta>,
     no_intro_installed: Option<NoIntroPackInspection>,
     no_intro_status: Option<archivefs_core::identity_source::no_intro::ManagedNoIntroStatusReport>,
     no_intro_status_error: Option<String>,
@@ -3328,6 +3332,7 @@ impl DatSourcesPageState {
             no_intro_inspection: None,
             no_intro_staged: None,
             no_intro_staged_comparison: None,
+            no_intro_delta: None,
             no_intro_installed: None,
             no_intro_status: None,
             no_intro_status_error: None,
@@ -4871,6 +4876,13 @@ impl DatSourcesPageState {
                     archivefs_core::app_dirs::data_path("no_intro_pack")
                         .ok()
                         .and_then(|root| compare_staged_no_intro_pack_at(&root).ok().flatten());
+                self.no_intro_delta = archivefs_core::app_dirs::data_path("no_intro_pack")
+                    .ok()
+                    .and_then(|root| {
+                        let active = load_current_no_intro_pack().ok().flatten()?;
+                        let candidate = load_staged_no_intro_pack_at(&root).ok().flatten()?;
+                        Some(compare_no_intro_sources(&active, &candidate))
+                    });
             }
             Err(error) => self.no_intro_action_error = Some(error.to_string()),
         }
@@ -4890,6 +4902,7 @@ impl DatSourcesPageState {
                 self.no_intro_import_status = Some(report.import.status);
                 self.no_intro_staged = None;
                 self.no_intro_staged_comparison = None;
+                self.no_intro_delta = None;
                 self.no_intro_installed = load_current_no_intro_pack_summary().ok().flatten();
                 let (status, status_error) = load_no_intro_lifecycle_status();
                 self.no_intro_status = status;
@@ -6467,6 +6480,7 @@ impl DatSourcesPageState {
             no_intro_inspection: self.no_intro_inspection.clone(),
             no_intro_staged: self.no_intro_staged.clone(),
             no_intro_staged_comparison: self.no_intro_staged_comparison,
+            no_intro_delta: self.no_intro_delta.clone(),
             no_intro_installed: self.no_intro_installed.clone(),
             no_intro_status: self.no_intro_status.clone(),
             no_intro_status_error: self.no_intro_status_error.clone(),
@@ -9002,6 +9016,23 @@ fn show_evidence_acquisition_section(
                 None => "The staged content has not been compared with an active snapshot.",
             };
             ui.label(comparison);
+            if let Some(delta) = &view.no_intro_delta {
+                ui.label(format!(
+                    "Delta: +{} added · -{} removed · {} changed · {} hash changes · {} renamed · {} metadata change(s)",
+                    delta.entries_added,
+                    delta.entries_removed,
+                    delta.entries_changed,
+                    delta.hash_changes,
+                    delta.renamed_canonical_entries,
+                    delta.metadata_changes.len(),
+                ));
+                if !delta.metadata_changes.is_empty() {
+                    ui.label(format!(
+                        "Metadata changed for: {}",
+                        delta.metadata_changes.join(", ")
+                    ));
+                }
+            }
             ui.label(egui::RichText::new(
                 "Review the staged release, then activate it explicitly. Activation marks existing verification for re-check.",
             ).color(theme::muted(ui)).small());

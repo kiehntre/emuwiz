@@ -5,6 +5,7 @@
 //! its DAT contents, then publishes one content-addressed snapshot. It never
 //! performs HTTP, scrapes a page, or interprets a filename as authority.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -126,6 +127,30 @@ pub enum NoIntroPackComparison {
     OlderRevision,
     RevisionUnknown,
     DifferentSnapshot,
+}
+
+/// Deterministic content comparison between two validated No-Intro packs.
+/// Entry continuity is hash-led: a renamed DAT entry with the same strongest
+/// ROM checksum is reported as a rename, not as a lost and newly invented ROM.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoIntroPackDelta {
+    pub entries_added: usize,
+    pub entries_removed: usize,
+    pub entries_changed: usize,
+    pub hash_changes: usize,
+    pub renamed_canonical_entries: usize,
+    pub metadata_changes: Vec<String>,
+}
+
+impl NoIntroPackDelta {
+    pub fn is_unchanged(&self) -> bool {
+        self.entries_added == 0
+            && self.entries_removed == 0
+            && self.entries_changed == 0
+            && self.hash_changes == 0
+            && self.renamed_canonical_entries == 0
+            && self.metadata_changes.is_empty()
+    }
 }
 
 /// The non-mutating result of validating a user-supplied pack.  This contains
@@ -740,6 +765,143 @@ pub fn compare_staged_no_intro_pack_at(
         _ => NoIntroPackComparison::RevisionUnknown,
     };
     Ok(Some(comparison))
+}
+
+/// Loads a validated staged candidate without activating it.
+pub fn load_staged_no_intro_pack_at(
+    storage_root: &Path,
+) -> Result<Option<Vec<ImportedNoIntroSource>>, NoIntroPackImportError> {
+    let staged_path = storage_root.join("staged.json");
+    let staged: NoIntroPackStagedState = match fs::read_to_string(&staged_path) {
+        Ok(body) => serde_json::from_str(&body)
+            .map_err(|error| NoIntroPackImportError::State(error.to_string()))?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error(&staged_path, error)),
+    };
+    let snapshot_path = storage_root.join("snapshots").join(&staged.snapshot_sha256);
+    if !snapshot_is_complete(&snapshot_path, &staged.accepted_members) {
+        return Err(NoIntroPackImportError::State(
+            "staged No-Intro snapshot is incomplete".into(),
+        ));
+    }
+    Ok(Some(load_sources(
+        &snapshot_path,
+        &staged.accepted_members,
+    )?))
+}
+
+/// Compares two already validated No-Intro source sets. This function never
+/// reads ROMs and never uses filenames as identity when a DAT checksum exists.
+pub fn compare_no_intro_sources(
+    active: &[ImportedNoIntroSource],
+    candidate: &[ImportedNoIntroSource],
+) -> NoIntroPackDelta {
+    let active_entries = entry_map(active);
+    let candidate_entries = entry_map(candidate);
+    let active_keys: BTreeSet<_> = active_entries.keys().cloned().collect();
+    let candidate_keys: BTreeSet<_> = candidate_entries.keys().cloned().collect();
+    let mut delta = NoIntroPackDelta {
+        entries_added: candidate_keys.difference(&active_keys).count(),
+        entries_removed: active_keys.difference(&candidate_keys).count(),
+        ..NoIntroPackDelta::default()
+    };
+    let mut renamed_hashes = BTreeSet::new();
+    for key in active_keys.intersection(&candidate_keys) {
+        let (active_name, active_hash) = &active_entries[key];
+        let (candidate_name, candidate_hash) = &candidate_entries[key];
+        if active_hash != candidate_hash {
+            delta.entries_changed += 1;
+            delta.hash_changes += 1;
+        } else if active_name != candidate_name {
+            delta.renamed_canonical_entries += 1;
+            renamed_hashes.insert(active_hash.clone());
+        }
+    }
+    let active_by_hash = hash_to_names(&active_entries);
+    let candidate_by_hash = hash_to_names(&candidate_entries);
+    for hash in active_by_hash
+        .keys()
+        .filter(|hash| candidate_by_hash.contains_key(*hash))
+    {
+        if active_by_hash[hash] != candidate_by_hash[hash] && !renamed_hashes.contains(hash) {
+            delta.renamed_canonical_entries += 1;
+        }
+    }
+    let active_metadata = metadata_map(active);
+    let candidate_metadata = metadata_map(candidate);
+    for scope in active_metadata.keys().chain(candidate_metadata.keys()) {
+        if active_metadata.get(scope) != candidate_metadata.get(scope)
+            && !delta.metadata_changes.contains(scope)
+        {
+            delta.metadata_changes.push(scope.clone());
+        }
+    }
+    delta.metadata_changes.sort();
+    delta
+}
+
+fn entry_map(sources: &[ImportedNoIntroSource]) -> BTreeMap<String, (String, String)> {
+    let mut entries = BTreeMap::new();
+    for source in sources {
+        for refs in [
+            &source.index.by_sha1,
+            &source.index.by_md5,
+            &source.index.by_crc32,
+            &source.index.by_sha256,
+        ] {
+            for values in refs.values() {
+                for entry in values {
+                    let key = format!(
+                        "{}|{:?}|{:?}",
+                        source.system_name, source.variant, entry.member_key
+                    );
+                    let hash = entry
+                        .checksums
+                        .iter()
+                        .max_by_key(|checksum| checksum.algorithm)
+                        .map(|checksum| {
+                            format!("{}:{}", checksum.algorithm.label(), checksum.value)
+                        })
+                        .unwrap_or_else(|| "no-checksum".into());
+                    entries.entry(key).or_insert_with(|| {
+                        (format!("{}::{}", entry.game_name, entry.rom_name), hash)
+                    });
+                }
+            }
+        }
+    }
+    entries
+}
+
+fn hash_to_names(
+    entries: &BTreeMap<String, (String, String)>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut result = BTreeMap::new();
+    for (name, hash) in entries.values() {
+        result
+            .entry(hash.clone())
+            .or_insert_with(BTreeSet::new)
+            .insert(name.clone());
+    }
+    result
+}
+
+fn metadata_map(
+    sources: &[ImportedNoIntroSource],
+) -> BTreeMap<String, (Option<String>, usize, usize)> {
+    sources
+        .iter()
+        .map(|source| {
+            (
+                format!("{}|{:?}", source.system_name, source.variant),
+                (
+                    source.upstream_version.clone(),
+                    source.entry_count,
+                    source.rom_count,
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Compare only the conservative release signals emitted by No-Intro DATs.
