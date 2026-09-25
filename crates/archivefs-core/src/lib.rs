@@ -68,6 +68,8 @@ pub mod evidence_resolution;
 pub mod library_visibility;
 /// Read-only impact projection for refreshed imported MAME authority.
 pub mod mame_authority_impact;
+/// Read-only MAME collection health, completeness and update-readiness analysis.
+pub mod mame_collection_analyser;
 /// Deterministic collection statistics over evaluated MAME evidence.
 pub mod mame_collection_stats;
 /// Conservative static input requirements projected from MAME metadata.

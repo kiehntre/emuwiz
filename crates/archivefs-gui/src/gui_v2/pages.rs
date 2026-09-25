@@ -1934,6 +1934,8 @@ impl App {
         workflows.show_sources(ui, &mut self.activity);
         ui.separator();
         self.hackhash.show(ui);
+        ui.separator();
+        super::mame_collection_health::show(ui);
     }
 
     fn dat_sources(&mut self, ui: &mut egui::Ui) {

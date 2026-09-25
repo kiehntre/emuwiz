@@ -10,6 +10,7 @@ mod hackhash;
 mod imagery;
 mod legacy;
 pub(crate) mod library;
+mod mame_collection_health;
 mod media_sources;
 mod mods;
 mod native_workflows;
