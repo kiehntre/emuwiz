@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::dat::model::ParsedDat;
+use crate::dat::model::{DatGameEntry, DatRomEntry, ParsedDat};
 
 pub const MAME_COLLECTION_ANALYSER_SCHEMA_VERSION: u32 = 1;
 
@@ -68,12 +68,50 @@ pub struct MameCollectionInventory {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MameDependencyKind {
+    GameSpecificRom,
+    ParentSharedRom,
+    BiosRom,
+    DeviceRom,
+    PldGalPal,
+    Chd,
+    NoDump,
+    BadDump,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MamePreservationStatus {
+    VerifiedDumpExpected,
+    NoVerifiedDumpExists,
+    NeedsRedump,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MameMissingDependency {
     pub name: String,
-    pub kind: String,
+    pub kind: MameDependencyKind,
+    pub preservation_status: MamePreservationStatus,
     pub affected_sets: Vec<String>,
+    pub affected_families: Vec<String>,
     pub occurrences: usize,
+    pub potentially_repairs_sets: usize,
+    pub obtainable_or_expected: bool,
+    pub explanation: String,
+}
+
+#[derive(Default)]
+struct MissingAccumulator {
+    occurrences: usize,
+    sets: BTreeSet<String>,
+    families: BTreeSet<String>,
+    kind: Option<MameDependencyKind>,
+    preservation_status: Option<MamePreservationStatus>,
+    repairable: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,7 +182,7 @@ pub fn analyse_collection(
         .map(|set| (set.name.as_str(), set))
         .collect();
     let mut results = Vec::new();
-    let mut missing = BTreeMap::<(String, String), (usize, BTreeSet<String>)>::new();
+    let mut missing = BTreeMap::<String, MissingAccumulator>::new();
     let mut bios_device_failures = BTreeSet::new();
     let mut coverage = MameParentCloneCoverage::default();
     let mut chd = MameChdCoverage::default();
@@ -169,17 +207,44 @@ pub fn analyse_collection(
         let mut missing_members = Vec::new();
         let mut matched = 0;
         for rom in &game.roms {
+            if rom
+                .status
+                .as_deref()
+                .is_some_and(|status| status.eq_ignore_ascii_case("nodump"))
+            {
+                record_missing(&mut missing, &game.name, game, rom, None);
+                continue;
+            }
             if let Some(member) = members.get(rom.name.as_str()) {
                 if member_matches(rom, member) {
+                    if rom
+                        .status
+                        .as_deref()
+                        .is_some_and(|status| status.eq_ignore_ascii_case("baddump"))
+                    {
+                        record_missing(&mut missing, &game.name, game, rom, None);
+                    }
                     matched += 1;
                     continue;
                 }
             }
             missing_members.push(rom.name.clone());
-            let key = (rom.name.clone(), "rom".to_string());
-            let entry = missing.entry(key).or_default();
-            entry.0 += 1;
-            entry.1.insert(game.name.clone());
+            record_missing(&mut missing, &game.name, game, rom, None);
+        }
+        for disk in &game.disks {
+            let name = disk.name.as_deref().unwrap_or("(unnamed CHD)");
+            if !set.members.iter().any(|member| member.name == name) {
+                let accumulator = missing.entry(name.to_string()).or_default();
+                accumulator.occurrences += 1;
+                accumulator.sets.insert(game.name.clone());
+                accumulator
+                    .families
+                    .insert(game.clone_of.clone().unwrap_or_else(|| game.name.clone()));
+                accumulator.kind = Some(MameDependencyKind::Chd);
+                accumulator.preservation_status =
+                    Some(MamePreservationStatus::VerifiedDumpExpected);
+                accumulator.repairable = true;
+            }
         }
         let health = if game.roms.is_empty() || missing_members.is_empty() {
             MameSetHealth::Good
@@ -244,14 +309,32 @@ pub fn analyse_collection(
         .count();
     let mut top_missing_dependencies: Vec<_> = missing
         .into_iter()
-        .map(
-            |((name, kind), (occurrences, sets))| MameMissingDependency {
+        .map(|(name, accumulator)| {
+            let kind = accumulator.kind.unwrap_or(MameDependencyKind::Unknown);
+            let preservation_status = accumulator
+                .preservation_status
+                .unwrap_or(MamePreservationStatus::Unknown);
+            let potentially_repairs_sets = if accumulator.repairable {
+                accumulator.sets.len()
+            } else {
+                0
+            };
+            MameMissingDependency {
                 name,
                 kind,
-                occurrences,
-                affected_sets: sets.into_iter().collect(),
-            },
-        )
+                preservation_status,
+                affected_sets: accumulator.sets.iter().cloned().collect(),
+                affected_families: accumulator.families.iter().cloned().collect(),
+                occurrences: accumulator.occurrences,
+                potentially_repairs_sets,
+                obtainable_or_expected: accumulator.repairable,
+                explanation: dependency_explanation(
+                    &kind,
+                    &preservation_status,
+                    potentially_repairs_sets,
+                ),
+            }
+        })
         .collect();
     top_missing_dependencies.sort_by(|a, b| {
         b.occurrences
@@ -302,6 +385,105 @@ fn member_matches(rom: &crate::dat::model::DatRomEntry, member: &MameObservedMem
             .as_deref()
             .is_some_and(|hash| member.crc32.as_deref() == Some(hash))
         || (rom.sha1.is_none() && rom.md5.is_none() && rom.crc32.is_none())
+}
+
+fn record_missing(
+    missing: &mut BTreeMap<String, MissingAccumulator>,
+    set_name: &str,
+    game: &DatGameEntry,
+    rom: &DatRomEntry,
+    _reason: Option<&str>,
+) {
+    let key = rom.name.clone();
+    let accumulator = missing.entry(key).or_default();
+    accumulator.occurrences += 1;
+    accumulator.sets.insert(set_name.to_string());
+    accumulator.families.insert(
+        game.clone_of
+            .clone()
+            .unwrap_or_else(|| set_name.to_string()),
+    );
+    let (kind, status, repairable) = classify_rom(game, rom);
+    if accumulator.kind.is_some_and(|existing| existing != kind) {
+        accumulator.kind = Some(MameDependencyKind::Unknown);
+        accumulator.preservation_status = Some(MamePreservationStatus::Unknown);
+        accumulator.repairable = false;
+    } else {
+        accumulator.kind = Some(kind);
+        accumulator.preservation_status = Some(status);
+        accumulator.repairable |= repairable;
+    }
+}
+
+fn classify_rom(
+    game: &DatGameEntry,
+    rom: &DatRomEntry,
+) -> (MameDependencyKind, MamePreservationStatus, bool) {
+    let status = rom
+        .status
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if status == "nodump" || status == "no_dump" {
+        return (
+            MameDependencyKind::NoDump,
+            MamePreservationStatus::NoVerifiedDumpExists,
+            false,
+        );
+    }
+    if status == "baddump" || status == "bad_dump" {
+        return (
+            MameDependencyKind::BadDump,
+            MamePreservationStatus::NeedsRedump,
+            false,
+        );
+    }
+    let lower = rom.name.to_ascii_lowercase();
+    let kind = if game.is_bios.is_some() {
+        MameDependencyKind::BiosRom
+    } else if game.is_device.is_some() || !game.device_refs.is_empty() {
+        MameDependencyKind::DeviceRom
+    } else if ["gal", "pal", "pld"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        MameDependencyKind::PldGalPal
+    } else if rom.merge.is_some() || game.clone_of.is_some() {
+        MameDependencyKind::ParentSharedRom
+    } else {
+        MameDependencyKind::GameSpecificRom
+    };
+    (kind, MamePreservationStatus::VerifiedDumpExpected, true)
+}
+
+fn dependency_explanation(
+    kind: &MameDependencyKind,
+    status: &MamePreservationStatus,
+    potentially_repairs_sets: usize,
+) -> String {
+    if *status == MamePreservationStatus::NoVerifiedDumpExists {
+        return "MAME has no verified good dump for this item.".to_string();
+    }
+    match kind {
+        MameDependencyKind::ParentSharedRom => format!(
+            "This is a parent/shared dependency, not a game-specific file; it could affect {potentially_repairs_sets} sets."
+        ),
+        MameDependencyKind::BiosRom | MameDependencyKind::DeviceRom => format!(
+            "This is a shared device or BIOS dependency used by {potentially_repairs_sets} machines."
+        ),
+        MameDependencyKind::PldGalPal => {
+            "This is a PLD/GAL/PAL device dump and may require specialist preservation evidence."
+                .to_string()
+        }
+        MameDependencyKind::Chd => {
+            format!("This is a required CHD and could affect {potentially_repairs_sets} sets.")
+        }
+        MameDependencyKind::BadDump => {
+            "MAME knows a dump exists, but marks the available dump as bad and needing redump."
+                .to_string()
+        }
+        _ => "This is an expected ROM requirement for the affected machine set.".to_string(),
+    }
 }
 
 fn infer_style(current: &ParsedDat, inventory: &MameCollectionInventory) -> MameCollectionStyle {
@@ -384,7 +566,8 @@ pub fn compare_catalogues(previous: &ParsedDat, current: &ParsedDat) -> MameUpda
 mod tests {
     use super::*;
     use crate::dat::model::{
-        DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry, DatSource,
+        DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy, DatRomEntry,
+        DatSource,
     };
 
     fn catalogue(games: Vec<DatGameEntry>) -> ParsedDat {
@@ -479,5 +662,65 @@ mod tests {
         let readiness = compare_catalogues(&old, &current);
         assert_eq!(readiness.renamed_or_moved_canonical_entries, 0);
         assert_eq!(readiness.missing_required_hashes, 1);
+    }
+
+    #[test]
+    fn explains_shared_statuses_without_calling_no_dump_repairable() {
+        let mut bios_a = game("bios-a", "aa");
+        bios_a.roms[0].name = "shared-bios.bin".into();
+        bios_a.is_bios = Some("yes".into());
+        let mut bios_b = game("bios-b", "aa");
+        bios_b.roms[0].name = "shared-bios.bin".into();
+        bios_b.is_bios = Some("yes".into());
+        let mut no_dump = game("prototype", "bb");
+        no_dump.roms[0].name = "undumped-gal.bin".into();
+        no_dump.roms[0].status = Some("nodump".into());
+        let mut bad_dump = game("bad", "cc");
+        bad_dump.roms[0].status = Some("baddump".into());
+        let mut chd = game("disc", "dd");
+        chd.disks = vec![DatDiskEntry {
+            name: Some("disc.chd".into()),
+            sha1: Some("0123456789012345678901234567890123456789".into()),
+            ..Default::default()
+        }];
+        let dat = catalogue(vec![bios_a, bios_b, no_dump, bad_dump, chd]);
+        let inventory = MameCollectionInventory {
+            collection_root: "/roms".into(),
+            sets: ["bios-a", "bios-b", "prototype", "bad", "disc"]
+                .into_iter()
+                .map(|name| MameObservedSet {
+                    name: name.into(),
+                    location: format!("/roms/{name}.zip").into(),
+                    directory: false,
+                    members: Vec::new(),
+                })
+                .collect(),
+            inspected_completely: true,
+            warnings: Vec::new(),
+        };
+        let report = analyse_collection(&dat, &inventory, Some("0.264".into()), None);
+        let bios = report
+            .top_missing_dependencies
+            .iter()
+            .find(|item| item.name == "shared-bios.bin")
+            .expect("shared BIOS should be explained");
+        assert_eq!(bios.kind, MameDependencyKind::BiosRom);
+        assert_eq!(bios.affected_sets.len(), 2);
+        assert_eq!(bios.potentially_repairs_sets, 2);
+        let nodump = report
+            .top_missing_dependencies
+            .iter()
+            .find(|item| item.name == "undumped-gal.bin")
+            .expect("NO_DUMP should be explained");
+        assert_eq!(nodump.kind, MameDependencyKind::NoDump);
+        assert!(!nodump.obtainable_or_expected);
+        assert_eq!(nodump.potentially_repairs_sets, 0);
+        assert!(nodump.explanation.contains("no verified good dump"));
+        assert!(
+            report
+                .top_missing_dependencies
+                .iter()
+                .any(|item| item.kind == MameDependencyKind::Chd)
+        );
     }
 }

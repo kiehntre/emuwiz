@@ -20,6 +20,13 @@ pub(super) fn show(ui: &mut egui::Ui) {
                 });
             ui.strong("No update actions are available here");
             ui.label("The analyser prepares a read-only report only. ROM collection changes remain outside this feature.");
+            ui.separator();
+            ui.strong("Top shared problems");
+            ui.label("Affected sets · Type · Preservation status · Potentially fixes N sets");
+            ui.label("This is a shared device ROM used by many machines.");
+            ui.label("This is a parent/shared dependency, not a game-specific file.");
+            ui.label("MAME has no verified good dump for this chip.");
+            ui.label("NO_DUMP items are preservation gaps, not ordinary missing collection files.");
             if ui.button("Export report").clicked() {
                 ui.ctx().copy_text("MAME collection health export is available after an inspection report is loaded.".into());
             }
