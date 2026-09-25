@@ -11,9 +11,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use md5::Md5;
 use sha1::{Digest, Sha1};
 
+use super::hackhash::{
+    HackHashNativeInspection, HackHashPatchProvenance, HackHashVerificationState,
+};
 use super::hackhash_identity::HackHashOutputHashes;
 use super::hackhash_readiness::{HackHashPatchReadinessEvidence, HackHashPatchReadinessStatus};
+use crate::game_identity::{IdentityStatus, inspect_catalogued_game_identity};
 use crate::identity_source::hashing::Crc32;
+use crate::identity_source::hashing::hash_file;
 use crate::patch_manager::{
     PreviewAdapter, PreviewDestinationState, PreviewProposedAction, SHARED_APPLY_SCHEMA_VERSION,
     SharedApplyConfirmation, SharedApplyContext, SharedApplyOptions, SharedApplyResult,
@@ -22,6 +27,7 @@ use crate::patch_manager::{
     SharedTransactionPlan, execute_shared_materialized_apply, execute_shared_rollback,
     generate_shared_operation_id, preview_shared_rollback, seal_shared_transaction_plan,
 };
+use crate::safe_read::TrustedRoots;
 use crate::standalone_patch::{StandalonePatchApplyPlan, prepare_standalone_patch_output};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +38,10 @@ pub struct HackHashPatchApplyPlan {
     pub expected_output: HackHashOutputHashes,
     pub readiness_status: HackHashPatchReadinessStatus,
     pub provider_snapshot_sha256: String,
+    pub base_identity: Option<String>,
+    pub hack_titles: Vec<String>,
+    pub family_versions: Vec<String>,
+    pub provider_provenance: String,
 }
 
 #[derive(Debug)]
@@ -39,6 +49,7 @@ pub struct HackHashPatchApplyResult {
     pub shared: SharedApplyResult,
     pub produced_output: HackHashOutputHashes,
     pub tool: String,
+    pub provenance: HackHashPatchProvenance,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +170,7 @@ pub fn build_hackhash_patch_apply_plan(
                 expected_output_hash: String::new(),
                 provider_snapshot_hash: provider_snapshot_sha256.into(),
                 tool: "pending".into(),
+                provenance: None,
             }),
         }],
     };
@@ -173,6 +185,10 @@ pub fn build_hackhash_patch_apply_plan(
         expected_output,
         readiness_status: readiness.status,
         provider_snapshot_sha256: provider_snapshot_sha256.into(),
+        base_identity: readiness.expected_base_identity.clone(),
+        hack_titles: readiness.hack_titles.clone(),
+        family_versions: readiness.family_versions.clone(),
+        provider_provenance: readiness.provider_provenance.clone(),
     })
 }
 
@@ -234,6 +250,46 @@ pub fn apply_hackhash_patch(
         )));
     }
     let output_sha256 = sha256(&prepared.bytes);
+    let native = inspect_prepared_output(&prepared.bytes, &plan.destination_path)?;
+    let operation_id = generate_shared_operation_id();
+    let timestamp_unix_seconds = now();
+    let native_state = if native.complete && !native.evidence.is_empty() {
+        HackHashVerificationState::ProviderOutputAndNativeInspection
+    } else if native
+        .evidence
+        .iter()
+        .any(|evidence| evidence.contains(":Ambiguous:") || evidence.contains(":Invalid:"))
+    {
+        HackHashVerificationState::ProviderOutputNativeIdentityConflict
+    } else {
+        HackHashVerificationState::ProviderOutputNativeIdentityUnavailable
+    };
+    let mut provenance = HackHashPatchProvenance {
+        base_path: plan.standalone.reviewed.base_path.clone(),
+        base_identity: plan.base_identity.clone(),
+        base_sha256: plan
+            .standalone
+            .reviewed
+            .base_sha256
+            .clone()
+            .unwrap_or_default(),
+        patch_path: plan.standalone.reviewed.patch_path.clone(),
+        patch_sha256: plan.standalone.reviewed.patch_sha256.clone(),
+        patch_format: plan.standalone.reviewed.patch_format,
+        patch_source: "local HackHash patch selected by the user".into(),
+        expected_output: plan.expected_output.clone(),
+        actual_output: produced.clone(),
+        output_path: plan.destination_path.clone(),
+        output_sha256: output_sha256.clone(),
+        hack_titles: plan.hack_titles.clone(),
+        family_versions: plan.family_versions.clone(),
+        provider_snapshot_sha256: plan.provider_snapshot_sha256.clone(),
+        provider_provenance: plan.provider_provenance.clone(),
+        transaction_id: operation_id.clone(),
+        timestamp_unix_seconds,
+        verification_state: native_state,
+        native_inspection: native,
+    };
     let mut shared = plan.shared.clone();
     let entry = shared
         .entries
@@ -253,10 +309,10 @@ pub fn apply_hackhash_patch(
         expected_output_hash: output_sha256.clone(),
         provider_snapshot_hash: plan.provider_snapshot_sha256.clone(),
         tool: prepared.application.clone(),
+        provenance: Some(provenance.clone()),
     });
     seal_shared_transaction_plan(&mut shared)
         .map_err(|error| HackHashPatchApplyError::Transaction(error.detail))?;
-    let operation_id = generate_shared_operation_id();
     let options = SharedApplyOptions {
         dry_run: false,
         confirmation: Some(SharedApplyConfirmation {
@@ -265,7 +321,7 @@ pub fn apply_hackhash_patch(
             replacement_approved: false,
         }),
         operation_id,
-        timestamp_unix_seconds: now(),
+        timestamp_unix_seconds,
         current_context: shared.context.clone(),
         history_root: history_root.as_ref().to_path_buf(),
         backup_root: backup_root.as_ref().to_path_buf(),
@@ -286,10 +342,23 @@ pub fn apply_hackhash_patch(
         )],
     };
     let shared_result = execute_shared_materialized_apply(&shared, &options, &materialized);
+    if shared_result.journal.status == crate::patch_manager::SharedApplyStatus::Success {
+        match inspect_native_path(&plan.destination_path) {
+            Ok(native) => provenance.native_inspection = native,
+            Err(error) => {
+                provenance.verification_state =
+                    HackHashVerificationState::ProviderOutputNativeIdentityUnavailable;
+                provenance.native_inspection.warnings.push(format!(
+                    "post-publication native inspection unavailable: {error}"
+                ));
+            }
+        }
+    }
     Ok(HackHashPatchApplyResult {
         shared: shared_result,
         produced_output: produced,
         tool: prepared.application,
+        provenance,
     })
 }
 
@@ -358,6 +427,69 @@ fn hashes(bytes: &[u8]) -> HackHashOutputHashes {
         md5: hex(&Md5::digest(bytes)),
         crc32: crc.finish_hex(),
     }
+}
+
+fn inspect_prepared_output(
+    bytes: &[u8],
+    output_path: &Path,
+) -> Result<HackHashNativeInspection, HackHashPatchApplyError> {
+    let temp_root = tempfile::tempdir().map_err(|error| {
+        HackHashPatchApplyError::Transaction(format!(
+            "native inspection staging directory unavailable: {error}"
+        ))
+    })?;
+    let file_name = output_path.file_name().ok_or_else(|| {
+        HackHashPatchApplyError::Unsafe("output has no filename for native inspection".into())
+    })?;
+    let inspection_path = temp_root.path().join(file_name);
+    fs::write(&inspection_path, bytes).map_err(|error| {
+        HackHashPatchApplyError::Transaction(format!(
+            "native inspection staging write failed: {error}"
+        ))
+    })?;
+    inspect_native_path(&inspection_path)
+}
+
+fn inspect_native_path(path: &Path) -> Result<HackHashNativeInspection, HackHashPatchApplyError> {
+    let trusted_root = path.parent().unwrap_or(path);
+    let hashes =
+        hash_file(path, &TrustedRoots::from_paths([trusted_root]), None).map_err(|error| {
+            HackHashPatchApplyError::Transaction(format!(
+                "native output hash inspection failed: {}",
+                error.detail()
+            ))
+        })?;
+    let report = inspect_catalogued_game_identity(path, None);
+    let evidence = report
+        .evidence
+        .iter()
+        .map(|item| {
+            format!(
+                "{}={:?}:{}",
+                item.kind,
+                item.status,
+                item.value.as_deref().unwrap_or("-")
+            )
+        })
+        .collect::<Vec<_>>();
+    let warnings = report.warnings;
+    let complete = report.complete
+        && !report
+            .evidence
+            .iter()
+            .any(|item| matches!(item.status, IdentityStatus::Invalid));
+    Ok(HackHashNativeInspection {
+        complete,
+        platform: format!("{:?}", report.platform),
+        format: format!("{:?}", report.format),
+        evidence,
+        warnings,
+        hashes: HackHashOutputHashes {
+            sha1: hashes.sha1,
+            md5: hashes.md5,
+            crc32: hashes.crc32,
+        },
+    })
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -460,6 +592,26 @@ mod tests {
             result.shared.journal.status,
             crate::patch_manager::SharedApplyStatus::Success
         );
+        assert_eq!(result.provenance.actual_output, expected);
+        assert_eq!(result.provenance.native_inspection.hashes, expected);
+        assert_eq!(
+            result.provenance.transaction_id,
+            result.shared.journal.operation_id
+        );
+        assert!(result.shared.journal.entries.iter().any(|entry| {
+            matches!(
+                entry.plan_entry.content_verification,
+                Some(
+                    crate::patch_manager::SharedContentVerification::HackHashPatch {
+                        provenance: Some(_),
+                        ..
+                    }
+                )
+            )
+        }));
+        let journal_text =
+            fs::read_to_string(result.shared.journal_path.as_ref().unwrap()).unwrap();
+        assert!(journal_text.contains("provider_snapshot_sha256"));
         assert_eq!(fs::read(&base).unwrap(), base_before);
         assert_eq!(fs::read(&patch).unwrap(), patch_before);
         assert_eq!(hashes(&fs::read(&plan.destination_path).unwrap()), expected);
