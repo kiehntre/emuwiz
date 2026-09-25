@@ -7,15 +7,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 
-use super::mame_arcade_join::ArcadeJoinEvidence;
+use crate::dat::archive::ArchiveMemberSource;
+use crate::safe_read::TrustedRoots;
+
+use super::mame_arcade_join::{ArcadeJoinClass, ArcadeJoinEvidence};
 use super::model::{DatRomEntry, ParsedDat};
 
 /// Durable journal marker used by GUI-v2 and recovery history to distinguish
 /// MAME reconstruction transactions from the other rename-based workflows.
 pub const MAME_RECONSTRUCTION_WORKFLOW: &str = "mame_merged_reconstruction";
+pub const MAX_RECONSTRUCTION_STAGED_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconstructionMemberRequirement {
@@ -146,7 +151,11 @@ pub fn build_merged_reconstruction_plan(
                 .or_default()
                 .push(ReconstructionMemberSource {
                     archive_path: archive_path.clone(),
-                    member_path: archive_path.join(&current_name),
+                    member_path: if archive_path.is_dir() {
+                        archive_path.join(&current_name)
+                    } else {
+                        PathBuf::from(&current_name)
+                    },
                     current_name,
                     target_name: member.name.clone(),
                     observed_sha1: member.observed_sha1.clone(),
@@ -200,14 +209,15 @@ pub fn build_merged_reconstruction_plan(
     if plan.destination.exists() {
         plan.collisions.push(plan.destination.display().to_string());
     }
-    if plan
-        .sources
-        .iter()
-        .any(|source| !source.archive_path.is_dir())
-    {
-        plan.reasons.push(
-            "only extracted source-set directories are supported by this staged writer".into(),
-        );
+    if plan.sources.iter().any(|source| {
+        !source.archive_path.is_dir()
+            && !source
+                .archive_path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    }) {
+        plan.reasons
+            .push("source is neither an extracted set directory nor a ZIP archive".into());
     }
     if !plan.missing_members.is_empty() {
         plan.reasons.push("required ROM members are missing".into());
@@ -233,6 +243,157 @@ pub fn build_merged_reconstruction_plan(
     Ok(plan)
 }
 
+/// Discovers packed set archives whose filename is only used as a bounded
+/// candidate filter.  Every usable member is still selected by its decoded
+/// checksum when the reconstruction plan is built; the ZIP basename never
+/// establishes ROM identity.
+pub fn discover_packed_zip_sources(
+    root: &Path,
+    dat: &ParsedDat,
+    requested_set: &str,
+    dat_sha256: &str,
+) -> Result<Vec<(PathBuf, ArcadeJoinEvidence)>, String> {
+    let selected = dat
+        .games
+        .iter()
+        .find(|game| game.name == requested_set)
+        .ok_or_else(|| {
+            format!("MAME set is absent from the selected catalogue: {requested_set}")
+        })?;
+    let parent = selected
+        .clone_of
+        .as_deref()
+        .unwrap_or(selected.name.as_str());
+    let family = dat
+        .games
+        .iter()
+        .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
+        .map(|game| game.name.clone())
+        .collect::<BTreeSet<_>>();
+    let mut target_names = BTreeMap::new();
+    for game in &dat.games {
+        if family.contains(&game.name) {
+            for rom in game.roms.iter().filter(|rom| !is_non_physical(rom)) {
+                if let Some(identity) = rom_identity(rom) {
+                    target_names
+                        .entry(identity)
+                        .or_insert_with(|| rom.name.clone());
+                }
+            }
+        }
+    }
+    let trusted = crate::safe_read::TrustedRoots::from_paths(std::iter::once(root));
+    let cancel = AtomicBool::new(false);
+    let mut paths = std::fs::read_dir(root)
+        .map_err(|error| format!("scan packed MAME sources: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        })
+        .filter(|path| {
+            path.file_stem()
+                .map(|stem| family.contains(&stem.to_string_lossy().to_ascii_lowercase()))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut discovered = Vec::new();
+    for path in paths {
+        let mut source = crate::dat::archive::zip::ZipArchiveSource::open(
+            &path,
+            &trusted,
+            crate::dat::archive::limits::ArchiveLimits::default(),
+            &cancel,
+        )
+        .map_err(|error| format!("packed MAME source {} refused: {error:?}", path.display()))?;
+        let mut budget = crate::dat::archive::ArchiveRunBudget::new(
+            crate::dat::archive::limits::MAX_ARCHIVE_LOGICAL_BYTES,
+        );
+        let outcome = source.verify_all(&cancel, &mut budget);
+        if !matches!(
+            outcome.completion,
+            crate::dat::archive::ArchivePassCompletion::Complete
+        ) {
+            return Err(format!(
+                "packed MAME source {} changed or could not be fully verified",
+                path.display()
+            ));
+        }
+        if let Some(refused) = outcome.members.iter().find(|member| {
+            !matches!(
+                member.status,
+                crate::dat::archive::ArchiveMemberStatus::HashComplete
+            )
+        }) {
+            return Err(format!(
+                "packed MAME source {} member {} refused: {:?}",
+                path.display(),
+                refused.member_name_display,
+                refused.status
+            ));
+        }
+        let members = outcome
+            .members
+            .into_iter()
+            .filter_map(|member| {
+                let hashes = member.hashes?;
+                if member.member_name_display.is_empty() {
+                    return None;
+                }
+                let identity = evidence_identity(Some(&hashes.sha1), Some(&hashes.crc32))?;
+                let target_name = target_names.get(&identity)?.clone();
+                Some(super::mame_arcade_join::ArcadeMemberEvidence {
+                    name: target_name,
+                    kind: super::mame_arcade_join::MemberEvidenceKind::Present,
+                    current_name: Some(member.member_name_display),
+                    checksum: Some(hashes.sha1.clone()),
+                    observed_sha1: Some(hashes.sha1),
+                    observed_crc32: Some(hashes.crc32),
+                })
+            })
+            .collect::<Vec<_>>();
+        if members.is_empty() {
+            continue;
+        }
+        let set_name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_else(|| parent.to_string());
+        discovered.push((
+            path,
+            ArcadeJoinEvidence {
+                logical_set_name: set_name.clone(),
+                dat_set_name: Some(set_name),
+                class: ArcadeJoinClass::ExactSetMatch,
+                description: None,
+                manufacturer: None,
+                year: None,
+                clone_of: None,
+                rom_of: None,
+                parent_description: None,
+                runnable: Some("yes".into()),
+                mechanical: false,
+                is_bios: false,
+                is_device: false,
+                expected_member_count: members.len(),
+                members,
+                dependencies: Vec::new(),
+                launchable_normal_game: true,
+                dat_version: dat.source.version.clone().unwrap_or_default(),
+                dat_sha256: dat_sha256.to_string(),
+                dat_path: String::new(),
+                audited_at: format!("unix:{}", crate::dat::sources::now_unix()),
+            },
+        ));
+    }
+    Ok(discovered)
+}
+
 /// Writes only a staging ZIP. It never opens a source archive for writing and
 /// never removes or renames a source member. Publication is intentionally a
 /// separate caller action after [`verify_staged_output`].
@@ -247,20 +408,72 @@ pub fn stage_reconstruction_output(
     let staged = staging_root.join(format!("{}.zip.staged", plan.parent));
     let file = std::fs::File::create(&staged).map_err(|e| e.to_string())?;
     let mut writer = zip::ZipWriter::new(file);
-    for source in &plan.sources {
-        let bytes = std::fs::read(&source.member_path).map_err(|e| {
-            format!(
-                "could not read staged source member {}: {e}",
-                source.member_path.display()
+    let mut staged_bytes = 0_u64;
+    let cancel = AtomicBool::new(false);
+    let temp_root = staging_root.join("source-members");
+    for (index, source) in plan.sources.iter().enumerate() {
+        let requirement = plan
+            .required_members
+            .iter()
+            .find(|requirement| requirement.member_name == source.target_name)
+            .ok_or_else(|| {
+                format!(
+                    "source has no reviewed requirement for {}",
+                    source.target_name
+                )
+            })?;
+        let member_size = requirement
+            .size_bytes
+            .unwrap_or(MAX_RECONSTRUCTION_STAGED_BYTES.saturating_add(1));
+        staged_bytes = staged_bytes
+            .checked_add(member_size)
+            .ok_or_else(|| "reconstruction staged-byte bound overflowed".to_string())?;
+        if staged_bytes > MAX_RECONSTRUCTION_STAGED_BYTES {
+            return Err(format!(
+                "reconstruction staged-byte bound exceeded ({MAX_RECONSTRUCTION_STAGED_BYTES} bytes)"
+            ));
+        }
+        let mut temporary_source = None;
+        let source_file = if source.archive_path.is_dir() {
+            std::fs::File::open(&source.member_path).map_err(|e| {
+                format!(
+                    "could not read staged source member {}: {e}",
+                    source.member_path.display()
+                )
+            })?
+        } else {
+            let temporary = temp_root.join(format!("{index}.member"));
+            let trusted = TrustedRoots::from_paths(source.archive_path.parent().into_iter());
+            let requirement_request = crate::dat::archive::zip::ZipMemberRequest {
+                member_name: Some(source.current_name.clone()),
+                size_bytes: requirement.size_bytes,
+                sha1: requirement.sha1.clone(),
+                crc32: requirement.crc32.clone(),
+            };
+            crate::dat::archive::zip::copy_zip_member_to(
+                &source.archive_path,
+                &trusted,
+                &crate::dat::archive::limits::ArchiveLimits::default(),
+                &cancel,
+                &requirement_request,
+                &temporary,
             )
-        })?;
+            .map_err(|error| format!("ZIP member {} refused: {error}", source.current_name))?;
+            temporary_source = Some(temporary);
+            std::fs::File::open(temporary_source.as_ref().unwrap()).map_err(|e| e.to_string())?
+        };
         writer
             .start_file(
                 &source.target_name,
                 zip::write::SimpleFileOptions::default(),
             )
             .map_err(|e| e.to_string())?;
-        std::io::Write::write_all(&mut writer, &bytes).map_err(|e| e.to_string())?;
+        let mut source_file = source_file;
+        std::io::copy(&mut source_file, &mut writer).map_err(|e| e.to_string())?;
+        drop(source_file);
+        if let Some(temporary) = temporary_source {
+            let _ = std::fs::remove_file(temporary);
+        }
     }
     writer.finish().map_err(|e| e.to_string())?;
     verify_staged_output(plan, &staged)?;
@@ -634,9 +847,9 @@ mod tests {
     #[test]
     fn staged_publish_journals_the_output_and_leaves_source_member_untouched() {
         use crate::dat::rename_apply::journal::list_journals;
-        use sha1::{Digest, Sha1};
+        use sha1::Digest;
 
-        let digest = Sha1::digest(b"mame member")
+        let digest = sha1::Sha1::digest(b"mame member")
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
@@ -687,6 +900,35 @@ mod tests {
         assert!(error.contains("staged SHA-1 mismatch"));
         assert!(!plan.destination.exists());
         assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn packed_zip_member_is_staged_without_modifying_the_source_archive() {
+        use sha1::Digest;
+        use zip::write::SimpleFileOptions;
+
+        let digest = sha1::Sha1::digest(b"mame member")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (mut plan, root, _loose_member) = publish_fixture(&digest);
+        let packed = root.join("parent.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&packed).unwrap());
+        writer
+            .start_file("member.bin", SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"mame member").unwrap();
+        writer.finish().unwrap();
+        let before = std::fs::read(&packed).unwrap();
+        plan.sources[0].archive_path = packed.clone();
+        plan.sources[0].member_path = PathBuf::from("member.bin");
+        plan.sources[0].current_name = "member.bin".into();
+        let staging = root.join("staging");
+        let staged = stage_reconstruction_output(&plan, &staging).unwrap();
+        verify_staged_output(&plan, &staged).unwrap();
+        assert_eq!(std::fs::read(&packed).unwrap(), before);
+        assert!(!root.join("member.bin").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 }

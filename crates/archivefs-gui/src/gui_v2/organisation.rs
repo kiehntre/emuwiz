@@ -21,7 +21,7 @@ use archivefs_core::dat::mame_arcade_join::{
 };
 use archivefs_core::dat::mame_merged_reconstruction::{
     MAME_RECONSTRUCTION_WORKFLOW, MameMergedReconstructionPlan, apply_staged_reconstruction_output,
-    build_merged_reconstruction_plan,
+    build_merged_reconstruction_plan, discover_packed_zip_sources,
 };
 use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionState};
 use archivefs_core::dat::rename_apply::{
@@ -397,12 +397,33 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
         }
         ui.collapsing("Verified ownership", |ui| {
             for source in &plan.sources {
+                let evidence = plan
+                    .required_members
+                    .iter()
+                    .find(|requirement| requirement.member_name == source.target_name);
+                let kind = if source.archive_path.is_file()
+                    || source
+                        .archive_path
+                        .extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+                {
+                    "ZIP member"
+                } else {
+                    "source member"
+                };
                 ui.label(format!(
-                    "{} ← {}::{}",
+                    "{} ← {kind} {}::{}",
                     source.target_name,
                     source.archive_path.display(),
                     source.current_name
                 ));
+                if let Some(evidence) = evidence {
+                    ui.small(format!(
+                        "checksum evidence: SHA-1 {} · CRC32 {}",
+                        evidence.sha1.as_deref().unwrap_or("not recorded"),
+                        evidence.crc32.as_deref().unwrap_or("not recorded")
+                    ));
+                }
             }
         });
         if plan.ready_to_apply {
@@ -510,9 +531,15 @@ fn current_mame_reconstruction_plan(
         .collect::<String>();
     let database_path = default_database_path().map_err(|e| e.to_string())?;
     let database = Database::open_read_only(&database_path).map_err(|e| e.to_string())?;
-    let joins = database
+    let mut joins = database
         .mame_arcade_join_paths_for_dat(&dat_sha256)
         .map_err(|e| e.to_string())?;
+    joins.extend(discover_packed_zip_sources(
+        root,
+        &dat.parsed,
+        requested_set,
+        &dat_sha256,
+    )?);
     if joins.is_empty() {
         return Err(
             "no persisted verified MAME evidence is available; refresh this family first".into(),

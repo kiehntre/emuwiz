@@ -6,7 +6,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::limits::ArchiveLimits;
+use super::limits::{ArchiveLimits, MAX_ZIP_MEMBER_NAME_BYTES};
 
 const EOCD_SIGNATURE: u32 = 0x0605_4b50;
 const ZIP64_EOCD_SIGNATURE: u32 = 0x0606_4b50;
@@ -142,6 +142,9 @@ pub fn preflight_zip<R: Read + Seek>(
         let logical_32 = le_u32(&fixed[24..28]);
         let crc32 = le_u32(&fixed[16..20]);
         let name_len = usize::from(le_u16(&fixed[28..30]));
+        if name_len > MAX_ZIP_MEMBER_NAME_BYTES {
+            return Err(ZipPreflightError::Refused("member name length"));
+        }
         let extra_len = usize::from(le_u16(&fixed[30..32]));
         let comment_len = usize::from(le_u16(&fixed[32..34]));
         let disk_start_16 = le_u16(&fixed[34..36]);

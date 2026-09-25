@@ -10,7 +10,9 @@ use zip::ZipArchive;
 use crate::safe_read::{TrustedRoots, open_bounded_read};
 
 use super::hash::{MemberStreamError, hash_member_stream};
-use super::limits::ArchiveLimits;
+use super::limits::{
+    ARCHIVE_HASH_CHUNK_BYTES, ArchiveLimits, MAX_ZIP_ARCHIVE_BYTES, MAX_ZIP_MEMBER_NAME_BYTES,
+};
 use super::zip_preflight::{ZipPreflightError, ZipPreflightInfo, preflight_zip};
 use super::{
     ArchiveMemberEvidence, ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
@@ -91,6 +93,11 @@ impl ZipArchiveSource {
                 detail: format!("read policy refused the ZIP: {error:?}"),
             })?;
         let len = safe.len();
+        if len > MAX_ZIP_ARCHIVE_BYTES {
+            return Err(ArchiveMemberSourceError::RefusedLimits {
+                reason: "ZIP archive size",
+            });
+        }
         let mut file = safe.into_file();
         let identity = OuterIdentity::from_metadata(&file.metadata().map_err(|error| {
             ArchiveMemberSourceError::Open {
@@ -383,6 +390,285 @@ pub enum ZipExtractError {
     Refused(&'static str),
     Corrupt(String),
     Cancelled,
+}
+
+/// Evidence used to select one decoded ZIP member.  At least one checksum is
+/// required; a filename is only a secondary narrowing hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipMemberRequest {
+    pub member_name: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub sha1: Option<String>,
+    pub crc32: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZipMemberCopy {
+    pub member_name: String,
+    pub size_bytes: u64,
+    pub sha1: String,
+    pub crc32: String,
+}
+
+/// Typed refusal from the reconstruction-specific ZIP member reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZipMemberError {
+    Missing,
+    Ambiguous,
+    BadChecksum,
+    Encrypted,
+    UnsupportedCompression { method: u16 },
+    Malformed(String),
+    BoundsExceeded(&'static str),
+    UnsafeMemberName,
+    SourceChanged,
+    Open(String),
+    Cancelled,
+}
+
+impl std::fmt::Display for ZipMemberError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(formatter, "ZIP member is missing"),
+            Self::Ambiguous => write!(formatter, "ZIP member identity is ambiguous"),
+            Self::BadChecksum => write!(formatter, "ZIP member checksum disagrees with evidence"),
+            Self::Encrypted => write!(formatter, "ZIP member is encrypted"),
+            Self::UnsupportedCompression { method } => {
+                write!(formatter, "ZIP compression method {method} is unsupported")
+            }
+            Self::Malformed(detail) => write!(formatter, "ZIP structure is malformed: {detail}"),
+            Self::BoundsExceeded(reason) => {
+                write!(formatter, "ZIP safety bound exceeded: {reason}")
+            }
+            Self::UnsafeMemberName => write!(formatter, "ZIP member name is unsafe"),
+            Self::SourceChanged => write!(formatter, "source ZIP changed during staging"),
+            Self::Open(detail) => write!(formatter, "could not stage ZIP member: {detail}"),
+            Self::Cancelled => write!(formatter, "ZIP member staging was cancelled"),
+        }
+    }
+}
+
+/// Finds and streams exactly one evidence-backed member into `destination`.
+/// The source is opened read-only, decoded in bounded chunks, and checked
+/// again after the copy so a concurrent source replacement cannot be used.
+pub fn copy_zip_member_to(
+    path: &Path,
+    trusted: &TrustedRoots,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+    request: &ZipMemberRequest,
+    destination: &Path,
+) -> Result<ZipMemberCopy, ZipMemberError> {
+    if request.sha1.is_none() && request.crc32.is_none() {
+        return Err(ZipMemberError::BadChecksum);
+    }
+    let mut source =
+        ZipArchiveSource::open(path, trusted, *limits, cancel).map_err(|error| match error {
+            ArchiveMemberSourceError::Cancelled => ZipMemberError::Cancelled,
+            ArchiveMemberSourceError::Encrypted => ZipMemberError::Encrypted,
+            ArchiveMemberSourceError::Unsupported { detail } => ZipMemberError::Malformed(detail),
+            ArchiveMemberSourceError::RefusedLimits { reason } => {
+                ZipMemberError::BoundsExceeded(reason)
+            }
+            ArchiveMemberSourceError::Corrupt { detail } => ZipMemberError::Malformed(detail),
+            ArchiveMemberSourceError::Open { detail } => ZipMemberError::Open(detail),
+        })?;
+
+    let mut matches = Vec::new();
+    let mut identity_candidate_seen = false;
+    for entry in &source.preflight.entries {
+        let name =
+            std::str::from_utf8(&entry.name_raw).map_err(|_| ZipMemberError::UnsafeMemberName)?;
+        if name.len() > MAX_ZIP_MEMBER_NAME_BYTES || unsafe_member_name(name) {
+            return Err(ZipMemberError::UnsafeMemberName);
+        }
+        if entry.is_directory {
+            continue;
+        }
+        if entry.flags & ((1 << 0) | (1 << 6) | (1 << 13)) != 0 {
+            return Err(ZipMemberError::Encrypted);
+        }
+        if entry.flags & ((1 << 4) | (1 << 5)) != 0 {
+            return Err(ZipMemberError::UnsupportedCompression {
+                method: entry.method,
+            });
+        }
+        if !matches!(entry.method, 0 | 8) {
+            return Err(ZipMemberError::UnsupportedCompression {
+                method: entry.method,
+            });
+        }
+        if request
+            .size_bytes
+            .is_some_and(|size| size != entry.logical_size)
+        {
+            continue;
+        }
+        if request
+            .member_name
+            .as_deref()
+            .is_some_and(|wanted| wanted.eq_ignore_ascii_case(name))
+            || request
+                .size_bytes
+                .is_some_and(|size| size == entry.logical_size)
+        {
+            identity_candidate_seen = true;
+        }
+        if entry.logical_size > limits.max_member_logical_bytes {
+            return Err(ZipMemberError::BoundsExceeded("member size"));
+        }
+        if ratio_exceeded(
+            entry.logical_size,
+            entry.compressed_size,
+            limits.max_compression_ratio,
+        ) {
+            return Err(ZipMemberError::BoundsExceeded("compression ratio"));
+        }
+        let hashed = decode_hash_entry(&mut source.file, entry, limits, cancel)?;
+        let sha1 = hashed.0;
+        let crc32 = hashed.1;
+        let sha_matches = request
+            .sha1
+            .as_deref()
+            .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha1));
+        let crc_matches = request
+            .crc32
+            .as_deref()
+            .is_some_and(|expected| expected.eq_ignore_ascii_case(&crc32));
+        if sha_matches || crc_matches {
+            matches.push((entry.clone(), name.to_string(), sha1, crc32));
+        }
+    }
+    if matches.is_empty() {
+        return Err(if identity_candidate_seen {
+            ZipMemberError::BadChecksum
+        } else {
+            ZipMemberError::Missing
+        });
+    }
+    if matches.len() != 1 {
+        return Err(ZipMemberError::Ambiguous);
+    }
+    let (entry, member_name, sha1, crc32) = matches.pop().unwrap();
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| ZipMemberError::Open(error.to_string()))?;
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| ZipMemberError::Open(error.to_string()))?;
+    let (staged_sha1, staged_crc32) =
+        decode_entry_to(&mut source.file, &entry, limits, cancel, &mut output)?;
+    if staged_sha1 != sha1 || staged_crc32 != crc32 {
+        return Err(ZipMemberError::BadChecksum);
+    }
+    output
+        .sync_all()
+        .map_err(|error| ZipMemberError::Open(error.to_string()))?;
+    if !source.outer_identity_unchanged() {
+        return Err(ZipMemberError::SourceChanged);
+    }
+    Ok(ZipMemberCopy {
+        member_name,
+        size_bytes: entry.logical_size,
+        sha1: staged_sha1,
+        crc32: staged_crc32,
+    })
+}
+
+fn unsafe_member_name(name: &str) -> bool {
+    let path = Path::new(name);
+    path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+}
+
+fn decode_hash_entry(
+    file: &mut File,
+    entry: &super::zip_preflight::ZipPreflightEntry,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+) -> Result<(String, String), ZipMemberError> {
+    file.seek(std::io::SeekFrom::Start(entry.data_start))
+        .map_err(|error| ZipMemberError::Malformed(error.to_string()))?;
+    let packed = file.take(entry.compressed_size);
+    let hashed = if entry.method == 0 {
+        hash_member_stream(packed, entry.logical_size, cancel)
+    } else {
+        let decoder = flate2::read::DeflateDecoder::new(packed);
+        hash_member_stream(decoder, entry.logical_size, cancel)
+    }
+    .map_err(|error| match error {
+        MemberStreamError::Cancelled => ZipMemberError::Cancelled,
+        MemberStreamError::TooLarge { .. } => ZipMemberError::BoundsExceeded("member size"),
+        MemberStreamError::Io(detail) => ZipMemberError::Malformed(detail),
+    })?;
+    if hashed.bytes_read != entry.logical_size
+        || hashed.hashes.crc32 != format!("{:08x}", entry.crc32)
+    {
+        return Err(ZipMemberError::BadChecksum);
+    }
+    let _ = limits;
+    Ok((hashed.hashes.sha1, hashed.hashes.crc32))
+}
+
+fn decode_entry_to(
+    file: &mut File,
+    entry: &super::zip_preflight::ZipPreflightEntry,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+    output: &mut File,
+) -> Result<(String, String), ZipMemberError> {
+    use sha1::Digest;
+
+    file.seek(std::io::SeekFrom::Start(entry.data_start))
+        .map_err(|error| ZipMemberError::Malformed(error.to_string()))?;
+    let packed = file.take(entry.compressed_size);
+    let reader: Box<dyn Read> = if entry.method == 0 {
+        Box::new(packed)
+    } else {
+        Box::new(flate2::read::DeflateDecoder::new(packed))
+    };
+    let mut reader = reader;
+    let mut buffer = vec![0_u8; ARCHIVE_HASH_CHUNK_BYTES];
+    let mut total = 0_u64;
+    let mut crc = crate::identity_source::hashing::Crc32::new();
+    let mut sha1 = sha1::Sha1::new();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ZipMemberError::Cancelled);
+        }
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| ZipMemberError::Malformed(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > limits.max_member_logical_bytes {
+            return Err(ZipMemberError::BoundsExceeded("member size"));
+        }
+        crc.update(&buffer[..read]);
+        sha1.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| ZipMemberError::Open(error.to_string()))?;
+    }
+    let crc32 = crc.finish();
+    if total != entry.logical_size || crc32 != entry.crc32 {
+        return Err(ZipMemberError::BadChecksum);
+    }
+    let sha1 = sha1
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok((sha1, format!("{crc32:08x}")))
 }
 
 /// One safely materialised ZIP member.  The path is relative to the caller's
@@ -1470,5 +1756,238 @@ mod tests {
         let before = bytes(&path);
         let _ = extract_sole_zip_member(&path, &ArchiveLimits::default(), &AtomicBool::new(false));
         assert_eq!(bytes(&path), before);
+    }
+
+    #[test]
+    fn targeted_member_copy_matches_decoded_checksum_and_preserves_source() {
+        use sha1::Digest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("packed.zip");
+        write_zip(
+            &path,
+            &[
+                ("other.bin", b"other", CompressionMethod::Stored),
+                ("actual.bin", b"payload", CompressionMethod::Deflated),
+            ],
+        );
+        let before = bytes(&path);
+        let before_metadata = std::fs::metadata(&path).unwrap();
+        let digest = sha1::Sha1::digest(b"payload")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let destination = dir.path().join("staging/member.bin");
+        let copied = copy_zip_member_to(
+            &path,
+            &trusted(dir.path()),
+            &ArchiveLimits::default(),
+            &AtomicBool::new(false),
+            &ZipMemberRequest {
+                member_name: Some("expected-name.bin".into()),
+                size_bytes: Some(7),
+                sha1: Some(digest.clone()),
+                crc32: None,
+            },
+            &destination,
+        )
+        .unwrap();
+        assert_eq!(copied.member_name, "actual.bin");
+        assert_eq!(copied.sha1, digest);
+        assert_eq!(bytes(&destination), b"payload");
+        assert_eq!(bytes(&path), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            before_metadata.len()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before_metadata.modified().unwrap()
+        );
+        assert!(!dir.path().join("actual.bin").exists());
+    }
+
+    #[test]
+    fn targeted_member_copy_refuses_ambiguous_checksum_and_bad_checksum() {
+        use sha1::Digest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ambiguous.zip");
+        write_zip(
+            &path,
+            &[
+                ("one.bin", b"same", CompressionMethod::Stored),
+                ("two.bin", b"same", CompressionMethod::Stored),
+            ],
+        );
+        let digest = sha1::Sha1::digest(b"same")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let request = ZipMemberRequest {
+            member_name: None,
+            size_bytes: Some(4),
+            sha1: Some(digest),
+            crc32: None,
+        };
+        assert_eq!(
+            copy_zip_member_to(
+                &path,
+                &trusted(dir.path()),
+                &ArchiveLimits::default(),
+                &AtomicBool::new(false),
+                &request,
+                &dir.path().join("ambiguous.member"),
+            )
+            .unwrap_err(),
+            ZipMemberError::Ambiguous
+        );
+        let bad = ZipMemberRequest {
+            member_name: Some("one.bin".into()),
+            size_bytes: Some(4),
+            sha1: Some("0".repeat(40)),
+            crc32: None,
+        };
+        assert_eq!(
+            copy_zip_member_to(
+                &path,
+                &trusted(dir.path()),
+                &ArchiveLimits::default(),
+                &AtomicBool::new(false),
+                &bad,
+                &dir.path().join("bad.member"),
+            )
+            .unwrap_err(),
+            ZipMemberError::BadChecksum
+        );
+    }
+
+    #[test]
+    fn targeted_member_copy_refuses_unsafe_encrypted_and_bomb_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let traversal = dir.path().join("traversal.zip");
+        write_zip(
+            &traversal,
+            &[("../escape.bin", b"payload", CompressionMethod::Stored)],
+        );
+        let error = copy_zip_member_to(
+            &traversal,
+            &trusted(dir.path()),
+            &ArchiveLimits::default(),
+            &AtomicBool::new(false),
+            &ZipMemberRequest {
+                member_name: None,
+                size_bytes: Some(7),
+                sha1: Some("0".repeat(40)),
+                crc32: None,
+            },
+            &dir.path().join("staging/member"),
+        )
+        .unwrap_err();
+        assert_eq!(error, ZipMemberError::UnsafeMemberName);
+
+        let encrypted = dir.path().join("encrypted.zip");
+        let mut writer = ZipWriter::new(File::create(&encrypted).unwrap());
+        writer
+            .start_file(
+                "member.bin",
+                SimpleFileOptions::default().with_aes_encryption(AesMode::Aes256, "secret"),
+            )
+            .unwrap();
+        writer.write_all(b"payload").unwrap();
+        writer.finish().unwrap();
+        let encrypted_error = copy_zip_member_to(
+            &encrypted,
+            &trusted(dir.path()),
+            &ArchiveLimits::default(),
+            &AtomicBool::new(false),
+            &ZipMemberRequest {
+                member_name: Some("member.bin".into()),
+                size_bytes: Some(7),
+                sha1: Some("0".repeat(40)),
+                crc32: None,
+            },
+            &dir.path().join("staging/encrypted"),
+        )
+        .unwrap_err();
+        assert_eq!(encrypted_error, ZipMemberError::Encrypted);
+
+        let bomb = dir.path().join("bomb.zip");
+        write_zip(
+            &bomb,
+            &[("member.bin", &[0_u8; 100], CompressionMethod::Deflated)],
+        );
+        let bomb_error = copy_zip_member_to(
+            &bomb,
+            &trusted(dir.path()),
+            &ArchiveLimits {
+                max_compression_ratio: 1,
+                ..ArchiveLimits::default()
+            },
+            &AtomicBool::new(false),
+            &ZipMemberRequest {
+                member_name: Some("member.bin".into()),
+                size_bytes: Some(100),
+                sha1: Some("0".repeat(40)),
+                crc32: None,
+            },
+            &dir.path().join("staging/bomb"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            bomb_error,
+            ZipMemberError::BoundsExceeded("compression ratio")
+        );
+    }
+
+    #[test]
+    fn targeted_member_copy_handles_multiple_members_and_source_archives() {
+        use sha1::Digest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.zip");
+        let second = dir.path().join("second.zip");
+        write_zip(
+            &first,
+            &[
+                ("one.bin", b"one", CompressionMethod::Stored),
+                ("two.bin", b"two", CompressionMethod::Deflated),
+            ],
+        );
+        write_zip(
+            &second,
+            &[("three.bin", b"three", CompressionMethod::Stored)],
+        );
+        let copy = |archive: &Path, name: &str, content: &[u8], destination: &Path| {
+            let digest = sha1::Sha1::digest(content)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            copy_zip_member_to(
+                archive,
+                &trusted(dir.path()),
+                &ArchiveLimits::default(),
+                &AtomicBool::new(false),
+                &ZipMemberRequest {
+                    member_name: Some(name.into()),
+                    size_bytes: Some(content.len() as u64),
+                    sha1: Some(digest),
+                    crc32: None,
+                },
+                destination,
+            )
+            .unwrap();
+        };
+        copy(&first, "one.bin", b"one", &dir.path().join("stage/one.bin"));
+        copy(&first, "two.bin", b"two", &dir.path().join("stage/two.bin"));
+        copy(
+            &second,
+            "three.bin",
+            b"three",
+            &dir.path().join("stage/three.bin"),
+        );
+        assert_eq!(bytes(&dir.path().join("stage/one.bin")), b"one");
+        assert_eq!(bytes(&dir.path().join("stage/two.bin")), b"two");
+        assert_eq!(bytes(&dir.path().join("stage/three.bin")), b"three");
     }
 }

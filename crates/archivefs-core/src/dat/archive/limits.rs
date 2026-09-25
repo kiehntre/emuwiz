@@ -72,6 +72,12 @@ pub const MAX_7Z_HEADER_BYTES: usize = 16 * 1024 * 1024;
 /// Largest ZIP central directory accepted before `ZipArchive::new`.
 pub const MAX_ZIP_CENTRAL_DIRECTORY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Largest outer ZIP file accepted by the targeted reconstruction reader.
+pub const MAX_ZIP_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Largest UTF-8 member name accepted by targeted ZIP readers.
+pub const MAX_ZIP_MEMBER_NAME_BYTES: usize = 4096;
+
 /// Largest single coder-properties blob the pre-decoder probe will accept.
 ///
 /// NEW. Coder properties (LZMA/LZMA2 dictionary declarations live inside
