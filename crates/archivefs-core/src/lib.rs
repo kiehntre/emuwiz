@@ -395,6 +395,9 @@ pub mod saturn_boot_evidence;
 pub mod saturn_disc_manifest;
 /// Read-only, fail-closed Saturn patch compatibility and impact preview.
 pub mod saturn_patch_readiness;
+/// Read-only comparison proof for a future deterministic Saturn data-track
+/// rebuild. This module contains no builder or apply operation.
+pub mod saturn_rebuild_proof;
 
 /// Pure, read-only Sega CD/Mega-CD boot-signature evidence
 /// (`SEGADISCSYSTEM` only - see the module documentation for scope limits).
