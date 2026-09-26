@@ -638,6 +638,10 @@ pub mod emulator_environment;
 /// see [`archivefs_core::launch`]'s own doc comment for the exact
 /// boundary.
 pub mod launch;
+/// Read-only verified WUD/WUX conversion planning.
+pub mod wiiu_conversion;
+/// Bounded, read-only Wii U WUD/WUX container inspection.
+pub mod wiiu_disc;
 
 /// Read-only persistence of already-verified [`game_identity`] facts as a
 /// catalogue-side cache / user-visible projection. Never a trust anchor:
