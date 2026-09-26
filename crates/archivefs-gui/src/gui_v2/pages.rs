@@ -1844,6 +1844,7 @@ impl App {
                 }
             });
             self.save_backups_panel(ui, game);
+            self.documents_panel(ui, id, game);
         });
     }
 
@@ -1869,7 +1870,6 @@ impl App {
                 ui.label("EmuWiz will require the emulator to be closed before snapshot or restore work.");
             });
         });
-        self.documents_panel(ui, id, game);
     }
 
     fn documents_panel(&mut self, ui: &mut egui::Ui, game_id: i64, game: &Game) {
