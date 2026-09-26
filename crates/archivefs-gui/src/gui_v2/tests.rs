@@ -136,6 +136,50 @@ fn gui_v2_romm_browser_has_explicit_empty_failure_state() {
 }
 
 #[test]
+fn gui_v2_mame_health_shows_internal_repair_preview_without_apply() {
+    let context = egui::Context::default();
+    let plan = archivefs_core::mame_internal_repair::MameInternalRepairPlan {
+        schema_version: 1,
+        collection_root: "/roms".into(),
+        catalogue_version: Some("0.264".into()),
+        sets_currently_failing: 3,
+        affected_sets: vec!["pacman".into()],
+        requirements: Vec::new(),
+        safe_internal_repair_count: 4,
+        no_download_needed_count: 4,
+        genuinely_absent_count: 2,
+        preservation_only_no_dump_count: 1,
+        bad_dump_count: 1,
+        ambiguous_count: 1,
+        wrong_content_same_name_count: 1,
+        unique_source_identities_needed: 3,
+        filesystem_operations_required: 4,
+        projected_sets_repairable: 2,
+        top_repairs_by_impact: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let output = context.run(Default::default(), |context| {
+        egui::CentralPanel::default().show(context, |ui| {
+            super::mame_collection_health::show_with_plans(ui, None, Some(&plan));
+        });
+    });
+    let strings = text(&output);
+    for expected in [
+        "Repair from your own collection",
+        "Exact matches already available",
+        "Genuinely absent",
+        "Preservation-only / NO_DUMP",
+        "Present but BAD_DUMP",
+        "No Apply button is available: this feature is read-only.",
+    ] {
+        assert!(
+            strings.iter().any(|value| value == expected),
+            "missing MAME repair UI text: {expected}"
+        );
+    }
+}
+
+#[test]
 fn artwork_route_exposes_local_first_bezel_preview() {
     let context = egui::Context::default();
     let mut app = fixture(&context);

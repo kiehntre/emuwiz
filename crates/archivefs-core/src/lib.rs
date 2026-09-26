@@ -74,6 +74,9 @@ pub mod mame_collection_analyser;
 pub mod mame_collection_stats;
 /// Conservative static input requirements projected from MAME metadata.
 pub mod mame_input_requirements;
+/// Read-only planning for repairing MAME sets from exact bytes already present
+/// elsewhere in the same collection.
+pub mod mame_internal_repair;
 /// Read-only MAME family curation and playing-library projection.
 pub mod mame_playing_library;
 pub mod managed_appimage_bootstrap;

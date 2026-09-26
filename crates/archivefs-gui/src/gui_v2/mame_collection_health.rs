@@ -1,10 +1,11 @@
 //! Read-only MAME collection health presentation.
 
+use archivefs_core::mame_internal_repair::MameInternalRepairPlan;
 use archivefs_core::mame_playing_library::MamePlayingLibraryPlan;
 use eframe::egui;
 
 pub(super) fn show(ui: &mut egui::Ui) {
-    show_with_playing_library_plan(ui, None);
+    show_with_plans(ui, None, None);
 }
 
 /// Renders the read-only MAME playing-library projection when an inspection
@@ -14,8 +15,16 @@ pub(super) fn show_with_playing_library_plan(
     ui: &mut egui::Ui,
     plan: Option<&MamePlayingLibraryPlan>,
 ) {
+    show_with_plans(ui, plan, None);
+}
+
+pub(super) fn show_with_plans(
+    ui: &mut egui::Ui,
+    plan: Option<&MamePlayingLibraryPlan>,
+    repair_plan: Option<&MameInternalRepairPlan>,
+) {
     egui::CollapsingHeader::new("MAME Collection Health")
-        .default_open(false)
+        .default_open(true)
         .show(ui, |ui| {
             ui.label("Inspect a collection against a supplied current MAME -listxml catalogue.");
             ui.label("This page is analysis-only: EmuWiz does not rename, rebuild, download, or mutate ROMs.");
@@ -60,6 +69,30 @@ pub(super) fn show_with_playing_library_plan(
             } else {
                 ui.label("Load a MAME catalogue and complete collection report to preview selected sets, storage, savings, exclusions, dependencies, and ambiguities.");
                 ui.label("No apply, copy, delete, rename, or source-update action is available here.");
+            }
+            ui.separator();
+            ui.strong("Repair from your own collection");
+            ui.label("Preview only: exact SHA-1 evidence can identify bytes already present elsewhere; EmuWiz does not copy, move, link, or rename ROMs here.");
+            if let Some(repair) = repair_plan {
+                egui::Grid::new("mame_internal_repair_preview")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Exact matches already available"); ui.label(repair.safe_internal_repair_count.to_string()); ui.end_row();
+                        ui.label("Affected sets"); ui.label(repair.affected_sets.len().to_string()); ui.end_row();
+                        ui.label("Projected sets repaired"); ui.label(repair.projected_sets_repairable.to_string()); ui.end_row();
+                        ui.label("No-download-needed"); ui.label(repair.no_download_needed_count.to_string()); ui.end_row();
+                        ui.label("Genuinely absent"); ui.label(repair.genuinely_absent_count.to_string()); ui.end_row();
+                        ui.label("Preservation-only / NO_DUMP"); ui.label(repair.preservation_only_no_dump_count.to_string()); ui.end_row();
+                        ui.label("Present but BAD_DUMP"); ui.label(repair.bad_dump_count.to_string()); ui.end_row();
+                        ui.label("Ambiguous"); ui.label(repair.ambiguous_count.to_string()); ui.end_row();
+                });
+                ui.label(format!("{} unique source identities · {} preview operation(s) · {} same-name content mismatch(es)", repair.unique_source_identities_needed, repair.filesystem_operations_required, repair.wrong_content_same_name_count));
+                ui.label("Source selection is deterministic and preserves duplicate copies as visible evidence.");
+                ui.label("No Apply button is available: this feature is read-only.");
+            } else {
+                ui.label("Load a MAME catalogue and complete collection report to preview exact internal repair matches, absent identities, preservation gaps, and ambiguities.");
+                ui.label("No Apply button is available: this feature is read-only.");
             }
         });
 }
