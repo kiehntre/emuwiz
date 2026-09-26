@@ -19,7 +19,8 @@
 //! emitted game keeps `unsupported_structure = true` and set classification remains
 //! fail-closed for all ClrMamePro inputs.
 
-use std::fs;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use super::super::classification::{DatContentClassification, DatOriginalMetadata};
@@ -45,60 +46,22 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         });
     }
 
-    let bytes = fs::read(path).map_err(|error| ParseError::Io {
+    let file = File::open(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
     })?;
-    // ClrMamePro DATs are line-oriented legacy catalogue files.  Real-world
-    // preservation catalogues sometimes retain Windows-1252 game titles
-    // (for example `ü`) while their checksum syntax remains ASCII.  Keep
-    // UTF-8 as the normal path, but decode this format's legacy text
-    // deterministically rather than rejecting an otherwise valid catalogue.
-    // Logiqx/XML is intentionally not relaxed here.
-    let (content, decoded_windows_1252) = match String::from_utf8(bytes) {
-        Ok(content) => (content, false),
-        Err(error) => {
-            let bytes = error.into_bytes();
-            let (decoded, _, _) = WINDOWS_1252.decode(&bytes);
-            (decoded.into_owned(), true)
-        }
-    };
-
-    let lines: Vec<&str> = content.lines().collect();
+    // ClrMamePro DATs are line-oriented legacy catalogue files. Read one line
+    // at a time so input size does not create a second whole-file allocation
+    // before the typed catalogue model is built. Real-world preservation
+    // catalogues sometimes retain Windows-1252 titles; decode each line with
+    // the same deterministic fallback used by the former whole-file path.
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
 
     let mut warnings: Vec<ParseWarning> = Vec::new();
-    if decoded_windows_1252 {
-        warnings.push(ParseWarning {
-            byte_offset: None,
-            line: None,
-            column: None,
-            context: String::new(),
-            message: "decoded non-UTF-8 ClrMamePro text as Windows-1252".to_string(),
-            severity: DiagnosticSeverity::Warning,
-            code: "legacy_windows_1252",
-        });
-    }
-    let push_warning = |warnings: &mut Vec<ParseWarning>, offset: usize, msg: &str| {
-        if warnings.len() < limits.max_warnings {
-            let line_num = lines
-                .iter()
-                .enumerate()
-                .rfind(|(_, l)| {
-                    let line_start = l.as_ptr() as usize - content.as_ptr() as usize;
-                    line_start <= offset
-                })
-                .map(|(i, _)| i + 1);
-            warnings.push(ParseWarning {
-                byte_offset: Some(offset),
-                line: line_num,
-                column: None,
-                context: String::new(),
-                message: msg.to_string(),
-                severity: DiagnosticSeverity::Warning,
-                code: "description_truncated",
-            });
-        }
-    };
+    let mut raw_line = Vec::new();
+    let mut byte_offset = 0usize;
+    let mut line_number = 0usize;
+    let mut legacy_warning_recorded = false;
 
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
@@ -127,13 +90,55 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut current_rom_fidelity = CurrentRomFidelity::default();
     let mut current_roms: Vec<DatRomEntry> = Vec::new();
 
-    for line in &lines {
+    loop {
+        raw_line.clear();
+        let read = read_bounded_line(
+            &mut reader,
+            &mut raw_line,
+            limits
+                .max_identifier_length
+                .saturating_add(limits.max_description_length)
+                .saturating_add(16 * 1024),
+            path,
+        )?;
+        if read == 0 {
+            break;
+        }
+        line_number += 1;
+        let line_offset = byte_offset;
+        byte_offset = byte_offset.saturating_add(read);
+        while raw_line
+            .last()
+            .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+        {
+            raw_line.pop();
+        }
+        let (line, decoded_windows_1252) = match String::from_utf8(raw_line.clone()) {
+            Ok(line) => (line, false),
+            Err(error) => {
+                let bytes = error.into_bytes();
+                let (decoded, _, _) = WINDOWS_1252.decode(&bytes);
+                (decoded.into_owned(), true)
+            }
+        };
+        if decoded_windows_1252 && !legacy_warning_recorded {
+            if warnings.len() < limits.max_warnings {
+                warnings.push(ParseWarning {
+                    byte_offset: Some(line_offset),
+                    line: Some(line_number),
+                    column: None,
+                    context: String::new(),
+                    message: "decoded non-UTF-8 ClrMamePro text as Windows-1252".to_string(),
+                    severity: DiagnosticSeverity::Warning,
+                    code: "legacy_windows_1252",
+                });
+            }
+            legacy_warning_recorded = true;
+        }
         let trimmed_line = line.trim();
         if trimmed_line.is_empty() {
             continue;
         }
-
-        let offset = line.as_ptr() as usize - content.as_ptr() as usize;
 
         if trimmed_line == "clrmamepro (" {
             in_clrmamepro = true;
@@ -152,9 +157,9 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
                 &mut version,
                 &mut author,
                 &limits,
-                offset,
+                line_offset,
+                line_number,
                 &mut warnings,
-                &push_warning,
             );
             continue;
         }
@@ -409,6 +414,13 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         }
     }
 
+    if in_game || in_rom {
+        return Err(ParseError::MalformedXml {
+            detail: "unterminated ClrMamePro game or ROM block".into(),
+            byte_offset: Some(byte_offset),
+        });
+    }
+
     emit_rom_flush(
         &mut current_rom_name,
         &mut current_rom_size,
@@ -460,6 +472,39 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
         dat: ParsedDat { source, games },
         warnings,
     })
+}
+
+fn read_bounded_line(
+    reader: &mut BufReader<File>,
+    line: &mut Vec<u8>,
+    limit: usize,
+    path: &Path,
+) -> Result<usize, ParseError> {
+    let mut total = 0usize;
+    loop {
+        let chunk = reader.fill_buf().map_err(|error| ParseError::Io {
+            path: path.to_path_buf(),
+            error,
+        })?;
+        if chunk.is_empty() {
+            break;
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(chunk.len(), |index| index + 1);
+        if line.len().saturating_add(take) > limit {
+            return Err(ParseError::DescriptionTooLong {
+                length: line.len().saturating_add(take),
+                limit,
+            });
+        }
+        line.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        total = total.saturating_add(take);
+        if newline.is_some() {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// Extract the content inside `prefix(...)`, stripping the closing `)` if present.
@@ -728,8 +773,8 @@ fn parse_header_field(
     author: &mut Option<String>,
     limits: &DatLimits,
     offset: usize,
+    line_number: usize,
     warnings: &mut Vec<ParseWarning>,
-    push_warning: &dyn Fn(&mut Vec<ParseWarning>, usize, &str),
 ) {
     let lower = line.to_ascii_lowercase();
     if lower.starts_with("name ") {
@@ -737,15 +782,21 @@ fn parse_header_field(
     } else if lower.starts_with("description ") {
         let text = unquote(&line[12..]);
         if text.len() > limits.max_description_length {
-            push_warning(
-                warnings,
-                offset,
-                &format!(
-                    "description truncated from {} to {} bytes",
-                    text.len(),
-                    limits.max_description_length
-                ),
-            );
+            if warnings.len() < limits.max_warnings {
+                warnings.push(ParseWarning {
+                    byte_offset: Some(offset),
+                    line: Some(line_number),
+                    column: None,
+                    context: String::new(),
+                    message: format!(
+                        "description truncated from {} to {} bytes",
+                        text.len(),
+                        limits.max_description_length
+                    ),
+                    severity: DiagnosticSeverity::Warning,
+                    code: "description_truncated",
+                });
+            }
             *description = Some(text.chars().take(limits.max_description_length).collect());
         } else {
             *description = Some(text);
@@ -1111,5 +1162,40 @@ mod tests {
         assert_eq!(ordinary.is_bios, None);
         assert_eq!(ordinary.runnable, None);
         assert!(ordinary.unsupported_structure);
+    }
+
+    #[test]
+    fn ten_thousand_game_catalogue_streams_and_preserves_order() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-tosec.dat");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "clrmamepro (\n\tname Synthetic\n)").unwrap();
+        for index in 0..10_000 {
+            writeln!(
+                file,
+                "game (\n\tname \"Game {index}\"\n\trom ( name \"rom-{index}.bin\" size 4 crc {index:08X} )\n\trom ( name \"extra-{index}.bin\" size 8 md5 {index:032X} )\n)"
+            )
+            .unwrap();
+        }
+        let result = parse_clrmamepro(&path, DatLimits::default()).unwrap();
+        assert_eq!(result.dat.games.len(), 10_000);
+        assert_eq!(result.dat.games[0].name, "Game 0");
+        assert_eq!(result.dat.games[9_999].name, "Game 9999");
+        assert_eq!(result.dat.games[9_999].roms.len(), 2);
+    }
+
+    #[test]
+    fn unterminated_tail_is_refused_instead_of_returning_partial_catalogue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.dat");
+        std::fs::write(
+            &path,
+            "clrmamepro (\n\tname Broken\n)\ngame (\n\tname \"Incomplete\"\n\trom ( name bad.bin size 4 crc DEADBEEF )\n",
+        )
+        .unwrap();
+        let error = parse_clrmamepro(&path, DatLimits::default()).unwrap_err();
+        assert!(matches!(error, ParseError::MalformedXml { .. }));
     }
 }
