@@ -101,6 +101,8 @@ pub mod remote_source_health;
 /// Optional, read-only RetroAchievements game metadata and bounded cache.
 pub mod retroachievements;
 pub mod retrobios_provider;
+/// Local immutable emulator-save snapshots and conservative restore previews.
+pub mod save_snapshots;
 /// Bounded descriptive analysis for supported tape-image containers.
 pub mod tape_analysis;
 /// Bounded PCM/WAV pulse evidence for tape recordings.

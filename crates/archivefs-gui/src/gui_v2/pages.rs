@@ -1843,6 +1843,31 @@ impl App {
                     _ => {}
                 }
             });
+            self.save_backups_panel(ui, game);
+        });
+    }
+
+    fn save_backups_panel(&mut self, ui: &mut egui::Ui, game: &Game) {
+        if !game.archive.absolute_path.exists() {
+            return;
+        }
+        ui.add_space(theme::SPACE_MD);
+        ui.collapsing("Saves & Backups", |ui| {
+            ui.label("Create a local backup of your save before making changes.");
+            ui.label("Save files and save states are kept as different kinds of data.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Open Saves & States").clicked() {
+                    self.go(Route::Section(Section::Saves));
+                }
+                ui.add_enabled(false, egui::Button::new("Compare"))
+                    .on_hover_text("Choose a snapshot in the Saves & States page; comparison is being introduced in this foundation.");
+                ui.add_enabled(false, egui::Button::new("Restore"))
+                    .on_hover_text("Restore remains preview-only until a complete filesystem transaction is available.");
+            });
+            ui.collapsing("Advanced details", |ui| {
+                ui.label("Snapshots are stored locally, hashed on this machine, and published only after the copy is complete.");
+                ui.label("EmuWiz will require the emulator to be closed before snapshot or restore work.");
+            });
         });
         self.documents_panel(ui, id, game);
     }
