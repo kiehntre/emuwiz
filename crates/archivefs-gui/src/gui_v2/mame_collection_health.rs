@@ -1,6 +1,9 @@
 //! Read-only MAME collection health presentation.
 
 use archivefs_core::mame_internal_repair::MameInternalRepairPlan;
+use archivefs_core::mame_internal_repair_apply::{
+    MameInternalRepairApplyOptions, MameInternalRepairApplyPlan, apply_mame_internal_repair_plan,
+};
 use archivefs_core::mame_playing_library::MamePlayingLibraryPlan;
 use eframe::egui;
 
@@ -22,6 +25,18 @@ pub(super) fn show_with_plans(
     ui: &mut egui::Ui,
     plan: Option<&MamePlayingLibraryPlan>,
     repair_plan: Option<&MameInternalRepairPlan>,
+) {
+    show_with_apply_plan(ui, plan, repair_plan, None);
+}
+
+/// Renders the apply controls only when a caller supplies a planner-bound
+/// apply projection. The ordinary health route supplies no projection, so it
+/// cannot accidentally expose a mutation control for an unreviewed report.
+pub(super) fn show_with_apply_plan(
+    ui: &mut egui::Ui,
+    plan: Option<&MamePlayingLibraryPlan>,
+    repair_plan: Option<&MameInternalRepairPlan>,
+    apply_plan: Option<&mut MameInternalRepairApplyPlan>,
 ) {
     egui::CollapsingHeader::new("MAME Collection Health")
         .default_open(true)
@@ -89,7 +104,32 @@ pub(super) fn show_with_plans(
                 });
                 ui.label(format!("{} unique source identities · {} preview operation(s) · {} same-name content mismatch(es)", repair.unique_source_identities_needed, repair.filesystem_operations_required, repair.wrong_content_same_name_count));
                 ui.label("Source selection is deterministic and preserves duplicate copies as visible evidence.");
-                ui.label("No Apply button is available: this feature is read-only.");
+                if let Some(apply_plan) = apply_plan {
+                    ui.separator();
+                    ui.strong("Apply safe internal repairs");
+                    ui.label("EmuWiz already found the exact required bytes elsewhere in your library. This does not download anything or replace archival originals.");
+                    let planned = apply_plan.operations.iter().filter(|item| item.state == archivefs_core::mame_internal_repair_apply::MameRepairOperationState::Planned).count();
+                    ui.label(format!("{planned} destination write(s); {} conflict(s); {} unsupported archive destination(s).", apply_plan.refused_count, apply_plan.unsupported_count));
+                    for operation in apply_plan.operations.iter().filter(|item| item.state == archivefs_core::mame_internal_repair_apply::MameRepairOperationState::Planned).take(8) {
+                        ui.label(format!("{} ← {} ({:?})", operation.destination_path.display(), operation.selected_source.display(), operation.strategy));
+                    }
+                    let phrase = format!("REPAIR {planned} MAME FILES");
+                    let mut confirmation = ui.ctx().data_mut(|data| data.get_temp::<String>(egui::Id::new("mame_repair_confirmation")).unwrap_or_default());
+                    ui.label(format!("Type {phrase} to confirm."));
+                    ui.text_edit_singleline(&mut confirmation);
+                    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("mame_repair_confirmation"), confirmation.clone()));
+                    let enabled = planned > 0 && confirmation == phrase;
+                    if ui.add_enabled(enabled, egui::Button::new("Apply")).clicked() {
+                        let result = apply_mame_internal_repair_plan(apply_plan, &MameInternalRepairApplyOptions::default(), &std::sync::atomic::AtomicBool::new(false));
+                        match result {
+                            Ok(result) => ui.label(format!("Applied transaction {}. History and undo are available.", result.outcome.transaction.transaction_id)),
+                            Err(error) => ui.label(format!("Apply refused: {error}")),
+                        };
+                    }
+                    ui.label("Undo removes only destinations created by this transaction, and refuses if a created file changed.");
+                } else {
+                    ui.label("No Apply button is available: this feature is read-only.");
+                }
             } else {
                 ui.label("Load a MAME catalogue and complete collection report to preview exact internal repair matches, absent identities, preservation gaps, and ambiguities.");
                 ui.label("No Apply button is available: this feature is read-only.");

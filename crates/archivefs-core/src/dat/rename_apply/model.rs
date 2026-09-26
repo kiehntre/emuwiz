@@ -270,6 +270,13 @@ pub enum TransactionOperation {
         /// its destination hardlink.
         destination_root: PathBuf,
     },
+    /// Copy the recorded regular source into a new destination. The executor
+    /// performs the copy through a same-directory temporary and a
+    /// no-clobber rename; the source remains untouched.
+    CreateCopy {
+        expected_source: PathBuf,
+        destination_root: PathBuf,
+    },
 }
 
 /// One step of a rename transaction: one approved proposal.

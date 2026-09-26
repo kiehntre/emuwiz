@@ -58,7 +58,7 @@ pub use history::{
     StaleRecoveryReason, archive_recovery_transaction, archive_recovery_transactions,
     classify_recovery_cleanup, load_recovery_history_state, recovery_history_state_path,
 };
-pub use identity::{capture_identity, classify_at, identity_matches};
+pub use identity::{capture_identity, classify_at, content_identity_matches, identity_matches};
 pub use journal::{
     RENAME_TRANSACTIONS_DIRECTORY, default_rename_transaction_dir, find_recovery_transactions,
     find_rollbackable_transactions, journal_exists, journal_path, list_journals,

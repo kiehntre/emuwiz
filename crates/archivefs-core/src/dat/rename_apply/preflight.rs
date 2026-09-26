@@ -168,6 +168,18 @@ pub fn run_preflight(
             }
             Some(expected_source)
         }
+        TransactionOperation::CreateCopy {
+            expected_source,
+            destination_root,
+        } => {
+            if expected_source != &entry.source_path
+                || !expected_source.is_absolute()
+                || !destination_is_confined(&entry.destination_path, destination_root)
+            {
+                failures.push(PreflightFailure::OutsideTrustedRoot);
+            }
+            Some(expected_source)
+        }
     };
 
     if options.plan_generation != options.current_generation {

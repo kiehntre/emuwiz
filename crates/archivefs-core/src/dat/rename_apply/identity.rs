@@ -84,6 +84,17 @@ pub fn identity_matches(expected: &ObjectIdentity, current: &ObjectIdentity) -> 
         if a.version == FRESHNESS_VERSION && b.version == FRESHNESS_VERSION && a == b)
 }
 
+/// Compares the content proof of two regular files without requiring the same
+/// inode. Used for copy-created destinations, where preserving the source
+/// inode would defeat the preservation boundary.
+pub fn content_identity_matches(expected: &ObjectIdentity, current: &ObjectIdentity) -> bool {
+    expected.kind == ObjectKind::RegularFile
+        && current.kind == ObjectKind::RegularFile
+        && expected.size_bytes == current.size_bytes
+        && matches!((&expected.freshness, &current.freshness), (Some(a), Some(b))
+            if a.version == FRESHNESS_VERSION && b.version == FRESHNESS_VERSION && a.sha256 == b.sha256)
+}
+
 fn capture_regular(path: &Path, before: &Metadata) -> io::Result<ObjectFreshness> {
     let mut options = OpenOptions::new();
     options.read(true);

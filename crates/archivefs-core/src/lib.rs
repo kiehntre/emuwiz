@@ -77,6 +77,7 @@ pub mod mame_input_requirements;
 /// Read-only planning for repairing MAME sets from exact bytes already present
 /// elsewhere in the same collection.
 pub mod mame_internal_repair;
+pub mod mame_internal_repair_apply;
 /// Read-only MAME family curation and playing-library projection.
 pub mod mame_playing_library;
 pub mod managed_appimage_bootstrap;

@@ -73,6 +73,8 @@ pub struct MameRepairRelationship {
 pub struct MameRepairSource {
     pub container: PathBuf,
     pub member: String,
+    #[serde(default)]
+    pub container_is_directory: bool,
     pub sha1: String,
     pub size_bytes: Option<u64>,
 }
@@ -119,6 +121,8 @@ pub struct MameInternalRepairRequirement {
     pub requirement_class: MameRepairRequirementClass,
     pub relationship: MameRepairRelationship,
     pub expected_destination_container: Option<PathBuf>,
+    #[serde(default)]
+    pub expected_destination_is_directory: bool,
     pub expected_destination_member: String,
     pub exact_matching_sources: Vec<MameRepairSource>,
     pub source_sha1_verified: bool,
@@ -478,6 +482,7 @@ fn classify_requirement(
         .map(|candidate| MameRepairSource {
             container: candidate.set.location.clone(),
             member: candidate.member.name.clone(),
+            container_is_directory: candidate.set.directory,
             sha1: normalized_sha1(candidate.member.sha1.as_deref()).unwrap_or_default(),
             size_bytes: candidate.member.size_bytes,
         })
@@ -572,6 +577,7 @@ fn classify_requirement(
         requirement_class: expected.class,
         relationship: expected.relationship.clone(),
         expected_destination_container: destination.map(|set| set.location.clone()),
+        expected_destination_is_directory: destination.is_some_and(|set| set.directory),
         expected_destination_member: expected.filename.clone(),
         exact_matching_sources,
         source_sha1_verified: !candidates.is_empty(),

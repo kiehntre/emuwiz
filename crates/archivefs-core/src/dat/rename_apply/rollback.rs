@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::identity::{capture_identity, identity_matches};
+use super::identity::{capture_identity, content_identity_matches, identity_matches};
 use super::journal::write_journal;
 use super::model::{
     EntryState, RenameTransaction, RollbackResult, TransactionOperation, TransactionState,
@@ -284,6 +284,31 @@ fn rollback_mutation(
         }
         std::fs::remove_file(&entry.destination_path)
             .map_err(|error| format!("rollback refused: could not remove hardlink: {error}"))?;
+        return Ok(());
+    }
+    if let TransactionOperation::CreateCopy {
+        expected_source,
+        destination_root,
+    } = &entry.operation
+    {
+        if !expected_source.is_absolute()
+            || expected_source != &entry.source_path
+            || !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+        {
+            return Err("rollback refused: invalid journalled copy source".into());
+        }
+        let source = capture_identity(&entry.source_path)
+            .map_err(|_| "rollback refused: copy source no longer exists".to_string())?;
+        let destination = capture_identity(&entry.destination_path)
+            .map_err(|_| "rollback refused: copy destination no longer exists".to_string())?;
+        if !identity_matches(&entry.identity, &source)
+            || !content_identity_matches(&entry.identity, &destination)
+        {
+            return Err("rollback refused: copied destination or source changed".into());
+        }
+        std::fs::remove_file(&entry.destination_path).map_err(|error| {
+            format!("rollback refused: could not remove copied destination: {error}")
+        })?;
         return Ok(());
     }
     // Destination must still exist and still be the recorded object.

@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use super::identity::{capture_identity, identity_matches};
+use super::identity::{capture_identity, content_identity_matches, identity_matches};
 use super::journal::write_journal;
 use super::model::{
     EntryState, RenameTransaction, TransactionEntry, TransactionOperation, TransactionState,
@@ -268,6 +268,55 @@ fn classify_entry(entry: &TransactionEntry, index: usize) -> RecoveryIssue {
                 kind: RecoveryIssueKind::DestinationIdentityChanged,
                 detail: "hardlink destination identity changed; manual review is required"
                     .to_string(),
+            }
+        };
+    }
+    if let TransactionOperation::CreateCopy {
+        expected_source,
+        destination_root,
+    } = &entry.operation
+    {
+        if !super::preflight::destination_is_confined(&entry.destination_path, destination_root)
+            || !expected_source.is_absolute()
+            || expected_source != &entry.source_path
+        {
+            return RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail:
+                    "journalled copy destination authority is invalid; manual review is required"
+                        .into(),
+            };
+        }
+        let source_matches = capture_identity(&entry.source_path)
+            .ok()
+            .is_some_and(|identity| identity_matches(&entry.identity, &identity));
+        let destination_matches = capture_identity(&entry.destination_path)
+            .ok()
+            .is_some_and(|identity| content_identity_matches(&entry.identity, &identity));
+        return if source_matches && destination_matches {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::RenameConfirmed,
+                detail: "copy creation confirmed; source intentionally remains present".into(),
+            }
+        } else if !source_matches {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::SourceIdentityChanged,
+                detail: "copy source changed or disappeared; manual review is required".into(),
+            }
+        } else if std::fs::symlink_metadata(&entry.destination_path).is_err() {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::RenameDidNotHappen,
+                detail: "copy destination is absent; copy did not happen".into(),
+            }
+        } else {
+            RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DestinationIdentityChanged,
+                detail: "copy destination differs from the journalled content; manual review is required".into(),
             }
         };
     }
