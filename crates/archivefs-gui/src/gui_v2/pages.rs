@@ -1721,6 +1721,7 @@ impl App {
             .inspect_selected_rom(&game.archive.absolute_path);
         self.hackhash.show_selected_rom_evidence(ui);
         super::dreamcast_ipbin::show(ui, game);
+        super::wiiu_disc::show(ui, game);
         super::saturn_manifest::show(ui, game);
         egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
             let wide = ui.available_width() >= 760.0;

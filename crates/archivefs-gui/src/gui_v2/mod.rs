@@ -30,6 +30,7 @@ mod tape_tests;
 mod tests;
 mod thumbnail;
 mod visual_pages;
+mod wiiu_disc;
 
 use crate::optical_conversion_page::OpticalConversionPageState;
 use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
