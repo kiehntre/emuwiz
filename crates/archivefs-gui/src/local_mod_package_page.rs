@@ -6,6 +6,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use archivefs_core::archive_mod_package::{
+    ArchiveModPackagePlan, ArchiveModPackageRequest, build_archive_mod_package_transaction_plan,
+    inspect_archive_mod_package,
+};
 use archivefs_core::game_identity::GameIdentityReport;
 use archivefs_core::mod_catalogue::ModCatalogueRecord;
 use archivefs_core::mod_catalogue_review::review_catalogue_record;
@@ -14,6 +18,7 @@ use archivefs_core::mod_package::{
     SelectedGameForMod, build_local_mod_package_transaction_plan,
     inspect_local_mod_package_candidates,
 };
+use archivefs_core::mod_package_preview::{ModPackageReadiness, project_archive_mod_package};
 use archivefs_core::patch_manager::{
     SharedApplyConfirmation, SharedApplyOptions, SharedApplyOutcome, SharedApplyResult,
     SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview,
@@ -38,7 +43,9 @@ use crate::ui::components as widgets;
 
 enum Stage {
     Pick(Receiver<Option<PathBuf>>, SelectedGameForMod, Vec<PathBuf>),
+    ArchivePick(Receiver<Option<PathBuf>>, SelectedGameForMod),
     Candidates(LocalModPackageCandidateInspection, usize),
+    ArchivePlanned(ArchiveModPackagePlan),
     #[allow(dead_code)]
     Planned(LocalModPackagePlan),
     Confirm(SharedTransactionPlan),
@@ -92,7 +99,12 @@ impl LocalModPackagePageState {
     pub fn is_busy(&self) -> bool {
         matches!(
             self.stage,
-            Some(Stage::Pick(..) | Stage::Applying(_, _) | Stage::RollingBack(_))
+            Some(
+                Stage::Pick(..)
+                    | Stage::ArchivePick(..)
+                    | Stage::Applying(_, _)
+                    | Stage::RollingBack(_)
+            )
         ) || self.standalone.picker.is_some()
             || self.standalone.applying.is_some()
     }
@@ -116,6 +128,20 @@ impl LocalModPackagePageState {
                 Ok(None) | Err(TryRecvError::Disconnected) => {}
                 Err(TryRecvError::Empty) => {
                     self.stage = Some(Stage::Pick(receiver, selected_game, package_roots))
+                }
+            },
+            Stage::ArchivePick(receiver, selected_game) => match receiver.try_recv() {
+                Ok(Some(path)) => {
+                    self.stage = Some(Stage::ArchivePlanned(inspect_archive_mod_package(
+                        ArchiveModPackageRequest {
+                            selected_game,
+                            package_path: path,
+                        },
+                    )));
+                }
+                Ok(None) | Err(TryRecvError::Disconnected) => {}
+                Err(TryRecvError::Empty) => {
+                    self.stage = Some(Stage::ArchivePick(receiver, selected_game))
                 }
             },
             Stage::Applying(receiver, plan) => match receiver.try_recv() {
@@ -1391,6 +1417,46 @@ pub fn show_local_mod_package_panel_with_catalogue(
                 Vec::new(),
             ));
         }
+        if widgets::action_button(
+            ui,
+            "Preview local ZIP package",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(rfd::FileDialog::new().pick_file());
+            });
+            state.stage = Some(Stage::ArchivePick(
+                receiver,
+                SelectedGameForMod {
+                    game_root: game_root.clone(),
+                    identity: identity.clone(),
+                },
+            ));
+        }
+        if widgets::action_button(
+            ui,
+            "Preview local folder tree",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+        {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(rfd::FileDialog::new().pick_folder());
+            });
+            state.stage = Some(Stage::ArchivePick(
+                receiver,
+                SelectedGameForMod {
+                    game_root: game_root.clone(),
+                    identity: identity.clone(),
+                },
+            ));
+        }
         return;
     }
     let stage = state.stage.take().unwrap();
@@ -1398,6 +1464,13 @@ pub fn show_local_mod_package_panel_with_catalogue(
         Stage::Pick(receiver, selected_game, package_roots) => {
             ui.label("Waiting for folder selection…");
             state.stage = Some(Stage::Pick(receiver, selected_game, package_roots));
+        }
+        Stage::ArchivePick(receiver, selected_game) => {
+            ui.label("Waiting for a local ZIP or folder package…");
+            state.stage = Some(Stage::ArchivePick(receiver, selected_game));
+        }
+        Stage::ArchivePlanned(plan) => {
+            show_archive_plan(ui, state, plan, &game_root);
         }
         Stage::Planned(plan) => {
             show_plan(ui, state, plan, archive_path, identity, &game_root);
@@ -1722,6 +1795,85 @@ fn show_plan(
     });
     let _ = (archive_path, identity);
     left_candidates
+}
+
+fn show_archive_plan(
+    ui: &mut egui::Ui,
+    state: &mut LocalModPackagePageState,
+    plan: ArchiveModPackagePlan,
+    game_root: &std::path::Path,
+) {
+    let projection = project_archive_mod_package("local-package", &plan);
+    widgets::card(ui, |ui| {
+        ui.heading("Mod package preview");
+        ui.label(format!("Source: {}", projection.package_path.display()));
+        ui.label(format!("Target: {}", projection.target_platform));
+        ui.label(format!(
+            "Package contents: {} file(s)",
+            projection.entries.len()
+        ));
+        ui.label(format!("Destination root: {}", game_root.display()));
+        widgets::status_badge(
+            ui,
+            match projection.readiness {
+                ModPackageReadiness::ReadyToApply => "Ready for review",
+                ModPackageReadiness::PreviewSafe => "Preview only",
+                ModPackageReadiness::NeedsReview => "Needs review",
+                ModPackageReadiness::Refused => "Refused safely",
+            },
+            if projection.readiness == ModPackageReadiness::Refused {
+                widgets::StatusTone::Blocked
+            } else if projection.readiness == ModPackageReadiness::NeedsReview {
+                widgets::StatusTone::Warning
+            } else {
+                widgets::StatusTone::Info
+            },
+        );
+        ui.label("No installer or bundled script will be executed. The source package remains unchanged.");
+        for conflict in &projection.conflicts {
+            widgets::banner(
+                ui,
+                "Review warning",
+                &conflict.detail,
+                widgets::StatusTone::Warning,
+            );
+        }
+        for entry in projection.entries.iter().take(32) {
+            ui.label(format!(
+                "{}: {} ({} bytes)",
+                match entry.operation {
+                    archivefs_core::archive_mod_package::ArchiveModFileAction::Create => "Add",
+                    archivefs_core::archive_mod_package::ArchiveModFileAction::Replace => "Replace",
+                    archivefs_core::archive_mod_package::ArchiveModFileAction::AlreadyInstalled =>
+                        "Already installed",
+                    archivefs_core::archive_mod_package::ArchiveModFileAction::Conflict =>
+                        "Conflict",
+                    archivefs_core::archive_mod_package::ArchiveModFileAction::Blocked => "Refuse",
+                    archivefs_core::archive_mod_package::ArchiveModFileAction::IgnoredMetadata =>
+                        "Metadata",
+                },
+                entry.destination_path.display(),
+                entry.size
+            ));
+        }
+        if projection.readiness == ModPackageReadiness::ReadyToApply
+            && let Ok(transaction) = build_archive_mod_package_transaction_plan(&plan)
+            && widgets::action_button(
+                ui,
+                "Review and apply package",
+                widgets::ActionStyle::Primary,
+                true,
+            )
+            .clicked()
+        {
+            state.stage = Some(Stage::Confirm(transaction));
+            return;
+        }
+        if widgets::action_button(ui, "Close preview", widgets::ActionStyle::Quiet, true).clicked()
+        {
+            state.stage = None;
+        }
+    });
 }
 
 #[cfg(test)]
