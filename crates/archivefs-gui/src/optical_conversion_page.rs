@@ -14,6 +14,9 @@ use crate::optical_conversion_page;
 use crate::selected_evidence_page;
 use crate::ui::{components as widgets, theme};
 use crate::zip_converter_page::ZipConverterPageState;
+use archivefs_core::conversion_queue::{
+    CompressionPreview, ConversionPlanningInput, ConversionQueue, SpaceEstimate,
+};
 use archivefs_core::psp_reversible_shrink::{
     PspShrinkInspection, PspShrinkResult, PspShrinkTrust, convert_psp_iso_to_cso, inspect_psp_iso,
 };
@@ -196,6 +199,7 @@ pub(crate) struct OpticalConversionPageState {
     hero_preview_scroll: bool,
     psp_shrink: PspShrinkPageState,
     zip_converter: ZipConverterPageState,
+    conversion_queue: ConversionQueue,
 }
 
 #[derive(Default)]
@@ -305,6 +309,7 @@ impl Default for OpticalConversionPageState {
             hero_preview_scroll: false,
             psp_shrink: PspShrinkPageState::default(),
             zip_converter: ZipConverterPageState::default(),
+            conversion_queue: ConversionQueue::default(),
         }
     }
 }
@@ -871,6 +876,10 @@ pub(crate) fn show_optical_conversion_page(
     // Keep the route's text identity available to accessibility/search
     // output even when the approved hero asset supplies the visual title.
     ui.label(egui::RichText::new("Disc Conversion · CUE/BIN → CHD").heading());
+    widgets::card(ui, |ui| {
+        crate::conversion_queue_page::show(ui, &mut state.conversion_queue);
+    });
+    ui.add_space(theme::SECTION_GAP);
     widgets::workflow_strip(ui, &WORKFLOW_STEPS, workflow_step(state));
     ui.add_space(theme::SPACE_SM);
     widgets::card(ui, |ui| {
@@ -1113,6 +1122,56 @@ pub(crate) fn show_optical_conversion_page(
                         .wrap(),
                     );
                 });
+                if ui
+                    .button("Add this preview to the conversion queue")
+                    .clicked()
+                {
+                    let source_size = std::fs::metadata(&plan.cue_path)
+                        .ok()
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0)
+                        .saturating_add(
+                            std::fs::metadata(&plan.bin_path)
+                                .ok()
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0),
+                        );
+                    let platform = state
+                        .selected_context
+                        .as_ref()
+                        .and_then(|context| context.platform.clone());
+                    let queue_id = state.conversion_queue.add(ConversionPlanningInput {
+                        source_path: plan.cue_path.clone(),
+                        source_format: "CUE/BIN".into(),
+                        destination_path: plan.target_path.clone(),
+                        destination_format: "CHD".into(),
+                        platform,
+                        source_size,
+                        destination_size: SpaceEstimate::Unknown,
+                        temporary_space: SpaceEstimate::Exact(source_size),
+                        reclaimable_space: SpaceEstimate::Exact(source_size),
+                        converter: "existing verified CHD backend".into(),
+                        verification_plan: "canonical optical fingerprint".into(),
+                        provenance: "existing ChdConversionPlan".into(),
+                        readiness_reason: None,
+                        available_space_override: None,
+                    });
+                    if let Some(item) = state
+                        .conversion_queue
+                        .items
+                        .iter_mut()
+                        .find(|item| item.id == queue_id)
+                    {
+                        item.compression = Some(CompressionPreview {
+                            expected_type: "CHD cdlz/cdzl/cdfl".into(),
+                            space_saving: SpaceEstimate::Unknown,
+                            lossless: true,
+                            preservation_equivalent: true,
+                            round_trip_identity_expected: true,
+                            retain_original: true,
+                        });
+                    }
+                }
             });
             if !state.previewed {
                 if widgets::action_button(

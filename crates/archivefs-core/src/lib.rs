@@ -537,6 +537,8 @@ pub mod tape_identity;
 /// [`content_evidence::ContentEvidenceConfidence`] (how reliably the fact
 /// was observed). Consumed only by [`platform_evidence_fusion`].
 pub mod content_evidence_scope;
+/// Generic, mutation-free conversion queue and space-preview model.
+pub mod conversion_queue;
 
 /// The first conservative, explainable content-evidence fusion layer:
 /// groups/weighs/compares [`content_evidence::ContentEvidence`] facts into

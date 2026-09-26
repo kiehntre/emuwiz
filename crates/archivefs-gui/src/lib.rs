@@ -314,6 +314,7 @@ pub(crate) mod home_page;
 mod simple_mode;
 use home_page::home_library_snapshot;
 pub(crate) mod cemu_graphic_pack_page;
+pub(crate) mod conversion_queue_page;
 pub(crate) mod identity_sources_page;
 #[allow(dead_code)]
 pub(crate) mod launch_readiness_page;
