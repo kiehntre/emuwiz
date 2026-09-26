@@ -43,6 +43,7 @@
 
 use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
+use serde::{Deserialize, Serialize};
 
 pub const SATURN_SYSTEM_ID_BYTES: usize = 0x100;
 
@@ -58,7 +59,7 @@ const GAME_TITLE: (usize, usize) = (0x60, 0x70);
 
 const RECOGNIZED_HARDWARE_ID: &str = "SEGA SEGASATURN";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SaturnSystemIdFact {
     pub hardware_id: String,
     pub hardware_id_recognized: bool,

@@ -2943,6 +2943,31 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
 }
 
 #[test]
+fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(
+        9,
+        "Panzer Dragoon",
+        Some("Saturn"),
+    )]));
+    app.router.current = Route::Game(9);
+
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value == "Saturn disc layout"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Disc manifest unavailable"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("will not infer Saturn topology"))
+    );
+}
+
+#[test]
 fn gui_v2_artwork_route_contains_native_provider_setup_without_legacy_handoff() {
     let context = egui::Context::default();
     let mut app = fixture(&context);

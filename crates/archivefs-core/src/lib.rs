@@ -384,6 +384,9 @@ pub mod ps4_layout_evidence;
 /// Pure, read-only Sega Saturn boot-header ("System ID") evidence,
 /// verified against Sega's own official SDK specification.
 pub mod saturn_boot_evidence;
+/// Deterministic, read-only Saturn CUE/BIN optical preservation manifests
+/// and byte/topology verifier.
+pub mod saturn_disc_manifest;
 
 /// Pure, read-only Sega CD/Mega-CD boot-signature evidence
 /// (`SEGADISCSYSTEM` only - see the module documentation for scope limits).

@@ -21,6 +21,7 @@ mod pages;
 mod problems;
 mod romm_library;
 mod routes;
+mod saturn_manifest;
 mod saves_states;
 #[cfg(test)]
 mod tape_tests;
