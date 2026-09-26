@@ -387,6 +387,8 @@ pub mod saturn_boot_evidence;
 /// Deterministic, read-only Saturn CUE/BIN optical preservation manifests
 /// and byte/topology verifier.
 pub mod saturn_disc_manifest;
+/// Read-only, fail-closed Saturn patch compatibility and impact preview.
+pub mod saturn_patch_readiness;
 
 /// Pure, read-only Sega CD/Mega-CD boot-signature evidence
 /// (`SEGADISCSYSTEM` only - see the module documentation for scope limits).

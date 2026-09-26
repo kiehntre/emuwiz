@@ -2965,6 +2965,16 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
             .iter()
             .any(|value| value.contains("will not infer Saturn topology"))
     );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Saturn patch readiness")
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Apply is unavailable: Saturn patch readiness is read-only.")
+    );
 }
 
 #[test]
