@@ -92,6 +92,8 @@ pub mod oric_media;
 pub mod oric_tape;
 /// Pure per-game launch-readiness projection over existing gathered evidence.
 pub mod ready_to_play;
+/// Bounded, read-only availability probes for local and remote-backed paths.
+pub mod remote_source_health;
 /// Optional, read-only RetroAchievements game metadata and bounded cache.
 pub mod retroachievements;
 pub mod retrobios_provider;

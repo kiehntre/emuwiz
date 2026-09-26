@@ -15,9 +15,14 @@ use crate::{
     identity_sources_page, launch_readiness_page, selected_evidence_page,
 };
 use archivefs_core::emulator_environment::retroarch::PathPurpose;
+use archivefs_core::remote_source_health::{
+    RemoteSourceAvailability, RemoteSourceProbeRequest, RemoteSourceProbeResult,
+};
 use archivefs_core::{SourceAvailability, SourceFolderView, SourceScanStatus};
 use eframe::egui;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
@@ -37,6 +42,8 @@ pub(super) struct NativeWorkflows {
     source_library_reload: bool,
     artwork_reload: bool,
     sources_discovery: bool,
+    remote_probe_results: BTreeMap<PathBuf, RemoteSourceProbeResult>,
+    remote_probe_jobs: BTreeMap<PathBuf, Receiver<RemoteSourceProbeResult>>,
 }
 
 #[derive(Clone, Copy)]
@@ -137,6 +144,53 @@ fn source_scan_label(status: Option<SourceScanStatus>) -> &'static str {
     }
 }
 
+fn remote_availability_label(availability: RemoteSourceAvailability) -> &'static str {
+    match availability {
+        RemoteSourceAvailability::Available => "Available",
+        RemoteSourceAvailability::AvailableSlow => "Slow",
+        RemoteSourceAvailability::Unavailable => "Unavailable upstream",
+        RemoteSourceAvailability::StaleMetadata => "Needs reacquisition",
+        RemoteSourceAvailability::Timeout => "Timed out",
+        RemoteSourceAvailability::Partial => "Partial",
+        RemoteSourceAvailability::Unknown => "Unknown",
+    }
+}
+
+fn remote_availability_tone(
+    availability: RemoteSourceAvailability,
+) -> crate::ui::components::StatusTone {
+    match availability {
+        RemoteSourceAvailability::Available => crate::ui::components::StatusTone::Success,
+        RemoteSourceAvailability::AvailableSlow | RemoteSourceAvailability::Partial => {
+            crate::ui::components::StatusTone::Warning
+        }
+        RemoteSourceAvailability::Unavailable
+        | RemoteSourceAvailability::StaleMetadata
+        | RemoteSourceAvailability::Timeout => crate::ui::components::StatusTone::Blocked,
+        RemoteSourceAvailability::Unknown => crate::ui::components::StatusTone::Pending,
+    }
+}
+
+fn remote_availability_detail(result: &RemoteSourceProbeResult) -> &'static str {
+    match result.availability {
+        RemoteSourceAvailability::Available => "The source responded to a bounded read.",
+        RemoteSourceAvailability::AvailableSlow => {
+            "The source responded, but the bounded read was slow."
+        }
+        RemoteSourceAvailability::StaleMetadata => {
+            "The remote entry still exists, but its backing data is currently unavailable."
+        }
+        RemoteSourceAvailability::Unavailable => {
+            "The source is unavailable right now; it may need reconnection or reacquisition."
+        }
+        RemoteSourceAvailability::Timeout => {
+            "The source did not respond within the bounded probe time."
+        }
+        RemoteSourceAvailability::Partial => "Only partial source information was available.",
+        RemoteSourceAvailability::Unknown => "The source health could not be determined safely.",
+    }
+}
+
 fn discovery_container_label(container: &archivefs_core::ingestion::ContainerKind) -> &'static str {
     match container {
         archivefs_core::ingestion::ContainerKind::Archive(_) => "Archive",
@@ -210,6 +264,8 @@ impl NativeWorkflows {
             source_library_reload: false,
             artwork_reload: false,
             sources_discovery: false,
+            remote_probe_results: BTreeMap::new(),
+            remote_probe_jobs: BTreeMap::new(),
         }
     }
 
@@ -228,6 +284,7 @@ impl NativeWorkflows {
         self.observe_launch_activity(activity);
         self.observe_readiness_activity(activity);
         self.observe_source_activity(activity);
+        self.poll_remote_source_probes(context);
         self.observe_provider_activity(activity);
         self.observe_metadata_activity(activity);
         self.poll_dat_activity(context, activity);
@@ -571,6 +628,8 @@ impl NativeWorkflows {
         let busy = !self.app.source_action_available();
         let mut action = None;
 
+        self.poll_remote_source_probes(ui.ctx());
+
         ui.heading("Sources");
         ui.label("Add existing game folders, review what EmuWiz knows about them, then scan only when you choose.");
         ui.horizontal_wrapped(|ui| {
@@ -685,6 +744,15 @@ impl NativeWorkflows {
                             .map_or_else(|| "Not available".into(), |count| count.to_string()),
                     );
                     ui.end_row();
+                    ui.weak("Remote health");
+                    if let Some(result) = self.remote_probe_results.get(&source.path) {
+                        ui.label(remote_availability_detail(result));
+                    } else if self.remote_probe_jobs.contains_key(&source.path) {
+                        ui.label("Checking backing availability…");
+                    } else {
+                        ui.label("Not checked");
+                    }
+                    ui.end_row();
                     ui.weak("Platform hint");
                     ui.label(crate::source_state::source_platform_value_label(
                         &crate::source_state::source_platform_state(source, archives),
@@ -700,7 +768,45 @@ impl NativeWorkflows {
                     },
                 );
             }
+            if let Some(result) = self.remote_probe_results.get(&source.path) {
+                ui.horizontal_wrapped(|ui| {
+                    crate::ui::components::status_badge(
+                        ui,
+                        remote_availability_label(result.availability),
+                        remote_availability_tone(result.availability),
+                    );
+                    ui.label(remote_availability_detail(result));
+                });
+                crate::ui::components::technical_details(
+                    ui,
+                    ("v2_remote_source_probe", &source.path),
+                    |ui| {
+                        ui.label(format!("Probe latency: {} ms", result.latency_ms));
+                        ui.label(format!("Bounded bytes read: {}", result.bytes_probed));
+                        ui.label(format!("Timestamp: {}", result.timestamp_unix_seconds));
+                        ui.label(format!("Provenance: {}", result.provenance));
+                        ui.label(format!("Failure class: {:?}", result.error_category));
+                        if let Some(error) = &result.error {
+                            ui.label(format!("Detail: {error}"));
+                        }
+                    },
+                );
+            }
             ui.horizontal_wrapped(|ui| {
+                let probing = self.remote_probe_jobs.contains_key(&source.path);
+                if ui
+                    .add_enabled(
+                        !probing,
+                        egui::Button::new(if probing {
+                            "Checking backing…"
+                        } else {
+                            "Check backing availability"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.start_remote_source_probe(source.path.clone(), ui.ctx().clone());
+                }
                 let label = if source.availability == SourceAvailability::Available {
                     "Scan this folder"
                 } else {
@@ -726,6 +832,42 @@ impl NativeWorkflows {
                 }
             });
         });
+    }
+
+    fn start_remote_source_probe(&mut self, path: PathBuf, context: egui::Context) {
+        if self.remote_probe_jobs.contains_key(&path) {
+            return;
+        }
+        let request =
+            RemoteSourceProbeRequest::new(&path).with_provenance("configured EmuWiz source path");
+        let (sender, receiver) = mpsc::channel();
+        self.remote_probe_jobs.insert(path, receiver);
+        std::thread::spawn(move || {
+            let result = archivefs_core::remote_source_health::probe_remote_source(&request);
+            let _ = sender.send(result);
+            context.request_repaint();
+        });
+    }
+
+    fn poll_remote_source_probes(&mut self, context: &egui::Context) {
+        let paths: Vec<PathBuf> = self.remote_probe_jobs.keys().cloned().collect();
+        for path in paths {
+            let Some(receiver) = self.remote_probe_jobs.get(&path) else {
+                continue;
+            };
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.remote_probe_jobs.remove(&path);
+                    self.remote_probe_results.insert(path, result);
+                    context.request_repaint();
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.remote_probe_jobs.remove(&path);
+                    context.request_repaint();
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
     }
 
     fn show_native_discovery(
