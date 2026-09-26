@@ -103,6 +103,8 @@ fn fixture(context: &egui::Context) -> App {
         hackhash: super::hackhash::HackHashPageState::default(),
         romm_library: super::romm_library::RommBrowserState::default(),
         romm_library_job: None,
+        document_preferences: super::documents::DocumentPreferences::default(),
+        document_cache: None,
     }
 }
 
@@ -1212,7 +1214,7 @@ fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
         assert!(!section.action().is_empty());
         assert_eq!(Route::Section(*section).section(), *section);
     }
-    assert_eq!(unique.len(), 23);
+    assert_eq!(unique.len(), routes::SECTIONS.len());
 }
 
 #[test]
@@ -1974,6 +1976,9 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
             },
             welcome_dismissed: false,
             beginner_hints_enabled: true,
+            document_roots: Vec::new(),
+            document_associations: std::collections::BTreeMap::new(),
+            document_reading: std::collections::BTreeMap::new(),
         },
     )
     .unwrap();

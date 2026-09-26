@@ -4,6 +4,7 @@ mod archive_inspector;
 mod artwork;
 mod backend;
 mod bezel;
+mod documents;
 mod dreamcast_ipbin;
 mod environment;
 mod guidance;
@@ -271,6 +272,8 @@ pub(super) struct App {
     hackhash: hackhash::HackHashPageState,
     romm_library: romm_library::RommBrowserState,
     romm_library_job: Option<u64>,
+    document_preferences: documents::DocumentPreferences,
+    document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
 }
 
 impl App {
@@ -342,6 +345,8 @@ impl App {
             hackhash: hackhash::HackHashPageState::new(),
             romm_library: romm_library::RommBrowserState::default(),
             romm_library_job: None,
+            document_preferences: documents::DocumentPreferences::default(),
+            document_cache: None,
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1358,6 +1363,12 @@ impl App {
                                     self.welcome_dismissed = preferences.welcome_dismissed;
                                     self.beginner_hints_enabled =
                                         preferences.beginner_hints_enabled;
+                                    self.document_preferences.roots =
+                                        preferences.document_roots.clone();
+                                    self.document_preferences.associations =
+                                        preferences.document_associations.clone();
+                                    self.document_preferences.reading =
+                                        preferences.document_reading.clone();
                                     let mut preferences = preferences;
                                     preferences.route = migrate_route(preferences.route);
                                     if !self.interacted {
@@ -1537,6 +1548,9 @@ impl App {
                     filter: self.filter.clone(),
                     welcome_dismissed: self.welcome_dismissed,
                     beginner_hints_enabled: self.beginner_hints_enabled,
+                    document_roots: self.document_preferences.roots.clone(),
+                    document_associations: self.document_preferences.associations.clone(),
+                    document_reading: self.document_preferences.reading.clone(),
                 }),
             );
         }

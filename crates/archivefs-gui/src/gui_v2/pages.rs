@@ -1844,6 +1844,120 @@ impl App {
                 }
             });
         });
+        self.documents_panel(ui, id, game);
+    }
+
+    fn documents_panel(&mut self, ui: &mut egui::Ui, game_id: i64, game: &Game) {
+        let path = game.archive.absolute_path.clone();
+        // A stale/mocked catalogue row has no filesystem evidence to browse.
+        // Keep the existing detail layout compact in that case; real local
+        // rows reach the empty state and nearby-document discovery below.
+        if !path.exists() {
+            return;
+        }
+        let needs_discovery = self
+            .document_cache
+            .as_ref()
+            .is_none_or(|(id, cached_path, _)| *id != game_id || *cached_path != path);
+        if needs_discovery {
+            let documents =
+                super::documents::discover_documents(super::documents::DocumentDiscoveryRequest {
+                    game_id,
+                    game_title: &game.title,
+                    platform: &game.platform,
+                    game_path: &path,
+                    roots: &self.document_preferences.roots,
+                    associations: &self.document_preferences.associations,
+                });
+            self.document_cache = Some((game_id, path, documents));
+        }
+        let documents = self
+            .document_cache
+            .as_ref()
+            .map(|(_, _, documents)| documents.clone())
+            .unwrap_or_default();
+        ui.collapsing("Manuals & Guides", |ui| {
+            ui.label("Local documents only. EmuWiz never downloads, extracts permanently, or changes them.");
+            if documents.is_empty() {
+                ui.weak("No manuals or guides are linked to this game yet.");
+                return;
+            }
+            for document in documents {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(&document.title);
+                    ui.label(format!("{} · {}", document.format.label(), document.page_count.map_or("page count unknown".into(), |count| format!("{count} pages"))));
+                    ui.weak(document.kind.label());
+                });
+                ui.label(format!("{} · {} · {}", document.association_reason, document.source_label(), document.path.display()));
+                if let Some(page) = super::documents::safe_resume_page(
+                    self.document_preferences.reading.get(&document.path),
+                    document.page_count,
+                ) {
+                    ui.label(format!("Resume at page {page}"));
+                }
+                if let Some(page_count) = document.page_count {
+                    let mut resume_page = self
+                        .document_preferences
+                        .reading
+                        .get(&document.path)
+                        .and_then(|state| state.last_page)
+                        .unwrap_or(1)
+                        .min(page_count);
+                    ui.horizontal(|ui| {
+                        ui.label("Resume page");
+                        if ui
+                            .add(egui::DragValue::new(&mut resume_page).range(1..=page_count))
+                            .changed()
+                        {
+                            let zoom_percent = self
+                                .document_preferences
+                                .reading
+                                .get(&document.path)
+                                .and_then(|state| state.zoom_percent);
+                            self.document_preferences.reading.insert(
+                                document.path.clone(),
+                                super::documents::DocumentReadingState {
+                                    last_page: Some(resume_page),
+                                    zoom_percent,
+                                },
+                            );
+                            self.preferences_dirty = Some(std::time::Instant::now());
+                        }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let can_open = document.viewer == super::documents::GameDocumentViewerCapability::ExternalViewer;
+                    if ui.add_enabled(can_open, egui::Button::new("Open")).clicked() {
+                        let job = self.activity.queue("Opening local document", Route::Game(game_id), false);
+                        self.send(job, Command::OpenDocument(document.path.clone()));
+                    }
+                    if document.association != super::documents::GameDocumentAssociation::Explicit
+                        && ui.button("Associate").clicked()
+                    {
+                        self.document_preferences.associations.insert(document.path.clone(), game_id);
+                        self.document_cache = None;
+                        self.preferences_dirty = Some(std::time::Instant::now());
+                    } else if document.association == super::documents::GameDocumentAssociation::Explicit
+                        && ui.button("Remove association").clicked()
+                    {
+                        self.document_preferences.associations.remove(&document.path);
+                        self.document_cache = None;
+                        self.preferences_dirty = Some(std::time::Instant::now());
+                    }
+                    if document.viewer == super::documents::GameDocumentViewerCapability::ExternalViewerUnavailable {
+                        ui.weak("No supported local viewer");
+                    }
+                });
+                ui.collapsing("View details", |ui| {
+                    ui.label(format!("File size: {} bytes", document.file_size));
+                    ui.label(format!("Provenance: {}", document.source_label()));
+                    ui.label(format!("Association confidence: {}", document.association.label()));
+                    ui.label("Opening a document uses your desktop viewer; the source file is read-only to EmuWiz.");
+                });
+            });
+            }
+        });
     }
 
     fn mods_page(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
@@ -2345,6 +2459,33 @@ impl App {
             ui.label("MAME preservation keeps original set relationships; a playing library is a reviewed frontend-oriented projection.");
         });
         ui.label("Advanced tools remain available in the sidebar and through Advanced Details, even when hints are disabled.");
+        ui.separator();
+        ui.heading("Local manuals and guides");
+        ui.label("EmuWiz checks each game's folder and these optional folders for documents. It never searches the whole filesystem.");
+        if ui.button("Add documentation root").clicked()
+            && let Some(root) = rfd::FileDialog::new().pick_folder()
+            && !self.document_preferences.roots.contains(&root)
+        {
+            self.document_preferences.roots.push(root);
+            self.document_preferences.roots.sort();
+            self.document_cache = None;
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        let mut remove_root = None;
+        for (index, root) in self.document_preferences.roots.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(root.display().to_string());
+                if ui.small_button("Remove").clicked() {
+                    remove_root = Some(index);
+                }
+            });
+        }
+        if let Some(index) = remove_root {
+            self.document_preferences.roots.remove(index);
+            self.document_cache = None;
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        ui.label("PDF and CBZ open in your desktop viewer. CBR is recognised but requires an installed viewer that EmuWiz cannot verify.");
         if primary(ui, "Return Home") {
             self.go(Route::Home);
         }

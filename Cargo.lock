@@ -181,6 +181,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "time",
+ "zip",
 ]
 
 [[package]]

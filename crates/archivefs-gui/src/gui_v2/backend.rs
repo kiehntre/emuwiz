@@ -8,10 +8,11 @@ use super::{
     routes::{Route, Section},
 };
 use crate::playing_library_page::PlayingLibraryPageState;
+use archivefs_core::identity_source::romm::manual::ManualOpener;
 use archivefs_core::{Database, default_database_path};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -32,6 +33,12 @@ pub(super) struct Preferences {
     pub welcome_dismissed: bool,
     #[serde(default = "default_beginner_hints_enabled")]
     pub beginner_hints_enabled: bool,
+    #[serde(default)]
+    pub document_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub document_associations: BTreeMap<PathBuf, i64>,
+    #[serde(default)]
+    pub document_reading: BTreeMap<PathBuf, crate::gui_v2::documents::DocumentReadingState>,
 }
 
 fn default_beginner_hints_enabled() -> bool {
@@ -45,6 +52,9 @@ impl Default for Preferences {
             filter: Filter::default(),
             welcome_dismissed: false,
             beginner_hints_enabled: true,
+            document_roots: Vec::new(),
+            document_associations: BTreeMap::new(),
+            document_reading: BTreeMap::new(),
         }
     }
 }
@@ -92,6 +102,7 @@ pub(super) enum Command {
     },
     LoadRepairHistory,
     OpenFolder(PathBuf),
+    OpenDocument(PathBuf),
     Legacy {
         section: Section,
         path: Option<PathBuf>,
@@ -594,6 +605,17 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 return Err("The game folder is no longer available.".into());
             }
             crate::open_folder_in_file_manager(folder).map_err(|error| error.to_string())?;
+            Ok(Payload::Done)
+        }
+        Command::OpenDocument(path) => {
+            let metadata = fs::metadata(&path)
+                .map_err(|error| format!("The document is unavailable: {error}"))?;
+            if !metadata.is_file() || !path.is_absolute() {
+                return Err("The document path is not a regular absolute file.".into());
+            }
+            archivefs_core::identity_source::romm::manual::DesktopManualOpener
+                .open(&path)
+                .map_err(|error| error.to_string())?;
             Ok(Payload::Done)
         }
         Command::Legacy { section, path } => {
