@@ -380,7 +380,7 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
                 "quick-rename",
                 "Quick Rename",
                 "Rename verified games through the existing easy organisation workflow.",
-                Route::Section(Section::Build),
+                Route::QuickRename,
                 Easy,
             ),
             action(
@@ -761,18 +761,9 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
         return vec!["DATs & Verification".into(), "Quick Rename".into()];
     }
     let section = route.section();
-    let mut labels = match section {
-        Section::Check | Section::Dat => vec!["DATs & Verification".into()],
-        Section::Mods => vec!["Cheats & Mods".into()],
-        Section::Saves => vec!["Saves & States".into()],
-        Section::Emulators | Section::Firmware | Section::Setup => vec!["Emulators".into()],
-        Section::Artwork | Section::Museum | Section::Tape => vec!["Artwork & Extras".into()],
-        Section::Converter => vec!["Conversion".into()],
-        Section::Build => vec!["Organisation".into()],
-        Section::Problems => vec!["Problems & Repair".into()],
-        Section::Games | Section::Platforms | Section::Launch => vec!["Games".into()],
-        _ => Vec::new(),
-    };
+    let mut labels = family_for_route(route)
+        .map(|family| vec![family.label().to_string()])
+        .unwrap_or_default();
     let title = section.title().to_string();
     if labels.is_empty() {
         labels.push(title);
