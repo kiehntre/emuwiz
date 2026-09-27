@@ -536,7 +536,7 @@ fn gui_v2_arcade_set_is_a_logical_library_row_with_plain_details() {
     let mut app = fixture(&context);
     app.library = Arc::new(library);
     app.router.current = Route::Game(7);
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    let strings = text(&frame(&context, &mut app, [1280.0, 1200.0]));
 
     assert!(strings.iter().any(|value| value == "Media: Arcade set"));
     assert!(strings.iter().any(|value| value == "Source: pacman"));
@@ -2305,10 +2305,11 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(vec![archive(1, "Example Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
-    let output = frame(&context, &mut app, [1280.0, 820.0]);
+    let output = frame(&context, &mut app, [1280.0, 1200.0]);
     let texts = text(&output);
     for label in [
         "Play",
+        "Checking whether this game is ready",
         "Verify",
         "Artwork & Metadata",
         "Mods & Cheats",
@@ -2753,7 +2754,7 @@ fn gui_v2_refresh_readiness_error_retains_an_obvious_retry() {
     app.library = Arc::new(Library::new(vec![archive(1, "Game", Some("PS2"))]));
     app.router.current = Route::Game(1);
     app.detail_failed = Some(1);
-    let output = frame(&context, &mut app, [1280.0, 820.0]);
+    let output = frame(&context, &mut app, [1280.0, 1200.0]);
     assert!(
         text(&output)
             .iter()
@@ -3242,7 +3243,7 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let context = egui::Context::default();
     let mut app = visual_fixture(&context);
     app.go(Route::Game(1));
-    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 720.0]));
+    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
     for expected in [
         "Play",
         "PSX",

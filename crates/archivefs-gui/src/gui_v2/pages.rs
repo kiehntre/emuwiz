@@ -1738,6 +1738,22 @@ impl App {
                         });
                     });
                     ui.add_space(theme::SPACE_SM);
+                    let readiness_route = {
+                        let workflows = self
+                            .native_workflows
+                            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+                        workflows.show_readiness_summary(
+                            ui,
+                            id,
+                            &game.archive.absolute_path,
+                            game.archive.identity_report.as_ref(),
+                            &mut self.activity,
+                        )
+                    };
+                    if let Some(route) = readiness_route {
+                        self.go(route);
+                    }
+                    ui.add_space(theme::SPACE_SM);
                     if primary(ui, "Play") { self.go(Route::Task { section: Section::Launch, game: id }); }
                     ui.label("Next: review the existing launch check. Nothing starts until you choose Launch there.");
                     ui.add_space(theme::SPACE_SM);

@@ -10,6 +10,7 @@ mod environment;
 mod guidance;
 mod hackhash;
 mod imagery;
+mod launch_readiness_summary;
 mod legacy;
 pub(crate) mod library;
 mod mame_collection_health;

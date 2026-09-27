@@ -7,6 +7,7 @@
 use super::{
     activity::Activity,
     environment::EnvironmentSnapshot,
+    launch_readiness_summary::{self, ReadinessAction, ReadinessFreshness},
     routes::{Route, Section},
 };
 use crate::{
@@ -436,6 +437,45 @@ impl NativeWorkflows {
         }
         self.observe_launch_activity(activity);
         recovery_route
+    }
+
+    /// Render the compact Game Details projection over the same launch input
+    /// used by the full Launch page. This owns no readiness facts and never
+    /// launches directly; the primary action routes to the existing workflow.
+    pub(super) fn show_readiness_summary(
+        &mut self,
+        ui: &mut egui::Ui,
+        game_id: i64,
+        path: &Path,
+        catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        activity: &mut Activity,
+    ) -> Option<Route> {
+        self.selected_game = Some(game_id);
+        self.catalogue_identity_report = catalogue_identity_report.cloned();
+        self.select(path);
+        self.start_launch_readiness(ui.ctx());
+        let input = self.launch_input();
+        let freshness = if self.readiness_error().is_some() {
+            ReadinessFreshness::Stale
+        } else {
+            ReadinessFreshness::Current
+        };
+        self.observe_readiness_activity(activity);
+        let summary = launch_readiness_summary::project(&input, freshness);
+        let action = launch_readiness_summary::show(ui, &summary);
+        action.and_then(|action| match action {
+            ReadinessAction::Play
+            | ReadinessAction::ChooseEmulator
+            | ReadinessAction::RecheckReadiness => Some(Route::Task {
+                section: Section::Launch,
+                game: game_id,
+            }),
+            ReadinessAction::SetUpEmulator => Some(Route::Section(Section::Emulators)),
+            ReadinessAction::CheckFirmware => Some(Route::Section(Section::Firmware)),
+            ReadinessAction::ReviewIdentity => Some(Route::Section(Section::Check)),
+            ReadinessAction::CheckGamesFolder => Some(Route::Section(Section::Sources)),
+            ReadinessAction::ReviewProblem => Some(Route::Section(Section::Problems)),
+        })
     }
 
     /// Native v2 presentation of the existing bounded tape-analysis result.
