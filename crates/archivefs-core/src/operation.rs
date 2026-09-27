@@ -982,6 +982,7 @@ fn shared_apply_operation(
         | PreviewAdapter::Rpcs3OrdinaryMod => OperationKind::ModApply,
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
+        | PreviewAdapter::DuckStation
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Ppsspp
         | PreviewAdapter::Xenia => OperationKind::CheatApply,

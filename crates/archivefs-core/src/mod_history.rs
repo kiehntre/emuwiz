@@ -632,7 +632,10 @@ fn kind_for_adapter(adapter: PreviewAdapter) -> Option<ModKind> {
         PreviewAdapter::CemuGraphicPack => Some(ModKind::CemuGraphicPack),
         PreviewAdapter::Rpcs3OrdinaryMod => Some(ModKind::Rpcs3Ordinary),
         PreviewAdapter::LocalModPackage => Some(ModKind::LocalPackage),
-        PreviewAdapter::RetroArch | PreviewAdapter::Dolphin | PreviewAdapter::Xenia => None,
+        PreviewAdapter::RetroArch
+        | PreviewAdapter::DuckStation
+        | PreviewAdapter::Dolphin
+        | PreviewAdapter::Xenia => None,
     }
 }
 

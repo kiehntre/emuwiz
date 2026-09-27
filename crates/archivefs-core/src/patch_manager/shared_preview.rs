@@ -29,6 +29,7 @@ pub const PREVIEW_MAX_WARNINGS: usize = 64;
 pub enum PreviewAdapter {
     RetroArch,
     Pcsx2,
+    DuckStation,
     Dolphin,
     Ppsspp,
     Xenia,
@@ -49,6 +50,7 @@ pub enum PreviewAdapter {
 pub enum PreviewIdentityKind {
     RetroArchCatalogueMatch,
     Pcsx2ExecutableCrc,
+    DuckStationSerial,
     Pcsx2TexturePack,
     DolphinGameId,
     /// An explicit multi-file Dolphin texture-pack manifest. Multiple
@@ -445,6 +447,7 @@ fn preview_one(
         (matches!(
             request.adapter,
             PreviewAdapter::RetroArch
+                | PreviewAdapter::DuckStation
                 | PreviewAdapter::CemuGraphicPack
                 | PreviewAdapter::Rpcs3OrdinaryMod
         ))
@@ -755,6 +758,7 @@ fn apply_eligibility_blockers(
             PreviewMatchStrength::VerifiedExact | PreviewMatchStrength::Strong
         ),
         PreviewAdapter::Pcsx2
+        | PreviewAdapter::DuckStation
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Ppsspp
         | PreviewAdapter::LocalModPackage
@@ -890,6 +894,8 @@ fn detect_cross_entry_conflicts(request: &SharedPreviewRequest, report: &mut Sha
         .collect::<BTreeSet<_>>();
     if ((request.adapter == PreviewAdapter::Pcsx2
         && request.identity.kind == PreviewIdentityKind::Pcsx2ExecutableCrc)
+        || (request.adapter == PreviewAdapter::DuckStation
+            && request.identity.kind == PreviewIdentityKind::DuckStationSerial)
         || (request.adapter == PreviewAdapter::Dolphin
             && request.identity.kind == PreviewIdentityKind::DolphinGameId)
         || (request.adapter == PreviewAdapter::Rpcs3OrdinaryMod
@@ -1270,6 +1276,10 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::Pcsx2 => matches!(
             normalized.as_str(),
             "ps2" | "playstation 2" | "playstation2" | "sony playstation 2"
+        ),
+        PreviewAdapter::DuckStation => matches!(
+            normalized.as_str(),
+            "ps1" | "playstation" | "playstation 1" | "sony playstation"
         ),
         PreviewAdapter::Dolphin => matches!(
             normalized.as_str(),

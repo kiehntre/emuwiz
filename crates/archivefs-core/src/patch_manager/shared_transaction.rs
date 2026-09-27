@@ -153,6 +153,7 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
     match adapter {
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
+        | PreviewAdapter::DuckStation
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Ppsspp
         | PreviewAdapter::Xenia
@@ -1595,6 +1596,7 @@ fn apply_one(
             plan.adapter,
             PreviewAdapter::RetroArch
                 | PreviewAdapter::Pcsx2
+                | PreviewAdapter::DuckStation
                 | PreviewAdapter::Dolphin
                 | PreviewAdapter::Ppsspp
                 | PreviewAdapter::Xenia

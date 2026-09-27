@@ -60,6 +60,7 @@ mod dolphin_onframe_install_plan;
 mod dolphin_onframe_source;
 mod dolphin_texture_mod;
 mod dolphin_texture_pack;
+mod duckstation_cheat;
 mod duckstation_firmware;
 mod duckstation_local;
 mod emulator_profile_memory;
@@ -470,6 +471,15 @@ pub use dolphin_texture_pack::{
     build_dolphin_texture_pack_manifest, build_dolphin_texture_pack_preview,
     build_dolphin_texture_pack_transaction_plan, execute_dolphin_texture_pack_apply,
     inspect_dolphin_texture_pack_zip, validate_dolphin_texture_pack_manifest,
+};
+pub use duckstation_cheat::{
+    DUCKSTATION_CHEAT_MAX_BYTES, DUCKSTATION_CHEAT_MAX_LINES, DuckStationCheatApplyPlan,
+    DuckStationCheatApplyRequest, DuckStationCheatCode, DuckStationCheatEntry,
+    DuckStationCheatFile, DuckStationCheatParseIssue, DuckStationCheatParseResult,
+    DuckStationCheatState, DuckStationEnablement, DuckStationIdentity, DuckStationLoadabilityFacts,
+    apply_duckstation_cheat_plan, build_duckstation_cheat_apply_plan,
+    duckstation_loadability_facts, merge_duckstation_cheat, parse_duckstation_cheat_file,
+    remove_duckstation_cheat, render_duckstation_cheat_file, update_duckstation_enablement,
 };
 pub use duckstation_firmware::{
     DuckStationBiosVerificationOutcome, DuckStationGameInspectionWithFirmware, DuckStationRegion,
