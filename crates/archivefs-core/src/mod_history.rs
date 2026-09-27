@@ -641,7 +641,9 @@ fn kind_for_adapter(adapter: PreviewAdapter) -> Option<ModKind> {
         | PreviewAdapter::Flycast
         | PreviewAdapter::Rpcs3Patch
         | PreviewAdapter::Mednafen
-        | PreviewAdapter::Fbneo => None,
+        | PreviewAdapter::Fbneo
+        | PreviewAdapter::AmigaWhdloadTrainer
+        | PreviewAdapter::ScummVmTrainer => None,
     }
 }
 

@@ -121,6 +121,8 @@ mod rpcs3_ordinary_mod;
 mod rpcs3_patch;
 mod sameboy_local;
 mod saturn_action_replay;
+// ScummVM’s documented gameplay options stay separate from memory-write cheats.
+mod scummvm_trainer;
 mod shared_preview;
 mod shared_transaction;
 mod snes9x_local;
@@ -934,6 +936,13 @@ pub use saturn_action_replay::{
     SATURN_ACTION_REPLAY_MAX_BYTES, SATURN_ACTION_REPLAY_MAX_CODES, SaturnCheatCode,
     SaturnCheatDecodeResult, SaturnCheatIdentityEvidence, SaturnCheatIssue, SaturnCheatOpcode,
     SaturnCheatReadiness, decode_saturn_action_replay, saturn_cheat_document,
+};
+pub use scummvm_trainer::{
+    ScummVmTrainerApplyOptions, ScummVmTrainerConflict, ScummVmTrainerConflictKind,
+    ScummVmTrainerError, ScummVmTrainerIdentity, ScummVmTrainerOption, ScummVmTrainerOptionKind,
+    ScummVmTrainerPreview, ScummVmTrainerReadiness, ScummVmTrainerRequest, ScummVmTrainerSelection,
+    ScummVmTrainerValue, apply_scummvm_trainer_preview, build_scummvm_trainer_preview,
+    scummvm_trainer_options,
 };
 pub use shared_preview::{
     PREVIEW_MAX_BYTES_PER_FILE, PREVIEW_MAX_CONFLICTS, PREVIEW_MAX_DESTINATION_FILES_HASHED,

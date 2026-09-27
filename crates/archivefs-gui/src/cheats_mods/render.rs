@@ -1811,6 +1811,14 @@ pub(crate) fn show_cheat_route_panel(
                 ui.separator();
                 show_whdload_trainer_editor(ui, workflow);
             }
+            if route.native_format == "ScummVM documented engine trainer options" {
+                ui.separator();
+                ui.strong("Trainer options");
+                ui.label(
+                    "These are documented gameplay options for the selected ScummVM engine. EmuWiz updates an EmuWiz-owned per-game profile only; it does not modify game files.",
+                );
+                ui.label("Apply: updates the selected ScummVM game profile only");
+            }
         }
         let choices = decision.choices();
         if !choices.is_empty() {

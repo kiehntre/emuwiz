@@ -14,7 +14,8 @@ use crate::launch::evidence_bridge::canonical_identity_from_game_report;
 use crate::launch::planning::CanonicalIdentityStatus;
 use crate::launch::process_spawn::{self, PreparedProcessCommand, WatchedProcess};
 use crate::launch::scummvm_command::{
-    ScummVmCommand, build_scummvm_command_plan, resolve_scummvm_native_launch_binding_at,
+    ScummVmCommand, ScummVmTrainerLaunchBinding, build_scummvm_command_plan_with_trainer,
+    resolve_scummvm_native_launch_binding_at,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub struct ScummVmLaunchRequest {
     pub selected_game_folder: PathBuf,
     pub expected_game_key: String,
     pub expected_executable: PathBuf,
+    pub trainer: Option<ScummVmTrainerLaunchBinding>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,8 +148,13 @@ pub fn preflight_scummvm_launch(
         ));
     }
 
-    let command_plan =
-        build_scummvm_command_plan(&identity, Some(verified_id), folder, &Ok(binding));
+    let command_plan = build_scummvm_command_plan_with_trainer(
+        &identity,
+        Some(verified_id),
+        folder,
+        &Ok(binding),
+        request.trainer.as_ref(),
+    );
     if !command_plan.blockers.is_empty() {
         return Err(error(
             ScummVmLaunchPreflightErrorKind::CommandBlocked,

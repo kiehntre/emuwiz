@@ -53,6 +53,7 @@ fn malformed_request_is_rejected_before_any_spawn() {
         selected_game_folder: "relative/game".into(),
         expected_game_key: "scumm:game".into(),
         expected_executable: "/does/not/exist".into(),
+        trainer: None,
     });
     assert_eq!(
         result.unwrap_err().kind,
@@ -72,6 +73,7 @@ fn fresh_detector_evidence_builds_a_command_for_a_renamed_folder() {
         selected_game_folder: folder.clone(),
         expected_game_key: "sci:monkey".into(),
         expected_executable: executable,
+        trainer: None,
     })
     .unwrap();
     assert_eq!(command.arguments[0], "-p");
@@ -90,6 +92,7 @@ fn fresh_detector_disagreement_refuses_before_command_creation() {
         selected_game_folder: folder,
         expected_game_key: "sci:monkey".into(),
         expected_executable: executable,
+        trainer: None,
     })
     .unwrap_err();
     assert_eq!(

@@ -54,6 +54,10 @@ pub enum PreviewAdapter {
     Mednafen,
     /// A local native FinalBurn Neo per-set cheat definition.
     Fbneo,
+    /// A documented ScummVM engine-specific gameplay trainer option.
+    ScummVmTrainer,
+    /// A documented WHDLoad trainer/custom-option launch override.
+    AmigaWhdloadTrainer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -76,6 +80,8 @@ pub enum PreviewIdentityKind {
     /// Exact MD5 section identity used by Mednafen `.cht` files.
     MednafenMd5,
     MameMachineShortname,
+    ScummVmGameId,
+    WhdloadSlave,
     DreamcastProductCode,
 }
 
@@ -470,6 +476,8 @@ fn preview_one(
                 | PreviewAdapter::Flycast
                 | PreviewAdapter::Rpcs3Patch
                 | PreviewAdapter::Fbneo
+                | PreviewAdapter::AmigaWhdloadTrainer
+                | PreviewAdapter::ScummVmTrainer
         ))
         .then(|| (OsString::new(), OsString::new()))
     }) else {
@@ -535,6 +543,8 @@ fn preview_one(
             | PreviewAdapter::Flycast
             | PreviewAdapter::Rpcs3Patch
             | PreviewAdapter::Fbneo
+            | PreviewAdapter::AmigaWhdloadTrainer
+            | PreviewAdapter::ScummVmTrainer
     ) {
         assess_nested_destination(&request.destination_root, &relative)
     } else {
@@ -793,6 +803,8 @@ fn apply_eligibility_blockers(
         | PreviewAdapter::Rpcs3Patch
         | PreviewAdapter::Mednafen
         | PreviewAdapter::Fbneo => source.match_strength == PreviewMatchStrength::VerifiedExact,
+        | PreviewAdapter::AmigaWhdloadTrainer
+        | PreviewAdapter::ScummVmTrainer => source.match_strength == PreviewMatchStrength::VerifiedExact,
     };
     if !strength_eligible {
         let blocker = match source.match_strength {
@@ -1379,6 +1391,8 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::Fbneo => {
             normalized == "arcade" || normalized == "finalburn neo" || normalized == "fbneo"
         }
+        PreviewAdapter::ScummVmTrainer => normalized == "scummvm",
+        PreviewAdapter::AmigaWhdloadTrainer => normalized == "amiga" || normalized == "commodore amiga",
     }
 }
 

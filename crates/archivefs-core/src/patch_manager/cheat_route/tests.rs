@@ -119,6 +119,29 @@ fn arcade_mame_selected_routes_to_native_xml() {
 }
 
 #[test]
+fn amiga_whdload_selected_routes_to_trainer_options() {
+    let mut req = request("Amiga");
+    req.selected = Some(CheatRouteTarget::standalone("amiga_whdload"));
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.apply_support, CheatApplySupport::Supported);
+    assert_eq!(route.native_format, "WHDLoad CUSTOM/tooltype options");
+}
+
+#[test]
+fn scummvm_selected_routes_to_documented_trainer_options() {
+    let mut req = request("ScummVM");
+    req.selected = Some(CheatRouteTarget::standalone("scummvm"));
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.apply_support, CheatApplySupport::Supported);
+    assert_eq!(
+        route.native_format,
+        "ScummVM documented engine trainer options"
+    );
+}
+
+#[test]
 fn psp_retroarch_selected_routes_to_retroarch() {
     let mut req = request("PSP");
     req.selected = Some(CheatRouteTarget::retroarch(None));

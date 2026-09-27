@@ -132,7 +132,9 @@ impl ManagedFormat {
             | PreviewAdapter::Flycast
             | PreviewAdapter::Rpcs3Patch
             | PreviewAdapter::Mednafen
-            | PreviewAdapter::Fbneo => Self::LocalModPackage,
+            | PreviewAdapter::Fbneo
+            | PreviewAdapter::AmigaWhdloadTrainer
+            | PreviewAdapter::ScummVmTrainer => Self::LocalModPackage,
         }
     }
 }

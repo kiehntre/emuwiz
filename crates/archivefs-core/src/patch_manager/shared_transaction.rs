@@ -165,7 +165,9 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Flycast
         | PreviewAdapter::Rpcs3Patch
         | PreviewAdapter::Mednafen
-        | PreviewAdapter::Fbneo => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Fbneo
+        | PreviewAdapter::AmigaWhdloadTrainer
+        | PreviewAdapter::ScummVmTrainer => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -1612,6 +1614,8 @@ fn apply_one(
                 | PreviewAdapter::Rpcs3OrdinaryMod
                 | PreviewAdapter::Mednafen
                 | PreviewAdapter::Fbneo
+                | PreviewAdapter::AmigaWhdloadTrainer
+                | PreviewAdapter::ScummVmTrainer
         );
         if !plan.parent_creation_approved || !adapter_allows_parent_creation {
             return fail_result(

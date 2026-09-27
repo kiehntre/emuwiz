@@ -427,7 +427,8 @@ pub use sameboy_execution::{
 };
 pub use scummvm_command::{
     SCUMMVM_SUPPORTED_PLATFORM_ID, ScummVmCommand, ScummVmCommandPlan, ScummVmCommandSelection,
-    ScummVmNativeLaunchBinding, build_scummvm_command_plan, resolve_scummvm_native_launch_binding,
+    ScummVmNativeLaunchBinding, ScummVmTrainerLaunchBinding, build_scummvm_command_plan,
+    build_scummvm_command_plan_with_trainer, resolve_scummvm_native_launch_binding,
     resolve_scummvm_native_launch_binding_at,
 };
 pub use scummvm_execution::{

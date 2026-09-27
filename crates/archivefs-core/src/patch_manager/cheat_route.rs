@@ -129,6 +129,7 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
             }
             "rpcs3" => CheatApplySupport::Supported,
             "flycast" => CheatApplySupport::Supported,
+            "amiga_whdload" | "scummvm" => CheatApplySupport::Supported,
             _ => CheatApplySupport::Unsupported,
         },
     }
@@ -146,6 +147,8 @@ pub fn native_cheat_format(target: &CheatRouteTarget) -> &'static str {
             "ppsspp" => "PPSSPP CWCheat .ini",
             "mgba" => "mGBA .cheats",
             "mame" => "MAME cheat XML",
+            "amiga_whdload" => "WHDLoad CUSTOM/tooltype options",
+            "scummvm" => "ScummVM documented engine trainer options",
             "flycast" => "Flycast .cht",
             "rpcs3" => "RPCS3 patch.yml",
             "azahar" => "Azahar/Citra cheats .txt",

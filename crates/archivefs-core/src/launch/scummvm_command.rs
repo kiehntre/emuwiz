@@ -20,6 +20,12 @@ pub struct ScummVmNativeLaunchBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScummVmTrainerLaunchBinding {
+    pub configuration: PathBuf,
+    pub target_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScummVmCommand {
     pub executable: PathBuf,
     pub arguments: Vec<OsString>,
@@ -88,6 +94,16 @@ pub fn build_scummvm_command_plan(
     game_folder: &Path,
     binding: &Result<ScummVmNativeLaunchBinding, String>,
 ) -> ScummVmCommandPlan {
+    build_scummvm_command_plan_with_trainer(identity, verified_game_id, game_folder, binding, None)
+}
+
+pub fn build_scummvm_command_plan_with_trainer(
+    identity: &CanonicalIdentityStatus,
+    verified_game_id: Option<&str>,
+    game_folder: &Path,
+    binding: &Result<ScummVmNativeLaunchBinding, String>,
+    trainer: Option<&ScummVmTrainerLaunchBinding>,
+) -> ScummVmCommandPlan {
     let mut blockers = Vec::new();
     let resolved = match identity {
         CanonicalIdentityStatus::Resolved(value) => Some(value),
@@ -122,7 +138,7 @@ pub fn build_scummvm_command_plan(
             LaunchBlockerKind::ScummVmGameIdMissing,
             "no verified ScummVM engine:game ID is available",
         ));
-        return blocked_or_binding(blockers, binding, resolved, game_folder, None);
+        return blocked_or_binding(blockers, binding, resolved, game_folder, None, trainer);
     };
     if !is_valid_scummvm_game_id(game_id) {
         blockers.push(LaunchBlocker::new(
@@ -136,7 +152,30 @@ pub fn build_scummvm_command_plan(
             "ScummVM game folder must be an absolute path",
         ));
     }
-    blocked_or_binding(blockers, binding, resolved, game_folder, Some(game_id))
+    if let Some(trainer) = trainer
+        && (!trainer.configuration.is_absolute()
+            || trainer
+                .configuration
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+            || trainer.target_name.is_empty()
+            || !trainer.target_name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            }))
+    {
+        blockers.push(LaunchBlocker::new(
+            LaunchBlockerKind::ScummVmContentUnsupported,
+            "ScummVM trainer profile path or target name is unsafe",
+        ));
+    }
+    blocked_or_binding(
+        blockers,
+        binding,
+        resolved,
+        game_folder,
+        Some(game_id),
+        trainer,
+    )
 }
 
 fn blocked_or_binding(
@@ -145,6 +184,7 @@ fn blocked_or_binding(
     resolved: Option<&crate::launch::planning::ResolvedIdentity>,
     game_folder: &Path,
     game_id: Option<&str>,
+    trainer: Option<&ScummVmTrainerLaunchBinding>,
 ) -> ScummVmCommandPlan {
     let binding = match binding {
         Ok(value) => Some(value),
@@ -162,14 +202,26 @@ fn blocked_or_binding(
     let resolved = resolved.expect("resolved identity when unblocked");
     let game_id = game_id.expect("game ID when unblocked");
     let binding = binding.expect("binding when unblocked");
-    ScummVmCommandPlan {
-        command: Some(ScummVmCommand {
-            executable: binding.executable.clone(),
-            arguments: vec![
+    let arguments = trainer.map_or_else(
+        || {
+            vec![
                 OsString::from("-p"),
                 game_folder.as_os_str().to_os_string(),
                 OsString::from(game_id),
-            ],
+            ]
+        },
+        |trainer| {
+            vec![
+                OsString::from("--config"),
+                trainer.configuration.as_os_str().to_os_string(),
+                OsString::from(trainer.target_name.clone()),
+            ]
+        },
+    );
+    ScummVmCommandPlan {
+        command: Some(ScummVmCommand {
+            executable: binding.executable.clone(),
+            arguments,
             working_directory: None,
             selection: ScummVmCommandSelection {
                 platform_id: resolved.platform_id.clone(),

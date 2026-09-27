@@ -1543,6 +1543,8 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::Flycast => "Flycast Dreamcast cheat",
         PreviewAdapter::Mednafen => "Mednafen cheat",
         PreviewAdapter::Fbneo => "FBNeo cheat",
+        PreviewAdapter::AmigaWhdloadTrainer => "WHDLoad trainer options",
+        PreviewAdapter::ScummVmTrainer => "ScummVM trainer options",
     }
 }
 

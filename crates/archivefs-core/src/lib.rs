@@ -16,6 +16,9 @@ use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+// Launch-option trainer adapters keep preview, identity, and transaction
+// semantics in the core crate for all GUI surfaces.
+
 /// Bounded gzip decompression of `.adz` (compressed Amiga floppy) containers,
 /// projected through the existing ADF parser - no new filesystem, no new
 /// ADF parsing.

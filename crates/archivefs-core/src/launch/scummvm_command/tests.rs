@@ -73,3 +73,25 @@ fn missing_binding_refuses() {
     );
     assert!(plan.command.is_none());
 }
+
+#[test]
+fn documented_trainer_profile_uses_alternate_config_and_exact_target() {
+    let plan = build_scummvm_command_plan_with_trainer(
+        &identity("ScummVM", "hypno:demo"),
+        Some("hypno:demo"),
+        std::path::Path::new("/games/game"),
+        &binding(),
+        Some(&ScummVmTrainerLaunchBinding {
+            configuration: "/emuwiz/scummvm/hypno-demo.ini".into(),
+            target_name: "emuwiz-hypno-demo".into(),
+        }),
+    );
+    assert_eq!(
+        plan.command.unwrap().arguments,
+        vec![
+            std::ffi::OsString::from("--config"),
+            std::ffi::OsString::from("/emuwiz/scummvm/hypno-demo.ini"),
+            std::ffi::OsString::from("emuwiz-hypno-demo")
+        ]
+    );
+}
