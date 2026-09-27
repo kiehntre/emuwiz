@@ -1529,33 +1529,39 @@ impl App {
         if !self.playing_library_history.is_empty() {
             ui.heading("Playing libraries");
             for transaction in self.playing_library_history.iter().rev() {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.heading("Built Playing Library");
-                    ui.label(format!(
-                        "{} · {} link(s)",
-                        transaction.transaction_id,
-                        transaction.entries.len()
-                    ));
-                    ui.label(format!("Destination: {}", transaction.source_scan_root));
-                    match transaction.state {
-                        TransactionState::Applied => {
-                            ui.strong("Ready to undo");
-                            if ui.button("Open Build Library to preview undo").clicked() {
-                                open_build = true;
+                // Each history card needs its own id scope: without it, the
+                // identical "Advanced Details" header on every card resolves
+                // to one shared persistent open/closed state (see
+                // saves_states.rs's record_card for the same class of bug).
+                ui.push_id(&transaction.transaction_id, |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.heading("Built Playing Library");
+                        ui.label(format!(
+                            "{} · {} link(s)",
+                            transaction.transaction_id,
+                            transaction.entries.len()
+                        ));
+                        ui.label(format!("Destination: {}", transaction.source_scan_root));
+                        match transaction.state {
+                            TransactionState::Applied => {
+                                ui.strong("Ready to undo");
+                                if ui.button("Open Build Library to preview undo").clicked() {
+                                    open_build = true;
+                                }
+                            }
+                            TransactionState::RolledBack => {
+                                ui.label("Already undone");
+                            }
+                            _ => {
+                                ui.label("Needs review — the transaction did not finish normally.");
                             }
                         }
-                        TransactionState::RolledBack => {
-                            ui.label("Already undone");
-                        }
-                        _ => {
-                            ui.label("Needs review — the transaction did not finish normally.");
-                        }
-                    }
-                    ui.collapsing("Advanced Details", |ui| {
-                        ui.label(
+                        ui.collapsing("Advanced Details", |ui| {
+                            ui.label(
                             "Shared journaled link transaction from the Playing Library planner.",
                         );
+                        });
                     });
                 });
             }
@@ -1563,22 +1569,24 @@ impl App {
         if !self.canonical_organisation_history.is_empty() {
             ui.heading("Organised verified games");
             for transaction in self.canonical_organisation_history.iter().rev() {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.heading("Organised verified games");
-                    ui.label(format!(
-                        "{} · {} item(s)",
-                        transaction.transaction_id,
-                        transaction.entries.len()
-                    ));
-                    ui.label(format!("Source: {}", transaction.source_scan_root));
-                    ui.label(match transaction.state {
-                        TransactionState::Applied => "Undo available from Organisation",
-                        TransactionState::RolledBack => "Already undone",
-                        _ => "Needs review — recovery state is recorded in the journal",
-                    });
-                    ui.collapsing("Advanced Details", |ui| {
-                        ui.label(format!("State: {}", transaction.state.label()));
+                ui.push_id(&transaction.transaction_id, |ui| {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.heading("Organised verified games");
+                        ui.label(format!(
+                            "{} · {} item(s)",
+                            transaction.transaction_id,
+                            transaction.entries.len()
+                        ));
+                        ui.label(format!("Source: {}", transaction.source_scan_root));
+                        ui.label(match transaction.state {
+                            TransactionState::Applied => "Undo available from Organisation",
+                            TransactionState::RolledBack => "Already undone",
+                            _ => "Needs review — recovery state is recorded in the journal",
+                        });
+                        ui.collapsing("Advanced Details", |ui| {
+                            ui.label(format!("State: {}", transaction.state.label()));
+                        });
                     });
                 });
             }
@@ -1586,6 +1594,7 @@ impl App {
         if !self.organisation.mame_history.is_empty() {
             ui.heading("MAME reconstructions");
             for transaction in self.organisation.mame_history.iter().rev() {
+                ui.push_id(&transaction.transaction_id, |ui| {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.heading("MAME merged reconstruction");
@@ -1609,6 +1618,7 @@ impl App {
                         ui.label(format!("State: {}", transaction.state.label()));
                     });
                 });
+                });
             }
         }
         let mut undo = None;
@@ -1616,38 +1626,42 @@ impl App {
             .id_salt("v2_repair_history")
             .show(ui, |ui| {
                 for (index, record) in self.repair_history.iter().enumerate().rev() {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.heading("Duplicate quarantine");
-                        ui.label(format!(
-                            "Transaction {} · {} · {} file(s)",
-                            record.transaction.transaction_id,
-                            record.transaction.state.label(),
-                            record.transaction.entries.len()
-                        ));
-                        ui.label(format!(
-                            "Affected folder: {}",
-                            record.trusted_root.display()
-                        ));
-                        match record.transaction.state {
-                            TransactionState::Applied => {
-                                ui.strong("Ready to undo");
-                                if primary(ui, "Preview undo") {
-                                    undo = Some(index);
+                    ui.push_id(&record.transaction.transaction_id, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.heading("Duplicate quarantine");
+                            ui.label(format!(
+                                "Transaction {} · {} · {} file(s)",
+                                record.transaction.transaction_id,
+                                record.transaction.state.label(),
+                                record.transaction.entries.len()
+                            ));
+                            ui.label(format!(
+                                "Affected folder: {}",
+                                record.trusted_root.display()
+                            ));
+                            match record.transaction.state {
+                                TransactionState::Applied => {
+                                    ui.strong("Ready to undo");
+                                    if primary(ui, "Preview undo") {
+                                        undo = Some(index);
+                                    }
+                                }
+                                TransactionState::RolledBack => {
+                                    ui.label("Already undone");
+                                }
+                                TransactionState::RollbackFailed => {
+                                    ui.label("Undo is not available — the rollback needs review.");
+                                }
+                                _ => {
+                                    ui.label(
+                                        "Needs review — the transaction did not finish normally.",
+                                    );
                                 }
                             }
-                            TransactionState::RolledBack => {
-                                ui.label("Already undone");
-                            }
-                            TransactionState::RollbackFailed => {
-                                ui.label("Undo is not available — the rollback needs review.");
-                            }
-                            _ => {
-                                ui.label("Needs review — the transaction did not finish normally.");
-                            }
-                        }
-                        ui.collapsing("Advanced Details", |ui| {
-                            ui.monospace(format!("Journal: {}", record.journal_dir.display()));
+                            ui.collapsing("Advanced Details", |ui| {
+                                ui.monospace(format!("Journal: {}", record.journal_dir.display()));
+                            });
                         });
                     });
                 }

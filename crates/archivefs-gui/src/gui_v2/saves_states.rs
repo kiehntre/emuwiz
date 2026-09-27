@@ -270,7 +270,15 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         .id_salt("v2_saves_states_records")
         .show(ui, |ui| {
             for record in records {
-                record_card(ui, record, &mut app.imagery);
+                // Every card must get its own id scope: `egui::Frame::show`
+                // gives its content `Ui` the same default id ("child")
+                // relative to this shared parent, so identical "Advanced
+                // details" headers across records would otherwise resolve
+                // to the *same* persistent open/closed state and appear to
+                // flash open/closed as the list repaints.
+                ui.push_id(&record.path, |ui| {
+                    record_card(ui, record, &mut app.imagery);
+                });
             }
         });
     for warning in &inventory.warnings {
@@ -505,6 +513,76 @@ fn portability_label(value: PortabilityClass) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record_at(path: &str) -> PersistentStateRecord {
+        PersistentStateRecord {
+            emulator: StateEmulator::DuckStation,
+            selected_installation: None,
+            state_type: PersistentStateType::NativeSave,
+            game_identity: Vec::new(),
+            path: path.into(),
+            container_path: None,
+            slot_profile_account: None,
+            emulator_version: None,
+            firmware_context: None,
+            portability_class: PortabilityClass::SafeToCopy,
+            source_path_origin:
+                archivefs_core::persistent_state_inventory::StatePathOrigin::Configured,
+            provenance: "fixture".into(),
+            sha256: None,
+            size_bytes: 1,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Regression test for the "Advanced details flashes open/closed"
+    /// symptom: every record card renders an identically-labelled
+    /// `ui.collapsing("Advanced details", ...)`. `egui::Frame::show` gives
+    /// its content `Ui` the same default id (`"child"`) relative to its
+    /// parent, so without a `ui.push_id` keyed on something unique per
+    /// record (here, the save's path — always distinct on disk), every
+    /// card's "Advanced details" header resolves to the *same* persisted
+    /// open/closed id and one record's toggle bleeds into every other
+    /// record's card, appearing as a flash when the list repaints.
+    #[test]
+    fn advanced_details_id_is_isolated_per_record() {
+        let context = egui::Context::default();
+        let record_a = record_at("/fixture/saves/a.bin");
+        let record_b = record_at("/fixture/saves/b.bin");
+        let mut ids = Vec::new();
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |context| {
+                egui::CentralPanel::default().show(context, |ui| {
+                    for record in [&record_a, &record_b] {
+                        // Mirrors the caller in `show()`: the record must be
+                        // pushed as an id scope *before* `record_card` opens
+                        // its `Frame`, or the frame's content `Ui` collapses
+                        // every record onto the same default "child" id.
+                        ui.push_id(&record.path, |ui| {
+                            ids.push(
+                                ui.id()
+                                    .with(egui::Id::from("child"))
+                                    .with("Advanced details"),
+                            );
+                        });
+                    }
+                });
+            },
+        );
+        assert_eq!(ids.len(), 2);
+        assert_ne!(
+            ids[0], ids[1],
+            "two records must not share an \"Advanced details\" collapsing id"
+        );
+    }
+
     #[test]
     fn friendly_labels_do_not_leak_backend_taxonomy() {
         assert_eq!(
