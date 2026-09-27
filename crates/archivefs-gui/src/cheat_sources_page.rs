@@ -759,6 +759,9 @@ pub(crate) fn show_cheat_sources_page(
     }
     ui.add_space(10.0);
 
+    show_open_retro_provider_catalogue(ui);
+    ui.add_space(10.0);
+
     if let Some(bar_action) = show_save_bar(ui, view) {
         action = Some(bar_action);
     }
@@ -810,6 +813,29 @@ pub(crate) fn show_cheat_sources_page(
     }
 
     action
+}
+
+fn show_open_retro_provider_catalogue(ui: &mut egui::Ui) {
+    widgets::technical_details(ui, "open-retro-cheat-providers", |ui| {
+        ui.heading("Open and local cheat providers");
+        ui.label("These sources are reference/download/import options. EmuWiz does not bundle unclear or community payloads automatically.");
+        for provider in archivefs_core::patch_manager::open_cheat_provider_catalogue() {
+            ui.collapsing(&provider.name, |ui| {
+                ui.label(format!(
+                    "Platform: {}",
+                    provider.platform_coverage.join(", ")
+                ));
+                ui.label(format!("Mode: {:?}", provider.mode));
+                ui.label(format!("Licence: {}", provider.licence));
+                ui.label(format!("Status: {}", provider.redistribution_status));
+                if provider.id == "c64-user-import" || provider.id == "atari-st-user-import" {
+                    ui.label(
+                        "No clearly licensed reusable database is enabled; local import only.",
+                    );
+                }
+            });
+        }
+    });
 }
 
 /// The save/revert bar, plus the unsaved-change state and its consequences.

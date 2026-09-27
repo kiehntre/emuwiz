@@ -604,6 +604,8 @@ pub mod mod_catalogue;
 pub mod mod_provider;
 /// Conservative, metadata-only ModDB project and release provider.
 pub mod moddb;
+/// Legal/open cheat-provider metadata and conservative local projections.
+pub mod open_retro_cheat_providers;
 /// Bounded import of user-supplied local ROM-hack metadata.
 pub mod rom_hack_catalogue;
 

@@ -136,6 +136,11 @@ pub use azahar_local::{
 
 use crate::{Database, PersistedArchive};
 
+pub use crate::open_retro_cheat_providers::{
+    LIBRETRO_CHEAT_URL, OpenCheatProvider, OpenCheatProviderMode, OpenCheatTrustState,
+    WHDLOAD_OPTIONS_URL, WhdloadCustomOption, ZXDB_URL, ZxPokError, ZxPokOperation, ZxPokTrainer,
+    normalize_zx_pok, open_cheat_provider_catalogue, parse_whdload_custom_options, parse_zx_pok,
+};
 pub use adapter::{
     AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,
     HypotheticalDestination, InstallationCandidate,
