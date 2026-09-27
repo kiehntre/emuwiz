@@ -10,7 +10,10 @@ use super::{
     onboarding,
     problems::{Category, Problem, Severity},
     romm_library::PresenceFilter,
-    routes::{HOME_TASKS, Route, SECTIONS, Section, breadcrumb_labels},
+    routes::{
+        FamilyVariant, FeatureFamily, HOME_TASKS, Route, SECTIONS, Section, breadcrumb_labels,
+        family_children, family_for_route, family_home,
+    },
 };
 use crate::ui::{
     components::{StatusTone, page_hero},
@@ -406,6 +409,20 @@ impl App {
                         Route::Section(Section::History) => self.history(ui),
                         Route::Section(Section::Settings) => self.settings(ui),
                         Route::Section(Section::Advanced) => self.advanced(ui),
+                        Route::Section(
+                            section @ (Section::DatVerification
+                            | Section::CheatsMods
+                            | Section::SavesStates
+                            | Section::EmulatorsFamily
+                            | Section::Mame
+                            | Section::ArtworkExtras
+                            | Section::Conversion
+                            | Section::OrganisationFamily
+                            | Section::ProblemsRepair
+                            | Section::SourcesProviders
+                            | Section::HistoryUndo
+                            | Section::AdvancedDiagnostics),
+                        ) => self.family_page(ui, section),
                         Route::Task {
                             section: Section::Build,
                             ..
@@ -554,19 +571,22 @@ impl App {
                     ui.menu_button("Jump to…", |ui| {
                         ui.label("Feature families");
                         ui.separator();
-                        for (label, destination) in [
-                            ("Games", Route::Section(Section::Games)),
-                            ("DATs & Verification", Route::Section(Section::Check)),
-                            ("Cheats & Mods", Route::Section(Section::Mods)),
-                            ("Saves & States", Route::Section(Section::Saves)),
-                            ("Emulators", Route::Section(Section::Emulators)),
-                            ("MAME / Organisation", Route::Section(Section::Build)),
-                            ("Artwork & Extras", Route::Section(Section::Artwork)),
-                            ("Conversion", Route::Section(Section::Converter)),
-                            ("Problems & Repair", Route::Section(Section::Problems)),
+                        for family in [
+                            FeatureFamily::DatsVerification,
+                            FeatureFamily::CheatsMods,
+                            FeatureFamily::SavesStates,
+                            FeatureFamily::Emulators,
+                            FeatureFamily::Mame,
+                            FeatureFamily::ArtworkExtras,
+                            FeatureFamily::Conversion,
+                            FeatureFamily::Organisation,
+                            FeatureFamily::ProblemsRepair,
+                            FeatureFamily::SourcesProviders,
+                            FeatureFamily::HistoryUndo,
+                            FeatureFamily::AdvancedDiagnostics,
                         ] {
-                            if ui.button(label).clicked() {
-                                self.go(destination);
+                            if ui.button(family.label()).clicked() {
+                                self.go(family_home(family));
                                 ui.close();
                             }
                         }
@@ -577,21 +597,58 @@ impl App {
     }
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
+        let family = family_for_route(&self.router.current);
         let title = match &self.router.current {
             Route::Game(id) | Route::Task { game: id, .. } => self
                 .library
                 .game(*id)
                 .map(|game| game.title.as_str())
                 .unwrap_or("Game no longer listed"),
-            _ => self.router.current.section().title(),
+            _ => family
+                .filter(|family| family_home(*family).section() == self.router.current.section())
+                .map(FeatureFamily::label)
+                .unwrap_or_else(|| self.router.current.section().title()),
         };
         ui.heading(title);
         ui.label(if self.router.current.game().is_some() {
             "Your game's information, readiness and next actions, in one place."
+        } else if let Some(family) = family {
+            if family_home(family).section() == self.router.current.section() {
+                family.purpose()
+            } else {
+                self.router.current.section().purpose()
+            }
         } else {
             self.router.current.section().purpose()
         });
         ui.separator();
+    }
+
+    fn family_page(&mut self, ui: &mut egui::Ui, section: Section) {
+        let Some(family) = family_for_route(&Route::Section(section)) else {
+            return;
+        };
+        ui.heading(family.label());
+        ui.label(family.purpose());
+        ui.label("These are shortcuts to existing GUI-v2 workflows; opening a shortcut does not change your files.");
+        ui.add_space(theme::SPACE_SM);
+        for action in family_children(family) {
+            let variant = match action.variant {
+                FamilyVariant::Normal => "",
+                FamilyVariant::Easy => " · Easy",
+                FamilyVariant::Advanced => " · Advanced",
+            };
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.push_id(("v2_family_action", family, action.id), |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.heading(format!("{}{}", action.label, variant));
+                    ui.label(action.description);
+                    if ui.button(format!("Open {}", action.label)).clicked() {
+                        self.go(action.route.clone());
+                    }
+                });
+            });
+        }
     }
 
     fn setup_doctor(&mut self, ui: &mut egui::Ui) {

@@ -28,6 +28,18 @@ pub(super) enum Section {
     History,
     Settings,
     Advanced,
+    DatVerification,
+    CheatsMods,
+    SavesStates,
+    EmulatorsFamily,
+    Mame,
+    ArtworkExtras,
+    Conversion,
+    OrganisationFamily,
+    ProblemsRepair,
+    SourcesProviders,
+    HistoryUndo,
+    AdvancedDiagnostics,
 }
 
 pub(super) const SECTIONS: &[Section] = &[
@@ -55,6 +67,18 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::History,
     Section::Settings,
     Section::Advanced,
+    Section::DatVerification,
+    Section::CheatsMods,
+    Section::SavesStates,
+    Section::EmulatorsFamily,
+    Section::Mame,
+    Section::ArtworkExtras,
+    Section::Conversion,
+    Section::OrganisationFamily,
+    Section::ProblemsRepair,
+    Section::SourcesProviders,
+    Section::HistoryUndo,
+    Section::AdvancedDiagnostics,
 ];
 
 impl Section {
@@ -84,6 +108,18 @@ impl Section {
             Self::History => "History",
             Self::Settings => "Settings",
             Self::Advanced => "Advanced",
+            Self::DatVerification => "DATs & Verification",
+            Self::CheatsMods => "Cheats & Mods",
+            Self::SavesStates => "Saves & States",
+            Self::EmulatorsFamily => "Emulators",
+            Self::Mame => "MAME",
+            Self::ArtworkExtras => "Artwork & Extras",
+            Self::Conversion => "Conversion",
+            Self::OrganisationFamily => "Organisation",
+            Self::ProblemsRepair => "Problems & Repair",
+            Self::SourcesProviders => "Sources & Providers",
+            Self::HistoryUndo => "History & Undo",
+            Self::AdvancedDiagnostics => "Advanced / Diagnostics",
         }
     }
 
@@ -125,6 +161,18 @@ impl Section {
             Self::History => "Review previous changes and the recovery options available for them.",
             Self::Settings => "Adjust this interface without changing your games.",
             Self::Advanced => "Explore detailed tools. Opening this page changes nothing.",
+            Self::DatVerification
+            | Self::CheatsMods
+            | Self::SavesStates
+            | Self::EmulatorsFamily
+            | Self::Mame
+            | Self::ArtworkExtras
+            | Self::Conversion
+            | Self::OrganisationFamily
+            | Self::ProblemsRepair
+            | Self::SourcesProviders
+            | Self::HistoryUndo
+            | Self::AdvancedDiagnostics => "Choose a workflow. Opening a shortcut changes nothing.",
         }
     }
 
@@ -147,6 +195,18 @@ impl Section {
             Self::Dat => "Manage identification data",
             Self::History => "Review previous changes",
             Self::Advanced => "Open specialist tools",
+            Self::DatVerification
+            | Self::CheatsMods
+            | Self::SavesStates
+            | Self::EmulatorsFamily
+            | Self::Mame
+            | Self::ArtworkExtras
+            | Self::Conversion
+            | Self::OrganisationFamily
+            | Self::ProblemsRepair
+            | Self::SourcesProviders
+            | Self::HistoryUndo
+            | Self::AdvancedDiagnostics => "Open family",
             _ => "Browse my games",
         }
     }
@@ -160,8 +220,507 @@ impl Section {
             Self::Mods => Some("TOOLS"),
             Self::Converter | Self::Tape | Self::Museum => Some("TOOLS"),
             Self::Romm => Some("LIBRARY"),
+            Self::DatVerification
+            | Self::CheatsMods
+            | Self::SavesStates
+            | Self::EmulatorsFamily
+            | Self::Mame
+            | Self::ArtworkExtras
+            | Self::Conversion
+            | Self::OrganisationFamily
+            | Self::ProblemsRepair
+            | Self::SourcesProviders
+            | Self::HistoryUndo
+            | Self::AdvancedDiagnostics => Some("FAMILIES"),
             _ => None,
         }
+    }
+}
+
+/// The stable information-architecture homes for GUI-v2 workflows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum FeatureFamily {
+    DatsVerification,
+    CheatsMods,
+    SavesStates,
+    Emulators,
+    Mame,
+    ArtworkExtras,
+    Conversion,
+    Organisation,
+    ProblemsRepair,
+    SourcesProviders,
+    HistoryUndo,
+    AdvancedDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FamilyVariant {
+    Normal,
+    Easy,
+    Advanced,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct FamilyAction {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub route: Route,
+    pub variant: FamilyVariant,
+}
+
+impl FeatureFamily {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DatsVerification => "DATs & Verification",
+            Self::CheatsMods => "Cheats & Mods",
+            Self::SavesStates => "Saves & States",
+            Self::Emulators => "Emulators",
+            Self::Mame => "MAME",
+            Self::ArtworkExtras => "Artwork & Extras",
+            Self::Conversion => "Conversion",
+            Self::Organisation => "Organisation",
+            Self::ProblemsRepair => "Problems & Repair",
+            Self::SourcesProviders => "Sources & Providers",
+            Self::HistoryUndo => "History & Undo",
+            Self::AdvancedDiagnostics => "Advanced / Diagnostics",
+        }
+    }
+
+    pub fn purpose(self) -> &'static str {
+        match self {
+            Self::DatsVerification => {
+                "Identify games, review evidence and make safe rename decisions."
+            }
+            Self::CheatsMods => "Keep cheats, mods and their conflicts discoverable in one place.",
+            Self::SavesStates => "Manage saves, snapshots, restores and memory-card workflows.",
+            Self::Emulators => "Set up emulators and review the firmware they require.",
+            Self::Mame => "Inspect MAME collections without hiding the existing MAME workflows.",
+            Self::ArtworkExtras => "Find artwork, metadata and supporting collection material.",
+            Self::Conversion => "Open the existing verified conversion workflows.",
+            Self::Organisation => "Choose how verified games are arranged or published.",
+            Self::ProblemsRepair => "Review the global problems inbox and safe repair paths.",
+            Self::SourcesProviders => "Keep local sources, DATs and remote providers distinct.",
+            Self::HistoryUndo => "Review the one authoritative history and its undo options.",
+            Self::AdvancedDiagnostics => {
+                "Open specialist tools with an explicit explanation of each one."
+            }
+        }
+    }
+}
+
+pub(super) fn family_home(family: FeatureFamily) -> Route {
+    Route::Section(match family {
+        FeatureFamily::DatsVerification => Section::DatVerification,
+        FeatureFamily::CheatsMods => Section::CheatsMods,
+        FeatureFamily::SavesStates => Section::SavesStates,
+        FeatureFamily::Emulators => Section::EmulatorsFamily,
+        FeatureFamily::Mame => Section::Mame,
+        FeatureFamily::ArtworkExtras => Section::ArtworkExtras,
+        FeatureFamily::Conversion => Section::Conversion,
+        FeatureFamily::Organisation => Section::OrganisationFamily,
+        FeatureFamily::ProblemsRepair => Section::ProblemsRepair,
+        FeatureFamily::SourcesProviders => Section::SourcesProviders,
+        FeatureFamily::HistoryUndo => Section::HistoryUndo,
+        FeatureFamily::AdvancedDiagnostics => Section::AdvancedDiagnostics,
+    })
+}
+
+pub(super) fn family_for_route(route: &Route) -> Option<FeatureFamily> {
+    let section = route.section();
+    Some(match section {
+        Section::Check | Section::Dat | Section::DatVerification => FeatureFamily::DatsVerification,
+        Section::Mods | Section::CheatsMods => FeatureFamily::CheatsMods,
+        Section::Saves | Section::SavesStates => FeatureFamily::SavesStates,
+        Section::Emulators | Section::Firmware | Section::EmulatorsFamily => {
+            FeatureFamily::Emulators
+        }
+        Section::Mame => FeatureFamily::Mame,
+        Section::Artwork | Section::ArtworkExtras | Section::Museum => FeatureFamily::ArtworkExtras,
+        Section::Converter | Section::Conversion => FeatureFamily::Conversion,
+        Section::Build | Section::OrganisationFamily | Section::Games | Section::Launch => {
+            FeatureFamily::Organisation
+        }
+        Section::Problems | Section::ProblemsRepair | Section::Duplicates => {
+            FeatureFamily::ProblemsRepair
+        }
+        Section::Sources | Section::Romm | Section::SourcesProviders => {
+            FeatureFamily::SourcesProviders
+        }
+        Section::History | Section::Activity | Section::HistoryUndo => FeatureFamily::HistoryUndo,
+        Section::Advanced | Section::Settings | Section::Tape | Section::AdvancedDiagnostics => {
+            FeatureFamily::AdvancedDiagnostics
+        }
+        Section::Home => return None,
+        Section::Platforms => FeatureFamily::Organisation,
+        Section::Setup => FeatureFamily::AdvancedDiagnostics,
+    })
+}
+
+pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
+    use FamilyVariant::{Advanced, Easy, Normal};
+    let action = |id, label, description, route, variant| FamilyAction {
+        id,
+        label,
+        description,
+        route,
+        variant,
+    };
+    match family {
+        FeatureFamily::DatsVerification => vec![
+            action(
+                "check",
+                "Check Games",
+                "Find missing, unknown, damaged or mismatched games.",
+                Route::Section(Section::Check),
+                Normal,
+            ),
+            action(
+                "quick-rename",
+                "Quick Rename",
+                "Rename verified games through the existing easy organisation workflow.",
+                Route::Section(Section::Build),
+                Easy,
+            ),
+            action(
+                "advanced-rename",
+                "Advanced Rename",
+                "Review the full organisation and preview workflow.",
+                Route::Section(Section::Build),
+                Advanced,
+            ),
+            action(
+                "dat-management",
+                "DAT Management",
+                "Manage trusted identification data.",
+                Route::Section(Section::Dat),
+                Normal,
+            ),
+            action(
+                "repair",
+                "Repair from DAT evidence",
+                "Review repair candidates in the global problems inbox.",
+                Route::Section(Section::Problems),
+                Normal,
+            ),
+            action(
+                "history",
+                "History",
+                "Review the authoritative change history.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+        ],
+        FeatureFamily::CheatsMods => vec![
+            action(
+                "cheats",
+                "Cheats",
+                "Open the existing cheats and mods workflow.",
+                Route::Section(Section::Mods),
+                Normal,
+            ),
+            action(
+                "mods",
+                "Mods",
+                "Browse available game improvements.",
+                Route::Section(Section::Mods),
+                Normal,
+            ),
+            action(
+                "conflicts",
+                "Conflicts",
+                "Review problems that need attention.",
+                Route::Section(Section::Problems),
+                Normal,
+            ),
+            action(
+                "installed",
+                "Installed",
+                "Review the existing installed-mod workflow.",
+                Route::Section(Section::Mods),
+                Normal,
+            ),
+            action(
+                "history",
+                "History",
+                "Review the authoritative change history.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+        ],
+        FeatureFamily::SavesStates => vec![
+            action(
+                "saves",
+                "Saves",
+                "Review portable and emulator-bound saves.",
+                Route::Section(Section::Saves),
+                Normal,
+            ),
+            action(
+                "snapshots",
+                "Snapshots",
+                "Open the existing saves and states inventory.",
+                Route::Section(Section::Saves),
+                Normal,
+            ),
+            action(
+                "restore",
+                "Restore",
+                "Review restore options in the saves workflow.",
+                Route::Section(Section::Saves),
+                Normal,
+            ),
+            action(
+                "memory-cards",
+                "Memory Cards",
+                "Review memory-card state in the saves workflow.",
+                Route::Section(Section::Saves),
+                Normal,
+            ),
+            action(
+                "history",
+                "History",
+                "Review the authoritative change history.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+        ],
+        FeatureFamily::Emulators => vec![
+            action(
+                "setup",
+                "Emulator Setup",
+                "Find installed emulators and their requirements.",
+                Route::Section(Section::Emulators),
+                Normal,
+            ),
+            action(
+                "firmware",
+                "BIOS / Firmware",
+                "Review required firmware without changing settings.",
+                Route::Section(Section::Firmware),
+                Normal,
+            ),
+        ],
+        FeatureFamily::Mame => vec![
+            action(
+                "collection-health",
+                "Collection Health",
+                "Open the existing read-only MAME health workflow.",
+                Route::Section(Section::Build),
+                Normal,
+            ),
+            action(
+                "mame-organisation",
+                "MAME Organisation",
+                "Open the existing MAME organisation workflow.",
+                Route::Section(Section::Build),
+                Advanced,
+            ),
+            action(
+                "problems",
+                "MAME Problems",
+                "Review MAME-related problems in the global inbox.",
+                Route::Section(Section::Problems),
+                Normal,
+            ),
+            action(
+                "history",
+                "History",
+                "Review the authoritative change history.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+        ],
+        FeatureFamily::ArtworkExtras => vec![
+            action(
+                "artwork",
+                "Artwork",
+                "Manage covers and screenshots.",
+                Route::Section(Section::Artwork),
+                Normal,
+            ),
+            action(
+                "metadata",
+                "Metadata",
+                "Review metadata in the existing artwork workflow.",
+                Route::Section(Section::Artwork),
+                Normal,
+            ),
+            action(
+                "bezels",
+                "Bezels / Decorations",
+                "Open the existing artwork extras workflow.",
+                Route::Section(Section::Artwork),
+                Normal,
+            ),
+            action(
+                "manuals",
+                "Manuals / Guides",
+                "Open the existing document and artwork workflow.",
+                Route::Section(Section::Artwork),
+                Normal,
+            ),
+        ],
+        FeatureFamily::Conversion => vec![
+            action(
+                "easy-conversion",
+                "Easy Conversion",
+                "Open the verified conversion workflow.",
+                Route::Section(Section::Converter),
+                Easy,
+            ),
+            action(
+                "advanced-conversion",
+                "Advanced Conversion",
+                "Open the same conversion backend with its specialist controls.",
+                Route::Section(Section::Converter),
+                Advanced,
+            ),
+        ],
+        FeatureFamily::Organisation => vec![
+            action(
+                "easy-organiser",
+                "Easy Organiser",
+                "Choose a guided organisation workflow.",
+                Route::Section(Section::Build),
+                Easy,
+            ),
+            action(
+                "advanced-organiser",
+                "Advanced Organiser",
+                "Review specialist organisation options.",
+                Route::Section(Section::Build),
+                Advanced,
+            ),
+            action(
+                "playing-library",
+                "Playing Library",
+                "Open the existing playing-library projection.",
+                Route::Section(Section::Build),
+                Normal,
+            ),
+            action(
+                "history",
+                "History",
+                "Review the authoritative change history.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+        ],
+        FeatureFamily::ProblemsRepair => vec![
+            action(
+                "inbox",
+                "Problems Inbox",
+                "Review all currently known problems.",
+                Route::Section(Section::Problems),
+                Normal,
+            ),
+            action(
+                "repair",
+                "Repair",
+                "Preview safe repair paths without changing the backend model.",
+                Route::Section(Section::Problems),
+                Normal,
+            ),
+            action(
+                "history",
+                "History",
+                "Review repair history and undo options.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+        ],
+        FeatureFamily::SourcesProviders => vec![
+            action(
+                "local",
+                "Local Sources",
+                "Manage configured local game folders.",
+                Route::Section(Section::Sources),
+                Normal,
+            ),
+            action(
+                "dat-sources",
+                "DAT Sources",
+                "Manage trusted DAT sources.",
+                Route::Section(Section::Dat),
+                Normal,
+            ),
+            action(
+                "providers",
+                "Metadata Providers",
+                "Review provider configuration without merging concepts.",
+                Route::Section(Section::Sources),
+                Normal,
+            ),
+            action(
+                "romm",
+                "RomM",
+                "Browse the read-only RomM snapshot.",
+                Route::Section(Section::Romm),
+                Normal,
+            ),
+            action(
+                "remote-health",
+                "Remote Health",
+                "Review provider health in Sources.",
+                Route::Section(Section::Sources),
+                Normal,
+            ),
+        ],
+        FeatureFamily::HistoryUndo => vec![
+            action(
+                "history",
+                "History",
+                "Open the one authoritative history system.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+            action(
+                "activity",
+                "Activity",
+                "See current and recent work.",
+                Route::Section(Section::Activity),
+                Normal,
+            ),
+            action(
+                "undo",
+                "Undo",
+                "Review undo options in History.",
+                Route::Section(Section::History),
+                Normal,
+            ),
+        ],
+        FeatureFamily::AdvancedDiagnostics => vec![
+            action(
+                "advanced",
+                "Advanced Tools",
+                "Open specialist tools explicitly.",
+                Route::Section(Section::Advanced),
+                Advanced,
+            ),
+            action(
+                "diagnostics",
+                "Diagnostics",
+                "Review setup and diagnostic workflows.",
+                Route::Section(Section::Setup),
+                Normal,
+            ),
+            action(
+                "tape",
+                "Tape Inspector",
+                "Inspect supported tape media.",
+                Route::Section(Section::Tape),
+                Normal,
+            ),
+            action(
+                "settings",
+                "Settings",
+                "Adjust this interface without changing games.",
+                Route::Section(Section::Settings),
+                Normal,
+            ),
+        ],
     }
 }
 

@@ -1244,6 +1244,122 @@ fn gui_v2_every_sidebar_route_has_a_purpose_and_action() {
 }
 
 #[test]
+fn gui_v2_feature_families_have_unique_homes_and_cover_direct_routes() {
+    use routes::FeatureFamily;
+
+    let families = [
+        FeatureFamily::DatsVerification,
+        FeatureFamily::CheatsMods,
+        FeatureFamily::SavesStates,
+        FeatureFamily::Emulators,
+        FeatureFamily::Mame,
+        FeatureFamily::ArtworkExtras,
+        FeatureFamily::Conversion,
+        FeatureFamily::Organisation,
+        FeatureFamily::ProblemsRepair,
+        FeatureFamily::SourcesProviders,
+        FeatureFamily::HistoryUndo,
+        FeatureFamily::AdvancedDiagnostics,
+    ];
+    let homes = families
+        .iter()
+        .map(|family| routes::family_home(*family))
+        .collect::<Vec<_>>();
+    assert_eq!(homes.len(), families.len());
+    assert!(homes.windows(2).all(|window| window[0] != window[1]));
+
+    for section in routes::SECTIONS
+        .iter()
+        .copied()
+        .filter(|section| *section != Section::Home)
+    {
+        assert!(
+            routes::family_for_route(&Route::Section(section)).is_some(),
+            "unclassified route: {section:?}"
+        );
+    }
+}
+
+#[test]
+fn gui_v2_family_children_preserve_canonical_workflows() {
+    use routes::FeatureFamily;
+
+    let dat = routes::family_children(FeatureFamily::DatsVerification);
+    assert!(dat.iter().any(|action| action.label == "Check Games"));
+    assert!(dat.iter().any(|action| action.label == "Quick Rename"));
+    assert!(dat.iter().any(|action| action.label == "Advanced Rename"));
+    assert!(dat.iter().any(|action| action.label == "DAT Management"));
+
+    let cheats = routes::family_children(FeatureFamily::CheatsMods);
+    assert!(cheats.iter().any(|action| action.label == "Cheats"));
+    assert!(cheats.iter().any(|action| action.label == "Mods"));
+
+    let saves = routes::family_children(FeatureFamily::SavesStates);
+    for label in ["Saves", "Snapshots", "Restore", "Memory Cards"] {
+        assert!(
+            saves.iter().any(|action| action.label == label),
+            "missing saves action: {label}"
+        );
+    }
+
+    let emulators = routes::family_children(FeatureFamily::Emulators);
+    assert!(
+        emulators
+            .iter()
+            .any(|action| action.label == "Emulator Setup")
+    );
+    assert!(
+        emulators
+            .iter()
+            .any(|action| action.label == "BIOS / Firmware")
+    );
+    assert!(
+        routes::family_children(FeatureFamily::Mame)
+            .iter()
+            .any(|action| action.label == "Collection Health")
+    );
+    assert!(
+        routes::family_children(FeatureFamily::Conversion)
+            .iter()
+            .any(|action| action.route == Route::Section(Section::Converter))
+    );
+    assert!(
+        routes::family_children(FeatureFamily::Organisation)
+            .iter()
+            .any(|action| action.label == "Playing Library")
+    );
+    assert!(
+        routes::family_children(FeatureFamily::ProblemsRepair)
+            .iter()
+            .any(|action| action.route == Route::Section(Section::Problems))
+    );
+    assert_eq!(
+        routes::family_children(FeatureFamily::HistoryUndo)
+            .iter()
+            .filter(|action| action.route == Route::Section(Section::History))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn gui_v2_family_landing_render_is_paint_only_and_uses_family_breadcrumb() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = routes::family_home(routes::FeatureFamily::DatsVerification);
+    let before = app.activity.jobs.len();
+    let strings = text(&frame(&context, &mut app, [1280.0, 1000.0]));
+    assert!(strings.iter().any(|value| value == "DATs & Verification"));
+    assert!(strings.iter().any(|value| value == "Quick Rename · Easy"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Advanced Rename · Advanced")
+    );
+    assert_eq!(app.activity.jobs.len(), before);
+}
+
+#[test]
 fn gui_v2_saves_states_is_a_native_route_and_duplicate_refresh_is_refused() {
     assert!(routes::SECTIONS.contains(&Section::Saves));
     assert_eq!(Section::Saves.title(), "Saves & States");
