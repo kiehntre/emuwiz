@@ -611,6 +611,8 @@ pub mod mod_package_preview;
 /// provider provenance attached only after a strong local-package join.
 pub mod mod_history;
 
+/// Neutral, bank-aware classic microcomputer POKE cheat projections.
+pub mod classic_poke_family;
 /// Provider-neutral, metadata-only catalogue records for future mod sources.
 pub mod mod_catalogue;
 /// Provider-neutral, metadata-only discovery and user-acquisition handoff.

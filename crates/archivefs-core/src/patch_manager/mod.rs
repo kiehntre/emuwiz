@@ -166,6 +166,15 @@ pub use azahar_local::{
 
 use crate::{Database, PersistedArchive};
 
+pub use crate::classic_poke_family::{
+    POKE_MAX_LINES, POKE_MAX_OPERATIONS, POKE_MAX_TITLE_BYTES, PokeAddress, PokeBank, PokeCheat,
+    PokeCondition, PokeConflict, PokeConflictKind, PokeEmulatorCapability, PokeEmulatorProjection,
+    PokeIdentityState, PokeIssue, PokeMemorySpace, PokeOperation, PokeOriginalValue,
+    PokeParseError, PokePlatform, PokePlatformSemantics, PokeValue, find_poke_conflicts,
+    manual_poke, normalize_zx_pok_family, parse_simple_pokes, poke_apply_allowed,
+    poke_emulator_capabilities, poke_identity_state, poke_platform_semantics,
+};
+
 pub use crate::open_retro_cheat_providers::{
     LIBRETRO_CHEAT_URL, OpenCheatProvider, OpenCheatProviderMode, OpenCheatTrustState,
     WHDLOAD_OPTIONS_URL, WhdloadCustomOption, ZXDB_URL, ZxPokError, ZxPokOperation, ZxPokTrainer,
