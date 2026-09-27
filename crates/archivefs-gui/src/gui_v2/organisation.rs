@@ -1003,10 +1003,48 @@ impl App {
                 RomOrganisationPageAction::Rollback => self.start_canonical_organisation_job(
                     super::CanonicalOrganisationJobKind::Rollback,
                 ),
+                RomOrganisationPageAction::OpenAdvanced => {}
+                RomOrganisationPageAction::OpenDat => {}
+                RomOrganisationPageAction::OpenCheck => {}
+                RomOrganisationPageAction::OpenMame => {}
+                RomOrganisationPageAction::OpenHistory => {}
+                RomOrganisationPageAction::OpenGames => {}
             }
         }
         if let Some(action) = playing_action {
             self.handle_playing_library_action(action);
+        }
+    }
+
+    pub(super) fn quick_rename(&mut self, ui: &mut egui::Ui) {
+        self.invalidate_changed_canonical_organisation_plan();
+        let action = rom_organisation_page::show_quick_rename_page_with_busy(
+            ui,
+            &mut self.canonical_organisation,
+            self.canonical_organisation_job.is_some(),
+        );
+        if let Some(action) = action {
+            match action {
+                RomOrganisationPageAction::Preview => self
+                    .start_canonical_organisation_job(super::CanonicalOrganisationJobKind::Preview),
+                RomOrganisationPageAction::Apply => self
+                    .start_canonical_organisation_job(super::CanonicalOrganisationJobKind::Apply),
+                RomOrganisationPageAction::Rollback => self.start_canonical_organisation_job(
+                    super::CanonicalOrganisationJobKind::Rollback,
+                ),
+                RomOrganisationPageAction::OpenAdvanced => {
+                    self.organisation.view = OrganisationView::VerifiedGames;
+                    self.go(Route::Section(Section::Build));
+                }
+                RomOrganisationPageAction::OpenDat => self.go(Route::Section(Section::Dat)),
+                RomOrganisationPageAction::OpenCheck => self.go(Route::Section(Section::Check)),
+                RomOrganisationPageAction::OpenMame => {
+                    self.organisation.view = OrganisationView::MameNormalizer;
+                    self.go(Route::Section(Section::Build));
+                }
+                RomOrganisationPageAction::OpenHistory => self.go(Route::Section(Section::History)),
+                RomOrganisationPageAction::OpenGames => self.go(Route::Section(Section::Games)),
+            }
         }
     }
 }

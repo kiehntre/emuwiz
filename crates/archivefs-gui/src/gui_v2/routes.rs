@@ -730,6 +730,7 @@ pub(super) enum Route {
     Home,
     Section(Section),
     Game(i64),
+    QuickRename,
     Task {
         section: Section,
         game: i64,
@@ -742,6 +743,7 @@ impl Route {
             Self::Home => Section::Home,
             Self::Section(section) | Self::Task { section, .. } => *section,
             Self::Game(_) => Section::Games,
+            Self::QuickRename => Section::Dat,
         }
     }
     pub fn game(&self) -> Option<i64> {
@@ -755,6 +757,9 @@ impl Route {
 /// Presentation-only location labels for the app chrome. Navigation remains
 /// owned by `Route` and `Router`.
 pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<String> {
+    if matches!(route, Route::QuickRename) {
+        return vec!["DATs & Verification".into(), "Quick Rename".into()];
+    }
     let section = route.section();
     let mut labels = match section {
         Section::Check | Section::Dat => vec!["DATs & Verification".into()],
@@ -801,6 +806,11 @@ mod tests {
             ),
             ["Cheats & Mods", "Mods & Cheats", "Pac-Man"]
         );
+        assert_eq!(
+            breadcrumb_labels(&Route::QuickRename, None),
+            ["DATs & Verification", "Quick Rename"]
+        );
+        assert_eq!(Route::QuickRename.section(), Section::Dat);
     }
 }
 

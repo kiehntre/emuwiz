@@ -396,6 +396,7 @@ impl App {
                         Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
                         Route::Section(Section::Mods) => self.mods_page(ui, None),
                         Route::Section(Section::Check) => self.check_games(ui),
+                        Route::QuickRename => self.quick_rename(ui),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
                         Route::Section(Section::Problems) => self.problems(ui),
                         Route::Section(Section::Build) => self.organisation_page(ui),
@@ -491,7 +492,7 @@ impl App {
                 section: Section::Advanced,
                 ..
             } => GuidancePage::ArchiveInspector,
-            Route::Section(Section::Dat) => GuidancePage::DatManagement,
+            Route::Section(Section::Dat) | Route::QuickRename => GuidancePage::DatManagement,
             Route::Section(Section::Firmware) => GuidancePage::BiosFirmware,
             Route::Section(Section::Emulators) => GuidancePage::EmulatorSetup,
             _ => GuidancePage::Home,
@@ -1135,6 +1136,9 @@ impl App {
 
     fn check_games_content(&mut self, ui: &mut egui::Ui) {
         ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here.");
+        if ui.button("Quick Rename verified games").clicked() {
+            self.go(Route::QuickRename);
+        }
         if self.check_platform.is_none() {
             ui.heading("Choose a platform");
             for (platform, count) in self.library.platforms.clone() {
@@ -2207,6 +2211,12 @@ impl App {
     }
 
     fn dat_sources(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Need to rename verified files to their trusted DAT names?");
+            if ui.button("Quick Rename").clicked() {
+                self.go(Route::QuickRename);
+            }
+        });
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));

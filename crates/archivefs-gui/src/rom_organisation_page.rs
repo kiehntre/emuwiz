@@ -257,6 +257,25 @@ impl RomOrganisationPageState {
         self.plan = None;
     }
 
+    pub(crate) fn ensure_mode(&mut self, mode: OrganisationMode) {
+        if self.mode != mode {
+            self.set_mode(mode);
+        }
+    }
+
+    pub(crate) fn restrict_quick_rename_approvals(&mut self) {
+        let Some(plan) = &self.plan else {
+            return;
+        };
+        self.approved.retain(|source| {
+            plan.entries.iter().any(|entry| {
+                entry.status == OrganisationStatus::Suggested
+                    && entry.source_path.to_string_lossy() == source.as_str()
+                    && !entry.platform_display_name.eq_ignore_ascii_case("Arcade")
+            })
+        });
+    }
+
     /// Saves the master ROM root draft (or clears it). Configuring a root
     /// never moves anything by itself.
     pub(crate) fn save_master_root(&mut self) {
@@ -886,6 +905,12 @@ pub(crate) enum RomOrganisationPageAction {
     Preview,
     Apply,
     Rollback,
+    OpenAdvanced,
+    OpenDat,
+    OpenCheck,
+    OpenMame,
+    OpenHistory,
+    OpenGames,
 }
 
 pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrganisationPageState) {
@@ -897,6 +922,12 @@ pub(crate) fn show_rom_organisation_page(ui: &mut egui::Ui, state: &mut RomOrgan
             }
             RomOrganisationPageAction::Apply => state.apply(),
             RomOrganisationPageAction::Rollback => state.rollback(),
+            RomOrganisationPageAction::OpenAdvanced => {}
+            RomOrganisationPageAction::OpenDat => {}
+            RomOrganisationPageAction::OpenCheck => {}
+            RomOrganisationPageAction::OpenMame => {}
+            RomOrganisationPageAction::OpenHistory => {}
+            RomOrganisationPageAction::OpenGames => {}
         }
     }
 }
@@ -906,6 +937,26 @@ pub(crate) fn show_rom_organisation_page_with_busy(
     state: &mut RomOrganisationPageState,
     async_busy: bool,
     canonical_only: bool,
+) -> Option<RomOrganisationPageAction> {
+    show_rom_organisation_page_with_options(ui, state, async_busy, canonical_only, false)
+}
+
+pub(crate) fn show_quick_rename_page_with_busy(
+    ui: &mut egui::Ui,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+) -> Option<RomOrganisationPageAction> {
+    state.ensure_mode(OrganisationMode::RenameInPlace);
+    state.restrict_quick_rename_approvals();
+    show_rom_organisation_page_with_options(ui, state, async_busy, true, true)
+}
+
+fn show_rom_organisation_page_with_options(
+    ui: &mut egui::Ui,
+    state: &mut RomOrganisationPageState,
+    async_busy: bool,
+    canonical_only: bool,
+    quick_only: bool,
 ) -> Option<RomOrganisationPageAction> {
     let mut page_action = None;
     // See `RomOrganisationPageState::pending_preview`: this runs the actual
@@ -934,7 +985,13 @@ pub(crate) fn show_rom_organisation_page_with_busy(
         });
         return page_action;
     }
-    if canonical_only {
+    if quick_only {
+        widgets::workflow_header(
+            ui,
+            "Quick Rename",
+            "Rename verified games to their trusted DAT names. Nothing changes until you review the preview.",
+        );
+    } else if canonical_only {
         widgets::workflow_header(
             ui,
             "Organise verified games",
@@ -953,7 +1010,27 @@ pub(crate) fn show_rom_organisation_page_with_busy(
             "Create clean libraries for RomM, ES-DE, RetroDECK or Generic.",
         );
     }
-    ui.weak("1. Choose output   /   2. Choose destination   /   3. Preview   /   4. Apply");
+    if quick_only {
+        ui.weak("1. Choose scope   /   2. Preview   /   3. Confirm   /   4. Apply");
+        ui.label("Quick Rename uses Rename in place. File contents are not changed.");
+        ui.label("Scope: All verified games. Unsupported multi-disc or archive cases stay blocked for Advanced Rename.");
+        ui.label("MAME collections use the dedicated MAME tools.");
+        if widgets::action_button(ui, "Advanced Rename", widgets::ActionStyle::Secondary, true)
+            .clicked()
+        {
+            page_action = Some(RomOrganisationPageAction::OpenAdvanced);
+        }
+        if widgets::action_button(ui, "Manage DATs", widgets::ActionStyle::Quiet, true).clicked() {
+            page_action = Some(RomOrganisationPageAction::OpenDat);
+        }
+        if widgets::action_button(ui, "Open MAME tools", widgets::ActionStyle::Quiet, true)
+            .clicked()
+        {
+            page_action = Some(RomOrganisationPageAction::OpenMame);
+        }
+    } else {
+        ui.weak("1. Choose output   /   2. Choose destination   /   3. Preview   /   4. Apply");
+    }
 
     if !canonical_only {
         ui.horizontal(|ui| {
@@ -1169,32 +1246,34 @@ pub(crate) fn show_rom_organisation_page_with_busy(
         });
     }
 
-    ui.add_space(8.0);
-    widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Organisation mode").strong());
-        for mode in [
-            OrganisationMode::RenameInPlace,
-            OrganisationMode::MoveRealFile,
-            OrganisationMode::BuildLinkedLibrary,
-            OrganisationMode::OrganiseSymlinkOnly,
-        ] {
-            let selected = state.mode == mode;
-            if ui
-                .radio(selected, organisation_mode_plain_label(mode))
-                .clicked()
-            {
-                state.set_mode(mode);
+    if !quick_only {
+        ui.add_space(8.0);
+        widgets::card(ui, |ui| {
+            ui.label(egui::RichText::new("Organisation mode").strong());
+            for mode in [
+                OrganisationMode::RenameInPlace,
+                OrganisationMode::MoveRealFile,
+                OrganisationMode::BuildLinkedLibrary,
+                OrganisationMode::OrganiseSymlinkOnly,
+            ] {
+                let selected = state.mode == mode;
+                if ui
+                    .radio(selected, organisation_mode_plain_label(mode))
+                    .clicked()
+                {
+                    state.set_mode(mode);
+                }
             }
-        }
-        ui.label(
-            egui::RichText::new(organisation_mode_plain_explanation(state.mode))
-                .color(theme::muted(ui)),
-        );
-        ui.label(
-            egui::RichText::new("Modes are separate choices and are never combined.")
-                .color(theme::muted(ui)),
-        );
-    });
+            ui.label(
+                egui::RichText::new(organisation_mode_plain_explanation(state.mode))
+                    .color(theme::muted(ui)),
+            );
+            ui.label(
+                egui::RichText::new("Modes are separate choices and are never combined.")
+                    .color(theme::muted(ui)),
+            );
+        });
+    }
 
     ui.add_space(8.0);
     widgets::card(ui, |ui| {
@@ -1252,16 +1331,42 @@ pub(crate) fn show_rom_organisation_page_with_busy(
 
     if let Some(plan) = state.plan.clone() {
         ui.add_space(8.0);
-        show_plan(ui, &plan, state, async_busy, &mut page_action);
+        show_plan(ui, &plan, state, async_busy, &mut page_action, quick_only);
     }
 
     if let Some(message) = &state.result_message {
         ui.add_space(8.0);
         widgets::banner(ui, "Result", message, widgets::StatusTone::Success);
+        if quick_only && let Some(transaction) = state.applied() {
+            ui.label(format!("Renamed: {}", transaction.applied_count()));
+            ui.label(format!("Skipped: {}", transaction.skipped_count()));
+            ui.label(format!("Failed: {}", transaction.failed_count()));
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(ui, "View changes", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    page_action = Some(RomOrganisationPageAction::OpenHistory);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Back to Games",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                {
+                    page_action = Some(RomOrganisationPageAction::OpenGames);
+                }
+            });
+        }
         if state.applied.is_some()
             && widgets::action_button(
                 ui,
-                "Roll back this organisation",
+                if quick_only {
+                    "Undo"
+                } else {
+                    "Roll back this organisation"
+                },
                 widgets::ActionStyle::Secondary,
                 !async_busy,
             )
@@ -1397,8 +1502,16 @@ fn show_plan(
     state: &mut RomOrganisationPageState,
     async_busy: bool,
     page_action: &mut Option<RomOrganisationPageAction>,
+    quick_only: bool,
 ) {
-    let suggested_count = plan.suggested().count();
+    let suggested_count = plan
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.status == OrganisationStatus::Suggested
+                && (!quick_only || !entry.platform_display_name.eq_ignore_ascii_case("Arcade"))
+        })
+        .count();
     let blocked_count = plan
         .entries
         .iter()
@@ -1406,7 +1519,9 @@ fn show_plan(
             matches!(
                 entry.status,
                 OrganisationStatus::Conflict | OrganisationStatus::Blocked
-            )
+            ) || (quick_only
+                && entry.status == OrganisationStatus::Suggested
+                && entry.platform_display_name.eq_ignore_ascii_case("Arcade"))
         })
         .count();
     // Needs-attention also folds in entries the current mode cannot support
@@ -1429,25 +1544,58 @@ fn show_plan(
         // reading every row: already correct / will change / blocked or
         // needs attention, using only the plan's own existing statuses.
         ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(
-                ui,
-                format!("{already_correct_count} already correct"),
-                widgets::StatusTone::Success,
-            );
-            widgets::status_badge(
-                ui,
-                format!("{suggested_count} will change"),
-                widgets::StatusTone::Info,
-            );
-            widgets::status_badge(
-                ui,
-                format!("{attention_count} blocked or need attention"),
-                if attention_count == 0 {
-                    widgets::StatusTone::Success
-                } else {
-                    widgets::StatusTone::Blocked
-                },
-            );
+            if quick_only {
+                widgets::status_badge(
+                    ui,
+                    format!("Ready to rename: {suggested_count}"),
+                    widgets::StatusTone::Info,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("Already correct: {already_correct_count}"),
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("Blocked: {blocked_count}"),
+                    if blocked_count == 0 {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Blocked
+                    },
+                );
+                widgets::status_badge(
+                    ui,
+                    format!(
+                        "Needs review: {}",
+                        plan.entries
+                            .iter()
+                            .filter(|entry| entry.status == OrganisationStatus::Unsupported)
+                            .count()
+                    ),
+                    widgets::StatusTone::Pending,
+                );
+            } else {
+                widgets::status_badge(
+                    ui,
+                    format!("{already_correct_count} already correct"),
+                    widgets::StatusTone::Success,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("{suggested_count} will change"),
+                    widgets::StatusTone::Info,
+                );
+                widgets::status_badge(
+                    ui,
+                    format!("{attention_count} blocked or need attention"),
+                    if attention_count == 0 {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Blocked
+                    },
+                );
+            }
         });
         ui.label(format!("{suggested_count} file(s) selected"));
         ui.label(format!("{blocked_count} blocker(s)"));
@@ -1470,113 +1618,215 @@ fn show_plan(
         .filter(|entry| state.filter.is_none_or(|f| entry.status == f))
         .collect();
 
-    ui.horizontal(|ui| {
-        ui.label("Filter:");
-        let all = state.filter.is_none();
-        if ui.selectable_label(all, "All").clicked() {
-            state.set_filter(None);
-        }
-        for status in [
-            OrganisationStatus::Suggested,
-            OrganisationStatus::AlreadyOrganised,
-            OrganisationStatus::Conflict,
-            OrganisationStatus::Blocked,
-            OrganisationStatus::Unsupported,
-        ] {
-            let selected = state.filter == Some(status);
-            if ui.selectable_label(selected, status.label()).clicked() {
-                state.set_filter(if selected { None } else { Some(status) });
+    if !quick_only {
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            let all = state.filter.is_none();
+            if ui.selectable_label(all, "All").clicked() {
+                state.set_filter(None);
             }
-        }
-    });
+            for status in [
+                OrganisationStatus::Suggested,
+                OrganisationStatus::AlreadyOrganised,
+                OrganisationStatus::Conflict,
+                OrganisationStatus::Blocked,
+                OrganisationStatus::Unsupported,
+            ] {
+                let selected = state.filter == Some(status);
+                if ui.selectable_label(selected, status.label()).clicked() {
+                    state.set_filter(if selected { None } else { Some(status) });
+                }
+            }
+        });
+    }
     ui.add_space(4.0);
 
     for entry in &entries {
-        ui.horizontal(|ui| {
-            match entry.status {
-                OrganisationStatus::Suggested => {
-                    let mut approved = state
-                        .approved
-                        .contains(&entry.source_path.to_string_lossy().into_owned());
-                    if ui.checkbox(&mut approved, "").changed() {
-                        state.toggle_approved(&entry.source_path.to_string_lossy());
+        ui.push_id(("quick-rename-entry", &entry.source_path), |ui| {
+            ui.horizontal(|ui| {
+                match entry.status {
+                    OrganisationStatus::Suggested
+                        if !quick_only
+                            || !entry.platform_display_name.eq_ignore_ascii_case("Arcade") =>
+                    {
+                        let mut approved = state
+                            .approved
+                            .contains(&entry.source_path.to_string_lossy().into_owned());
+                        if ui.checkbox(&mut approved, "").changed() {
+                            state.toggle_approved(&entry.source_path.to_string_lossy());
+                        }
+                    }
+                    _ => {
+                        ui.add_space(20.0);
                     }
                 }
-                _ => {
-                    ui.add_space(20.0);
-                }
-            }
-            widgets::status_badge(ui, entry.status.label(), status_tone(entry.status));
-            if plan.mode == OrganisationMode::BuildLinkedLibrary {
-                // Linked-library preview: make the semantics painfully
-                // obvious. Never worded as a Rename or Move.
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Source: {}", entry.source_path.display()))
-                            .monospace(),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Destination link: {}",
-                            entry.destination_path.display()
-                        ))
-                        .monospace(),
-                    );
-                    ui.label("Source action: Untouched");
-                    ui.label(format!("Result: {}", linked_library_preview_result(entry)));
-                    if !entry.platform_display_name.is_empty() {
+                let quick_mame = quick_only
+                    && entry.status == OrganisationStatus::Suggested
+                    && entry.platform_display_name.eq_ignore_ascii_case("Arcade");
+                widgets::status_badge(
+                    ui,
+                    if quick_mame {
+                        "MAME tools"
+                    } else {
+                        entry.status.label()
+                    },
+                    if quick_mame {
+                        widgets::StatusTone::Pending
+                    } else {
+                        status_tone(entry.status)
+                    },
+                );
+                if plan.mode == OrganisationMode::BuildLinkedLibrary {
+                    // Linked-library preview: make the semantics painfully
+                    // obvious. Never worded as a Rename or Move.
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("Source: {}", entry.source_path.display()))
+                                .monospace(),
+                        );
                         ui.label(
                             egui::RichText::new(format!(
-                                "{} · {}",
-                                entry.platform_display_name, entry.platform_source
-                            ))
-                            .color(theme::muted(ui)),
-                        );
-                    }
-                });
-            } else {
-                ui.vertical(|ui| {
-                    ui.label(format!("Current: {}", entry.source_path.display()));
-                    ui.label(format!("Will become: {}", entry.destination_path.display()));
-                    if !entry.platform_display_name.is_empty() {
-                        ui.label(format!(
-                            "Reason: Verified for {}",
-                            entry.platform_display_name
-                        ));
-                    }
-                    ui.label(match plan.mode {
-                        OrganisationMode::RenameInPlace => "Action: Rename file",
-                        OrganisationMode::MoveRealFile => "Action: Move file",
-                        OrganisationMode::OrganiseSymlinkOnly => "Action: Move existing link",
-                        OrganisationMode::BuildLinkedLibrary => "Action: Create link",
-                    });
-                    if let Some(reason) = &entry.reason {
-                        ui.label(
-                            egui::RichText::new(reason)
-                                .color(widgets::StatusTone::Blocked.color(ui))
-                                .small(),
-                        );
-                    }
-                    widgets::technical_details(
-                        ui,
-                        ("organisation_entry", &entry.source_path),
-                        |ui| {
-                            ui.label(format!("Platform evidence: {}", entry.platform_source));
-                            ui.label(format!("Source path: {}", entry.source_path.display()));
-                            ui.label(format!(
-                                "Destination path: {}",
+                                "Destination link: {}",
                                 entry.destination_path.display()
+                            ))
+                            .monospace(),
+                        );
+                        ui.label("Source action: Untouched");
+                        ui.label(format!("Result: {}", linked_library_preview_result(entry)));
+                        if !entry.platform_display_name.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} · {}",
+                                    entry.platform_display_name, entry.platform_source
+                                ))
+                                .color(theme::muted(ui)),
+                            );
+                        }
+                    });
+                } else if quick_only {
+                    ui.vertical(|ui| {
+                        ui.label(format!("Current: {}", entry.source_path.display()));
+                        if quick_mame {
+                            ui.label("MAME collections use the dedicated MAME tools.");
+                        } else {
+                            ui.label(format!("Rename to: {}", entry.destination_path.display()));
+                            ui.label(format!("Identity: Verified by {}", entry.platform_source));
+                        }
+                        ui.label(format!("Status: {}", entry.status.label()));
+                        if let Some(reason) = &entry.reason {
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .color(widgets::StatusTone::Blocked.color(ui))
+                                    .small(),
+                            );
+                        }
+                        if quick_mame {
+                            if widgets::action_button(
+                                ui,
+                                "Open MAME tools",
+                                widgets::ActionStyle::Quiet,
+                                true,
+                            )
+                            .clicked()
+                            {
+                                *page_action = Some(RomOrganisationPageAction::OpenMame);
+                            }
+                        } else if matches!(
+                            entry.status,
+                            OrganisationStatus::Conflict
+                                | OrganisationStatus::Blocked
+                                | OrganisationStatus::Unsupported
+                        ) && widgets::action_button(
+                            ui,
+                            "Review in Advanced Rename",
+                            widgets::ActionStyle::Quiet,
+                            true,
+                        )
+                        .clicked()
+                        {
+                            *page_action = Some(RomOrganisationPageAction::OpenAdvanced);
+                        }
+                    });
+                } else {
+                    ui.vertical(|ui| {
+                        ui.label(format!("Current: {}", entry.source_path.display()));
+                        ui.label(format!("Will become: {}", entry.destination_path.display()));
+                        if !entry.platform_display_name.is_empty() {
+                            ui.label(format!(
+                                "Reason: Verified for {}",
+                                entry.platform_display_name
                             ));
-                        },
-                    );
-                });
-            }
+                        }
+                        ui.label(match plan.mode {
+                            OrganisationMode::RenameInPlace => "Action: Rename file",
+                            OrganisationMode::MoveRealFile => "Action: Move file",
+                            OrganisationMode::OrganiseSymlinkOnly => "Action: Move existing link",
+                            OrganisationMode::BuildLinkedLibrary => "Action: Create link",
+                        });
+                        if let Some(reason) = &entry.reason {
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .color(widgets::StatusTone::Blocked.color(ui))
+                                    .small(),
+                            );
+                        }
+                        if !quick_only {
+                            widgets::technical_details(
+                                ui,
+                                ("organisation_entry", &entry.source_path),
+                                |ui| {
+                                    ui.label(format!(
+                                        "Platform evidence: {}",
+                                        entry.platform_source
+                                    ));
+                                    ui.label(format!(
+                                        "Source path: {}",
+                                        entry.source_path.display()
+                                    ));
+                                    ui.label(format!(
+                                        "Destination path: {}",
+                                        entry.destination_path.display()
+                                    ));
+                                },
+                            );
+                        }
+                    });
+                }
+            });
         });
     }
 
     let suggested = suggested_count;
     ui.add_space(8.0);
     let approved = state.approved.len();
+    if quick_only && suggested == 0 {
+        widgets::card(ui, |ui| {
+            ui.strong("No verified renames are available right now.");
+            ui.label("Files may already use trusted names, still need verification, or require specialist handling.");
+            ui.horizontal_wrapped(|ui| {
+                if widgets::action_button(ui, "Check Games", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    *page_action = Some(RomOrganisationPageAction::OpenCheck);
+                }
+                if widgets::action_button(ui, "Manage DATs", widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    *page_action = Some(RomOrganisationPageAction::OpenDat);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Advanced Rename",
+                    widgets::ActionStyle::Secondary,
+                    true,
+                )
+                .clicked()
+                {
+                    *page_action = Some(RomOrganisationPageAction::OpenAdvanced);
+                }
+            });
+        });
+    }
     let applyable = suggested > 0 && approved > 0;
     if widgets::action_button(
         ui,

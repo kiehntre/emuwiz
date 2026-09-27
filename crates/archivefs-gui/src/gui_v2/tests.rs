@@ -142,6 +142,43 @@ fn gui_v2_top_toolbar_exposes_core_mouse_routes() {
 }
 
 #[test]
+fn gui_v2_quick_rename_is_a_native_dat_child_route() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::QuickRename;
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+
+    for expected in [
+        "Quick Rename",
+        "DATs & Verification",
+        "Rename verified games to their trusted DAT names.",
+        "Advanced Rename",
+        "Manage DATs",
+        "Open MAME tools",
+        "Games",
+    ] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "missing {expected}"
+        );
+    }
+    assert!(!strings.iter().any(|value| value == "Organisation mode"));
+}
+
+#[test]
+fn gui_v2_dat_page_offers_the_same_quick_rename_route() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Dat);
+    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    assert!(strings.iter().any(|value| value == "Quick Rename"));
+    assert_eq!(
+        routes::breadcrumb_labels(&Route::QuickRename, None),
+        ["DATs & Verification", "Quick Rename"]
+    );
+}
+
+#[test]
 fn gui_v2_organisation_landing_uses_user_intents() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
