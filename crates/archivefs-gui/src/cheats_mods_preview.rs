@@ -1006,10 +1006,8 @@ pub(crate) fn show_shared_transaction_readiness(
             ui.label(match report.adapter {
                 PreviewAdapter::Dolphin => "This Dolphin GameSettings file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected codes are staged in this exact preview.",
                 PreviewAdapter::DuckStation => "This DuckStation CHT file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected codes are staged for the verified serial.",
-                PreviewAdapter::MelonDs => "This melonDS MCH file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected ROM identity is verified.",
                 PreviewAdapter::Xenia => "This Xenia patch.toml file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected patches are staged in this exact preview.",
                 PreviewAdapter::Mame => "This native MAME XML file has a reviewed shared apply and rollback contract. MAME expressions remain native and may still require runtime enabling.",
-                PreviewAdapter::Flycast => "This native Flycast .cht file has a reviewed shared apply and rollback contract. Direct writes are normalized where proven; other native operations remain opaque.",
                 _ => "RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected per-game catalogue source is materialized in this exact preview.",
             });
             ui.label(format!(
@@ -1617,6 +1615,13 @@ pub(crate) fn show_cheats_mods_page(
             show_saturn_action_replay_preview(ui);
             ui.add_space(theme::SECTION_GAP);
         }
+        if workflow.platform.as_deref().is_some_and(|platform| {
+            let platform = platform.to_ascii_lowercase();
+            platform.contains("3ds") || platform.contains("nintendo 3ds")
+        }) {
+            show_three_ds_cheat_preview(ui);
+            ui.add_space(theme::SECTION_GAP);
+        }
         match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => {
                 action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
@@ -1843,5 +1848,51 @@ fn show_saturn_action_replay_preview(ui: &mut egui::Ui) {
             ui.colored_label(egui::Color32::YELLOW, format!("Review: {issue:?}"));
         }
         ui.small("Exact disc/product/revision evidence is required before any future runtime action. Conditional and master codes stay visible but are not guessed.");
+    });
+}
+
+fn show_three_ds_cheat_preview(ui: &mut egui::Ui) {
+    widgets::section_header(
+        ui,
+        "Azahar / Citra 3DS cheat preview",
+        Some("Paste a local Gateway-format file to inspect it. No title or content is changed."),
+    );
+    let id = egui::Id::new("three_ds_cheat_preview_text");
+    let mut text = ui
+        .ctx()
+        .data(|data| data.get_temp::<String>(id).unwrap_or_default());
+    ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .desired_rows(4)
+            .hint_text("[Infinite HP]\n00123456 000000FF"),
+    );
+    ui.ctx().data_mut(|data| data.insert_temp(id, text.clone()));
+    if text.trim().is_empty() {
+        ui.label("No cheat file entered.");
+        return;
+    }
+    let file = archivefs_core::patch_manager::parse_three_ds_cheat_file("0004000000000000", &text);
+    widgets::card(ui, |ui| {
+        ui.label(format!(
+            "Title ID: {} · Status: {:?}",
+            file.title_id, file.readiness
+        ));
+        for entry in file.entries.iter().take(16) {
+            ui.label(format!(
+                "{} · {} operation(s) · {}",
+                entry.name,
+                entry.codes.iter().filter(|c| c.operation.is_some()).count(),
+                if entry.enabled { "enabled" } else { "disabled" }
+            ));
+            for code in &entry.codes {
+                if let Some(issue) = &code.issue {
+                    ui.colored_label(egui::Color32::YELLOW, format!("Opaque: {issue:?}"));
+                }
+            }
+        }
+        for issue in file.issues.iter().take(8) {
+            ui.colored_label(egui::Color32::YELLOW, format!("Review: {issue:?}"));
+        }
+        ui.small("Exact 3DS title ID and update evidence are required before any future Apply. Gateway control codes remain visible but are not guessed.");
     });
 }

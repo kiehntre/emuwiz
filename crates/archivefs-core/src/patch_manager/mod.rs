@@ -121,6 +121,7 @@ mod shared_preview;
 mod shared_transaction;
 mod snes9x_local;
 mod stella_local;
+mod three_ds_cheat;
 mod tsugaru_local;
 mod user_cheat_import;
 mod vice_local;
@@ -942,6 +943,13 @@ pub use stella_local::{
     StellaLaunchBlockerKind, StellaNativeLaunchBinding, StellaProfile, StellaProfileDiscovery,
     StellaProfileDiscoveryRoots, discover_stella_profiles, parse_stella_version,
     resolve_stella_native_launch_binding,
+};
+pub use three_ds_cheat::{
+    THREE_DS_CHEAT_MAX_BYTES, THREE_DS_CHEAT_MAX_ENTRIES, THREE_DS_CHEAT_MAX_LINES,
+    ThreeDsCheatCode, ThreeDsCheatEntry, ThreeDsCheatFile, ThreeDsCheatIssue,
+    ThreeDsCheatReadiness, ThreeDsCheatState, ThreeDsCheatVersion, assess_three_ds_version,
+    merge_three_ds_cheat_file, parse_three_ds_cheat_file, render_three_ds_cheat_file,
+    three_ds_cheat_document,
 };
 pub use tsugaru_local::{
     TSUGARU_EXECUTABLE_NAME, TSUGARU_FIRMWARE_DIRECTORY_ENV, TSUGARU_ROM_DIRECTORY_ENV,
