@@ -216,6 +216,22 @@ impl CheatCompatibilityOperation {
                 write(*address, 2, u32::from(*value), false)
             }
             CheatOperation::Write32 { address, value } => write(*address, 4, *value, false),
+            CheatOperation::ConditionalWrite8 {
+                address,
+                value,
+                compare,
+            } => Self::Write(CheatMemoryRange {
+                address: *address,
+                width_bytes: 1,
+                value: Some(u32::from(*value)),
+                condition: CheatCondition::MemoryEquals {
+                    address: *address,
+                    width_bytes: 1,
+                    value: u32::from(*compare),
+                },
+                continuous: false,
+                pointer_based: false,
+            }),
             CheatOperation::OnFrameWrite8 { address, value } => {
                 write(*address, 1, u32::from(*value), true)
             }

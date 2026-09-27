@@ -1794,3 +1794,24 @@ fn the_page_header_shows_its_icon_alongside_the_title() {
     assert!(rendered_text_contains(&output, crate::ui::icons::CHEATS));
     assert!(rendered_text_contains(&output, "Cheat sources"));
 }
+
+#[test]
+fn game_genie_preview_renders_game_boy_compare_guidance_without_apply() {
+    let view = fresh("game-genie-preview").view();
+    let mut ui_state = CheatSourcesPageUi {
+        game_genie_input: "068-5FF-E66".into(),
+        game_genie_platform: archivefs_core::patch_manager::GameGeniePlatform::GameBoy,
+        ..CheatSourcesPageUi::default()
+    };
+    let output = render_with(&view, &mut ui_state, false);
+    assert!(rendered_text_contains(
+        &output,
+        "Classic Game Genie preview"
+    ));
+    assert!(rendered_text_contains(&output, "Compare: 0x03"));
+    assert!(rendered_text_contains(&output, "unverified ROM revision"));
+    assert!(rendered_text_contains(
+        &output,
+        "No ROM patch or hidden apply"
+    ));
+}

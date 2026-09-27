@@ -44,6 +44,11 @@ pub enum CheatOperation {
         address: u64,
         value: u32,
     },
+    ConditionalWrite8 {
+        address: u64,
+        value: u8,
+        compare: u8,
+    },
     OnFrameWrite8 {
         address: u64,
         value: u8,
@@ -350,6 +355,7 @@ pub fn encode_ds_action_replay_operation(operation: &CheatOperation) -> Option<S
         | CheatOperation::OnFrameWrite8 { .. }
         | CheatOperation::OnFrameWrite16 { .. }
         | CheatOperation::OnFrameWrite32 { .. }
+        | CheatOperation::ConditionalWrite8 { .. }
         | CheatOperation::UnsupportedRaw { .. } => None,
     }
 }
@@ -627,7 +633,9 @@ pub fn encode_operation(operation: &CheatOperation, target: &CheatTargetFormat) 
         CheatOperation::OnFrameWrite8 { .. }
         | CheatOperation::OnFrameWrite16 { .. }
         | CheatOperation::OnFrameWrite32 { .. } => return None,
-        CheatOperation::UnsupportedRaw { .. } => return None,
+        CheatOperation::ConditionalWrite8 { .. } | CheatOperation::UnsupportedRaw { .. } => {
+            return None;
+        }
     };
     match target {
         CheatTargetFormat::DolphinActionReplay | CheatTargetFormat::Gecko => {
@@ -644,7 +652,8 @@ pub fn encode_operation(operation: &CheatOperation, target: &CheatTargetFormat) 
                 CheatOperation::OnFrameWrite8 { .. }
                 | CheatOperation::OnFrameWrite16 { .. }
                 | CheatOperation::OnFrameWrite32 { .. } => return None,
-                CheatOperation::UnsupportedRaw { .. } => return None,
+                CheatOperation::ConditionalWrite8 { .. }
+                | CheatOperation::UnsupportedRaw { .. } => return None,
             };
             let rendered = match operation {
                 CheatOperation::Write8 { value, .. } => format!("{value:02X}"),
@@ -653,7 +662,8 @@ pub fn encode_operation(operation: &CheatOperation, target: &CheatTargetFormat) 
                 CheatOperation::OnFrameWrite8 { .. }
                 | CheatOperation::OnFrameWrite16 { .. }
                 | CheatOperation::OnFrameWrite32 { .. } => return None,
-                CheatOperation::UnsupportedRaw { .. } => return None,
+                CheatOperation::ConditionalWrite8 { .. }
+                | CheatOperation::UnsupportedRaw { .. } => return None,
             };
             Some(format!("patch=1,EE,{address:08X},{width},{rendered}"))
         }
@@ -673,7 +683,9 @@ fn encode_on_frame_operation(operation: &CheatOperation) -> Option<String> {
         CheatOperation::Write8 { .. }
         | CheatOperation::Write16 { .. }
         | CheatOperation::Write32 { .. } => return None,
-        CheatOperation::UnsupportedRaw { .. } => return None,
+        CheatOperation::ConditionalWrite8 { .. } | CheatOperation::UnsupportedRaw { .. } => {
+            return None;
+        }
     };
     (address <= u64::from(u32::MAX)).then(|| format!("0x{address:08X}:{kind}:0x{value:08X}"))
 }
@@ -879,6 +891,15 @@ fn semantic_fingerprint(document: &CheatDocument) -> Option<String> {
                 hash.update(b"write32\0");
                 hash.update(address.to_le_bytes());
                 hash.update(value.to_le_bytes());
+            }
+            CheatOperation::ConditionalWrite8 {
+                address,
+                value,
+                compare,
+            } => {
+                hash.update(b"conditional8\0");
+                hash.update(address.to_le_bytes());
+                hash.update([*value, *compare]);
             }
             CheatOperation::OnFrameWrite8 { address, value } => {
                 hash.update(b"onframe8\0");
