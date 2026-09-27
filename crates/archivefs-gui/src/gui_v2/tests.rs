@@ -124,6 +124,45 @@ fn gui_v2_converter_is_a_native_workflow() {
 }
 
 #[test]
+fn gui_v2_top_toolbar_exposes_core_mouse_routes() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    for expected in [
+        "Home",
+        "Games",
+        "Check",
+        "Organisation",
+        "DAT",
+        "Setup & Doctor",
+    ] {
+        assert!(
+            strings.iter().any(|value| value == expected),
+            "missing top route: {expected}"
+        );
+    }
+}
+
+#[test]
+fn gui_v2_organisation_landing_uses_user_intents() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    for expected in [
+        "Rename verified games",
+        "Build a clean playing library",
+        "Fix my MAME library",
+        "Analyse MAME collection",
+    ] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "missing organisation intent: {expected}"
+        );
+    }
+}
+
+#[test]
 fn gui_v2_romm_browser_has_explicit_empty_failure_state() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
@@ -839,7 +878,7 @@ fn gui_v2_organisation_is_a_native_plain_english_workflow() {
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
     for expected in [
         "Choose what you want to organise",
-        "Organise verified games",
+        "Rename verified games",
         "Build a clean playing library",
         "Fix my MAME library",
     ] {
@@ -945,9 +984,7 @@ fn gui_v2_organisation_landing_remains_usable_at_supported_viewports() {
             "{size:?}"
         );
         assert!(
-            strings
-                .iter()
-                .any(|value| value == "Organise verified games"),
+            strings.iter().any(|value| value == "Rename verified games"),
             "{size:?}"
         );
     }
@@ -1000,7 +1037,7 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
     // All five action cards must still be present and clickable alongside
     // the contextual guidance - it must never bury the primary actions.
     for title in [
-        "Organise verified games",
+        "Rename verified games",
         "Build a clean playing library",
         "Organise for RomM",
         "Export to ES-DE",
@@ -1013,7 +1050,7 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
     assert!(
         strings_after
             .iter()
-            .any(|value| value == "Organise verified games")
+            .any(|value| value == "Rename verified games")
     );
 }
 
@@ -1079,7 +1116,7 @@ fn gui_v2_organisation_landing_is_reachable_at_narrow_1280x720() {
     for expected in [
         "Choose what you want to organise",
         "Nothing changes until you preview and confirm",
-        "Organise verified games",
+        "Rename verified games",
     ] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
@@ -1797,6 +1834,23 @@ fn gui_v2_library_search_platform_filter_attention_and_empty_platform() {
     );
     assert_eq!(library.game(1).unwrap().title, "Shadow");
     assert!(library.game(100).is_none());
+}
+
+#[test]
+fn gui_v2_unknown_review_filter_excludes_verified_games() {
+    let mut verified = Game::from_archive(archive(1, "Verified", Some("SNES")));
+    verified.identified = true;
+    let unknown = Game::from_archive(archive(2, "Unknown", Some("SNES")));
+    let library = Library {
+        games: vec![verified, unknown],
+        ..Default::default()
+    };
+    let indices = library.filter(&Filter {
+        unverified_only: true,
+        ..Default::default()
+    });
+    assert_eq!(indices.len(), 1);
+    assert_eq!(library.games[indices[0]].title, "Unknown");
 }
 
 #[test]
@@ -2722,7 +2776,7 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
             ]
         } else if section == Section::Build {
             vec![
-                "Organise verified games",
+                "Rename verified games",
                 "Build a clean playing library",
                 "Organisation",
             ]

@@ -27,6 +27,7 @@ use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionSta
 use archivefs_core::dat::rename_apply::{
     default_rename_transaction_dir, rollback_transaction_confined,
 };
+use archivefs_core::dat::rom_organisation::OrganisationMode;
 use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{Database, default_database_path};
 use sha2::{Digest, Sha256};
@@ -240,8 +241,8 @@ struct ActionCard {
 
 const ACTIONS: [ActionCard; 5] = [
     ActionCard {
-        title: "Organise verified games",
-        description: "Rename or arrange verified files into clean platform folders.",
+        title: "Rename verified games",
+        description: "Rename files to trusted DAT names after reviewing the preview.",
         semantics: "Moves or renames original files · Preview required · Undo available",
         destination: None,
         kind: CardKind::VerifiedGames,
@@ -827,11 +828,26 @@ impl App {
                         }
                         ui.add_space(theme::SPACE_SM);
                     }
-                    if ui.button(RichText::new("Fix my MAME library").strong().color(theme::TEAL)).clicked() {
-                        self.organisation.view = OrganisationView::MameNormalizer;
-                    }
+                    ui.label("Choose one clear job. Every changing workflow starts with a preview.");
+                    ui.horizontal_wrapped(|ui| {
+                        if primary(ui, "Rename verified games") {
+                            selected = Some(None);
+                        }
+                        if primary(ui, "Build a clean playing library") {
+                            selected = Some(Some(PlayingLibraryDestination::Generic));
+                        }
+                        if ui.button("Fix my MAME library").clicked() {
+                            self.organisation.view = OrganisationView::MameNormalizer;
+                        }
+                        if primary(ui, "Analyse MAME collection") {
+                            self.organisation.view = OrganisationView::MameNormalizer;
+                        }
+                        if ui.button("Repair problems").clicked() {
+                            self.go(Route::Section(Section::Problems));
+                        }
+                    });
+                    ui.label("Advanced organisation options remain available below for specialist preferences and history.");
                     ui.label("Source untouched until a reviewed preview is confirmed.");
-                    ui.label("Build a clean playing library");
                     for card in ACTIONS {
                         widgets::workflow_card(ui, card.kind.accent(), |ui| {
                             ui.horizontal(|ui| {
@@ -864,8 +880,11 @@ impl App {
                             ui.add_space(theme::SPACE_SM);
                             ui.vertical(|ui| {
                                 ui.label(RichText::new("Fix my MAME library").size(theme::SECTION_TITLE_SIZE).strong());
-                                ui.label("Use verified MAME evidence to review safe set repairs.");
+                                ui.label("Separate MAME set names, ROM members, parent/clone dependencies and dump state before repair.");
                                 ui.label(RichText::new("Preview required · Evidence must be sufficient · Recovery remains available").strong().color(theme::TEAL));
+                                if primary(ui, "Analyse MAME collection") {
+                                    self.organisation.view = OrganisationView::MameNormalizer;
+                                }
                             });
                         });
                     });
@@ -890,7 +909,7 @@ impl App {
                         if ui.button("← Organisation").clicked() {
                             back = true;
                         }
-                        sub_view_heading(ui, CardKind::VerifiedGames, "Organise verified games");
+                        sub_view_heading(ui, CardKind::VerifiedGames, "Rename verified games");
                     });
                     ui.label("1 Choose  ·  2 Preview  ·  3 Confirm  ·  4 Apply");
                     ui.label("MOVE changes the original file's folder. RENAME changes its name in place. LINK leaves the original untouched and creates a shortcut in a new library.");
@@ -935,6 +954,12 @@ impl App {
                         }
                         ui.heading("Fix my MAME library");
                     });
+                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                        ui.strong("What MAME names mean");
+                        ui.label("Set/archive name: the outer set such as pacman.zip.");
+                        ui.label("ROM member: a file inside that set. Parent, clone, BIOS, device and CHD dependencies are separate evidence.");
+                        ui.label("BAD_DUMP needs preservation/redump treatment. NO_DUMP means no verified dump is known; neither is an ordinary rename repair.");
+                    });
                     show_mame_normalizer(ui, &mut self.organisation);
                 }
             });
@@ -944,7 +969,14 @@ impl App {
         }
         if let Some(destination) = selected {
             match destination {
-                None => self.organisation.view = OrganisationView::VerifiedGames,
+                None => {
+                    // The novice "Rename verified games" intent is a real
+                    // projection of the existing DAT-backed rename engine,
+                    // not a generic move workflow with a friendlier label.
+                    self.canonical_organisation
+                        .set_mode(OrganisationMode::RenameInPlace);
+                    self.organisation.view = OrganisationView::VerifiedGames;
+                }
                 Some(destination) => {
                     self.playing_library.set_destination(destination);
                     self.organisation.view = OrganisationView::PlayingLibrary;
@@ -984,7 +1016,7 @@ mod tests {
     #[test]
     fn landing_has_exactly_the_five_backed_normal_actions() {
         assert_eq!(ACTIONS.len(), 5);
-        assert_eq!(ACTIONS[0].title, "Organise verified games");
+        assert_eq!(ACTIONS[0].title, "Rename verified games");
         assert_eq!(
             ACTIONS[1].destination,
             Some(PlayingLibraryDestination::Generic)

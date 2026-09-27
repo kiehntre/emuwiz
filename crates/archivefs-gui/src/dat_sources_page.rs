@@ -254,6 +254,41 @@ pub(crate) struct DatSourceRowView {
     pub(crate) mame_replacement_candidate: Option<MameReplacementCandidate>,
 }
 
+impl Default for DatSourceRowView {
+    fn default() -> Self {
+        Self {
+            arcade_verification: None,
+            id: String::new(),
+            display_name: String::new(),
+            path: String::new(),
+            kind_label: "DAT",
+            enabled: false,
+            platform_display: None,
+            platform_id: None,
+            platform_unresolved: false,
+            formats: Vec::new(),
+            health_state: DatHealthState::NotChecked,
+            health_detail: None,
+            last_validated: None,
+            health_stale: false,
+            entry_count: None,
+            rom_count: None,
+            changed: false,
+            busy: false,
+            detail: None,
+            groups: Vec::new(),
+            incomplete_load: false,
+            dat_files_read: None,
+            dat_files_total: None,
+            history_link_available: false,
+            mame_replacement_available: false,
+            current_file_missing_or_invalid: false,
+            mame_replacement_checking: false,
+            mame_replacement_candidate: None,
+        }
+    }
+}
+
 /// A fully inspected local file awaiting the user's explicit approval.
 /// Invalid candidates are retained too: the review card can then explain the
 /// refusal without mutating the source or losing the useful file details.
@@ -8044,6 +8079,9 @@ pub(crate) struct DatSourcesPageUi {
     /// session-only disclosure choices; the registry itself is unchanged.
     pub(crate) show_all_local_dat_sources: bool,
     pub(crate) show_unassigned_local_dat_sources: bool,
+    /// Session-only practical navigation for long local DAT registries.
+    pub(crate) local_source_query: String,
+    pub(crate) local_source_status: LocalDatStatusFilter,
     /// Which source's detail disclosure is open.
     pub(crate) open_inspect: Option<String>,
     /// Which source's platform picker is open.
@@ -8110,6 +8148,8 @@ impl DatSourcesPageUi {
         self.open_inspect = None;
         self.open_platform_picker = None;
         self.platform_query.clear();
+        self.local_source_query.clear();
+        self.local_source_status = LocalDatStatusFilter::All;
         self.open_audit_picker = None;
         self.open_combined_audit_picker = false;
         self.quick_review_open = false;
@@ -8156,6 +8196,54 @@ pub(crate) fn local_dat_row_visible(
                 | DatHealthState::Invalid
                 | DatHealthState::Unreadable
         )
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LocalDatStatusFilter {
+    #[default]
+    All,
+    Ready,
+    NeedsAttention,
+    Unassigned,
+}
+
+pub(crate) fn local_dat_row_matches_filter(
+    row: &DatSourceRowView,
+    query: &str,
+    status: LocalDatStatusFilter,
+) -> bool {
+    let query = query.trim().to_lowercase();
+    let text_matches = query.is_empty()
+        || row.display_name.to_lowercase().contains(&query)
+        || row.path.to_lowercase().contains(&query)
+        || row
+            .platform_display
+            .as_deref()
+            .unwrap_or("unassigned")
+            .to_lowercase()
+            .contains(&query);
+    let status_matches = match status {
+        LocalDatStatusFilter::All => true,
+        LocalDatStatusFilter::Ready => {
+            row.enabled
+                && !row.health_stale
+                && matches!(
+                    row.health_state,
+                    DatHealthState::Valid | DatHealthState::ValidWithWarnings
+                )
+                && !row.current_file_missing_or_invalid
+        }
+        LocalDatStatusFilter::NeedsAttention => {
+            row.health_stale
+                || row.current_file_missing_or_invalid
+                || matches!(
+                    row.health_state,
+                    DatHealthState::Invalid | DatHealthState::Unreadable
+                )
+        }
+        LocalDatStatusFilter::Unassigned => row.platform_display.is_none(),
+    };
+    text_matches && status_matches
 }
 
 /// Draws the page and returns at most one requested action.
@@ -8257,6 +8345,41 @@ pub(crate) fn show_dat_sources_page(
             ui_state.show_unassigned_local_dat_sources =
                 !ui_state.show_unassigned_local_dat_sources;
         }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Find a DAT");
+        ui.text_edit_singleline(&mut ui_state.local_source_query);
+        ui.label("Status");
+        egui::ComboBox::from_id_salt("local_dat_status_filter")
+            .selected_text(match ui_state.local_source_status {
+                LocalDatStatusFilter::All => "All",
+                LocalDatStatusFilter::Ready => "Ready",
+                LocalDatStatusFilter::NeedsAttention => "Needs attention",
+                LocalDatStatusFilter::Unassigned => "Not configured",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut ui_state.local_source_status,
+                    LocalDatStatusFilter::All,
+                    "All",
+                );
+                ui.selectable_value(
+                    &mut ui_state.local_source_status,
+                    LocalDatStatusFilter::Ready,
+                    "Ready",
+                );
+                ui.selectable_value(
+                    &mut ui_state.local_source_status,
+                    LocalDatStatusFilter::NeedsAttention,
+                    "Needs attention",
+                );
+                ui.selectable_value(
+                    &mut ui_state.local_source_status,
+                    LocalDatStatusFilter::Unassigned,
+                    "Not configured",
+                );
+            });
+        ui.label("Searches name, path and platform.");
     });
     ui.add_space(6.0);
 
@@ -8362,6 +8485,10 @@ pub(crate) fn show_dat_sources_page(
                     row,
                     ui_state.show_all_local_dat_sources,
                     ui_state.show_unassigned_local_dat_sources,
+                ) && local_dat_row_matches_filter(
+                    row,
+                    &ui_state.local_source_query,
+                    ui_state.local_source_status,
                 )
             })
             .collect::<Vec<_>>();

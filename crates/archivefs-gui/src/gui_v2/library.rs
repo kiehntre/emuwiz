@@ -197,6 +197,7 @@ impl Library {
             .filter(|(_, game)| {
                 (filter.platform.is_empty() || game.platform == filter.platform)
                     && (!filter.attention_only || game.attention)
+                    && (!filter.unverified_only || !game.identified)
                     && (needle.is_empty() || game.search.contains(&needle))
             })
             .map(|(index, _)| index)
@@ -209,6 +210,7 @@ pub(super) struct Filter {
     pub search: String,
     pub platform: String,
     pub attention_only: bool,
+    pub unverified_only: bool,
     pub list: bool,
 }
 
@@ -218,6 +220,7 @@ impl Filter {
         self.platform = platform;
         self.search.clear();
         self.attention_only = false;
+        self.unverified_only = false;
     }
 }
 

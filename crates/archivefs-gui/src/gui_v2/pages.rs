@@ -555,8 +555,10 @@ impl App {
                         let destinations = [
                             ("Home", Route::Home),
                             ("Games", Route::Section(Section::Games)),
+                            ("Check", Route::Section(Section::Check)),
                             ("Platforms", Route::Section(Section::Platforms)),
                             ("Organisation", Route::Section(Section::Build)),
+                            ("DAT", Route::Section(Section::Dat)),
                             ("Launch", Route::Section(Section::Launch)),
                             ("Converter", Route::Section(Section::Converter)),
                             ("Museum", Route::Section(Section::Museum)),
@@ -1123,6 +1125,7 @@ impl App {
                 if count > 0 && ui.button(format!("Review {label} ({count})")).clicked() {
                     self.filter.select_platform(platform.clone());
                     self.filter.attention_only = label == "Needs attention";
+                    self.filter.unverified_only = label == "Unknown";
                     self.change_filter();
                     self.go(Route::Section(Section::Games));
                 }

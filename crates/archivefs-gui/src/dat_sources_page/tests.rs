@@ -34,6 +34,39 @@ use super::*;
 
 mod save_results;
 
+#[test]
+fn local_dat_navigation_filters_by_name_platform_and_status() {
+    let ready = DatSourceRowView {
+        display_name: "Sony PlayStation 2 DAT".into(),
+        path: "/data/dats/ps2.xml".into(),
+        enabled: true,
+        platform_display: Some("Sony PlayStation 2".into()),
+        health_state: DatHealthState::Valid,
+        ..Default::default()
+    };
+    let unassigned = DatSourceRowView {
+        display_name: "Arcade catalogue".into(),
+        path: "/data/dats/mame.xml".into(),
+        platform_display: None,
+        ..Default::default()
+    };
+    assert!(local_dat_row_matches_filter(
+        &ready,
+        "playstation 2",
+        LocalDatStatusFilter::Ready
+    ));
+    assert!(!local_dat_row_matches_filter(
+        &ready,
+        "mame",
+        LocalDatStatusFilter::All
+    ));
+    assert!(local_dat_row_matches_filter(
+        &unassigned,
+        "arcade",
+        LocalDatStatusFilter::Unassigned
+    ));
+}
+
 fn row_for_visibility(
     platform_display: Option<&str>,
     platform_unresolved: bool,

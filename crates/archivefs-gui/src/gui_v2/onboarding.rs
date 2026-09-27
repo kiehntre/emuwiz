@@ -186,7 +186,19 @@ pub(super) fn show(
                             status(ui, lifecycle_state_label(emulator.state), lifecycle_state_tone(emulator.state));
                         });
                         if emulator.installations.is_empty() {
-                            ui.label("Not installed");
+                            ui.label(lifecycle_empty_explanation(emulator.state));
+                            if matches!(
+                                emulator.state,
+                                archivefs_core::emulator_lifecycle::LifecycleState::Missing
+                                    | archivefs_core::emulator_lifecycle::LifecycleState::Broken
+                            ) && button(ui, "Open Emulator Setup")
+                            {
+                                action = Some(Action::Open(Section::Emulators));
+                            }
+                            ui.collapsing("Advanced details", |ui| {
+                                ui.label("Checked PATH, configured executable paths, known user AppImage locations and bounded Flatpak metadata.");
+                                ui.label("No executable or package binding was proven automatically for this emulator.");
+                            });
                         } else {
                             for installation in &emulator.installations {
                                 lifecycle_installation_card(ui, installation);
@@ -258,6 +270,22 @@ pub(super) fn show(
     action
 }
 
+fn lifecycle_empty_explanation(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+) -> &'static str {
+    use archivefs_core::emulator_lifecycle::LifecycleState::*;
+    match state {
+        Missing => "Not found automatically · choose an executable or review setup",
+        Broken => "Found evidence, but the selected profile needs attention",
+        MultipleInstallations => "Multiple installations need a selection",
+        ManagedExternally => "Managed externally · review the detected installation",
+        InstalledCurrent
+        | InstalledUpdateAvailable
+        | InstalledUnknownVersion
+        | InstalledUnsupportedVersion => "Installation evidence is incomplete · review setup",
+    }
+}
+
 fn lifecycle_state_label(
     state: archivefs_core::emulator_lifecycle::LifecycleState,
 ) -> &'static str {
@@ -267,7 +295,7 @@ fn lifecycle_state_label(
         InstalledUpdateAvailable => "Update available",
         InstalledUnknownVersion => "Installed · version unknown",
         InstalledUnsupportedVersion => "Installed · unsupported version",
-        Missing => "Not installed",
+        Missing => "Not found automatically",
         Broken => "Needs attention",
         MultipleInstallations => "Multiple installations found",
         ManagedExternally => "Managed by another installer",
@@ -730,6 +758,18 @@ mod tests {
         assert_eq!(
             lifecycle_state_label(LifecycleState::Broken),
             "Needs attention"
+        );
+    }
+
+    #[test]
+    fn empty_lifecycle_does_not_call_a_missing_binding_not_installed() {
+        assert!(
+            lifecycle_empty_explanation(LifecycleState::Missing)
+                .contains("Not found automatically")
+        );
+        assert!(!lifecycle_empty_explanation(LifecycleState::Missing).contains("Not installed"));
+        assert!(
+            lifecycle_empty_explanation(LifecycleState::Broken).contains("profile needs attention")
         );
     }
 
