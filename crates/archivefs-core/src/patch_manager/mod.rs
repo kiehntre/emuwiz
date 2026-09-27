@@ -32,6 +32,7 @@ mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
 mod cheat_catalogue;
+mod cheat_compatibility;
 mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
@@ -241,6 +242,11 @@ pub use cheat_catalogue::{
     JsonManifestSource, MAX_CATALOGUE_EXCLUDED_ENTRIES, MAX_CATALOGUE_EXCLUSION_EXAMPLES,
     RetroarchChtDirectorySource, build_cheat_availability_report, load_cheat_catalogue_snapshot,
     match_cheat_game_record, matching_excluded_entry,
+};
+pub use cheat_compatibility::{
+    CheatCompatibilityEntry, CheatCompatibilityOperation, CheatCompatibilityReport, CheatCondition,
+    CheatConflict, CheatConflictKind, CheatConflictSeverity, CheatMasterCodeRequirement,
+    CheatMemoryRange, CheatRevisionEvidence, CheatStackReadiness, analyze_cheat_stack,
 };
 pub use cheat_conversion::{
     CheatConversionMismatchReason, CheatConversionPlan, CheatConversionRequest,

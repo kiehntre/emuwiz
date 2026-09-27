@@ -8,9 +8,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use archivefs_core::patch_manager::{
-    CheatOperation, CheatReconciliationGroup, CheatReconciliationResult, CheatRelationship,
-    CheatReviewChoice, ResolvedCheatApplyEligibility, ResolvedCheatPlan, ResolvedCheatPlanRequest,
-    resolve_reviewed_cheat_plan,
+    CheatCompatibilityEntry, CheatConflictSeverity, CheatOperation, CheatReconciliationGroup,
+    CheatReconciliationResult, CheatRelationship, CheatReviewChoice, CheatRevisionEvidence,
+    ResolvedCheatApplyEligibility, ResolvedCheatPlan, ResolvedCheatPlanRequest,
+    analyze_cheat_stack, resolve_reviewed_cheat_plan,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -287,6 +288,53 @@ impl CheatReconciliationReviewState {
                 ),
             ],
         );
+        let compatibility_entries = result
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                CheatCompatibilityEntry::from_document(
+                    format!("entry-{index}"),
+                    &entry.document,
+                    entry.source.clone(),
+                    entry.source.clone(),
+                    CheatRevisionEvidence::Unknown,
+                    archivefs_core::patch_manager::CheatMasterCodeRequirement::None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let compatibility = analyze_cheat_stack(&compatibility_entries);
+        widgets::card(ui, |ui| {
+            ui.strong("Cheat compatibility");
+            ui.label(format!(
+                "Selected cheats: {} · Operations: {}",
+                compatibility.selected_cheats, compatibility.operation_count
+            ));
+            let blocking = compatibility
+                .conflicts
+                .iter()
+                .filter(|conflict| conflict.severity == CheatConflictSeverity::Blocking)
+                .count();
+            let warnings = compatibility
+                .conflicts
+                .iter()
+                .filter(|conflict| conflict.severity == CheatConflictSeverity::Warning)
+                .count();
+            ui.label(format!("Warnings: {warnings} · Conflicts: {blocking}"));
+            if compatibility.can_apply() {
+                ui.label("No blocking conflict was proven from the normalized operations.");
+            } else {
+                ui.colored_label(
+                    theme::WARNING,
+                    "A blocking conflict or unsupported interaction needs review before apply.",
+                );
+            }
+            widgets::technical_details(ui, "cheat_compatibility_details", |ui| {
+                for conflict in &compatibility.conflicts {
+                    ui.label(format!("{:?}: {}", conflict.kind, conflict.reason));
+                }
+            });
+        });
         ui.strong("Cheat review");
         ui.label(format!(
             "{} entries found · {ready} ready · {conflicts} conflicts · {duplicates} duplicates · {malformed} malformed/unsupported",
