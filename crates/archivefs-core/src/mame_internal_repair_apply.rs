@@ -24,6 +24,10 @@ use crate::mame_internal_repair::{
     MameInternalRepairPlan, MameInternalRepairRequirement, MameRepairDisposition,
     MameRepairRelationshipKind,
 };
+use crate::mame_post_repair::{
+    MamePostRepairVerificationRequest, MameRepairDestinationHash, MameRepairVerification,
+    verify_mame_repair,
+};
 use crate::safe_read::TrustedRoots;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -292,6 +296,41 @@ pub fn rollback_mame_internal_repair(
 ) -> Result<RollbackOutcome, String> {
     let trusted = TrustedRoots::from_paths([Path::new(&transaction.source_scan_root)]);
     rollback_transaction_confined(transaction, journal_dir, &AtomicBool::new(false), &trusted)
+}
+
+/// Runs the post-repair MAME check only after the shared transaction has
+/// completed. The transaction id and plan digest are taken from the applied
+/// result/plan so a caller cannot accidentally verify unrelated bytes.
+pub fn verify_mame_internal_repair_after_apply(
+    apply_plan: &MameInternalRepairApplyPlan,
+    apply_result: &MameInternalRepairApplyResult,
+    mut request: MamePostRepairVerificationRequest,
+) -> MameRepairVerification {
+    if apply_result.outcome.transaction.state != TransactionState::Applied {
+        let mut result = verify_mame_repair(&MamePostRepairVerificationRequest {
+            transaction_id: apply_result.outcome.transaction.transaction_id.clone(),
+            repair_plan_digest: apply_plan.plan_digest.clone(),
+            expected_destinations: Vec::new(),
+            ..request
+        });
+        result.state = crate::mame_post_repair::MameRepairVerificationState::StaleEvidence;
+        result
+            .issues
+            .push(crate::mame_post_repair::MameRepairVerificationIssue::TransactionChanged);
+        return result;
+    }
+    request.transaction_id = apply_result.outcome.transaction.transaction_id.clone();
+    request.repair_plan_digest = apply_plan.plan_digest.clone();
+    request.expected_destinations = apply_result
+        .operations
+        .iter()
+        .filter(|operation| operation.state == MameRepairOperationState::RepairedAndVerified)
+        .map(|operation| MameRepairDestinationHash {
+            path: operation.destination_path.clone(),
+            expected_sha1: operation.expected_sha1.clone(),
+        })
+        .collect();
+    verify_mame_repair(&request)
 }
 
 fn operation_for_requirement(

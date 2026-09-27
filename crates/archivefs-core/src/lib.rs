@@ -83,6 +83,7 @@ pub mod mame_internal_repair;
 pub mod mame_internal_repair_apply;
 /// Read-only MAME family curation and playing-library projection.
 pub mod mame_playing_library;
+pub mod mame_post_repair;
 pub mod managed_appimage_bootstrap;
 /// Manifest-backed ownership and side-by-side managed AppImage installs.
 pub mod managed_emulator_install;
