@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use super::CheatOperation;
+use super::{CheatOperation, decode_gba_action_replay};
 
 pub const MGBA_CHEAT_MAX_BYTES: usize = 1024 * 1024;
 pub const MGBA_CHEAT_MAX_ENTRIES: usize = 1000;
@@ -262,8 +262,8 @@ pub fn parse_mgba_cheat_file(bytes: &[u8]) -> Result<MgbaCheatFile, MgbaCheatPar
             issues.push(MgbaCheatIssue::TooManyLines);
             continue;
         }
-        let normalized = parse_direct_write(line)
-            .map(|(address, value)| CheatOperation::Write8 { address, value });
+        let format = entry.format;
+        let normalized = normalize_code(line, format);
         if normalized.is_none() {
             issues.push(if line.contains(':') {
                 MgbaCheatIssue::MalformedCode(line.to_string())
@@ -444,6 +444,16 @@ fn format_from_directives(directives: &[String]) -> MgbaCheatFormat {
         .unwrap_or(MgbaCheatFormat::NativeOrUnknown)
 }
 
+fn normalize_code(line: &str, format: MgbaCheatFormat) -> Option<CheatOperation> {
+    if format == MgbaCheatFormat::ProActionReplay {
+        let decoded = decode_gba_action_replay(line);
+        if decoded.issues.is_empty() && decoded.instructions.len() == 1 {
+            return Some(decoded.instructions[0].operation.clone());
+        }
+    }
+    parse_direct_write(line).map(|(address, value)| CheatOperation::Write8 { address, value })
+}
+
 fn parse_direct_write(line: &str) -> Option<(u64, u8)> {
     let (address, value) = line.split_once(':')?;
     if address.len() != 8
@@ -548,6 +558,18 @@ mod tests {
             file.entries[1].codes[0].normalized,
             Some(CheatOperation::Write8 { .. })
         ));
+    }
+
+    #[test]
+    fn reuses_conservative_action_replay_decoder_for_direct_writes() {
+        let file = parse_mgba_cheat_file(b"!ARv3\n# Direct\n02000000 1234\n").unwrap();
+        assert_eq!(
+            file.entries[0].codes[0].normalized,
+            Some(CheatOperation::Write16 {
+                address: 0x02000000,
+                value: 0x1234,
+            })
+        );
     }
 
     #[test]

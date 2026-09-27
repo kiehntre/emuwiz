@@ -24,7 +24,7 @@ It is pure (no I/O) and deterministic.
 | `CheatRouteRequest` | The caller's observed facts: platform, explicit selection, configured defaults, installed standalone emulators, and RetroArch installed state plus cores for the platform. |
 | `CheatRouteDecision` | One of `Routed(CheatRoute)`, `Refused { selected, refusal, alternatives }`, `Ambiguous { candidates }`, or `NoRoute`. |
 | `CheatRoute` | Target, `CheatRouteBasis`, `CheatApplySupport`, native format, and the other emulators the user may choose explicitly. |
-| `CheatApplySupport` | `Supported` = RetroArch, PCSX2, Dolphin, Xenia. `InventoryOnly` = DuckStation, PPSSPP, Flycast, RPCS3. `Unsupported` = everything else. |
+| `CheatApplySupport` | `Supported` = RetroArch, PCSX2, Dolphin, Xenia, DuckStation, PPSSPP, mGBA, and MAME. `InventoryOnly` = Flycast and RPCS3. `Unsupported` = everything else. |
 
 ### Precedence
 
@@ -53,10 +53,10 @@ test `gamecube_route_cannot_select_retroarch` still holds.
 
 | Game | Selected | Result |
 |---|---|---|
-| PS1 | DuckStation | DuckStation. Inventory only, so no apply, and no RetroArch substitute. |
+| PS1 | DuckStation | DuckStation native `.cht` apply, with no RetroArch substitute when DuckStation owns the route. |
 | PS1 | RetroArch (Beetle PSX HW) | RetroArch with that core. Installable. |
 | PS1 | none, DuckStation installed, RetroArch installed | `Ambiguous`. The user chooses. |
-| PSP | PPSSPP | PPSSPP. Inventory only. |
+| PSP | PPSSPP | PPSSPP native CWCheat apply. |
 | PSP | RetroArch | RetroArch. The single installed PSP core is adopted. |
 | Dreamcast | Flycast standalone | Flycast standalone. Inventory only. |
 | Dreamcast | RetroArch Flycast core | RetroArch (flycast). |
@@ -102,8 +102,10 @@ follow-up. It was not done here because it changes an install contract.
 | Dolphin | yes | yes | profile `GameSettings/` | `*.ini` | `[Core] EnableCheats` (existing activation reader) | restart game |
 | Xenia | yes | yes | profile `patches/` | `*.patch.toml` | `apply_patches` in `xenia-canary.config.toml` | restart title |
 | RetroArch | yes | yes | `<cheat_database_path>/<core>/` | `<content stem>.cht` | `apply_cheats_after_load` in `retroarch.cfg` | reload content |
-| DuckStation | yes | inventory only | — | — | — | — |
-| PPSSPP | yes | inventory only | — | — | — | — |
+| DuckStation | yes | native apply | `.cht` | per-cheat / profile state | restart game |
+| PPSSPP | yes | native apply | CWCheat `.ini` | per-cheat / global state | reload cheats or game |
+| mGBA | yes | native apply | configured cheats directory | `.cheats` | native per-set state | restart game |
+| MAME | yes | native apply | configured cheat path | cheat XML | native runtime state | restart machine/game |
 | Flycast | yes | inventory only | — | — | — | — |
 | RPCS3 | yes | inventory only | — | — | — | — |
 | Azahar | yes | unsupported | — | — | — | — |
@@ -177,7 +179,8 @@ The fix counts every non-empty `[Section]` header. An enabled entry is still
 counted only from an explicit in-file `Enabled = true` key; newer DuckStation
 builds keep enable state in per-game settings, which this inventory does not
 read. There is a new test with three realistic sections and one empty `[]`
-header. This is still inventory only: no DuckStation writer was added.
+header. The native DuckStation adapter now supplies preview, merge, apply, and
+rollback through the shared transaction path.
 
 ## 8. Import quick wins
 
@@ -241,10 +244,9 @@ page's stale "never offers an install operation" header was corrected.
 
 - Installed-standalone detection is limited to PS1 (DuckStation), PSP (PPSSPP)
   and Dreamcast (Flycast), using the same bounded discovery the launch
-  readiness page runs.
-  - For other shared platforms (for example GBA with mGBA, or DS with melonDS)
-    the fallback is still RetroArch unless the user chooses otherwise or has a
-    remembered profile.
+  readiness page runs. mGBA and MAME are valid native route targets when
+  explicitly selected or remembered; their broader GUI profile discovery is a
+  separate concern.
   - The route panel always lists the standalone alternatives.
 - RetroArch installs still land in the platform folder, so they are reported as
   needing a manual load (see §2). Moving the installer to the per-core
@@ -290,7 +292,7 @@ page's stale "never offers an install operation" header was corrected.
   - the RetroArch core is recorded;
   - a RetroArch platform-folder install needs a manual load;
   - a RetroArch install without a core is ambiguous;
-  - an inventory-only emulator is unsupported;
+  - Flycast/RPCS3 inventory-only emulators are unsupported for apply;
   - the title-only revision warning is kept, and exact identity is not
     downgraded;
   - the config parser and the `/proc` probe.

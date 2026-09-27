@@ -1728,6 +1728,7 @@ pub(crate) fn show_cheat_route_panel(
     // single row so the cheat list below remains in view.
     if let CheatRouteDecision::Routed(route) = decision
         && route.can_apply()
+        && cheat_adapter_for_decision(decision) != CheatEmulatorAdapter::Unsupported
         && !matches!(route.target, CheatRouteTarget::RetroArch { core: None })
     {
         ui.horizontal_wrapped(|ui| {
@@ -1754,7 +1755,13 @@ pub(crate) fn show_cheat_route_panel(
                     ui.label(route.target.display_name());
                     let (label, tone) = match route.apply_support {
                         CheatApplySupport::Supported => {
-                            ("Cheats can be installed", widgets::StatusTone::Success)
+                            if cheat_adapter_for_decision(decision)
+                                == CheatEmulatorAdapter::Unsupported
+                            {
+                                ("Native adapter available", widgets::StatusTone::Info)
+                            } else {
+                                ("Cheats can be installed", widgets::StatusTone::Success)
+                            }
                         }
                         CheatApplySupport::InventoryOnly => {
                             ("Apply not supported yet", widgets::StatusTone::Warning)
@@ -1791,6 +1798,13 @@ pub(crate) fn show_cheat_route_panel(
             if matches!(route.target, CheatRouteTarget::RetroArch { core: None }) {
                 ui.label(
                     "EmuWiz cannot verify which RetroArch core runs this game, so it cannot confirm RetroArch will load an installed cheat. Choose the core below if it is listed.",
+                );
+            }
+            if route.can_apply()
+                && cheat_adapter_for_decision(decision) == CheatEmulatorAdapter::Unsupported
+            {
+                ui.label(
+                    "EmuWiz knows this emulator's native cheat format, but this GUI workflow does not apply it yet.",
                 );
             }
         }

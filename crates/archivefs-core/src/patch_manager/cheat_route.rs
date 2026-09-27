@@ -124,8 +124,10 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
     match target {
         CheatRouteTarget::RetroArch { .. } => CheatApplySupport::Supported,
         CheatRouteTarget::Standalone { adapter_id } => match adapter_id.as_str() {
-            "pcsx2" | "dolphin" | "xenia" => CheatApplySupport::Supported,
-            "duckstation" | "ppsspp" | "flycast" | "rpcs3" => CheatApplySupport::InventoryOnly,
+            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "mgba" | "mame" => {
+                CheatApplySupport::Supported
+            }
+            "flycast" | "rpcs3" => CheatApplySupport::InventoryOnly,
             _ => CheatApplySupport::Unsupported,
         },
     }
@@ -141,6 +143,8 @@ pub fn native_cheat_format(target: &CheatRouteTarget) -> &'static str {
             "xenia" => "Xenia .patch.toml",
             "duckstation" => "DuckStation .cht",
             "ppsspp" => "PPSSPP CWCheat .ini",
+            "mgba" => "mGBA .cheats",
+            "mame" => "MAME cheat XML",
             "flycast" => "Flycast .cht",
             "rpcs3" => "RPCS3 patch.yml",
             "azahar" => "Azahar/Citra cheats .txt",

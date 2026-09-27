@@ -115,7 +115,7 @@ fn route_panel_names_the_selected_emulator_and_its_limits() {
     });
     for expected in [
         "DuckStation",
-        "Apply not supported yet",
+        "Native adapter available",
         "Clear my emulator choice",
     ] {
         assert!(rendered_text_contains(&output, expected), "{expected}");

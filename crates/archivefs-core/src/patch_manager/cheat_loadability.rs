@@ -75,9 +75,8 @@ pub fn cheat_restart_requirement(target: &CheatRouteTarget) -> CheatRestartRequi
     match target {
         CheatRouteTarget::RetroArch { .. } => CheatRestartRequirement::ReloadContent,
         CheatRouteTarget::Standalone { adapter_id } => match adapter_id.as_str() {
-            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "flycast" | "rpcs3" => {
-                CheatRestartRequirement::RestartGame
-            }
+            "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "mgba" | "mame"
+            | "flycast" | "rpcs3" => CheatRestartRequirement::RestartGame,
             _ => CheatRestartRequirement::Unknown,
         },
     }
@@ -572,6 +571,8 @@ fn process_name_fragments(target: &CheatRouteTarget) -> &'static [&'static str] 
             "xenia" => &["xenia"],
             "duckstation" => &["duckstation"],
             "ppsspp" => &["ppsspp"],
+            "mgba" => &["mgba"],
+            "mame" => &["mame"],
             "flycast" => &["flycast"],
             "rpcs3" => &["rpcs3"],
             "azahar" => &["azahar"],

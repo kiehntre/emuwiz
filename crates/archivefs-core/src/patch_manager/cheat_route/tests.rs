@@ -62,7 +62,7 @@ fn ps1_duckstation_selected_routes_to_duckstation() {
     let decision = route_cheat_install(&req);
     let route = routed(&decision);
     assert_eq!(route.target, CheatRouteTarget::standalone("duckstation"));
-    assert_eq!(route.apply_support, CheatApplySupport::InventoryOnly);
+    assert_eq!(route.apply_support, CheatApplySupport::Supported);
     assert!(
         route
             .alternatives
@@ -95,6 +95,27 @@ fn psp_ppsspp_selected_routes_to_ppsspp() {
         CheatRouteTarget::standalone("ppsspp")
     );
     assert_eq!(routed(&route).native_format, "PPSSPP CWCheat .ini");
+    assert_eq!(routed(&route).apply_support, CheatApplySupport::Supported);
+}
+
+#[test]
+fn gba_mgba_selected_routes_to_native_cheats() {
+    let mut req = request("GBA");
+    req.selected = Some(CheatRouteTarget::standalone("mgba"));
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.apply_support, CheatApplySupport::Supported);
+    assert_eq!(route.native_format, "mGBA .cheats");
+}
+
+#[test]
+fn arcade_mame_selected_routes_to_native_xml() {
+    let mut req = request("Arcade");
+    req.selected = Some(CheatRouteTarget::standalone("mame"));
+    let decision = route_cheat_install(&req);
+    let route = routed(&decision);
+    assert_eq!(route.apply_support, CheatApplySupport::Supported);
+    assert_eq!(route.native_format, "MAME cheat XML");
 }
 
 #[test]
@@ -188,25 +209,16 @@ fn three_ds_never_invents_a_retroarch_route() {
 }
 
 #[test]
-fn installed_standalone_plus_retroarch_without_a_selection_is_ambiguous() {
+fn installed_native_standalone_plus_retroarch_prefers_native_apply_route() {
     let mut req = request("PSX");
     req.installed_standalone = vec!["duckstation".into()];
     req.retroarch_installed = Some(true);
     req.retroarch_cores = vec!["pcsx_rearmed".into()];
     let decision = route_cheat_install(&req);
-    match &decision {
-        CheatRouteDecision::Ambiguous { candidates, .. } => {
-            assert_eq!(
-                candidates,
-                &vec![
-                    CheatRouteTarget::standalone("duckstation"),
-                    CheatRouteTarget::retroarch(Some("pcsx_rearmed")),
-                ]
-            );
-        }
-        other => panic!("expected ambiguous, got {other:?}"),
-    }
-    assert!(decision.applicable_target().is_none());
+    let route = routed(&decision);
+    assert_eq!(route.target, CheatRouteTarget::standalone("duckstation"));
+    assert_eq!(route.apply_support, CheatApplySupport::Supported);
+    assert_eq!(decision.applicable_target(), Some(&route.target));
 }
 
 #[test]
@@ -247,12 +259,15 @@ fn explicit_selection_beats_configured_default() {
 }
 
 #[test]
-fn retroarch_fallback_with_several_cores_keeps_core_unknown() {
+fn native_standalone_fallback_beats_retroarch_with_several_cores() {
     let mut req = request("PSX");
     req.retroarch_installed = Some(true);
     req.retroarch_cores = vec!["pcsx_rearmed".into(), "mednafen_psx_hw".into()];
     let decision = route_cheat_install(&req);
-    assert_eq!(routed(&decision).target, CheatRouteTarget::retroarch(None));
+    assert_eq!(
+        routed(&decision).target,
+        CheatRouteTarget::standalone("duckstation")
+    );
     assert_eq!(routed(&decision).basis, CheatRouteBasis::PlatformFallback);
 }
 

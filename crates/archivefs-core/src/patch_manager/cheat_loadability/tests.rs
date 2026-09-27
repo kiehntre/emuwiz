@@ -302,7 +302,7 @@ fn retroarch_without_core_is_ambiguous() {
 fn inventory_only_emulator_is_unsupported() {
     let fixture = installed_pnach();
     let mut input = pcsx2_input(&fixture, Some(true));
-    input.route = route(CheatRouteTarget::standalone("duckstation"));
+    input.route = route(CheatRouteTarget::standalone("flycast"));
     let report = assess_cheat_loadability(&input);
     assert_eq!(
         report.state,
