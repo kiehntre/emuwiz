@@ -88,6 +88,7 @@ mod melonds_local;
 mod mesen_local;
 mod mgba_cheats;
 mod mgba_local;
+mod n64_gameshark;
 mod openmsx_local;
 mod pcengine_cd_firmware;
 mod pcsx2;
@@ -684,6 +685,12 @@ pub use mgba_local::{
     MgbaLaunchBlockerKind, MgbaNativeLaunchBinding, MgbaProfile, MgbaProfileDiscovery,
     MgbaProfileDiscoveryRoots, discover_mgba_profiles, parse_mgba_version,
     resolve_mgba_native_launch_binding,
+};
+pub use n64_gameshark::{
+    N64CheatCode, N64CheatDecodeResult, N64CheatIssue, N64CheatOpcode, N64CheatProjection,
+    N64CheatReadiness, N64CheatRegion, N64CheatRevisionEvidence, N64MasterCodeState,
+    N64NormalizedOperation, N64ProjectionTarget, N64RomByteOrder, N64RomIdentity,
+    decode_n64_gameshark, inspect_n64_rom_header, project_n64_cheat,
 };
 pub use openmsx_local::{
     OpenMsxExecutable, OpenMsxInstallationType, OpenMsxProfile, OpenMsxProfileDiscovery,

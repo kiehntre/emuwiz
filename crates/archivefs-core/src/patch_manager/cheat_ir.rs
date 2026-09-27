@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 pub enum CheatPlatform {
     GameCube,
     Wii,
+    Nintendo64,
     Ps2,
     NintendoDs,
     Other(String),
@@ -27,6 +28,7 @@ pub enum CheatSourceFormat {
     ActionReplayDs,
     GameSharkPs2,
     CodeBreakerPs2,
+    N64GameShark,
     Other(String),
 }
 
@@ -802,6 +804,7 @@ pub fn supported_targets_for(document: &CheatDocument) -> Vec<TargetCapability> 
             CheatTargetFormat::ActionReplayDs,
             CheatTargetFormat::RetroArch,
         ],
+        CheatPlatform::Nintendo64 => Vec::new(),
         CheatPlatform::Other(_) => Vec::new(),
     };
     targets
@@ -928,6 +931,7 @@ fn platform_key(platform: &CheatPlatform) -> String {
         CheatPlatform::Wii => "wii".into(),
         CheatPlatform::Ps2 => "ps2".into(),
         CheatPlatform::NintendoDs => "nintendo-ds".into(),
+        CheatPlatform::Nintendo64 => "nintendo-64".into(),
         CheatPlatform::Other(value) => format!("other:{value}"),
     }
 }
