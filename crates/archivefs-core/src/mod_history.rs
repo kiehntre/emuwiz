@@ -638,7 +638,9 @@ fn kind_for_adapter(adapter: PreviewAdapter) -> Option<ModKind> {
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Xenia
         | PreviewAdapter::Mame
-        | PreviewAdapter::Flycast => None,
+        | PreviewAdapter::Flycast
+        | PreviewAdapter::Rpcs3Patch
+        => None,
     }
 }
 

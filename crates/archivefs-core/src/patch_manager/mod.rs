@@ -115,6 +115,7 @@ mod retroarch_materialization;
 mod rmg_local;
 mod rpcs3_local;
 mod rpcs3_ordinary_mod;
+mod rpcs3_patch;
 mod sameboy_local;
 mod saturn_action_replay;
 mod shared_preview;
@@ -888,6 +889,15 @@ pub use rpcs3_ordinary_mod::{
     build_rpcs3_ordinary_mod_transaction_plan, inspect_rpcs3_ordinary_mod,
     inspect_rpcs3_ordinary_mod_zip, preview_rpcs3_ordinary_mod_rollback,
     rollback_rpcs3_ordinary_mod, rpcs3_ordinary_mod_destination_root,
+};
+pub use rpcs3_patch::{
+    RPCS3_PATCH_ENGINE_VERSION, RPCS3_PATCH_MAX_BYTES, RPCS3_PATCH_MAX_ENTRIES,
+    RPCS3_PATCH_MAX_LINES, RPCS3_PATCH_MAX_OPS, RPCS3_PATCH_SOURCE_MODE, Rpcs3PatchEntryDefinition,
+    Rpcs3PatchError, Rpcs3PatchFile, Rpcs3PatchGroup, Rpcs3PatchIssue, Rpcs3PatchLoadabilityFacts,
+    Rpcs3PatchOperation, Rpcs3PatchPlan, Rpcs3PatchReadiness, Rpcs3PatchSelection, Rpcs3PatchState,
+    apply_rpcs3_patch, build_rpcs3_patch_plan, merge_rpcs3_patch_files, parse_rpcs3_patch_yaml,
+    preview_rpcs3_patch_rollback, readiness as rpcs3_patch_readiness, render_rpcs3_patch_yaml,
+    rollback_rpcs3_patch, rpcs3_patch_loadability_facts,
 };
 pub use sameboy_local::{
     SAMEBOY_MAX_CONFIG_BYTES, SAMEBOY_MAX_PROFILES, SameBoyBootRomEvidence, SameBoyBootRomState,

@@ -48,6 +48,8 @@ pub enum PreviewAdapter {
     Mame,
     /// A native Flycast Dreamcast cheat file.
     Flycast,
+    /// A local native RPCS3 patch.yml definition.
+    Rpcs3Patch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -460,6 +462,7 @@ fn preview_one(
                 | PreviewAdapter::CemuGraphicPack
                 | PreviewAdapter::Rpcs3OrdinaryMod
                 | PreviewAdapter::Flycast
+                | PreviewAdapter::Rpcs3Patch
         ))
         .then(|| (OsString::new(), OsString::new()))
     }) else {
@@ -523,6 +526,7 @@ fn preview_one(
             | PreviewAdapter::CemuGraphicPack
             | PreviewAdapter::Rpcs3OrdinaryMod
             | PreviewAdapter::Flycast
+            | PreviewAdapter::Rpcs3Patch
     ) {
         assess_nested_destination(&request.destination_root, &relative)
     } else {
@@ -778,6 +782,8 @@ fn apply_eligibility_blockers(
         | PreviewAdapter::Rpcs3OrdinaryMod
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast => source.match_strength == PreviewMatchStrength::VerifiedExact,
+        | PreviewAdapter::Rpcs3Patch
+        | PreviewAdapter::Mame => source.match_strength == PreviewMatchStrength::VerifiedExact,
     };
     if !strength_eligible {
         let blocker = match source.match_strength {
@@ -1314,6 +1320,7 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::RetroArch | PreviewAdapter::LocalModPackage => !normalized.is_empty(),
         PreviewAdapter::CemuGraphicPack => matches!(normalized.as_str(), "wiiu" | "wii u"),
         PreviewAdapter::Rpcs3OrdinaryMod => normalized == "ps3" || normalized == "playstation 3",
+        PreviewAdapter::Rpcs3Patch => normalized == "ps3" || normalized == "playstation 3",
         PreviewAdapter::Mame => normalized == "mame" || normalized == "arcade",
         PreviewAdapter::Flycast => normalized == "dreamcast" || normalized == "sega dreamcast",
     }

@@ -129,7 +129,8 @@ impl ManagedFormat {
             | PreviewAdapter::CemuGraphicPack
             | PreviewAdapter::Rpcs3OrdinaryMod
             | PreviewAdapter::Mame
-            | PreviewAdapter::Flycast => Self::LocalModPackage,
+            | PreviewAdapter::Flycast
+            | PreviewAdapter::Rpcs3Patch => Self::LocalModPackage,
         }
     }
 }

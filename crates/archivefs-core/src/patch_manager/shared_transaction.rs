@@ -163,6 +163,8 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Rpcs3OrdinaryMod
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Rpcs3Patch
+        | PreviewAdapter::Mame => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
