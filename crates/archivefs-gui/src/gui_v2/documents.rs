@@ -82,18 +82,55 @@ pub(crate) enum GameDocumentSource {
     NearbyGameDirectory,
     ConfiguredRoot(PathBuf),
     ExplicitAssociation,
+    /// Provenance for a document reached through a RomM-provided manual
+    /// reference, safely mapped to a user-trusted local root (never a
+    /// remote URL). Carries that local root for display/explanation only;
+    /// it does not change opening/resume behavior relative to a document
+    /// discovered locally.
+    Romm(PathBuf),
 }
 
+/// Whether "Open" can actually do something useful right now, established
+/// by a bounded, non-executing probe (never opens the file itself).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum GameDocumentViewerCapability {
-    ExternalViewer,
-    ExternalViewerUnavailable,
+pub(crate) enum DocumentOpenCapability {
+    /// A local OS opener for this format was found on `PATH` (or is a
+    /// built-in OS shell association on Windows/macOS).
+    Supported,
+    /// The format is externally-openable in principle, but no handler was
+    /// found on this machine.
+    NoHandler,
+    /// The format is recognised but EmuWiz does not offer opening it yet
+    /// (e.g. CBR).
+    UnsupportedFormat,
+    /// The document's file no longer exists at its resolved path.
+    MissingFile,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
+/// Strongest evidence tying a document to exactly one already-verified
+/// game identity, reusing whatever the rest of the codebase already
+/// computed (see `archivefs_core::launch::planning::ResolvedIdentity`).
+/// This module never derives identity itself - it only carries evidence a
+/// caller already resolved.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct ExactIdentityEvidence {
+    pub(crate) platform_id: String,
+    pub(crate) game_key: String,
+}
+
+impl From<&archivefs_core::launch::planning::ResolvedIdentity> for ExactIdentityEvidence {
+    fn from(identity: &archivefs_core::launch::planning::ResolvedIdentity) -> Self {
+        Self {
+            platform_id: identity.platform_id.clone(),
+            game_key: identity.game_key.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
 pub(crate) enum GameDocumentAssociation {
     Explicit,
-    ExactGameIdentity,
+    ExactGameIdentity(ExactIdentityEvidence),
     SameGameDirectory,
     ExactTitle,
     PlatformAndTitle,
@@ -102,15 +139,59 @@ pub(crate) enum GameDocumentAssociation {
 }
 
 impl GameDocumentAssociation {
-    pub(crate) fn label(self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Explicit => "Explicit user association",
-            Self::ExactGameIdentity => "Exact stored game identity",
+            Self::ExactGameIdentity(_) => "Exact stored game identity",
             Self::SameGameDirectory => "Same game directory",
             Self::ExactTitle => "Exact title match",
             Self::PlatformAndTitle => "Platform and title match",
             Self::WeakFilename => "Weak filename hint",
             Self::Unmatched => "Not associated",
+        }
+    }
+}
+
+/// Novice-facing, typed reasons a document cannot be shown/opened right
+/// now. Technical detail (paths, underlying error causes) stays available
+/// separately via [`DocumentUnavailableReason::technical_detail`] rather
+/// than being folded into the user-facing message.
+#[allow(
+    dead_code,
+    reason = "NoApplicationToOpen/FormatNotYetSupported are reserved for GUI wiring beyond this backend-only change"
+)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentUnavailableReason {
+    NoLongerAvailable,
+    CouldNotMapRommDocument(String),
+    NoApplicationToOpen,
+    AmbiguousMatch,
+    FormatNotYetSupported,
+}
+
+#[allow(
+    dead_code,
+    reason = "novice-facing message/detail split is reserved for GUI wiring beyond this backend-only change"
+)]
+impl DocumentUnavailableReason {
+    pub(crate) fn user_message(&self) -> &'static str {
+        match self {
+            Self::NoLongerAvailable => "This manual is no longer available.",
+            Self::CouldNotMapRommDocument(_) => {
+                "EmuWiz could not safely map this RomM document to a local file."
+            }
+            Self::NoApplicationToOpen => "No application is available to open this document.",
+            Self::AmbiguousMatch => "More than one manual matches this game equally well.",
+            Self::FormatNotYetSupported => {
+                "This document format is recognised but cannot be opened yet."
+            }
+        }
+    }
+
+    pub(crate) fn technical_detail(&self) -> Option<&str> {
+        match self {
+            Self::CouldNotMapRommDocument(detail) => Some(detail),
+            _ => None,
         }
     }
 }
@@ -128,7 +209,7 @@ pub(crate) struct GameDocument {
     pub(crate) association_reason: String,
     pub(crate) page_count: Option<usize>,
     pub(crate) file_size: u64,
-    pub(crate) viewer: GameDocumentViewerCapability,
+    pub(crate) viewer: DocumentOpenCapability,
 }
 
 impl GameDocument {
@@ -139,6 +220,9 @@ impl GameDocument {
                 format!("configured root: {}", root.display())
             }
             GameDocumentSource::ExplicitAssociation => "explicit user association".to_string(),
+            GameDocumentSource::Romm(root) => {
+                format!("RomM · mapped to local root: {}", root.display())
+            }
         }
     }
 }
@@ -210,6 +294,13 @@ pub(crate) struct DocumentDiscoveryRequest<'a> {
     pub(crate) game_path: &'a Path,
     pub(crate) roots: &'a [PathBuf],
     pub(crate) associations: &'a BTreeMap<PathBuf, i64>,
+    /// Already-resolved, strongest-tier identity evidence for this exact
+    /// game, exactly as the rest of the codebase computed it (never
+    /// derived here). When present, a document found in the game's own
+    /// directory is promoted from the heuristic `SameGameDirectory` tier
+    /// to `ExactGameIdentity`, since it is known to live alongside a
+    /// verified - not just filename-matched - game.
+    pub(crate) verified_identity: Option<&'a archivefs_core::launch::planning::ResolvedIdentity>,
 }
 
 pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<GameDocument> {
@@ -288,6 +379,12 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                     .contains(&request.platform.to_ascii_lowercase());
             let association = if explicit {
                 GameDocumentAssociation::Explicit
+            } else if same_directory && request.verified_identity.is_some() {
+                GameDocumentAssociation::ExactGameIdentity(ExactIdentityEvidence::from(
+                    request
+                        .verified_identity
+                        .expect("checked Some above via is_some()"),
+                ))
             } else if same_directory {
                 GameDocumentAssociation::SameGameDirectory
             } else if platform_title {
@@ -314,6 +411,7 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                 .and_then(|v| v.to_str())
                 .unwrap_or("Untitled document")
                 .replace(['_', '-'], " ");
+            let association_reason = association.label().to_string();
             candidates.entry(canonical.clone()).or_insert(GameDocument {
                 path: canonical,
                 format,
@@ -327,7 +425,7 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                     source.clone()
                 },
                 association,
-                association_reason: association.label().to_string(),
+                association_reason,
                 page_count,
                 file_size: metadata.len(),
                 viewer,
@@ -335,15 +433,19 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
         }
     }
     let mut documents = candidates.into_values().collect::<Vec<_>>();
+    sort_documents(&mut documents);
+    documents.truncate(MAX_DOCUMENTS);
+    documents
+}
+
+fn sort_documents(documents: &mut [GameDocument]) {
     documents.sort_by_key(|document| {
         (
-            document.association,
+            document.association.clone(),
             normalize_title(&document.title),
             document.path.clone(),
         )
     });
-    documents.truncate(MAX_DOCUMENTS);
-    documents
 }
 
 fn is_document_path(path: &Path) -> bool {
@@ -390,24 +492,74 @@ fn infer_kind(title: &str) -> GameDocumentKind {
 fn inspect_capability(
     path: &Path,
     format: GameDocumentFormat,
-) -> (Option<usize>, GameDocumentViewerCapability) {
+) -> (Option<usize>, DocumentOpenCapability) {
+    let page_count = match format {
+        GameDocumentFormat::Pdf => pdf_page_count(path),
+        GameDocumentFormat::Cbz => inspect_cbz(path).ok().map(|pages| pages.len()),
+        GameDocumentFormat::Cbr | GameDocumentFormat::Unknown => None,
+    };
+    (
+        page_count,
+        document_open_capability_with(path, format, external_handler_available()),
+    )
+}
+
+/// The OS-opener program EmuWiz already uses
+/// (`archivefs_core::identity_source::romm::manual::DesktopManualOpener`),
+/// duplicated here only as a name for the PATH probe below - the actual
+/// spawn always goes through that shared opener, never through this
+/// module.
+fn opener_program_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+/// Pure, bounded PATH probe: does `program` exist as a file in any
+/// directory listed in `path_value`? Never spawns or opens anything.
+fn handler_on_path(path_value: Option<&std::ffi::OsStr>, program: &str) -> bool {
+    path_value
+        .is_some_and(|paths| std::env::split_paths(paths).any(|dir| dir.join(program).is_file()))
+}
+
+/// Whether an OS handler for the current opener program is actually
+/// available. Windows/macOS ship a built-in shell association
+/// (`explorer`/`open`) so they are not PATH-probed; other platforms are
+/// probed for `xdg-open` on `PATH`. This never spawns a process - it only
+/// checks for the executable's presence.
+fn external_handler_available() -> bool {
+    if cfg!(target_os = "windows") || cfg!(target_os = "macos") {
+        return true;
+    }
+    handler_on_path(std::env::var_os("PATH").as_deref(), opener_program_name())
+}
+
+/// General open-capability projection: applies to any externally-opened
+/// format (PDF, CBZ, future formats), not just CBZ. CBR/Unknown are always
+/// `UnsupportedFormat`, independent of file existence or handler
+/// availability, matching the "recognised but blocked" policy.
+fn document_open_capability_with(
+    path: &Path,
+    format: GameDocumentFormat,
+    handler_available: bool,
+) -> DocumentOpenCapability {
     match format {
-        GameDocumentFormat::Pdf => (
-            pdf_page_count(path),
-            GameDocumentViewerCapability::ExternalViewer,
-        ),
-        GameDocumentFormat::Cbz => (
-            inspect_cbz(path).ok().map(|pages| pages.len()),
-            GameDocumentViewerCapability::ExternalViewer,
-        ),
-        GameDocumentFormat::Cbr => (
-            None,
-            GameDocumentViewerCapability::ExternalViewerUnavailable,
-        ),
-        GameDocumentFormat::Unknown => (
-            None,
-            GameDocumentViewerCapability::ExternalViewerUnavailable,
-        ),
+        GameDocumentFormat::Cbr | GameDocumentFormat::Unknown => {
+            DocumentOpenCapability::UnsupportedFormat
+        }
+        GameDocumentFormat::Pdf | GameDocumentFormat::Cbz => {
+            if !path.is_file() {
+                DocumentOpenCapability::MissingFile
+            } else if handler_available {
+                DocumentOpenCapability::Supported
+            } else {
+                DocumentOpenCapability::NoHandler
+            }
+        }
     }
 }
 
@@ -495,6 +647,120 @@ fn natural_sort_key(value: &str) -> Vec<NaturalPart> {
     parts
 }
 
+/// Request to project a RomM-provided manual reference into the local
+/// document model. Reuses the existing, already-tested RomM path-safety
+/// policy (`resolve_local_romm_manual`) unchanged - this module never
+/// invents its own trust-root or traversal logic.
+#[allow(dead_code)]
+pub(crate) struct RommDocumentRequest<'a> {
+    pub(crate) game_id: i64,
+    pub(crate) platform: &'a str,
+    pub(crate) mapping:
+        Option<&'a archivefs_core::identity_source::romm::media_mapping::ValidatedRommMediaMapping>,
+    pub(crate) manual: &'a archivefs_core::identity_source::model::MediaReference,
+    pub(crate) verified_identity: Option<&'a archivefs_core::launch::planning::ResolvedIdentity>,
+}
+
+/// Projects a RomM manual reference into the same [`GameDocument`] model
+/// used for local documents, so there is one document/association/
+/// capability model rather than two parallel manual features. Never
+/// fetches anything remote and never opens the file - only maps and
+/// inspects it, exactly like local discovery does.
+#[allow(dead_code)]
+pub(crate) fn project_romm_manual_document(
+    request: RommDocumentRequest<'_>,
+) -> Result<GameDocument, DocumentUnavailableReason> {
+    use archivefs_core::identity_source::romm::manual::{
+        RommManualRefusal, resolve_local_romm_manual,
+    };
+
+    let local_root = request
+        .mapping
+        .map(|mapping| mapping.local_root().to_path_buf());
+    let path =
+        resolve_local_romm_manual(request.mapping, request.manual).map_err(
+            |refusal| match refusal {
+                RommManualRefusal::Unavailable => DocumentUnavailableReason::NoLongerAvailable,
+                other => DocumentUnavailableReason::CouldNotMapRommDocument(other.to_string()),
+            },
+        )?;
+    if !path.is_file() {
+        return Err(DocumentUnavailableReason::NoLongerAvailable);
+    }
+    let format = GameDocumentFormat::from_path(&path);
+    let (page_count, viewer) = inspect_capability(&path, format);
+    let association = match request.verified_identity {
+        Some(identity) => {
+            GameDocumentAssociation::ExactGameIdentity(ExactIdentityEvidence::from(identity))
+        }
+        None => GameDocumentAssociation::PlatformAndTitle,
+    };
+    let association_reason = association.label().to_string();
+    let title = path
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("Untitled document")
+        .replace(['_', '-'], " ");
+    let file_size = fs::metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    Ok(GameDocument {
+        kind: infer_kind(&title),
+        title,
+        platform: Some(request.platform.to_string()),
+        game_id: Some(request.game_id),
+        source: GameDocumentSource::Romm(local_root.unwrap_or_default()),
+        association,
+        association_reason,
+        page_count,
+        file_size,
+        viewer,
+        path,
+        format,
+    })
+}
+
+/// Merges a RomM-projected document into an already-discovered local list,
+/// keyed by canonical path so the same underlying file never appears
+/// twice merely because it was reached through two provenances. Keeps
+/// the list sorted by association strength.
+#[allow(dead_code)]
+pub(crate) fn merge_romm_document(documents: &mut Vec<GameDocument>, romm_document: GameDocument) {
+    if documents
+        .iter()
+        .any(|existing| existing.path == romm_document.path)
+    {
+        return;
+    }
+    documents.push(romm_document);
+    sort_documents(documents);
+}
+
+/// Picks a single "the manual" document, refusing to silently choose
+/// between two matches that tie at the strongest identity-bearing tier.
+/// Weaker ties (e.g. two `SameGameDirectory` matches) are not ambiguity
+/// errors here since callers of this function only care about the
+/// strongest-evidence pick; the full, un-collapsed list remains available
+/// via [`discover_documents`] for display.
+#[allow(dead_code)]
+pub(crate) fn resolve_strongest_document(
+    documents: &[GameDocument],
+) -> Result<Option<&GameDocument>, DocumentUnavailableReason> {
+    let Some(strongest) = documents.iter().map(|document| &document.association).min() else {
+        return Ok(None);
+    };
+    let mut at_strongest = documents
+        .iter()
+        .filter(|document| &document.association == strongest);
+    let first = at_strongest.next();
+    if matches!(strongest, GameDocumentAssociation::ExactGameIdentity(_))
+        && at_strongest.next().is_some()
+    {
+        return Err(DocumentUnavailableReason::AmbiguousMatch);
+    }
+    Ok(first)
+}
+
 pub(crate) fn safe_resume_page(
     state: Option<&DocumentReadingState>,
     page_count: Option<usize>,
@@ -548,7 +814,7 @@ mod tests {
         assert!(inspect_cbz(&bad).is_err());
         assert_eq!(
             inspect_capability(&dir.path().join("x.cbr"), GameDocumentFormat::Cbr).1,
-            GameDocumentViewerCapability::ExternalViewerUnavailable
+            DocumentOpenCapability::UnsupportedFormat
         );
     }
     #[test]
@@ -567,6 +833,7 @@ mod tests {
             game_path: &game,
             roots: &[],
             associations: &BTreeMap::new(),
+            verified_identity: None,
         });
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].format, GameDocumentFormat::Pdf);
@@ -587,6 +854,7 @@ mod tests {
             game_path: &dir.path().join("game.bin"),
             roots: &[],
             associations: &associations,
+            verified_identity: None,
         });
         assert_eq!(docs[0].association, GameDocumentAssociation::Explicit);
     }
@@ -607,6 +875,7 @@ mod tests {
             game_path: &game_path,
             roots: &[docs_root],
             associations: &BTreeMap::new(),
+            verified_identity: None,
         });
         assert!(docs.is_empty());
     }
@@ -630,5 +899,360 @@ mod tests {
             map_viewer_input(ViewerInput::Menu),
             ViewerCommand::ToggleControls
         );
+    }
+
+    use archivefs_core::identity_source::model::MediaReference;
+    use archivefs_core::identity_source::romm::media_mapping::{
+        RommMediaMapping, validate_romm_media_mapping,
+    };
+    use archivefs_core::launch::planning::ResolvedIdentity;
+
+    fn identity() -> ResolvedIdentity {
+        ResolvedIdentity {
+            platform_id: "saturn".to_string(),
+            game_key: "MK-81088".to_string(),
+        }
+    }
+
+    // 1. local exact GameId association
+    #[test]
+    fn local_exact_identity_association_is_produced() {
+        let dir = tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        fs::create_dir(&game_dir).unwrap();
+        let game = game_dir.join("game.bin");
+        fs::write(&game, b"game").unwrap();
+        let manual = game_dir.join("readme.pdf");
+        fs::write(&manual, b"%PDF").unwrap();
+        let evidence = identity();
+        let docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 4,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &game,
+            roots: &[],
+            associations: &BTreeMap::new(),
+            verified_identity: Some(&evidence),
+        });
+        assert_eq!(docs.len(), 1);
+        assert!(matches!(
+            docs[0].association,
+            GameDocumentAssociation::ExactGameIdentity(_)
+        ));
+    }
+
+    // 2. exact identity beats title match
+    #[test]
+    fn exact_identity_outranks_exact_title_match() {
+        let dir = tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        fs::create_dir(&game_dir).unwrap();
+        let title_root = dir.path().join("titles");
+        fs::create_dir(&title_root).unwrap();
+        let game = game_dir.join("game.bin");
+        fs::write(&game, b"game").unwrap();
+        let in_directory = game_dir.join("readme.pdf");
+        fs::write(&in_directory, b"%PDF").unwrap();
+        let title_matched = title_root.join("Sonic.pdf");
+        fs::write(&title_matched, b"%PDF").unwrap();
+        let evidence = identity();
+        let docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 4,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &game,
+            roots: &[title_root],
+            associations: &BTreeMap::new(),
+            verified_identity: Some(&evidence),
+        });
+        assert!(matches!(
+            docs[0].association,
+            GameDocumentAssociation::ExactGameIdentity(_)
+        ));
+        assert!(
+            docs.iter()
+                .any(|document| document.association == GameDocumentAssociation::ExactTitle)
+        );
+    }
+
+    fn romm_mapping(
+        root: &Path,
+    ) -> archivefs_core::identity_source::romm::media_mapping::ValidatedRommMediaMapping {
+        validate_romm_media_mapping(&RommMediaMapping {
+            provider_prefix: "/assets/romm/resources".to_string(),
+            local_root: root.to_path_buf(),
+        })
+        .unwrap()
+    }
+
+    fn romm_manual(reference: &str) -> MediaReference {
+        MediaReference {
+            hosted_reference: Some(reference.to_string()),
+            public_reference: None,
+        }
+    }
+
+    // 3. RomM local trusted-root document maps into common model
+    #[test]
+    fn romm_document_maps_into_common_model() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("manual.pdf"), b"%PDF").unwrap();
+        let mapping = romm_mapping(root.path());
+        let manual = romm_manual("/assets/romm/resources/manual.pdf");
+        let document = project_romm_manual_document(RommDocumentRequest {
+            game_id: 9,
+            platform: "Saturn",
+            mapping: Some(&mapping),
+            manual: &manual,
+            verified_identity: None,
+        })
+        .unwrap();
+        assert_eq!(document.format, GameDocumentFormat::Pdf);
+        assert!(matches!(document.source, GameDocumentSource::Romm(_)));
+        assert_eq!(
+            document.association,
+            GameDocumentAssociation::PlatformAndTitle
+        );
+    }
+
+    // 4. RomM path outside trusted root refused
+    #[test]
+    fn romm_document_outside_trusted_root_is_refused() {
+        let root = tempdir().unwrap();
+        let mapping = romm_mapping(root.path());
+        let manual = romm_manual("/assets/other/manual.pdf");
+        let result = project_romm_manual_document(RommDocumentRequest {
+            game_id: 9,
+            platform: "Saturn",
+            mapping: Some(&mapping),
+            manual: &manual,
+            verified_identity: None,
+        });
+        assert!(matches!(
+            result,
+            Err(DocumentUnavailableReason::CouldNotMapRommDocument(_))
+        ));
+    }
+
+    // 5. RomM traversal refused
+    #[test]
+    fn romm_document_traversal_is_refused() {
+        let root = tempdir().unwrap();
+        let mapping = romm_mapping(root.path());
+        let manual = romm_manual("/assets/romm/resources/../escape.pdf");
+        let result = project_romm_manual_document(RommDocumentRequest {
+            game_id: 9,
+            platform: "Saturn",
+            mapping: Some(&mapping),
+            manual: &manual,
+            verified_identity: None,
+        });
+        assert!(matches!(
+            result,
+            Err(DocumentUnavailableReason::CouldNotMapRommDocument(_))
+        ));
+    }
+
+    // 6. same local document via RomM/local provenance does not duplicate identity
+    #[test]
+    fn merge_romm_document_avoids_duplicate_identity() {
+        let dir = tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        fs::create_dir(&game_dir).unwrap();
+        let game = game_dir.join("game.bin");
+        fs::write(&game, b"game").unwrap();
+        let manual_path = game_dir.join("readme.pdf");
+        fs::write(&manual_path, b"%PDF").unwrap();
+        let mut docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 4,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &game,
+            roots: &[],
+            associations: &BTreeMap::new(),
+            verified_identity: None,
+        });
+        assert_eq!(docs.len(), 1);
+        let mapping = romm_mapping(&game_dir);
+        let manual = romm_manual("/assets/romm/resources/readme.pdf");
+        let romm_document = project_romm_manual_document(RommDocumentRequest {
+            game_id: 4,
+            platform: "Saturn",
+            mapping: Some(&mapping),
+            manual: &manual,
+            verified_identity: None,
+        })
+        .unwrap();
+        merge_romm_document(&mut docs, romm_document);
+        assert_eq!(docs.len(), 1, "same canonical path must not duplicate");
+    }
+
+    // 7. ambiguous exact matches refused
+    #[test]
+    fn resolve_strongest_document_refuses_ambiguous_exact_matches() {
+        let dir = tempdir().unwrap();
+        let evidence = identity();
+        let one = GameDocument {
+            path: dir.path().join("a.pdf"),
+            format: GameDocumentFormat::Pdf,
+            kind: GameDocumentKind::Manual,
+            title: "A".to_string(),
+            platform: Some("Saturn".to_string()),
+            game_id: Some(4),
+            source: GameDocumentSource::NearbyGameDirectory,
+            association: GameDocumentAssociation::ExactGameIdentity(ExactIdentityEvidence::from(
+                &evidence,
+            )),
+            association_reason: String::new(),
+            page_count: None,
+            file_size: 0,
+            viewer: DocumentOpenCapability::Supported,
+        };
+        let mut two = one.clone();
+        two.path = dir.path().join("b.pdf");
+        let candidates = [one, two];
+        let result = resolve_strongest_document(&candidates);
+        assert!(matches!(
+            result,
+            Err(DocumentUnavailableReason::AmbiguousMatch)
+        ));
+    }
+
+    // 8 & 9. PDF/CBZ external open capability
+    #[test]
+    fn pdf_and_cbz_report_handler_backed_capability() {
+        let dir = tempdir().unwrap();
+        let pdf = dir.path().join("a.pdf");
+        fs::write(&pdf, b"%PDF").unwrap();
+        assert_eq!(
+            document_open_capability_with(&pdf, GameDocumentFormat::Pdf, true),
+            DocumentOpenCapability::Supported
+        );
+        assert_eq!(
+            document_open_capability_with(&pdf, GameDocumentFormat::Pdf, false),
+            DocumentOpenCapability::NoHandler
+        );
+        let cbz = dir.path().join("a.cbz");
+        fs::write(&cbz, b"PK").unwrap();
+        assert_eq!(
+            document_open_capability_with(&cbz, GameDocumentFormat::Cbz, true),
+            DocumentOpenCapability::Supported
+        );
+        assert_eq!(
+            document_open_capability_with(&cbz, GameDocumentFormat::Cbz, false),
+            DocumentOpenCapability::NoHandler
+        );
+    }
+
+    // 10. no xdg-open/handler disables Open
+    #[test]
+    fn handler_probe_is_pure_and_never_executes() {
+        let dir = tempdir().unwrap();
+        let path_var = std::ffi::OsString::from(dir.path());
+        assert!(!handler_on_path(Some(&path_var), "xdg-open"));
+        fs::write(dir.path().join("xdg-open"), b"#!/bin/sh\n").unwrap();
+        assert!(handler_on_path(Some(&path_var), "xdg-open"));
+    }
+
+    // 11. missing document
+    #[test]
+    fn missing_local_file_reports_missing_capability() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone.pdf");
+        assert_eq!(
+            document_open_capability_with(&missing, GameDocumentFormat::Pdf, true),
+            DocumentOpenCapability::MissingFile
+        );
+    }
+    #[test]
+    fn romm_missing_local_file_reports_unavailable() {
+        let root = tempdir().unwrap();
+        let mapping = romm_mapping(root.path());
+        let manual = romm_manual("/assets/romm/resources/missing.pdf");
+        let result = project_romm_manual_document(RommDocumentRequest {
+            game_id: 9,
+            platform: "Saturn",
+            mapping: Some(&mapping),
+            manual: &manual,
+            verified_identity: None,
+        });
+        assert!(matches!(
+            result,
+            Err(DocumentUnavailableReason::NoLongerAvailable)
+        ));
+    }
+
+    // 12. CBR remains recognised-but-blocked
+    #[test]
+    fn cbr_is_always_unsupported_regardless_of_handler_or_existence() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            document_open_capability_with(&dir.path().join("x.cbr"), GameDocumentFormat::Cbr, true),
+            DocumentOpenCapability::UnsupportedFormat
+        );
+    }
+
+    // 13. resume lookup uses unified document representation
+    #[test]
+    fn resume_state_is_shared_by_canonical_path_across_provenance() {
+        let dir = tempdir().unwrap();
+        let game_dir = dir.path().join("game");
+        fs::create_dir(&game_dir).unwrap();
+        let game = game_dir.join("game.bin");
+        fs::write(&game, b"game").unwrap();
+        let manual_path = game_dir.join("readme.pdf");
+        fs::write(&manual_path, b"%PDF").unwrap();
+        let local_docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 4,
+            game_title: "Sonic",
+            platform: "Saturn",
+            game_path: &game,
+            roots: &[],
+            associations: &BTreeMap::new(),
+            verified_identity: None,
+        });
+        let mapping = romm_mapping(&game_dir);
+        let manual = romm_manual("/assets/romm/resources/readme.pdf");
+        let romm_document = project_romm_manual_document(RommDocumentRequest {
+            game_id: 4,
+            platform: "Saturn",
+            mapping: Some(&mapping),
+            manual: &manual,
+            verified_identity: None,
+        })
+        .unwrap();
+        // Same underlying file, reached two ways: resume state keyed by
+        // canonical path resolves to the same entry either way.
+        assert_eq!(local_docs[0].path, romm_document.path);
+        let mut reading = BTreeMap::new();
+        reading.insert(
+            local_docs[0].path.clone(),
+            DocumentReadingState {
+                last_page: Some(3),
+                zoom_percent: None,
+            },
+        );
+        assert_eq!(
+            safe_resume_page(reading.get(&romm_document.path), romm_document.page_count),
+            Some(3)
+        );
+    }
+
+    // 14. no network activity (by construction: this module performs no
+    // network I/O anywhere - it only reads local files via `std::fs`, and
+    // the RomM path resolves exclusively through the already-audited
+    // `resolve_local_romm_manual`, which is local-filesystem-only).
+    #[test]
+    fn module_source_contains_no_network_primitives() {
+        let source = include_str!("documents.rs");
+        // Only the production code above the test module needs checking -
+        // this assertion string itself would otherwise self-match.
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        for forbidden in ["TcpStream", "reqwest", "UdpSocket", "http:", "https:"] {
+            assert!(
+                !production.contains(forbidden),
+                "unexpected network-shaped token: {forbidden}"
+            );
+        }
     }
 }

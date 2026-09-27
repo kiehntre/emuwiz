@@ -1886,6 +1886,19 @@ impl App {
             .as_ref()
             .is_none_or(|(id, cached_path, _)| *id != game_id || *cached_path != path);
         if needs_discovery {
+            // Reuse the same verified-identity evidence other features
+            // (organisation, launch planning) already compute from this
+            // game's stored identity report - never re-derived here.
+            let identity_status = game.archive.identity_report.as_ref().map(|report| {
+                archivefs_core::launch::evidence_bridge::canonical_identity_from_game_report(report)
+                    .0
+            });
+            let verified_identity = match &identity_status {
+                Some(archivefs_core::launch::planning::CanonicalIdentityStatus::Resolved(
+                    identity,
+                )) => Some(identity),
+                _ => None,
+            };
             let documents =
                 super::documents::discover_documents(super::documents::DocumentDiscoveryRequest {
                     game_id,
@@ -1894,6 +1907,7 @@ impl App {
                     game_path: &path,
                     roots: &self.document_preferences.roots,
                     associations: &self.document_preferences.associations,
+                    verified_identity,
                 });
             self.document_cache = Some((game_id, path, documents));
         }
@@ -1953,7 +1967,7 @@ impl App {
                     });
                 }
                 ui.horizontal_wrapped(|ui| {
-                    let can_open = document.viewer == super::documents::GameDocumentViewerCapability::ExternalViewer;
+                    let can_open = document.viewer == super::documents::DocumentOpenCapability::Supported;
                     if ui.add_enabled(can_open, egui::Button::new("Open")).clicked() {
                         let job = self.activity.queue("Opening local document", Route::Game(game_id), false);
                         self.send(job, Command::OpenDocument(document.path.clone()));
@@ -1971,7 +1985,7 @@ impl App {
                         self.document_cache = None;
                         self.preferences_dirty = Some(std::time::Instant::now());
                     }
-                    if document.viewer == super::documents::GameDocumentViewerCapability::ExternalViewerUnavailable {
+                    if document.viewer != super::documents::DocumentOpenCapability::Supported {
                         ui.weak("No supported local viewer");
                     }
                 });

@@ -197,6 +197,25 @@ mod tests {
         assert!(opener.opened.lock().unwrap().is_empty());
     }
 
+    // Opening must use argv/process APIs, never a shell-interpolated
+    // string command. Verified by source inspection: `Command::new` is
+    // present and no `sh -c`/`bash -c`/`cmd /c` shell-string invocation
+    // exists anywhere in this module.
+    #[test]
+    fn opener_never_shells_out_through_a_string_command() {
+        let source = include_str!("manual.rs");
+        // Only the production code above the test module needs checking -
+        // this assertion's own string literals would otherwise self-match.
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        assert!(production.contains("Command::new"));
+        for forbidden in ["sh -c\"", "bash -c\"", "cmd /c\"", "cmd.exe /c\""] {
+            assert!(
+                !production.contains(forbidden),
+                "unexpected shell-string invocation: {forbidden}"
+            );
+        }
+    }
+
     #[test]
     fn opener_failure_is_returned_cleanly() {
         let root = TempDir::new().unwrap();
