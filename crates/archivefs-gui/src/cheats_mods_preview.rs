@@ -1607,6 +1607,14 @@ pub(crate) fn show_cheats_mods_page(
         // belongs to that emulator only.
         action = show_cheat_route_panel(ui, workflow).or(action);
         ui.add_space(theme::SECTION_GAP);
+        if workflow
+            .platform
+            .as_deref()
+            .is_some_and(|platform| platform.to_ascii_lowercase().contains("saturn"))
+        {
+            show_saturn_action_replay_preview(ui);
+            ui.add_space(theme::SECTION_GAP);
+        }
         match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => {
                 action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
@@ -1787,4 +1795,51 @@ pub(crate) fn show_cheats_mods_page(
         show_recent_cheat_activity(ui, history, activity_archive.as_deref());
     }
     action
+}
+
+fn show_saturn_action_replay_preview(ui: &mut egui::Ui) {
+    widgets::section_header(
+        ui,
+        "Saturn Action Replay preview",
+        Some(
+            "Paste local/imported codes to inspect them. Preview only; Saturn media is never changed.",
+        ),
+    );
+    let id = egui::Id::new("saturn_action_replay_preview_text");
+    let mut text = ui
+        .ctx()
+        .data(|data| data.get_temp::<String>(id).unwrap_or_default());
+    ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .desired_rows(3)
+            .hint_text("16AAAAAA VVVV or 36AAAAAA 00VV"),
+    );
+    ui.ctx().data_mut(|data| data.insert_temp(id, text.clone()));
+    if text.trim().is_empty() {
+        ui.label("No code entered.");
+        return;
+    }
+    let decoded = archivefs_core::patch_manager::decode_saturn_action_replay(&text);
+    widgets::card(ui, |ui| {
+        ui.label(format!(
+            "Codes: {} · Status: {:?}",
+            decoded.codes.len(),
+            decoded.readiness
+        ));
+        for code in decoded.codes.iter().take(16) {
+            ui.label(format!(
+                "{} · {:?} · {} operation(s)",
+                code.normalized,
+                code.opcode,
+                code.operations.len()
+            ));
+            for issue in &code.issues {
+                ui.colored_label(egui::Color32::YELLOW, format!("Review: {issue:?}"));
+            }
+        }
+        for issue in decoded.issues.iter().take(8) {
+            ui.colored_label(egui::Color32::YELLOW, format!("Review: {issue:?}"));
+        }
+        ui.small("Exact disc/product/revision evidence is required before any future runtime action. Conditional and master codes stay visible but are not guessed.");
+    });
 }

@@ -114,6 +114,7 @@ mod rmg_local;
 mod rpcs3_local;
 mod rpcs3_ordinary_mod;
 mod sameboy_local;
+mod saturn_action_replay;
 mod shared_preview;
 mod shared_transaction;
 mod snes9x_local;
@@ -873,6 +874,11 @@ pub use sameboy_local::{
     SameBoyLaunchBlocker, SameBoyLaunchBlockerKind, SameBoyNativeLaunchBinding, SameBoyProfile,
     SameBoyProfileDiscovery, SameBoyProfileDiscoveryRoots, discover_sameboy_profiles,
     parse_sameboy_version, resolve_sameboy_native_launch_binding,
+};
+pub use saturn_action_replay::{
+    SATURN_ACTION_REPLAY_MAX_BYTES, SATURN_ACTION_REPLAY_MAX_CODES, SaturnCheatCode,
+    SaturnCheatDecodeResult, SaturnCheatIdentityEvidence, SaturnCheatIssue, SaturnCheatOpcode,
+    SaturnCheatReadiness, decode_saturn_action_replay, saturn_cheat_document,
 };
 pub use shared_preview::{
     PREVIEW_MAX_BYTES_PER_FILE, PREVIEW_MAX_CONFLICTS, PREVIEW_MAX_DESTINATION_FILES_HASHED,
