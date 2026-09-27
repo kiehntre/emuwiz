@@ -12,6 +12,7 @@ use crate::open_retro_cheat_providers::{ZxPokOperation, ZxPokTrainer};
 pub const POKE_MAX_TITLE_BYTES: usize = 256;
 pub const POKE_MAX_LINES: usize = 4096;
 pub const POKE_MAX_OPERATIONS: usize = 512;
+pub const POKE_MAX_EXPRESSION_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -199,6 +200,15 @@ pub enum PokeIssue {
     IdentityRequired,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PokeExpressionResult {
+    ParsedDirectWrite(PokeOperation),
+    ParsedWriteSequence(Vec<PokeOperation>),
+    UnsupportedExpression(String),
+    AmbiguousExpression(String),
+    UnsafeExpression(String),
+}
+
 impl fmt::Display for PokeIssue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
@@ -329,58 +339,10 @@ pub fn parse_simple_pokes(
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
-        let body = line
-            .strip_prefix("POKE")
-            .or_else(|| line.strip_prefix("poke"))
-            .ok_or_else(|| {
-                PokeParseError(PokeIssue::InvalidSyntax {
-                    line: index + 1,
-                    detail: "expected POKE address,value[,original]".into(),
-                })
-            })?
-            .trim();
-        let values: Vec<_> = body.split(',').map(str::trim).collect();
-        if !(2..=3).contains(&values.len()) {
-            return Err(PokeParseError(PokeIssue::InvalidSyntax {
-                line: index + 1,
-                detail: "expected two or three comma-separated values".into(),
-            }));
+        for segment in line.split(':') {
+            let operation = parse_poke_segment(platform, title, segment, index + 1)?;
+            operations.push(operation);
         }
-        let address = parse_number(values[0]).ok_or_else(|| {
-            PokeParseError(PokeIssue::InvalidSyntax {
-                line: index + 1,
-                detail: "invalid address".into(),
-            })
-        })?;
-        let value = parse_number(values[1]).ok_or_else(|| {
-            PokeParseError(PokeIssue::InvalidSyntax {
-                line: index + 1,
-                detail: "invalid value".into(),
-            })
-        })?;
-        let original = values
-            .get(2)
-            .map(|v| {
-                parse_number(v).ok_or_else(|| {
-                    PokeParseError(PokeIssue::InvalidSyntax {
-                        line: index + 1,
-                        detail: "invalid original value".into(),
-                    })
-                })
-            })
-            .transpose()?;
-        let one = manual_poke(
-            platform,
-            title,
-            address,
-            value,
-            original,
-            PokeBank::Unspecified,
-            None,
-            None,
-            false,
-        )?;
-        operations.extend(one.operations);
         if operations.len() > POKE_MAX_OPERATIONS {
             return Err(PokeParseError(PokeIssue::TooManyOperations));
         }
@@ -400,6 +362,287 @@ pub fn parse_simple_pokes(
         source: "local manual/import".into(),
         provenance: vec!["Local parse only; no network and no media mutation".into()],
     })
+}
+
+fn parse_poke_segment(
+    platform: PokePlatform,
+    title: &str,
+    segment: &str,
+    line: usize,
+) -> Result<PokeOperation, PokeParseError> {
+    let body = segment
+        .trim()
+        .strip_prefix("POKE")
+        .or_else(|| segment.trim().strip_prefix("poke"))
+        .ok_or_else(|| {
+            PokeParseError(PokeIssue::InvalidSyntax {
+                line,
+                detail: "expected POKE address,value[,original]".into(),
+            })
+        })?
+        .trim();
+    let values: Vec<_> = body.split(',').map(str::trim).collect();
+    if !(2..=3).contains(&values.len()) {
+        return Err(PokeParseError(PokeIssue::InvalidSyntax {
+            line,
+            detail: "expected two or three comma-separated values".into(),
+        }));
+    }
+    let address = parse_number(values[0]).ok_or_else(|| {
+        PokeParseError(PokeIssue::InvalidSyntax {
+            line,
+            detail: "invalid address".into(),
+        })
+    })?;
+    let value = parse_number(values[1]).ok_or_else(|| {
+        PokeParseError(PokeIssue::InvalidSyntax {
+            line,
+            detail: "invalid value".into(),
+        })
+    })?;
+    let original = values
+        .get(2)
+        .map(|v| {
+            parse_number(v).ok_or_else(|| {
+                PokeParseError(PokeIssue::InvalidSyntax {
+                    line,
+                    detail: "invalid original value".into(),
+                })
+            })
+        })
+        .transpose()?;
+    Ok(manual_poke(
+        platform,
+        title,
+        address,
+        value,
+        original,
+        PokeBank::Unspecified,
+        None,
+        None,
+        false,
+    )?
+    .operations
+    .remove(0))
+}
+
+pub fn parse_poke_expression(
+    platform: PokePlatform,
+    title: &str,
+    expression: &str,
+) -> PokeExpressionResult {
+    if expression.len() > POKE_MAX_EXPRESSION_BYTES {
+        return PokeExpressionResult::UnsafeExpression(
+            "expression exceeds the bounded input limit".into(),
+        );
+    }
+    let upper = expression.to_ascii_uppercase();
+    for token in [
+        "FOR",
+        "NEXT",
+        "DATA",
+        "READ",
+        "SYS",
+        "CALL",
+        "USR",
+        "RANDOMIZE",
+    ] {
+        if upper
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part == token)
+        {
+            return PokeExpressionResult::UnsafeExpression(format!(
+                "BASIC token {token} is not executable or reducible"
+            ));
+        }
+    }
+    if expression.contains('=') || expression.contains(';') {
+        return PokeExpressionResult::UnsupportedExpression(expression.into());
+    }
+    match parse_simple_pokes(platform, title, expression) {
+        Ok(cheat) if cheat.operations.len() == 1 => PokeExpressionResult::ParsedDirectWrite(
+            cheat.operations.into_iter().next().expect("one operation"),
+        ),
+        Ok(cheat) => PokeExpressionResult::ParsedWriteSequence(cheat.operations),
+        Err(error) => PokeExpressionResult::AmbiguousExpression(error.to_string()),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PokeRuntimeSupport {
+    SupportedNativeRuntime,
+    SupportedGeneratedScript,
+    SupportedMonitorCommand,
+    PreviewOnly,
+    Unsupported,
+    UnknownUnproven,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PokeRuntimeEmulator {
+    Fuse,
+    Vice,
+    Hatari,
+    Caprice32,
+    OpenMsx,
+    BeebEm,
+    BEm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PokeRuntimeCapability {
+    pub emulator: PokeRuntimeEmulator,
+    pub platform: PokePlatform,
+    pub support: PokeRuntimeSupport,
+    pub preserves_banking: bool,
+    pub preserves_original_guards: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PokeProjectionRefusal {
+    WrongPlatform,
+    UnsupportedRuntime,
+    BankingUnproven,
+    MemorySpaceUnproven,
+    WidthUnsupported,
+    OriginalGuardUnsupported,
+    InvalidAddress,
+    IdentityNotEligible,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PokeRuntimeProjection {
+    pub capability: PokeRuntimeCapability,
+    pub commands_or_files: Vec<String>,
+    pub preview: String,
+    pub refusal: Option<PokeProjectionRefusal>,
+}
+
+pub fn poke_runtime_capability(emulator: PokeRuntimeEmulator) -> PokeRuntimeCapability {
+    match emulator {
+        PokeRuntimeEmulator::Fuse => PokeRuntimeCapability { emulator, platform: PokePlatform::ZxSpectrum, support: PokeRuntimeSupport::SupportedNativeRuntime, preserves_banking: true, preserves_original_guards: true, detail: "Fuse multiface .pok files document bank, address, value and original value".into() },
+        PokeRuntimeEmulator::Vice => PokeRuntimeCapability { emulator, platform: PokePlatform::Commodore64, support: PokeRuntimeSupport::SupportedMonitorCommand, preserves_banking: false, preserves_original_guards: false, detail: "VICE monitor documents the > memory-write command; this adapter only projects explicit unbanked byte writes".into() },
+        PokeRuntimeEmulator::Hatari => PokeRuntimeCapability { emulator, platform: PokePlatform::AtariSt, support: PokeRuntimeSupport::PreviewOnly, preserves_banking: false, preserves_original_guards: false, detail: "Hatari documents memwrite and --parse, but exact scripted command syntax and guard semantics are not proven here".into() },
+        PokeRuntimeEmulator::Caprice32 => PokeRuntimeCapability { emulator, platform: PokePlatform::AmstradCpc, support: PokeRuntimeSupport::PreviewOnly, preserves_banking: false, preserves_original_guards: false, detail: "Caprice32 documents --autocmd but not a stable memory-write command contract".into() },
+        PokeRuntimeEmulator::OpenMsx => PokeRuntimeCapability { emulator, platform: PokePlatform::Msx, support: PokeRuntimeSupport::PreviewOnly, preserves_banking: false, preserves_original_guards: false, detail: "openMSX documents interactive poke/poke16 and trainer tooling; mapper projection is not proven".into() },
+        PokeRuntimeEmulator::BeebEm | PokeRuntimeEmulator::BEm => PokeRuntimeCapability { emulator, platform: PokePlatform::BbcMicro, support: PokeRuntimeSupport::PreviewOnly, preserves_banking: false, preserves_original_guards: false, detail: "debugger memory inspection is documented, but a safe scripted memory-write path is not proven".into() },
+    }
+}
+
+pub fn project_poke_runtime(
+    cheat: &PokeCheat,
+    emulator: PokeRuntimeEmulator,
+) -> PokeRuntimeProjection {
+    let capability = poke_runtime_capability(emulator);
+    if !cheat.target_verified {
+        return PokeRuntimeProjection {
+            capability,
+            commands_or_files: Vec::new(),
+            preview: "Runtime projection blocked: verified game/release identity is required."
+                .into(),
+            refusal: Some(PokeProjectionRefusal::IdentityNotEligible),
+        };
+    }
+    if cheat.platform != capability.platform {
+        return PokeRuntimeProjection {
+            capability,
+            commands_or_files: Vec::new(),
+            preview: "Runtime projection blocked: platform does not match the emulator.".into(),
+            refusal: Some(PokeProjectionRefusal::WrongPlatform),
+        };
+    }
+    match emulator {
+        PokeRuntimeEmulator::Fuse => project_fuse_pok(cheat, capability),
+        PokeRuntimeEmulator::Vice => project_vice_monitor(cheat, capability),
+        _ => PokeRuntimeProjection { capability, commands_or_files: Vec::new(), preview: "Preview only: this emulator's documented path is insufficient for exact projection.".into(), refusal: Some(PokeProjectionRefusal::UnsupportedRuntime) },
+    }
+}
+
+fn project_fuse_pok(cheat: &PokeCheat, capability: PokeRuntimeCapability) -> PokeRuntimeProjection {
+    let mut lines = vec![format!("N{}", cheat.title)];
+    for (index, operation) in cheat.operations.iter().enumerate() {
+        if operation.memory_space != PokeMemorySpace::BankedRam
+            || operation.value.width_bits != 8
+            || operation.original_value.is_none()
+        {
+            return PokeRuntimeProjection { capability, commands_or_files: Vec::new(), preview: "Fuse projection blocked: every write must be an 8-bit banked write with an original-value field.".into(), refusal: Some(if operation.memory_space != PokeMemorySpace::BankedRam { PokeProjectionRefusal::MemorySpaceUnproven } else if operation.value.width_bits != 8 { PokeProjectionRefusal::WidthUnsupported } else { PokeProjectionRefusal::OriginalGuardUnsupported }) };
+        }
+        let PokeBank::Number(bank) = operation.bank else {
+            return PokeRuntimeProjection {
+                capability,
+                commands_or_files: Vec::new(),
+                preview: "Fuse projection blocked: bank 0-8 must be explicit.".into(),
+                refusal: Some(PokeProjectionRefusal::BankingUnproven),
+            };
+        };
+        if bank > 8
+            || operation.address.0 > u16::MAX as u32
+            || operation.value.value > u8::MAX as u32
+        {
+            return PokeRuntimeProjection {
+                capability,
+                commands_or_files: Vec::new(),
+                preview:
+                    "Fuse projection blocked: address, bank or value is outside documented limits."
+                        .into(),
+                refusal: Some(PokeProjectionRefusal::InvalidAddress),
+            };
+        }
+        let original = operation.original_value.expect("checked above").value;
+        let kind = if index + 1 == cheat.operations.len() {
+            'Z'
+        } else {
+            'M'
+        };
+        lines.push(format!(
+            "{kind} {bank} {} {} {original}",
+            operation.address.0, operation.value.value
+        ));
+    }
+    lines.push("Y".into());
+    let file = lines.join("\n") + "\n";
+    PokeRuntimeProjection {
+        capability,
+        commands_or_files: vec![file.clone()],
+        preview: file,
+        refusal: None,
+    }
+}
+
+fn project_vice_monitor(
+    cheat: &PokeCheat,
+    capability: PokeRuntimeCapability,
+) -> PokeRuntimeProjection {
+    let mut commands = Vec::new();
+    for operation in &cheat.operations {
+        if operation.memory_space != PokeMemorySpace::MainRam
+            || !matches!(operation.bank, PokeBank::Unspecified)
+        {
+            return PokeRuntimeProjection { capability, commands_or_files: Vec::new(), preview: "VICE projection blocked: only explicit unbanked main-memory writes are representable.".into(), refusal: Some(if operation.memory_space != PokeMemorySpace::MainRam { PokeProjectionRefusal::MemorySpaceUnproven } else { PokeProjectionRefusal::BankingUnproven }) };
+        }
+        if operation.value.width_bits != 8 {
+            return PokeRuntimeProjection {
+                capability,
+                commands_or_files: Vec::new(),
+                preview: "VICE projection blocked: only byte writes are currently emitted.".into(),
+                refusal: Some(PokeProjectionRefusal::WidthUnsupported),
+            };
+        }
+        if operation.original_value.is_some() {
+            return PokeRuntimeProjection { capability, commands_or_files: Vec::new(), preview: "VICE projection blocked: monitor command projection cannot preserve an original-value guard.".into(), refusal: Some(PokeProjectionRefusal::OriginalGuardUnsupported) };
+        }
+        commands.push(format!(
+            "> ${:04x} {:02x}",
+            operation.address.0, operation.value.value
+        ));
+    }
+    PokeRuntimeProjection {
+        capability,
+        preview: commands.join("\n") + "\n",
+        commands_or_files: commands,
+        refusal: None,
+    }
 }
 
 pub fn normalize_zx_pok_family(trainer: &ZxPokTrainer) -> PokeCheat {
@@ -450,10 +693,20 @@ pub struct PokeConflict {
     pub kind: PokeConflictKind,
 }
 
-fn same_location(left: &PokeOperation, right: &PokeOperation) -> bool {
-    left.memory_space == right.memory_space
-        && left.bank == right.bank
-        && left.address == right.address
+fn same_memory_context(left: &PokeOperation, right: &PokeOperation) -> bool {
+    left.memory_space == right.memory_space && left.bank == right.bank
+}
+
+fn operation_ranges_overlap(left: &PokeOperation, right: &PokeOperation) -> bool {
+    let left_end = left
+        .address
+        .0
+        .saturating_add((left.value.width_bits / 8).saturating_sub(1) as u32);
+    let right_end = right
+        .address
+        .0
+        .saturating_add((right.value.width_bits / 8).saturating_sub(1) as u32);
+    left.address.0 <= right_end && right.address.0 <= left_end
 }
 
 pub fn find_poke_conflicts(cheats: &[PokeCheat]) -> Vec<PokeConflict> {
@@ -468,10 +721,10 @@ pub fn find_poke_conflicts(cheats: &[PokeCheat]) -> Vec<PokeConflict> {
         for right in (left + 1)..flattened.len() {
             let (li, lop) = flattened[left];
             let (ri, rop) = flattened[right];
-            if li == ri || !same_location(lop, rop) {
+            if li == ri || !same_memory_context(lop, rop) || !operation_ranges_overlap(lop, rop) {
                 continue;
             }
-            if lop.value != rop.value {
+            if lop.address != rop.address || lop.value != rop.value {
                 conflicts.push(PokeConflict {
                     left: li,
                     right: ri,
@@ -701,5 +954,155 @@ mod tests {
             value: 2,
             original_value: Some(0),
         };
+    }
+
+    #[test]
+    fn trainer_expression_parser_accepts_sequence_and_rejects_basic() {
+        let result = parse_poke_expression(
+            PokePlatform::Commodore64,
+            "Lives",
+            "POKE 1024,1:POKE $0401,$02",
+        );
+        assert!(
+            matches!(result, PokeExpressionResult::ParsedWriteSequence(writes) if writes.len() == 2)
+        );
+        assert!(matches!(
+            parse_poke_expression(
+                PokePlatform::ZxSpectrum,
+                "x",
+                "FOR i=1 TO 5: POKE 1,i:NEXT i"
+            ),
+            PokeExpressionResult::UnsafeExpression(_)
+        ));
+    }
+
+    #[test]
+    fn fuse_native_and_vice_monitor_projection_are_deterministic() {
+        let mut fuse = manual_poke(
+            PokePlatform::ZxSpectrum,
+            "Lives",
+            32768,
+            255,
+            Some(3),
+            PokeBank::Number(5),
+            None,
+            Some("verified-release".into()),
+            true,
+        )
+        .unwrap();
+        fuse.operations.push(
+            manual_poke(
+                PokePlatform::ZxSpectrum,
+                "Lives",
+                32769,
+                1,
+                Some(0),
+                PokeBank::Number(5),
+                None,
+                Some("verified-release".into()),
+                true,
+            )
+            .unwrap()
+            .operations
+            .remove(0),
+        );
+        let projection = project_poke_runtime(&fuse, PokeRuntimeEmulator::Fuse);
+        assert!(projection.refusal.is_none());
+        assert_eq!(
+            projection.commands_or_files[0],
+            "NLives\nM 5 32768 255 3\nZ 5 32769 1 0\nY\n"
+        );
+        let vice = manual_poke(
+            PokePlatform::Commodore64,
+            "Lives",
+            1024,
+            255,
+            None,
+            PokeBank::Unspecified,
+            None,
+            Some("verified-release".into()),
+            true,
+        )
+        .unwrap();
+        let vice_projection = project_poke_runtime(&vice, PokeRuntimeEmulator::Vice);
+        assert_eq!(vice_projection.commands_or_files, vec!["> $0400 ff"]);
+    }
+
+    #[test]
+    fn runtime_projection_refuses_identity_guards_and_banking_it_cannot_represent() {
+        let unverified = manual_poke(
+            PokePlatform::Commodore64,
+            "Lives",
+            1024,
+            1,
+            None,
+            PokeBank::Unspecified,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            project_poke_runtime(&unverified, PokeRuntimeEmulator::Vice).refusal,
+            Some(PokeProjectionRefusal::IdentityNotEligible)
+        );
+        let guarded = manual_poke(
+            PokePlatform::Commodore64,
+            "Lives",
+            1024,
+            1,
+            Some(0),
+            PokeBank::Unspecified,
+            None,
+            Some("verified".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            project_poke_runtime(&guarded, PokeRuntimeEmulator::Vice).refusal,
+            Some(PokeProjectionRefusal::OriginalGuardUnsupported)
+        );
+        let banked = manual_poke(
+            PokePlatform::Commodore64,
+            "Lives",
+            1024,
+            1,
+            None,
+            PokeBank::Number(1),
+            None,
+            Some("verified".into()),
+            true,
+        );
+        assert!(banked.is_err());
+    }
+
+    #[test]
+    fn overlapping_writes_conflict_even_when_start_addresses_differ() {
+        let mut first = manual_poke(
+            PokePlatform::AtariSt,
+            "a",
+            100,
+            0x34,
+            None,
+            PokeBank::Unspecified,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        first.operations[0].value.width_bits = 16;
+        let second = manual_poke(
+            PokePlatform::AtariSt,
+            "b",
+            101,
+            0xff,
+            None,
+            PokeBank::Unspecified,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(find_poke_conflicts(&[first, second]).len(), 1);
     }
 }

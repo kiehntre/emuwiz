@@ -974,6 +974,22 @@ fn show_open_retro_provider_catalogue(ui: &mut egui::Ui) {
                 ui.label(format!("Banking: {}", semantics.banking_description));
             });
         }
+        ui.separator();
+        ui.label("Runtime projection is explicit and inspectable; no emulator is launched from this preview.");
+        for emulator in [
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Fuse,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Vice,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Hatari,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::Caprice32,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::OpenMsx,
+            archivefs_core::patch_manager::PokeRuntimeEmulator::BeebEm,
+        ] {
+            let capability = archivefs_core::patch_manager::poke_runtime_capability(emulator);
+            ui.label(format!(
+                "{emulator:?}: {:?} — {}",
+                capability.support, capability.detail
+            ));
+        }
     });
 }
 

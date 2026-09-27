@@ -64,6 +64,59 @@ No native writers are added here. RetroArch/libretro routing may consume the
 neutral writes where an existing adapter proves the target format; this module
 does not invent a writer for other emulators.
 
+## Runtime projection continuation
+
+The runtime capability model is intentionally more specific than “supported”:
+
+| Emulator | Classification | Projection |
+| --- | --- | --- |
+| Fuse | `SupportedNativeRuntime` | deterministic `.pok` file with bank, address, value and original guard |
+| VICE | `SupportedMonitorCommand` | deterministic `>` monitor commands for explicit unbanked byte writes |
+| Hatari | `PreviewOnly` | `memwrite` exists, but exact scripted argument semantics and guards are not proven |
+| Caprice32 | `PreviewOnly` | `--autocmd` exists, but a memory-write command contract is not documented |
+| openMSX | `PreviewOnly` | interactive `poke` exists, but mapper projection is not proven |
+| BeebEm / b-em | `PreviewOnly` | debugger inspection is documented; safe scripted writes are not proven |
+
+Fuse’s manual documents `.pok` loading and activation. VICE documents both the
+`>` memory-write monitor command and playback files in its
+[monitor manual](https://vice-emu.sourceforge.io/vice_12.html). Hatari documents
+`memwrite` and `--parse` but its command argument grammar remains an adapter
+follow-up ([debugger manual](https://www.hatari-emu.org/doc/debugger.html)).
+Caprice32 documents `--autocmd` but not an equivalent memory-write command
+([manual](https://github.com/ColinPitrat/caprice32/blob/master/doc/man.html)).
+BeebEm documents debugger inspection commands but not a safe scripted write
+path ([README](https://github.com/AndyA/beebem/blob/master/doc/README.txt)).
+
+Runtime projection is blocked unless identity is verified. Source media is
+never changed. Generated output is returned as inspectable preview text; no
+emulator is launched by this adapter.
+
+## Trainer expression grammar
+
+The accepted grammar is deliberately tiny:
+
+```text
+POKE integer, integer [, integer]
+POKE integer, integer : POKE integer, integer
+```
+
+Decimal, `$hex`, and `0xhex` integers are accepted. The optional third integer
+is an original-value guard. Lines, operation count, expression bytes and
+integer widths are bounded. `FOR`, `NEXT`, `DATA`, `READ`, `SYS`, `CALL`, `USR`,
+`RANDOMIZE`, assignments, arithmetic, variables and arbitrary expressions are
+classified as unsafe/unsupported rather than simplified.
+
+## Source expansion
+
+The existing ZXDB/.pok provider remains the only non-local classic source
+integration. CPC, MSX and BBC/Acorn descriptors are now explicit local-import
+provider entries, matching the existing C64 and Atari ST legal boundary. No
+public source with both clear redistribution rights and sufficiently stable,
+identity-bearing classic POKE data was established in this pass. Community
+manuals and emulator documentation are research evidence, not cheat payload
+providers. No ROM, disk, tape, trainer executable or opaque patch archive is
+downloaded or bundled.
+
 ## Legal/source boundary
 
 ZXDB and the existing `.pok` provider remain governed by the already-audited

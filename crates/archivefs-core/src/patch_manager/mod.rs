@@ -167,12 +167,15 @@ pub use azahar_local::{
 use crate::{Database, PersistedArchive};
 
 pub use crate::classic_poke_family::{
-    POKE_MAX_LINES, POKE_MAX_OPERATIONS, POKE_MAX_TITLE_BYTES, PokeAddress, PokeBank, PokeCheat,
-    PokeCondition, PokeConflict, PokeConflictKind, PokeEmulatorCapability, PokeEmulatorProjection,
-    PokeIdentityState, PokeIssue, PokeMemorySpace, PokeOperation, PokeOriginalValue,
-    PokeParseError, PokePlatform, PokePlatformSemantics, PokeValue, find_poke_conflicts,
-    manual_poke, normalize_zx_pok_family, parse_simple_pokes, poke_apply_allowed,
+    POKE_MAX_EXPRESSION_BYTES, POKE_MAX_LINES, POKE_MAX_OPERATIONS, POKE_MAX_TITLE_BYTES,
+    PokeAddress, PokeBank, PokeCheat, PokeCondition, PokeConflict, PokeConflictKind,
+    PokeEmulatorCapability, PokeEmulatorProjection, PokeExpressionResult, PokeIdentityState,
+    PokeIssue, PokeMemorySpace, PokeOperation, PokeOriginalValue, PokeParseError, PokePlatform,
+    PokePlatformSemantics, PokeProjectionRefusal, PokeRuntimeCapability, PokeRuntimeEmulator,
+    PokeRuntimeProjection, PokeRuntimeSupport, PokeValue, find_poke_conflicts, manual_poke,
+    normalize_zx_pok_family, parse_poke_expression, parse_simple_pokes, poke_apply_allowed,
     poke_emulator_capabilities, poke_identity_state, poke_platform_semantics,
+    poke_runtime_capability, project_poke_runtime,
 };
 
 pub use crate::open_retro_cheat_providers::{
