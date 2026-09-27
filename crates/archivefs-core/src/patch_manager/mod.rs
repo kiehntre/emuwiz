@@ -83,6 +83,7 @@ mod local_cheat_install_pcsx2;
 mod matching;
 mod melonds_local;
 mod mesen_local;
+mod mgba_cheats;
 mod mgba_local;
 mod openmsx_local;
 mod pcengine_cd_firmware;
@@ -641,6 +642,15 @@ pub use mesen_local::{
     MesenExecutable, MesenInstallationType, MesenLaunchBlocker, MesenLaunchBlockerKind,
     MesenNativeLaunchBinding, MesenProfile, MesenProfileDiscovery, MesenProfileDiscoveryRoots,
     discover_mesen_profiles, parse_mesen_version, resolve_mesen_native_launch_binding,
+};
+pub use mgba_cheats::{
+    MGBA_CHEAT_MAX_BYTES, MGBA_CHEAT_MAX_ENTRIES, MGBA_CHEAT_MAX_LINES_PER_ENTRY,
+    MgbaCheatApplyPlan, MgbaCheatApplyReceipt, MgbaCheatCode, MgbaCheatEntry, MgbaCheatFile,
+    MgbaCheatFormat, MgbaCheatIdentity, MgbaCheatIdentityEvidence, MgbaCheatIssue,
+    MgbaCheatParseError, MgbaCheatReadiness, MgbaCheatState, MgbaCheatWriteError,
+    MgbaCheatWriteResult, apply_mgba_cheat_plan, build_mgba_cheat_apply_plan,
+    merge_mgba_cheat_entry, parse_mgba_cheat_file, remove_mgba_cheat_entry, render_mgba_cheat_file,
+    set_mgba_cheat_state,
 };
 pub use mgba_local::{
     MGBA_MAX_CONFIG_BYTES, MGBA_MAX_PROFILES, MgbaBiosState, MgbaConfigInspection,
