@@ -19,6 +19,7 @@
 //! `retrieval.rs` was changed to add it; every PCSX2 type, plan ID, JSON
 //! shape, and CLI output listed above remains exactly as it was.
 
+mod action_replay;
 mod adapter;
 mod amiga_whdload_local;
 mod azahar_local;
@@ -140,6 +141,13 @@ pub use crate::open_retro_cheat_providers::{
     LIBRETRO_CHEAT_URL, OpenCheatProvider, OpenCheatProviderMode, OpenCheatTrustState,
     WHDLOAD_OPTIONS_URL, WhdloadCustomOption, ZXDB_URL, ZxPokError, ZxPokOperation, ZxPokTrainer,
     normalize_zx_pok, open_cheat_provider_catalogue, parse_whdload_custom_options, parse_zx_pok,
+};
+pub use action_replay::{
+    CheatAdapterProjection, CheatCodeDecodeResult, CheatCodeEncoding, CheatCodeFormat,
+    CheatDecoderProvenance, CheatDetection, CheatInstruction, CheatTargetPlatform,
+    CheatValidationIssue, decode_action_replay, decode_ds_action_replay,
+    decode_gamecube_action_replay, decode_gba_action_replay, decode_ps2_action_replay,
+    detect_action_replay_format, project_action_replay, refuse_encrypted_action_replay,
 };
 pub use adapter::{
     AdapterCapabilities, AdapterId, AdapterIdentityEvidence, DiscoveryConfidence, EmulatorAdapter,

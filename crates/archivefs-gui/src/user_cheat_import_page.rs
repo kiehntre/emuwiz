@@ -12,22 +12,23 @@ use std::thread;
 use crate::onframe_install_session::OnFrameInstallSession;
 use archivefs_core::emulator_environment::HostReadOnlyFilesystem;
 use archivefs_core::patch_manager::{
-    CheatCandidateOptions, CheatDestinationRequest, CheatDocument, CheatIssue,
-    CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyGameIdentity,
+    CheatCandidateOptions, CheatCodeDecodeResult, CheatDestinationRequest, CheatDocument,
+    CheatIssue, CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyGameIdentity,
     CheatJourneyPreview, CheatJourneyPreviewAction, CheatJourneyUndoConfirmation,
     CheatJourneyUndoOptions, CheatJourneyUndoPreview, CheatOperation, CheatPlatform,
-    CheatSourceFormat, CheatTargetFormat, ConversionCapability, DolphinCandidate,
-    DolphinInstallPreview, DolphinInstallPreviewRequest, LocalDolphinInstallState,
-    LocalPcsx2InstallState, LocalXeniaInstallState, Pcsx2GameIdentity, Pcsx2InstallPreview,
-    Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation,
-    SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions,
-    SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat,
-    UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState,
-    XeniaInstallPreview, XeniaInstallPreviewRequest, XeniaProfile, apply_cheat_journey,
-    build_dolphin_install_preview, build_pcsx2_install_preview, build_shared_transaction_plan,
-    build_xenia_install_preview, check_local_dolphin_install_state,
+    CheatSourceFormat, CheatTargetFormat, CheatTargetPlatform, ConversionCapability,
+    DolphinCandidate, DolphinInstallPreview, DolphinInstallPreviewRequest,
+    LocalDolphinInstallState, LocalPcsx2InstallState, LocalXeniaInstallState, Pcsx2GameIdentity,
+    Pcsx2InstallPreview, Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction,
+    SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation,
+    SharedRollbackOptions, SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic,
+    UserCheatFormat, UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame,
+    UserCheatMatchState, XeniaInstallPreview, XeniaInstallPreviewRequest, XeniaProfile,
+    apply_cheat_journey, build_dolphin_install_preview, build_pcsx2_install_preview,
+    build_shared_transaction_plan, build_xenia_install_preview, check_local_dolphin_install_state,
     check_local_pcsx2_install_state, check_local_xenia_install_state, convert_cheat_document,
-    default_shared_backup_root, default_shared_history_root, discover_local_dolphin_cheat_file,
+    decode_action_replay, default_shared_backup_root, default_shared_history_root,
+    detect_action_replay_format, discover_local_dolphin_cheat_file,
     discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file,
     discover_local_xenia_patch_file, execute_shared_apply, execute_shared_rollback,
     generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
@@ -269,6 +270,9 @@ pub(crate) struct UserCheatImportPageState {
     /// Dedicated OnFrame workflow state; never shared with Gecko/Action Replay.
     pub(crate) onframe_install: OnFrameInstallSession,
     onframe_profile_key: Option<String>,
+    action_replay_input: String,
+    action_replay_target: CheatTargetPlatform,
+    action_replay_result: Option<CheatCodeDecodeResult>,
 }
 
 impl UserCheatImportPageState {
@@ -487,6 +491,80 @@ impl UserCheatImportPageState {
         self.show_onframe_install_panel(ui, local_dolphin_install_context);
         self.show_local_xenia_install_picker(ui, local_xenia_install_context);
         self.show_local_xenia_install_panel(ui);
+        self.show_action_replay_decoder_panel(ui);
+    }
+
+    fn show_action_replay_decoder_panel(&mut self, ui: &mut egui::Ui) {
+        widgets::section_header(
+            ui,
+            "Action Replay / GameShark decoder",
+            Some(
+                "Local-only clean-room decoding preview; no database, network, or emulator writes.",
+            ),
+        );
+        widgets::card(ui, |ui| {
+            ui.label("Paste raw code lines to inspect format and supported operations.");
+            ui.add(
+                egui::TextEdit::multiline(&mut self.action_replay_input)
+                    .desired_rows(3)
+                    .hint_text("02000000 1234"),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Target:");
+                for (label, target) in [
+                    ("GBA", CheatTargetPlatform::GameBoyAdvance),
+                    ("PS2", CheatTargetPlatform::PlayStation2),
+                    ("GameCube", CheatTargetPlatform::GameCube),
+                    ("DS", CheatTargetPlatform::NintendoDs),
+                ] {
+                    ui.selectable_value(&mut self.action_replay_target, target, label);
+                }
+                if widgets::action_button(
+                    ui,
+                    "Decode preview",
+                    widgets::ActionStyle::Secondary,
+                    !self.action_replay_input.trim().is_empty(),
+                )
+                .clicked()
+                {
+                    self.action_replay_result = Some(decode_action_replay(
+                        &self.action_replay_input,
+                        self.action_replay_target.clone(),
+                    ));
+                }
+            });
+            if !self.action_replay_input.trim().is_empty() {
+                let detection = detect_action_replay_format(&self.action_replay_input);
+                ui.label(format!("Detected shape: {:?}", detection.candidates));
+            }
+            if let Some(result) = &self.action_replay_result {
+                let status = result.status();
+                widgets::status_badge(
+                    ui,
+                    format!("Status: {status}"),
+                    if status == "Decoded successfully" {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Warning
+                    },
+                );
+                ui.label(format!("Format: {:?}", result.format));
+                ui.label(format!("Instructions: {}", result.instructions.len()));
+                for instruction in &result.instructions {
+                    ui.label(format!(
+                        "{} → {:?}",
+                        instruction.original, instruction.operation
+                    ));
+                }
+                for issue in &result.issues {
+                    ui.label(format!("Warning: {:?}", issue));
+                }
+                ui.label(format!(
+                    "Provenance: {} (local-only)",
+                    result.provenance.method
+                ));
+            }
+        });
     }
 
     fn show_onframe_install_panel(
