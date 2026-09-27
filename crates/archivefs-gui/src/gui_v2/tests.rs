@@ -124,6 +124,56 @@ fn gui_v2_converter_is_a_native_workflow() {
 }
 
 #[test]
+fn gui_v2_browse_play_reuses_filter_selection_and_canonical_destinations() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Mario", Some("SNES")),
+        archive(2, "Sonic", Some("Mega Drive")),
+    ]));
+    app.filter.select_platform("SNES".into());
+    app.filter.search = "mario".into();
+    assert_eq!(super::browse_play::filtered_game_indices(&app), vec![0]);
+    assert_eq!(
+        super::browse_play::browse_play_contextual_routes(1)[0].1,
+        Route::Task {
+            section: Section::Mods,
+            game: 1
+        }
+    );
+    app.router.current = Route::BrowsePlayGame(1);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    for expected in ["Browse & Play", "Mario", "Play", "Game Details"] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "missing Browse & Play content: {expected}"
+        );
+    }
+}
+
+#[test]
+fn gui_v2_browse_play_empty_state_is_safe_and_points_to_sources() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::BrowsePlay;
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value.contains("No games found")));
+    assert!(strings.iter().any(|value| value.contains("Open Sources")));
+    assert_eq!(app.router.current, Route::BrowsePlay);
+}
+
+#[test]
+fn gui_v2_browse_play_repeated_widgets_have_semantic_ids_and_one_chrome() {
+    let source = include_str!("browse_play.rs");
+    assert!(source.contains("v2_browse_play_platform"));
+    assert!(source.contains("v2_browse_play_game"));
+    assert!(source.contains("v2_browse_play_action"));
+    let pages = include_str!("pages.rs");
+    assert_eq!(pages.matches("v2_app_chrome").count(), 1);
+    assert!(pages.contains("v2_navigation"));
+}
+
+#[test]
 fn gui_v2_top_toolbar_exposes_core_mouse_routes() {
     let context = egui::Context::default();
     let mut app = fixture(&context);

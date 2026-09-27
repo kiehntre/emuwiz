@@ -330,6 +330,22 @@ impl App {
             .show(context, |ui| {
                 ui.heading("EmuWiz");
                 ui.label("GUI v2 · live review");
+                ui.push_id("v2_sidebar_browse_play", |ui| {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new("Browse & Play")
+                                .selected(matches!(
+                                    self.router.current,
+                                    Route::BrowsePlay | Route::BrowsePlayGame(_)
+                                ))
+                                .wrap(),
+                        )
+                        .clicked()
+                    {
+                        self.go(Route::BrowsePlay);
+                    }
+                });
                 egui::ScrollArea::vertical()
                     .id_salt("v2_sidebar_scroll")
                     .show(ui, |ui| {
@@ -386,6 +402,8 @@ impl App {
                 .show(ui, |ui| {
                     match route {
                         Route::Home | Route::Section(Section::Home) => self.home(ui),
+                        Route::BrowsePlay => self.browse_play(ui, None),
+                        Route::BrowsePlayGame(id) => self.browse_play(ui, Some(id)),
                         Route::Section(Section::Games | Section::Launch) => self.games(ui),
                         Route::Section(Section::Saves) => self.saves_states(ui),
                         Route::Section(Section::Emulators) => self.emulator_setup(ui),
@@ -470,6 +488,7 @@ impl App {
         use super::guidance::{GuidanceContext, GuidancePage};
         let page = match route {
             Route::Home => GuidancePage::Home,
+            Route::BrowsePlay | Route::BrowsePlayGame(_) => GuidancePage::Games,
             Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
             Route::Section(Section::Sources) => GuidancePage::Sources,
             Route::Section(Section::Launch)
@@ -600,6 +619,7 @@ impl App {
     fn page_header(&mut self, ui: &mut egui::Ui) {
         let family = family_for_route(&self.router.current);
         let title = match &self.router.current {
+            Route::BrowsePlay | Route::BrowsePlayGame(_) => "Browse & Play",
             Route::Game(id) | Route::Task { game: id, .. } => self
                 .library
                 .game(*id)
@@ -611,7 +631,14 @@ impl App {
                 .unwrap_or_else(|| self.router.current.section().title()),
         };
         ui.heading(title);
-        if self.router.current.game().is_some() {
+        if matches!(
+            self.router.current,
+            Route::BrowsePlay | Route::BrowsePlayGame(_)
+        ) {
+            ui.label(
+                "Browse platforms, choose a game, and launch it through the existing planner.",
+            );
+        } else if self.router.current.game().is_some() {
             ui.label("Your game's information, readiness and next actions, in one place.");
         } else if let Some(family) = family {
             if family_home(family).section() == self.router.current.section() {
@@ -671,6 +698,14 @@ impl App {
 
     fn home(&mut self, ui: &mut egui::Ui) {
         self.home_hero(ui);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading("Browse & Play");
+            ui.label("A simple game-first view for platforms, artwork and launching.");
+            if primary(ui, "Browse & Play") {
+                self.go(Route::BrowsePlay);
+            }
+        });
+        ui.add_space(theme::SPACE_SM);
         if self.loaded && self.library.games.is_empty() {
             if empty_state(
                 ui,

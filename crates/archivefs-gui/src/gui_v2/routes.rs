@@ -328,6 +328,9 @@ pub(super) fn family_home(family: FeatureFamily) -> Route {
 }
 
 pub(super) fn family_for_route(route: &Route) -> Option<FeatureFamily> {
+    if matches!(route, Route::BrowsePlay | Route::BrowsePlayGame(_)) {
+        return None;
+    }
     let section = route.section();
     Some(match section {
         Section::Check | Section::Dat | Section::DatVerification => FeatureFamily::DatsVerification,
@@ -728,6 +731,8 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
 pub(super) enum Route {
     #[default]
     Home,
+    BrowsePlay,
+    BrowsePlayGame(i64),
     Section(Section),
     Game(i64),
     QuickRename,
@@ -741,6 +746,7 @@ impl Route {
     pub fn section(&self) -> Section {
         match self {
             Self::Home => Section::Home,
+            Self::BrowsePlay | Self::BrowsePlayGame(_) => Section::Games,
             Self::Section(section) | Self::Task { section, .. } => *section,
             Self::Game(_) => Section::Games,
             Self::QuickRename => Section::Dat,
@@ -748,6 +754,7 @@ impl Route {
     }
     pub fn game(&self) -> Option<i64> {
         match self {
+            Self::BrowsePlayGame(id) => Some(*id),
             Self::Game(id) | Self::Task { game: id, .. } => Some(*id),
             _ => None,
         }
@@ -757,6 +764,13 @@ impl Route {
 /// Presentation-only location labels for the app chrome. Navigation remains
 /// owned by `Route` and `Router`.
 pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<String> {
+    if matches!(route, Route::BrowsePlay | Route::BrowsePlayGame(_)) {
+        let mut labels = vec!["Browse & Play".to_string()];
+        if let Some(game_title) = game_title.filter(|title| !title.trim().is_empty()) {
+            labels.push(game_title.to_string());
+        }
+        return labels;
+    }
     if matches!(route, Route::QuickRename) {
         return vec!["DATs & Verification".into(), "Quick Rename".into()];
     }
@@ -778,7 +792,7 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, Section, breadcrumb_labels};
+    use super::{Route, Section, breadcrumb_labels, family_for_route};
 
     #[test]
     fn breadcrumbs_follow_route_and_selected_game_context() {
@@ -802,6 +816,17 @@ mod tests {
             ["DATs & Verification", "Quick Rename"]
         );
         assert_eq!(Route::QuickRename.section(), Section::Dat);
+    }
+
+    #[test]
+    fn browse_play_is_a_presentation_route_outside_feature_families() {
+        assert_eq!(Route::BrowsePlay.section(), Section::Games);
+        assert_eq!(Route::BrowsePlayGame(7).game(), Some(7));
+        assert_eq!(family_for_route(&Route::BrowsePlay), None);
+        assert_eq!(
+            breadcrumb_labels(&Route::BrowsePlayGame(7), Some("Pac-Man")),
+            ["Browse & Play", "Pac-Man"]
+        );
     }
 }
 

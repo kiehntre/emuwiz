@@ -4,6 +4,7 @@ mod archive_inspector;
 mod artwork;
 mod backend;
 mod bezel;
+mod browse_play;
 mod documents;
 mod dreamcast_ipbin;
 mod environment;
