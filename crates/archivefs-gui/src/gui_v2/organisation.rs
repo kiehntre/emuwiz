@@ -461,7 +461,8 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
         ui.heading("MAME reconstruction history");
         let history = state.mame_history.clone();
         for transaction in history.iter().rev() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.push_id(&transaction.transaction_id, |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(format!(
                     "{} · {} · {} output",
                     transaction.transaction_id,
@@ -510,6 +511,7 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                 ui.collapsing("Advanced transaction details", |ui| {
                     ui.label(format!("State: {}", transaction.state.label()));
                     ui.label("The shared journal is the recovery record; source archives are never rollback targets.");
+                });
                 });
             });
         }

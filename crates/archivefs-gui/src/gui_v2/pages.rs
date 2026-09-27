@@ -1203,7 +1203,8 @@ impl App {
             if self.duplicate_ignored.contains(&key) {
                 continue;
             }
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.push_id(("duplicate-group", &group.sha256), |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.heading(format!("{} · {} copies", group.kind, group.members.len()));
                 if let Some(readiness) = self.duplicate_readiness(group) {
                     ui.label(RichText::new(readiness).strong().color(
@@ -1233,6 +1234,7 @@ impl App {
                     "This group is blocked from automatic action; review the evidence before deciding what to do."
                 } else {
                     "Quarantine is recoverable and must be reviewed in Problems & Repair; there is no delete action here."
+                });
                 });
             });
         }
@@ -1437,7 +1439,8 @@ impl App {
                     for index in range {
                         let problem = &summary.problems[entries[index]];
                         let is_selected = selected.as_deref() == Some(problem.id.as_str());
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.push_id(&problem.id, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal_wrapped(|ui| {
                             ui.strong(&problem.title);
@@ -1457,6 +1460,7 @@ impl App {
                         {
                             self.start_duplicate_preview(index);
                         }
+                        });
                     });
                     }
                 });
@@ -1956,7 +1960,8 @@ impl App {
                 return;
             }
             for document in documents {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.push_id(("document", &document.path), |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.strong(&document.title);
                     ui.label(format!("{} · {}", document.format.label(), document.page_count.map_or("page count unknown".into(), |count| format!("{count} pages"))));
@@ -2027,6 +2032,7 @@ impl App {
                     ui.label(format!("Provenance: {}", document.source_label()));
                     ui.label(format!("Association confidence: {}", document.association.label()));
                     ui.label("Opening a document uses your desktop viewer; the source file is read-only to EmuWiz.");
+                });
                 });
             });
             }
@@ -2165,11 +2171,13 @@ impl App {
                 ui.label("No archive-backed games are currently in the catalogue.");
             } else {
                 for (id, title, kind) in &archive_games {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("{title} · {}", media_kind_label(kind)));
-                        if ui.button("Inspect contents").clicked() {
-                            inspect_game = Some(*id);
-                        }
+                    ui.push_id(("archive-game", id), |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(format!("{title} · {}", media_kind_label(kind)));
+                            if ui.button("Inspect contents").clicked() {
+                                inspect_game = Some(*id);
+                            }
+                        });
                     });
                 }
             }
@@ -2250,7 +2258,8 @@ impl App {
                             ui.label("Showing the first 200 games here. Open any other game from Games, then choose Artwork & Metadata.");
                         }
                         for game in library.games.iter().take(200) {
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.push_id(game.archive.id, |ui| {
+                                egui::Frame::group(ui.style()).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     self.picture(ui, game, Kind::Cover, egui::vec2(72.0, 96.0));
                                     ui.vertical(|ui| {
@@ -2261,6 +2270,7 @@ impl App {
                                             self.go(Route::Task { section: Section::Artwork, game: game.archive.id });
                                         }
                                     });
+                                });
                                 });
                             });
                         }

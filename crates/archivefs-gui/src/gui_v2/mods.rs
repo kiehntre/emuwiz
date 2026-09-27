@@ -323,7 +323,9 @@ fn installed(
         return;
     }
     for receipt in receipts {
-        receipt_card(ui, receipt);
+        ui.push_id(&receipt.transaction_id, |ui| {
+            receipt_card(ui, receipt);
+        });
     }
 }
 

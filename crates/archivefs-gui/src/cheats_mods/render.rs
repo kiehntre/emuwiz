@@ -2178,8 +2178,10 @@ pub(crate) fn show_pcsx2_workflow(
                 ));
             }
             for profile in &discovery.profiles {
-                show_pcsx2_profile_card(ui, workflow, profile, clipboard);
-                ui.add_space(6.0);
+                ui.push_id(("pcsx2-profile", &profile.profile_id), |ui| {
+                    show_pcsx2_profile_card(ui, workflow, profile, clipboard);
+                    ui.add_space(6.0);
+                });
             }
             for warning in &discovery.warnings {
                 widgets::banner(
@@ -2453,27 +2455,33 @@ pub(crate) fn show_dolphin_beginner_summary(
         .iter()
         .filter(|entry| entry.selectable)
     {
-        widgets::card(ui, |ui| {
-            let mut selected = entry.selected;
-            ui.horizontal_wrapped(|ui| {
-                if ui.checkbox(&mut selected, &entry.name).changed() {
-                    action = Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
-                        index: entry.index,
-                        selected,
-                    });
-                }
-                if entry.uncertain_revision {
-                    widgets::status_badge(ui, "Probably compatible", widgets::StatusTone::Warning);
-                } else {
-                    widgets::status_badge(ui, "Compatible", widgets::StatusTone::Success);
-                }
-                if entry.already_present && entry.already_enabled {
-                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Info);
+        ui.push_id(("dolphin-code", entry.index), |ui| {
+            widgets::card(ui, |ui| {
+                let mut selected = entry.selected;
+                ui.horizontal_wrapped(|ui| {
+                    if ui.checkbox(&mut selected, &entry.name).changed() {
+                        action = Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
+                            index: entry.index,
+                            selected,
+                        });
+                    }
+                    if entry.uncertain_revision {
+                        widgets::status_badge(
+                            ui,
+                            "Probably compatible",
+                            widgets::StatusTone::Warning,
+                        );
+                    } else {
+                        widgets::status_badge(ui, "Compatible", widgets::StatusTone::Success);
+                    }
+                    if entry.already_present && entry.already_enabled {
+                        widgets::status_badge(ui, "Installed", widgets::StatusTone::Info);
+                    }
+                });
+                for note in &entry.notes {
+                    ui.label(note);
                 }
             });
-            for note in &entry.notes {
-                ui.label(note);
-            }
         });
     }
     let selected_entries: Vec<_> = state
@@ -2832,8 +2840,10 @@ pub(crate) fn show_dolphin_workflow_details(
                 ));
             }
             for profile in &discovery.profiles {
-                show_dolphin_profile_card(ui, workflow, profile, clipboard);
-                ui.add_space(6.0);
+                ui.push_id(("dolphin-profile", &profile.profile_id), |ui| {
+                    show_dolphin_profile_card(ui, workflow, profile, clipboard);
+                    ui.add_space(6.0);
+                });
             }
             for warning in &discovery.warnings {
                 widgets::banner(
@@ -3214,45 +3224,55 @@ pub(crate) fn show_dolphin_provider_code_picker(
         }
     });
     for entry in &state.selection.entries {
-        widgets::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let mut selected = entry.selected;
-                if ui
-                    .add_enabled(
-                        entry.selectable,
-                        egui::Checkbox::new(&mut selected, &entry.name),
-                    )
-                    .changed()
-                {
-                    action = Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
-                        index: entry.index,
-                        selected,
-                    });
+        ui.push_id(("provider-code", &entry.provider_entry_id), |ui| {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let mut selected = entry.selected;
+                    if ui
+                        .add_enabled(
+                            entry.selectable,
+                            egui::Checkbox::new(&mut selected, &entry.name),
+                        )
+                        .changed()
+                    {
+                        action = Some(CheatWorkflowAction::ToggleDolphinCodeSelected {
+                            index: entry.index,
+                            selected,
+                        });
+                    }
+                    if entry.already_present {
+                        widgets::status_badge(ui, "Already installed", widgets::StatusTone::Info);
+                    }
+                    if entry.already_enabled {
+                        widgets::status_badge(ui, "Enabled", widgets::StatusTone::Success);
+                    }
+                    if entry.uncertain_revision {
+                        widgets::status_badge(
+                            ui,
+                            "Revision uncertain",
+                            widgets::StatusTone::Warning,
+                        );
+                    }
+                    if !entry.selectable {
+                        widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                    }
+                });
+                for note in &entry.notes {
+                    ui.label(note);
                 }
-                if entry.already_present {
-                    widgets::status_badge(ui, "Already installed", widgets::StatusTone::Info);
+                for warning in &entry.warnings {
+                    ui.weak(warning);
                 }
-                if entry.already_enabled {
-                    widgets::status_badge(ui, "Enabled", widgets::StatusTone::Success);
-                }
-                if entry.uncertain_revision {
-                    widgets::status_badge(ui, "Revision uncertain", widgets::StatusTone::Warning);
-                }
-                if !entry.selectable {
-                    widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                if let Some(provider_entry) = fetch.result.entries.get(entry.index) {
+                    widgets::technical_details(
+                        ui,
+                        ("provider_code", &entry.provider_entry_id),
+                        |ui| {
+                            ui.code(provider_entry.code_lines.join("\n"));
+                        },
+                    );
                 }
             });
-            for note in &entry.notes {
-                ui.label(note);
-            }
-            for warning in &entry.warnings {
-                ui.weak(warning);
-            }
-            if let Some(provider_entry) = fetch.result.entries.get(entry.index) {
-                widgets::technical_details(ui, ("provider_code", &entry.provider_entry_id), |ui| {
-                    ui.code(provider_entry.code_lines.join("\n"));
-                });
-            }
         });
     }
     if widgets::action_button(
@@ -3458,35 +3478,37 @@ pub(crate) fn show_xenia_beginner_summary(
         .iter()
         .filter(|entry| entry.selectable)
     {
-        widgets::card(ui, |ui| {
-            let mut selected = entry.selected;
-            ui.horizontal_wrapped(|ui| {
-                if ui.checkbox(&mut selected, &entry.name).changed() {
-                    action = Some(CheatWorkflowAction::ToggleXeniaPatchSelected {
-                        index: entry.index,
-                        selected,
-                    });
-                }
-                match state.selection.compatibility {
-                    XeniaCandidateCompatibility::ExactCompatible => {
-                        widgets::status_badge(ui, "Compatible", widgets::StatusTone::Success);
+        ui.push_id(("xenia-patch", entry.index), |ui| {
+            widgets::card(ui, |ui| {
+                let mut selected = entry.selected;
+                ui.horizontal_wrapped(|ui| {
+                    if ui.checkbox(&mut selected, &entry.name).changed() {
+                        action = Some(CheatWorkflowAction::ToggleXeniaPatchSelected {
+                            index: entry.index,
+                            selected,
+                        });
                     }
-                    XeniaCandidateCompatibility::PartiallyVerified => {
-                        widgets::status_badge(
-                            ui,
-                            "Probably compatible",
-                            widgets::StatusTone::Warning,
-                        );
+                    match state.selection.compatibility {
+                        XeniaCandidateCompatibility::ExactCompatible => {
+                            widgets::status_badge(ui, "Compatible", widgets::StatusTone::Success);
+                        }
+                        XeniaCandidateCompatibility::PartiallyVerified => {
+                            widgets::status_badge(
+                                ui,
+                                "Probably compatible",
+                                widgets::StatusTone::Warning,
+                            );
+                        }
+                        XeniaCandidateCompatibility::Incompatible => {}
                     }
-                    XeniaCandidateCompatibility::Incompatible => {}
-                }
-                if entry.already_enabled {
-                    widgets::status_badge(ui, "Installed", widgets::StatusTone::Info);
+                    if entry.already_enabled {
+                        widgets::status_badge(ui, "Installed", widgets::StatusTone::Info);
+                    }
+                });
+                if !entry.description.is_empty() {
+                    ui.label(&entry.description);
                 }
             });
-            if !entry.description.is_empty() {
-                ui.label(&entry.description);
-            }
         });
     }
     ui.add_space(theme::SECTION_GAP);
@@ -3685,8 +3707,10 @@ pub(crate) fn show_xenia_workflow_details(
                 ));
             }
             for profile in &discovery.profiles {
-                show_xenia_profile_card(ui, workflow, profile, clipboard);
-                ui.add_space(6.0);
+                ui.push_id(("xenia-profile", &profile.profile_id), |ui| {
+                    show_xenia_profile_card(ui, workflow, profile, clipboard);
+                    ui.add_space(6.0);
+                });
             }
         }
     }
@@ -4141,37 +4165,43 @@ pub(crate) fn show_xenia_patch_picker(
         }
     });
     for entry in &state.selection.entries {
-        widgets::card(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                let mut selected = entry.selected;
-                if ui
-                    .add_enabled(
-                        entry.selectable,
-                        egui::Checkbox::new(&mut selected, &entry.name),
-                    )
-                    .changed()
-                {
-                    action = Some(CheatWorkflowAction::ToggleXeniaPatchSelected {
-                        index: entry.index,
-                        selected,
-                    });
+        ui.push_id(("dolphin-code-file", entry.index), |ui| {
+            widgets::card(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let mut selected = entry.selected;
+                    if ui
+                        .add_enabled(
+                            entry.selectable,
+                            egui::Checkbox::new(&mut selected, &entry.name),
+                        )
+                        .changed()
+                    {
+                        action = Some(CheatWorkflowAction::ToggleXeniaPatchSelected {
+                            index: entry.index,
+                            selected,
+                        });
+                    }
+                    if entry.already_enabled {
+                        widgets::status_badge(
+                            ui,
+                            "Already enabled in file",
+                            widgets::StatusTone::Info,
+                        );
+                    }
+                    if !entry.selectable {
+                        widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                    }
+                });
+                if !entry.author.is_empty() {
+                    ui.label(format!("Author: {}", entry.author));
                 }
-                if entry.already_enabled {
-                    widgets::status_badge(ui, "Already enabled in file", widgets::StatusTone::Info);
+                if !entry.description.is_empty() {
+                    ui.label(&entry.description);
                 }
-                if !entry.selectable {
-                    widgets::status_badge(ui, "Blocked", widgets::StatusTone::Blocked);
+                for warning in &entry.warnings {
+                    ui.weak(warning);
                 }
             });
-            if !entry.author.is_empty() {
-                ui.label(format!("Author: {}", entry.author));
-            }
-            if !entry.description.is_empty() {
-                ui.label(&entry.description);
-            }
-            for warning in &entry.warnings {
-                ui.weak(warning);
-            }
         });
     }
     if widgets::action_button(
@@ -5756,7 +5786,8 @@ pub(crate) fn show_gamecube_gamehacking(
                     .iter()
                     .find(|entry| entry.index == position)
                     .cloned();
-                widgets::card(ui, |ui| {
+                ui.push_id(("gamehacking-gamecube-cheat", &cheat.id), |ui| {
+                    widgets::card(ui, |ui| {
                     if let Some(entry) = &entry
                         && entry.selectable
                     {
@@ -5795,6 +5826,7 @@ pub(crate) fn show_gamecube_gamehacking(
                             "Preview only - EmuWiz never installs a cheat whose Action Replay/Gecko format wasn't explicitly labelled by GameHacking.org.",
                         );
                     }
+                    });
                 });
             }
             ui.horizontal_wrapped(|ui| {
@@ -6106,30 +6138,40 @@ pub(crate) fn show_bsfree_gamecube(
             match state.status {
                 BsFreeGameCubeSearchStatus::Candidates => {
                     for candidate in &state.candidates {
-                        widgets::card(ui, |ui| {
-                            ui.strong(&candidate.matched_bsfree_title);
-                            ui.label(format!(
-                                "Version: {} · BSFree game UID {}",
-                                candidate
-                                    .matched_bsfree_version
-                                    .as_deref()
-                                    .unwrap_or("not supplied"),
-                                candidate.matched_bsfree_game_upstream_uid
-                            ));
-                            ui.weak(&candidate.region_evidence);
-                            if widgets::action_button(
-                                ui,
-                                "Use this game",
-                                widgets::ActionStyle::Primary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action = Some(CheatWorkflowAction::ConfirmBsFreeGameCubeMatch {
-                                    upstream_uid: candidate.matched_bsfree_game_upstream_uid,
+                        ui.push_id(
+                            (
+                                "bsfree-gamecube-candidate",
+                                candidate.matched_bsfree_game_upstream_uid,
+                            ),
+                            |ui| {
+                                widgets::card(ui, |ui| {
+                                    ui.strong(&candidate.matched_bsfree_title);
+                                    ui.label(format!(
+                                        "Version: {} · BSFree game UID {}",
+                                        candidate
+                                            .matched_bsfree_version
+                                            .as_deref()
+                                            .unwrap_or("not supplied"),
+                                        candidate.matched_bsfree_game_upstream_uid
+                                    ));
+                                    ui.weak(&candidate.region_evidence);
+                                    if widgets::action_button(
+                                        ui,
+                                        "Use this game",
+                                        widgets::ActionStyle::Primary,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        action =
+                                            Some(CheatWorkflowAction::ConfirmBsFreeGameCubeMatch {
+                                                upstream_uid: candidate
+                                                    .matched_bsfree_game_upstream_uid,
+                                            });
+                                    }
                                 });
-                            }
-                        });
+                            },
+                        );
                     }
                 }
                 BsFreeGameCubeSearchStatus::NoMatch => {}
@@ -6156,38 +6198,40 @@ pub(crate) fn show_bsfree_gamecube(
                             .find(|entry| entry.index == position)
                             .cloned();
                         let (status_label, tone) = bsfree_cheat_status(cheat, &state.analysis);
-                        widgets::card(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                if let Some(entry) = &entry
-                                    && entry.selectable
-                                {
-                                    let mut selected = entry.selected;
-                                    if ui.checkbox(&mut selected, &cheat.name).changed() {
-                                        action = Some(
+                        ui.push_id(("bsfree-gamecube-cheat", cheat.upstream_id), |ui| {
+                            widgets::card(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(entry) = &entry
+                                        && entry.selectable
+                                    {
+                                        let mut selected = entry.selected;
+                                        if ui.checkbox(&mut selected, &cheat.name).changed() {
+                                            action = Some(
                                             CheatWorkflowAction::ToggleBsFreeGameCubeCheatSelected {
                                                 index: entry.index,
                                                 selected,
                                             },
                                         );
+                                        }
+                                    } else {
+                                        ui.strong(&cheat.name);
                                     }
-                                } else {
-                                    ui.strong(&cheat.name);
+                                    widgets::status_badge(ui, status_label, tone);
+                                });
+                                if let Some(author) = &cheat.author {
+                                    ui.label(format!("Author: {author}"));
                                 }
-                                widgets::status_badge(ui, status_label, tone);
-                            });
-                            if let Some(author) = &cheat.author {
-                                ui.label(format!("Author: {author}"));
-                            }
-                            if let Some(note) = &cheat.note {
-                                ui.label(format!("Notes: {note}"));
-                            }
-                            if entry.is_none_or(|entry| !entry.selectable) {
-                                ui.weak(bsfree_browse_only_reason(cheat.code_format));
-                            }
-                            ui.collapsing("Code", |ui| {
-                                for line in &cheat.code_lines {
-                                    ui.monospace(line);
+                                if let Some(note) = &cheat.note {
+                                    ui.label(format!("Notes: {note}"));
                                 }
+                                if entry.is_none_or(|entry| !entry.selectable) {
+                                    ui.weak(bsfree_browse_only_reason(cheat.code_format));
+                                }
+                                ui.collapsing("Code", |ui| {
+                                    for line in &cheat.code_lines {
+                                        ui.monospace(line);
+                                    }
+                                });
                             });
                         });
                     }
@@ -6393,30 +6437,39 @@ pub(crate) fn show_bsfree_wii(
             match state.status {
                 BsFreeWiiSearchStatus::Candidates => {
                     for candidate in &state.candidates {
-                        widgets::card(ui, |ui| {
-                            ui.strong(&candidate.matched_bsfree_title);
-                            ui.label(format!(
-                                "Version: {} · BSFree game UID {}",
-                                candidate
-                                    .matched_bsfree_version
-                                    .as_deref()
-                                    .unwrap_or("not supplied"),
-                                candidate.matched_bsfree_game_upstream_uid
-                            ));
-                            ui.weak(&candidate.region_evidence);
-                            if widgets::action_button(
-                                ui,
-                                "Use this game",
-                                widgets::ActionStyle::Primary,
-                                true,
-                            )
-                            .clicked()
-                            {
-                                action = Some(CheatWorkflowAction::ConfirmBsFreeWiiMatch {
-                                    upstream_uid: candidate.matched_bsfree_game_upstream_uid,
+                        ui.push_id(
+                            (
+                                "bsfree-wii-candidate",
+                                candidate.matched_bsfree_game_upstream_uid,
+                            ),
+                            |ui| {
+                                widgets::card(ui, |ui| {
+                                    ui.strong(&candidate.matched_bsfree_title);
+                                    ui.label(format!(
+                                        "Version: {} · BSFree game UID {}",
+                                        candidate
+                                            .matched_bsfree_version
+                                            .as_deref()
+                                            .unwrap_or("not supplied"),
+                                        candidate.matched_bsfree_game_upstream_uid
+                                    ));
+                                    ui.weak(&candidate.region_evidence);
+                                    if widgets::action_button(
+                                        ui,
+                                        "Use this game",
+                                        widgets::ActionStyle::Primary,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        action = Some(CheatWorkflowAction::ConfirmBsFreeWiiMatch {
+                                            upstream_uid: candidate
+                                                .matched_bsfree_game_upstream_uid,
+                                        });
+                                    }
                                 });
-                            }
-                        });
+                            },
+                        );
                     }
                 }
                 BsFreeWiiSearchStatus::NoMatch => {
@@ -6448,38 +6501,40 @@ pub(crate) fn show_bsfree_wii(
                             .find(|entry| entry.index == position)
                             .cloned();
                         let (status_label, tone) = bsfree_wii_cheat_status(cheat, &state.analysis);
-                        widgets::card(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                if let Some(entry) = &entry
-                                    && entry.selectable
-                                {
-                                    let mut selected = entry.selected;
-                                    if ui.checkbox(&mut selected, &cheat.name).changed() {
-                                        action = Some(
-                                            CheatWorkflowAction::ToggleBsFreeWiiCheatSelected {
-                                                index: entry.index,
-                                                selected,
-                                            },
-                                        );
+                        ui.push_id(("bsfree-wii-cheat", cheat.upstream_id), |ui| {
+                            widgets::card(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    if let Some(entry) = &entry
+                                        && entry.selectable
+                                    {
+                                        let mut selected = entry.selected;
+                                        if ui.checkbox(&mut selected, &cheat.name).changed() {
+                                            action = Some(
+                                                CheatWorkflowAction::ToggleBsFreeWiiCheatSelected {
+                                                    index: entry.index,
+                                                    selected,
+                                                },
+                                            );
+                                        }
+                                    } else {
+                                        ui.strong(&cheat.name);
                                     }
-                                } else {
-                                    ui.strong(&cheat.name);
+                                    widgets::status_badge(ui, status_label, tone);
+                                });
+                                if let Some(author) = &cheat.author {
+                                    ui.label(format!("Author: {author}"));
                                 }
-                                widgets::status_badge(ui, status_label, tone);
-                            });
-                            if let Some(author) = &cheat.author {
-                                ui.label(format!("Author: {author}"));
-                            }
-                            if let Some(note) = &cheat.note {
-                                ui.label(format!("Notes: {note}"));
-                            }
-                            if entry.is_none_or(|entry| !entry.selectable) {
-                                ui.weak(bsfree_wii_browse_only_reason(cheat.code_format));
-                            }
-                            ui.collapsing("Code", |ui| {
-                                for line in &cheat.code_lines {
-                                    ui.monospace(line);
+                                if let Some(note) = &cheat.note {
+                                    ui.label(format!("Notes: {note}"));
                                 }
+                                if entry.is_none_or(|entry| !entry.selectable) {
+                                    ui.weak(bsfree_wii_browse_only_reason(cheat.code_format));
+                                }
+                                ui.collapsing("Code", |ui| {
+                                    for line in &cheat.code_lines {
+                                        ui.monospace(line);
+                                    }
+                                });
                             });
                         });
                     }
@@ -8541,7 +8596,8 @@ pub(crate) fn show_cheat_workflow_step1(
                 ));
             }
             for profile in &discovery.profiles {
-                widgets::card(ui, |ui| {
+                ui.push_id(("retroarch-profile", &profile.profile_id), |ui| {
+                    widgets::card(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if profile.eligible {
                             let selected = workflow.selected_profile_id.as_deref()
@@ -8589,6 +8645,7 @@ pub(crate) fn show_cheat_workflow_step1(
                             }
                         },
                     );
+                    });
                 });
                 ui.add_space(6.0);
             }

@@ -180,7 +180,8 @@ pub(super) fn show(
                 }
             } else {
                 for emulator in &snapshot.lifecycle {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.push_id(("emulator", &emulator.emulator_id), |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             ui.strong(&emulator.emulator_id);
                             status(ui, lifecycle_state_label(emulator.state), lifecycle_state_tone(emulator.state));
@@ -201,9 +202,13 @@ pub(super) fn show(
                             });
                         } else {
                             for installation in &emulator.installations {
-                                lifecycle_installation_card(ui, installation);
+                                ui.push_id(
+                                    ("installation", format!("{:?}", installation.exact_binding)),
+                                    |ui| lifecycle_installation_card(ui, installation),
+                                );
                             }
                         }
+                        });
                     });
                 }
             }
@@ -697,12 +702,14 @@ fn platform_details(
             ready(ui, "No library blocker is recorded for this system");
         }
         for game in games.iter().filter(|game| !game.identified || game.attention).take(8) {
-            if ui
-                .button(format!("Why won’t {} start?", game.title))
-                .clicked()
-            {
-                *action = Some(Action::OpenGame(game.archive.id));
-            }
+            ui.push_id(("readiness-game", game.archive.id), |ui| {
+                if ui
+                    .button(format!("Why won’t {} start?", game.title))
+                    .clicked()
+                {
+                    *action = Some(Action::OpenGame(game.archive.id));
+                }
+            });
         }
         ui.collapsing("Advanced details", |ui| {
             ui.label("EmuWiz uses the existing launch planner and identity evidence. This page does not recalculate readiness.");

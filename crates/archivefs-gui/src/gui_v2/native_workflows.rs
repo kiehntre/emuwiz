@@ -722,7 +722,9 @@ impl NativeWorkflows {
                 .id_salt("v2_native_sources")
                 .show(ui, |ui| {
                     for source in &source_state.sources {
-                        self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                        ui.push_id(&source.path, |ui| {
+                            self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                        });
                     }
                 });
         }
@@ -944,28 +946,30 @@ impl NativeWorkflows {
             .id_salt("v2_source_discovery")
             .show(ui, |ui| {
                 for candidate in candidates.into_iter().take(200) {
-                    crate::ui::components::card(ui, |ui| {
-                        ui.strong(candidate.path.display().to_string());
-                        ui.label(format!(
-                            "{} · {}",
-                            discovery_container_label(&candidate.container),
-                            candidate
-                                .platform_hint
-                                .as_deref()
-                                .unwrap_or("Platform not identified")
-                        ));
-                        ui.label(&candidate.explanation);
-                        let root = candidate.path.parent().map(Path::to_path_buf);
-                        if let Some(root) = root
-                            && ui
-                                .add_enabled(
-                                    !busy,
-                                    egui::Button::new("Add this folder as a source"),
-                                )
-                                .clicked()
-                        {
-                            *action = Some(crate::SourceAction::Add(root));
-                        }
+                    ui.push_id(&candidate.path, |ui| {
+                        crate::ui::components::card(ui, |ui| {
+                            ui.strong(candidate.path.display().to_string());
+                            ui.label(format!(
+                                "{} · {}",
+                                discovery_container_label(&candidate.container),
+                                candidate
+                                    .platform_hint
+                                    .as_deref()
+                                    .unwrap_or("Platform not identified")
+                            ));
+                            ui.label(&candidate.explanation);
+                            let root = candidate.path.parent().map(Path::to_path_buf);
+                            if let Some(root) = root
+                                && ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new("Add this folder as a source"),
+                                    )
+                                    .clicked()
+                            {
+                                *action = Some(crate::SourceAction::Add(root));
+                            }
+                        });
                     });
                 }
             });
@@ -1082,54 +1086,58 @@ impl NativeWorkflows {
             ui.label("No local DAT sources are installed yet.");
         }
         for row in &view.rows {
-            crate::ui::components::card(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong(&row.display_name);
-                    ui.label(row.kind_label);
-                    ui.label(dat_health_label(row.health_state));
-                });
-                ui.label(format!(
-                    "Ecosystem / platform: {}",
-                    row.platform_display.as_deref().unwrap_or("not assigned")
-                ));
-                ui.label(format!("Source: {}", row.path));
-                if let Some(version) = row.arcade_verification.as_deref() {
-                    ui.label(format!("Version: {version}"));
-                }
-                if let Some(detail) = row.health_detail.as_deref() {
-                    ui.weak(detail);
-                }
-                if ui
-                    .button(
-                        if row.health_state
-                            == archivefs_core::dat::sources::DatHealthState::NotChecked
-                        {
-                            "Validate"
-                        } else {
-                            "Validate again"
-                        },
-                    )
-                    .clicked()
-                {
-                    action = Some(crate::dat_sources_page::DatSourcesPageAction::Validate {
-                        id: row.id.clone(),
+            ui.push_id(("dat", &row.id), |ui| {
+                crate::ui::components::card(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&row.display_name);
+                        ui.label(row.kind_label);
+                        ui.label(dat_health_label(row.health_state));
                     });
-                }
+                    ui.label(format!(
+                        "Ecosystem / platform: {}",
+                        row.platform_display.as_deref().unwrap_or("not assigned")
+                    ));
+                    ui.label(format!("Source: {}", row.path));
+                    if let Some(version) = row.arcade_verification.as_deref() {
+                        ui.label(format!("Version: {version}"));
+                    }
+                    if let Some(detail) = row.health_detail.as_deref() {
+                        ui.weak(detail);
+                    }
+                    if ui
+                        .button(
+                            if row.health_state
+                                == archivefs_core::dat::sources::DatHealthState::NotChecked
+                            {
+                                "Validate"
+                            } else {
+                                "Validate again"
+                            },
+                        )
+                        .clicked()
+                    {
+                        action = Some(crate::dat_sources_page::DatSourcesPageAction::Validate {
+                            id: row.id.clone(),
+                        });
+                    }
+                });
             });
         }
         for row in view.managed_rows.iter().filter(|row| row.installed) {
-            crate::ui::components::card(ui, |ui| {
-                ui.strong(&row.authoritative_name);
-                ui.label(format!(
-                    "Managed {} · status: {:?}",
-                    row.source_label, row.status
-                ));
-                if let Some(hash) = row.technical.sha256.as_deref() {
-                    ui.label(format!("Snapshot SHA-256: {hash}"));
-                }
-                if let Some(revision) = row.current_revision.as_deref() {
-                    ui.label(format!("Version / revision: {revision}"));
-                }
+            ui.push_id(("managed-dat", format!("{:?}", row.source_id)), |ui| {
+                crate::ui::components::card(ui, |ui| {
+                    ui.strong(&row.authoritative_name);
+                    ui.label(format!(
+                        "Managed {} · status: {:?}",
+                        row.source_label, row.status
+                    ));
+                    if let Some(hash) = row.technical.sha256.as_deref() {
+                        ui.label(format!("Snapshot SHA-256: {hash}"));
+                    }
+                    if let Some(revision) = row.current_revision.as_deref() {
+                        ui.label(format!("Version / revision: {revision}"));
+                    }
+                });
             });
         }
 
@@ -1358,15 +1366,21 @@ impl NativeWorkflows {
         }
         ui.heading("Cheat activity");
         for entry in entries {
-            crate::ui::components::card(ui, |ui| {
-                ui.strong(entry.action.to_string());
-                ui.label(entry.outcome.to_string());
-                ui.label(&entry.message);
-                if let Some(path) = &entry.archive_path {
-                    ui.collapsing("Advanced Details", |ui| {
-                        ui.monospace(path.display().to_string());
-                    });
-                }
+            let entry_id = format!(
+                "{:?}|{:?}|{:?}|{}",
+                entry.timestamp, entry.action, entry.archive_path, entry.message
+            );
+            ui.push_id(("cheat-history", entry_id), |ui| {
+                crate::ui::components::card(ui, |ui| {
+                    ui.strong(entry.action.to_string());
+                    ui.label(entry.outcome.to_string());
+                    ui.label(&entry.message);
+                    if let Some(path) = &entry.archive_path {
+                        ui.collapsing("Advanced Details", |ui| {
+                            ui.monospace(path.display().to_string());
+                        });
+                    }
+                });
             });
         }
         let undo_available = self.app.cheat_workflow.as_ref().is_some_and(|workflow| {
@@ -2230,7 +2244,8 @@ fn lifecycle_setup_panel(
     ui.heading("Emulator lifecycle health");
     ui.label("This read-only view explains which installation is selected and who can update it. EmuWiz never runs package-manager updates here.");
     for projection in projections {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.push_id(("emulator", &projection.emulator_id), |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&projection.emulator_id);
                 ui.label(lifecycle_state_label(projection.state));
@@ -2253,7 +2268,10 @@ fn lifecycle_setup_panel(
                 ui.label("Not installed");
             }
             for installation in &projection.installations {
-                ui.group(|ui| {
+                ui.push_id(
+                    ("installation", format!("{:?}", installation.exact_binding)),
+                    |ui| {
+                        ui.group(|ui| {
                     let marker = if installation.selected {
                         " · Currently selected"
                     } else {
@@ -2316,8 +2334,11 @@ fn lifecycle_setup_panel(
                             }
                         }
                     });
-                });
+                        });
+                    },
+                );
             }
+            });
         });
     }
     ui.separator();
