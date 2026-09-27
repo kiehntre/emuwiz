@@ -642,6 +642,7 @@ impl ArchiveFsApp {
             preview: CheatStepResource::NotLoaded,
             transaction: CheatTransactionState::Idle,
             transaction_notice: None,
+            whdload_editor: WhdloadTrainerEditorState::default(),
             selected_profile_id,
             selected_pcsx2_profile_id,
             pcsx2_inventory_profile_id: None,

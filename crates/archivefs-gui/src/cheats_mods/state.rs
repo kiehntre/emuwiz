@@ -76,6 +76,10 @@ pub(crate) struct CheatWorkflowState {
     pub(crate) preview: CheatStepResource<CheatPreviewResponse>,
     pub(crate) transaction: CheatTransactionState,
     pub(crate) transaction_notice: Option<String>,
+    /// Per-game WHDLoad editor state. It is populated only after an exact
+    /// installed slave/config binding is supplied; an archive name alone
+    /// never manufactures trainer controls.
+    pub(crate) whdload_editor: WhdloadTrainerEditorState,
     /// The explicitly selected profile. Preselected only when exactly
     /// one eligible profile exists (the CLI's own auto-selection rule);
     /// with several eligible profiles the user must choose - never
@@ -221,6 +225,14 @@ pub(crate) struct CheatWorkflowState {
     /// A candidate the user chose that could not be opened - kept so the
     /// failure stays on screen instead of silently reverting the choice.
     pub(crate) candidate_load_error: Option<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct WhdloadTrainerEditorState {
+    pub(crate) options: Vec<archivefs_core::patch_manager::TrainerOption>,
+    pub(crate) selections: Vec<archivefs_core::patch_manager::TrainerOptionSelection>,
+    pub(crate) exact_binding_ready: bool,
+    pub(crate) status: Option<String>,
 }
 
 /// One completed candidate match, bound to the exact context that produced

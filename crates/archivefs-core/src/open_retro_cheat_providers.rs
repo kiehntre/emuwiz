@@ -243,12 +243,20 @@ pub struct WhdloadCustomOption {
     pub option_type: String,
     pub description: String,
     pub default_value: Option<String>,
+    /// The raw documented `Spec` portion after the label.  It is retained so
+    /// an adapter can interpret lists and bit ranges without guessing from a
+    /// trainer name.
+    #[serde(default)]
+    pub spec: Option<String>,
     pub documented: bool,
 }
 
 /// Parses the documented `C1:X:Description:default;` style declaration from
 /// a WHDLoad slave. It does not infer that an option is a trainer or mutate a
 /// slave; callers must retain the slave path/hash as provenance.
+/// Official ws_config types are B/L/M/X. N is retained only as EmuWiz's
+/// internal numeric compatibility representation. Other one-letter records
+/// remain visible as opaque declarations but are never applyable.
 pub fn parse_whdload_custom_options(config: &str) -> Vec<WhdloadCustomOption> {
     config
         .split(';')
@@ -259,18 +267,21 @@ pub fn parse_whdload_custom_options(config: &str) -> Vec<WhdloadCustomOption> {
             }
             let key = fields[0].to_string();
             let option_type = fields[1].to_string();
-            if !matches!(option_type.as_str(), "B" | "X" | "K" | "N" | "S") {
+            if !matches!(key.as_str(), "C1" | "C2" | "C3" | "C4" | "C5") || option_type.len() != 1 {
                 return None;
             }
+            let spec = fields
+                .get(3)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let documented = matches!(option_type.as_str(), "B" | "L" | "M" | "X" | "N");
             Some(WhdloadCustomOption {
                 key,
                 option_type,
                 description: fields[2].trim().to_string(),
-                default_value: fields
-                    .get(3)
-                    .map(|v| v.trim().to_string())
-                    .filter(|v| !v.is_empty()),
-                documented: true,
+                default_value: spec.clone(),
+                spec,
+                documented,
             })
         })
         .collect()
@@ -318,9 +329,10 @@ mod tests {
         let options = parse_whdload_custom_options(
             "C2:X:Activate Trainer:0;C3:B:Infinite lives:1;C4:Q:unknown:0;",
         );
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 3);
         assert_eq!(options[0].key, "C2");
         assert_eq!(options[1].default_value.as_deref(), Some("1"));
+        assert!(!options[2].documented);
     }
 
     #[test]

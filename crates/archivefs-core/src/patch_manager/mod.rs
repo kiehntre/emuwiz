@@ -1019,6 +1019,15 @@ pub use vita3k_local::{
     assess_vita3k_readiness, classify_vita3k_content, discover_vita3k_profiles,
     inspect_installed_title, parse_vita3k_version, resolve_vita3k_native_launch_binding,
 };
+pub use whdload_trainer::{
+    TrainerOption, TrainerOptionChoice, TrainerOptionConflict, TrainerOptionConflictKind,
+    TrainerOptionKind, TrainerOptionReadiness, TrainerOptionSelection, TrainerOptionSource,
+    TrainerOptionValue, WhdloadTrainerApplyOptions, WhdloadTrainerError, WhdloadTrainerIdentity,
+    WhdloadTrainerLaunchProjection, WhdloadTrainerPreview, WhdloadTrainerReadiness,
+    WhdloadTrainerRequest, apply_whdload_trainer_preview, build_whdload_trainer_preview,
+    project_whdload_trainer_launch_options, project_whdload_trainer_options,
+    render_whdload_arguments,
+};
 pub use xemu_local::{
     XEMU_MAX_CONFIG_BYTES, XEMU_MAX_PROFILES, XemuConfig, XemuDiscoveryError, XemuExecutable,
     XemuGameIdMapping, XemuGameInspection, XemuGameRequest, XemuHealth, XemuInstallationType,

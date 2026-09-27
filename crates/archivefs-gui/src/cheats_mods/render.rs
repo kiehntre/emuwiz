@@ -1714,10 +1714,10 @@ fn cheat_route_basis_label(basis: archivefs_core::patch_manager::CheatRouteBasis
 /// emulator is always an explicit action; nothing switches automatically.
 pub(crate) fn show_cheat_route_panel(
     ui: &mut egui::Ui,
-    workflow: &CheatWorkflowState,
+    workflow: &mut CheatWorkflowState,
 ) -> Option<CheatWorkflowAction> {
     use archivefs_core::patch_manager::{CheatApplySupport, CheatRouteDecision, CheatRouteTarget};
-    let decision = &workflow.routing.decision;
+    let decision = workflow.routing.decision.clone();
     let mut action = None;
     // No route at all is explained by the workflow's own "platform not
     // recognised / not supported" banner.
@@ -1726,9 +1726,9 @@ pub(crate) fn show_cheat_route_panel(
     }
     // The common case - an installable emulator with a known core - stays a
     // single row so the cheat list below remains in view.
-    if let CheatRouteDecision::Routed(route) = decision
+    if let CheatRouteDecision::Routed(route) = &decision
         && route.can_apply()
-        && cheat_adapter_for_decision(decision) != CheatEmulatorAdapter::Unsupported
+        && cheat_adapter_for_decision(&decision) != CheatEmulatorAdapter::Unsupported
         && !matches!(route.target, CheatRouteTarget::RetroArch { core: None })
     {
         ui.horizontal_wrapped(|ui| {
@@ -1750,12 +1750,12 @@ pub(crate) fn show_cheat_route_panel(
     widgets::card(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Selected emulator:");
-            match decision {
+            match &decision {
                 CheatRouteDecision::Routed(route) => {
                     ui.label(route.target.display_name());
                     let (label, tone) = match route.apply_support {
                         CheatApplySupport::Supported => {
-                            if cheat_adapter_for_decision(decision)
+                            if cheat_adapter_for_decision(&decision)
                                 == CheatEmulatorAdapter::Unsupported
                             {
                                 ("Native adapter available", widgets::StatusTone::Info)
@@ -1789,7 +1789,7 @@ pub(crate) fn show_cheat_route_panel(
             }
         });
         ui.label(decision.headline());
-        if let CheatRouteDecision::Routed(route) = decision {
+        if let CheatRouteDecision::Routed(route) = &decision {
             ui.label(format!(
                 "Cheat format: {} · {}",
                 route.native_format,
@@ -1801,11 +1801,15 @@ pub(crate) fn show_cheat_route_panel(
                 );
             }
             if route.can_apply()
-                && cheat_adapter_for_decision(decision) == CheatEmulatorAdapter::Unsupported
+                && cheat_adapter_for_decision(&decision) == CheatEmulatorAdapter::Unsupported
             {
                 ui.label(
                     "EmuWiz knows this emulator's native cheat format, but this GUI workflow does not apply it yet.",
                 );
+            }
+            if route.native_format == "WHDLoad CUSTOM/tooltype options" {
+                ui.separator();
+                show_whdload_trainer_editor(ui, workflow);
             }
         }
         let choices = decision.choices();
@@ -1818,6 +1822,148 @@ pub(crate) fn show_cheat_route_panel(
         action = show_cheat_route_choices(ui, workflow, choices);
     });
     action
+}
+
+fn show_whdload_trainer_editor(ui: &mut egui::Ui, workflow: &mut CheatWorkflowState) {
+    widgets::section_header(
+        ui,
+        "WHDLoad Trainer / Custom Options",
+        Some("Options declared by the exact installed WHDLoad slave."),
+    );
+    widgets::card(ui, |ui| {
+        ui.label("These options come from the installed WHDLoad slave.");
+        ui.label("EmuWiz changes launch options only. Game files are not modified.");
+        ui.label(format!("Game: {}", workflow.display_name));
+        ui.label("Exact slave path: unavailable until the installed slave is explicitly bound.");
+        ui.label(format!(
+            "Package/source context: {}",
+            workflow.archive_path.display()
+        ));
+        if !workflow.whdload_editor.exact_binding_ready {
+            widgets::status_badge(
+                ui,
+                "Exact installed slave/config binding required",
+                widgets::StatusTone::Warning,
+            );
+            ui.label(
+                "The selected archive is not enough to identify an installed slave revision or EmuWiz-owned per-game option layer. Controls and Apply remain blocked.",
+            );
+            if let Some(status) = &workflow.whdload_editor.status {
+                ui.label(status);
+            }
+            return;
+        }
+        for option in workflow.whdload_editor.options.clone() {
+            show_whdload_option(ui, workflow, &option);
+        }
+        if workflow.whdload_editor.options.is_empty() {
+            ui.label("No supported CUSTOM declarations were found.");
+        }
+        ui.separator();
+        ui.label("Preview shows exact CUSTOM1-CUSTOM5 changes before Apply.");
+        ui.add_enabled(
+            false,
+            egui::Button::new("Preview CUSTOM changes (binding unavailable)"),
+        );
+    });
+}
+
+fn show_whdload_option(
+    ui: &mut egui::Ui,
+    workflow: &mut CheatWorkflowState,
+    option: &archivefs_core::patch_manager::TrainerOption,
+) {
+    use archivefs_core::patch_manager::{TrainerOptionKind, TrainerOptionValue};
+    let slot = option.custom_slot.clone();
+    let mut current = workflow
+        .whdload_editor
+        .selections
+        .iter()
+        .find(|selection| selection.custom_slot == slot)
+        .and_then(|selection| selection.value.clone())
+        .or_else(|| option.current_value.clone());
+    ui.group(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(&option.name);
+            ui.label(format!("({})", option.custom_slot));
+            if option.readiness != archivefs_core::patch_manager::TrainerOptionReadiness::Ready {
+                widgets::status_badge(ui, "Unsupported", widgets::StatusTone::Blocked);
+            }
+        });
+        ui.label(&option.description);
+        ui.label(format!("Current raw value: {}", option.current_raw_value.map_or_else(|| "<unset>".into(), |v| v.to_string())));
+        match option.kind {
+            TrainerOptionKind::Boolean => {
+                let mut enabled = matches!(current, Some(TrainerOptionValue::Boolean(true)));
+                if ui.checkbox(&mut enabled, "Enabled").changed() {
+                    current = Some(TrainerOptionValue::Boolean(enabled));
+                }
+            }
+            TrainerOptionKind::Enum => {
+                let mut selected = match &current {
+                    Some(TrainerOptionValue::Enum(value)) => value.clone(),
+                    _ => option.allowed_values.first().map(|c| c.label.clone()).unwrap_or_default(),
+                };
+                egui::ComboBox::from_id_salt(format!("whdload_{}", option.custom_slot))
+                    .selected_text(if selected.is_empty() { "Choose…" } else { &selected })
+                    .show_ui(ui, |ui| {
+                        for choice in &option.allowed_values {
+                            ui.selectable_value(&mut selected, choice.label.clone(), &choice.label);
+                        }
+                    });
+                current = Some(TrainerOptionValue::Enum(selected));
+            }
+            TrainerOptionKind::Bitfield => {
+                let (lo, hi) = option.bit_range.unwrap_or((0, 0));
+                let mut mask = match current {
+                    Some(TrainerOptionValue::Bitfield(value)) => value,
+                    _ => 0,
+                };
+                for bit in lo..=hi {
+                    let mut checked = mask & (1 << (bit - lo)) != 0;
+                    if ui.checkbox(&mut checked, format!("Bit {bit}")).changed() {
+                        if checked {
+                            mask |= 1 << (bit - lo);
+                        } else {
+                            mask &= !(1 << (bit - lo));
+                        }
+                    }
+                }
+                current = Some(TrainerOptionValue::Bitfield(mask));
+            }
+            TrainerOptionKind::Numeric => {
+                let mut value = match current {
+                    Some(TrainerOptionValue::Numeric(value)) => value,
+                    _ => 0,
+                };
+                if ui.add(egui::DragValue::new(&mut value)).changed() {
+                    current = Some(TrainerOptionValue::Numeric(value));
+                }
+            }
+            TrainerOptionKind::Opaque => {
+                ui.label("This custom field uses unsupported syntax, so it can be shown but will not apply.");
+            }
+        }
+        if option.readiness == archivefs_core::patch_manager::TrainerOptionReadiness::Ready {
+            if let Some(value) = current {
+                if let Some(selection) = workflow
+                    .whdload_editor
+                    .selections
+                    .iter_mut()
+                    .find(|selection| selection.custom_slot == slot)
+                {
+                    selection.value = Some(value);
+                } else {
+                    workflow.whdload_editor.selections.push(
+                        archivefs_core::patch_manager::TrainerOptionSelection {
+                            custom_slot: slot,
+                            value: Some(value),
+                        },
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn show_cheat_route_choices(

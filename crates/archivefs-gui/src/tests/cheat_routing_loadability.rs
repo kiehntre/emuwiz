@@ -110,13 +110,37 @@ fn route_panel_names_the_selected_emulator_and_its_limits() {
     let ctx = egui::Context::default();
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let _ = show_cheat_route_panel(ui, app.cheat_workflow.as_ref().unwrap());
+            let _ = show_cheat_route_panel(ui, app.cheat_workflow.as_mut().unwrap());
         });
     });
     for expected in [
         "DuckStation",
         "Native adapter available",
         "Clear my emulator choice",
+    ] {
+        assert!(rendered_text_contains(&output, expected), "{expected}");
+    }
+}
+
+#[test]
+fn amiga_whdload_route_shows_safe_trainer_editor_gate() {
+    let mut app = app_with_game("/roms/game.adf", "Amiga");
+    app.cheat_emulator_selections.insert(
+        PathBuf::from("/roms/game.adf"),
+        CheatRouteTarget::standalone("amiga_whdload"),
+    );
+    assert!(app.prepare_cheats_mods_workspace(PathBuf::from("/roms/game.adf")));
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_cheat_route_panel(ui, app.cheat_workflow.as_mut().unwrap());
+        });
+    });
+    for expected in [
+        "WHDLoad Trainer / Custom Options",
+        "These options come from the installed WHDLoad slave.",
+        "Exact installed slave/config binding required",
+        "Controls and Apply remain blocked.",
     ] {
         assert!(rendered_text_contains(&output, expected), "{expected}");
     }
