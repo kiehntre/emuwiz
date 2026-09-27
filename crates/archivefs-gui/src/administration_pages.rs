@@ -1541,6 +1541,7 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::Rpcs3Patch => "RPCS3 native patch",
         PreviewAdapter::Mame => "MAME cheat",
         PreviewAdapter::Flycast => "Flycast Dreamcast cheat",
+        PreviewAdapter::Mednafen => "Mednafen cheat",
     }
 }
 

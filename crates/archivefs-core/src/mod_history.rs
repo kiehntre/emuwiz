@@ -640,7 +640,7 @@ fn kind_for_adapter(adapter: PreviewAdapter) -> Option<ModKind> {
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast
         | PreviewAdapter::Rpcs3Patch
-        => None,
+        | PreviewAdapter::Mednafen => None,
     }
 }
 

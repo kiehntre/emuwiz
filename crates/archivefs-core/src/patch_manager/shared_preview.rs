@@ -50,6 +50,8 @@ pub enum PreviewAdapter {
     Flycast,
     /// A local native RPCS3 patch.yml definition.
     Rpcs3Patch,
+    /// A native Mednafen per-system `.cht` definition.
+    Mednafen,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -69,6 +71,8 @@ pub enum PreviewIdentityKind {
     XeniaTitleId,
     CemuTitleId,
     Rpcs3TitleId,
+    /// Exact MD5 section identity used by Mednafen `.cht` files.
+    MednafenMd5,
     MameMachineShortname,
     DreamcastProductCode,
 }
@@ -781,9 +785,9 @@ fn apply_eligibility_blockers(
         | PreviewAdapter::CemuGraphicPack
         | PreviewAdapter::Rpcs3OrdinaryMod
         | PreviewAdapter::Mame
-        | PreviewAdapter::Flycast => source.match_strength == PreviewMatchStrength::VerifiedExact,
+        | PreviewAdapter::Flycast
         | PreviewAdapter::Rpcs3Patch
-        | PreviewAdapter::Mame => source.match_strength == PreviewMatchStrength::VerifiedExact,
+        | PreviewAdapter::Mednafen => source.match_strength == PreviewMatchStrength::VerifiedExact,
     };
     if !strength_eligible {
         let blocker = match source.match_strength {
@@ -919,7 +923,9 @@ fn detect_cross_entry_conflicts(request: &SharedPreviewRequest, report: &mut Sha
         || (request.adapter == PreviewAdapter::Dolphin
             && request.identity.kind == PreviewIdentityKind::DolphinGameId)
         || (request.adapter == PreviewAdapter::Rpcs3OrdinaryMod
-            && request.identity.kind == PreviewIdentityKind::Rpcs3TitleId))
+            && request.identity.kind == PreviewIdentityKind::Rpcs3TitleId)
+        || (request.adapter == PreviewAdapter::Mednafen
+            && request.identity.kind == PreviewIdentityKind::MednafenMd5))
         && exact_sources.len() > 1
     {
         for index in 0..report.entries.len() {
@@ -1323,6 +1329,48 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::Rpcs3Patch => normalized == "ps3" || normalized == "playstation 3",
         PreviewAdapter::Mame => normalized == "mame" || normalized == "arcade",
         PreviewAdapter::Flycast => normalized == "dreamcast" || normalized == "sega dreamcast",
+        PreviewAdapter::Mednafen => matches!(
+            normalized.as_str(),
+            "gb" | "gbc"
+                | "game boy"
+                | "gameboy"
+                | "game boy color"
+                | "gg"
+                | "game gear"
+                | "lynx"
+                | "atari lynx"
+                | "md"
+                | "mega drive"
+                | "genesis"
+                | "sega genesis"
+                | "nes"
+                | "famicom"
+                | "nintendo entertainment system"
+                | "pce"
+                | "pc engine"
+                | "pc engine cd"
+                | "turbografx 16"
+                | "turbografx cd"
+                | "supergrafx"
+                | "pce_fast"
+                | "pcfx"
+                | "pc-fx"
+                | "psx"
+                | "ps1"
+                | "playstation"
+                | "sms"
+                | "sega master system"
+                | "snes"
+                | "super nintendo"
+                | "super famicom"
+                | "snes_faust"
+                | "vb"
+                | "virtual boy"
+                | "wswan"
+                | "wonderswan"
+                | "wonder swan"
+                | "wonderswan color"
+        ),
     }
 }
 

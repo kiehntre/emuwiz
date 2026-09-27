@@ -86,6 +86,7 @@ mod local_cheat_install_pcsx2;
 mod mame_cheat;
 mod matching;
 mod melonds_cheat;
+mod mednafen_cheat;
 mod melonds_local;
 mod mesen_local;
 mod mgba_cheats;
@@ -679,6 +680,17 @@ pub use melonds_cheat::{
     apply_melonds_cheat_plan, build_melonds_cheat_apply_plan, melonds_loadability_facts,
     parse_melonds_cheat_file, remove_melonds_cheat, render_melonds_cheat_file,
     set_melonds_cheat_state,
+};
+pub use mednafen_cheat::{
+    MEDNAFEN_CHEAT_MAX_BYTES, MEDNAFEN_CHEAT_MAX_ENTRIES, MEDNAFEN_CHEAT_MAX_LINE_BYTES,
+    MEDNAFEN_CHEAT_MAX_LINES, MEDNAFEN_CHEAT_SOURCE_MODE, MednafenCheatEntry, MednafenCheatError,
+    MednafenCheatFile, MednafenCheatOperation, MednafenCheatParseIssue, MednafenCheatPlan,
+    MednafenCheatReadiness, MednafenCheatState, MednafenCheatTarget, MednafenEndian,
+    MednafenLoadabilityFacts, MednafenMemorySpace, apply_mednafen_cheat_plan,
+    build_mednafen_cheat_plan, mednafen_compatibility, mednafen_loadability_facts,
+    mednafen_supported_systems, mednafen_system_for_platform, merge_mednafen_cheat_files,
+    parse_mednafen_cheat_file, preview_mednafen_cheat_rollback, render_mednafen_cheat_file,
+    rollback_mednafen_cheat,
 };
 pub use melonds_local::{
     MELONDS_MAX_CONFIG_BYTES, MELONDS_MAX_PROFILES, MelonDsConfigInspection, MelonDsDiscoveryError,

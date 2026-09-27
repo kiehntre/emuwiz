@@ -162,9 +162,10 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::CemuGraphicPack
         | PreviewAdapter::Rpcs3OrdinaryMod
         | PreviewAdapter::Mame
-        | PreviewAdapter::Flycast => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Flycast
         | PreviewAdapter::Rpcs3Patch
-        | PreviewAdapter::Mame => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Mame
+        | PreviewAdapter::Mednafen => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -1609,6 +1610,7 @@ fn apply_one(
                 | PreviewAdapter::LocalModPackage
                 | PreviewAdapter::CemuGraphicPack
                 | PreviewAdapter::Rpcs3OrdinaryMod
+                | PreviewAdapter::Mednafen
         );
         if !plan.parent_creation_approved || !adapter_allows_parent_creation {
             return fail_result(

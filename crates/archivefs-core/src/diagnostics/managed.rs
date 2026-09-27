@@ -130,7 +130,8 @@ impl ManagedFormat {
             | PreviewAdapter::Rpcs3OrdinaryMod
             | PreviewAdapter::Mame
             | PreviewAdapter::Flycast
-            | PreviewAdapter::Rpcs3Patch => Self::LocalModPackage,
+            | PreviewAdapter::Rpcs3Patch
+            | PreviewAdapter::Mednafen => Self::LocalModPackage,
         }
     }
 }
