@@ -67,6 +67,7 @@ mod duckstation_firmware;
 mod duckstation_local;
 mod emulator_profile_memory;
 mod emulator_request_bridge;
+mod flycast_cheats;
 mod flycast_local;
 mod fuse_local;
 mod gamehacking_browser_import;
@@ -533,6 +534,14 @@ pub use emulator_profile_memory::{
 pub use emulator_request_bridge::{
     duckstation_request, inspect_duckstation_game_for_verified, inspect_ppsspp_game_for_verified,
     ppsspp_request,
+};
+pub use flycast_cheats::{
+    DreamcastCheatCode, DreamcastCheatIdentity, FLYCAST_CHEAT_MAX_BYTES, FLYCAST_CHEAT_MAX_ENTRIES,
+    FLYCAST_CHEAT_MAX_LINE_BYTES, FLYCAST_CHEAT_MAX_LINES, FlycastCheatApplyOptions,
+    FlycastCheatConflict, FlycastCheatConflictKind, FlycastCheatEntry, FlycastCheatError,
+    FlycastCheatFile, FlycastCheatParseIssue, FlycastCheatPreview, FlycastCheatReadiness,
+    FlycastCheatRequest, FlycastCheatSelection, FlycastCheatState, FlycastCheatType,
+    apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
 };
 pub use flycast_local::{
     FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,

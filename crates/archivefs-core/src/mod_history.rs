@@ -637,7 +637,8 @@ fn kind_for_adapter(adapter: PreviewAdapter) -> Option<ModKind> {
         | PreviewAdapter::MelonDs
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Xenia
-        | PreviewAdapter::Mame => None,
+        | PreviewAdapter::Mame
+        | PreviewAdapter::Flycast => None,
     }
 }
 

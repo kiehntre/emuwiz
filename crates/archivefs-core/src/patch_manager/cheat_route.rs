@@ -127,7 +127,8 @@ pub fn cheat_apply_support(target: &CheatRouteTarget) -> CheatApplySupport {
             "pcsx2" | "dolphin" | "xenia" | "duckstation" | "ppsspp" | "mgba" | "mame" => {
                 CheatApplySupport::Supported
             }
-            "flycast" | "rpcs3" => CheatApplySupport::InventoryOnly,
+            "rpcs3" => CheatApplySupport::InventoryOnly,
+            "flycast" => CheatApplySupport::Supported,
             _ => CheatApplySupport::Unsupported,
         },
     }

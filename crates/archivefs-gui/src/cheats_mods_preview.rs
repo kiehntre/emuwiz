@@ -1009,6 +1009,7 @@ pub(crate) fn show_shared_transaction_readiness(
                 PreviewAdapter::MelonDs => "This melonDS MCH file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected ROM identity is verified.",
                 PreviewAdapter::Xenia => "This Xenia patch.toml file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected patches are staged in this exact preview.",
                 PreviewAdapter::Mame => "This native MAME XML file has a reviewed shared apply and rollback contract. MAME expressions remain native and may still require runtime enabling.",
+                PreviewAdapter::Flycast => "This native Flycast .cht file has a reviewed shared apply and rollback contract. Direct writes are normalized where proven; other native operations remain opaque.",
                 _ => "RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected per-game catalogue source is materialized in this exact preview.",
             });
             ui.label(format!(

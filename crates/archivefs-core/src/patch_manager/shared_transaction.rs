@@ -161,7 +161,8 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::LocalModPackage
         | PreviewAdapter::CemuGraphicPack
         | PreviewAdapter::Rpcs3OrdinaryMod
-        | PreviewAdapter::Mame => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Mame
+        | PreviewAdapter::Flycast => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -1476,7 +1477,7 @@ fn apply_one(
                 | SharedContentVerification::RetroArchBezel
                 | SharedContentVerification::HackHashPatch { .. }
         )
-    );
+    ) || plan.adapter == PreviewAdapter::Flycast;
     let assessment = if nested_mod_package {
         assess_local_mod_destination(destination_root, &relative)
     } else {

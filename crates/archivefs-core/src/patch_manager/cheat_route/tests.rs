@@ -139,7 +139,7 @@ fn dreamcast_flycast_standalone_selected_routes_to_standalone() {
     let decision = route_cheat_install(&req);
     let route = routed(&decision);
     assert_eq!(route.target, CheatRouteTarget::standalone("flycast"));
-    assert_eq!(route.apply_support, CheatApplySupport::InventoryOnly);
+    assert_eq!(route.apply_support, CheatApplySupport::Supported);
 }
 
 #[test]

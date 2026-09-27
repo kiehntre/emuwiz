@@ -987,7 +987,8 @@ fn shared_apply_operation(
         | PreviewAdapter::MelonDs
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Ppsspp
-        | PreviewAdapter::Xenia => OperationKind::CheatApply,
+        | PreviewAdapter::Xenia
+        | PreviewAdapter::Flycast => OperationKind::CheatApply,
     };
     let state = match journal.status {
         SharedApplyStatus::DryRun => OperationState::Planned,
