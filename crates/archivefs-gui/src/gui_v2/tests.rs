@@ -128,19 +128,17 @@ fn gui_v2_top_toolbar_exposes_core_mouse_routes() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
-    for expected in [
-        "Home",
-        "Games",
-        "Check",
-        "Organisation",
-        "DAT",
-        "Setup & Doctor",
-    ] {
+    for expected in ["Home", "Games", "Jump to…"] {
         assert!(
             strings.iter().any(|value| value == expected),
-            "missing top route: {expected}"
+            "missing app-chrome control: {expected}"
         );
     }
+    assert!(
+        routes::breadcrumb_labels(&Route::Section(Section::Check), None)
+            .iter()
+            .any(|label| label == "DATs & Verification")
+    );
 }
 
 #[test]
@@ -511,19 +509,10 @@ fn gui_v2_top_toolbar_destinations_render_and_share_sidebar_routes() {
     let output = frame(&context, &mut app, [1280.0, 720.0]);
     let strings = text(&output);
 
-    for label in [
-        "Home",
-        "Games",
-        "Platforms",
-        "Organisation",
-        "Launch",
-        "Converter",
-        "Museum",
-        "Setup & Doctor",
-    ] {
+    for label in ["Home", "Games", "Jump to…"] {
         assert!(
             strings.iter().any(|value| value == label),
-            "missing {label}"
+            "missing app-chrome control {label}"
         );
     }
 
@@ -551,7 +540,7 @@ fn gui_v2_top_toolbar_back_uses_existing_history_at_narrow_width() {
 
     let output = frame(&context, &mut app, [480.0, 360.0]);
     let strings = text(&output);
-    assert!(strings.iter().any(|value| value == "← Back"));
+    assert!(strings.iter().any(|value| value == "Back"));
 
     app.back();
     assert_eq!(app.router.current, Route::Home);

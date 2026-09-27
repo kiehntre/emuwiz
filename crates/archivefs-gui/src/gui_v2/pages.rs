@@ -10,7 +10,7 @@ use super::{
     onboarding,
     problems::{Category, Problem, Severity},
     romm_library::PresenceFilter,
-    routes::{HOME_TASKS, Route, SECTIONS, Section},
+    routes::{HOME_TASKS, Route, SECTIONS, Section, breadcrumb_labels},
 };
 use crate::ui::{
     components::{StatusTone, page_hero},
@@ -315,6 +315,7 @@ impl App {
                 }
             }
         });
+        self.app_chrome(context);
         let sidebar_width = if context.content_rect().width() < 900.0 {
             178.0
         } else {
@@ -357,8 +358,7 @@ impl App {
                     });
             });
         egui::CentralPanel::default().show(context, |ui| {
-            self.header(ui);
-            self.toolbar(ui);
+            self.page_header(ui);
             if let Some(notice) = &self.notice {
                 let mut dismiss = false;
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -498,31 +498,87 @@ impl App {
         super::saves_states::show(self, ui);
     }
 
-    fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(self.router.can_back(), egui::Button::new("Back"))
-                .clicked()
-            {
-                self.back();
-            }
-            if ui.button("Home").clicked() {
-                self.go(Route::Home);
-            }
-            ui.label("›");
-            ui.strong(self.router.current.section().title());
-            if let Some(game) = self
-                .router
-                .current
-                .game()
-                .and_then(|id| self.library.game(id))
-            {
-                ui.label("›");
-                ui.label(&game.title);
-            }
+    fn app_chrome(&mut self, context: &egui::Context) {
+        let route = self.router.current.clone();
+        let game_title = route
+            .game()
+            .and_then(|id| self.library.game(id))
+            .map(|game| game.title.as_str());
+        let breadcrumbs = breadcrumb_labels(&route, game_title);
+        egui::TopBottomPanel::top("v2_app_chrome").show(context, |ui| {
+            ui.set_min_height(48.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui
+                    .add_enabled(
+                        self.router.can_back(),
+                        egui::Button::new("Back").min_size(egui::vec2(76.0, 32.0)),
+                    )
+                    .on_hover_text("Return to the previous GUI v2 location.")
+                    .clicked()
+                {
+                    self.back();
+                }
+                if ui
+                    .button("Home")
+                    .on_hover_text("Return to the GUI v2 home page.")
+                    .clicked()
+                {
+                    self.go(Route::Home);
+                }
+                ui.separator();
+                ui.push_id("v2_breadcrumbs", |ui| {
+                    ui.horizontal(|ui| {
+                        for (index, label) in breadcrumbs.iter().enumerate() {
+                            if index > 0 {
+                                ui.label("›");
+                            }
+                            let is_game = index + 1 == breadcrumbs.len() && route.game().is_some();
+                            if is_game {
+                                if ui
+                                    .button(egui::RichText::new(label).strong())
+                                    .on_hover_text("Open Game Details.")
+                                    .clicked()
+                                {
+                                    if let Some(id) = route.game() {
+                                        self.go(Route::Game(id));
+                                    }
+                                }
+                            } else {
+                                ui.strong(label);
+                            }
+                        }
+                    });
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("Jump to…", |ui| {
+                        ui.label("Feature families");
+                        ui.separator();
+                        for (label, destination) in [
+                            ("Games", Route::Section(Section::Games)),
+                            ("DATs & Verification", Route::Section(Section::Check)),
+                            ("Cheats & Mods", Route::Section(Section::Mods)),
+                            ("Saves & States", Route::Section(Section::Saves)),
+                            ("Emulators", Route::Section(Section::Emulators)),
+                            ("MAME / Organisation", Route::Section(Section::Build)),
+                            ("Artwork & Extras", Route::Section(Section::Artwork)),
+                            ("Conversion", Route::Section(Section::Converter)),
+                            ("Problems & Repair", Route::Section(Section::Problems)),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.go(destination);
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+            });
         });
+    }
+
+    fn page_header(&mut self, ui: &mut egui::Ui) {
         let title = match &self.router.current {
-            Route::Game(id) => self
+            Route::Game(id) | Route::Task { game: id, .. } => self
                 .library
                 .game(*id)
                 .map(|game| game.title.as_str())
@@ -530,53 +586,12 @@ impl App {
             _ => self.router.current.section().title(),
         };
         ui.heading(title);
-        ui.label(if matches!(self.router.current, Route::Game(_)) {
+        ui.label(if self.router.current.game().is_some() {
             "Your game's information, readiness and next actions, in one place."
         } else {
             self.router.current.section().purpose()
         });
         ui.separator();
-    }
-
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            egui::ScrollArea::horizontal()
-                .id_salt("v2_top_toolbar")
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(self.router.can_back(), egui::Button::new("← Back"))
-                            .on_hover_text("Return to the previous GUI v2 page.")
-                            .clicked()
-                        {
-                            self.back();
-                        }
-                        let destinations = [
-                            ("Home", Route::Home),
-                            ("Games", Route::Section(Section::Games)),
-                            ("Check", Route::Section(Section::Check)),
-                            ("Platforms", Route::Section(Section::Platforms)),
-                            ("Organisation", Route::Section(Section::Build)),
-                            ("DAT", Route::Section(Section::Dat)),
-                            ("Launch", Route::Section(Section::Launch)),
-                            ("Converter", Route::Section(Section::Converter)),
-                            ("Museum", Route::Section(Section::Museum)),
-                            ("Setup & Doctor", Route::Section(Section::Setup)),
-                        ];
-                        for (label, route) in destinations {
-                            let selected = self.router.current.section() == route.section();
-                            if ui
-                                .add(egui::Button::new(label).selected(selected))
-                                .on_hover_text(format!("Open {label}."))
-                                .clicked()
-                            {
-                                self.go(route);
-                            }
-                        }
-                    });
-                });
-        });
     }
 
     fn setup_doctor(&mut self, ui: &mut egui::Ui) {

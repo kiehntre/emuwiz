@@ -193,6 +193,58 @@ impl Route {
     }
 }
 
+/// Presentation-only location labels for the app chrome. Navigation remains
+/// owned by `Route` and `Router`.
+pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<String> {
+    let section = route.section();
+    let mut labels = match section {
+        Section::Check | Section::Dat => vec!["DATs & Verification".into()],
+        Section::Mods => vec!["Cheats & Mods".into()],
+        Section::Saves => vec!["Saves & States".into()],
+        Section::Emulators | Section::Firmware | Section::Setup => vec!["Emulators".into()],
+        Section::Artwork | Section::Museum | Section::Tape => vec!["Artwork & Extras".into()],
+        Section::Converter => vec!["Conversion".into()],
+        Section::Build => vec!["Organisation".into()],
+        Section::Problems => vec!["Problems & Repair".into()],
+        Section::Games | Section::Platforms | Section::Launch => vec!["Games".into()],
+        _ => Vec::new(),
+    };
+    let title = section.title().to_string();
+    if labels.is_empty() {
+        labels.push(title);
+    } else if labels.last() != Some(&title) && section != Section::Games {
+        labels.push(title);
+    }
+    if let Some(game_title) = game_title.filter(|title| !title.trim().is_empty()) {
+        labels.push(game_title.to_string());
+    }
+    labels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Route, Section, breadcrumb_labels};
+
+    #[test]
+    fn breadcrumbs_follow_route_and_selected_game_context() {
+        assert_eq!(breadcrumb_labels(&Route::Home, None), ["Home"]);
+        assert_eq!(
+            breadcrumb_labels(&Route::Section(Section::Check), None),
+            ["DATs & Verification", "Check Games"]
+        );
+        assert_eq!(
+            breadcrumb_labels(
+                &Route::Task {
+                    section: Section::Mods,
+                    game: 7
+                },
+                Some("Pac-Man")
+            ),
+            ["Cheats & Mods", "Mods & Cheats", "Pac-Man"]
+        );
+    }
+}
+
 /// Migrate routes written by the pre-retirement shell.  `Advanced` used to
 /// be the normal DAT page; it now intentionally names the specialist escape.
 pub(super) fn migrate_route(route: Route) -> Route {
