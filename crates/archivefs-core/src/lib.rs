@@ -66,6 +66,7 @@ pub mod emulator_update;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.
 pub mod evidence_resolution;
+pub mod game_profile_planner;
 /// Typed library presentation visibility, separate from source ownership and
 /// subsystem evidence availability.
 pub mod library_visibility;
