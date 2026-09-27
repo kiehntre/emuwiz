@@ -131,7 +131,8 @@ impl ManagedFormat {
             | PreviewAdapter::Mame
             | PreviewAdapter::Flycast
             | PreviewAdapter::Rpcs3Patch
-            | PreviewAdapter::Mednafen => Self::LocalModPackage,
+            | PreviewAdapter::Mednafen
+            | PreviewAdapter::Fbneo => Self::LocalModPackage,
         }
     }
 }

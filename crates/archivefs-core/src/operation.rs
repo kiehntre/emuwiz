@@ -983,6 +983,7 @@ fn shared_apply_operation(
         PreviewAdapter::Rpcs3Patch => OperationKind::CheatApply,
         PreviewAdapter::Mame => OperationKind::CheatApply,
         PreviewAdapter::Mednafen => OperationKind::CheatApply,
+        PreviewAdapter::Fbneo => OperationKind::CheatApply,
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::DuckStation

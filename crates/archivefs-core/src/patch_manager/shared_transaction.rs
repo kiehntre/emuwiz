@@ -164,8 +164,8 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast
         | PreviewAdapter::Rpcs3Patch
-        | PreviewAdapter::Mame
-        | PreviewAdapter::Mednafen => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Mednafen
+        | PreviewAdapter::Fbneo => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 
@@ -1611,6 +1611,7 @@ fn apply_one(
                 | PreviewAdapter::CemuGraphicPack
                 | PreviewAdapter::Rpcs3OrdinaryMod
                 | PreviewAdapter::Mednafen
+                | PreviewAdapter::Fbneo
         );
         if !plan.parent_creation_approved || !adapter_allows_parent_creation {
             return fail_result(

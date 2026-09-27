@@ -52,6 +52,8 @@ pub enum PreviewAdapter {
     Rpcs3Patch,
     /// A native Mednafen per-system `.cht` definition.
     Mednafen,
+    /// A local native FinalBurn Neo per-set cheat definition.
+    Fbneo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -467,6 +469,7 @@ fn preview_one(
                 | PreviewAdapter::Rpcs3OrdinaryMod
                 | PreviewAdapter::Flycast
                 | PreviewAdapter::Rpcs3Patch
+                | PreviewAdapter::Fbneo
         ))
         .then(|| (OsString::new(), OsString::new()))
     }) else {
@@ -531,6 +534,7 @@ fn preview_one(
             | PreviewAdapter::Rpcs3OrdinaryMod
             | PreviewAdapter::Flycast
             | PreviewAdapter::Rpcs3Patch
+            | PreviewAdapter::Fbneo
     ) {
         assess_nested_destination(&request.destination_root, &relative)
     } else {
@@ -787,7 +791,8 @@ fn apply_eligibility_blockers(
         | PreviewAdapter::Mame
         | PreviewAdapter::Flycast
         | PreviewAdapter::Rpcs3Patch
-        | PreviewAdapter::Mednafen => source.match_strength == PreviewMatchStrength::VerifiedExact,
+        | PreviewAdapter::Mednafen
+        | PreviewAdapter::Fbneo => source.match_strength == PreviewMatchStrength::VerifiedExact,
     };
     if !strength_eligible {
         let blocker = match source.match_strength {
@@ -1371,6 +1376,9 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
                 | "wonder swan"
                 | "wonderswan color"
         ),
+        PreviewAdapter::Fbneo => {
+            normalized == "arcade" || normalized == "finalburn neo" || normalized == "fbneo"
+        }
     }
 }
 

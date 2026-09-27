@@ -1542,6 +1542,7 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::Mame => "MAME cheat",
         PreviewAdapter::Flycast => "Flycast Dreamcast cheat",
         PreviewAdapter::Mednafen => "Mednafen cheat",
+        PreviewAdapter::Fbneo => "FBNeo cheat",
     }
 }
 

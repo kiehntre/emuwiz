@@ -68,6 +68,7 @@ mod duckstation_local;
 mod emulator_profile_memory;
 mod emulator_request_bridge;
 mod flycast_cheats;
+mod fbneo_cheat;
 mod flycast_local;
 mod fuse_local;
 mod gamehacking_browser_import;
@@ -546,6 +547,15 @@ pub use flycast_cheats::{
     FlycastCheatFile, FlycastCheatParseIssue, FlycastCheatPreview, FlycastCheatReadiness,
     FlycastCheatRequest, FlycastCheatSelection, FlycastCheatState, FlycastCheatType,
     apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
+};
+pub use fbneo_cheat::{
+    FBNEO_MAX_CHEATS, FBNEO_MAX_FILE_BYTES, FBNEO_MAX_LINE_BYTES, FBNEO_MAX_LINES,
+    FBNEO_MAX_OPERATIONS_PER_OPTION, FBNEO_MAX_OPTIONS_PER_CHEAT, FbneoCheatApplyOptions,
+    FbneoCheatApplyPlan, FbneoCheatDestination, FbneoCheatEntry, FbneoCheatFile, FbneoCheatFormat,
+    FbneoCheatIssue, FbneoCheatLoadabilityFacts, FbneoCheatOperation, FbneoCheatOption,
+    FbneoCheatReadiness, FbneoCheatState, FbneoCheatTarget, apply_fbneo_cheat_plan,
+    build_fbneo_cheat_apply_plan, fbneo_readiness, merge_fbneo_cheat_file, parse_fbneo_cheat_file,
+    render_fbneo_cheat_file,
 };
 pub use flycast_local::{
     FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
