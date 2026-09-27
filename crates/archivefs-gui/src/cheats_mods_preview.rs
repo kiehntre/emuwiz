@@ -1608,6 +1608,13 @@ pub(crate) fn show_cheats_mods_page(
         // belongs to that emulator only.
         action = show_cheat_route_panel(ui, workflow).or(action);
         ui.add_space(theme::SECTION_GAP);
+        if workflow.platform.as_deref().is_some_and(|platform| {
+            let platform = platform.to_ascii_lowercase();
+            platform.contains("commodore 64") || platform == "c64"
+        }) {
+            show_vice_c64_cheat_preview(ui);
+            ui.add_space(theme::SECTION_GAP);
+        }
         if workflow
             .platform
             .as_deref()
@@ -1895,5 +1902,76 @@ fn show_three_ds_cheat_preview(ui: &mut egui::Ui) {
             ui.colored_label(egui::Color32::YELLOW, format!("Review: {issue:?}"));
         }
         ui.small("Exact 3DS title ID and update evidence are required before any future Apply. Gateway control codes remain visible but are not guessed.");
+    });
+}
+
+fn show_vice_c64_cheat_preview(ui: &mut egui::Ui) {
+    widgets::section_header(
+        ui,
+        "C64 / VICE POKE preview",
+        Some(
+            "Review local or manual POKEs before a VICE session. Disk, tape, and cartridge media stay unchanged.",
+        ),
+    );
+    let id = egui::Id::new("vice_c64_cheat_preview_text");
+    let mut text = ui
+        .ctx()
+        .data(|data| data.get_temp::<String>(id).unwrap_or_default());
+    ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .desired_rows(2)
+            .hint_text("POKE 49152,255"),
+    );
+    ui.ctx().data_mut(|data| data.insert_temp(id, text.clone()));
+    if text.trim().is_empty() {
+        ui.label("No POKE entered.");
+        return;
+    }
+    let mut operations = Vec::new();
+    let mut invalid = false;
+    for line in text.lines() {
+        let parts: Vec<_> = line
+            .trim()
+            .strip_prefix("POKE")
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .collect();
+        if parts.len() != 2 {
+            invalid = true;
+            continue;
+        }
+        match (parts[0].parse::<u64>(), parts[1].parse::<u16>()) {
+            (Ok(address), Ok(value)) if address <= 0xFFFF && value <= 255 => {
+                operations.push(archivefs_core::patch_manager::CheatOperation::Write8 {
+                    address,
+                    value: value as u8,
+                })
+            }
+            _ => invalid = true,
+        }
+    }
+    let projection = archivefs_core::patch_manager::project_vice_c64_pokes(
+        &operations,
+        &archivefs_core::patch_manager::ViceCheatIdentity::TitleOnly("manual C64 entry".into()),
+    );
+    widgets::card(ui, |ui| {
+        ui.label(format!(
+            "Operations: {} · Application: Runtime only",
+            projection.commands.len()
+        ));
+        if invalid {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Some lines are invalid; nothing is applied automatically.",
+            );
+        }
+        for command in &projection.commands {
+            ui.label(format!("{} · {:?}", command.text, command.memory));
+        }
+        for issue in &projection.issues {
+            ui.colored_label(egui::Color32::YELLOW, format!("Review: {issue:?}"));
+        }
+        ui.small("VICE monitor commands use an EmuWiz-managed session projection. Hardware I/O, ROM-mapped, and banked targets remain review-only.");
     });
 }

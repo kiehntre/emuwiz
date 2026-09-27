@@ -125,6 +125,7 @@ mod stella_local;
 mod three_ds_cheat;
 mod tsugaru_local;
 mod user_cheat_import;
+mod vice_c64_cheat;
 mod vice_local;
 mod vita3k_local;
 mod xemu_local;
@@ -975,6 +976,10 @@ pub use user_cheat_import::{
     UserCheatImportLimits, UserCheatImportReport, UserCheatLibraryGame, UserCheatMatch,
     UserCheatMatchState, UserCheatProvenance, UserCheatSourceOrigin, scan_user_cheat_directory,
     scan_user_cheat_directory_with_limits, scan_user_cheat_file, scan_user_cheat_file_with_limits,
+};
+pub use vice_c64_cheat::{
+    ViceCheatCommand, ViceCheatIdentity, ViceCheatIssue, ViceCheatProjection, ViceCheatReadiness,
+    ViceMemoryTarget, classify_c64_memory, project_vice_c64_pokes, vice_cheat_identity_strength,
 };
 pub use vice_local::{
     VICE_MAX_EXPLICIT_EXECUTABLES, ViceC64ExecutableKind, ViceExecutable, ViceInstallationType,
