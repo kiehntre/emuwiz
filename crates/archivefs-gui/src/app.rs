@@ -37,6 +37,12 @@ pub(crate) struct ArchiveFsApp {
     /// returning to the same exact archive does not discard a completed
     /// cache inspection or retrieval.
     pub(crate) cheat_workflow: Option<CheatWorkflowState>,
+    /// Emulators the user explicitly chose to receive cheats, per exact
+    /// archive, for this session. Never filled automatically.
+    pub(crate) cheat_emulator_selections: std::collections::BTreeMap<
+        std::path::PathBuf,
+        archivefs_core::patch_manager::CheatRouteTarget,
+    >,
     /// Independent read-only review state for user-supplied .cht/.pnach files.
     pub(crate) user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState,
     /// The Dolphin texture-mod panel's own state - deliberately separate
@@ -434,6 +440,7 @@ impl ArchiveFsApp {
             storage_health_page: storage_health_page::StorageHealthPageState::default(),
             tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
             cheat_workflow: None,
+            cheat_emulator_selections: std::collections::BTreeMap::new(),
             user_cheat_import_page: user_cheat_import_page::UserCheatImportPageState::default(),
             dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
             ppsspp_texture_mod: ppsspp_texture_mod_page::PpssppTextureModPageState::default(),

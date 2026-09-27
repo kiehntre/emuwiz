@@ -120,7 +120,7 @@ fn gamecube_cancel_notice_is_distinct_from_success_and_failure() {
         &output,
         "no live emulator file was changed"
     ));
-    assert!(!rendered_text_contains(&output, "Installed successfully"));
+    assert!(!rendered_text_contains(&output, "Files installed"));
 }
 
 #[test]
@@ -1046,9 +1046,10 @@ fn route_change_drops_stale_pcsx2_result_and_preserves_archive_state() {
             .and_then(|workflow| workflow.platform.as_deref()),
         Some("PS3")
     );
+    // PS3 routes to RPCS3 (no cheat install yet), never to RetroArch.
     assert_eq!(
         app.cheat_workflow.as_ref().unwrap().adapter,
-        CheatEmulatorAdapter::RetroArch
+        CheatEmulatorAdapter::Unsupported
     );
 }
 

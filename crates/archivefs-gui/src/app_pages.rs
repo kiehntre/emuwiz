@@ -966,6 +966,12 @@ pub(crate) fn show_pages(
                     Some(CheatWorkflowAction::OpenLibrary) => {
                         app.navigate_to_library_tab(LibraryTab::Archives);
                     }
+                    Some(CheatWorkflowAction::ChooseCheatEmulator(target)) => {
+                        app.choose_cheat_emulator(context, Some(target));
+                    }
+                    Some(CheatWorkflowAction::ClearCheatEmulatorChoice) => {
+                        app.choose_cheat_emulator(context, None);
+                    }
                     Some(CheatWorkflowAction::RescanProfiles) => {
                         app.start_retroarch_profile_scan(context.clone());
                     }

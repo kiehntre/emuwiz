@@ -237,6 +237,7 @@ impl ShelfGeometry {
     }
 }
 
+mod cheat_routing_loadability;
 mod cheats_mods_workflows;
 mod database_and_catalogue;
 mod doctor_and_repair;
@@ -558,6 +559,7 @@ fn app_with_cheats_mods_context() -> ArchiveFsApp {
         source_root: PathBuf::from("/roms"),
         size_bytes: None,
         adapter: CheatEmulatorAdapter::RetroArch,
+        routing: CheatRoutingState::default(),
         identity_request: None,
         identity: CheatStepResource::NotLoaded,
         preview_request: None,
@@ -1088,6 +1090,7 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
         emulator_readiness: EmulatorReadinessState::default(),
         tape_inspector_filter: tape_analysis_page::LibraryTapeFilterState::default(),
         cheat_workflow: None,
+        cheat_emulator_selections: std::collections::BTreeMap::new(),
         dolphin_texture_mod: dolphin_texture_mod_page::DolphinTextureModPageState::default(),
         ppsspp_texture_mod: ppsspp_texture_mod_page::PpssppTextureModPageState::default(),
         launch_retroarch: launch_readiness_page::RetroArchLaunchState::default(),

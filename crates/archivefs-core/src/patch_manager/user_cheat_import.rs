@@ -21,8 +21,11 @@ use crate::canonical_platform_for_alias;
 
 use super::cheat_provider::ProviderGameMatchConfidence;
 use super::cht_document::{ChtDocument, parse_cht_bytes};
+use super::dolphin_local::parse_game_identity as parse_dolphin_game_identity;
+use super::gecko_document::parse_dolphin_ini;
 use super::pcsx2::{normalize_crc, normalize_serial, parse_patch_identity};
 use super::pcsx2_pnach::PnachPatchLine;
+use super::xenia_patch_document::parse_xenia_patch_toml;
 
 /// Maximum bytes read from one selected user cheat file.
 pub const USER_CHEAT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -44,6 +47,11 @@ pub const USER_CHEAT_MAX_PATH_BYTES: usize = 4 * 1024;
 pub enum UserCheatFormat {
     RetroarchCht,
     Pcsx2Pnach,
+    /// A Dolphin GameSettings-shaped `.ini` declaring `[Gecko]` and/or
+    /// `[ActionReplay]` codes, read by the existing Dolphin INI parser.
+    DolphinGameSettingsIni,
+    /// A Xenia Canary `.patch.toml`, read by the existing strict parser.
+    XeniaPatchToml,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -609,7 +617,153 @@ fn parse_one_file(
             )))
         }
         UserCheatFormat::Pcsx2Pnach => parse_pnach(path, provenance, &bytes, limits, library),
+        UserCheatFormat::DolphinGameSettingsIni => {
+            parse_dolphin_game_settings(path, provenance, &bytes, limits, library, report)
+        }
+        UserCheatFormat::XeniaPatchToml => {
+            parse_xenia_patch(path, provenance, &bytes, limits, library)
+        }
     }
+}
+
+/// Indexes a Dolphin GameSettings-shaped `.ini`. `.ini` is a generic
+/// extension, so a file without any `[Gecko]`/`[ActionReplay]` code is
+/// reported as ignored rather than as a malformed cheat file.
+fn parse_dolphin_game_settings(
+    path: &Path,
+    provenance: UserCheatProvenance,
+    bytes: &[u8],
+    limits: &UserCheatImportLimits,
+    library: &[UserCheatLibraryGame],
+    report: &mut UserCheatImportReport,
+) -> Result<Option<UserCheatCandidate>, UserCheatImportError> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        report.diagnostic(
+            UserCheatDiagnostic {
+                kind: UserCheatDiagnosticKind::IgnoredFile,
+                path: path.to_path_buf(),
+                message: ".ini file is not valid UTF-8; not a Dolphin cheat file".to_string(),
+            },
+            limits,
+        );
+        return Ok(None);
+    };
+    let document = parse_dolphin_ini(text);
+    let code_count = document.gecko_codes.len() + document.action_replay_codes.len();
+    if code_count == 0 {
+        report.diagnostic(
+            UserCheatDiagnostic {
+                kind: UserCheatDiagnosticKind::IgnoredFile,
+                path: path.to_path_buf(),
+                message: ".ini file declares no [Gecko] or [ActionReplay] codes".to_string(),
+            },
+            limits,
+        );
+        return Ok(None);
+    }
+    let stem = path.file_stem().unwrap_or_default();
+    let (game_id, _revision, _region) = parse_dolphin_game_identity(stem);
+    let title = stem.to_string_lossy().into_owned();
+    let platform_hint = infer_platform_hint(path);
+    let matches = match_library(
+        std::slice::from_ref(&title),
+        platform_hint.as_deref(),
+        game_id.as_deref(),
+        None,
+        None,
+        library,
+    );
+    let warnings = document
+        .warnings
+        .iter()
+        .take(limits.max_warnings)
+        .map(|warning| warning.detail.clone())
+        .collect();
+    Ok(Some(UserCheatCandidate {
+        format: UserCheatFormat::DolphinGameSettingsIni,
+        provenance,
+        title_hints: vec![title],
+        platform_hint,
+        serial: game_id,
+        title_id: None,
+        crc: None,
+        cheat_count: code_count.min(limits.max_cheats_per_file),
+        parser_warnings: warnings,
+        match_state: overall_match_state(&matches),
+        matches,
+        duplicate_of: None,
+    }))
+}
+
+fn parse_xenia_patch(
+    path: &Path,
+    provenance: UserCheatProvenance,
+    bytes: &[u8],
+    limits: &UserCheatImportLimits,
+    library: &[UserCheatLibraryGame],
+) -> Result<Option<UserCheatCandidate>, UserCheatImportError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| UserCheatImportError::Io {
+        path: path.to_path_buf(),
+        message: "Xenia patch file is not valid UTF-8".to_string(),
+    })?;
+    let document = parse_xenia_patch_toml(text);
+    if document.is_fatally_malformed() {
+        return Err(UserCheatImportError::Io {
+            path: path.to_path_buf(),
+            message: "Xenia patch file has no usable Title ID".to_string(),
+        });
+    }
+    if document.patches.is_empty() {
+        return Err(UserCheatImportError::Io {
+            path: path.to_path_buf(),
+            message: "Xenia patch file contains no patches".to_string(),
+        });
+    }
+    let mut title_hints = Vec::new();
+    if !document.title_name.trim().is_empty() {
+        title_hints.push(document.title_name.trim().to_string());
+    }
+    if title_hints.is_empty() {
+        title_hints.push(
+            path.file_name()
+                .map(|name| {
+                    name.to_string_lossy()
+                        .trim_end_matches(".patch.toml")
+                        .to_string()
+                })
+                .unwrap_or_default(),
+        );
+    }
+    let platform_hint = Some("Xbox 360".to_string());
+    let title_id = Some(document.title_id.clone());
+    let matches = match_library(
+        &title_hints,
+        platform_hint.as_deref(),
+        None,
+        title_id.as_deref(),
+        None,
+        library,
+    );
+    let warnings = document
+        .warnings
+        .iter()
+        .take(limits.max_warnings)
+        .map(|warning| warning.detail.clone())
+        .collect();
+    Ok(Some(UserCheatCandidate {
+        format: UserCheatFormat::XeniaPatchToml,
+        provenance,
+        title_hints,
+        platform_hint,
+        serial: None,
+        title_id,
+        crc: None,
+        cheat_count: document.patches.len().min(limits.max_cheats_per_file),
+        parser_warnings: warnings,
+        match_state: overall_match_state(&matches),
+        matches,
+        duplicate_of: None,
+    }))
 }
 
 fn candidate_from_cht(
@@ -958,10 +1112,15 @@ fn apply_duplicate_groups(
 }
 
 fn format_for_path(path: &Path) -> Option<UserCheatFormat> {
+    let file_name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if file_name.ends_with(".patch.toml") && file_name.len() > ".patch.toml".len() {
+        return Some(UserCheatFormat::XeniaPatchToml);
+    }
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
         "cht" => Some(UserCheatFormat::RetroarchCht),
         "pnach" => Some(UserCheatFormat::Pcsx2Pnach),
+        "ini" => Some(UserCheatFormat::DolphinGameSettingsIni),
         _ => None,
     }
 }
@@ -1288,6 +1447,71 @@ cheat0_enable = true
         assert_eq!(report.skipped_symlinks, 1);
         #[cfg(unix)]
         assert!(report.candidates.is_empty());
+    }
+
+    #[test]
+    fn dolphin_game_settings_ini_is_recognised_without_writing() {
+        let root = tempdir().unwrap();
+        let platform_root = root.path().join("GameCube");
+        fs::create_dir_all(&platform_root).unwrap();
+        let path = write(
+            &platform_root,
+            "GALE01.ini",
+            b"[Gecko]\n$Infinite Health\n04123456 00000063\n[Gecko_Enabled]\n$Infinite Health\n\
+              [ActionReplay]\n$Max Coins\n00123456 000000FF\n",
+        );
+        let before = fs::read(&path).unwrap();
+        let report = scan_user_cheat_file(&path, &[]).unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        let candidate = &report.candidates[0];
+        assert_eq!(candidate.format, UserCheatFormat::DolphinGameSettingsIni);
+        assert_eq!(candidate.cheat_count, 2);
+        assert_eq!(candidate.serial.as_deref(), Some("GALE01"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn unrelated_ini_is_ignored_not_reported_as_a_cheat() {
+        let root = tempdir().unwrap();
+        let path = write(root.path(), "desktop.ini", b"[Core]\nEnableCheats = True\n");
+        let report = scan_user_cheat_file(&path, &[]).unwrap();
+        assert!(report.candidates.is_empty());
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.kind == UserCheatDiagnosticKind::IgnoredFile)
+        );
+    }
+
+    #[test]
+    fn xenia_patch_toml_is_recognised_with_its_title_id() {
+        let root = tempdir().unwrap();
+        let path = write(
+            root.path(),
+            "415607D2 - Test Game.patch.toml",
+            br#"title_name = "Test Game"
+title_id = "415607D2"
+hash = "4768B579A3C5F134"
+
+[[patch]]
+name = "Infinite health"
+desc = "test"
+author = "local"
+is_enabled = false
+[[patch.be32]]
+address = 0x82000000
+value = 0x1
+"#,
+        );
+        let report = scan_user_cheat_file(&path, &[game("x360", "Test Game", "Xbox 360")]).unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        let candidate = &report.candidates[0];
+        assert_eq!(candidate.format, UserCheatFormat::XeniaPatchToml);
+        assert_eq!(candidate.title_id.as_deref(), Some("415607D2"));
+        assert_eq!(candidate.cheat_count, 1);
+        assert_eq!(candidate.title_hints, vec!["Test Game".to_string()]);
+        assert!(!candidate.matches.is_empty());
     }
 
     #[test]

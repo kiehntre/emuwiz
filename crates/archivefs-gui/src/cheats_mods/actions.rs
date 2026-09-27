@@ -9,6 +9,9 @@ pub(crate) enum CheatArchivePickerAction {
 #[derive(Clone)]
 pub(crate) enum CheatWorkflowAction {
     ChooseArchive,
+    /// Explicitly aim cheats at this emulator for the selected game.
+    ChooseCheatEmulator(archivefs_core::patch_manager::CheatRouteTarget),
+    ClearCheatEmulatorChoice,
     OpenLibrary,
     RescanProfiles,
     RescanPcsx2Profiles,

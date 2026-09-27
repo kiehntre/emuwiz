@@ -534,7 +534,14 @@ impl ArchiveFsApp {
             self.cheat_workflow = None;
             return false;
         };
-        let adapter = cheat_adapter_route(platform.as_deref());
+        // Route by the emulator the user selected for this game first, then a
+        // configured default, then a platform fallback that can actually
+        // consume the cheat - never by platform alone.
+        let selected_emulator = self.cheat_emulator_selections.get(&archive_path).cloned();
+        let route_decision = archivefs_core::patch_manager::route_cheat_install(
+            &self.cheat_route_request(platform.as_deref(), selected_emulator.clone()),
+        );
+        let adapter = cheat_adapter_for_decision(&route_decision);
         let persisted_identity = self
             .database_state
             .snapshot()
@@ -625,6 +632,7 @@ impl ArchiveFsApp {
             source_root,
             size_bytes,
             adapter,
+            routing: CheatRoutingState::for_decision(route_decision, selected_emulator),
             identity_request: persisted_identity_request.clone(),
             identity: match (persisted_identity_request, persisted_identity) {
                 (Some(request), Some(report)) => CheatStepResource::Ready((request, report)),
@@ -5154,6 +5162,21 @@ impl ArchiveFsApp {
                         legacy_migration_history_entry =
                             apply_pcsx2_pending_legacy_migration(workflow, &result);
                     }
+                    // Files written is not the same as the selected emulator
+                    // loading them: re-read the destination and classify.
+                    workflow.routing.loadability = if matches!(
+                        result.journal.status,
+                        SharedApplyStatus::Success | SharedApplyStatus::PartialFailure
+                    ) {
+                        cheat_install_loadability(
+                            workflow,
+                            &self.emulator_readiness,
+                            &result,
+                            live_emulator_process_probe,
+                        )
+                    } else {
+                        None
+                    };
                     workflow.transaction = CheatTransactionState::Result { key, result };
                 }
                 Ok(Err(message)) => {
@@ -5538,9 +5561,18 @@ impl ArchiveFsApp {
                 LoadState::Error(_) => None,
             });
         if let Some(live_platform) = live_platform {
+            let live_adapter = self.cheat_workflow.as_ref().map(|workflow| {
+                cheat_adapter_for_decision(&archivefs_core::patch_manager::route_cheat_install(
+                    &self.cheat_route_request(
+                        live_platform.as_deref(),
+                        self.cheat_emulator_selections
+                            .get(&workflow.archive_path)
+                            .cloned(),
+                    ),
+                ))
+            });
             let route_changed = self.cheat_workflow.as_ref().is_some_and(|workflow| {
-                workflow.platform != live_platform
-                    && workflow.adapter != cheat_adapter_route(live_platform.as_deref())
+                workflow.platform != live_platform && Some(workflow.adapter) != live_adapter
             });
             if route_changed {
                 let archive = self

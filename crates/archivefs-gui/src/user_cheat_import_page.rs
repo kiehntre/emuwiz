@@ -1,9 +1,9 @@
-//! Read-only review of user-supplied RetroArch and PCSX2 cheat files.
+//! Review of user-supplied RetroArch, PCSX2, Dolphin and Xenia cheat files.
 //!
-//! This page intentionally does not share state with CheatBase or the
-//! emulator-specific installation workflows. The core importer is an index:
-//! it reads bounded local files, reports provenance and matching evidence, and
-//! never offers an install operation.
+//! The core importer is a read-only index: it reads bounded local files and
+//! reports provenance and matching evidence. Installing a reviewed file is a
+//! separate, explicit step that hands it to the existing per-emulator local
+//! install bridge (preview, confirm, apply, undo); the index never writes.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -479,6 +479,8 @@ impl UserCheatImportPageState {
                             report,
                             local_install_context,
                             local_pcsx2_install_context,
+                            local_dolphin_install_context,
+                            local_xenia_install_context,
                         );
                     }
                 }
@@ -791,6 +793,8 @@ impl UserCheatImportPageState {
         report: &UserCheatImportReport,
         local_install_context: Option<&LocalCheatInstallContext>,
         local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+        local_xenia_install_context: Option<&LocalXeniaInstallContext>,
     ) {
         if self.report_context_key != self.context_key {
             widgets::banner(
@@ -844,6 +848,8 @@ impl UserCheatImportPageState {
             "Matched",
             local_install_context,
             local_pcsx2_install_context,
+            local_dolphin_install_context,
+            local_xenia_install_context,
             |candidate| {
                 matches!(
                     candidate.match_state,
@@ -851,19 +857,42 @@ impl UserCheatImportPageState {
                 )
             },
         );
-        self.show_candidates(ui, report, "Possible matches", None, None, |candidate| {
-            candidate.match_state == UserCheatMatchState::Possible
-        });
-        self.show_candidates(ui, report, "Ambiguous matches", None, None, |candidate| {
-            candidate.match_state == UserCheatMatchState::Ambiguous
-        });
-        self.show_candidates(ui, report, "Unmatched", None, None, |candidate| {
-            candidate.match_state == UserCheatMatchState::NoMatch
-        });
+        self.show_candidates(
+            ui,
+            report,
+            "Possible matches",
+            None,
+            None,
+            local_dolphin_install_context,
+            local_xenia_install_context,
+            |candidate| candidate.match_state == UserCheatMatchState::Possible,
+        );
+        self.show_candidates(
+            ui,
+            report,
+            "Ambiguous matches",
+            None,
+            None,
+            local_dolphin_install_context,
+            local_xenia_install_context,
+            |candidate| candidate.match_state == UserCheatMatchState::Ambiguous,
+        );
+        self.show_candidates(
+            ui,
+            report,
+            "Unmatched",
+            None,
+            None,
+            local_dolphin_install_context,
+            local_xenia_install_context,
+            |candidate| candidate.match_state == UserCheatMatchState::NoMatch,
+        );
         self.show_candidates(
             ui,
             report,
             "Unsupported or rejected",
+            None,
+            None,
             None,
             None,
             |candidate| candidate.match_state == UserCheatMatchState::Unsupported,
@@ -910,6 +939,8 @@ impl UserCheatImportPageState {
         heading: &str,
         local_install_context: Option<&LocalCheatInstallContext>,
         local_pcsx2_install_context: Option<&LocalPcsx2InstallContext>,
+        local_dolphin_install_context: Option<&LocalDolphinInstallContext>,
+        local_xenia_install_context: Option<&LocalXeniaInstallContext>,
         filter: F,
     ) where
         F: Fn(&UserCheatCandidate) -> bool,
@@ -962,6 +993,20 @@ impl UserCheatImportPageState {
                                     ui,
                                     candidate,
                                     local_pcsx2_install_context,
+                                );
+                            }
+                            UserCheatFormat::DolphinGameSettingsIni => {
+                                self.show_scanned_dolphin_install_action(
+                                    ui,
+                                    candidate,
+                                    local_dolphin_install_context,
+                                );
+                            }
+                            UserCheatFormat::XeniaPatchToml => {
+                                self.show_scanned_xenia_install_action(
+                                    ui,
+                                    candidate,
+                                    local_xenia_install_context,
                                 );
                             }
                         }
@@ -2407,6 +2452,71 @@ impl UserCheatImportPageState {
 }
 
 impl UserCheatImportPageState {
+    /// Hands a scanned Dolphin `.ini` to the existing local Dolphin install
+    /// bridge, which re-validates the file and its Game ID against the game
+    /// selected in Cheats & Mods before any preview.
+    fn show_scanned_dolphin_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        context: Option<&LocalDolphinInstallContext>,
+    ) {
+        let Some(context) = context else {
+            ui.label("To install it, select this GameCube/Wii game and a Dolphin profile in Cheats & Mods.");
+            return;
+        };
+        let enabled = matches!(self.local_dolphin_install, LocalDolphinInstallStage::Idle);
+        if widgets::action_button(
+            ui,
+            "Preview install for Dolphin",
+            widgets::ActionStyle::Secondary,
+            enabled,
+        )
+        .clicked()
+        {
+            self.start_local_dolphin_install(
+                candidate.provenance.original_path.clone(),
+                context.candidate.clone(),
+                context.configuration_path.clone(),
+                context.profile_id.clone(),
+            );
+        }
+    }
+
+    /// Hands a scanned Xenia `.patch.toml` to the existing local Xenia
+    /// install bridge, which binds it to the selected game's Title ID.
+    fn show_scanned_xenia_install_action(
+        &mut self,
+        ui: &mut egui::Ui,
+        candidate: &UserCheatCandidate,
+        context: Option<&LocalXeniaInstallContext>,
+    ) {
+        let Some(context) = context else {
+            ui.label(
+                "To install it, select this Xbox 360 game and a Xenia profile in Cheats & Mods.",
+            );
+            return;
+        };
+        let enabled = context.title_id.is_some()
+            && context.profile.is_some()
+            && matches!(self.local_xenia_install, LocalXeniaInstallStage::Idle);
+        if widgets::action_button(
+            ui,
+            "Preview install for Xenia",
+            widgets::ActionStyle::Secondary,
+            enabled,
+        )
+        .clicked()
+            && let Some(profile) = context.profile.clone()
+        {
+            self.start_local_xenia_install(
+                candidate.provenance.original_path.clone(),
+                context.title_id.clone(),
+                profile,
+            );
+        }
+    }
+
     fn show_local_xenia_install_picker(
         &mut self,
         ui: &mut egui::Ui,
@@ -2474,6 +2584,8 @@ impl UserCheatImportPageState {
         let source_format = match candidate.format {
             UserCheatFormat::RetroarchCht => CheatSourceFormat::RetroArch,
             UserCheatFormat::Pcsx2Pnach => CheatSourceFormat::Pnach,
+            UserCheatFormat::DolphinGameSettingsIni => CheatSourceFormat::Gecko,
+            UserCheatFormat::XeniaPatchToml => CheatSourceFormat::Other("xenia_patch_toml".into()),
         };
         let platform = candidate
             .platform_hint
@@ -2898,6 +3010,8 @@ fn format_label(format: UserCheatFormat) -> &'static str {
     match format {
         UserCheatFormat::RetroarchCht => "RetroArch .cht",
         UserCheatFormat::Pcsx2Pnach => "PCSX2 .pnach",
+        UserCheatFormat::DolphinGameSettingsIni => "Dolphin GameSettings .ini",
+        UserCheatFormat::XeniaPatchToml => "Xenia .patch.toml",
     }
 }
 

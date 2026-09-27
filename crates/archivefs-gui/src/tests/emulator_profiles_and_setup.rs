@@ -2303,7 +2303,7 @@ fn pcsx2_confirmed_apply_writes_through_the_shared_transaction_result_exposes_th
     let key = cheat_preview_key(workflow);
     workflow.transaction = CheatTransactionState::Result { key, result };
     let output = ctx_run_pcsx2_gamehacking(workflow, None);
-    assert!(rendered_text_contains(&output, "Installed successfully"));
+    assert!(rendered_text_contains(&output, "Files installed"));
     assert!(rendered_text_contains(&output, "Undo installation"));
 
     let (history_root, backup_root) = shared_history_and_backup_roots(&directory);
@@ -2981,8 +2981,14 @@ fn adapter_routing_is_platform_authoritative() {
             CheatEmulatorAdapter::Xenia
         );
     }
+    // PS3 has no libretro core: it routes to RPCS3 (no cheat install yet),
+    // never to RetroArch.
     assert_eq!(
         cheat_adapter_route(Some("PS3")),
+        CheatEmulatorAdapter::Unsupported
+    );
+    assert_eq!(
+        cheat_adapter_route(Some("PSX")),
         CheatEmulatorAdapter::RetroArch
     );
     assert_eq!(cheat_adapter_route(None), CheatEmulatorAdapter::Unsupported);
@@ -4155,7 +4161,7 @@ fn undo_appears_after_a_successful_beginner_install_result() {
     };
     let output = render_dolphin_workflow(&mut app);
     assert!(
-        rendered_text_contains(&output, "Installed successfully"),
+        rendered_text_contains(&output, "Files installed"),
         "rendering mismatch"
     );
     assert!(
@@ -4188,7 +4194,7 @@ fn beginner_failure_result_names_failed_stage_and_live_target() {
     let ctx = egui::Context::default();
     let output = ctx.run(egui::RawInput::default(), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let _ = show_beginner_install_result(ui, &result);
+            let _ = show_beginner_install_result(ui, &result, None);
         });
     });
     for expected in [

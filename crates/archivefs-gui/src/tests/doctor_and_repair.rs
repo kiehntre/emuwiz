@@ -384,6 +384,7 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
         source_root: PathBuf::from("/roms"),
         size_bytes: None,
         adapter: CheatEmulatorAdapter::RetroArch,
+        routing: CheatRoutingState::default(),
         identity_request: None,
         identity: CheatStepResource::NotLoaded,
         preview_request: None,

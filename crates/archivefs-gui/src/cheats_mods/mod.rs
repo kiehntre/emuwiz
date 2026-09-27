@@ -18,9 +18,11 @@
 mod actions;
 mod controller;
 mod render;
+mod routing;
 mod state;
 
 pub(crate) use actions::*;
 pub(crate) use controller::*;
 pub(crate) use render::*;
+pub(crate) use routing::*;
 pub(crate) use state::*;

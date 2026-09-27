@@ -1688,6 +1688,8 @@ impl NativeWorkflows {
             A::ChooseArchive | A::OpenLibrary => {
                 return Some(Route::Section(super::routes::Section::Games));
             }
+            A::ChooseCheatEmulator(target) => self.app.choose_cheat_emulator(context, Some(target)),
+            A::ClearCheatEmulatorChoice => self.app.choose_cheat_emulator(context, None),
             A::RescanProfiles => self.app.start_retroarch_profile_scan(context.clone()),
             A::RescanPcsx2Profiles => self.app.start_pcsx2_profile_scan(context.clone()),
             A::InspectPcsx2Profile => self.app.start_pcsx2_inventory(context.clone()),

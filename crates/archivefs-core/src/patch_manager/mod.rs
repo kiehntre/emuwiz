@@ -41,10 +41,12 @@ mod cheat_install_result;
 mod cheat_installer;
 mod cheat_ir;
 mod cheat_journey;
+mod cheat_loadability;
 mod cheat_provider;
 mod cheat_reconciliation_plan;
 mod cheat_rollback;
 mod cheat_rollback_result;
+mod cheat_route;
 mod cheat_source_registry;
 mod cheat_sources;
 mod cheatbase;
@@ -309,6 +311,13 @@ pub use cheat_journey::{
     apply_cheat_journey, discover_cheat_journey, preview_cheat_journey, preview_cheat_journey_undo,
     select_cheat_journey_candidate, undo_cheat_journey,
 };
+pub use cheat_loadability::{
+    CheatEnablementEvidence, CheatIdentityStrength, CheatInstalledFileCheck,
+    CheatLoadPathConvention, CheatLoadabilityEvidence, CheatLoadabilityInput,
+    CheatLoadabilityIssue, CheatLoadabilityReport, CheatLoadabilityState, CheatRestartRequirement,
+    EmulatorProcessObservation, assess_cheat_loadability, cheat_restart_requirement,
+    observe_emulator_process, parse_config_bool, read_config_bool, verify_installed_cheat_file,
+};
 pub use cheat_provider::{
     CheatProviderIdentity, CheatProviderLicence, CheatProviderLicenceStatus,
     CheatProviderProvenance, CheatProviderSourceState, DeviceFormatCompatibility,
@@ -329,6 +338,11 @@ pub use cheat_rollback_result::{
     CHEAT_ROLLBACK_RUN_SCHEMA_VERSION, CheatRollbackEntryResult, CheatRollbackOutcome,
     CheatRollbackRun, CheatRollbackRunSchemaError, CheatRollbackRunStatus, CheatRollbackSummary,
     parse_cheat_rollback_run,
+};
+pub use cheat_route::{
+    CheatApplySupport, CheatRoute, CheatRouteBasis, CheatRouteDecision, CheatRouteRefusal,
+    CheatRouteRequest, CheatRouteTarget, RETROARCH_ROUTE_ID, canonical_cheat_platform,
+    cheat_apply_support, native_cheat_format, route_cheat_install, standalone_display_name,
 };
 pub use cheat_source_registry::{
     CheatSourceCapabilities, CheatSourceEntry, CheatSourceHealth, CheatSourceRegistry,

@@ -928,6 +928,13 @@ fn inspect_bios(
     }
 }
 
+fn is_cheat_section_header(line: &str) -> bool {
+    line.len() > 2
+        && line.starts_with('[')
+        && line.ends_with(']')
+        && !line[1..line.len() - 1].trim().is_empty()
+}
+
 fn inspect_cheats(path: &Path) -> DuckStationCheatInventory {
     let exists = path.exists();
     let mut warnings = Vec::new();
@@ -943,7 +950,10 @@ fn inspect_cheats(path: &Path) -> DuckStationCheatInventory {
     let mut entries = 0;
     let mut enabled_entries = 0;
     for line in text.lines().map(str::trim) {
-        if line.starts_with("[Cheat") || line.starts_with("Cheat") {
+        // Every non-empty `[Section]` header is one cheat. DuckStation names
+        // sections after the cheat itself (`[Infinite Health]`), so matching
+        // only a `Cheat` prefix undercounted real files.
+        if is_cheat_section_header(line) {
             entries += 1;
         }
         if line.to_ascii_lowercase().starts_with("enabled")
@@ -2043,6 +2053,43 @@ mod tests {
         let inspection = inspect_duckstation_game(&eligible(root), &verified("SLUS-12345"));
         assert_eq!(inspection.cheats.unwrap().entries, 0);
         assert!(!inspection.textures.unwrap().complete);
+    }
+
+    #[test]
+    fn realistic_named_cheat_sections_are_all_counted() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("duckstation");
+        write_global(&root, "");
+        fs::create_dir_all(root.join("cheats")).unwrap();
+        fs::write(
+            root.join("cheats/SLUS-12345.cht"),
+            "[Infinite Health]\n\
+             Type = Gameshark\n\
+             Activation = EndFrame\n\
+             Description = Health never drops\n\
+             80012345 0063\n\
+             \n\
+             [Max Money]\n\
+             Type = Gameshark\n\
+             Activation = EndFrame\n\
+             Enabled = true\n\
+             80054321 FFFF\n\
+             \n\
+             [Moon Jump (Hold L2)]\n\
+             Type = Gameshark\n\
+             Activation = Manual\n\
+             D0010000 FEFF\n\
+             80010002 0200\n\
+             []\n",
+        )
+        .unwrap();
+        let cheats = inspect_duckstation_game(&eligible(root), &verified("SLUS-12345"))
+            .cheats
+            .unwrap();
+        // Three named sections; the empty `[]` header is not a cheat. Only
+        // an explicit in-file `Enabled` key counts as enabled.
+        assert_eq!(cheats.entries, 3);
+        assert_eq!(cheats.enabled_entries, 1);
     }
 
     // -----------------------------------------------------------------

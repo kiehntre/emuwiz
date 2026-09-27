@@ -1,5 +1,42 @@
 use crate::*;
 
+/// Selected-emulator routing plus the post-install loadability result for
+/// the current cheat workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheatRoutingState {
+    pub(crate) decision: archivefs_core::patch_manager::CheatRouteDecision,
+    /// The emulator the user explicitly chose for this game, if any.
+    pub(crate) selected_emulator: Option<archivefs_core::patch_manager::CheatRouteTarget>,
+    /// Filled after a filesystem transaction completes. `None` before any
+    /// install, and for results that predate this check.
+    pub(crate) loadability: Option<archivefs_core::patch_manager::CheatLoadabilityReport>,
+}
+
+impl Default for CheatRoutingState {
+    fn default() -> Self {
+        Self {
+            decision: archivefs_core::patch_manager::CheatRouteDecision::NoRoute {
+                platform_id: None,
+            },
+            selected_emulator: None,
+            loadability: None,
+        }
+    }
+}
+
+impl CheatRoutingState {
+    pub(crate) fn for_decision(
+        decision: archivefs_core::patch_manager::CheatRouteDecision,
+        selected_emulator: Option<archivefs_core::patch_manager::CheatRouteTarget>,
+    ) -> Self {
+        Self {
+            decision,
+            selected_emulator,
+            loadability: None,
+        }
+    }
+}
+
 /// What `try_resolve_dolphin_provider_from_local_sources` found, kept
 /// distinct from `dolphin_provider` itself because `NotLoaded` alone can no
 /// longer distinguish "hasn't looked yet" from "looked locally and found
@@ -30,6 +67,9 @@ pub(crate) struct CheatWorkflowState {
     /// The emulator adapter is explicit and independent from archive
     /// selection. PCSX2 is offered only for a canonical PS2 archive.
     pub(crate) adapter: CheatEmulatorAdapter,
+    /// Which emulator cheats are aimed at, and why. `adapter` is derived
+    /// from this decision; it is never widened to RetroArch on its own.
+    pub(crate) routing: CheatRoutingState,
     pub(crate) identity_request: Option<GameIdentityRequest>,
     pub(crate) identity: CheatStepResource<(GameIdentityRequest, GameIdentityReport)>,
     pub(crate) preview_request: Option<CheatPreviewRequestKey>,

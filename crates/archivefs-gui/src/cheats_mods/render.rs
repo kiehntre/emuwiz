@@ -1603,18 +1603,6 @@ pub(crate) fn show_mods_section(ui: &mut egui::Ui, pcsx2_read_only: bool, dolphi
     widgets::banner(ui, "Mods: planned", detail, tone);
 }
 
-pub(crate) fn platform_is_ps2(platform: Option<&str>) -> bool {
-    platform.is_some_and(|platform| platform.eq_ignore_ascii_case("PS2"))
-}
-
-pub(crate) fn platform_is_dolphin(platform: Option<&str>) -> bool {
-    platform.is_some_and(|platform| {
-        ["GameCube", "Nintendo GameCube", "Wii", "Nintendo Wii"]
-            .iter()
-            .any(|candidate| platform.eq_ignore_ascii_case(candidate))
-    })
-}
-
 pub(crate) fn detected_platform_counts<'a>(
     platforms: impl Iterator<Item = Option<&'a str>>,
 ) -> DetectedPlatformCounts {
@@ -1676,31 +1664,261 @@ pub(crate) fn xenia_provider_auto_fetch_needed(workflow: &CheatWorkflowState) ->
         && matches!(workflow.xenia_provider, CheatStepResource::NotLoaded)
 }
 
-pub(crate) fn platform_is_xenia(platform: Option<&str>) -> bool {
-    platform.is_some_and(|platform| {
-        ["Xbox360", "Xbox 360"]
-            .iter()
-            .any(|candidate| platform.eq_ignore_ascii_case(candidate))
-    })
+/// Routes one canonical library platform to exactly one workflow using only
+/// the platform (no selected emulator, no installed-emulator evidence). The
+/// full selected-profile routing lives in
+/// [`archivefs_core::patch_manager::route_cheat_install`]; this keeps the
+/// same fail-closed rules, so a platform with no RetroArch route (PS3, 3DS,
+/// ...) is never sent to RetroArch.
+#[cfg(test)]
+pub(crate) fn cheat_adapter_route(platform: Option<&str>) -> CheatEmulatorAdapter {
+    cheat_adapter_for_decision(&archivefs_core::patch_manager::route_cheat_install(
+        &archivefs_core::patch_manager::CheatRouteRequest {
+            platform: platform.map(str::to_owned),
+            ..Default::default()
+        },
+    ))
 }
 
-/// Routes one canonical library platform to exactly one workflow. This is
-/// intentionally not a UI preference: rendering two adapters against one
-/// archive allowed stale profile/candidate state from the wrong system to
-/// remain reachable.
-pub(crate) fn cheat_adapter_route(platform: Option<&str>) -> CheatEmulatorAdapter {
-    if platform_is_ps2(platform) {
-        CheatEmulatorAdapter::Pcsx2
-    } else if platform_is_dolphin(platform) {
-        CheatEmulatorAdapter::Dolphin
-    } else if platform_is_xenia(platform) {
-        CheatEmulatorAdapter::Xenia
-    } else if platform.is_some_and(|platform| {
-        !platform.trim().is_empty() && !platform.eq_ignore_ascii_case("unknown")
-    }) {
-        CheatEmulatorAdapter::RetroArch
-    } else {
-        CheatEmulatorAdapter::Unsupported
+/// The install workflow for a routing decision. Only a routed emulator that
+/// EmuWiz can actually install cheats for gets a workflow; every other
+/// decision (inventory-only emulator, refusal, ambiguity, no route) is
+/// `Unsupported`, which offers no apply.
+pub(crate) fn cheat_adapter_for_decision(
+    decision: &archivefs_core::patch_manager::CheatRouteDecision,
+) -> CheatEmulatorAdapter {
+    use archivefs_core::patch_manager::CheatRouteTarget;
+    match decision.applicable_target() {
+        Some(CheatRouteTarget::RetroArch { .. }) => CheatEmulatorAdapter::RetroArch,
+        Some(CheatRouteTarget::Standalone { adapter_id }) => match adapter_id.as_str() {
+            "pcsx2" => CheatEmulatorAdapter::Pcsx2,
+            "dolphin" => CheatEmulatorAdapter::Dolphin,
+            "xenia" => CheatEmulatorAdapter::Xenia,
+            _ => CheatEmulatorAdapter::Unsupported,
+        },
+        None => CheatEmulatorAdapter::Unsupported,
+    }
+}
+
+fn cheat_route_basis_label(basis: archivefs_core::patch_manager::CheatRouteBasis) -> &'static str {
+    use archivefs_core::patch_manager::CheatRouteBasis;
+    match basis {
+        CheatRouteBasis::ExplicitSelection => "chosen by you",
+        CheatRouteBasis::ConfiguredDefault => "your saved emulator for this system",
+        CheatRouteBasis::PlatformFallback => "the only cheat-capable emulator EmuWiz found",
+    }
+}
+
+/// Which emulator cheats are aimed at, whether EmuWiz can install for it,
+/// and explicit buttons for every other known emulator. Choosing another
+/// emulator is always an explicit action; nothing switches automatically.
+pub(crate) fn show_cheat_route_panel(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+) -> Option<CheatWorkflowAction> {
+    use archivefs_core::patch_manager::{CheatApplySupport, CheatRouteDecision, CheatRouteTarget};
+    let decision = &workflow.routing.decision;
+    let mut action = None;
+    // No route at all is explained by the workflow's own "platform not
+    // recognised / not supported" banner.
+    if matches!(decision, CheatRouteDecision::NoRoute { .. }) {
+        return None;
+    }
+    // The common case - an installable emulator with a known core - stays a
+    // single row so the cheat list below remains in view.
+    if let CheatRouteDecision::Routed(route) = decision
+        && route.can_apply()
+        && !matches!(route.target, CheatRouteTarget::RetroArch { core: None })
+    {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Cheats for:");
+            ui.label(route.target.display_name());
+            widgets::status_badge(ui, "Cheats can be installed", widgets::StatusTone::Success);
+            ui.label(format!("({})", cheat_route_basis_label(route.basis)));
+        });
+        if !route.alternatives.is_empty() || workflow.routing.selected_emulator.is_some() {
+            egui::CollapsingHeader::new("Play this game in a different emulator?")
+                .id_salt("cheat_route_alternatives")
+                .default_open(false)
+                .show(ui, |ui| {
+                    action = show_cheat_route_choices(ui, workflow, &route.alternatives);
+                });
+        }
+        return action;
+    }
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Selected emulator:");
+            match decision {
+                CheatRouteDecision::Routed(route) => {
+                    ui.label(route.target.display_name());
+                    let (label, tone) = match route.apply_support {
+                        CheatApplySupport::Supported => {
+                            ("Cheats can be installed", widgets::StatusTone::Success)
+                        }
+                        CheatApplySupport::InventoryOnly => {
+                            ("Apply not supported yet", widgets::StatusTone::Warning)
+                        }
+                        CheatApplySupport::Unsupported => {
+                            ("Format not supported", widgets::StatusTone::Warning)
+                        }
+                    };
+                    widgets::status_badge(ui, label, tone);
+                }
+                CheatRouteDecision::Refused { selected, .. } => {
+                    ui.label(selected.display_name());
+                    widgets::status_badge(
+                        ui,
+                        "Cannot use cheats here",
+                        widgets::StatusTone::Blocked,
+                    );
+                }
+                CheatRouteDecision::Ambiguous { .. } => {
+                    widgets::status_badge(ui, "Choose an emulator", widgets::StatusTone::Pending);
+                }
+                CheatRouteDecision::NoRoute { .. } => {
+                    widgets::status_badge(ui, "No cheat route", widgets::StatusTone::Info);
+                }
+            }
+        });
+        ui.label(decision.headline());
+        if let CheatRouteDecision::Routed(route) = decision {
+            ui.label(format!(
+                "Cheat format: {} · {}",
+                route.native_format,
+                cheat_route_basis_label(route.basis)
+            ));
+            if matches!(route.target, CheatRouteTarget::RetroArch { core: None }) {
+                ui.label(
+                    "EmuWiz cannot verify which RetroArch core runs this game, so it cannot confirm RetroArch will load an installed cheat. Choose the core below if it is listed.",
+                );
+            }
+        }
+        let choices = decision.choices();
+        if !choices.is_empty() {
+            ui.label(match decision {
+                CheatRouteDecision::Routed(_) => "Play this game in a different emulator?",
+                _ => "Emulators that can run this game:",
+            });
+        }
+        action = show_cheat_route_choices(ui, workflow, choices);
+    });
+    action
+}
+
+fn show_cheat_route_choices(
+    ui: &mut egui::Ui,
+    workflow: &CheatWorkflowState,
+    choices: &[archivefs_core::patch_manager::CheatRouteTarget],
+) -> Option<CheatWorkflowAction> {
+    use archivefs_core::patch_manager::CheatApplySupport;
+    let mut action = None;
+    if !choices.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for choice in choices {
+                let label = match archivefs_core::patch_manager::cheat_apply_support(choice) {
+                    CheatApplySupport::Supported => format!("Use {}", choice.display_name()),
+                    CheatApplySupport::InventoryOnly | CheatApplySupport::Unsupported => {
+                        format!("Use {} (no cheat install yet)", choice.display_name())
+                    }
+                };
+                if widgets::action_button(ui, &label, widgets::ActionStyle::Secondary, true)
+                    .clicked()
+                {
+                    action = Some(CheatWorkflowAction::ChooseCheatEmulator(choice.clone()));
+                }
+            }
+        });
+    }
+    if workflow.routing.selected_emulator.is_some()
+        && widgets::action_button(
+            ui,
+            "Clear my emulator choice",
+            widgets::ActionStyle::Quiet,
+            true,
+        )
+        .clicked()
+    {
+        action = Some(CheatWorkflowAction::ClearCheatEmulatorChoice);
+    }
+    action
+}
+
+/// Post-install result, keeping "the file was installed" visibly separate
+/// from "the selected emulator is expected to load it".
+pub(crate) fn show_cheat_loadability(
+    ui: &mut egui::Ui,
+    report: &archivefs_core::patch_manager::CheatLoadabilityReport,
+) {
+    widgets::card(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Selected emulator:");
+            ui.label(&report.selected_emulator);
+        });
+        if let Some(target) = &report.install_target {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Install target:");
+                ui.label(target.display().to_string());
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Installed file:");
+            if report.file_installed {
+                widgets::status_badge(ui, "Yes, bytes verified", widgets::StatusTone::Success);
+            } else {
+                widgets::status_badge(ui, "Not verified", widgets::StatusTone::Blocked);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.strong("Selected emulator will load it:");
+            let (label, tone) = cheat_loadability_badge(report.state);
+            widgets::status_badge(ui, label, tone);
+        });
+        ui.strong(report.headline());
+        for issue in &report.issues {
+            ui.label(format!("Reason: {}", issue.message()));
+        }
+        if let Some(note) = report.restart_note() {
+            ui.label(note);
+        }
+        ui.small("EmuWiz checks files and settings only; it cannot confirm a cheat works in-game.");
+        widgets::technical_details(ui, "cheat_loadability_evidence", |ui| {
+            ui.label(format!(
+                "State: {:?} · restart: {:?}",
+                report.state, report.restart
+            ));
+            if let Some(core) = &report.retroarch_core {
+                ui.label(format!("RetroArch core: {core}"));
+            }
+            ui.label(format!("File check: {:?}", report.file_check));
+            for evidence in &report.evidence {
+                ui.label(format!("Evidence: {evidence:?}"));
+            }
+        });
+    });
+}
+
+pub(crate) fn cheat_loadability_badge(
+    state: archivefs_core::patch_manager::CheatLoadabilityState,
+) -> (&'static str, widgets::StatusTone) {
+    use archivefs_core::patch_manager::CheatLoadabilityState;
+    match state {
+        CheatLoadabilityState::LoadableVerifiedByConfig => (
+            "Yes, verified from its settings",
+            widgets::StatusTone::Success,
+        ),
+        CheatLoadabilityState::LoadableExpected => {
+            ("Expected, setting not confirmed", widgets::StatusTone::Info)
+        }
+        CheatLoadabilityState::RestartRequired => ("After a restart", widgets::StatusTone::Warning),
+        CheatLoadabilityState::EmulatorCheatsDisabled
+        | CheatLoadabilityState::PathNotObserved
+        | CheatLoadabilityState::UnsupportedBySelectedEmulator => {
+            ("No", widgets::StatusTone::Blocked)
+        }
+        CheatLoadabilityState::AmbiguousProfile | CheatLoadabilityState::Unknown => {
+            ("Cannot tell", widgets::StatusTone::Warning)
+        }
     }
 }
 
@@ -1978,7 +2196,11 @@ pub(crate) fn show_dolphin_beginner_summary(
                 return action;
             }
             CheatTransactionState::Result { result, .. } => {
-                return show_beginner_install_result(ui, result);
+                return show_beginner_install_result(
+                    ui,
+                    result,
+                    workflow.routing.loadability.as_ref(),
+                );
             }
             CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
         }
@@ -2282,12 +2504,13 @@ pub(crate) fn show_beginner_install_confirm(
 pub(crate) fn show_beginner_install_result(
     ui: &mut egui::Ui,
     result: &SharedApplyResult,
+    loadability: Option<&archivefs_core::patch_manager::CheatLoadabilityReport>,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
     widgets::card(ui, |ui| {
         match result.journal.status {
             SharedApplyStatus::Success => {
-                widgets::status_badge(ui, "Installed successfully", widgets::StatusTone::Success);
+                widgets::status_badge(ui, "Files installed", widgets::StatusTone::Success);
             }
             SharedApplyStatus::PartialFailure => {
                 widgets::status_badge(
@@ -2321,6 +2544,9 @@ pub(crate) fn show_beginner_install_result(
                     failure.detail
                 ));
             }
+        }
+        if let Some(report) = loadability {
+            show_cheat_loadability(ui, report);
         }
         let rollback_available = result.journal_path.is_some()
             && matches!(
@@ -2964,7 +3190,7 @@ pub(crate) fn show_xenia_beginner_summary(
             return action;
         }
         CheatTransactionState::Result { result, .. } => {
-            return show_beginner_install_result(ui, result);
+            return show_beginner_install_result(ui, result, workflow.routing.loadability.as_ref());
         }
         CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
     }
@@ -4614,7 +4840,7 @@ pub(crate) fn show_pcsx2_gamehacking(
             return action;
         }
         CheatTransactionState::Result { result, .. } => {
-            return show_beginner_install_result(ui, result);
+            return show_beginner_install_result(ui, result, workflow.routing.loadability.as_ref());
         }
         CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
     }
@@ -5201,7 +5427,11 @@ pub(crate) fn show_gamecube_gamehacking(
                 return action;
             }
             CheatTransactionState::Result { result, .. } => {
-                return show_beginner_install_result(ui, result);
+                return show_beginner_install_result(
+                    ui,
+                    result,
+                    workflow.routing.loadability.as_ref(),
+                );
             }
             CheatTransactionState::Idle | CheatTransactionState::Review { .. } => {}
         }
@@ -6463,6 +6693,9 @@ pub(crate) fn show_bsfree_install_result(
                     failure.detail
                 ));
             }
+        }
+        if let Some(report) = workflow.routing.loadability.as_ref() {
+            show_cheat_loadability(ui, report);
         }
         let rollback_available = result.journal_path.is_some()
             && matches!(

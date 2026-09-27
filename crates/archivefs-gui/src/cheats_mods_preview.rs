@@ -938,6 +938,7 @@ pub(crate) fn show_shared_cheat_preview(
                         || response.pcsx2_generated.is_some()
                         || response.gamecube_gamehacking_generated.is_some(),
                     &mut workflow.transaction,
+                    workflow.routing.loadability.as_ref(),
                     clipboard,
                 );
             }
@@ -951,6 +952,7 @@ pub(crate) fn show_shared_transaction_readiness(
     report: &SharedPreviewReport,
     source_materialized: bool,
     transaction: &mut CheatTransactionState,
+    loadability: Option<&archivefs_core::patch_manager::CheatLoadabilityReport>,
     clipboard: &mut dyn ClipboardBackend,
 ) -> Option<CheatWorkflowAction> {
     let mut action = None;
@@ -1094,7 +1096,7 @@ pub(crate) fn show_shared_transaction_readiness(
             CheatTransactionState::Result { result, .. } => {
                 let (label, tone) = match result.journal.status {
                     SharedApplyStatus::Success => {
-                        ("Installed and verified", widgets::StatusTone::Success)
+                        ("Files installed and verified", widgets::StatusTone::Success)
                     }
                     SharedApplyStatus::PartialFailure => {
                         ("Some changes failed", widgets::StatusTone::Warning)
@@ -1112,6 +1114,9 @@ pub(crate) fn show_shared_transaction_readiness(
                         "s"
                     }
                 ));
+                if let Some(report) = loadability {
+                    show_cheat_loadability(ui, report);
+                }
                 if result.journal_failure.is_some() {
                     widgets::banner(
                         ui,
@@ -1598,6 +1603,10 @@ pub(crate) fn show_cheats_mods_page(
         // rendering `show_shared_cheat_preview` unconditionally used to
         // show a permanently-empty "Preview waiting" card even while a
         // read-only adapter was selected.
+        // Which emulator the cheats are for comes first: every step below
+        // belongs to that emulator only.
+        action = show_cheat_route_panel(ui, workflow).or(action);
+        ui.add_space(theme::SECTION_GAP);
         match workflow.adapter {
             CheatEmulatorAdapter::RetroArch => {
                 action = show_cheat_workflow_step1(ui, workflow, profiles, busy).or(action);
@@ -1693,7 +1702,12 @@ pub(crate) fn show_cheats_mods_page(
             CheatEmulatorAdapter::Xenia => {
                 action = show_xenia_workflow(ui, workflow, xenia_profiles, clipboard).or(action);
             }
-            CheatEmulatorAdapter::Unsupported => {
+            CheatEmulatorAdapter::Unsupported
+                if matches!(
+                    workflow.routing.decision,
+                    archivefs_core::patch_manager::CheatRouteDecision::NoRoute { .. }
+                ) =>
+            {
                 widgets::banner(
                     ui,
                     &match workflow.platform.as_deref() {
@@ -1711,6 +1725,10 @@ pub(crate) fn show_cheats_mods_page(
                     widgets::StatusTone::Info,
                 );
             }
+            // A known platform whose routed emulator cannot receive cheats
+            // from EmuWiz: the route panel above already explains why and
+            // offers explicit alternatives.
+            CheatEmulatorAdapter::Unsupported => {}
         }
 
         // --- Diagnostics: everything a user needs only occasionally
