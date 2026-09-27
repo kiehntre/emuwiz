@@ -94,6 +94,7 @@ mod pcsx2_local;
 mod pcsx2_pnach;
 mod pcsx2_provider;
 mod pcsx2_texture_pack;
+mod ppsspp_cwcheat;
 mod ppsspp_local;
 mod ppsspp_texture_pack;
 mod resolved_emulator_profile;
@@ -717,6 +718,15 @@ pub use pcsx2_texture_pack::{
     Pcsx2TexturePackRejectedFile, build_pcsx2_texture_pack_preview,
     build_pcsx2_texture_pack_transaction_plan, execute_pcsx2_texture_pack_apply,
     inspect_pcsx2_texture_pack, pcsx2_texture_destination_root, verified_pcsx2_texture_identity,
+};
+pub use ppsspp_cwcheat::{
+    PPSSPP_CWCHEAT_MAX_BYTES, PPSSPP_CWCHEAT_MAX_CODE_LINES, PPSSPP_CWCHEAT_MAX_ENTRIES,
+    PPSSPP_CWCHEAT_MAX_LINE_BYTES, PPSSPP_CWCHEAT_MAX_LINES, PpssppCheatEntry, PpssppCheatFile,
+    PpssppCheatGame, PpssppCheatLine, PpssppCheatParseIssue, PpssppCheatState,
+    PpssppCwCheatPreview, PpssppCwCheatStaged, PpssppGlobalCheatState, PpssppReloadRequirement,
+    build_ppsspp_cwcheat_preview, merge_ppsspp_cheat, normalize_game_id, parse_ppsspp_cwcheat,
+    parse_ppsspp_cwcheat_file, ppsspp_global_cheat_state, remove_ppsspp_cheat,
+    render_ppsspp_cwcheat, set_ppsspp_cheat_state,
 };
 pub use ppsspp_local::{
     PPSSPP_MAX_CHEAT_BYTES, PPSSPP_MAX_CHEAT_ENTRIES, PPSSPP_MAX_CONFIG_BYTES,
