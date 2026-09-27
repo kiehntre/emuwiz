@@ -984,6 +984,7 @@ fn shared_apply_operation(
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::DuckStation
+        | PreviewAdapter::MelonDs
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Ppsspp
         | PreviewAdapter::Xenia => OperationKind::CheatApply,

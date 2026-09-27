@@ -30,6 +30,7 @@ pub enum PreviewAdapter {
     RetroArch,
     Pcsx2,
     DuckStation,
+    MelonDs,
     Dolphin,
     Ppsspp,
     Xenia,
@@ -53,6 +54,7 @@ pub enum PreviewIdentityKind {
     RetroArchCatalogueMatch,
     Pcsx2ExecutableCrc,
     DuckStationSerial,
+    MelonDsRomIdentity,
     Pcsx2TexturePack,
     DolphinGameId,
     /// An explicit multi-file Dolphin texture-pack manifest. Multiple
@@ -451,6 +453,7 @@ fn preview_one(
             request.adapter,
             PreviewAdapter::RetroArch
                 | PreviewAdapter::DuckStation
+                | PreviewAdapter::MelonDs
                 | PreviewAdapter::CemuGraphicPack
                 | PreviewAdapter::Rpcs3OrdinaryMod
         ))
@@ -762,6 +765,7 @@ fn apply_eligibility_blockers(
         ),
         PreviewAdapter::Pcsx2
         | PreviewAdapter::DuckStation
+        | PreviewAdapter::MelonDs
         | PreviewAdapter::Dolphin
         | PreviewAdapter::Ppsspp
         | PreviewAdapter::LocalModPackage
@@ -898,6 +902,8 @@ fn detect_cross_entry_conflicts(request: &SharedPreviewRequest, report: &mut Sha
         && request.identity.kind == PreviewIdentityKind::Pcsx2ExecutableCrc)
         || (request.adapter == PreviewAdapter::DuckStation
             && request.identity.kind == PreviewIdentityKind::DuckStationSerial)
+        || (request.adapter == PreviewAdapter::MelonDs
+            && request.identity.kind == PreviewIdentityKind::MelonDsRomIdentity)
         || (request.adapter == PreviewAdapter::Dolphin
             && request.identity.kind == PreviewIdentityKind::DolphinGameId)
         || (request.adapter == PreviewAdapter::Rpcs3OrdinaryMod
@@ -1282,6 +1288,10 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::DuckStation => matches!(
             normalized.as_str(),
             "ps1" | "playstation" | "playstation 1" | "sony playstation"
+        ),
+        PreviewAdapter::MelonDs => matches!(
+            normalized.as_str(),
+            "nds" | "nintendo ds" | "nintendo ds / dsi" | "melonds"
         ),
         PreviewAdapter::Dolphin => matches!(
             normalized.as_str(),

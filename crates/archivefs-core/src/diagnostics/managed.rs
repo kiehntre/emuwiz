@@ -122,6 +122,7 @@ impl ManagedFormat {
             PreviewAdapter::Ppsspp => Self::LocalModPackage,
             PreviewAdapter::Pcsx2 => Self::Pcsx2Pnach,
             PreviewAdapter::DuckStation => Self::LocalModPackage,
+            PreviewAdapter::MelonDs => Self::LocalModPackage,
             PreviewAdapter::Xenia => Self::XeniaPatch,
             PreviewAdapter::RetroArch => Self::RetroArchCheat,
             PreviewAdapter::LocalModPackage

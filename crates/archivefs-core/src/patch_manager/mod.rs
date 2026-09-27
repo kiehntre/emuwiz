@@ -84,6 +84,7 @@ mod local_cheat_install_dolphin;
 mod local_cheat_install_pcsx2;
 mod mame_cheat;
 mod matching;
+mod melonds_cheat;
 mod melonds_local;
 mod mesen_local;
 mod mgba_cheats;
@@ -656,6 +657,16 @@ pub use mame_cheat::{
     MameNativeExpression, MameNormalizedWrite, MameScriptState, build_mame_cheat_preview,
     inspect_mame_cheat, load_mame_cheat, merge_mame_cheat, parse_mame_cheat_xml,
     render_mame_cheat_xml, set_mame_cheat_enabled,
+};
+pub use melonds_cheat::{
+    MELONDS_CHEAT_MAX_BYTES, MELONDS_CHEAT_MAX_CODES, MELONDS_CHEAT_MAX_LINES,
+    MELONDS_CHEAT_MAX_STRING_BYTES, MELONDS_CHEAT_MAX_WORDS_PER_CODE, MelonDsCheatApplyPlan,
+    MelonDsCheatApplyRequest, MelonDsCheatCategory, MelonDsCheatCode, MelonDsCheatEntry,
+    MelonDsCheatFile, MelonDsCheatFormat, MelonDsCheatItem, MelonDsCheatParseIssue,
+    MelonDsCheatState, MelonDsLoadabilityFacts, MelonDsRomIdentity, MelonDsUsrCheatStatus,
+    apply_melonds_cheat_plan, build_melonds_cheat_apply_plan, melonds_loadability_facts,
+    parse_melonds_cheat_file, remove_melonds_cheat, render_melonds_cheat_file,
+    set_melonds_cheat_state,
 };
 pub use melonds_local::{
     MELONDS_MAX_CONFIG_BYTES, MELONDS_MAX_PROFILES, MelonDsConfigInspection, MelonDsDiscoveryError,
