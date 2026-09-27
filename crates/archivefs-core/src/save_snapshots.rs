@@ -1,8 +1,8 @@
 //! Local immutable save snapshots and conservative restore previews.
 //!
 //! Snapshot creation copies and hashes local save data into an EmuWiz data
-//! directory. Restore planning is read-only. Generic restore apply remains
-//! disabled until a complete filesystem transaction is available.
+//! directory. Generic restore apply is intentionally limited to explicitly
+//! bound, single-file native saves.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -153,6 +153,209 @@ pub struct SaveRestorePlan {
     pub automatic_pre_restore_snapshot_required: bool,
     pub apply_supported: bool,
     pub required_space_bytes: u64,
+}
+
+/// The deliberately small set of native save artifacts that the generic
+/// executor is allowed to replace.  Memory cards, save states, directories,
+/// and opaque containers remain preview-only even when represented by one
+/// filesystem path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenericSingleFileSaveFamily {
+    Sram,
+    Eeprom,
+    FlashSave,
+    Nvram,
+}
+
+impl GenericSingleFileSaveFamily {
+    fn from_artifact_type(value: SaveArtifactType) -> Option<Self> {
+        match value {
+            SaveArtifactType::Sram => Some(Self::Sram),
+            SaveArtifactType::Eeprom => Some(Self::Eeprom),
+            SaveArtifactType::FlashSave => Some(Self::FlashSave),
+            SaveArtifactType::Nvram => Some(Self::Nvram),
+            _ => None,
+        }
+    }
+}
+
+/// Strong target binding captured by the restore preview.  The path and
+/// snapshot association are mandatory; emulator/profile and game identity
+/// are checked whenever either side supplies them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveTargetBinding {
+    pub target_path: PathBuf,
+    pub artifact_type: SaveArtifactType,
+    pub emulator: Option<String>,
+    pub profile: Option<String>,
+    pub game_identity: Option<String>,
+    pub snapshot_id: String,
+}
+
+impl SaveTargetBinding {
+    pub fn from_snapshot(snapshot: &SaveSnapshot) -> Self {
+        Self {
+            target_path: snapshot.manifest.original_save_path.clone(),
+            artifact_type: snapshot.manifest.artifact_type,
+            emulator: snapshot.manifest.emulator.clone(),
+            profile: snapshot.manifest.emulator_profile.clone(),
+            game_identity: snapshot.manifest.game_identity.clone(),
+            snapshot_id: snapshot.manifest.snapshot_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SaveQuiescenceRequirement {
+    ConfirmedClosed,
+    Running,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SaveRestoreRefusal {
+    SnapshotIncomplete,
+    SnapshotUnreadable,
+    SnapshotHashChanged,
+    SnapshotAssociationMismatch,
+    TargetPathUnsafe,
+    TargetSymlinkOrSpecial,
+    TargetBindingMismatch,
+    UnsupportedArtifactType(SaveArtifactType),
+    MultiFileRestoreNotSupported,
+    SharedContainerRestoreNotSupported,
+    SaveStateRestoreNotSupported,
+    EmulatorRunning,
+    EmulatorStateUnknown,
+    DestinationChanged,
+    BackupFailed,
+    StagingFailed,
+    StagedHashMismatch,
+    PublicationFailed,
+    PostWriteVerificationFailed,
+    RollbackFailed,
+    ReceiptWriteFailed,
+    CrossFilesystemStaging,
+}
+
+impl std::fmt::Display for SaveRestoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::SnapshotIncomplete => "the snapshot is incomplete",
+            Self::SnapshotUnreadable => "the snapshot could not be verified",
+            Self::SnapshotHashChanged => "the snapshot changed since preview",
+            Self::SnapshotAssociationMismatch => {
+                "the snapshot is not associated with the selected target"
+            }
+            Self::TargetPathUnsafe => "the save target path is unsafe",
+            Self::TargetSymlinkOrSpecial => "the save target is a symlink or special file",
+            Self::TargetBindingMismatch => "the selected game or emulator binding does not match",
+            Self::UnsupportedArtifactType(_) => "this save type is not allowed for generic restore",
+            Self::MultiFileRestoreNotSupported => {
+                "multi-file restore requires atomic set publication and is not yet supported"
+            }
+            Self::SharedContainerRestoreNotSupported => {
+                "this save uses a shared memory card or container and cannot be restored generically"
+            }
+            Self::SaveStateRestoreNotSupported => {
+                "save states require emulator-specific compatibility checks"
+            }
+            Self::EmulatorRunning => "close the emulator before restoring this save",
+            Self::EmulatorStateUnknown => {
+                "EmuWiz cannot prove that the emulator is closed; close it before restoring this save"
+            }
+            Self::DestinationChanged => {
+                "the destination changed since preview; review the restore again"
+            }
+            Self::BackupFailed => "a verified backup could not be created",
+            Self::StagingFailed => "the restore staging file could not be prepared",
+            Self::StagedHashMismatch => "the staged restore bytes did not match the snapshot",
+            Self::PublicationFailed => "the restore could not be published atomically",
+            Self::PostWriteVerificationFailed => "the restored save failed post-write verification",
+            Self::RollbackFailed => "restore failed and rollback could not be completed safely",
+            Self::ReceiptWriteFailed => "the restore receipt could not be recorded",
+            Self::CrossFilesystemStaging => {
+                "safe atomic staging requires the same filesystem as the target"
+            }
+        };
+        f.write_str(message)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveRestorePreflight {
+    pub snapshot_id: String,
+    pub snapshot_sha256: String,
+    pub target_binding: SaveTargetBinding,
+    pub target_fingerprint: Option<String>,
+    pub target_exists: bool,
+    pub quiescence: SaveQuiescenceRequirement,
+    pub refusals: Vec<SaveRestoreRefusal>,
+}
+
+impl SaveRestorePreflight {
+    pub fn ready(&self) -> bool {
+        self.refusals.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveRestoreReceipt {
+    pub transaction_id: String,
+    pub snapshot_id: String,
+    pub snapshot_sha256: String,
+    pub target_binding: SaveTargetBinding,
+    pub pre_restore_target_sha256: Option<String>,
+    pub backup_snapshot_id: Option<String>,
+    pub backup_snapshot_path: Option<PathBuf>,
+    pub post_restore_expected_sha256: String,
+    pub post_restore_actual_sha256: String,
+    pub quiescence: SaveQuiescenceRequirement,
+    pub applied_unix_seconds: u64,
+    pub target_was_missing: bool,
+    pub rollback_eligible: bool,
+    pub receipt_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveRestoreApplyOptions {
+    pub backup_root: PathBuf,
+    pub receipt_root: PathBuf,
+    pub now_unix_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SaveRestoreResult {
+    pub receipt: SaveRestoreReceipt,
+    pub backup_snapshot: Option<SaveSnapshot>,
+}
+
+#[derive(Debug)]
+pub enum SaveRestoreError {
+    Refused(SaveRestoreRefusal),
+    Snapshot(SaveSnapshotError),
+    Io { path: PathBuf, detail: String },
+}
+
+impl std::fmt::Display for SaveRestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => write!(f, "save restore refused: {reason}"),
+            Self::Snapshot(error) => write!(f, "save restore snapshot failed: {error}"),
+            Self::Io { path, detail } => {
+                write!(f, "save restore I/O at {}: {detail}", path.display())
+            }
+        }
+    }
+}
+impl std::error::Error for SaveRestoreError {}
+
+impl From<SaveSnapshotError> for SaveRestoreError {
+    fn from(value: SaveSnapshotError) -> Self {
+        Self::Snapshot(value)
+    }
 }
 
 #[derive(Debug)]
@@ -407,6 +610,594 @@ pub fn build_restore_plan(
         plan.readiness = SaveSnapshotReadiness::SourceChanged;
     }
     plan
+}
+
+/// Build a strict, single-file restore preflight.  This is intentionally
+/// separate from the broad preview planner: callers must opt into the typed
+/// target binding and explicit quiescence state before Apply is possible.
+pub fn build_single_file_restore_preflight(
+    snapshot: &SaveSnapshot,
+    binding: &SaveTargetBinding,
+    quiescence: SaveQuiescenceRequirement,
+) -> SaveRestorePreflight {
+    let mut refusals = Vec::new();
+    let snapshot_sha256 = snapshot
+        .manifest
+        .artifacts
+        .first()
+        .map(|artifact| artifact.sha256.clone())
+        .unwrap_or_default();
+
+    if snapshot.manifest.completeness != SaveSnapshotCompleteness::Complete {
+        refusals.push(SaveRestoreRefusal::SnapshotIncomplete);
+    }
+    if snapshot.manifest.artifacts.len() != 1 {
+        refusals.push(SaveRestoreRefusal::MultiFileRestoreNotSupported);
+    }
+    if GenericSingleFileSaveFamily::from_artifact_type(snapshot.manifest.artifact_type).is_none() {
+        let refusal = match snapshot.manifest.artifact_type {
+            SaveArtifactType::MemoryCard
+            | SaveArtifactType::PsMemoryCard
+            | SaveArtifactType::DolphinMemoryCard
+            | SaveArtifactType::Vmu => SaveRestoreRefusal::SharedContainerRestoreNotSupported,
+            SaveArtifactType::SaveState => SaveRestoreRefusal::SaveStateRestoreNotSupported,
+            SaveArtifactType::SaveDirectory => SaveRestoreRefusal::MultiFileRestoreNotSupported,
+            artifact_type => SaveRestoreRefusal::UnsupportedArtifactType(artifact_type),
+        };
+        refusals.push(refusal);
+    }
+    if binding.snapshot_id != snapshot.manifest.snapshot_id
+        || binding.target_path != snapshot.manifest.original_save_path
+        || binding.artifact_type != snapshot.manifest.artifact_type
+        || binding.emulator != snapshot.manifest.emulator
+        || binding.profile != snapshot.manifest.emulator_profile
+        || (snapshot.manifest.game_identity.is_some()
+            && binding.game_identity != snapshot.manifest.game_identity)
+    {
+        refusals.push(SaveRestoreRefusal::SnapshotAssociationMismatch);
+    }
+    if !safe_target_path(&binding.target_path) {
+        refusals.push(SaveRestoreRefusal::TargetPathUnsafe);
+    }
+    let target_exists = match fs::symlink_metadata(&binding.target_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            refusals.push(SaveRestoreRefusal::TargetSymlinkOrSpecial);
+            true
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => {
+            refusals.push(SaveRestoreRefusal::TargetPathUnsafe);
+            false
+        }
+    };
+    if let Some(parent) = binding.target_path.parent()
+        && !safe_existing_parent(parent)
+    {
+        refusals.push(SaveRestoreRefusal::TargetPathUnsafe);
+    }
+    let target_fingerprint =
+        if target_exists && !refusals.contains(&SaveRestoreRefusal::TargetSymlinkOrSpecial) {
+            match hash_and_metadata(&binding.target_path) {
+                Ok((_, hash, _)) => Some(hash),
+                Err(_) => {
+                    refusals.push(SaveRestoreRefusal::TargetPathUnsafe);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    match quiescence {
+        SaveQuiescenceRequirement::ConfirmedClosed => {}
+        SaveQuiescenceRequirement::Running => refusals.push(SaveRestoreRefusal::EmulatorRunning),
+        SaveQuiescenceRequirement::Unknown => {
+            refusals.push(SaveRestoreRefusal::EmulatorStateUnknown)
+        }
+    }
+    if verify_snapshot(snapshot).is_err() {
+        refusals.push(SaveRestoreRefusal::SnapshotUnreadable);
+    }
+
+    SaveRestorePreflight {
+        snapshot_id: snapshot.manifest.snapshot_id.clone(),
+        snapshot_sha256,
+        target_binding: binding.clone(),
+        target_fingerprint,
+        target_exists,
+        quiescence,
+        refusals,
+    }
+}
+
+/// Apply one exact single-file native save.  The function creates and verifies
+/// a pre-restore snapshot before touching the destination, stages beside the
+/// destination's filesystem, publishes with rename, and records a durable
+/// receipt.  It never applies a directory, memory card, save state, or opaque
+/// artifact.
+pub fn apply_single_file_restore(
+    snapshot: &SaveSnapshot,
+    preflight: &SaveRestorePreflight,
+    options: &SaveRestoreApplyOptions,
+) -> Result<SaveRestoreResult, SaveRestoreError> {
+    if !preflight.ready() {
+        return Err(SaveRestoreError::Refused(
+            preflight
+                .refusals
+                .first()
+                .cloned()
+                .unwrap_or(SaveRestoreRefusal::TargetBindingMismatch),
+        ));
+    }
+    let current = build_single_file_restore_preflight(
+        snapshot,
+        &preflight.target_binding,
+        preflight.quiescence,
+    );
+    if current.snapshot_sha256 != preflight.snapshot_sha256
+        || current.target_fingerprint != preflight.target_fingerprint
+        || current.target_exists != preflight.target_exists
+    {
+        return Err(SaveRestoreError::Refused(
+            if current.snapshot_sha256 != preflight.snapshot_sha256 {
+                SaveRestoreRefusal::SnapshotHashChanged
+            } else {
+                SaveRestoreRefusal::DestinationChanged
+            },
+        ));
+    }
+    if !current.ready() {
+        return Err(SaveRestoreError::Refused(
+            current
+                .refusals
+                .first()
+                .cloned()
+                .unwrap_or(SaveRestoreRefusal::DestinationChanged),
+        ));
+    }
+
+    let target = &preflight.target_binding.target_path;
+    let parent = target
+        .parent()
+        .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
+    ensure_directory(parent)?;
+    ensure_directory(&options.backup_root)
+        .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+    ensure_directory(&options.receipt_root)
+        .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::ReceiptWriteFailed))?;
+    verify_snapshot(snapshot)?;
+
+    let transaction_id = format!(
+        "save-restore-{}-{}",
+        options.now_unix_seconds,
+        short_path_token(target)
+    );
+    let backup_snapshot = if preflight.target_exists {
+        let backup_request = SaveSnapshotRequest {
+            location: SaveLocation {
+                path: target.clone(),
+                emulator: preflight.target_binding.emulator.clone(),
+                profile: preflight.target_binding.profile.clone(),
+                artifact_type: preflight.target_binding.artifact_type,
+                provenance: SaveProvenance::ConfiguredPath,
+            },
+            game_identity: preflight.target_binding.game_identity.clone(),
+            platform: None,
+            storage_root: options.backup_root.clone(),
+            available_space_bytes: None,
+            snapshot_id: Some(format!("{transaction_id}-preimage")),
+            now_unix_seconds: Some(options.now_unix_seconds),
+            emulator_use: EmulatorUseStatus::NotDetected,
+        };
+        let backup = create_snapshot(&backup_request)
+            .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+        verify_snapshot(&backup)
+            .map_err(|_| SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+        Some(backup)
+    } else {
+        None
+    };
+
+    if !live_target_matches(preflight) {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::DestinationChanged,
+        ));
+    }
+
+    let source = snapshot_file_path(snapshot)?;
+    let stage = parent.join(format!(
+        ".{}.emuwiz-restore-stage-{}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("save"),
+        short_path_token(Path::new(&transaction_id))
+    ));
+    if stage.exists() {
+        return Err(SaveRestoreError::Refused(SaveRestoreRefusal::StagingFailed));
+    }
+    if let Err(error) = copy_and_verify(&source, &stage, &preflight.snapshot_sha256) {
+        let _ = fs::remove_file(&stage);
+        return Err(error);
+    }
+    if !live_target_matches(preflight) {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::DestinationChanged,
+        ));
+    }
+    if let Err(error) = fs::rename(&stage, target) {
+        let _ = fs::remove_file(&stage);
+        return Err(SaveRestoreError::Io {
+            path: target.clone(),
+            detail: format!("atomic publication failed: {error}"),
+        });
+    }
+    sync_parent(parent).map_err(|error| SaveRestoreError::Io {
+        path: parent.to_path_buf(),
+        detail: error,
+    })?;
+
+    let actual = match hash_and_metadata(target).map(|(_, hash, _)| hash) {
+        Ok(actual) => actual,
+        Err(error) => {
+            let rollback =
+                rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
+            return Err(if rollback.is_ok() {
+                SaveRestoreError::Snapshot(error)
+            } else {
+                SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
+            });
+        }
+    };
+    if actual != preflight.snapshot_sha256 {
+        let rollback = rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
+        return Err(if rollback.is_ok() {
+            SaveRestoreError::Refused(SaveRestoreRefusal::PostWriteVerificationFailed)
+        } else {
+            SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
+        });
+    }
+
+    let receipt_path = options.receipt_root.join(format!("{transaction_id}.json"));
+    let receipt = SaveRestoreReceipt {
+        transaction_id,
+        snapshot_id: preflight.snapshot_id.clone(),
+        snapshot_sha256: preflight.snapshot_sha256.clone(),
+        target_binding: preflight.target_binding.clone(),
+        pre_restore_target_sha256: preflight.target_fingerprint.clone(),
+        backup_snapshot_id: backup_snapshot
+            .as_ref()
+            .map(|backup| backup.manifest.snapshot_id.clone()),
+        backup_snapshot_path: backup_snapshot
+            .as_ref()
+            .map(|backup| backup.storage_path.clone()),
+        post_restore_expected_sha256: preflight.snapshot_sha256.clone(),
+        post_restore_actual_sha256: actual,
+        quiescence: preflight.quiescence,
+        applied_unix_seconds: options.now_unix_seconds,
+        target_was_missing: !preflight.target_exists,
+        rollback_eligible: true,
+        receipt_path,
+    };
+    persist_receipt(&receipt).map_err(|error| {
+        let rollback = rollback_after_failed_restore(target, preflight, backup_snapshot.as_ref());
+        if rollback.is_ok() {
+            error
+        } else {
+            SaveRestoreError::Refused(SaveRestoreRefusal::RollbackFailed)
+        }
+    })?;
+    Ok(SaveRestoreResult {
+        receipt,
+        backup_snapshot,
+    })
+}
+
+/// Undo a completed generic single-file restore only while the destination
+/// still contains the bytes created by that transaction.
+pub fn undo_single_file_restore(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError> {
+    if !receipt.rollback_eligible {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::DestinationChanged,
+        ));
+    }
+    let target = &receipt.target_binding.target_path;
+    if !safe_target_path(target)
+        || target
+            .parent()
+            .is_none_or(|parent| !safe_existing_parent(parent))
+    {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::TargetPathUnsafe,
+        ));
+    }
+    if fs::symlink_metadata(target)
+        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        .unwrap_or(true)
+    {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::TargetSymlinkOrSpecial,
+        ));
+    }
+    let current = hash_and_metadata(target)
+        .map(|(_, hash, _)| hash)
+        .map_err(SaveRestoreError::Snapshot)?;
+    if current != receipt.post_restore_actual_sha256 {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::DestinationChanged,
+        ));
+    }
+    if receipt.target_was_missing {
+        fs::remove_file(target).map_err(|error| SaveRestoreError::Io {
+            path: target.clone(),
+            detail: error.to_string(),
+        })?;
+        sync_parent(
+            target
+                .parent()
+                .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?,
+        )
+        .map_err(|error| SaveRestoreError::Io {
+            path: target.clone(),
+            detail: error,
+        })?;
+        return Ok(());
+    }
+    let backup_root = receipt
+        .backup_snapshot_path
+        .as_deref()
+        .ok_or(SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+    let backup = backup_root.join("files").join(
+        target
+            .file_name()
+            .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?,
+    );
+    if fs::symlink_metadata(&backup)
+        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        .unwrap_or(true)
+    {
+        return Err(SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed));
+    }
+    let backup_hash = hash_and_metadata(&backup)
+        .map(|(_, hash, _)| hash)
+        .map_err(SaveRestoreError::Snapshot)?;
+    if receipt.pre_restore_target_sha256.as_deref() != Some(backup_hash.as_str()) {
+        return Err(SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
+    let stage = parent.join(format!(
+        ".{}.emuwiz-undo-stage-{}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("save"),
+        short_path_token(&receipt.receipt_path)
+    ));
+    copy_and_verify(&backup, &stage, &backup_hash)?;
+    fs::rename(&stage, target).map_err(|error| SaveRestoreError::Io {
+        path: target.clone(),
+        detail: format!("atomic undo publication failed: {error}"),
+    })?;
+    sync_parent(parent).map_err(|error| SaveRestoreError::Io {
+        path: parent.to_path_buf(),
+        detail: error,
+    })?;
+    let restored = hash_and_metadata(target)
+        .map(|(_, hash, _)| hash)
+        .map_err(SaveRestoreError::Snapshot)?;
+    if restored != backup_hash {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::PostWriteVerificationFailed,
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_file_path(snapshot: &SaveSnapshot) -> Result<PathBuf, SaveRestoreError> {
+    let artifact = snapshot
+        .manifest
+        .artifacts
+        .first()
+        .ok_or(SaveRestoreError::Refused(
+            SaveRestoreRefusal::SnapshotUnreadable,
+        ))?;
+    safe_join(
+        &snapshot.storage_path.join("files"),
+        &artifact.relative_path,
+    )
+    .map_err(SaveRestoreError::Snapshot)
+}
+
+fn safe_target_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+}
+
+fn safe_existing_parent(path: &Path) -> bool {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        let Ok(metadata) = fs::symlink_metadata(candidate) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return false;
+        }
+        let Some(parent) = candidate.parent() else {
+            break;
+        };
+        if parent == candidate {
+            break;
+        }
+        current = Some(parent);
+    }
+    true
+}
+
+fn live_target_matches(preflight: &SaveRestorePreflight) -> bool {
+    match (
+        preflight.target_exists,
+        fs::symlink_metadata(&preflight.target_binding.target_path),
+    ) {
+        (false, Err(error)) if error.kind() == io::ErrorKind::NotFound => true,
+        (true, Ok(metadata)) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            hash_and_metadata(&preflight.target_binding.target_path)
+                .map(|(_, hash, _)| Some(hash) == preflight.target_fingerprint)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn ensure_directory(path: &Path) -> Result<(), SaveRestoreError> {
+    fs::create_dir_all(path).map_err(|error| SaveRestoreError::Io {
+        path: path.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| SaveRestoreError::Io {
+        path: path.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::TargetPathUnsafe,
+        ));
+    }
+    Ok(())
+}
+
+fn copy_and_verify(
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<(), SaveRestoreError> {
+    let mut input = File::open(source).map_err(|error| SaveRestoreError::Io {
+        path: source.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    let mut output = File::options()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|error| SaveRestoreError::Io {
+            path: destination.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .map_err(|error| SaveRestoreError::Io {
+                path: source.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        if count == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| SaveRestoreError::Io {
+                path: destination.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        digest.update(&buffer[..count]);
+    }
+    output.sync_all().map_err(|error| SaveRestoreError::Io {
+        path: destination.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    let actual = hex_digest(digest);
+    if actual != expected_sha256 {
+        let _ = fs::remove_file(destination);
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::StagedHashMismatch,
+        ));
+    }
+    Ok(())
+}
+
+fn rollback_after_failed_restore(
+    target: &Path,
+    preflight: &SaveRestorePreflight,
+    backup: Option<&SaveSnapshot>,
+) -> Result<(), SaveRestoreError> {
+    let current = fs::symlink_metadata(target).map_err(|error| SaveRestoreError::Io {
+        path: target.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    if current.file_type().is_symlink() || !current.is_file() {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::TargetSymlinkOrSpecial,
+        ));
+    }
+    if hash_and_metadata(target)
+        .map(|(_, hash, _)| hash != preflight.snapshot_sha256)
+        .unwrap_or(true)
+    {
+        return Err(SaveRestoreError::Refused(
+            SaveRestoreRefusal::DestinationChanged,
+        ));
+    }
+    if !preflight.target_exists {
+        if hash_and_metadata(target)
+            .map(|(_, hash, _)| hash == preflight.snapshot_sha256)
+            .unwrap_or(false)
+        {
+            fs::remove_file(target).map_err(|error| SaveRestoreError::Io {
+                path: target.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+        }
+        return Ok(());
+    }
+    let backup = backup.ok_or(SaveRestoreError::Refused(SaveRestoreRefusal::BackupFailed))?;
+    let source = snapshot_file_path(backup)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| SaveRestoreError::Refused(SaveRestoreRefusal::TargetPathUnsafe))?;
+    let stage = parent.join(format!(
+        ".{}.emuwiz-rollback-stage-{}",
+        target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("save"),
+        short_path_token(target)
+    ));
+    copy_and_verify(
+        &source,
+        &stage,
+        preflight.target_fingerprint.as_deref().unwrap_or_default(),
+    )?;
+    fs::rename(stage, target).map_err(|error| SaveRestoreError::Io {
+        path: target.to_path_buf(),
+        detail: error.to_string(),
+    })?;
+    Ok(())
+}
+
+fn persist_receipt(receipt: &SaveRestoreReceipt) -> Result<(), SaveRestoreError> {
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(|error| SaveRestoreError::Io {
+        path: receipt.receipt_path.clone(),
+        detail: error.to_string(),
+    })?;
+    let staging = receipt.receipt_path.with_extension("json.partial");
+    write_file(&staging, &bytes).map_err(SaveRestoreError::Snapshot)?;
+    fs::rename(&staging, &receipt.receipt_path).map_err(|error| SaveRestoreError::Io {
+        path: receipt.receipt_path.clone(),
+        detail: error.to_string(),
+    })?;
+    Ok(())
+}
+
+fn sync_parent(path: &Path) -> Result<(), String> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())
 }
 
 fn validate_source(path: &Path) -> Result<PathBuf, SaveSnapshotError> {
@@ -777,6 +1568,174 @@ mod tests {
         assert!(
             plan.conflicts
                 .contains(&SaveRestoreConflict::ProfileMismatch)
+        );
+    }
+
+    fn restore_options(root: &Path) -> SaveRestoreApplyOptions {
+        SaveRestoreApplyOptions {
+            backup_root: root.join("backups"),
+            receipt_root: root.join("receipts"),
+            now_unix_seconds: 200,
+        }
+    }
+
+    #[test]
+    fn single_file_restore_backs_up_publishes_and_undoes_exact_bytes() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("save.srm");
+        fs::write(&source, b"before").unwrap();
+        let snapshot = create_snapshot(&request(&source, &dir.path().join("snapshots"))).unwrap();
+        fs::write(&source, b"changed").unwrap();
+        let binding = SaveTargetBinding::from_snapshot(&snapshot);
+        let preflight = build_single_file_restore_preflight(
+            &snapshot,
+            &binding,
+            SaveQuiescenceRequirement::ConfirmedClosed,
+        );
+        assert!(preflight.ready());
+        let result =
+            apply_single_file_restore(&snapshot, &preflight, &restore_options(dir.path())).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"before");
+        assert!(result.receipt.rollback_eligible);
+        assert!(result.receipt.backup_snapshot_path.is_some());
+        assert!(result.receipt.receipt_path.is_file());
+        undo_single_file_restore(&result.receipt).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"changed");
+    }
+
+    #[test]
+    fn single_file_restore_missing_target_is_removed_by_undo() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("save.srm");
+        fs::write(&source, b"save").unwrap();
+        let snapshot = create_snapshot(&request(&source, &dir.path().join("snapshots"))).unwrap();
+        fs::remove_file(&source).unwrap();
+        let preflight = build_single_file_restore_preflight(
+            &snapshot,
+            &SaveTargetBinding::from_snapshot(&snapshot),
+            SaveQuiescenceRequirement::ConfirmedClosed,
+        );
+        let result =
+            apply_single_file_restore(&snapshot, &preflight, &restore_options(dir.path())).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), b"save");
+        undo_single_file_restore(&result.receipt).unwrap();
+        assert!(!source.exists());
+    }
+
+    #[test]
+    fn single_file_restore_refuses_stale_destination_and_external_undo() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("save.srm");
+        fs::write(&source, b"before").unwrap();
+        let snapshot = create_snapshot(&request(&source, &dir.path().join("snapshots"))).unwrap();
+        fs::write(&source, b"changed-before-preview").unwrap();
+        let preflight = build_single_file_restore_preflight(
+            &snapshot,
+            &SaveTargetBinding::from_snapshot(&snapshot),
+            SaveQuiescenceRequirement::ConfirmedClosed,
+        );
+        fs::write(&source, b"changed-after-preview").unwrap();
+        assert!(matches!(
+            apply_single_file_restore(&snapshot, &preflight, &restore_options(dir.path())),
+            Err(SaveRestoreError::Refused(
+                SaveRestoreRefusal::DestinationChanged
+            ))
+        ));
+
+        let fresh = build_single_file_restore_preflight(
+            &snapshot,
+            &SaveTargetBinding::from_snapshot(&snapshot),
+            SaveQuiescenceRequirement::ConfirmedClosed,
+        );
+        let result =
+            apply_single_file_restore(&snapshot, &fresh, &restore_options(dir.path())).unwrap();
+        fs::write(&source, b"external-change").unwrap();
+        assert!(matches!(
+            undo_single_file_restore(&result.receipt),
+            Err(SaveRestoreError::Refused(
+                SaveRestoreRefusal::DestinationChanged
+            ))
+        ));
+    }
+
+    #[test]
+    fn single_file_restore_refuses_unsafe_families_and_quiescence() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("card.mcr");
+        fs::write(&source, b"card").unwrap();
+        let mut card_request = request(&source, &dir.path().join("snapshots"));
+        card_request.location.artifact_type = SaveArtifactType::MemoryCard;
+        let card = create_snapshot(&card_request).unwrap();
+        let card_preflight = build_single_file_restore_preflight(
+            &card,
+            &SaveTargetBinding::from_snapshot(&card),
+            SaveQuiescenceRequirement::ConfirmedClosed,
+        );
+        assert!(
+            card_preflight
+                .refusals
+                .contains(&SaveRestoreRefusal::SharedContainerRestoreNotSupported)
+        );
+
+        let mut state_request = request(&source, &dir.path().join("states"));
+        state_request.location.artifact_type = SaveArtifactType::SaveState;
+        let state = create_snapshot(&state_request).unwrap();
+        let state_preflight = build_single_file_restore_preflight(
+            &state,
+            &SaveTargetBinding::from_snapshot(&state),
+            SaveQuiescenceRequirement::Unknown,
+        );
+        assert!(
+            state_preflight
+                .refusals
+                .contains(&SaveRestoreRefusal::SaveStateRestoreNotSupported)
+        );
+        assert!(
+            state_preflight
+                .refusals
+                .contains(&SaveRestoreRefusal::EmulatorStateUnknown)
+        );
+    }
+
+    #[test]
+    fn single_file_restore_refuses_changed_snapshot_and_symlink_target() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("save.srm");
+        fs::write(&source, b"save").unwrap();
+        let snapshot = create_snapshot(&request(&source, &dir.path().join("snapshots"))).unwrap();
+        let snapshot_file = snapshot.storage_path.join("files").join("save.srm");
+        fs::write(snapshot_file, b"tampered").unwrap();
+        let changed = build_single_file_restore_preflight(
+            &snapshot,
+            &SaveTargetBinding::from_snapshot(&snapshot),
+            SaveQuiescenceRequirement::ConfirmedClosed,
+        );
+        assert!(
+            changed
+                .refusals
+                .contains(&SaveRestoreRefusal::SnapshotUnreadable)
+        );
+
+        let replacement = dir.path().join("replacement.srm");
+        fs::write(&replacement, b"replacement").unwrap();
+        let link = dir.path().join("link.srm");
+        symlink(&replacement, &link).unwrap();
+        let mut link_binding = SaveTargetBinding::from_snapshot(&snapshot);
+        link_binding.target_path = link;
+        let link_preflight = build_single_file_restore_preflight(
+            &snapshot,
+            &link_binding,
+            SaveQuiescenceRequirement::ConfirmedClosed,
+        );
+        assert!(
+            link_preflight
+                .refusals
+                .contains(&SaveRestoreRefusal::SnapshotAssociationMismatch)
+        );
+        assert!(
+            link_preflight
+                .refusals
+                .contains(&SaveRestoreRefusal::TargetSymlinkOrSpecial)
         );
     }
 }
