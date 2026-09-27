@@ -88,6 +88,7 @@ mod mame_cheat;
 mod matching;
 mod melonds_cheat;
 mod mednafen_cheat;
+mod whdload_trainer;
 mod melonds_local;
 mod mesen_local;
 mod mgba_cheats;
