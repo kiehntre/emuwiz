@@ -28,6 +28,7 @@ mod bsfree_gamecube;
 mod bsfree_wii;
 mod cemu_graphic_pack;
 mod cemu_local;
+mod classic_game_genie;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -313,6 +314,12 @@ pub use cheat_ir::{
     dolphin_on_frame_line_to_ir, ds_action_replay_line_to_ir, encode_ds_action_replay_operation,
     encode_operation, export_conversion_preview, parse_ds_action_replay_document, pnach_line_to_ir,
     reconcile_cheats_for_game, supported_targets_for,
+};
+pub use classic_game_genie::{
+    ClassicCheatFormat, GameGenieDecodeResult, GameGenieDecodeStatus, GameGenieDetection,
+    GameGenieInstruction, GameGenieIssue, GameGeniePlatform, GameGenieProvenance,
+    GameGenieRevisionEvidence, GameGenieRevisionSafety, decode_classic_game_genie,
+    detect_classic_game_genie, game_genie_to_document,
 };
 pub use cheat_journey::{
     CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyApplyResult,
