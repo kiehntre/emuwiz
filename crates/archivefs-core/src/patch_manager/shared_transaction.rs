@@ -1482,7 +1482,12 @@ fn apply_one(
                 | SharedContentVerification::RetroArchBezel
                 | SharedContentVerification::HackHashPatch { .. }
         )
-    ) || plan.adapter == PreviewAdapter::Flycast;
+    ) || matches!(
+        plan.adapter,
+        PreviewAdapter::Flycast
+            | PreviewAdapter::AmigaWhdloadTrainer
+            | PreviewAdapter::ScummVmTrainer
+    );
     let assessment = if nested_mod_package {
         assess_local_mod_destination(destination_root, &relative)
     } else {

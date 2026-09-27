@@ -803,8 +803,9 @@ fn apply_eligibility_blockers(
         | PreviewAdapter::Rpcs3Patch
         | PreviewAdapter::Mednafen
         | PreviewAdapter::Fbneo => source.match_strength == PreviewMatchStrength::VerifiedExact,
-        | PreviewAdapter::AmigaWhdloadTrainer
-        | PreviewAdapter::ScummVmTrainer => source.match_strength == PreviewMatchStrength::VerifiedExact,
+        PreviewAdapter::AmigaWhdloadTrainer | PreviewAdapter::ScummVmTrainer => {
+            source.match_strength == PreviewMatchStrength::VerifiedExact
+        }
     };
     if !strength_eligible {
         let blocker = match source.match_strength {
@@ -1392,7 +1393,9 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
             normalized == "arcade" || normalized == "finalburn neo" || normalized == "fbneo"
         }
         PreviewAdapter::ScummVmTrainer => normalized == "scummvm",
-        PreviewAdapter::AmigaWhdloadTrainer => normalized == "amiga" || normalized == "commodore amiga",
+        PreviewAdapter::AmigaWhdloadTrainer => {
+            normalized == "amiga" || normalized == "commodore amiga"
+        }
     }
 }
 

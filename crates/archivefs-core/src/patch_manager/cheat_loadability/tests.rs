@@ -299,10 +299,10 @@ fn retroarch_without_core_is_ambiguous() {
 }
 
 #[test]
-fn inventory_only_emulator_is_unsupported() {
+fn unsupported_emulator_is_unsupported() {
     let fixture = installed_pnach();
     let mut input = pcsx2_input(&fixture, Some(true));
-    input.route = route(CheatRouteTarget::standalone("flycast"));
+    input.route = route(CheatRouteTarget::standalone("azahar"));
     let report = assess_cheat_loadability(&input);
     assert_eq!(
         report.state,

@@ -28,7 +28,6 @@ mod bsfree_gamecube;
 mod bsfree_wii;
 mod cemu_graphic_pack;
 mod cemu_local;
-mod classic_game_genie;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -52,6 +51,7 @@ mod cheat_source_registry;
 mod cheat_sources;
 mod cheatbase;
 mod cht_document;
+mod classic_game_genie;
 mod destination_safety;
 mod dolphin_cheat_catalogue;
 mod dolphin_code;
@@ -68,8 +68,8 @@ mod duckstation_firmware;
 mod duckstation_local;
 mod emulator_profile_memory;
 mod emulator_request_bridge;
-mod flycast_cheats;
 mod fbneo_cheat;
+mod flycast_cheats;
 mod flycast_local;
 mod fuse_local;
 mod gamehacking_browser_import;
@@ -87,9 +87,8 @@ mod local_cheat_install_dolphin;
 mod local_cheat_install_pcsx2;
 mod mame_cheat;
 mod matching;
-mod melonds_cheat;
 mod mednafen_cheat;
-mod whdload_trainer;
+mod melonds_cheat;
 mod melonds_local;
 mod mesen_local;
 mod mgba_cheats;
@@ -122,6 +121,7 @@ mod rpcs3_ordinary_mod;
 mod rpcs3_patch;
 mod sameboy_local;
 mod saturn_action_replay;
+mod whdload_trainer;
 // ScummVM’s documented gameplay options stay separate from memory-write cheats.
 mod scummvm_trainer;
 mod shared_preview;
@@ -315,12 +315,6 @@ pub use cheat_ir::{
     encode_operation, export_conversion_preview, parse_ds_action_replay_document, pnach_line_to_ir,
     reconcile_cheats_for_game, supported_targets_for,
 };
-pub use classic_game_genie::{
-    ClassicCheatFormat, GameGenieDecodeResult, GameGenieDecodeStatus, GameGenieDetection,
-    GameGenieInstruction, GameGenieIssue, GameGeniePlatform, GameGenieProvenance,
-    GameGenieRevisionEvidence, GameGenieRevisionSafety, decode_classic_game_genie,
-    detect_classic_game_genie, game_genie_to_document,
-};
 pub use cheat_journey::{
     CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyApplyResult,
     CheatJourneyCandidate, CheatJourneyCandidateList, CheatJourneyDestinationFingerprint,
@@ -415,6 +409,12 @@ pub use cht_document::{
     MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_EXTRA_FIELDS_PER_ENTRY,
     MAX_CHT_FIELD_BYTES, MAX_CHT_GLOBAL_FIELDS, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes,
     parse_cht_text, render_cht_file,
+};
+pub use classic_game_genie::{
+    ClassicCheatFormat, GameGenieDecodeResult, GameGenieDecodeStatus, GameGenieDetection,
+    GameGenieInstruction, GameGenieIssue, GameGeniePlatform, GameGenieProvenance,
+    GameGenieRevisionEvidence, GameGenieRevisionSafety, decode_classic_game_genie,
+    detect_classic_game_genie, game_genie_to_document,
 };
 pub use destination_safety::{
     DestinationRootState, DestinationSafetyAssessment, DestinationSafetyError,
@@ -551,14 +551,6 @@ pub use emulator_request_bridge::{
     duckstation_request, inspect_duckstation_game_for_verified, inspect_ppsspp_game_for_verified,
     ppsspp_request,
 };
-pub use flycast_cheats::{
-    DreamcastCheatCode, DreamcastCheatIdentity, FLYCAST_CHEAT_MAX_BYTES, FLYCAST_CHEAT_MAX_ENTRIES,
-    FLYCAST_CHEAT_MAX_LINE_BYTES, FLYCAST_CHEAT_MAX_LINES, FlycastCheatApplyOptions,
-    FlycastCheatConflict, FlycastCheatConflictKind, FlycastCheatEntry, FlycastCheatError,
-    FlycastCheatFile, FlycastCheatParseIssue, FlycastCheatPreview, FlycastCheatReadiness,
-    FlycastCheatRequest, FlycastCheatSelection, FlycastCheatState, FlycastCheatType,
-    apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
-};
 pub use fbneo_cheat::{
     FBNEO_MAX_CHEATS, FBNEO_MAX_FILE_BYTES, FBNEO_MAX_LINE_BYTES, FBNEO_MAX_LINES,
     FBNEO_MAX_OPERATIONS_PER_OPTION, FBNEO_MAX_OPTIONS_PER_CHEAT, FbneoCheatApplyOptions,
@@ -567,6 +559,14 @@ pub use fbneo_cheat::{
     FbneoCheatReadiness, FbneoCheatState, FbneoCheatTarget, apply_fbneo_cheat_plan,
     build_fbneo_cheat_apply_plan, fbneo_readiness, merge_fbneo_cheat_file, parse_fbneo_cheat_file,
     render_fbneo_cheat_file,
+};
+pub use flycast_cheats::{
+    DreamcastCheatCode, DreamcastCheatIdentity, FLYCAST_CHEAT_MAX_BYTES, FLYCAST_CHEAT_MAX_ENTRIES,
+    FLYCAST_CHEAT_MAX_LINE_BYTES, FLYCAST_CHEAT_MAX_LINES, FlycastCheatApplyOptions,
+    FlycastCheatConflict, FlycastCheatConflictKind, FlycastCheatEntry, FlycastCheatError,
+    FlycastCheatFile, FlycastCheatParseIssue, FlycastCheatPreview, FlycastCheatReadiness,
+    FlycastCheatRequest, FlycastCheatSelection, FlycastCheatState, FlycastCheatType,
+    apply_flycast_cheat_preview, build_flycast_cheat_preview, parse_flycast_cheat_file,
 };
 pub use flycast_local::{
     FLYCAST_MAX_CHEAT_BYTES, FLYCAST_MAX_CONFIG_BYTES, FLYCAST_MAX_DIRECTORY_ENTRIES,
@@ -692,16 +692,6 @@ pub use mame_cheat::{
     inspect_mame_cheat, load_mame_cheat, merge_mame_cheat, parse_mame_cheat_xml,
     render_mame_cheat_xml, set_mame_cheat_enabled,
 };
-pub use melonds_cheat::{
-    MELONDS_CHEAT_MAX_BYTES, MELONDS_CHEAT_MAX_CODES, MELONDS_CHEAT_MAX_LINES,
-    MELONDS_CHEAT_MAX_STRING_BYTES, MELONDS_CHEAT_MAX_WORDS_PER_CODE, MelonDsCheatApplyPlan,
-    MelonDsCheatApplyRequest, MelonDsCheatCategory, MelonDsCheatCode, MelonDsCheatEntry,
-    MelonDsCheatFile, MelonDsCheatFormat, MelonDsCheatItem, MelonDsCheatParseIssue,
-    MelonDsCheatState, MelonDsLoadabilityFacts, MelonDsRomIdentity, MelonDsUsrCheatStatus,
-    apply_melonds_cheat_plan, build_melonds_cheat_apply_plan, melonds_loadability_facts,
-    parse_melonds_cheat_file, remove_melonds_cheat, render_melonds_cheat_file,
-    set_melonds_cheat_state,
-};
 pub use mednafen_cheat::{
     MEDNAFEN_CHEAT_MAX_BYTES, MEDNAFEN_CHEAT_MAX_ENTRIES, MEDNAFEN_CHEAT_MAX_LINE_BYTES,
     MEDNAFEN_CHEAT_MAX_LINES, MEDNAFEN_CHEAT_SOURCE_MODE, MednafenCheatEntry, MednafenCheatError,
@@ -712,6 +702,16 @@ pub use mednafen_cheat::{
     mednafen_supported_systems, mednafen_system_for_platform, merge_mednafen_cheat_files,
     parse_mednafen_cheat_file, preview_mednafen_cheat_rollback, render_mednafen_cheat_file,
     rollback_mednafen_cheat,
+};
+pub use melonds_cheat::{
+    MELONDS_CHEAT_MAX_BYTES, MELONDS_CHEAT_MAX_CODES, MELONDS_CHEAT_MAX_LINES,
+    MELONDS_CHEAT_MAX_STRING_BYTES, MELONDS_CHEAT_MAX_WORDS_PER_CODE, MelonDsCheatApplyPlan,
+    MelonDsCheatApplyRequest, MelonDsCheatCategory, MelonDsCheatCode, MelonDsCheatEntry,
+    MelonDsCheatFile, MelonDsCheatFormat, MelonDsCheatItem, MelonDsCheatParseIssue,
+    MelonDsCheatState, MelonDsLoadabilityFacts, MelonDsRomIdentity, MelonDsUsrCheatStatus,
+    apply_melonds_cheat_plan, build_melonds_cheat_apply_plan, melonds_loadability_facts,
+    parse_melonds_cheat_file, remove_melonds_cheat, render_melonds_cheat_file,
+    set_melonds_cheat_state,
 };
 pub use melonds_local::{
     MELONDS_MAX_CONFIG_BYTES, MELONDS_MAX_PROFILES, MelonDsConfigInspection, MelonDsDiscoveryError,
