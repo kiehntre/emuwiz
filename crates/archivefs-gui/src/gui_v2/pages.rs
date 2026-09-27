@@ -611,17 +611,22 @@ impl App {
                 .unwrap_or_else(|| self.router.current.section().title()),
         };
         ui.heading(title);
-        ui.label(if self.router.current.game().is_some() {
-            "Your game's information, readiness and next actions, in one place."
+        if self.router.current.game().is_some() {
+            ui.label("Your game's information, readiness and next actions, in one place.");
         } else if let Some(family) = family {
             if family_home(family).section() == self.router.current.section() {
-                family.purpose()
+                ui.label(family.purpose());
+                // Keep the stable route-level purpose visible alongside the
+                // richer family projection. Existing route coverage and
+                // accessibility checks rely on every Section retaining its
+                // own plain-language purpose.
+                ui.label(self.router.current.section().purpose());
             } else {
-                self.router.current.section().purpose()
+                ui.label(self.router.current.section().purpose());
             }
         } else {
-            self.router.current.section().purpose()
-        });
+            ui.label(self.router.current.section().purpose());
+        }
         ui.separator();
     }
 
