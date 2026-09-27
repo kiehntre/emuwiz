@@ -51,6 +51,17 @@ SBOM_FILES = (
 SBOM_CHECKSUM_FILE = "SBOM_SHA256SUMS"
 MARKER_NAME = ".emuwiz-release-package.json"
 FINAL_METADATA = {"manifest.json", "SHA256SUMS"}
+CANONICAL_SUPPORT_FILES = (
+    "install.sh",
+    "config.toml.example",
+    "assets/linux/io.github.kiehntre.emuwiz.desktop.in",
+    "assets/branding/emuwiz-logo-32.png",
+    "assets/branding/emuwiz-logo-64.png",
+    "assets/branding/emuwiz-logo-128.png",
+    "assets/branding/emuwiz-logo-256.png",
+    "assets/branding/emuwiz-logo-512.png",
+)
+CANONICAL_EXECUTABLES = {"bin/emuwiz", "bin/emuwiz-cli", "install.sh"}
 EXIT_INPUT = 1
 EXIT_VERIFY = 2
 EXIT_UNSAFE = 3
@@ -454,6 +465,18 @@ def copy_license_payload(source_root: pathlib.Path, docs: pathlib.Path) -> list[
     return copied
 
 
+def copy_canonical_support_files(source_root: pathlib.Path, release: pathlib.Path) -> None:
+    """Copy only the files required by the extracted-tree release contract."""
+    for relative in CANONICAL_SUPPORT_FILES:
+        source = source_root / relative
+        if source.is_symlink() or not source.is_file():
+            raise ReleaseError(f"canonical release file is missing or unsafe: {relative}", EXIT_INPUT)
+        destination = release / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        os.chmod(destination, 0o755 if relative == "install.sh" else 0o644)
+
+
 def write_generated_docs(root: pathlib.Path, version: str, release_platform: str) -> None:
     docs = root / "docs"
     docs.mkdir(parents=True, exist_ok=True)
@@ -462,9 +485,25 @@ def write_generated_docs(root: pathlib.Path, version: str, release_platform: str
 bin/emuwiz is the native EmuWiz GUI v2 application.
 bin/emuwiz-cli is the command-line application.
 
+Run directly from this extracted directory (no installation or network is
+required):
+  ./bin/emuwiz
+  ./bin/emuwiz-cli --version
+
+Install for the current user with:
+  ./install.sh
+
 Verify this directory from its top level with:
   sha256sum -c SHA256SUMS
-  scripts/release/verify-release.sh DIRECTORY
+
+Required to start: Linux {release_platform}, X11 or Wayland, a functional
+graphics/OpenGL/EGL stack, and writable user XDG config/data locations.
+Optional features may use ratarmount/FUSE, 7z, unrar, xdg-open/viewers,
+emulator executables, AppImages, Flatpak emulators, RomM/providers, and
+online DAT/metadata services. Missing optional tools do not prevent startup.
+
+Configuration and data use the normal XDG locations. config.toml.example is
+reference material and is never copied over an existing user config.
 
 ROMs, BIOS/firmware, saves, configuration, catalogues, and user data are not
 included. Configuration and data directories are created at runtime.
@@ -475,11 +514,12 @@ Run `sha256sum -c SHA256SUMS` from this directory for a basic byte check.
 If SBOM/ is present, also run:
   (cd SBOM && sha256sum -c SBOM_SHA256SUMS)
 For manifest, size, ELF architecture, symlink, and strict-layout checks run:
-  scripts/release/verify-release.sh --strict DIRECTORY
+  the release verifier from an EmuWiz source checkout, if available.
 
 The verifier inspects files and never executes packaged binaries. Dynamic
 dependency names are informational and do not prove availability on another
-Linux installation.
+Linux installation. A detached signature is available only when the release
+was signed; an SBOM is included only when generated for this artifact.
 """
     atomic_write(docs / "README.txt", readme.encode())
     atomic_write(root / "VERIFY.txt", verify.encode())
@@ -642,6 +682,14 @@ def verify_directory(
         raise ReleaseError(f"release directory not found: {root}", EXIT_VERIFY)
     manifest = read_manifest(root)
     checksums = parse_checksum_file(root / "SHA256SUMS")
+    required_paths = {"bin/emuwiz", "bin/emuwiz-cli", *CANONICAL_SUPPORT_FILES,
+                      "docs/README.txt", "docs/LICENSES.txt", "BUILD_INFO.txt", "VERIFY.txt"}
+    missing_paths = sorted(path for path in required_paths if not (root / path).is_file())
+    if missing_paths:
+        raise ReleaseError(f"canonical payload files are missing: {', '.join(missing_paths)}", EXIT_VERIFY)
+    license_files = root / "docs" / "licenses"
+    if not license_files.is_dir() or not any(path.is_file() for path in license_files.iterdir()):
+        raise ReleaseError("canonical payload has no docs/licenses file", EXIT_VERIFY)
     records = manifest.get("files")
     artifacts = manifest.get("artifacts")
     if not isinstance(records, list) or not isinstance(artifacts, list):
@@ -676,6 +724,10 @@ def verify_directory(
         digest = sha256_file(path)
         if digest != record.get("sha256") or digest != checksums.get(relative):
             raise ReleaseError(f"SHA-256 mismatch: {relative}", EXIT_VERIFY)
+        if bool(record.get("executable")) and relative not in CANONICAL_EXECUTABLES and not (
+            relative.startswith("bin/") and relative.endswith(".AppImage")
+        ):
+            raise ReleaseError(f"unexpected executable payload file: {relative}", EXIT_VERIFY)
     manifest_digest = sha256_file(root / "manifest.json")
     if checksums.get("manifest.json") != manifest_digest:
         raise ReleaseError("manifest SHA-256 does not agree with SHA256SUMS", EXIT_VERIFY)
@@ -891,6 +943,7 @@ def package(args: argparse.Namespace) -> pathlib.Path:
                 "rpath_runpath": info["rpath"],
             })
         write_generated_docs(release, version, release_platform)
+        copy_canonical_support_files(source_root, release)
         copied_licenses = copy_license_payload(source_root, release / "docs")
         if sbom_source is not None and sbom_info is not None:
             sbom_records = copy_sbom_payload(sbom_source, release / "SBOM")

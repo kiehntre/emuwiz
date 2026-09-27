@@ -177,6 +177,19 @@ make_bundle() {
     cp -R -- "$desktop_assets" "$1/assets/linux"
 }
 
+# make_canonical_bundle DIR - mirrors the packaged archive's bin/ layout.
+make_canonical_bundle() {
+    mkdir -p -- "$1/bin"
+    cp -- "$install_sh" "$1/install.sh"
+    printf '#!/bin/sh\necho canonical-cli\n' >"$1/bin/emuwiz-cli"
+    printf '#!/bin/sh\necho canonical-gui\n' >"$1/bin/emuwiz"
+    chmod +x -- "$1/bin/emuwiz-cli" "$1/bin/emuwiz" "$1/install.sh"
+    cp -- "$config_example" "$1/config.toml.example"
+    mkdir -p -- "$1/assets"
+    cp -R -- "$branding_assets" "$1/assets/branding"
+    cp -R -- "$desktop_assets" "$1/assets/linux"
+}
+
 # make_workspace DIR - populates DIR with a fake workspace checkout:
 # install.sh at the root, stub binaries under target/release/,
 # config.toml.example at the root.
@@ -235,6 +248,20 @@ assert_files_equal "config.toml matches config.toml.example" \
     "$config_example" "$home/.config/emuwiz/config.toml"
 cli_out=$("$bin_dir/emuwiz-cli")
 assert_contains "installed emuwiz-cli runs (bundle stub)" "$cli_out" "fake-cli"
+rm -rf -- "$work"
+
+echo "=== test: fresh install from the canonical bin-layout release tree ==="
+work=$(mktemp -d)
+make_canonical_bundle "$work/bundle"
+home="$work/home"
+mkdir -p -- "$home"
+bin_dir="$work/bin"
+assert_success "install from canonical extracted tree succeeds" \
+    env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir"
+assert_executable "canonical emuwiz-cli installed" "$bin_dir/emuwiz-cli"
+assert_executable "canonical emuwiz installed" "$bin_dir/emuwiz"
+canonical_cli_out=$("$bin_dir/emuwiz-cli")
+assert_contains "canonical emuwiz-cli runs" "$canonical_cli_out" "canonical-cli"
 rm -rf -- "$work"
 
 echo "=== test: this suite does not block on stdin when launched from a real controlling terminal ==="

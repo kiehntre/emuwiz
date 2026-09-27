@@ -1,22 +1,28 @@
-# EmuWiz release artifact packager
+# EmuWiz canonical Linux release artifact packager
 
 This tool packages already-built binaries. It never invokes Cargo and its
 verifier never executes packaged artifacts.
 
+The canonical artifact is `emuwiz-<version>-linux-<arch>.tar.xz`. Its
+extracted root is directly runnable and contains `bin/emuwiz`,
+`bin/emuwiz-cli`, the user-safe `install.sh`, `config.toml.example`, the
+desktop template, icons, generated docs/licences, provenance, manifest, and
+checksums. `SBOM/` is optional and present only when generated.
+
 ```sh
 scripts/release/package-release.sh \
   --target-dir /home/davedap/.cache/emuwiz-cargo-target \
-  --output-root /tmp/emuwiz-dist \
-  --sbom-dir /tmp/emuwiz-sbom/SBOM \
+  --output-root /home/davedap/.cache/emuwiz-release-dist \
+  --sbom-dir /home/davedap/.cache/emuwiz-sbom/SBOM \
   --require-sbom \
   --archive
 
 scripts/release/verify-release.sh --strict \
-  /tmp/emuwiz-dist/emuwiz-0.9.0-linux-x86_64
+  /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.9.0-linux-x86_64
 
 scripts/release/verify-release.sh --strict \
-  --checksum /tmp/emuwiz-dist/emuwiz-0.9.0-linux-x86_64.tar.xz.sha256 \
-  /tmp/emuwiz-dist/emuwiz-0.9.0-linux-x86_64.tar.xz
+  --checksum /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.9.0-linux-x86_64.tar.xz.sha256 \
+  /home/davedap/.cache/emuwiz-release-dist/emuwiz-0.9.0-linux-x86_64.tar.xz
 ```
 
 Explicit `--gui` and `--cli` paths may replace `--target-dir`. An existing

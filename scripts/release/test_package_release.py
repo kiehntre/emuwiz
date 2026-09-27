@@ -92,6 +92,18 @@ class ReleasePackagerTests(unittest.TestCase):
     def test_01_valid_synthetic_executable_package(self) -> None:
         release, result = self._package()
         self.assertEqual(result.returncode, 0, result.stderr)
+        for relative in (
+            "bin/emuwiz", "bin/emuwiz-cli", "install.sh", "config.toml.example",
+            "assets/linux/io.github.kiehntre.emuwiz.desktop.in",
+            "assets/branding/emuwiz-logo-32.png",
+            "assets/branding/emuwiz-logo-64.png",
+            "assets/branding/emuwiz-logo-128.png",
+            "assets/branding/emuwiz-logo-256.png",
+            "assets/branding/emuwiz-logo-512.png",
+            "docs/README.txt", "docs/LICENSES.txt", "BUILD_INFO.txt", "VERIFY.txt",
+        ):
+            self.assertTrue((release / relative).is_file(), relative)
+        self.assertTrue((release / "install.sh").stat().st_mode & stat.S_IXUSR)
         manifest = json.loads((release / "manifest.json").read_text())
         self.assertEqual(manifest["gui"]["target"], "emuwiz")
         self.assertEqual(manifest["gui"]["entrypoint"], "crates/archivefs-gui/src/bin/emuwiz.rs")

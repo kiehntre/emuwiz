@@ -62,11 +62,11 @@ if [[ -n "$BINARY_DIR" ]]; then
 fi
 
 if [[ -n "$ARTIFACT" ]]; then
-    [[ "$(basename -- "$ARTIFACT")" == "$BUNDLE_NAME.tar.gz" ]] ||
+    [[ "$(basename -- "$ARTIFACT")" == "$BUNDLE_NAME.tar.xz" ]] ||
         release_die "artifact filename disagrees with workspace version"
 fi
 if [[ -n "$CHECKSUM" ]]; then
-    [[ "$(basename -- "$CHECKSUM")" == "$BUNDLE_NAME.tar.gz.sha256" ]] ||
+    [[ "$(basename -- "$CHECKSUM")" == "$BUNDLE_NAME.tar.xz.sha256" ]] ||
         release_die "checksum filename disagrees with workspace version"
 fi
 

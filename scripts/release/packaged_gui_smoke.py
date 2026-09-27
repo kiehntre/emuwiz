@@ -134,7 +134,7 @@ def prerequisite_status(xvfb: str | None, required: bool) -> str:
         return "available"
     if required:
         raise RuntimeError("Xvfb is unavailable")
-    return "SKIPPED (Xvfb unavailable)"
+    return "SKIPPED: Xvfb is unavailable or unusable"
 
 
 def display_backend_available() -> bool:
@@ -343,7 +343,7 @@ def run(archive: Path, output: Path, timeout: float, required: bool) -> int:
 def self_test() -> int:
     root = Path(tempfile.mkdtemp(prefix="emuwiz-gui-smoke-selftest-"))
     try:
-        assert prerequisite_status(None, False) == "SKIPPED (Xvfb unavailable)"
+        assert prerequisite_status(None, False) == "SKIPPED: Xvfb is unavailable or unusable"
         try:
             prerequisite_status(None, True)
         except RuntimeError:

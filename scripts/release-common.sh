@@ -46,8 +46,8 @@ print(versions.pop())
 
 release_target_name() {
     case "$(uname -m)" in
-        x86_64) printf '%s\n' 'x86_64-linux' ;;
-        aarch64 | arm64) printf '%s\n' 'aarch64-linux' ;;
+        x86_64) printf '%s\n' 'x86_64' ;;
+        aarch64 | arm64) printf '%s\n' 'aarch64' ;;
         *) release_die "unsupported release architecture: $(uname -m)" ;;
     esac
 }
@@ -55,7 +55,7 @@ release_target_name() {
 release_bundle_name() {
     local version=$1
     local target_name=$2
-    printf 'archivefs-v%s-%s\n' "$version" "$target_name"
+    printf 'emuwiz-%s-linux-%s\n' "$version" "$target_name"
 }
 
 release_require_clean_repository() {

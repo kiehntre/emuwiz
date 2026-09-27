@@ -65,8 +65,8 @@ for run in 1 2; do
         --target-dir "$TEMP_ROOT/target$run"
 done
 
-ARCHIVE_ONE="$OUTPUT_DIR/run1/$BUNDLE_NAME.tar.gz"
-ARCHIVE_TWO="$OUTPUT_DIR/run2/$BUNDLE_NAME.tar.gz"
+ARCHIVE_ONE="$OUTPUT_DIR/run1/$BUNDLE_NAME.tar.xz"
+ARCHIVE_TWO="$OUTPUT_DIR/run2/$BUNDLE_NAME.tar.xz"
 CHECKSUM_ONE="$ARCHIVE_ONE.sha256"
 CHECKSUM_TWO="$ARCHIVE_TWO.sha256"
 
@@ -76,7 +76,7 @@ import hashlib
 import sys
 import tarfile
 
-with tarfile.open(sys.argv[1], "r:gz") as archive:
+with tarfile.open(sys.argv[1], "r:*") as archive:
     for member in archive.getmembers():
         digest = "-"
         if member.isfile():

@@ -7,8 +7,7 @@
 # touches an existing config.
 #
 # Works from two locations (detected automatically):
-#   - an extracted release bundle (emuwiz-cli / emuwiz sitting
-#     next to this script)
+#   - an extracted release bundle (bin/emuwiz-cli and bin/emuwiz)
 #   - a workspace checkout after `cargo build --workspace --release`
 #     (target/release/emuwiz-cli / target/release/emuwiz)
 #
@@ -1027,11 +1026,14 @@ if [ "$do_uninstall" -eq 1 ]; then
     exit 0
 fi
 
-# Prefer an extracted release bundle (binaries next to this script); fall
+# Prefer an extracted release bundle (binaries in bin/); fall
 # back to a workspace checkout with release binaries already built. The new
 # EmuWiz names are preferred, with the legacy ArchiveFS names accepted so
 # older release bundles still install.
-if [ -f "$script_dir/emuwiz-cli" ] || [ -f "$script_dir/emuwiz" ]; then
+if [ -f "$script_dir/bin/emuwiz-cli" ] || [ -f "$script_dir/bin/emuwiz" ]; then
+    src_mode="release bundle (bin layout)"
+    src_dir="$script_dir/bin"
+elif [ -f "$script_dir/emuwiz-cli" ] || [ -f "$script_dir/emuwiz" ]; then
     src_mode="release bundle"
     src_dir="$script_dir"
 elif [ -f "$script_dir/archivefs-cli" ] || [ -f "$script_dir/archivefs-gui" ]; then

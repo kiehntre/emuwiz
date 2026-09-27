@@ -141,6 +141,20 @@ class Gate:
             (self.logs / f"{len(self.results)+1:02d}-{name}.timing").write_text(
                 f"{time.monotonic()-start:.3f}s\n")
 
+    @staticmethod
+    def usable_display_harness() -> bool:
+        if os.environ.get("DISPLAY"):
+            return True
+        wrapper = shutil.which("xvfb-run")
+        if wrapper:
+            probe = subprocess.run(
+                [wrapper, "-a", "-s", "-screen 0 1280x800x24 -nolisten tcp", "true"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if probe.returncode == 0:
+                return True
+        return False
+
     def stage(self, title: str, fn) -> None:
         number = len(self.results) + 1
         start = time.monotonic()
@@ -245,15 +259,19 @@ class Gate:
         return "isolated CLI smoke passed"
 
     def gui_smoke(self, package: tuple[Path, Path] | None) -> tuple[str, str] | str:
-        if not self.gui_smoke_requested and not self.require_gui_smoke:
-            return "SKIPPED", "SKIPPED (not requested)"
+        harness_available = self.usable_display_harness()
+        if not self.gui_smoke_requested and not self.require_gui_smoke and not harness_available:
+            return "SKIPPED", "SKIPPED: no supported display/Xvfb harness available"
+        # Release-candidate mode is strict whenever the host can provide the
+        # bounded first-frame harness, even if --gui-smoke was not supplied.
+        require = self.require_gui_smoke or harness_available
         if not package:
             raise RuntimeError("packaged release unavailable for GUI smoke")
         result = self.command("gui-packaged-smoke", [
             "python3", "scripts/release/packaged_gui_smoke.py",
             "--archive", str(package[1]), "--output", str(self.evidence / "gui-smoke"),
             "--timeout", str(min(max(self.timeout, 15), 30)),
-            *( ["--require"] if self.require_gui_smoke else [] ),
+            *( ["--require"] if require else [] ),
         ])
         (self.evidence / "gui-smoke" / "result.txt").write_text(result.stdout + result.stderr)
         if result.returncode:

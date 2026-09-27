@@ -1,298 +1,119 @@
-# EmuWiz release engineering
+# EmuWiz release engineering contract
 
-> **Current release:** EmuWiz `v0.9.0` is published. It is a Linux-only,
-> pre-1.0 alpha release. The published canonical bundle is
-> `archivefs-v0.9.0-x86_64-linux.tar.gz` with the adjacent
-> `.tar.gz.sha256` sidecar. Examples below using older versions are historical
-> procedure examples, not current release claims.
+This is the authoritative release contract for the transparent Linux
+artifact. Other packaging lanes (AppImage, DEB/RPM, and the deferred Flatpak
+lane) must not redefine this contract.
 
-This document is the maintained release procedure for EmuWiz. The scripts
-described here build and inspect artifacts; they do not create tags, push
-branches, or publish releases.
+## Canonical artifact
 
-The current product uses the EmuWiz names (`emuwiz-cli`, `emuwiz`) and the
-workspace version. Legacy `archivefs-*` names remain compatibility aliases in
-release/install artifacts; they are not the primary product names.
-
-## Release contract
-
-The canonical Linux bundle is:
+The canonical artifact is:
 
 ```text
-archivefs-v<VERSION>-<ARCH>-linux.tar.gz
-archivefs-v<VERSION>-<ARCH>-linux.tar.gz.sha256
+emuwiz-<version>-linux-<arch>.tar.xz
+emuwiz-<version>-linux-<arch>.tar.xz.sha256
 ```
 
-`VERSION` comes from Cargo workspace metadata. The supported architecture names
-are currently `x86_64-linux` and `aarch64-linux`. The archive contains exactly
-one same-named root directory with:
+The archive has exactly one top-level directory named like the artifact. It
+is reproducibly staged when `SOURCE_DATE_EPOCH` and `--reproducible` are used.
+The maintained packager is `scripts/release/package_release.py`, normally
+invoked by `scripts/release/package-release.sh` or `scripts/build-release.sh`.
+
+## Payload contract
+
+Every canonical archive contains, with manifest and checksum coverage:
 
 ```text
-emuwiz-cli                                                   0755
-emuwiz                                                       0755
-install.sh                                                   0755
-README.md                                                    0644
-CHANGELOG.md                                                 0644
-LICENSE                                                      0644
-config.toml.example                                         0644
-assets/linux/io.github.kiehntre.emuwiz.desktop.in            0644
-assets/branding/emuwiz-logo-{32,64,128,256,512}.png          0644
+bin/emuwiz                 native GUI-v2 executable
+bin/emuwiz-cli             CLI executable
+install.sh                 safe current-user installer
+config.toml.example        reference only; never overwrites real config
+assets/linux/*.desktop.in  canonical desktop template
+assets/branding/*.png      canonical application icons
+docs/README.txt            extracted-artifact instructions
+docs/LICENSES.txt
+docs/licenses/*
+BUILD_INFO.txt
+VERIFY.txt
+manifest.json
+SHA256SUMS
+SBOM/*                     optional, only when generated and declared
 ```
 
-Every tar member has numeric UID/GID `0:0`. Entries are name-sorted, timestamps
-come from `SOURCE_DATE_EPOCH` (the release commit timestamp by default), gzip
-stores no original filename or timestamp, and compiler paths are remapped to
-neutral `/build/...` prefixes.
+The packager rejects symlinks, special files, unsafe paths, forbidden user
+state, and unexpected executable payload files. It also records GUI-v2
+identity, architecture, source provenance, and artifact hashes.
 
-## Required local tools
+## User paths
 
-- Git
-- Bash
-- the Rust toolchain pinned by `rust-toolchain.toml`, including Cargo
-- GNU tar and gzip
-- Python 3 with the standard `tarfile` data-filter API
-- `install`, `sha256sum`, and `strings` (GNU/binutils implementations on Linux)
-- optional: `cargo-audit` for the dependency-security gate
-
-Run release tooling from a Linux checkout. The canonical scripts reject a dirty
-repository. Their default outputs live below ignored `target/`; an explicit
-output directory may be anywhere, but should be empty.
-
-## One-command release build
-
-From a clean checkout of the intended release commit:
+The archive is directly usable after extraction:
 
 ```sh
-scripts/build-release.sh --output-dir "$PWD/target/release-artifacts"
+./bin/emuwiz
+./bin/emuwiz-cli --version
 ```
 
-The builder:
+Direct run uses normal XDG config/data/cache/state locations, does not rewrite
+`HOME`, does not install files, does not require root, and does not require a
+network connection.
 
-1. verifies the worktree is clean;
-2. reads one consistent EmuWiz version from `cargo metadata`;
-3. runs `cargo build --workspace --release --locked` with neutral compiler-path
-   remapping;
-4. stages only the required files with fixed permissions;
-5. writes a deterministic, sorted, numeric-owner archive and a one-record
-   SHA-256 file;
-6. invokes the independent verifier;
-7. safely extracts into a temporary directory; and
-8. runs both extracted binaries with `--version`. The GUI takes its version-only
-   exit path, so no window or display connection is opened.
-
-Use `--target-dir DIR` when the Cargo build itself must be isolated, such as a
-reproducibility run. Existing artifacts are not overwritten; use an empty
-output directory for each run.
-
-## Verify an existing artifact
-
-Keep the archive and its `.sha256` file together, then run:
+The bundled installer is the supported install path:
 
 ```sh
-scripts/verify-release-artifact.sh \
-  target/release-artifacts/archivefs-v0.9.0-x86_64-linux.tar.gz
+./install.sh
 ```
 
-The verifier checks the checksum filename and record, exact root layout,
-required and unexpected files, file types, modes, numeric ownership, path
-traversal, extracted path containment, the exact approved desktop/icon assets,
-PNG structure and dimensions, credential-shaped strings, maintainer paths,
-common build paths, and both binary versions. It returns non-zero on any
-failure. The desktop template is also checked with `desktop-file-validate` when
-that optional command is available.
+It performs a per-user install under `~/.local/bin` and XDG application/icon
+directories, keeps an ownership manifest, refuses foreign files, preserves
+existing configuration, and supports safe upgrade/uninstall boundaries. A
+system-wide install is not part of this contract. The installer works from
+the extracted `bin/` layout and does not require Git metadata, a repository
+checkout, or build directories.
 
-Its negative regression suite uses generated fixtures and must also pass:
+## Runtime requirements
+
+Required to start the current canonical Linux artifact: the published Linux
+architecture (currently x86_64), a standard ELF runtime, X11 or Wayland, a
+functional host graphics/OpenGL/EGL stack, and writable user XDG locations
+when EmuWiz creates state.
+
+Optional feature-specific tools include ratarmount/FUSE, 7z, unrar,
+xdg-open/viewers, emulator executables, AppImages, Flatpak emulators,
+RomM/providers, and online DAT/metadata services. Missing optional archive
+tools do not prevent EmuWiz itself from starting.
+
+## Trust and verification
+
+Users verify the downloaded sidecar before extraction:
 
 ```sh
-scripts/test-release-artifact-verifier.sh \
-  target/release-artifacts/archivefs-v0.9.0-x86_64-linux.tar.gz
+sha256sum -c emuwiz-<version>-linux-<arch>.tar.xz.sha256
 ```
 
-This proves rejection of a bad checksum, unexpected member, traversal path,
-unsafe executable mode, embedded maintainer path, missing or substituted icon,
-malformed PNG, malformed desktop entry, and a duplicate tar member. It never
-extracts an unvalidated member.
+`SHA256SUMS` verifies every extracted payload file except itself; the
+manifest is represented in `SHA256SUMS` to avoid a self-hash cycle.
+`BUILD_INFO.txt` records source/build/GUI identity. An SBOM is included only
+when generated and declared. A detached signature is available only when the
+release was signed; signing is not claimed for every artifact.
 
-## Reproducibility
+## Release gate
 
-Run two independent release builds with separate Cargo target directories:
+Before publication:
 
-```sh
-scripts/compare-release-builds.sh \
-  --output-dir "$PWD/target/reproducibility"
-```
+1. build the workspace with the locked Cargo graph;
+2. package the canonical tar.xz and sidecar;
+3. run strict extracted-directory and archive verification;
+4. confirm `bin/emuwiz --version` and `bin/emuwiz-cli --version`;
+5. run isolated installer tests and offline CLI smoke;
+6. run packaged GUI first-frame smoke when a display/Xvfb harness exists;
+7. record `SKIPPED: <reason>` when GUI smoke cannot run;
+8. confirm no source-tree-only path or network dependency is required.
 
-The output directory must be empty. The comparison fails unless:
+Release-candidate checks are orchestrated by
+`scripts/release/run-rc-acceptance.py`. The release gate does not silently
+turn unavailable GUI smoke into a pass.
 
-- each archive independently passes the verifier;
-- archive bytes are identical;
-- checksum files are identical; and
-- member order, payload SHA-256, modes, numeric ownership, timestamps, types,
-  and sizes are identical.
+## Historical compatibility
 
-A green run is evidence only for the tested commit, toolchain, target, and host
-class. It is not a universal cross-platform reproducibility claim. If a future
-toolchain prevents byte-identical archives, do not weaken the check silently:
-record the exact differing metadata/compiler input, retain the payload-manifest
-comparison, and document whether only extracted payload reproducibility was
-demonstrated.
-
-## Version consistency
-
-The source-only check is:
-
-```sh
-scripts/check-version-consistency.sh
-```
-
-For a built artifact, also check both binaries and filenames:
-
-```sh
-scripts/check-version-consistency.sh \
-  --binary-dir target/release \
-  --artifact target/release-artifacts/archivefs-v0.9.0-x86_64-linux.tar.gz \
-  --checksum target/release-artifacts/archivefs-v0.9.0-x86_64-linux.tar.gz.sha256
-```
-
-The workspace packages, CLI output, GUI output, archive, checksum, README
-release reference, and current changelog heading must agree. Do not hard-code a
-different version in release scripts and do not bump the project version as a
-side effect of building.
-
-## Security checks
-
-Run the lightweight tracked-file scan and RustSec audit:
-
-```sh
-scripts/security-scan.sh
-cargo audit
-```
-
-If `cargo-audit` is not installed locally, install it intentionally with
-`cargo install cargo-audit --locked`, or rely on the required CI security job.
-The scanner targets credential shapes (private keys, GitHub/AWS tokens,
-credential assignments, and credential-bearing URLs) rather than flagging
-ordinary security vocabulary.
-
-CI installs the current locked `cargo-audit` release and fails on vulnerable
-resolved dependencies. There are no ignored advisories at the time this
-procedure was written. A future exception must identify the advisory, affected
-dependency/path, exposure analysis, expiry/review condition, and tracking issue
-in this document and beside the CI command. Never add a blanket ignore or
-upgrade dependencies solely to make the report disappear without validating
-the repair.
-
-The artifact verifier repeats a focused privacy/credential scan over the actual
-payload, including printable strings embedded in both binaries. This is
-separate from the tracked-source scan because compiler output can introduce
-paths that do not appear in source.
-
-## Continuous integration
-
-`.github/workflows/ci.yml` requires no repository secrets and has distinct jobs:
-
-- **Formatting** — `cargo fmt --all --check`
-- **Clippy** — `cargo clippy --workspace --all-targets -- -D warnings`
-- **Workspace tests** — `cargo test --workspace`
-- **Locked release build** — `cargo build --workspace --release --locked` plus
-  binary version consistency
-- **Dependency and secret audit** — tracked-file scan plus `cargo audit`
-- **Create canonical artifact** — canonical builder, verifier negative suite,
-  and version check
-- **Verify downloaded artifact** — verifies the uploaded/downloaded CI payload,
-  not just the files left in the producing job
-- **Reproducibility** — two isolated builds and byte/metadata comparison
-
-Rust caches are scoped through `Swatinem/rust-cache`; failed builds are not
-saved. Reproducibility deliberately uses independent target directories rather
-than a shared target cache. The candidate archive and checksum are uploaded as
-a CI artifact for 14 days. Pull-request CI never creates a tag or GitHub
-Release and needs only read access to repository contents.
-
-The tag-only `.github/workflows/release.yml` also calls the canonical builder.
-It validates that the tag is exactly `v` plus the Cargo workspace version
-before publication, preventing a tag/artifact version mismatch.
-
-## Manual validation remains required
-
-Automation does not replace desktop release QA. Before publishing:
-
-1. download the CI artifact into a clean directory and run the independent
-   verifier;
-2. launch the extracted GUI on a supported desktop and complete the approved
-   manual GUI checklist at normal desktop size and 1024×600;
-3. run `emuwiz-cli doctor` using disposable configuration;
-4. exercise installation and rollback only with disposable emulator profiles;
-5. confirm no live ROM, production emulator profile, catalogue cache, database,
-   or configuration is included or modified; and
-6. record the exact commit, artifact SHA-256, host architecture, and QA result.
-
-## Prerelease and stable procedure
-
-Prerelease tags include a SemVer suffix, for example `v0.7.0-alpha` or
-`v1.0.0-rc.1`. The release workflow marks these as GitHub prereleases. A stable
-release uses `vMAJOR.MINOR.PATCH` with no suffix. In both cases:
-
-1. update the workspace version and release documentation in a dedicated,
-   reviewed version-bump change (not in the artifact build);
-2. complete all automated and manual gates on the exact commit;
-3. confirm the worktree is clean and the branch is pushed;
-4. create one annotated tag on that exact commit; and
-5. push only that tag, which starts the tag-only release workflow.
-
-Historical example: for v0.7.0, after every gate and explicit release
-authorization, the commands would have been:
-
-```sh
-git fetch origin
-git status --short
-git rev-parse HEAD
-git tag -a v0.7.0 <VERIFIED_COMMIT_SHA> -m "EmuWiz v0.7.0"
-git push origin v0.7.0
-```
-
-These commands are documentation, not authorization to run them. Never move or
-overwrite a published tag. Confirm the GitHub Release contains only the
-canonical archive and matching `.sha256` file, then download and verify those
-published bytes again.
-
-## Rollback and database downgrade warning
-
-Before upgrading an alpha installation, stop EmuWiz and copy the database
-and managed-state directory. Keep the previous verified application artifact
-and checksum.
-
-Application rollback means stopping EmuWiz and restoring the previous
-binary bundle. **In-place database downgrade is not supported.** The current
-migration chain extends through migration `0010` (schema version 10). Older
-binaries may reject a database created by the current workspace. To run an
-older binary, restore the pre-upgrade database copy to a separate compatible
-path. Keep the newer database and managed state untouched for later recovery.
-Never edit SQLite schema/version fields manually, and do not assume an older
-binary can interpret new journals, profile records, or catalogue state.
-
-If a published artifact itself must be withdrawn, preserve the tag, checksums,
-and incident evidence; mark the release clearly rather than replacing bytes
-under the same filename. Fix forward with a new version and tag.
-
-## Troubleshooting
-
-- **“repository must be clean”** — inspect `git status --short`; release only
-  committed source. Outputs below `target/` are ignored.
-- **output already exists** — choose a new empty output directory. The builder
-  does not overwrite evidence from an earlier run.
-- **checksum mismatch** — discard the archive and reacquire/rebuild it; never
-  regenerate a checksum for bytes whose origin is uncertain.
-- **unexpected member, unsafe path, mode, or owner** — treat this as a packaging
-  failure. Do not extract manually to bypass the verifier.
-- **version mismatch** — align Cargo workspace version, current changelog,
-  documentation, tag, and artifact by reviewing the intended release commit.
-- **local path found in a binary** — ensure the canonical builder supplied all
-  remap flags and that no wrapper replaced `RUSTFLAGS`; rebuild from a clean
-  target directory.
-- **reproducibility mismatch** — retain both output directories and compare the
-  emitted manifests. Identify compiler bytes versus tar metadata before making
-  any claim or changing normalization.
-- **cargo-audit finding** — inspect the advisory and dependency path with
-  `cargo tree`; repair only with a reviewed compatible dependency change or a
-  narrowly documented, time-bounded exception.
+EmuWiz retains runtime compatibility with legacy ArchiveFS directories and
+names where required for migration. The old `archivefs-*.tar.gz` naming is
+historical only and must not appear in current quick-install instructions.
