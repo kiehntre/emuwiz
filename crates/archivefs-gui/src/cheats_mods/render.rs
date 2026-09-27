@@ -7256,6 +7256,12 @@ pub(crate) fn local_cheat_install_context(
     let destination =
         selected_retroarch_cheat_root(workflow, profiles).map(|root| CheatDestinationRequest {
             profile_cheat_root: root,
+            retroarch_core: workflow
+                .routing
+                .decision
+                .applicable_target()
+                .and_then(|target| target.retroarch_core().map(str::to_owned)),
+            retroarch_core_required: true,
             platform: workflow.platform.clone(),
             content_basename: cheat_content_basename(workflow),
             playlist_name: None,

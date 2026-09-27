@@ -467,6 +467,13 @@ pub struct CheatDestinationRequest {
     /// The selected profile's own resolved cheat directory. Never a default
     /// this module invents.
     pub profile_cheat_root: PathBuf,
+    /// Exact RetroArch core directory identifier. When supplied, the
+    /// destination is `<cheat root>/<core>/<content>.cht`; absence retains
+    /// the legacy platform-directory behavior for non-RetroArch callers.
+    pub retroarch_core: Option<String>,
+    /// Require an exact core for RetroArch automatic placement; when true,
+    /// an absent core fails closed instead of using the legacy layout.
+    pub retroarch_core_required: bool,
     /// The archive's platform, in any recognized spelling.
     pub platform: Option<String>,
     /// The content file's basename without extension.
@@ -516,7 +523,124 @@ pub struct ResolvedCheatDestination {
     pub replaces_existing: bool,
 }
 
-/// Resolves `<profile cheat root>/<canonical platform>/<name>.cht`.
+/// A read-only description of moving an older EmuWiz platform-folder cheat
+/// into RetroArch's core/content folder. This deliberately has no apply
+/// method: an old install is never silently migrated by a normal install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetroArchCheatMigrationStatus {
+    ReadyForExplicitReview,
+    SourceMissing,
+    SourceChangedSincePreview,
+    DestinationConflict,
+    DestinationAlreadyMatches,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetroArchCheatMigrationPreview {
+    pub old_path: PathBuf,
+    pub new_path: PathBuf,
+    pub source_sha256: Option<String>,
+    pub destination_sha256: Option<String>,
+    pub status: RetroArchCheatMigrationStatus,
+    pub detail: String,
+}
+
+/// Previews an explicit migration from the old platform-folder layout to the
+/// verified RetroArch core/content layout. It reads and hashes files only.
+pub fn preview_retroarch_cheat_migration(
+    cheat_root: &Path,
+    old_platform: &str,
+    core: &str,
+    content_basename: &str,
+    expected_source_sha256: Option<&str>,
+) -> Result<RetroArchCheatMigrationPreview, CheatInstallPlanError> {
+    let old_platform = safe_file_stem(old_platform).ok_or_else(|| {
+        error(
+            CheatInstallPlanErrorKind::DestinationPlatformUnresolved,
+            None,
+            "legacy RetroArch platform directory is unsafe",
+        )
+    })?;
+    let core = safe_file_stem(core).ok_or_else(|| {
+        error(
+            CheatInstallPlanErrorKind::DestinationPlatformUnresolved,
+            None,
+            "RetroArch core identifier is not a safe single directory name",
+        )
+    })?;
+    let content = safe_file_stem(content_basename).ok_or_else(|| {
+        error(
+            CheatInstallPlanErrorKind::DestinationNameUnresolved,
+            None,
+            "RetroArch content identifier is not a safe filename",
+        )
+    })?;
+    let old = assess_destination(
+        cheat_root,
+        std::ffi::OsStr::new(&old_platform),
+        std::ffi::OsStr::new(&format!("{content}.cht")),
+    )
+    .map_err(|failure| destination_error(&failure))?;
+    let new = assess_destination(
+        cheat_root,
+        std::ffi::OsStr::new(&core),
+        std::ffi::OsStr::new(&format!("{content}.cht")),
+    )
+    .map_err(|failure| destination_error(&failure))?;
+    let old_path = old.proposed_destination.path().to_path_buf();
+    let new_path = new.proposed_destination.path().to_path_buf();
+    let source_bytes = match fs::read(&old_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(RetroArchCheatMigrationPreview {
+                old_path,
+                new_path,
+                source_sha256: None,
+                destination_sha256: None,
+                status: RetroArchCheatMigrationStatus::SourceMissing,
+                detail: "no regular legacy platform-folder cheat file was found".to_string(),
+            });
+        }
+    };
+    let source_sha256 = hex_sha256(&source_bytes);
+    if expected_source_sha256.is_some_and(|expected| expected != source_sha256) {
+        return Ok(RetroArchCheatMigrationPreview {
+            old_path,
+            new_path,
+            source_sha256: Some(source_sha256),
+            destination_sha256: None,
+            status: RetroArchCheatMigrationStatus::SourceChangedSincePreview,
+            detail: "the legacy cheat file no longer matches the reviewed bytes".to_string(),
+        });
+    }
+    let destination_sha256 = fs::read(&new_path).ok().map(|bytes| hex_sha256(&bytes));
+    let (status, detail) = match destination_sha256.as_deref() {
+        Some(hash) if hash == source_sha256 => (
+            RetroArchCheatMigrationStatus::DestinationAlreadyMatches,
+            "the core/content destination already contains the same bytes".to_string(),
+        ),
+        Some(_) => (
+            RetroArchCheatMigrationStatus::DestinationConflict,
+            "the core/content destination contains different bytes".to_string(),
+        ),
+        None => (
+            RetroArchCheatMigrationStatus::ReadyForExplicitReview,
+            "the legacy file can be reviewed for an explicit migration".to_string(),
+        ),
+    };
+    Ok(RetroArchCheatMigrationPreview {
+        old_path,
+        new_path,
+        source_sha256: Some(source_sha256),
+        destination_sha256,
+        status,
+        detail,
+    })
+}
+
+/// Resolves `<profile cheat root>/<core>/<name>.cht` for a bound RetroArch
+/// core, or the legacy platform layout for callers that are not core-bound.
 ///
 /// This is the libretro layout RetroArch's own cheat-file browser opens
 /// into, so an installed file is reachable through Quick Menu -> Cheats ->
@@ -543,6 +667,47 @@ pub fn resolve_cheat_destination(
             Some(&request.profile_cheat_root),
             "the selected RetroArch profile declares no absolute cheat directory",
         ));
+    }
+
+    if request.retroarch_core_required && request.retroarch_core.is_none() {
+        return Err(error(
+            CheatInstallPlanErrorKind::DestinationPlatformUnresolved,
+            None,
+            "RetroArch automatic placement requires an exact selected core",
+        ));
+    }
+
+    if let Some(core) = &request.retroarch_core {
+        let core = safe_file_stem(core).ok_or_else(|| {
+            error(
+                CheatInstallPlanErrorKind::DestinationPlatformUnresolved,
+                None,
+                "RetroArch core identifier is not a safe single directory name",
+            )
+        })?;
+        let (stem, name_source) = strongest_name(request).ok_or_else(|| {
+            error(
+                CheatInstallPlanErrorKind::DestinationNameUnresolved,
+                None,
+                "no safe filename could be derived from the content, playlist, or catalogue name",
+            )
+        })?;
+        let file_name = format!("{stem}.cht");
+        let assessment = assess_destination(
+            &request.profile_cheat_root,
+            std::ffi::OsStr::new(&core),
+            std::ffi::OsStr::new(&file_name),
+        )
+        .map_err(|failure| destination_error(&failure))?;
+        return Ok(ResolvedCheatDestination {
+            path: assessment.proposed_destination.path().to_path_buf(),
+            platform_directory: core.to_string(),
+            platform_directory_source: CheatPlatformDirectorySource::CanonicalPlatformName,
+            file_name,
+            name_source,
+            replaces_existing: assessment.destination_state == DestinationState::RegularFile,
+            state: assessment.destination_state,
+        });
     }
 
     let platform_hint = request.platform.as_deref().ok_or_else(|| {

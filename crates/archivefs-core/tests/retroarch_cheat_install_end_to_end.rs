@@ -169,6 +169,8 @@ impl Workflow {
 
         let destination = resolve_cheat_destination(&CheatDestinationRequest {
             profile_cheat_root: self.cheat_root.clone(),
+            retroarch_core: None,
+            retroarch_core_required: false,
             platform: Some(PLATFORM.to_string()),
             content_basename: Some("Chrono Quest (USA)".to_string()),
             playlist_name: None,
@@ -338,6 +340,8 @@ fn an_explicitly_chosen_ambiguous_candidate_still_installs() {
 
     let destination = resolve_cheat_destination(&CheatDestinationRequest {
         profile_cheat_root: cheat_root.clone(),
+        retroarch_core: None,
+        retroarch_core_required: false,
         platform: Some(PLATFORM.to_string()),
         content_basename: Some("Chrono Quest".to_string()),
         playlist_name: None,

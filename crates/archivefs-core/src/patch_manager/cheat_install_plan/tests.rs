@@ -92,6 +92,8 @@ fn candidate(classification: CheatCandidateClassification) -> CheatCandidate {
 fn destination_request(root: &Path) -> CheatDestinationRequest {
     CheatDestinationRequest {
         profile_cheat_root: root.to_path_buf(),
+        retroarch_core: None,
+        retroarch_core_required: false,
         platform: Some("Nintendo - Nintendo Entertainment System".to_string()),
         content_basename: Some("Chrono Quest (USA)".to_string()),
         playlist_name: None,
@@ -310,6 +312,66 @@ fn the_destination_uses_the_profile_root_platform_directory_and_content_name() {
         CheatDestinationNameSource::ContentBasename
     );
     assert!(!resolved.replaces_existing);
+}
+
+#[test]
+fn a_bound_retroarch_core_uses_the_core_content_autoload_path() {
+    let fixture = Fixture::new("core-dest");
+    let root = fixture.dir("cheats");
+    let mut request = destination_request(&root);
+    request.retroarch_core = Some("Beetle PSX HW".to_string());
+    let resolved = resolve_cheat_destination(&request).expect("resolves");
+    assert_eq!(resolved.platform_directory, "Beetle PSX HW");
+    assert_eq!(
+        resolved.path,
+        root.join("Beetle PSX HW").join("Chrono Quest (USA).cht")
+    );
+}
+
+#[test]
+fn an_unsafe_retroarch_core_is_refused_without_sanitizing() {
+    let fixture = Fixture::new("unsafe-core");
+    let root = fixture.dir("cheats");
+    let mut request = destination_request(&root);
+    request.retroarch_core = Some("../escape".to_string());
+    let error = resolve_cheat_destination(&request).expect_err("blocked");
+    assert_eq!(
+        error.kind,
+        CheatInstallPlanErrorKind::DestinationPlatformUnresolved
+    );
+}
+
+#[test]
+fn retroarch_automatic_placement_refuses_without_an_exact_core() {
+    let fixture = Fixture::new("missing-core");
+    let root = fixture.dir("cheats");
+    let mut request = destination_request(&root);
+    request.retroarch_core_required = true;
+    let error = resolve_cheat_destination(&request).expect_err("blocked");
+    assert_eq!(
+        error.kind,
+        CheatInstallPlanErrorKind::DestinationPlatformUnresolved
+    );
+}
+
+#[test]
+fn legacy_retroarch_install_is_only_a_hashed_migration_preview() {
+    let fixture = Fixture::new("migration");
+    let root = fixture.dir("cheats");
+    fixture.write("cheats/NES/Chrono Quest.cht", "cheats = 0\n");
+    let preview =
+        preview_retroarch_cheat_migration(&root, "NES", "Beetle PSX HW", "Chrono Quest", None)
+            .expect("preview resolves");
+    assert_eq!(
+        preview.status,
+        RetroArchCheatMigrationStatus::ReadyForExplicitReview
+    );
+    assert_eq!(
+        preview.new_path,
+        root.join("Beetle PSX HW").join("Chrono Quest.cht")
+    );
+    assert!(preview.source_sha256.is_some());
+    assert!(!preview.new_path.exists(), "preview must not migrate");
 }
 
 #[test]

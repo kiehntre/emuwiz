@@ -1759,6 +1759,12 @@ impl ArchiveFsApp {
 
         let destination_request = CheatDestinationRequest {
             profile_cheat_root: destination_root.clone(),
+            retroarch_core: workflow
+                .routing
+                .decision
+                .applicable_target()
+                .and_then(|target| target.retroarch_core().map(str::to_owned)),
+            retroarch_core_required: true,
             platform: workflow.platform.clone(),
             content_basename: cheat_content_basename(workflow),
             playlist_name: None,

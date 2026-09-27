@@ -75,6 +75,8 @@ impl Fixture {
         fs::create_dir_all(root.join(PLATFORM)).unwrap();
         CheatDestinationRequest {
             profile_cheat_root: root,
+            retroarch_core: None,
+            retroarch_core_required: false,
             platform: Some(PLATFORM.into()),
             content_basename: Some("Chrono Quest (USA)".into()),
             playlist_name: None,

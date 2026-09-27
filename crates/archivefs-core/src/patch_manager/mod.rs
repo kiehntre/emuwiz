@@ -288,8 +288,9 @@ pub use cheat_install_plan::{
     CheatInstallPlanErrorKind, CheatInstallPreview, CheatInstallPreviewRequest,
     CheatPlatformDirectorySource, CheatSelection, CheatSelectionEntry, GENERATED_FILE_PROVENANCE,
     LoadedCandidate, MAX_CANDIDATE_FILE_BYTES, MAX_GENERATED_FILE_BYTES,
-    MAX_PLATFORM_DIRECTORY_CANDIDATES, ResolvedCheatDestination, StagedCheatFile,
-    build_cheat_install_preview, load_candidate_document, match_strength_for_candidate,
+    MAX_PLATFORM_DIRECTORY_CANDIDATES, ResolvedCheatDestination, RetroArchCheatMigrationPreview,
+    RetroArchCheatMigrationStatus, StagedCheatFile, build_cheat_install_preview,
+    load_candidate_document, match_strength_for_candidate, preview_retroarch_cheat_migration,
     resolve_cheat_destination, stage_generated_cheat_file,
 };
 pub use cheat_install_result::{
