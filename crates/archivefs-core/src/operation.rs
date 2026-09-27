@@ -980,6 +980,7 @@ fn shared_apply_operation(
         PreviewAdapter::LocalModPackage
         | PreviewAdapter::CemuGraphicPack
         | PreviewAdapter::Rpcs3OrdinaryMod => OperationKind::ModApply,
+        PreviewAdapter::Mame => OperationKind::CheatApply,
         PreviewAdapter::RetroArch
         | PreviewAdapter::Pcsx2
         | PreviewAdapter::DuckStation

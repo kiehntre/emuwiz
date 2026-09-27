@@ -159,7 +159,8 @@ pub fn adapter_write_support(adapter: PreviewAdapter) -> SharedAdapterWriteSuppo
         | PreviewAdapter::Xenia
         | PreviewAdapter::LocalModPackage
         | PreviewAdapter::CemuGraphicPack
-        | PreviewAdapter::Rpcs3OrdinaryMod => SharedAdapterWriteSupport::ApplyAndRollback,
+        | PreviewAdapter::Rpcs3OrdinaryMod
+        | PreviewAdapter::Mame => SharedAdapterWriteSupport::ApplyAndRollback,
     }
 }
 

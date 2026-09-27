@@ -43,6 +43,8 @@ pub enum PreviewAdapter {
     /// A structurally inspected ordinary RPCS3 file-layer mod. Its relative
     /// paths retain the package's nested PS3 filesystem layout.
     Rpcs3OrdinaryMod,
+    /// A local native MAME cheat XML definition.
+    Mame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -61,6 +63,7 @@ pub enum PreviewIdentityKind {
     XeniaTitleId,
     CemuTitleId,
     Rpcs3TitleId,
+    MameMachineShortname,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -763,9 +766,8 @@ fn apply_eligibility_blockers(
         | PreviewAdapter::Ppsspp
         | PreviewAdapter::LocalModPackage
         | PreviewAdapter::CemuGraphicPack
-        | PreviewAdapter::Rpcs3OrdinaryMod => {
-            source.match_strength == PreviewMatchStrength::VerifiedExact
-        }
+        | PreviewAdapter::Rpcs3OrdinaryMod
+        | PreviewAdapter::Mame => source.match_strength == PreviewMatchStrength::VerifiedExact,
     };
     if !strength_eligible {
         let blocker = match source.match_strength {
@@ -1296,6 +1298,7 @@ fn platform_matches(adapter: PreviewAdapter, platform: Option<&str>) -> bool {
         PreviewAdapter::RetroArch | PreviewAdapter::LocalModPackage => !normalized.is_empty(),
         PreviewAdapter::CemuGraphicPack => matches!(normalized.as_str(), "wiiu" | "wii u"),
         PreviewAdapter::Rpcs3OrdinaryMod => normalized == "ps3" || normalized == "playstation 3",
+        PreviewAdapter::Mame => normalized == "mame" || normalized == "arcade",
     }
 }
 

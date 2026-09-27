@@ -126,7 +126,8 @@ impl ManagedFormat {
             PreviewAdapter::RetroArch => Self::RetroArchCheat,
             PreviewAdapter::LocalModPackage
             | PreviewAdapter::CemuGraphicPack
-            | PreviewAdapter::Rpcs3OrdinaryMod => Self::LocalModPackage,
+            | PreviewAdapter::Rpcs3OrdinaryMod
+            | PreviewAdapter::Mame => Self::LocalModPackage,
         }
     }
 }

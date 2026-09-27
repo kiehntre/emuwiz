@@ -1537,6 +1537,7 @@ pub(super) fn shared_history_adapter_label(adapter: PreviewAdapter) -> &'static 
         PreviewAdapter::LocalModPackage => "Local mod package",
         PreviewAdapter::CemuGraphicPack => "Cemu graphic pack",
         PreviewAdapter::Rpcs3OrdinaryMod => "RPCS3 ordinary mod",
+        PreviewAdapter::Mame => "MAME cheat",
     }
 }
 

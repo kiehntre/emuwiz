@@ -1005,6 +1005,7 @@ pub(crate) fn show_shared_transaction_readiness(
                 PreviewAdapter::Dolphin => "This Dolphin GameSettings file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected codes are staged in this exact preview.",
                 PreviewAdapter::DuckStation => "This DuckStation CHT file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected codes are staged for the verified serial.",
                 PreviewAdapter::Xenia => "This Xenia patch.toml file has a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected patches are staged in this exact preview.",
+                PreviewAdapter::Mame => "This native MAME XML file has a reviewed shared apply and rollback contract. MAME expressions remain native and may still require runtime enabling.",
                 _ => "RetroArch trusted catalogue files have a reviewed shared apply and rollback contract. Confirmation is unavailable until the selected per-game catalogue source is materialized in this exact preview.",
             });
             ui.label(format!(

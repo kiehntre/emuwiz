@@ -635,7 +635,8 @@ fn kind_for_adapter(adapter: PreviewAdapter) -> Option<ModKind> {
         PreviewAdapter::RetroArch
         | PreviewAdapter::DuckStation
         | PreviewAdapter::Dolphin
-        | PreviewAdapter::Xenia => None,
+        | PreviewAdapter::Xenia
+        | PreviewAdapter::Mame => None,
     }
 }
 
