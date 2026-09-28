@@ -105,6 +105,7 @@ fn configured_roots_from_environment() -> Vec<PersistentStateRoot> {
 }
 
 pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
+    let selected_game = game_id.and_then(|id| app.library.game(id)).cloned();
     let loading = app.saves_states.loading;
     let has_inventory = app.saves_states.inventory.is_some();
     let counts = app.saves_states.inventory.as_ref().map(|inventory| {
@@ -112,37 +113,49 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             inventory
                 .records
                 .iter()
+                .filter(|record| {
+                    selected_game
+                        .as_ref()
+                        .is_none_or(|game| record_belongs_to_game(record, game))
+                })
                 .filter(|record| record.state_type == PersistentStateType::NativeSave)
                 .count(),
             inventory
                 .records
                 .iter()
+                .filter(|record| {
+                    selected_game
+                        .as_ref()
+                        .is_none_or(|game| record_belongs_to_game(record, game))
+                })
                 .filter(|record| record.state_type == PersistentStateType::MemoryCard)
                 .count(),
             inventory
                 .records
                 .iter()
+                .filter(|record| {
+                    selected_game
+                        .as_ref()
+                        .is_none_or(|game| record_belongs_to_game(record, game))
+                })
                 .filter(|record| record.state_type == PersistentStateType::SaveState)
                 .count(),
         ]
     });
     let mut refresh = false;
-    let selected_game = game_id.and_then(|id| app.library.game(id)).cloned();
-    if let Some(game) = selected_game.as_ref() {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.strong("Saves for the selected game");
-            ui.label(format!("{} · {}", game.title, game.platform));
-            ui.label("Only saves with explicit identity evidence for this game are shown here.");
-            if ui.button("Back to Game Details").clicked() {
-                app.go(Route::Game(game.archive.id));
-            }
-        });
-    }
     page_hero(
         ui,
         checkpoint_motif,
-        "Saves & States",
-        "Your progress, preserved safely.",
+        if selected_game.is_some() {
+            "Saves & States for this game"
+        } else {
+            "Saves & States"
+        },
+        if selected_game.is_some() {
+            "Review explicitly associated progress and restore evidence."
+        } else {
+            "Your progress, preserved safely."
+        },
         Some((
             if loading {
                 "Inspecting save locations"
@@ -213,6 +226,18 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         ui.colored_label(egui::Color32::YELLOW, error);
     }
 
+    if let Some(game) = &selected_game {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Selected game");
+            ui.label(format!("{} · {}", game.title, game.platform));
+            ui.label("Only save evidence with an explicit identity match is shown here. Filename-only matches stay in the review view.");
+            if ui.button("Back to Game Details").clicked() {
+                app.go(Route::Game(game.archive.id));
+            }
+        });
+        ui.add_space(theme::SPACE_SM);
+    }
+
     let Some(inventory) = app.saves_states.inventory.as_ref() else {
         if !app.saves_states.loading
             && empty_state(
@@ -228,7 +253,16 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         }
         return;
     };
-    summary(ui, inventory);
+    let records: Vec<_> = inventory
+        .records
+        .iter()
+        .filter(|record| {
+            selected_game
+                .as_ref()
+                .is_none_or(|game| record_belongs_to_game(record, game))
+        })
+        .collect();
+    summary(ui, &records);
     ui.separator();
     ui.horizontal_wrapped(|ui| {
         for (filter, label) in [
@@ -253,9 +287,8 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     });
 
     let search = app.saves_states.search.to_ascii_lowercase();
-    let records: Vec<_> = inventory
-        .records
-        .iter()
+    let records: Vec<_> = records
+        .into_iter()
         .filter(|record| {
             selected_game
                 .as_ref()
@@ -265,32 +298,40 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         })
         .collect();
     if records.is_empty() {
-        let detail = if inventory.roots_inspected == 0 {
-            "Set up an emulator before EmuWiz can find its saves."
-        } else if !inventory.warnings.is_empty() {
-            "Your configured save location is unavailable or needs review."
+        let (title, detail) = if selected_game.is_some() {
+            (
+                "No saves found for this game",
+                "No save or state record has explicit identity evidence for the selected game. Review unassigned records from the full inventory if needed.",
+            )
+        } else if inventory.roots_inspected == 0 {
+            (
+                "No saves found yet",
+                "Set up an emulator before EmuWiz can find its saves.",
+            )
+        } else if inventory.warnings.is_empty() {
+            (
+                "No saves found yet",
+                "EmuWiz looks for game saves, memory cards and savestates in the configured emulator locations. None were found yet; inspection never changes them.",
+            )
         } else {
-            "EmuWiz looks for game saves, memory cards and savestates in the configured emulator locations. None were found yet; inspection never changes them."
+            (
+                "No saves found yet",
+                "Your configured save location is unavailable or needs review.",
+            )
         };
         empty_state(
             ui,
             &mut app.imagery,
             EmptyArt::Glyph("cartridge"),
-            "No saves found yet",
+            title,
             detail,
             None,
         );
     }
     egui::ScrollArea::vertical()
-        .id_salt("v2_saves_states_records")
+        .id_salt(("v2_saves_states_records", game_id))
         .show(ui, |ui| {
             for record in records {
-                // Every card must get its own id scope: `egui::Frame::show`
-                // gives its content `Ui` the same default id ("child")
-                // relative to this shared parent, so identical "Advanced
-                // details" headers across records would otherwise resolve
-                // to the *same* persistent open/closed state and appear to
-                // flash open/closed as the list repaints.
                 ui.push_id(&record.path, |ui| {
                     record_card(ui, record, &mut app.imagery);
                 });
@@ -301,53 +342,32 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     }
 }
 
-fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
-    let Some(report) = game.archive.identity_report.as_ref() else {
-        return false;
-    };
-    report.evidence.iter().any(|game_evidence| {
-        game_evidence.status == archivefs_core::game_identity::IdentityStatus::Verified
-            && game_evidence.value.is_some()
-            && record.game_identity.iter().any(|record_evidence| {
-                record_evidence.kind == game_evidence.kind
-                    && record_evidence.status
-                        == archivefs_core::game_identity::IdentityStatus::Verified
-                    && record_evidence.value == game_evidence.value
-            })
-    })
-}
-
-fn summary(ui: &mut egui::Ui, inventory: &PersistentStateInventory) {
+fn summary(ui: &mut egui::Ui, records: &[&PersistentStateRecord]) {
     let count = |kind| {
-        inventory
-            .records
+        records
             .iter()
-            .filter(|r| r.state_type == kind)
+            .filter(|record| record.state_type == kind)
             .count()
     };
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             for (label, value, detail) in [
                 (
-                    "Game saves",
+                    "Save data",
                     count(PersistentStateType::NativeSave),
-                    "portable progress",
+                    "normal progress / Savedata",
+                ),
+                (
+                    "Save states",
+                    count(PersistentStateType::SaveState),
+                    "emulator snapshots",
                 ),
                 (
                     "Memory cards",
                     count(PersistentStateType::MemoryCard),
-                    "shared save storage",
+                    "container storage",
                 ),
-                (
-                    "Savestates",
-                    count(PersistentStateType::SaveState),
-                    "emulator checkpoints",
-                ),
-                (
-                    "System storage",
-                    count(PersistentStateType::NandOrVirtualDisk),
-                    "accounts and installed data",
-                ),
+                ("Backups", 0, "no backup records in this inventory"),
             ] {
                 ui.vertical(|ui| {
                     ui.strong(format!("{value} {label}"));
@@ -356,6 +376,37 @@ fn summary(ui: &mut egui::Ui, inventory: &PersistentStateInventory) {
             }
         });
     });
+}
+
+fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
+    let Some(report) = game.archive.identity_report.as_ref() else {
+        return false;
+    };
+    report.evidence.iter().any(|game_identity| {
+        game_identity.status == archivefs_core::game_identity::IdentityStatus::Verified
+            && game_identity.value.is_some()
+            && record.game_identity.iter().any(|record_identity| {
+                record_identity.status == archivefs_core::game_identity::IdentityStatus::Verified
+                    && record_identity.kind == game_identity.kind
+                    && record_identity.value == game_identity.value
+            })
+    })
+}
+
+fn compatibility_label(record: &PersistentStateRecord) -> (&'static str, StatusTone) {
+    if !record.warnings.is_empty() || record.portability_class == PortabilityClass::DoNotTouch {
+        ("Restore unavailable", StatusTone::Warning)
+    } else {
+        match record.portability_class {
+            PortabilityClass::SafeToCopy => ("Ready to preview", StatusTone::Success),
+            PortabilityClass::CopyWithMetadata => ("Backup required", StatusTone::Warning),
+            PortabilityClass::VersionBound | PortabilityClass::EmulatorBound => {
+                ("Compatibility needs review", StatusTone::Warning)
+            }
+            PortabilityClass::NeedsReview => ("Compatibility unknown", StatusTone::Warning),
+            PortabilityClass::DoNotTouch => ("Restore unavailable", StatusTone::Warning),
+        }
+    }
 }
 
 fn filter_matches(record: &PersistentStateRecord, filter: Filter) -> bool {
@@ -401,15 +452,7 @@ fn record_card(
     record: &PersistentStateRecord,
     imagery: &mut super::imagery::Imagery,
 ) {
-    let tone = if !record.warnings.is_empty()
-        || matches!(
-            record.portability_class,
-            PortabilityClass::NeedsReview | PortabilityClass::DoNotTouch
-        ) {
-        StatusTone::Warning
-    } else {
-        StatusTone::Success
-    };
+    let (restore_state, tone) = compatibility_label(record);
     egui::Frame::new()
         .fill(theme::CARD_SURFACE)
         .stroke(theme::border(ui))
@@ -424,7 +467,7 @@ fn record_card(
                 ui.strong(state_type_label(record.state_type));
                 ui.label(record.emulator.as_str());
             });
-            status_badge(ui, portability_label(record.portability_class), tone);
+            status_badge(ui, restore_state, tone);
         });
         ui.label(match record.state_type {
             PersistentStateType::NativeSave => "Usually contains your game progress.",
@@ -449,6 +492,32 @@ fn record_card(
         } else if matches!(record.state_type, PersistentStateType::NativeSave | PersistentStateType::SaveState) {
             ui.label(egui::RichText::new("Needs review · game ownership is not confirmed.").color(theme::WARNING));
         }
+        ui.label(match record.state_type {
+            PersistentStateType::SaveState => format!(
+                "Compatibility: {} · emulator {}{}",
+                restore_state,
+                record.emulator.as_str(),
+                record
+                    .emulator_version
+                    .as_deref()
+                    .map(|version| format!(" version {version}"))
+                    .unwrap_or_default()
+            ),
+            PersistentStateType::MemoryCard => "Container: restore the card through its supported workflow; it is not a single save file.".to_string(),
+            PersistentStateType::NativeSave if record.provenance.contains("PS2 card save directory") => "Card save set: this is a directory/set and must be handled as one unit.".to_string(),
+            _ => format!("Restore status: {restore_state}"),
+        });
+        if matches!(record.portability_class, PortabilityClass::SafeToCopy | PortabilityClass::CopyWithMetadata) {
+            ui.label("Preview restore in the established Save Vault before applying any change.");
+        } else if matches!(record.portability_class, PortabilityClass::VersionBound | PortabilityClass::EmulatorBound) {
+            ui.label("Check the emulator, version and profile before considering restore.");
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled(false, egui::Button::new("Preview Restore"))
+                .on_hover_text("Restore preview is not wired into this read-only inventory projection yet.");
+            ui.add_enabled(false, egui::Button::new("Restore"))
+                .on_hover_text("Restore is not available from this read-only inventory projection; no safety bypass is offered.");
+        });
         ui.collapsing("Advanced details", |ui| {
             ui.label(format!("Path: {}", record.path.display()));
             ui.label(format!("State type: {:?}", record.state_type));
@@ -631,6 +700,31 @@ mod tests {
         assert_eq!(
             portability_label(PortabilityClass::EmulatorBound),
             "Tied to this emulator"
+        );
+    }
+
+    #[test]
+    fn restore_readiness_does_not_call_unknown_or_bound_state_ready() {
+        let mut record = record_at("/fixture/states/checkpoint.state");
+        record.state_type = PersistentStateType::SaveState;
+        record.portability_class = PortabilityClass::VersionBound;
+        assert_eq!(compatibility_label(&record).0, "Compatibility needs review");
+        record.portability_class = PortabilityClass::NeedsReview;
+        assert_eq!(compatibility_label(&record).0, "Compatibility unknown");
+    }
+
+    #[test]
+    fn warnings_make_restore_unavailable_and_keep_preview_before_apply() {
+        let mut record = record_at("/fixture/saves/checkpoint.bin");
+        record.warnings.push("source changed".into());
+        assert_eq!(compatibility_label(&record).0, "Restore unavailable");
+        assert_eq!(
+            state_type_label(PersistentStateType::MemoryCard),
+            "Memory card"
+        );
+        assert_eq!(
+            state_type_label(PersistentStateType::SaveState),
+            "Savestate"
         );
     }
 }

@@ -157,6 +157,30 @@ fn gui_v2_browse_play_reuses_filter_selection_and_canonical_destinations() {
             game: 1
         }
     );
+    assert!(
+        super::browse_play::browse_play_contextual_routes(1)
+            .iter()
+            .any(|(label, route)| {
+                *label == "Saves & States"
+                    && *route
+                        == Route::Task {
+                            section: Section::Saves,
+                            game: 1,
+                        }
+            })
+    );
+    assert!(
+        super::browse_play::browse_play_contextual_routes(1)
+            .iter()
+            .any(|(label, route)| {
+                *label == "Problems & Repair"
+                    && *route
+                        == Route::Task {
+                            section: Section::Problems,
+                            game: 1,
+                        }
+            })
+    );
     app.router.current = Route::BrowsePlayGame(1);
     let strings = text(&frame(&context, &mut app, [820.0, 720.0]));
     for expected in ["Browse & Play", "Mario", "Play"] {
