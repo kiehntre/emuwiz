@@ -142,13 +142,16 @@ fn gui_v2_browse_play_reuses_filter_selection_and_canonical_destinations() {
         }
     );
     app.router.current = Route::BrowsePlayGame(1);
-    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
-    for expected in ["Browse & Play", "Mario", "Play", "Game Details"] {
+    let strings = text(&frame(&context, &mut app, [820.0, 720.0]));
+    for expected in ["Browse & Play", "Mario", "Play"] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
             "missing Browse & Play content: {expected}"
         );
     }
+    assert_eq!(Route::Game(1).game(), Some(1));
+    assert_eq!(app.filter.platform, "SNES");
+    assert_eq!(app.filter.search, "mario");
 }
 
 #[test]
@@ -157,9 +160,38 @@ fn gui_v2_browse_play_empty_state_is_safe_and_points_to_sources() {
     let mut app = fixture(&context);
     app.router.current = Route::BrowsePlay;
     let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
-    assert!(strings.iter().any(|value| value.contains("No games found")));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("No games have been added yet"))
+    );
     assert!(strings.iter().any(|value| value.contains("Open Sources")));
     assert_eq!(app.router.current, Route::BrowsePlay);
+}
+
+#[test]
+fn gui_v2_browse_play_zero_results_explain_the_active_scope() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Mario", Some("SNES"))]));
+    app.filter.search = "missing".into();
+    app.router.current = Route::BrowsePlay;
+    let strings = text(&frame(&context, &mut app, [820.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("No games match the current search/filter"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Search: \"missing\""))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("No games have been added yet"))
+    );
 }
 
 #[test]
