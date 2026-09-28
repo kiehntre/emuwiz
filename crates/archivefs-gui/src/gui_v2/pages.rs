@@ -405,7 +405,7 @@ impl App {
                         Route::BrowsePlay => self.browse_play(ui, None),
                         Route::BrowsePlayGame(id) => self.browse_play(ui, Some(id)),
                         Route::Section(Section::Games | Section::Launch) => self.games(ui),
-                        Route::Section(Section::Saves) => self.saves_states(ui),
+                        Route::Section(Section::Saves) => self.saves_states(ui, None),
                         Route::Section(Section::Emulators) => self.emulator_setup(ui),
                         Route::Section(Section::Firmware) => self.firmware(ui),
                         Route::Section(Section::Sources) => self.sources(ui),
@@ -413,10 +413,10 @@ impl App {
                         Route::Section(Section::Dat) => self.dat_sources(ui),
                         Route::Section(Section::Artwork) => self.artwork_metadata(ui, None),
                         Route::Section(Section::Mods) => self.mods_page(ui, None),
-                        Route::Section(Section::Check) => self.check_games(ui),
+                        Route::Section(Section::Check) => self.check_games(ui, None),
                         Route::QuickRename => self.quick_rename(ui),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
-                        Route::Section(Section::Problems) => self.problems(ui),
+                        Route::Section(Section::Problems) => self.problems(ui, None),
                         Route::Section(Section::Build) => self.organisation_page(ui),
                         Route::Section(Section::Converter) => self.converter(ui),
                         Route::Section(Section::Tape) => self.tape_inspector(ui, None),
@@ -458,6 +458,18 @@ impl App {
                             section: Section::Artwork,
                             game,
                         } => self.artwork_metadata(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Saves,
+                            game,
+                        } => self.saves_states(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Check,
+                            game,
+                        } => self.check_games(ui, Some(game)),
+                        Route::Task {
+                            section: Section::Problems,
+                            game,
+                        } => self.problems(ui, Some(game)),
                         Route::Task {
                             section: Section::Advanced,
                             game,
@@ -528,11 +540,11 @@ impl App {
         context
     }
 
-    fn saves_states(&mut self, ui: &mut egui::Ui) {
+    fn saves_states(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         if self.saves_states.inventory.is_none() && !self.saves_states.loading {
             self.start_saves_inventory();
         }
-        super::saves_states::show(self, ui);
+        super::saves_states::show(self, ui, game_id);
     }
 
     fn app_chrome(&mut self, context: &egui::Context) {
@@ -1169,12 +1181,29 @@ impl App {
             });
     }
 
-    fn check_games(&mut self, ui: &mut egui::Ui) {
+    fn check_games(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         let platform = self.check_platform.clone();
-        check_scroll(ui, platform.as_deref(), |ui| self.check_games_content(ui));
+        check_scroll(ui, platform.as_deref(), |ui| {
+            self.check_games_content(ui, game_id)
+        });
     }
 
-    fn check_games_content(&mut self, ui: &mut egui::Ui) {
+    fn check_games_content(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
+        if let Some(game_id) = game_id
+            && let Some((title, platform_name)) = self
+                .library
+                .game(game_id)
+                .map(|game| (game.title.clone(), game.platform.clone()))
+        {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Checking this selected game");
+                ui.label(format!("{title} · {platform_name}"));
+                ui.label("The existing platform verification run remains authoritative; this context is retained while you review it.");
+                if ui.button("Back to Game Details").clicked() {
+                    self.go(Route::Game(game_id));
+                }
+            });
+        }
         ui.label("Read-only verification. Your original game files are never renamed, moved or deleted here.");
         if ui.button("Quick Rename verified games").clicked() {
             self.go(Route::QuickRename);
@@ -1482,7 +1511,7 @@ impl App {
         clicked
     }
 
-    fn problems(&mut self, ui: &mut egui::Ui) {
+    fn problems(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         if self.problem_summary.is_none() {
             self.start_problem_summary();
         }
@@ -1524,6 +1553,21 @@ impl App {
             });
             let problem_query = self.problem_query.trim().to_lowercase();
             let problem_filter = self.problem_filter;
+            if let Some(game_id) = game_id
+                && let Some((title, platform)) = self
+                    .library
+                    .game(game_id)
+                    .map(|game| (game.title.clone(), game.platform.clone()))
+            {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.strong("Problems for the selected game");
+                    ui.label(format!("{title} · {platform}"));
+                    ui.label("Only findings explicitly associated with this game are shown. Global history remains in History & Undo.");
+                    if ui.button("Back to Game Details").clicked() {
+                        self.go(Route::Game(game_id));
+                    }
+                });
+            }
             let mascot = self.imagery.mascot(ui.ctx()).cloned();
             page_hero(
                 ui,
@@ -1584,7 +1628,8 @@ impl App {
                 return;
             };
             let visible = |problem: &Problem| {
-                problem_filter.accepts(problem)
+                game_id.is_none_or(|id| problem.game_id == Some(id))
+                    && problem_filter.accepts(problem)
                     && (problem_query.is_empty()
                         || problem.title.to_lowercase().contains(&problem_query)
                         || problem.affected.to_lowercase().contains(&problem_query)
@@ -1596,6 +1641,21 @@ impl App {
                     ui.heading("Nothing currently needs your attention.");
                     ui.label("No current file, identity, or duplicate findings are recorded.");
                     if primary(ui, "Verify my games") { self.go(Route::Section(Section::Check)); }
+                });
+                return;
+            }
+            if let Some(game_id) = game_id
+                && !summary
+                    .problems
+                    .iter()
+                    .any(|problem| problem.game_id == Some(game_id))
+            {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("No current problems for this game");
+                    ui.label("This game has no explicitly associated problem findings. Global problems remain available from Problems & Repair.");
+                    if primary(ui, "Open Game Details") {
+                        self.go(Route::Game(game_id));
+                    }
                 });
                 return;
             }
@@ -1921,6 +1981,11 @@ impl App {
         ui.strong("Safety and undo");
         ui.label(&problem.safety);
         ui.label(&problem.undo);
+        if let Some(game_id) = problem.game_id
+            && ui.button("Open Game Details").clicked()
+        {
+            self.go(Route::Game(game_id));
+        }
         if primary(ui, problem.destination.label()) {
             match problem.destination {
                 ProblemDestination::CheckGames => self.go(Route::Section(Section::Check)),
@@ -1985,7 +2050,9 @@ impl App {
                     if let Some(route) = readiness_route {
                         self.go(route);
                     }
+                    ui.weak("Current readiness is authoritative. Previous launch results remain historical and are shown separately in the Launch workflow.");
                     ui.add_space(theme::SPACE_SM);
+                    ui.label(format!("Identity: {}", game.identity_summary()));
                     if primary(ui, "Play") { self.go(Route::Task { section: Section::Launch, game: id }); }
                     ui.label("Next: review the existing launch check. Nothing starts until you choose Launch there.");
                     ui.add_space(theme::SPACE_SM);
@@ -2007,11 +2074,11 @@ impl App {
                     } else { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking saved information and looking for installed emulators…"); }); }
                     ui.add_space(theme::SPACE_SM);
                     ui.horizontal_wrapped(|ui| {
-                        for (label, section) in [("Verify", Section::Check), ("Artwork & Metadata", Section::Artwork), ("Mods & Cheats", Section::Mods), ("Fix Problems", Section::Problems)] {
+                        for (label, section) in [("Verify", Section::Check), ("Artwork & Metadata", Section::Artwork), ("Mods & Cheats", Section::Mods), ("Saves & States", Section::Saves), ("Fix Problems", Section::Problems)] {
                             if ui.button(label).clicked() {
-                                if section == Section::Check {
+                                if matches!(section, Section::Check) {
                                     self.check_platform = Some(game.platform.clone());
-                                    self.go(Route::Section(Section::Check));
+                                    self.go(Route::Task { section, game: id });
                                 } else {
                                     self.go(Route::Task { section, game: id });
                                 }
@@ -2107,7 +2174,10 @@ impl App {
             ui.label("Save files and save states are kept as different kinds of data.");
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Open Saves & States").clicked() {
-                    self.go(Route::Section(Section::Saves));
+                    self.go(Route::Task {
+                        section: Section::Saves,
+                        game: game.archive.id,
+                    });
                 }
                 ui.add_enabled(false, egui::Button::new("Compare"))
                     .on_hover_text("Choose a snapshot in the Saves & States page; comparison is being introduced in this foundation.");

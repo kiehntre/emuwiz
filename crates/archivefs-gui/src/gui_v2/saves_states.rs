@@ -7,6 +7,7 @@
 use super::{
     App,
     imagery::{EmptyArt, empty_state},
+    library::Game,
     routes::{Route, Section},
 };
 use crate::ui::{
@@ -103,7 +104,7 @@ fn configured_roots_from_environment() -> Vec<PersistentStateRoot> {
     roots
 }
 
-pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
+pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
     let loading = app.saves_states.loading;
     let has_inventory = app.saves_states.inventory.is_some();
     let counts = app.saves_states.inventory.as_ref().map(|inventory| {
@@ -126,6 +127,17 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         ]
     });
     let mut refresh = false;
+    let selected_game = game_id.and_then(|id| app.library.game(id)).cloned();
+    if let Some(game) = selected_game.as_ref() {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.strong("Saves for the selected game");
+            ui.label(format!("{} · {}", game.title, game.platform));
+            ui.label("Only saves with explicit identity evidence for this game are shown here.");
+            if ui.button("Back to Game Details").clicked() {
+                app.go(Route::Game(game.archive.id));
+            }
+        });
+    }
     page_hero(
         ui,
         checkpoint_motif,
@@ -245,7 +257,10 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
         .records
         .iter()
         .filter(|record| {
-            filter_matches(record, app.saves_states.filter)
+            selected_game
+                .as_ref()
+                .is_none_or(|game| record_belongs_to_game(record, game))
+                && filter_matches(record, app.saves_states.filter)
                 && (search.is_empty() || record_matches(record, &search))
         })
         .collect();
@@ -284,6 +299,22 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui) {
     for warning in &inventory.warnings {
         ui.collapsing("Advanced inventory details", |ui| ui.label(warning));
     }
+}
+
+fn record_belongs_to_game(record: &PersistentStateRecord, game: &Game) -> bool {
+    let Some(report) = game.archive.identity_report.as_ref() else {
+        return false;
+    };
+    report.evidence.iter().any(|game_evidence| {
+        game_evidence.status == archivefs_core::game_identity::IdentityStatus::Verified
+            && game_evidence.value.is_some()
+            && record.game_identity.iter().any(|record_evidence| {
+                record_evidence.kind == game_evidence.kind
+                    && record_evidence.status
+                        == archivefs_core::game_identity::IdentityStatus::Verified
+                    && record_evidence.value == game_evidence.value
+            })
+    })
 }
 
 fn summary(ui: &mut egui::Ui, inventory: &PersistentStateInventory) {

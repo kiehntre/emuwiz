@@ -107,6 +107,7 @@ impl Category {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Problem {
     pub(super) id: String,
+    pub(super) game_id: Option<i64>,
     pub(super) title: String,
     pub(super) category: Category,
     pub(super) severity: Severity,
@@ -147,6 +148,7 @@ impl ProblemSummary {
             for group in &report.groups {
                 problems.push(Problem {
                     id: format!("duplicate-{}-{}", group.exact_index, group.sha256),
+                    game_id: None,
                     title: format!("{} identical copies were found", group.members.len()),
                     category: Category::Duplicates,
                     severity: Severity::Warning,
@@ -202,6 +204,7 @@ fn file_problem(game: &Game) -> Problem {
     let path_is_current = game.archive.absolute_path.is_file();
     Problem {
         id: format!("missing-{}", game.archive.id),
+        game_id: Some(game.archive.id),
         title: format!("{} is missing or has a saved health problem", game.title),
         category: Category::Files,
         severity: Severity::NeedsAttention,
@@ -229,6 +232,7 @@ fn file_problem(game: &Game) -> Problem {
 fn identity_problem(game: &Game) -> Problem {
     Problem {
         id: format!("identity-{}", game.archive.id),
+        game_id: Some(game.archive.id),
         title: format!("{} needs identity review", game.title),
         category: Category::Identity,
         severity: Severity::Warning,
@@ -383,6 +387,7 @@ mod tests {
             severity: Severity::Warning,
             state: ProblemState::NeedsEvidence,
             destination: ProblemDestination::CheckGames,
+            game_id: None,
             affected: "Arcade · Game".into(),
             location: "Current path: /game.zip".into(),
             why: "evidence".into(),

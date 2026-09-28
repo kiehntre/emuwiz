@@ -140,6 +140,17 @@ impl Game {
             "Not checked yet"
         }
     }
+
+    pub fn identity_summary(&self) -> &'static str {
+        let Some(report) = self.archive.identity_report.as_ref() else {
+            return "Unknown";
+        };
+        match canonical_identity_from_game_report(report).0 {
+            CanonicalIdentityStatus::Resolved(_) => "Verified",
+            CanonicalIdentityStatus::Conflicting => "Mismatch",
+            CanonicalIdentityStatus::Unknown => "Needs verification",
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -228,7 +239,8 @@ pub(super) type SharedLibrary = Arc<Library>;
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_platform_name;
+    use super::{Game, canonical_platform_name};
+    use archivefs_core::PersistedArchive;
 
     #[test]
     fn scummvm_aliases_project_to_the_canonical_selector_identity() {
@@ -240,6 +252,28 @@ mod tests {
     #[test]
     fn dos_does_not_project_as_scummvm() {
         assert_eq!(canonical_platform_name(Some("DOS")), "DOS");
+    }
+
+    #[test]
+    fn identity_summary_does_not_promote_missing_evidence_to_verified() {
+        let archive = PersistedArchive {
+            id: 7,
+            source_folder_id: 1,
+            relative_path: "unknown.zip".into(),
+            absolute_path: "/fixture/unknown.zip".into(),
+            archive_kind: "zip".into(),
+            display_name: "Unknown".into(),
+            normalized_name: "unknown".into(),
+            size_bytes: Some(1),
+            modified_time_unix_seconds: Some(1),
+            platform: Some("SNES".into()),
+            platform_source: Some("fixture".into()),
+            last_known_health: "pending".into(),
+            last_seen_at: "fixture".into(),
+            last_verified_missing_at: None,
+            identity_report: None,
+        };
+        assert_eq!(Game::from_archive(archive).identity_summary(), "Unknown");
     }
 }
 

@@ -41,15 +41,21 @@ pub(super) fn browse_play_contextual_routes(game: i64) -> [(&'static str, Route)
                 game,
             },
         ),
-        ("Saves & States", Route::Section(Section::Saves)),
         (
-            "Manuals / Guides",
+            "Saves & States",
             Route::Task {
-                section: Section::Artwork,
+                section: Section::Saves,
                 game,
             },
         ),
-        ("Problems & Repair", Route::Section(Section::Problems)),
+        ("Manuals / Guides", Route::Game(game)),
+        (
+            "Problems & Repair",
+            Route::Task {
+                section: Section::Problems,
+                game,
+            },
+        ),
     ]
 }
 
@@ -246,10 +252,8 @@ impl App {
             ui.label(&game.platform);
             ui.label(if game.attention {
                 "Needs attention"
-            } else if game.identified {
-                "Verified identity"
             } else {
-                "Needs verification"
+                game.identity_summary()
             });
             if ui
                 .add(
@@ -270,10 +274,11 @@ impl App {
                 ui.heading("Selected game");
                 ui.heading(&game.title);
                 ui.label(format!("Platform: {}", game.platform));
+                ui.label(format!("Identity: {}", game.identity_summary()));
                 ui.label(if game.attention {
                     "Launch issue needs attention"
                 } else if game.identified {
-                    "Identity verified · launch checks available"
+                    "Launch checks available"
                 } else {
                     "Needs verification before launch"
                 });

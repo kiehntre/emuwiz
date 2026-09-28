@@ -143,6 +143,20 @@ fn gui_v2_browse_play_reuses_filter_selection_and_canonical_destinations() {
             game: 1
         }
     );
+    assert_eq!(
+        super::browse_play::browse_play_contextual_routes(1)[1].1,
+        Route::Task {
+            section: Section::Saves,
+            game: 1
+        }
+    );
+    assert_eq!(
+        super::browse_play::browse_play_contextual_routes(1)[3].1,
+        Route::Task {
+            section: Section::Problems,
+            game: 1
+        }
+    );
     app.router.current = Route::BrowsePlayGame(1);
     let strings = text(&frame(&context, &mut app, [820.0, 720.0]));
     for expected in ["Browse & Play", "Mario", "Play"] {
@@ -467,7 +481,7 @@ fn saves_frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::
         },
         |context| {
             egui::CentralPanel::default().show(context, |ui| {
-                super::saves_states::show(app, ui);
+                super::saves_states::show(app, ui, None);
             });
         },
     )
