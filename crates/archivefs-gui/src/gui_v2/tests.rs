@@ -368,7 +368,7 @@ fn gui_v2_mame_health_shows_internal_repair_preview_without_apply() {
         "Genuinely absent",
         "Preservation-only / NO_DUMP",
         "Present but BAD_DUMP",
-        "No Apply button is available: this feature is read-only.",
+        "No Apply button is available: this health projection is read-only.",
     ] {
         assert!(
             strings.iter().any(|value| value == expected),
@@ -1475,8 +1475,23 @@ fn gui_v2_family_children_preserve_canonical_workflows() {
     assert!(
         routes::family_children(FeatureFamily::Mame)
             .iter()
-            .any(|action| action.label == "Collection Health")
+            .any(|action| action.label == "Health")
     );
+    for label in [
+        "Repair",
+        "Reconstruction",
+        "Verify",
+        "Playing Library",
+        "Problems",
+        "History & Undo",
+    ] {
+        assert!(
+            routes::family_children(FeatureFamily::Mame)
+                .iter()
+                .any(|action| action.label == label),
+            "missing MAME workflow: {label}"
+        );
+    }
     assert!(
         routes::family_children(FeatureFamily::Conversion)
             .iter()

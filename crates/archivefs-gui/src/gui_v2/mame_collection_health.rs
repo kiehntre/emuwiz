@@ -41,33 +41,39 @@ pub(super) fn show_with_apply_plan(
     egui::CollapsingHeader::new("MAME Collection Health")
         .default_open(true)
         .show(ui, |ui| {
-            ui.label("Inspect a collection against a supplied current MAME -listxml catalogue.");
-            ui.label("This page is analysis-only: EmuWiz does not rename, rebuild, download, or mutate ROMs.");
+            ui.label("MAME Health");
+            ui.label("Review the current collection, then move through Repair, Reconstruction, Verify, Playing Library, and History & Undo.");
+            ui.label("This health view is read-only. Any changing workflow still requires its own preview and safety confirmation.");
+            ui.horizontal_wrapped(|ui| {
+                for label in ["Health", "Repair", "Reconstruction", "Verify", "Playing Library", "History & Undo"] {
+                    ui.label(egui::RichText::new(label).strong());
+                    if label != "History & Undo" { ui.label("→"); }
+                }
+            });
             egui::Grid::new("mame_collection_health_summary")
                 .num_columns(2)
                 .striped(true)
                 .show(ui, |ui| {
-                    ui.label("Emulator version"); ui.label("Not inspected"); ui.end_row();
-                    ui.label("Collection root"); ui.label("Choose a root and current listxml in the inspection workflow"); ui.end_row();
-                    ui.label("Health"); ui.label("Good / bad / unknown are reported separately"); ui.end_row();
-                    ui.label("Set style"); ui.label("Merged, split, non-merged, exploded-self-contained, mixed, or unknown"); ui.end_row();
-                    ui.label("Update readiness"); ui.label("Reusable, missing, obsolete, renamed, new, removed, and shared dependencies"); ui.end_row();
+                    ui.label("Catalogue"); ui.label("Needs verification"); ui.end_row();
+                    ui.label("Collection"); ui.label("Load a MAME root and current catalogue to inspect it"); ui.end_row();
+                    ui.label("Health"); ui.label(health_label(repair_plan)); ui.end_row();
+                    ui.label("Parent / clone"); ui.label("Shared parent files are explained separately from clone files"); ui.end_row();
+                    ui.label("Next action"); ui.label(next_action_label(plan, repair_plan)); ui.end_row();
                 });
-            ui.strong("No update actions are available here");
-            ui.label("The analyser prepares a read-only report only. ROM collection changes remain outside this feature.");
+            ui.strong("Current collection health");
+            ui.label("Current evidence is separate from previous repair or reconstruction receipts in History & Undo.");
             ui.separator();
             ui.strong("Top shared problems");
-            ui.label("Affected sets · Type · Preservation status · Potentially fixes N sets");
-            ui.label("This is a shared device ROM used by many machines.");
-            ui.label("This is a parent/shared dependency, not a game-specific file.");
-            ui.label("MAME has no verified good dump for this chip.");
-            ui.label("NO_DUMP items are preservation gaps, not ordinary missing collection files.");
+            ui.label("Missing member · Wrong hash · Duplicate member · Unexpected member · Parent dependency");
+            ui.label("A parent/shared file may be used by several clones; it is not a generic game-file problem.");
+            ui.label("BAD_DUMP means a known imperfect reference dump, not ordinary repairable corruption.");
+            ui.label("NO_DUMP means no verified reference dump is known; it is a preservation gap, not a missing file to repair.");
             if ui.button("Export report").clicked() {
                 ui.ctx().copy_text("MAME collection health export is available after an inspection report is loaded.".into());
             }
             ui.separator();
-            ui.strong("MAME Playing Library preview");
-            ui.label("Curates one practical representative per authoritative parent/clone family while retaining meaningful control-panel and regional variants.");
+            ui.strong("Playing Library / 1G1R preview");
+            ui.label("Creates a clean play-focused view without modifying the original ROM collection.");
             if let Some(plan) = plan {
                 egui::Grid::new("mame_playing_library_preview")
                     .num_columns(2)
@@ -79,15 +85,16 @@ pub(super) fn show_with_apply_plan(
                         ui.label("Estimated savings"); ui.label(format_bytes(plan.projected_savings_bytes)); ui.end_row();
                         ui.label("Ambiguities"); ui.label(plan.unresolved_cases.len().to_string()); ui.end_row();
                     });
-                ui.label(format!("Preference rules are applied; {} sets excluded; {} BIOS/device support sets retained.", plan.excluded_sets.len(), plan.required_support_sets.len()));
-                ui.label("Preview only: the archival collection is never mutated by this planner.");
+                ui.label(format!("Preference rules selected {} sets; {} alternatives excluded; {} BIOS/device support sets retained.", plan.selected_sets.len(), plan.excluded_sets.len(), plan.required_support_sets.len()));
+                ui.label("Source preservation: the archival collection is never mutated by this planner.");
             } else {
+                ui.strong("No Playing Library plan");
                 ui.label("Load a MAME catalogue and complete collection report to preview selected sets, storage, savings, exclusions, dependencies, and ambiguities.");
                 ui.label("No apply, copy, delete, rename, or source-update action is available here.");
             }
             ui.separator();
             ui.strong("Repair from your own collection");
-            ui.label("Preview only: exact SHA-1 evidence can identify bytes already present elsewhere; EmuWiz does not copy, move, link, or rename ROMs here.");
+            ui.label("Repair uses exact SHA-1 evidence already present elsewhere; it does not download or rewrite archival originals.");
             if let Some(repair) = repair_plan {
                 egui::Grid::new("mame_internal_repair_preview")
                     .num_columns(2)
@@ -128,13 +135,46 @@ pub(super) fn show_with_apply_plan(
                     }
                     ui.label("Undo removes only destinations created by this transaction, and refuses if a created file changed.");
                 } else {
-                    ui.label("No Apply button is available: this feature is read-only.");
+                    ui.label("No Apply button is available: this health projection is read-only.");
                 }
             } else {
+                ui.strong("No repairable set report");
                 ui.label("Load a MAME catalogue and complete collection report to preview exact internal repair matches, absent identities, preservation gaps, and ambiguities.");
-                ui.label("No Apply button is available: this feature is read-only.");
+                ui.label("No Apply button is available: this health projection is read-only.");
             }
         });
+}
+
+fn health_label(repair_plan: Option<&MameInternalRepairPlan>) -> &'static str {
+    let Some(plan) = repair_plan else {
+        return "Needs verification";
+    };
+    if plan.sets_currently_failing == 0 {
+        "Healthy"
+    } else if plan.genuinely_absent_count > 0 {
+        "Missing files"
+    } else if plan.wrong_content_same_name_count > 0 || plan.bad_dump_count > 0 {
+        "Wrong files"
+    } else if plan.ambiguous_count > 0 {
+        "Needs attention"
+    } else {
+        "Needs attention"
+    }
+}
+
+fn next_action_label(
+    plan: Option<&MamePlayingLibraryPlan>,
+    repair_plan: Option<&MameInternalRepairPlan>,
+) -> &'static str {
+    if repair_plan.is_none() {
+        "Verify the collection"
+    } else if repair_plan.is_some_and(|plan| plan.safe_internal_repair_count > 0) {
+        "Review repair"
+    } else if plan.is_some() {
+        "Open Playing Library"
+    } else {
+        "Review the evidence"
+    }
 }
 
 fn format_bytes(value: Option<u64>) -> String {
@@ -149,4 +189,58 @@ fn format_bytes(value: Option<u64>) -> String {
         unit += 1;
     }
     format!("{amount:.1} {}", UNITS[unit])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan() -> MameInternalRepairPlan {
+        MameInternalRepairPlan {
+            schema_version: 1,
+            collection_root: "/mame".into(),
+            catalogue_version: Some("0.264".into()),
+            sets_currently_failing: 1,
+            affected_sets: vec!["pacman".into()],
+            requirements: Vec::new(),
+            safe_internal_repair_count: 0,
+            no_download_needed_count: 0,
+            genuinely_absent_count: 0,
+            preservation_only_no_dump_count: 0,
+            bad_dump_count: 0,
+            ambiguous_count: 0,
+            wrong_content_same_name_count: 0,
+            unique_source_identities_needed: 0,
+            filesystem_operations_required: 0,
+            projected_sets_repairable: 0,
+            top_repairs_by_impact: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn health_language_uses_current_evidence_not_history() {
+        assert_eq!(health_label(None), "Needs verification");
+        let mut healthy = plan();
+        healthy.sets_currently_failing = 0;
+        assert_eq!(health_label(Some(&healthy)), "Healthy");
+        let mut missing = plan();
+        missing.genuinely_absent_count = 2;
+        assert_eq!(health_label(Some(&missing)), "Missing files");
+        let mut wrong = plan();
+        wrong.wrong_content_same_name_count = 1;
+        assert_eq!(health_label(Some(&wrong)), "Wrong files");
+    }
+
+    #[test]
+    fn next_action_prioritizes_review_before_playing_library() {
+        let mut repair = plan();
+        repair.safe_internal_repair_count = 1;
+        assert_eq!(next_action_label(None, Some(&repair)), "Review repair");
+        repair.safe_internal_repair_count = 0;
+        assert_eq!(
+            next_action_label(None, Some(&repair)),
+            "Review the evidence"
+        );
+    }
 }

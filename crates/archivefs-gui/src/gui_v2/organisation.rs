@@ -366,14 +366,23 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
         ui.label(message);
     }
     if let Some(plan) = &state.mame_plan {
+        ui.strong("Reconstruction preview");
+        ui.label("Reconstruction builds a new complete merged set from verified evidence; it is different from repairing an existing set in place.");
         ui.label(format!(
-            "Parent: {} · clones: {}",
+            "Target parent set: {} · clone sets: {}",
             plan.parent,
-            plan.clones.join(", ")
+            if plan.clones.is_empty() {
+                "none".into()
+            } else {
+                plan.clones.join(", ")
+            }
         ));
-        ui.label(format!("Destination: {}", plan.destination.display()));
         ui.label(format!(
-            "{} required members · {} verified sources",
+            "New output destination: {}",
+            plan.destination.display()
+        ));
+        ui.label(format!(
+            "{} required members · {} verified source members",
             plan.required_members.len(),
             plan.sources.len()
         ));
@@ -389,14 +398,15 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             }
         }
         ui.label(if plan.ready_to_apply {
-            "Ready to publish after explicit confirmation."
+            "Ready to publish after explicit confirmation; source archives remain untouched and the transaction can be undone."
         } else {
-            "Publish blocked: evidence is not sufficient."
+            "Publish blocked: missing members, collisions, or insufficient ownership evidence must be resolved first."
         });
-        for reason in &plan.reasons {
-            ui.label(format!("• {reason}"));
-        }
-        ui.collapsing("Verified ownership", |ui| {
+        ui.label("Verification plan: re-check the published output against the reviewed member evidence after publication.");
+        ui.collapsing("Advanced reconstruction evidence", |ui| {
+            for reason in &plan.reasons {
+                ui.label(format!("• {reason}"));
+            }
             for source in &plan.sources {
                 let evidence = plan
                     .required_members
@@ -959,8 +969,10 @@ impl App {
                     widgets::workflow_card(ui, theme::TEAL, |ui| {
                         ui.strong("What MAME names mean");
                         ui.label("Set/archive name: the outer set such as pacman.zip.");
-                        ui.label("ROM member: a file inside that set. Parent, clone, BIOS, device and CHD dependencies are separate evidence.");
-                        ui.label("BAD_DUMP needs preservation/redump treatment. NO_DUMP means no verified dump is known; neither is an ordinary rename repair.");
+                        ui.label("ROM member: a file inside that set. Parent and clone relationships explain which shared files are required.");
+                        ui.label("A clone may use files stored in its parent set. Missing member, wrong hash, duplicate, and collision are separate outcomes.");
+                        ui.label("BAD_DUMP is a known imperfect reference dump. NO_DUMP means no verified dump is known; neither is an ordinary rename repair.");
+                        ui.label("Packed ZIP member repair and CHD changes remain unsupported or preview-only where the backend says so.");
                     });
                     show_mame_normalizer(ui, &mut self.organisation);
                 }
