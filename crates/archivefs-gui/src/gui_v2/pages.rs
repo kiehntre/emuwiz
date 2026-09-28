@@ -8,7 +8,7 @@ use super::{
     library::{DuplicateGroup, Game, media_kind_label},
     media_sources::{Kind, Source},
     onboarding,
-    problems::{Category, Problem, Severity},
+    problems::{Category, Problem, ProblemDestination, ProblemFilter, Severity},
     romm_library::PresenceFilter,
     routes::{
         FamilyVariant, FeatureFamily, HOME_TASKS, Route, SECTIONS, Section, breadcrumb_labels,
@@ -1208,39 +1208,44 @@ impl App {
         } else {
             "Verification data is available for this platform."
         });
-        if let Some(result) = &self.verification {
-            ui.label(format!("Checked {} files", result.total));
+        let verification = self.verification.clone();
+        if let Some(result) = verification.as_ref() {
+            ui.heading("What the check found");
+            ui.label(format!(
+                "Checked {} games in {platform} using the configured evidence.",
+                result.total
+            ));
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Matched: {}", result.matched));
-                ui.label(format!("Needs attention: {}", result.attention));
+                ui.strong(format!("Verified: {}", result.matched));
+                ui.label(format!("Mismatch / attention: {}", result.attention));
                 ui.label(format!("Unknown: {}", result.unknown));
                 ui.label(format!("Missing: {}", result.missing));
             });
             for (label, count, explanation) in [
                 (
-                    "Matched",
+                    "Verified",
                     result.matched,
-                    "These files match the saved identity evidence.",
+                    "These games match trusted identity evidence.",
                 ),
                 (
-                    "Needs attention",
+                    "Mismatch / attention",
                     result.attention,
-                    "These files have a saved health or scan warning.",
+                    "These games have a saved health or scan warning and need review before play or repair.",
                 ),
                 (
                     "Unknown",
                     result.unknown,
-                    "EmuWiz has not yet established a trusted identity.",
+                    "EmuWiz could not establish a trusted identity; do not rename these games from filenames alone.",
                 ),
                 (
-                    "Missing expected files",
+                    "Missing",
                     result.missing,
-                    "The recorded path is not available right now.",
+                    "The recorded game path is not available right now.",
                 ),
             ] {
                 if count > 0 && ui.button(format!("Review {label} ({count})")).clicked() {
                     self.filter.select_platform(platform.clone());
-                    self.filter.attention_only = label == "Needs attention";
+                    self.filter.attention_only = label == "Mismatch / attention";
                     self.filter.unverified_only = label == "Unknown";
                     self.change_filter();
                     self.go(Route::Section(Section::Games));
@@ -1248,6 +1253,21 @@ impl App {
                 if count > 0 {
                     ui.label(explanation);
                 }
+            }
+            if result.unknown > 0 {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.strong("Why games can be unknown");
+                    ui.label("No matching DAT identity was recorded, or the available evidence was not sufficient to resolve the game safely.");
+                    if ui.button("Manage DAT sources").clicked() {
+                        self.go(Route::Section(Section::Dat));
+                    }
+                    if ui.button("Review unknown games").clicked() {
+                        self.filter.select_platform(platform.clone());
+                        self.filter.unverified_only = true;
+                        self.change_filter();
+                        self.go(Route::Section(Section::Games));
+                    }
+                });
             }
             if ui.button("Choose another platform").clicked() {
                 self.check_platform = None;
@@ -1472,6 +1492,38 @@ impl App {
                 .as_ref()
                 .map(|summary| (summary.count(Severity::NeedsAttention), summary.count(Severity::Warning)))
                 .unwrap_or_default();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Inbox view");
+                if ui
+                    .selectable_label(
+                        self.problem_filter == ProblemFilter::Actionable,
+                        ProblemFilter::Actionable.label(),
+                    )
+                    .clicked()
+                {
+                    self.problem_filter = ProblemFilter::Actionable;
+                }
+                if ui
+                    .selectable_label(
+                        self.problem_filter == ProblemFilter::All,
+                        ProblemFilter::All.label(),
+                    )
+                    .clicked()
+                {
+                    self.problem_filter = ProblemFilter::All;
+                }
+                ui.label("Search");
+                ui.add_sized(
+                    [220.0, 28.0],
+                    egui::TextEdit::singleline(&mut self.problem_query)
+                        .hint_text("title, game or path"),
+                );
+                if !self.problem_query.is_empty() && ui.button("Clear").clicked() {
+                    self.problem_query.clear();
+                }
+            });
+            let problem_query = self.problem_query.trim().to_lowercase();
+            let problem_filter = self.problem_filter;
             let mascot = self.imagery.mascot(ui.ctx()).cloned();
             page_hero(
                 ui,
@@ -1491,7 +1543,16 @@ impl App {
                 |ui| {
                     ui.label("CRT STATUS");
                     ui.monospace(if summary.is_none() { "CHECKING..." } else { "SIGNAL STABLE" });
-                    if summary.is_some() { ui.label(format!("{attention} attention · {warnings} review")); }
+                    if let Some(summary) = summary.as_ref() {
+                        ui.label(format!(
+                            "{} actionable · {} warnings · {} total",
+                            summary.actionable_count(),
+                            warnings,
+                            summary.problems.len()
+                        ));
+                    } else {
+                        ui.label(format!("{attention} attention · {warnings} review"));
+                    }
                 },
                 |ui| {
                     if let Some(summary) = summary.as_ref() {
@@ -1522,11 +1583,30 @@ impl App {
                 });
                 return;
             };
+            let visible = |problem: &Problem| {
+                problem_filter.accepts(problem)
+                    && (problem_query.is_empty()
+                        || problem.title.to_lowercase().contains(&problem_query)
+                        || problem.affected.to_lowercase().contains(&problem_query)
+                        || problem.location.to_lowercase().contains(&problem_query))
+            };
+            let visible_count = summary.problems.iter().filter(|problem| visible(problem)).count();
             if summary.problems.is_empty() {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("Nothing currently needs your attention.");
-                    ui.label("No saved file, identity, or duplicate findings are currently recorded.");
+                    ui.label("No current file, identity, or duplicate findings are recorded.");
                     if primary(ui, "Verify my games") { self.go(Route::Section(Section::Check)); }
+                });
+                return;
+            }
+            if visible_count == 0 {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("No problems match the current filters.");
+                    ui.label("Clear the search or show all current findings to review the rest of the inbox.");
+                    if primary(ui, "Show all current findings") {
+                        self.problem_filter = ProblemFilter::All;
+                        self.problem_query.clear();
+                    }
                 });
                 return;
             }
@@ -1542,6 +1622,14 @@ impl App {
             let mut selected = self.problem_selected.clone();
             for category in [Category::Files, Category::Duplicates, Category::Identity, Category::Verification] {
                 let Some(entries) = summary.category_indices.get(&category) else { continue; };
+                let entries: Vec<_> = entries
+                    .iter()
+                    .copied()
+                    .filter(|&index| visible(&summary.problems[index]))
+                    .collect();
+                if entries.is_empty() {
+                    continue;
+                }
                 ui.separator();
                 ui.heading(category.label());
                 if let Some(&problem_index) = entries
@@ -1551,22 +1639,31 @@ impl App {
                     egui::Frame::group(ui.style())
                         .show(ui, |ui| self.problem_details(ui, &summary.problems[problem_index]));
                 }
-                egui::ScrollArea::vertical().id_salt(("v2_problem_rows", category)).show_rows(ui, 82.0, entries.len(), |ui, range| {
+                egui::ScrollArea::vertical().id_salt(("v2_problem_rows", category)).show_rows(ui, 96.0, entries.len(), |ui, range| {
                     for index in range {
                         let problem = &summary.problems[entries[index]];
                         let is_selected = selected.as_deref() == Some(problem.id.as_str());
                     ui.push_id(&problem.id, |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong(&problem.title);
-                            ui.label(problem.severity.label());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.strong(&problem.title);
+                                ui.label(problem.severity.label());
+                                ui.label(problem.state.label());
                             if ui.button(if is_selected { "Hide details" } else { "View details" }).clicked() {
                                 selected = (!is_selected).then(|| problem.id.clone());
                             }
                         });
                         ui.label(&problem.affected);
-                        ui.label(format!("Recommended action: {}", problem.action));
+                        ui.label(&problem.location);
+                        ui.label(format!("Next: {}", problem.action));
+                        if ui.button(problem.destination.label()).clicked() {
+                            match problem.destination {
+                                ProblemDestination::CheckGames => self.go(Route::Section(Section::Check)),
+                                ProblemDestination::Games => self.go(Route::Section(Section::Games)),
+                                ProblemDestination::Duplicates => self.go(Route::Section(Section::Duplicates)),
+                            }
+                        }
                         if problem.category == Category::Duplicates
                             && self.repair_preview.is_none()
                             && self.repair_job.is_none()
@@ -1818,19 +1915,17 @@ impl App {
         ui.label(&problem.why);
         ui.strong("What EmuWiz can do");
         ui.label(&problem.action);
+        ui.strong("Current state");
+        ui.label(problem.state.label());
+        ui.label(&problem.location);
         ui.strong("Safety and undo");
         ui.label(&problem.safety);
         ui.label(&problem.undo);
-        match problem.category {
-            Category::Duplicates => {
-                if primary(ui, "Review duplicate groups") {
-                    self.go(Route::Section(Section::Duplicates));
-                }
-            }
-            Category::Files | Category::Identity | Category::Verification => {
-                if primary(ui, "Review games and verify") {
-                    self.go(Route::Section(Section::Games));
-                }
+        if primary(ui, problem.destination.label()) {
+            match problem.destination {
+                ProblemDestination::CheckGames => self.go(Route::Section(Section::Check)),
+                ProblemDestination::Games => self.go(Route::Section(Section::Games)),
+                ProblemDestination::Duplicates => self.go(Route::Section(Section::Duplicates)),
             }
         }
         ui.collapsing("Advanced details", |ui| {
@@ -2255,6 +2350,15 @@ impl App {
             ui.label("Need to rename verified files to their trusted DAT names?");
             if ui.button("Quick Rename").clicked() {
                 self.go(Route::QuickRename);
+            }
+            if ui.button("Check Games").clicked() {
+                self.go(Route::Section(Section::Check));
+            }
+            if ui.button("Advanced Rename").clicked() {
+                self.go(Route::Section(Section::Build));
+            }
+            if ui.button("History & Undo").clicked() {
+                self.go(Route::Section(Section::History));
             }
         });
         let workflows = self

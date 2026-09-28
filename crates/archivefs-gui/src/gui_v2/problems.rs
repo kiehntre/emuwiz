@@ -14,6 +14,67 @@ pub(super) enum Severity {
     Informational,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
+pub(super) enum ProblemState {
+    Current,
+    NeedsEvidence,
+    Informational,
+}
+
+impl ProblemState {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Current => "Current",
+            Self::NeedsEvidence => "Needs evidence",
+            Self::Informational => "Informational",
+        }
+    }
+
+    pub(super) fn is_actionable(self) -> bool {
+        !matches!(self, Self::Informational)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProblemDestination {
+    CheckGames,
+    Games,
+    Duplicates,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ProblemFilter {
+    #[default]
+    Actionable,
+    All,
+}
+
+impl ProblemFilter {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Actionable => "Actionable now",
+            Self::All => "All current findings",
+        }
+    }
+
+    pub(super) fn accepts(self, problem: &Problem) -> bool {
+        match self {
+            Self::Actionable => problem.state.is_actionable(),
+            Self::All => true,
+        }
+    }
+}
+
+impl ProblemDestination {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::CheckGames => "Open Check Games",
+            Self::Games => "Review Games",
+            Self::Duplicates => "Review Duplicates",
+        }
+    }
+}
+
 impl Severity {
     pub(super) fn label(self) -> &'static str {
         match self {
@@ -49,7 +110,10 @@ pub(super) struct Problem {
     pub(super) title: String,
     pub(super) category: Category,
     pub(super) severity: Severity,
+    pub(super) state: ProblemState,
+    pub(super) destination: ProblemDestination,
     pub(super) affected: String,
+    pub(super) location: String,
     pub(super) why: String,
     pub(super) action: String,
     pub(super) safety: String,
@@ -86,7 +150,10 @@ impl ProblemSummary {
                     title: format!("{} identical copies were found", group.members.len()),
                     category: Category::Duplicates,
                     severity: Severity::Warning,
+                    state: ProblemState::Current,
+                    destination: ProblemDestination::Duplicates,
                     affected: group.members.iter().map(|member| member.title.as_str()).collect::<Vec<_>>().join(", "),
+                    location: "Current duplicate candidates".into(),
                     why: "Keeping multiple byte-for-byte copies makes it harder to know which file to use and wastes space.".into(),
                     action: "Review the duplicate group. EmuWiz will not remove anything from this page.".into(),
                     safety: "Read-only until an existing duplicate-quarantine plan is explicitly reviewed and approved.".into(),
@@ -122,20 +189,40 @@ impl ProblemSummary {
             .filter(|problem| problem.severity == severity)
             .count()
     }
+
+    pub(super) fn actionable_count(&self) -> usize {
+        self.problems
+            .iter()
+            .filter(|problem| problem.state.is_actionable())
+            .count()
+    }
 }
 
 fn file_problem(game: &Game) -> Problem {
+    let path_is_current = game.archive.absolute_path.is_file();
     Problem {
         id: format!("missing-{}", game.archive.id),
         title: format!("{} is missing or has a saved health problem", game.title),
         category: Category::Files,
         severity: Severity::NeedsAttention,
-        affected: format!("{} · {}", game.platform, game.archive.absolute_path.display()),
+        state: ProblemState::Current,
+        destination: ProblemDestination::Games,
+        affected: format!("{} · {}", game.platform, game.title),
+        location: if path_is_current {
+            format!("Current path: {}", game.archive.absolute_path.display())
+        } else {
+            format!("Last recorded path: {}", game.archive.absolute_path.display())
+        },
         why: "EmuWiz cannot safely verify or prepare this game until the recorded file is available and readable.".into(),
         action: "Review the game and its folder, then run verification again.".into(),
         safety: "Read-only. Browsing and verification do not rename, move, delete, or repair the source file.".into(),
         undo: "No file change was made, so there is nothing to undo.".into(),
-        technical: format!("Catalogue id {} · health {}", game.archive.id, game.archive.last_known_health),
+        technical: format!(
+            "Catalogue id {} · recorded path {} · health {}",
+            game.archive.id,
+            game.archive.absolute_path.display(),
+            game.archive.last_known_health
+        ),
     }
 }
 
@@ -145,11 +232,10 @@ fn identity_problem(game: &Game) -> Problem {
         title: format!("{} needs identity review", game.title),
         category: Category::Identity,
         severity: Severity::Warning,
-        affected: format!(
-            "{} · {}",
-            game.platform,
-            game.archive.absolute_path.display()
-        ),
+        state: ProblemState::NeedsEvidence,
+        destination: ProblemDestination::CheckGames,
+        affected: format!("{} · {}", game.platform, game.title),
+        location: format!("Current path: {}", game.archive.absolute_path.display()),
         why:
             "EmuWiz has not established enough trusted evidence to say exactly which game this is."
                 .into(),
@@ -251,5 +337,59 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.problems[0].category, Category::Duplicates);
         assert!(first.problems[0].action.contains("Review"));
+        assert_eq!(first.problems[0].state, ProblemState::Current);
+        assert_eq!(
+            first.problems[0].destination,
+            ProblemDestination::Duplicates
+        );
+    }
+
+    #[test]
+    fn identity_findings_require_evidence_before_rename() {
+        let mut library = Library::new(Vec::new());
+        library.games = vec![game(3, "Unknown", false, false)];
+        let summary = ProblemSummary::from_library(&library, None);
+        let problem = &summary.problems[0];
+        assert_eq!(problem.state, ProblemState::NeedsEvidence);
+        assert_eq!(problem.destination, ProblemDestination::CheckGames);
+        assert!(!problem.action.to_lowercase().contains("rename"));
+        assert!(problem.location.starts_with("Current path:"));
+    }
+
+    #[test]
+    fn missing_file_uses_last_recorded_path_instead_of_claiming_current_path() {
+        let mut library = Library::new(Vec::new());
+        library.games = vec![game(4, "Missing", true, true)];
+        let summary = ProblemSummary::from_library(&library, None);
+        assert!(
+            summary.problems[0]
+                .location
+                .starts_with("Last recorded path:")
+        );
+        assert!(
+            !summary.problems[0]
+                .affected
+                .contains("/path/that/does/not/exist.zip")
+        );
+    }
+
+    #[test]
+    fn problem_filter_defaults_to_actionable_and_can_show_all_findings() {
+        assert_eq!(ProblemFilter::default(), ProblemFilter::Actionable);
+        assert!(ProblemFilter::Actionable.accepts(&Problem {
+            id: "id".into(),
+            title: "Needs review".into(),
+            category: Category::Identity,
+            severity: Severity::Warning,
+            state: ProblemState::NeedsEvidence,
+            destination: ProblemDestination::CheckGames,
+            affected: "Arcade · Game".into(),
+            location: "Current path: /game.zip".into(),
+            why: "evidence".into(),
+            action: "Review".into(),
+            safety: "read-only".into(),
+            undo: "none".into(),
+            technical: "id".into(),
+        }));
     }
 }

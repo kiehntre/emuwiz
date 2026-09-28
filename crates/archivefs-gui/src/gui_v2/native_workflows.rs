@@ -983,6 +983,54 @@ impl NativeWorkflows {
         app_polling::start_view_gated_work(&mut self.app, ui.ctx());
         ui.heading("DATs & Verification");
         ui.label("Manage trusted DAT catalogues used to identify and verify your library.");
+        let dat_view = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_ref()
+            .map(crate::dat_sources_page::DatSourcesPageState::view);
+        if let Some(view) = dat_view.as_ref() {
+            let ready = view
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.enabled
+                        && !row.health_stale
+                        && matches!(
+                            row.health_state,
+                            archivefs_core::dat::sources::DatHealthState::Valid
+                                | archivefs_core::dat::sources::DatHealthState::ValidWithWarnings
+                        )
+                })
+                .count();
+            let attention = view
+                .rows
+                .iter()
+                .filter(|row| {
+                    row.health_stale
+                        || matches!(
+                            row.health_state,
+                            archivefs_core::dat::sources::DatHealthState::Invalid
+                                | archivefs_core::dat::sources::DatHealthState::Unreadable
+                        )
+                })
+                .count();
+            let disabled = view.rows.iter().filter(|row| !row.enabled).count();
+            crate::ui::components::card(ui, |ui| {
+                ui.strong("DAT status at a glance");
+                if view.rows.is_empty() {
+                    ui.label("No DAT sources are configured.");
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("Ready: {ready}"));
+                        ui.label(format!("Needs refresh or attention: {attention}"));
+                        ui.label(format!("Disabled: {disabled}"));
+                        ui.label(format!("Configured: {}", view.rows.len()));
+                    });
+                    ui.label("Ready sources can support identity checks; stale or invalid sources need review before they are trusted.");
+                }
+            });
+        }
         ui.heading("Installed and imported DATs");
         crate::ui::components::card(ui, |ui| {
             ui.strong("No-Intro pack import");

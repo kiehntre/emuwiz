@@ -72,6 +72,8 @@ fn fixture(context: &egui::Context) -> App {
         problem_summary_job: None,
         duplicate_ignored: std::collections::HashSet::new(),
         problem_selected: None,
+        problem_filter: super::problems::ProblemFilter::default(),
+        problem_query: String::new(),
         repair_preview: None,
         repair_confirm: false,
         repair_job: None,
