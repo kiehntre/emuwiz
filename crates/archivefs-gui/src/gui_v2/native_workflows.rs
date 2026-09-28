@@ -557,7 +557,9 @@ impl NativeWorkflows {
         action: launch_readiness_page::LaunchReadinessPageAction,
     ) -> Option<Route> {
         let section = match action {
-            launch_readiness_page::LaunchReadinessPageAction::OpenDoctor => Section::Emulators,
+            // The launch presenter uses this action for its firmware summary;
+            // keep the repair destination aligned with the evidence shown.
+            launch_readiness_page::LaunchReadinessPageAction::OpenDoctor => Section::Firmware,
             launch_readiness_page::LaunchReadinessPageAction::Navigate(destination) => {
                 match destination {
                     crate::navigation::NavClick::View(crate::navigation::MainView::Sources) => {
@@ -2234,6 +2236,39 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn lifecycle_status_never_calls_detected_installations_not_installed() {
+        use archivefs_core::emulator_lifecycle::LifecycleState;
+
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::Missing, 0, false, false),
+            "Not installed"
+        );
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::Missing, 1, false, false),
+            "Detected"
+        );
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::MultipleInstallations, 2, false, false),
+            "Multiple installs · choose one"
+        );
+        assert_eq!(
+            lifecycle_primary_state_label(LifecycleState::Broken, 1, false, true),
+            "Needs setup"
+        );
+    }
+
+    #[test]
+    fn firmware_recovery_uses_the_existing_firmware_route() {
+        assert_eq!(
+            NativeWorkflows::recovery_route(
+                Some(42),
+                launch_readiness_page::LaunchReadinessPageAction::OpenDoctor,
+            ),
+            Some(Route::Section(Section::Firmware))
+        );
+    }
 }
 
 fn lifecycle_setup_panel(
@@ -2248,7 +2283,12 @@ fn lifecycle_setup_panel(
             egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&projection.emulator_id);
-                ui.label(lifecycle_state_label(projection.state));
+                ui.label(lifecycle_primary_state_label(
+                    projection.state,
+                    projection.installations.len(),
+                    projection.selected.is_some(),
+                    projection.stale_selected,
+                ));
             });
             if projection.stale_selected {
                 ui.colored_label(
@@ -2357,6 +2397,27 @@ fn lifecycle_state_label(
         Broken => "Needs attention",
         MultipleInstallations => "Multiple installations found",
         ManagedExternally => "Managed by another installer",
+    }
+}
+
+fn lifecycle_primary_state_label(
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+    installation_count: usize,
+    has_selection: bool,
+    stale_selected: bool,
+) -> &'static str {
+    if installation_count == 0 {
+        return lifecycle_state_label(state);
+    }
+    if stale_selected {
+        return "Needs setup";
+    }
+    if installation_count > 1 && !has_selection {
+        return "Multiple installs · choose one";
+    }
+    match state {
+        archivefs_core::emulator_lifecycle::LifecycleState::Missing => "Detected",
+        _ => lifecycle_state_label(state),
     }
 }
 

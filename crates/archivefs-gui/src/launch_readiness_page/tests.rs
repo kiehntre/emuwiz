@@ -185,16 +185,16 @@ fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
 #[test]
 fn firmware_summary_uses_plain_language_and_only_offers_doctor_for_attention_states() {
     let not_required = firmware_summary(FirmwareReadiness::NotRequired, &[]);
-    assert_eq!(not_required.status, "Not required");
+    assert_eq!(not_required.status, "Firmware not required");
     assert!(!not_required.show_doctor_action);
 
     let verified = firmware_summary(FirmwareReadiness::Verified, &[]);
-    assert_eq!(verified.status, "Ready");
+    assert_eq!(verified.status, "Firmware ready");
     assert!(verified.description.contains("by hash"));
     assert!(!verified.show_doctor_action);
 
     let found_unverified = firmware_summary(FirmwareReadiness::PresentUnverified, &[]);
-    assert_eq!(found_unverified.status, "Found, not verified");
+    assert_eq!(found_unverified.status, "Firmware unverified");
     assert!(found_unverified.show_doctor_action);
 
     let missing = firmware_summary(
@@ -204,7 +204,7 @@ fn firmware_summary_uses_plain_language_and_only_offers_doctor_for_attention_sta
             "fixture only",
         )],
     );
-    assert_eq!(missing.status, "Required firmware missing");
+    assert_eq!(missing.status, "Firmware missing");
     assert_eq!(
         missing.description,
         "This emulator needs firmware before it can launch."
@@ -212,7 +212,7 @@ fn firmware_summary_uses_plain_language_and_only_offers_doctor_for_attention_sta
     assert!(missing.show_doctor_action);
 
     let unknown = firmware_summary(FirmwareReadiness::Unknown, &[]);
-    assert_eq!(unknown.status, "Firmware needs attention");
+    assert_eq!(unknown.status, "Firmware state unknown");
     assert!(unknown.show_doctor_action);
 
     for summary in [not_required, verified, found_unverified, missing, unknown] {
@@ -796,7 +796,7 @@ fn firmware_blocked_candidate_shows_required_firmware_missing_and_blocked_status
     let plan = plan_with(vec![candidate]);
     let output = render(&plan_input(plan));
     assert!(rendered_text_contains(&output, "Blocked"));
-    assert!(rendered_text_contains(&output, "Required firmware missing"));
+    assert!(rendered_text_contains(&output, "Firmware missing"));
     assert!(rendered_text_contains(
         &output,
         "This emulator needs firmware before it can launch."

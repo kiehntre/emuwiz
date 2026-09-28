@@ -2174,19 +2174,19 @@ fn firmware_summary(firmware: FirmwareReadiness, blockers: &[LaunchBlocker]) -> 
 
     match firmware {
         FirmwareReadiness::Verified => FirmwareSummary {
-            status: "Ready",
+            status: "Firmware ready",
             description: "EmuWiz recognised the required firmware by hash.",
             tone: widgets::StatusTone::Success,
             show_doctor_action: false,
         },
         FirmwareReadiness::PresentUnverified => FirmwareSummary {
-            status: "Found, not verified",
+            status: "Firmware unverified",
             description: "Firmware was found, but EmuWiz could not verify its contents.",
             tone: widgets::StatusTone::Warning,
             show_doctor_action: true,
         },
         FirmwareReadiness::Missing if launch_blocked_by_missing_firmware => FirmwareSummary {
-            status: "Required firmware missing",
+            status: "Firmware missing",
             description: "This emulator needs firmware before it can launch.",
             tone: widgets::StatusTone::Blocked,
             show_doctor_action: true,
@@ -2198,13 +2198,13 @@ fn firmware_summary(firmware: FirmwareReadiness, blockers: &[LaunchBlocker]) -> 
             show_doctor_action: true,
         },
         FirmwareReadiness::Unknown => FirmwareSummary {
-            status: "Firmware needs attention",
+            status: "Firmware state unknown",
             description: "EmuWiz could not determine whether the required firmware is ready.",
             tone: widgets::StatusTone::Pending,
             show_doctor_action: true,
         },
         FirmwareReadiness::NotRequired => FirmwareSummary {
-            status: "Not required",
+            status: "Firmware not required",
             description: "This launch option does not need separate firmware.",
             tone: widgets::StatusTone::Info,
             show_doctor_action: false,
@@ -2237,8 +2237,13 @@ fn show_firmware_summary(ui: &mut egui::Ui, candidate: &LaunchCandidate) -> bool
             .small()
             .color(theme::muted(ui)),
         );
-        return widgets::action_button(ui, "Open Doctor", widgets::ActionStyle::Secondary, true)
-            .clicked();
+        return widgets::action_button(
+            ui,
+            "Open BIOS & Firmware",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked();
     }
 
     false
@@ -3018,8 +3023,15 @@ fn show_standalone_launch_action(
             None => "Launch",
         };
         ui.label(label);
-        if let Some((_, _, StandaloneLaunchStage::Failed(detail))) = state.tracked.as_ref() {
-            ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
+        match state.tracked.as_ref() {
+            Some((_, _, StandaloneLaunchStage::Exited(_))) => {
+                ui.small("Historical result from the last launch attempt; current readiness is shown above.");
+            }
+            Some((_, _, StandaloneLaunchStage::Failed(detail))) => {
+                ui.small("Historical result from the last launch attempt; current readiness is shown above.");
+                ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
+            }
+            _ => {}
         }
         return;
     }
@@ -3054,9 +3066,11 @@ fn show_amiga_whdload_launch_action(
             }
             Some(AmigaWHDLoadStage::Exited(_)) => {
                 ui.label("WHDLoad process exited");
+                ui.small("Historical result from the last launch attempt; current readiness is shown above.");
             }
             Some(AmigaWHDLoadStage::Failed(detail)) => {
                 ui.label("WHDLoad launch failed");
+                ui.small("Historical result from the last launch attempt.");
                 ui.label(egui::RichText::new(detail).small().color(theme::muted(ui)));
             }
             None => {}
@@ -3132,6 +3146,7 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
                     "RetroArch closed normally.",
                     widgets::StatusTone::Success,
                 );
+                ui.small("Historical result from the last launch attempt; current readiness is shown above.");
             } else {
                 widgets::banner(
                     ui,
@@ -3150,6 +3165,9 @@ pub(crate) fn show_retroarch_launch_feedback(ui: &mut egui::Ui, display: &RetroA
         }
         RetroArchLaunchDisplay::Failed { message, detail } => {
             widgets::banner(ui, "Launch failed", message, widgets::StatusTone::Blocked);
+            ui.small(
+                "Historical result from the last launch attempt; current readiness is shown above.",
+            );
             widgets::technical_details(ui, "retroarch-launch-error", |ui| {
                 ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
             });
@@ -3237,6 +3255,7 @@ fn show_dolphin_launch_action(
                     "Dolphin closed normally.",
                     widgets::StatusTone::Success,
                 );
+                ui.small("Historical result from the last launch attempt; current readiness is shown above.");
             } else {
                 widgets::banner(
                     ui,
@@ -3258,6 +3277,9 @@ fn show_dolphin_launch_action(
         }
         Display::Failed { message, detail } => {
             widgets::banner(ui, "Launch failed", message, widgets::StatusTone::Blocked);
+            ui.small(
+                "Historical result from the last launch attempt; current readiness is shown above.",
+            );
             widgets::technical_details(ui, "dolphin-launch-error", |ui| {
                 ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
             });
@@ -3352,6 +3374,7 @@ fn show_pcsx2_launch_action(
                     "PCSX2 closed normally.",
                     widgets::StatusTone::Success,
                 );
+                ui.small("Historical result from the last launch attempt; current readiness is shown above.");
             } else {
                 widgets::banner(
                     ui,
@@ -3373,6 +3396,9 @@ fn show_pcsx2_launch_action(
         }
         Display::Failed { message, detail } => {
             widgets::banner(ui, "Launch failed", message, widgets::StatusTone::Blocked);
+            ui.small(
+                "Historical result from the last launch attempt; current readiness is shown above.",
+            );
             widgets::technical_details(ui, "pcsx2-launch-error", |ui| {
                 ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
             });

@@ -612,10 +612,10 @@ fn identity_label(identity: IdentitySummary) -> &'static str {
 
 fn firmware_label(firmware: FirmwareSummary) -> &'static str {
     match firmware {
-        FirmwareSummary::NotRequired => "Not required",
-        FirmwareSummary::Ready => "Ready",
-        FirmwareSummary::Missing => "Missing",
-        FirmwareSummary::Unknown => "Unknown",
+        FirmwareSummary::NotRequired => "Firmware not required",
+        FirmwareSummary::Ready => "Firmware ready",
+        FirmwareSummary::Missing => "Firmware missing",
+        FirmwareSummary::Unknown => "Firmware state unknown",
     }
 }
 
