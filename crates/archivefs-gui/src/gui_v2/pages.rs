@@ -713,7 +713,14 @@ impl App {
         let family = family_for_route(&self.router.current);
         let title = match &self.router.current {
             Route::BrowsePlay | Route::BrowsePlayGame(_) => "Browse & Play",
-            Route::Game(id) | Route::Task { game: id, .. } => self
+            // The title is the first thing in the page body (and in the
+            // breadcrumb); repeating it as the page heading made it appear twice.
+            Route::Game(id) => self
+                .library
+                .game(*id)
+                .map(|_| "Game Details")
+                .unwrap_or("Game no longer listed"),
+            Route::Task { game: id, .. } => self
                 .library
                 .game(*id)
                 .map(|game| game.title.as_str())
@@ -2123,6 +2130,19 @@ impl App {
                         self.imagery.platform_icon(ui, &game.platform, 28.0);
                         ui.label(RichText::new(format!("{} · {}", game.platform, media_kind_label(&game.archive.archive_kind))).color(theme::muted(ui)));
                     });
+                    // Only when another game shares this title (regions, revisions,
+                    // duplicates): a friendly hint, never a full path - the file
+                    // name when it says more than the title, else the folder.
+                    let has_twin = library
+                        .games
+                        .iter()
+                        .any(|other| other.archive.id != id && other.title == game.title);
+                    if let Some(hint) = has_twin
+                        .then(|| disambiguating_hint(&game.title, &game.archive.relative_path, &game.archive.absolute_path))
+                        .flatten()
+                    {
+                        ui.label(RichText::new(hint).small().color(theme::muted(ui)));
+                    }
                     ui.add_space(theme::SPACE_SM);
                     // The readiness card owns the single primary action: Play
                     // when the game is ready, otherwise the step that fixes it.
@@ -3089,4 +3109,94 @@ pub(super) fn duplicate_readiness_label(
 /// Button label for the RomM sample preview, from the real sample size.
 pub(super) fn romm_preview_button_label(games: usize) -> String {
     format!("Preview import (first {games} games)")
+}
+
+/// A short, friendly hint for telling same-title games apart. Prefers a file
+/// name that says more than the title; otherwise names the *source* the copy
+/// lives in (the last two folders of its scan root), which is what actually
+/// differs between duplicates of one file. Never a full path.
+fn disambiguating_hint(
+    title: &str,
+    relative_path: &std::path::Path,
+    absolute_path: &std::path::Path,
+) -> Option<String> {
+    let name = relative_path.file_name()?.to_string_lossy().into_owned();
+    let stem = relative_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !stem.eq_ignore_ascii_case(title.trim()) {
+        return Some(format!("File: {name}"));
+    }
+    let root = absolute_path
+        .to_string_lossy()
+        .strip_suffix(relative_path.to_string_lossy().as_ref())
+        .map(|root| std::path::PathBuf::from(root.trim_end_matches('/')));
+    if let Some(root) = root {
+        let names: Vec<_> = root
+            .components()
+            .filter_map(|part| match part {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        if !names.is_empty() {
+            let tail = &names[names.len().saturating_sub(2)..];
+            return Some(format!("Source: {}", tail.join("/")));
+        }
+    }
+    let folder = relative_path
+        .parent()?
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    (!folder.is_empty()).then(|| format!("Folder: {folder}"))
+}
+
+#[cfg(test)]
+mod disambiguation_tests {
+    use super::disambiguating_hint;
+    use std::path::Path;
+
+    #[test]
+    fn a_file_name_that_only_repeats_the_title_and_has_no_source_adds_nothing() {
+        assert_eq!(
+            disambiguating_hint(
+                "Example Game",
+                Path::new("Example Game.iso"),
+                Path::new("Example Game.iso")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_differing_file_name_is_shown() {
+        assert_eq!(
+            disambiguating_hint(
+                "Sonic",
+                Path::new("megadrive/Sonic (Rev A).zip"),
+                Path::new("/mnt/games/roms/megadrive/Sonic (Rev A).zip")
+            ),
+            Some("File: Sonic (Rev A).zip".into())
+        );
+    }
+
+    #[test]
+    fn identical_copies_in_two_sources_are_told_apart_by_their_source() {
+        let relative = Path::new("snes/'89 Dennou Kyuusei Uranai (Japan).zip");
+        let first = disambiguating_hint(
+            "'89 Dennou Kyuusei Uranai (Japan)",
+            relative,
+            Path::new("/mnt/games/roms/snes/'89 Dennou Kyuusei Uranai (Japan).zip"),
+        );
+        let second = disambiguating_hint(
+            "'89 Dennou Kyuusei Uranai (Japan)",
+            relative,
+            Path::new("/mnt/usbdrive/games/snes/'89 Dennou Kyuusei Uranai (Japan).zip"),
+        );
+        assert_eq!(first.as_deref(), Some("Source: games/roms"));
+        assert_eq!(second.as_deref(), Some("Source: usbdrive/games"));
+        assert_ne!(first, second);
+    }
 }

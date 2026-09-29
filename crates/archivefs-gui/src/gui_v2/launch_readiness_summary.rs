@@ -556,20 +556,8 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             );
             ui.strong(&summary.headline);
         });
-        ui.label(&summary.explanation);
-        ui.horizontal_wrapped(|ui| {
-            if let Some(emulator) = &summary.emulator {
-                ui.label(format!("Using: {}", emulator.name));
-            }
-            ui.label(format!("Identity: {}", identity_label(summary.identity)));
-            if summary.firmware != FirmwareSummary::Unknown {
-                ui.label(format!("Firmware: {}", firmware_label(summary.firmware)));
-            }
-            ui.label(format!("Game file: {}", source_label(summary.source)));
-        });
-        for warning in summary.warnings.iter().take(2) {
-            ui.colored_label(crate::ui::theme::WARNING, warning);
-        }
+        // The action sits directly under the state so it stays on screen in a
+        // short window; the explanation and evidence chips follow it.
         ui.horizontal_wrapped(|ui| {
             if let Some(primary) = summary.primary_action {
                 if ui
@@ -594,6 +582,20 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                 .on_disabled_hover_text(summary.headline.as_str());
             }
         });
+        ui.label(&summary.explanation);
+        ui.horizontal_wrapped(|ui| {
+            if let Some(emulator) = &summary.emulator {
+                ui.label(format!("Using: {}", emulator.name));
+            }
+            ui.label(format!("Identity: {}", identity_label(summary.identity)));
+            if summary.firmware != FirmwareSummary::Unknown {
+                ui.label(format!("Firmware: {}", firmware_label(summary.firmware)));
+            }
+            ui.label(format!("Game file: {}", source_label(summary.source)));
+        });
+        for warning in summary.warnings.iter().take(2) {
+            ui.colored_label(crate::ui::theme::WARNING, warning);
+        }
         ui.collapsing("Readiness details", |ui| {
             if let Some(emulator) = &summary.emulator {
                 ui.label(format!("Profile: {}", emulator.profile));

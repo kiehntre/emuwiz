@@ -5379,3 +5379,21 @@ fn gui_v2_browse_play_many_platforms_do_not_push_the_selected_game_off_screen() 
         );
     }
 }
+
+#[test]
+fn gui_v2_game_details_keep_the_action_on_screen_for_a_long_wrapping_title() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(
+        1,
+        "A Very Long Example Game Title That Certainly Wraps Onto Two Lines (Europe) (En,Fr,De,Es,It)",
+        Some("Saturn"),
+    )]));
+    app.router.current = Route::Game(1);
+    let output = frame(&context, &mut app, [1000.0, 560.0]);
+    let rect = bounds_below_chrome(&output, "Play").expect("Play is drawn");
+    assert!(
+        rect.max.y < 520.0,
+        "Play must stay above the footer: {rect:?}"
+    );
+}

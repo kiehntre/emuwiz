@@ -778,6 +778,14 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
     if matches!(route, Route::QuickRename) {
         return vec!["DATs & Verification".into(), "Quick Rename".into()];
     }
+    if matches!(route, Route::Game(_)) {
+        // Game Details is opened from the Games library, not from Organisation.
+        let mut labels = vec!["Games".to_string()];
+        if let Some(game_title) = game_title.filter(|title| !title.trim().is_empty()) {
+            labels.push(game_title.to_string());
+        }
+        return labels;
+    }
     let section = route.section();
     let mut labels = family_for_route(route)
         .map(|family| vec![family.label().to_string()])
@@ -797,6 +805,15 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::{Route, Section, breadcrumb_labels, family_for_route};
+
+    #[test]
+    fn game_details_breadcrumb_is_games_then_the_title() {
+        assert_eq!(
+            breadcrumb_labels(&Route::Game(7), Some("Pac-Man")),
+            ["Games", "Pac-Man"]
+        );
+        assert_eq!(breadcrumb_labels(&Route::Game(7), None), ["Games"]);
+    }
 
     #[test]
     fn breadcrumbs_follow_route_and_selected_game_context() {
