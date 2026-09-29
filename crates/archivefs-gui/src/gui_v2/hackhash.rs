@@ -475,6 +475,10 @@ impl HackHashPageState {
     /// Render the selected-ROM evidence surface.  Hash acquisition remains an
     /// explicit inspection action owned by the caller; browsing a game never
     /// reads or hashes its media.
+    pub(super) fn has_selected_evidence(&self) -> bool {
+        self.selected_identity.is_some()
+    }
+
     pub(super) fn show_selected_rom_evidence(&mut self, ui: &mut egui::Ui) {
         if let Some(result) = self.selected_identity.clone() {
             Self::show_identity_result(ui, &result);

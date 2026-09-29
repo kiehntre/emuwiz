@@ -562,25 +562,39 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                 ui.label(format!("Using: {}", emulator.name));
             }
             ui.label(format!("Identity: {}", identity_label(summary.identity)));
-            ui.label(format!("Firmware: {}", firmware_label(summary.firmware)));
+            if summary.firmware != FirmwareSummary::Unknown {
+                ui.label(format!("Firmware: {}", firmware_label(summary.firmware)));
+            }
             ui.label(format!("Game file: {}", source_label(summary.source)));
         });
         for warning in summary.warnings.iter().take(2) {
             ui.colored_label(crate::ui::theme::WARNING, warning);
         }
-        if let Some(primary) = summary.primary_action {
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new(action_label(primary)).strong())
-                        .fill(crate::ui::theme::PRIMARY_ACTION)
-                        .min_size(egui::vec2(180.0, 42.0)),
-                )
-                .clicked()
-            {
-                action = Some(primary);
+        ui.horizontal_wrapped(|ui| {
+            if let Some(primary) = summary.primary_action {
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(action_label(primary)).strong())
+                            .fill(crate::ui::theme::PRIMARY_ACTION)
+                            .min_size(egui::vec2(180.0, 42.0)),
+                    )
+                    .clicked()
+                {
+                    action = Some(primary);
+                }
             }
-        }
-        ui.collapsing("Advanced details", |ui| {
+            // Play is always on screen so the page never changes shape: when
+            // it cannot run, it is disabled and the headline above says why.
+            if summary.primary_action != Some(ReadinessAction::Play) {
+                ui.add_enabled(
+                    false,
+                    egui::Button::new(egui::RichText::new("Play").strong())
+                        .min_size(egui::vec2(120.0, 42.0)),
+                )
+                .on_disabled_hover_text(summary.headline.as_str());
+            }
+        });
+        ui.collapsing("Readiness details", |ui| {
             if let Some(emulator) = &summary.emulator {
                 ui.label(format!("Profile: {}", emulator.profile));
             }
@@ -914,5 +928,144 @@ mod tests {
             ReadinessPresentationState::ReadyWithWarnings
         );
         assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+    }
+
+    fn text_rects(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+        fn gather(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| gather(shape, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        output
+            .shapes
+            .iter()
+            .for_each(|shape| gather(&shape.shape, &mut out));
+        out
+    }
+
+    /// Lays the card out once, then clicks the centre of the button labelled
+    /// `label` and reports what the card asked the page to do.
+    fn click_card_button(
+        summary: &GameReadinessSummary,
+        label: &str,
+    ) -> (Vec<String>, Option<ReadinessAction>) {
+        let context = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0));
+        let run = |events: Vec<egui::Event>| {
+            let mut action = None;
+            let output = context.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |context| {
+                    egui::CentralPanel::default().show(context, |ui| {
+                        action = show(ui, summary);
+                    });
+                },
+            );
+            (output, action)
+        };
+        let (layout, _) = run(Vec::new());
+        let rects = text_rects(&layout);
+        let labels = rects.iter().map(|(text, _)| text.clone()).collect();
+        let Some((_, rect)) = rects.iter().find(|(text, _)| text == label) else {
+            return (labels, None);
+        };
+        let at = rect.center();
+        let button = egui::PointerButton::Primary;
+        let modifiers = egui::Modifiers::NONE;
+        let (_, action) = run(vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button,
+                pressed: true,
+                modifiers,
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button,
+                pressed: false,
+                modifiers,
+            },
+        ]);
+        (labels, action)
+    }
+
+    #[test]
+    fn ready_card_offers_exactly_one_enabled_play() {
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Ready,
+                FirmwareReadiness::NotRequired,
+                vec![],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        let (labels, action) = click_card_button(&summary, "Play");
+        assert_eq!(labels.iter().filter(|label| *label == "Play").count(), 1);
+        assert_eq!(action, Some(ReadinessAction::Play));
+    }
+
+    #[test]
+    fn blocked_card_keeps_play_visible_but_inert_and_routes_the_fix() {
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::NotRequired,
+                vec![LaunchBlocker {
+                    kind: LaunchBlockerKind::NoInstallationCandidate,
+                    detail: "no profile".into(),
+                }],
+                vec![],
+                CandidatePreference::SoleEligible,
+                Some("/game.iso"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        let (labels, play) = click_card_button(&summary, "Play");
+        assert!(
+            labels.iter().any(|label| label == "Play"),
+            "Play stays visible"
+        );
+        assert_eq!(play, None, "a blocked game must not launch");
+        let (_, fix) = click_card_button(&summary, "Set up emulator");
+        assert_eq!(fix, Some(ReadinessAction::SetUpEmulator));
+    }
+
+    #[test]
+    fn checking_card_shows_inert_play_and_no_other_action() {
+        let summary = project(
+            &LaunchReadinessInput::EvidenceNotLoaded,
+            ReadinessFreshness::Current,
+        );
+        let (labels, play) = click_card_button(&summary, "Play");
+        assert!(labels.iter().any(|label| label == "Play"));
+        assert_eq!(play, None);
+    }
+
+    #[test]
+    fn unknown_firmware_is_not_shown_as_a_status() {
+        let summary = project(
+            &LaunchReadinessInput::EvidenceNotLoaded,
+            ReadinessFreshness::Current,
+        );
+        let (labels, _) = click_card_button(&summary, "Play");
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("Firmware state unknown"))
+        );
     }
 }

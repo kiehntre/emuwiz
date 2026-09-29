@@ -23,8 +23,12 @@ fn is_container(game: &Game) -> bool {
     )
 }
 
+pub(super) fn applies(game: &Game) -> bool {
+    is_wii_u(game) && is_container(game)
+}
+
 pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
-    if !is_wii_u(game) || !is_container(game) {
+    if !applies(game) {
         return;
     }
 
