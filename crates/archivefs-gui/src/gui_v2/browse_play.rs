@@ -13,6 +13,9 @@ use super::{
 use crate::ui::theme;
 use eframe::egui::{self, RichText};
 
+/// Shelf cards drawn at a time. Drawing every card of a 132,000-game library
+/// every frame made the page unusably slow, so the shelf is paged.
+pub(super) const SHELF_PAGE: usize = 60;
 const PLATFORM_ICON_SIZE: f32 = 32.0;
 const GRID_CARD_WIDTH: f32 = 178.0;
 const GRID_COVER_SIZE: egui::Vec2 = egui::vec2(158.0, 158.0);
@@ -125,46 +128,57 @@ impl App {
             ui.strong("Platforms");
             ui.label("Choose a system to narrow the shelf.");
         });
-        ui.horizontal_wrapped(|ui| {
-            let platforms: Vec<_> = library.platforms.keys().cloned().collect();
-            if platforms.is_empty() {
-                ui.label("No platforms are available yet.");
-            } else {
-                for platform in platforms {
-                    let count = library
-                        .platforms
-                        .get(&platform)
-                        .copied()
-                        .unwrap_or_default();
-                    let selected = self.filter.platform == platform;
-                    ui.push_id(("v2_browse_play_platform", platform.as_str()), |ui| {
-                        let response = egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(148.0);
-                            ui.horizontal(|ui| {
-                                self.imagery
-                                    .platform_icon(ui, &platform, PLATFORM_ICON_SIZE);
-                                ui.vertical(|ui| {
-                                    ui.strong(&platform);
-                                    ui.label(format!("{count} games"));
+        // One scrolling row. Wrapped rows of framed chips never wrapped: the row
+        // grew as wide as every platform together, which stretched the page and
+        // pushed the selected-game column far off screen.
+        egui::ScrollArea::horizontal()
+            .id_salt("v2_browse_play_platform_row")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let platforms: Vec<_> = library.platforms.keys().cloned().collect();
+                    if platforms.is_empty() {
+                        ui.label("No platforms are available yet.");
+                    } else {
+                        for platform in platforms {
+                            let count = library
+                                .platforms
+                                .get(&platform)
+                                .copied()
+                                .unwrap_or_default();
+                            let selected = self.filter.platform == platform;
+                            ui.push_id(("v2_browse_play_platform", platform.as_str()), |ui| {
+                                let response = egui::Frame::group(ui.style()).show(ui, |ui| {
+                                    ui.set_min_width(148.0);
+                                    ui.horizontal(|ui| {
+                                        self.imagery.platform_icon(
+                                            ui,
+                                            &platform,
+                                            PLATFORM_ICON_SIZE,
+                                        );
+                                        ui.vertical(|ui| {
+                                            ui.strong(&platform);
+                                            ui.label(format!("{count} games"));
+                                        });
+                                    });
                                 });
+                                let response = response.response.interact(egui::Sense::click());
+                                if selected {
+                                    ui.painter().rect_stroke(
+                                        response.rect,
+                                        6.0,
+                                        egui::Stroke::new(2.0_f32, theme::PRIMARY_ACTION),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if response.clicked() {
+                                    self.filter.select_platform(platform.clone());
+                                }
                             });
-                        });
-                        let response = response.response.interact(egui::Sense::click());
-                        if selected {
-                            ui.painter().rect_stroke(
-                                response.rect,
-                                6.0,
-                                egui::Stroke::new(2.0_f32, theme::PRIMARY_ACTION),
-                                egui::StrokeKind::Inside,
-                            );
                         }
-                        if response.clicked() {
-                            self.filter.select_platform(platform.clone());
-                        }
-                    });
-                }
-            }
-        });
+                    }
+                })
+            });
     }
 
     fn browse_play_games(
@@ -174,17 +188,36 @@ impl App {
         selected_id: Option<i64>,
     ) {
         let indices = filtered_game_indices(self);
+        let paged = indices.len() > self.browse_play_shown.0.max(SHELF_PAGE);
         ui.horizontal(|ui| {
             ui.strong("Games");
             ui.label(format!("{} in the current scope", indices.len()));
+            if paged {
+                ui.label(format!(
+                    "· showing the first {}",
+                    self.browse_play_shown.0.max(SHELF_PAGE)
+                ));
+            }
         });
         if indices.is_empty() {
             self.browse_play_empty(ui, library.games.is_empty());
             return;
         }
 
+        // A new search/platform/view starts again from the first page.
+        let scope = (
+            self.filter.platform.clone(),
+            self.filter.search.clone(),
+            self.filter.list,
+        );
+        if self.browse_play_shown.1 != scope || self.browse_play_shown.0 == 0 {
+            self.browse_play_shown = (SHELF_PAGE, scope);
+        }
+        let shown = self.browse_play_shown.0.min(indices.len());
+        let total = indices.len();
+        let indices = &indices[..shown];
         if self.filter.list {
-            for index in indices {
+            for index in indices.iter().copied() {
                 let Some(game) = library.games.get(index) else {
                     continue;
                 };
@@ -207,6 +240,19 @@ impl App {
                     }
                 });
             }
+        }
+        if shown < total {
+            ui.add_space(theme::SPACE_SM);
+            ui.horizontal(|ui| {
+                ui.label(format!("Showing {shown} of {total} games."));
+                if ui
+                    .button(format!("Show {} more", SHELF_PAGE.min(total - shown)))
+                    .clicked()
+                {
+                    self.browse_play_shown.0 = shown + SHELF_PAGE;
+                }
+                ui.label("Search or choose a platform to narrow the shelf.");
+            });
         }
     }
 
@@ -237,8 +283,16 @@ impl App {
                         self.browse_play_card_text(ui, game, selected, id);
                     });
                 } else {
-                    self.picture(ui, game, Kind::Cover, size);
-                    self.browse_play_card_text(ui, game, selected, id);
+                    // The shelf row is a horizontal layout; without its own
+                    // vertical column the card's picture and text flow side
+                    // by side, several times wider than the width the shelf
+                    // budgets for it, and the selected-game panel is pushed
+                    // out of view. Keep the card one narrow column.
+                    ui.vertical(|ui| {
+                        ui.set_max_width(GRID_CARD_WIDTH);
+                        self.picture(ui, game, Kind::Cover, size);
+                        self.browse_play_card_text(ui, game, selected, id);
+                    });
                 }
             });
         });

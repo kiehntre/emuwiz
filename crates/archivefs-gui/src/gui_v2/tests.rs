@@ -57,6 +57,7 @@ fn fixture(context: &egui::Context) -> App {
         load_job: None,
         artwork_job: None,
         index_job: None,
+        browse_play_shown: (0, Default::default()),
         preferences_dirty: None,
         interacted: false,
         loaded: true,
@@ -5132,5 +5133,96 @@ fn gui_v2_switching_games_never_shows_the_previous_games_result() {
         if let Picture::Ready { .. } = picture {
             assert!((1..=3).contains(&key.game));
         }
+    }
+}
+
+#[test]
+fn gui_v2_browse_play_grid_cards_stay_narrow_so_the_selected_game_is_visible() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(
+        (1..=6000)
+            .map(|id| {
+                archive(
+                    id,
+                    "A Rather Long Game Title (Europe) (En,Fr,De,Es,It) (Rev 1)",
+                    Some("SNES"),
+                )
+            })
+            .collect(),
+    ));
+    app.indices = (0..app.library.games.len()).collect();
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.router.current = Route::BrowsePlayGame(2);
+    let width = 1880.0;
+    let output = frame(&context, &mut app, [width, 1000.0]);
+    let bounds = text_bounds(&output, "Selected game");
+    assert!(!bounds.is_empty(), "the selected-game panel must be drawn");
+    assert!(
+        bounds.iter().all(|rect| rect.max.x < width),
+        "the selected-game panel must be on screen, not pushed off by wide shelf cards"
+    );
+}
+
+#[test]
+fn gui_v2_browse_play_draws_one_page_of_a_huge_library_and_says_so() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(
+        (1..=6000)
+            .map(|id| archive(id, &format!("Game {id}"), Some("SNES")))
+            .collect(),
+    ));
+    app.indices = (0..app.library.games.len()).collect();
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.router.current = Route::BrowsePlay;
+    let started = Instant::now();
+    let strings = text(&frame(&context, &mut app, [1880.0, 1000.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "· showing the first 60"),
+        "the shelf must say it shows one page"
+    );
+    let cards = strings.iter().filter(|value| *value == "Select").count();
+    assert!(cards <= super::browse_play::SHELF_PAGE, "drawn {cards}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // A new search starts from the first page again.
+    app.browse_play_shown.0 = 300;
+    app.filter.search = "Game 1".into();
+    frame(&context, &mut app, [1880.0, 1000.0]);
+    assert_eq!(app.browse_play_shown.0, super::browse_play::SHELF_PAGE);
+}
+
+#[test]
+fn gui_v2_browse_play_many_platforms_do_not_push_the_selected_game_off_screen() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(
+        (1..=200)
+            .map(|id| {
+                archive(
+                    id,
+                    &format!("Game {id}"),
+                    Some(&format!("Platform {}", id % 70)),
+                )
+            })
+            .collect(),
+    ));
+    app.indices = (0..app.library.games.len()).collect();
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    let width = 1880.0;
+    for (route, heading) in [
+        (Route::BrowsePlay, "Select a game"),
+        (Route::BrowsePlayGame(5), "Selected game"),
+    ] {
+        app.router.current = route;
+        let output = frame(&context, &mut app, [width, 1000.0]);
+        let bounds = text_bounds(&output, heading);
+        assert!(!bounds.is_empty(), "{heading} must be drawn");
+        assert!(
+            bounds.iter().all(|rect| rect.max.x <= width),
+            "{heading} must be on screen: {bounds:?}"
+        );
     }
 }

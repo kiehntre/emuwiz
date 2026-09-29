@@ -2302,9 +2302,9 @@ impl App {
                     if timings.cache_hit { "yes" } else { "no" }
                 ));
             }
-            Some(Picture::Unavailable { issue, .. }) => {
+            Some(Picture::Unavailable { issue, message }) => {
                 ui.label(format!(
-                    "An uncached RomM picture exists but could not be fetched: {}",
+                    "An uncached RomM picture exists but could not be fetched: {} ({message})",
                     issue.technical_label()
                 ));
             }

@@ -242,6 +242,8 @@ pub(super) struct App {
     load_job: Option<u64>,
     artwork_job: Option<u64>,
     index_job: Option<u64>,
+    /// How many shelf cards Browse & Play draws, and the scope it was chosen for.
+    browse_play_shown: (usize, (String, String, bool)),
     preferences_dirty: Option<Instant>,
     interacted: bool,
     loaded: bool,
@@ -321,6 +323,7 @@ impl App {
             load_job: None,
             artwork_job: None,
             index_job: None,
+            browse_play_shown: (0, Default::default()),
             preferences_dirty: None,
             interacted: false,
             loaded: false,
