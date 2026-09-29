@@ -2431,8 +2431,6 @@ impl App {
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
-        workflows.show_artwork_provider_setup(ui, &mut self.activity);
-        ui.separator();
         workflows.show_sources(ui, &mut self.activity);
         ui.separator();
         self.hackhash.show(ui);

@@ -633,7 +633,7 @@ impl NativeWorkflows {
         self.app
             .navigate_to_main_view(crate::navigation::MainView::Sources);
         app_polling::start_view_gated_work(&mut self.app, ui.ctx());
-        let action = self.show_native_sources(ui);
+        let action = self.show_native_sources(ui, activity);
         if let Some(action) = action {
             self.app.start_source_action(ui.ctx().clone(), action);
         }
@@ -642,7 +642,11 @@ impl NativeWorkflows {
         self.observe_dat_activity(activity);
     }
 
-    fn show_native_sources(&mut self, ui: &mut egui::Ui) -> Option<crate::SourceAction> {
+    fn show_native_sources(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+    ) -> Option<crate::SourceAction> {
         let configured = self
             .app
             .gui_config
@@ -711,6 +715,12 @@ impl NativeWorkflows {
                 self.sources_discovery = true;
             }
         });
+
+        // Provider setup lives on this page, directly below the primary
+        // "Add source" row so that action stays visible.
+        ui.separator();
+        self.show_artwork_provider_setup(ui, activity);
+        ui.separator();
 
         if self.sources_discovery {
             self.show_native_discovery(ui, discovery_summary.as_ref(), busy, &mut action);
