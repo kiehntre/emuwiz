@@ -28,6 +28,7 @@ mod bsfree_gamecube;
 mod bsfree_wii;
 mod cemu_graphic_pack;
 mod cemu_local;
+mod cheat_applicability;
 mod cheat_cache_lock;
 mod cheat_cache_maintenance;
 mod cheat_candidates;
@@ -240,6 +241,13 @@ pub use cemu_local::{
     discover_cemu_profiles, extract_title_identity, form_for_path as cemu_form_for_path,
     inspect_config as cemu_inspect_config, inspect_extracted_layout,
     keys_evidence as cemu_keys_evidence, parse_cemu_version, resolve_cemu_native_launch_binding,
+};
+pub use cheat_applicability::{
+    CheatApplicabilityFinding, CheatApplicabilityFindingKind, CheatApplicabilityInput,
+    CheatApplicabilityIssue, CheatApplicabilityMatch, CheatApplicabilityPresentation,
+    CheatApplicabilityReport, CheatApplicabilityState, CheatApplicabilitySupport,
+    CheatGameAssociation, CheatIdentityRequirement, CheatParseEvidence, CheatReleaseEvidence,
+    CheatSelectedGame, CheatSupportState, assess_cheat_applicability,
 };
 pub use cheat_cache_maintenance::{
     CHEAT_CACHE_MAINTENANCE_SCHEMA_VERSION, CachePruneDisposition, CachePruneEntryKind,
