@@ -301,17 +301,29 @@ impl App {
         egui::TopBottomPanel::bottom("v2_activity_bar").show(context, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let running = self.activity.running();
-                if running == 0 {
+                let queued = self.activity.queued();
+                if running == 0 && queued == 0 {
                     ui.label("Ready · browsing does not change your game files");
                 } else {
-                    ui.spinner();
-                    ui.label(format!("{running} jobs in progress"));
+                    if running > 0 {
+                        ui.spinner();
+                    }
+                    ui.label(format!(
+                        "{} active jobs · {running} running · {queued} waiting",
+                        running + queued
+                    ));
                 }
                 if ui.button("View Activity").clicked() {
                     self.go(Route::Section(Section::Activity));
                 }
             });
-            if let Some(job) = self.activity.jobs.values().rev().find(|job| job.active()) {
+            if let Some(job) = self
+                .activity
+                .jobs
+                .values()
+                .rev()
+                .find(|job| job.phase == Phase::Running)
+            {
                 ui.label(&job.title);
                 if let Some(fraction) = job.fraction() {
                     ui.add(egui::ProgressBar::new(fraction).show_percentage());
@@ -2771,7 +2783,7 @@ impl App {
             }
             ui.collapsing("Advanced details", |ui| {
                 ui.label("Migration status: deliberate legacy handoff. Existing safety checks, previews and confirmations remain authoritative.");
-                ui.label("The v2 Activity page tracks opening the window. Jobs started there report progress inside that window, not here.");
+                ui.label("Opening the separate window is an immediate handoff. Jobs started there report progress inside that window, not here.");
                 if ui.button("Open full technical interface").clicked() { self.legacy(Section::Advanced); }
             });
         });

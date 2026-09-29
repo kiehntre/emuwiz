@@ -385,6 +385,29 @@ impl App {
         }
     }
 
+    fn romm_library_load_needed(&self) -> bool {
+        self.router.current.section() == Section::Romm
+            && self.romm_library.snapshot.is_none()
+            && self.romm_library_job.is_none()
+    }
+
+    fn settle_romm_library_load(
+        &mut self,
+        id: u64,
+        result: Result<romm_library::RommBrowserSnapshot, String>,
+    ) -> bool {
+        if self.romm_library_job != Some(id) {
+            return false;
+        }
+        self.romm_library_job = None;
+        self.romm_library.loading = false;
+        self.romm_library.snapshot = Some(match result {
+            Ok(snapshot) => snapshot,
+            Err(error) => romm_library::RommBrowserSnapshot::unavailable(error),
+        });
+        true
+    }
+
     fn start_romm_library_operation(&mut self, operation: romm_library::RommLibraryOperation) {
         if self.romm_library.operation.is_some() {
             return;
@@ -754,12 +777,12 @@ impl App {
             .game()
             .and_then(|id| self.library.game(id))
             .map(|game| game.archive.absolute_path.clone());
-        let id = self.activity.queue(
-            "Opening the existing workflow",
-            self.router.current.clone(),
-            false,
-        );
-        self.send(id, Command::Legacy { section, path });
+        if let Err(error) = legacy::open(section, path.as_deref()) {
+            self.notice = Some(Notice {
+                message: "The existing workflow could not be opened.".into(),
+                technical: error,
+            });
+        }
     }
 
     fn start_canonical_organisation_job(&mut self, kind: CanonicalOrganisationJobKind) {
@@ -797,24 +820,43 @@ impl App {
 
     fn finish_canonical_organisation_job(
         &mut self,
+        id: u64,
         kind: CanonicalOrganisationJobKind,
         state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
         generation: u64,
     ) {
-        let Some(job) = self.canonical_organisation_job.take() else {
+        let Some(job) = self.canonical_organisation_job.as_ref() else {
+            self.activity.supersede(
+                id,
+                "The organisation result no longer has an active request.".into(),
+            );
             return;
         };
+        if job.id != id {
+            self.activity.supersede(
+                id,
+                "A newer organisation request replaced this result.".into(),
+            );
+            return;
+        }
+        let job = self
+            .canonical_organisation_job
+            .take()
+            .expect("matching current job checked above");
         if job.kind != kind || job.generation != generation {
+            self.activity.supersede(
+                job.id,
+                "The organisation result did not match its request and was discarded.".into(),
+            );
             return;
         }
         if kind == CanonicalOrganisationJobKind::Preview
             && (generation != self.canonical_organisation_generation
                 || job.input_fingerprint != self.canonical_organisation.input_fingerprint())
         {
-            self.activity.finish(
+            self.activity.supersede(
                 job.id,
                 "The preview was discarded because the organisation settings changed. Preview again.".into(),
-                None,
             );
             return;
         }
@@ -1014,14 +1056,32 @@ impl App {
 
     fn finish_playing_library_job(
         &mut self,
+        id: u64,
         kind: PlayingLibraryJobKind,
         state: Box<PlayingLibraryPageState>,
         generation: u64,
     ) {
-        let Some(job) = self.playing_library_job.take() else {
+        let Some(job) = self.playing_library_job.as_ref() else {
+            self.activity.supersede(
+                id,
+                "The library result no longer has an active request.".into(),
+            );
             return;
         };
+        if job.id != id {
+            self.activity
+                .supersede(id, "A newer library request replaced this result.".into());
+            return;
+        }
+        let job = self
+            .playing_library_job
+            .take()
+            .expect("matching current job checked above");
         if job.kind != kind || job.generation != generation {
+            self.activity.supersede(
+                job.id,
+                "The library result did not match its request and was discarded.".into(),
+            );
             return;
         }
         match kind {
@@ -1029,10 +1089,9 @@ impl App {
                 if generation != self.playing_library_generation
                     || job.input_fingerprint != self.playing_library.input_fingerprint()
                 {
-                    self.activity.finish(
+                    self.activity.supersede(
                         job.id,
                         "The preview was discarded because the library settings changed. Plan again to review the new settings.".into(),
-                        None,
                     );
                     return;
                 }
@@ -1109,10 +1168,9 @@ impl App {
                     && (generation != self.playing_library_generation
                         || job.input_fingerprint != self.playing_library.input_fingerprint())
                 {
-                    self.activity.finish(
+                    self.activity.supersede(
                         job.id,
                         "The result was discarded because the source, destination or preferences changed. Preview again.".into(),
-                        None,
                     );
                     return;
                 }
@@ -1230,11 +1288,6 @@ impl App {
                     }
                     match outcome {
                         Ok(payload) => {
-                            self.activity.finish(
-                                id,
-                                "Complete. Open the result to continue.".into(),
-                                None,
-                            );
                             match payload {
                                 Payload::Environment(snapshot) => {
                                     self.environment_job = None;
@@ -1245,9 +1298,7 @@ impl App {
                                     }
                                 }
                                 Payload::RommLibrary(snapshot) => {
-                                    self.romm_library.snapshot = Some(snapshot);
-                                    self.romm_library.loading = false;
-                                    self.romm_library_job = None;
+                                    self.settle_romm_library_load(id, Ok(snapshot));
                                 }
                                 Payload::RommOperation {
                                     operation,
@@ -1396,6 +1447,7 @@ impl App {
                                 }
                                 Payload::PlayingLibraryPreview { state, generation } => {
                                     self.finish_playing_library_job(
+                                        id,
                                         PlayingLibraryJobKind::Preview,
                                         state,
                                         generation,
@@ -1403,6 +1455,7 @@ impl App {
                                 }
                                 Payload::PlayingLibraryApply { state, generation } => {
                                     self.finish_playing_library_job(
+                                        id,
                                         PlayingLibraryJobKind::Apply,
                                         state,
                                         generation,
@@ -1413,17 +1466,24 @@ impl App {
                                     generation,
                                     kind,
                                 } => {
-                                    self.finish_playing_library_job(kind, state, generation);
+                                    self.finish_playing_library_job(id, kind, state, generation);
                                 }
                                 Payload::CanonicalOrganisation {
                                     state,
                                     generation,
                                     kind,
                                 } => {
-                                    self.finish_canonical_organisation_job(kind, state, generation);
+                                    self.finish_canonical_organisation_job(
+                                        id, kind, state, generation,
+                                    );
                                 }
                                 Payload::Done => {}
                             }
+                            self.activity.finish(
+                                id,
+                                "Complete. Open the result to continue.".into(),
+                                None,
+                            );
                         }
                         Err(error) => {
                             if self
@@ -1453,10 +1513,7 @@ impl App {
                             if self.undo_job == Some(id) {
                                 self.undo_job = None;
                             }
-                            if self.romm_library_job == Some(id) {
-                                self.romm_library_job = None;
-                                self.romm_library.loading = false;
-                            }
+                            self.settle_romm_library_load(id, Err(error.clone()));
                             if self
                                 .romm_library
                                 .operation
@@ -1483,6 +1540,15 @@ impl App {
                                 // Startup housekeeping (preference restore and history
                                 // discovery) is intentionally untracked. It must not turn a
                                 // recoverable diagnostic detail into a global warning banner.
+                                if let Some(title) = title {
+                                    self.activity.finish(
+                                        id,
+                                        format!(
+                                            "{title} failed. See activity details for the reason."
+                                        ),
+                                        Some(error.clone()),
+                                    );
+                                }
                                 log::warn!("GUI v2 background operation {id} failed: {error}");
                             }
                         }
@@ -1516,10 +1582,7 @@ impl App {
                 },
             );
         }
-        if self.router.current.section() == Section::Romm
-            && self.romm_library.snapshot.is_none()
-            && self.romm_library_job.is_none()
-        {
+        if self.romm_library_load_needed() {
             let id =
                 self.activity
                     .queue("Loading RomM library", Route::Section(Section::Romm), false);
@@ -1565,7 +1628,7 @@ impl App {
                 }),
             );
         }
-        if self.activity.running() > 0
+        if self.activity.active() > 0
             || self.artwork.active() > 0
             || self.filter_dirty.is_some()
             || self.preferences_dirty.is_some()

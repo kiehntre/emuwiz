@@ -889,7 +889,12 @@ fn gui_v2_stale_playing_library_preview_is_discarded() {
         input_fingerprint: "old-input".into(),
     });
     let result = app.playing_library.clone();
-    app.finish_playing_library_job(super::PlayingLibraryJobKind::Preview, Box::new(result), 1);
+    app.finish_playing_library_job(
+        activity_id,
+        super::PlayingLibraryJobKind::Preview,
+        Box::new(result),
+        1,
+    );
     assert!(app.playing_library_job.is_none());
     assert!(
         app.activity
@@ -922,7 +927,12 @@ fn gui_v2_changed_then_restored_playing_library_input_stays_stale() {
     app.invalidate_changed_playing_library_plan();
     app.playing_library.source_root_draft = original;
     let result = app.playing_library.clone();
-    app.finish_playing_library_job(super::PlayingLibraryJobKind::Preview, Box::new(result), 1);
+    app.finish_playing_library_job(
+        activity_id,
+        super::PlayingLibraryJobKind::Preview,
+        Box::new(result),
+        1,
+    );
     assert!(
         app.activity
             .jobs
@@ -979,6 +989,7 @@ fn gui_v2_stale_canonical_organisation_preview_is_discarded() {
         input_fingerprint: "older-settings".into(),
     });
     app.finish_canonical_organisation_job(
+        activity_id,
         super::CanonicalOrganisationJobKind::Preview,
         Box::new(app.canonical_organisation.clone()),
         1,
@@ -1007,6 +1018,7 @@ fn gui_v2_stale_romm_projection_result_is_discarded() {
         input_fingerprint: "old-preferences".into(),
     });
     app.finish_playing_library_job(
+        activity_id,
         super::PlayingLibraryJobKind::PreviewRomm,
         Box::new(app.playing_library.clone()),
         3,
@@ -2356,6 +2368,139 @@ fn gui_v2_activity_covers_all_states_and_never_invents_eta() {
     activity.jobs[&id].request_cancel();
     activity.finish(id, "Cancelled".into(), None);
     assert_eq!(activity.jobs[&id].phase, Phase::Cancelled);
+    assert_eq!(activity.active(), 0);
+    assert_eq!(activity.running(), 0);
+    assert_eq!(activity.queued(), 0);
+
+    let id = activity.queue("Failed", Route::Home, false);
+    activity.start(id);
+    activity.finish(id, "Failed".into(), Some("failure".into()));
+    assert_eq!(activity.jobs[&id].phase, Phase::Failed);
+    assert_eq!(activity.active(), 0);
+
+    let id = activity.queue("Superseded", Route::Home, false);
+    activity.supersede(id, "A newer request replaced this one.".into());
+    assert_eq!(activity.jobs[&id].phase, Phase::Superseded);
+    activity.start(id);
+    activity.finish(id, "Late completion".into(), None);
+    assert_eq!(activity.jobs[&id].phase, Phase::Superseded);
+    assert_eq!(activity.active(), 0);
+}
+
+#[test]
+fn gui_v2_normal_route_navigation_does_not_create_activity_jobs() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let routes = [
+        Route::Section(Section::Games),
+        Route::Section(Section::Setup),
+        Route::Section(Section::Problems),
+        Route::Section(Section::Games),
+        Route::Section(Section::Games),
+        Route::Section(Section::Activity),
+    ];
+    for route in routes {
+        app.go(route);
+        assert_eq!(app.activity.active(), 0);
+        assert!(app.activity.jobs.is_empty());
+    }
+}
+
+#[test]
+fn gui_v2_romm_failed_initial_load_settles_without_retry_churn() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Romm);
+    assert!(app.romm_library_load_needed());
+    let id = app
+        .activity
+        .queue("Loading RomM library", app.router.current.clone(), true);
+    app.activity.start(id);
+    app.romm_library_job = Some(id);
+    app.romm_library.loading = true;
+
+    assert!(app.settle_romm_library_load(id, Err("fixture load failure".into())));
+    app.activity.finish(
+        id,
+        "RomM library could not be loaded.".into(),
+        Some("fixture load failure".into()),
+    );
+
+    assert_eq!(app.activity.jobs[&id].phase, Phase::Failed);
+    assert_eq!(app.activity.active(), 0);
+    assert_eq!(app.romm_library_job, None);
+    assert!(!app.romm_library.loading);
+    assert_eq!(
+        app.romm_library.snapshot.as_ref().unwrap().status,
+        "fixture load failure"
+    );
+    assert!(!app.romm_library_load_needed());
+}
+
+#[test]
+fn gui_v2_activity_view_and_footer_use_the_authoritative_job_registry() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let queued = app.activity.queue("Queued fixture", Route::Home, true);
+    let running = app.activity.queue("Running fixture", Route::Home, true);
+    app.activity.start(running);
+    let complete = app.activity.queue("Completed fixture", Route::Home, false);
+    app.activity.finish(complete, "Done".into(), None);
+
+    app.router.current = Route::Section(Section::Activity);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert_eq!(app.activity.active(), 2);
+    assert_eq!(
+        app.activity.active(),
+        app.activity.queued() + app.activity.running()
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("2 active jobs · 1 running · 1 waiting"))
+    );
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Running fixture"))
+    );
+    assert!(app.activity.jobs[&queued].active());
+    assert!(app.activity.jobs[&complete].phase == Phase::Complete);
+}
+
+#[test]
+fn gui_v2_real_worker_job_completes_and_leaves_activity_snapshot_inactive() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let id = app.activity.queue("Filter fixture", Route::Home, false);
+    let command = super::backend::Command::Filter {
+        library: Arc::new(Library::default()),
+        filter: Filter::default(),
+        generation: 42,
+    };
+    assert!(app.send(id, command));
+
+    for _ in 0..200 {
+        app.poll(&context);
+        if !app.activity.jobs[&id].active() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(app.activity.jobs[&id].phase, Phase::Complete);
+    assert_eq!(app.activity.active(), 0);
+    assert_eq!(app.activity.running(), 0);
+    assert_eq!(app.activity.queued(), 0);
+
+    app.router.current = Route::Section(Section::Activity);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|value| value.contains("Filter fixture")));
+    assert!(strings.iter().any(|value| value.contains("Finished")));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Ready · browsing does not change your game files"))
+    );
 }
 
 #[test]

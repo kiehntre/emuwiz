@@ -14,6 +14,7 @@ pub(super) enum Phase {
     Complete,
     Failed,
     Cancelled,
+    Superseded,
 }
 
 impl Phase {
@@ -24,6 +25,7 @@ impl Phase {
             Self::Complete => "Finished",
             Self::Failed => "Needs attention",
             Self::Cancelled => "Stopped",
+            Self::Superseded => "Superseded",
         }
     }
 }
@@ -104,13 +106,18 @@ impl Activity {
     }
     pub fn start(&mut self, id: u64) {
         if let Some(job) = self.jobs.get_mut(&id) {
+            if job.phase != Phase::Queued {
+                return;
+            }
             job.phase = Phase::Running;
             job.started = Some(Instant::now());
             job.summary = "Working. You can keep browsing.".into();
         }
     }
     pub fn finish(&mut self, id: u64, summary: String, error: Option<String>) {
-        if let Some(job) = self.jobs.get_mut(&id) {
+        if let Some(job) = self.jobs.get_mut(&id)
+            && job.active()
+        {
             job.phase = if error.is_some() {
                 Phase::Failed
             } else if job
@@ -127,7 +134,32 @@ impl Activity {
             job.finished = Some(Instant::now());
         }
     }
+
+    pub fn supersede(&mut self, id: u64, summary: String) {
+        if let Some(job) = self.jobs.get_mut(&id)
+            && job.active()
+        {
+            job.phase = Phase::Superseded;
+            job.summary = summary;
+            job.finished = Some(Instant::now());
+        }
+    }
+
+    pub fn queued(&self) -> usize {
+        self.jobs
+            .values()
+            .filter(|job| job.phase == Phase::Queued)
+            .count()
+    }
+
     pub fn running(&self) -> usize {
-        self.jobs.values().filter(|job| job.active()).count()
+        self.jobs
+            .values()
+            .filter(|job| job.phase == Phase::Running)
+            .count()
+    }
+
+    pub fn active(&self) -> usize {
+        self.queued() + self.running()
     }
 }

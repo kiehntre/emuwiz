@@ -5,7 +5,7 @@ use super::{
         SharedLibrary,
     },
     problems::ProblemSummary,
-    routes::{Route, Section},
+    routes::Route,
 };
 use crate::playing_library_page::PlayingLibraryPageState;
 use archivefs_core::identity_source::romm::manual::ManualOpener;
@@ -103,10 +103,6 @@ pub(super) enum Command {
     LoadRepairHistory,
     OpenFolder(PathBuf),
     OpenDocument(PathBuf),
-    Legacy {
-        section: Section,
-        path: Option<PathBuf>,
-    },
     Save(Preferences),
     Restore,
     PlayingLibraryPreview {
@@ -616,10 +612,6 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             archivefs_core::identity_source::romm::manual::DesktopManualOpener
                 .open(&path)
                 .map_err(|error| error.to_string())?;
-            Ok(Payload::Done)
-        }
-        Command::Legacy { section, path } => {
-            super::legacy::open(section, path.as_deref())?;
             Ok(Payload::Done)
         }
         Command::Save(preferences) => {
