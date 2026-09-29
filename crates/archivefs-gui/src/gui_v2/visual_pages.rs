@@ -233,7 +233,7 @@ impl App {
                         self.artwork
                             .pictures
                             .get(&self.artwork.key(**id, Kind::Cover)),
-                        Some(Picture::Missing | Picture::Failed(_))
+                        Some(Picture::Missing | Picture::Failed(_) | Picture::Unavailable { .. })
                     )
             })
             .filter_map(|id| library.game(*id))

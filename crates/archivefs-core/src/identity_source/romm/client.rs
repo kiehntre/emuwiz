@@ -281,7 +281,7 @@ impl RommTransport for UreqTransport {
 }
 
 /// A short classification of a transport failure, with no URL or header in it.
-fn classify_transport_error(error: &ureq::Error) -> String {
+pub(crate) fn classify_transport_error(error: &ureq::Error) -> String {
     match error {
         ureq::Error::ConnectionFailed => "the connection failed".to_string(),
         ureq::Error::HostNotFound => "the host could not be found".to_string(),

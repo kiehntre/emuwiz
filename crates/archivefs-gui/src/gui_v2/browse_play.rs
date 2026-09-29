@@ -294,6 +294,9 @@ impl App {
                 }
                 ui.label("Play opens the existing readiness and launch planner.");
                 self.picture(ui, game, Kind::Cover, SELECTED_COVER_SIZE);
+                ui.collapsing("Advanced details", |ui| {
+                    self.artwork_provider_details(ui, id);
+                });
                 ui.separator();
                 ui.label("More for this game");
                 ui.horizontal_wrapped(|ui| {

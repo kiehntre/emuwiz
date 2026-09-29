@@ -1075,10 +1075,12 @@ impl App {
     }
 
     pub(super) fn picture(&mut self, ui: &mut egui::Ui, game: &Game, kind: Kind, size: egui::Vec2) {
-        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
         if !ui.is_rect_visible(rect) {
             return;
         }
+        // Showing a picture is what starts artwork discovery.
+        self.ensure_artwork_index();
         let key = self.artwork.request(game.archive.id, kind);
         if let Some(Picture::Ready { texture, .. }) = self.artwork.pictures.get(&key) {
             ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
@@ -1097,14 +1099,34 @@ impl App {
             ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
             ui.painter()
                 .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
+            let label = super::artwork::picture_label(
+                self.artwork.preparing(),
+                self.artwork.paused,
+                self.artwork.pictures.get(&key),
+            );
             let labelled = size.x > 90.0 && size.y > 90.0;
+            // Lay the words out first so the hardware image leaves them room.
+            let font = egui::FontId::proportional(theme::METADATA_SIZE);
+            let wrap = (size.x - 12.0).max(40.0);
+            let galleys: Vec<_> = if labelled {
+                std::iter::once(label.headline.to_string())
+                    .chain(label.detail.clone())
+                    .map(|text| {
+                        ui.painter()
+                            .layout(text, font.clone(), theme::SECONDARY_TEXT, wrap)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let text_height: f32 = galleys.iter().map(|galley| galley.size().y).sum();
             let side = if labelled {
-                (size.x.min(size.y - 34.0)) * 0.72
+                (size.x.min(size.y - text_height - 22.0)).max(24.0) * 0.72
             } else {
                 size.x.min(size.y) * 0.82
             };
             let centre = if labelled {
-                rect.center() - egui::vec2(0.0, 12.0)
+                rect.center() - egui::vec2(0.0, text_height / 2.0)
             } else {
                 rect.center()
             };
@@ -1114,21 +1136,19 @@ impl App {
                 &game.platform,
                 Color32::from_white_alpha(150),
             );
-            if labelled {
-                let label = match self.artwork.pictures.get(&key) {
-                    Some(Picture::Missing) => "No picture yet",
-                    Some(Picture::Failed(_)) => "Picture unavailable",
-                    _ if self.artwork.paused => "Pictures paused",
-                    _ => "Loading picture…",
-                };
-                ui.painter().text(
-                    rect.center_bottom() - egui::vec2(0.0, 10.0),
-                    egui::Align2::CENTER_BOTTOM,
-                    label,
-                    egui::FontId::proportional(theme::METADATA_SIZE),
-                    theme::SECONDARY_TEXT,
-                );
+            let mut bottom = rect.bottom() - 8.0;
+            for galley in galleys.into_iter().rev() {
+                bottom -= galley.size().y;
+                let x = rect.center().x - galley.size().x / 2.0;
+                ui.painter()
+                    .galley(egui::pos2(x, bottom), galley, theme::SECONDARY_TEXT);
             }
+            // Small tiles have no room for words; the tooltip carries them.
+            let hover = match &label.detail {
+                Some(detail) => format!("{}\n{detail}", label.headline),
+                None => label.headline.to_string(),
+            };
+            response.on_hover_text(hover);
         }
     }
 
@@ -2180,7 +2200,7 @@ impl App {
                 });
             });
             let key = self.artwork.key(id, Kind::Cover);
-            if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_))) && ui.button("Retry picture").clicked() { self.artwork.retry(key); }
+            if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_) | Picture::Unavailable { .. })) && ui.button("Retry picture").clicked() { self.artwork.retry(key); }
             if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&id)) {
                 ui.add_space(theme::SPACE_MD);
                 ui.label(RichText::new("About this game").size(theme::SECTION_TITLE_SIZE).strong());
@@ -2206,7 +2226,7 @@ impl App {
                         ui.vertical(|ui| {
                             self.picture(ui, game, Kind::Screenshot(ordinal), egui::vec2(320.0, 240.0));
                             let key = self.artwork.key(id, Kind::Screenshot(ordinal));
-                            if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_))) && ui.button(format!("Retry screenshot {}", ordinal + 1)).clicked() { self.artwork.retry(key); }
+                            if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_) | Picture::Unavailable { .. })) && ui.button(format!("Retry screenshot {}", ordinal + 1)).clicked() { self.artwork.retry(key); }
                         });
                     }
                 });
@@ -2230,10 +2250,72 @@ impl App {
                     Some(Picture::Failed(error)) => { ui.label(error); }
                     _ => {}
                 }
+                self.artwork_provider_details(ui, id);
             });
             self.save_backups_panel(ui, game);
             self.documents_panel(ui, id, game);
         });
+    }
+
+    /// Technical artwork diagnosis for Advanced details. Never shows a token;
+    /// the endpoint is shown as configured, without any user-information part.
+    pub(super) fn artwork_provider_details(&self, ui: &mut egui::Ui, id: i64) {
+        use archivefs_core::identity_source::romm::connectivity::displayable_endpoint;
+        let key = self.artwork.key(id, Kind::Cover);
+        let Some(index) = self.artwork.index.as_ref() else {
+            ui.label("Artwork: the artwork index is still being prepared.");
+            return;
+        };
+        let source = &index.settings.source;
+        let endpoint = if source.url.trim().is_empty() {
+            "not configured".to_string()
+        } else {
+            displayable_endpoint(&source.url)
+        };
+        ui.label(format!("RomM endpoint: {endpoint}"));
+        ui.label(format!(
+            "RomM online artwork: {}",
+            if source.enabled { "on" } else { "off" }
+        ));
+        match self.artwork.health.snapshot() {
+            Some((state, age)) => ui.label(format!(
+                "RomM provider state: {} (last checked {}s ago)",
+                state.technical_label(),
+                age.as_secs()
+            )),
+            None => ui.label("RomM provider state: no online request has been needed yet"),
+        };
+        ui.label(format!(
+            "Cover source: {}",
+            match index.source(id, Kind::Cover) {
+                Some(super::media_sources::Source::Local(path)) =>
+                    format!("local file {}", path.display()),
+                Some(super::media_sources::Source::Remote { .. }) =>
+                    "RomM (remote; served from the local cache when cached)".to_string(),
+                None => "none found".to_string(),
+            }
+        ));
+        match self.artwork.pictures.get(&key) {
+            Some(Picture::Ready { timings, .. }) => {
+                ui.label(format!(
+                    "Cached image used: {}",
+                    if timings.cache_hit { "yes" } else { "no" }
+                ));
+            }
+            Some(Picture::Unavailable { issue, .. }) => {
+                ui.label(format!(
+                    "An uncached RomM picture exists but could not be fetched: {}",
+                    issue.technical_label()
+                ));
+            }
+            _ => {}
+        }
+        if let Some(wait) = self.artwork.retry_in(key) {
+            ui.label(format!(
+                "Automatic retry: in about {}s while this picture stays on screen",
+                wait.as_secs()
+            ));
+        }
     }
 
     fn save_backups_panel(&mut self, ui: &mut egui::Ui, game: &Game) {

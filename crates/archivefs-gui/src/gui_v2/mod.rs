@@ -575,16 +575,27 @@ impl App {
             self.saves_states.loading = false;
         }
     }
+    /// Any surface that shows artwork calls this. The first request after a
+    /// catalogue load builds the index in the background (never on the UI
+    /// thread); later requests find it building or built and do nothing, so
+    /// there is one index however many surfaces ask. Browse & Play is a
+    /// consumer like any other: nothing needs to visit Museum first.
+    fn ensure_artwork_index(&mut self) {
+        if self.loaded && self.artwork.index.is_none() && !self.artwork.index_loading {
+            self.start_artwork_index("Preparing artwork");
+        }
+    }
     fn refresh_artwork_index(&mut self) {
+        self.start_artwork_index("Refreshing metadata and artwork");
+    }
+    fn start_artwork_index(&mut self, label: &str) {
         if self.artwork.index_loading {
             return;
         }
         self.artwork.reload(self.library.clone());
-        let id = self.activity.queue(
-            "Refreshing metadata and artwork",
-            Route::Section(Section::Artwork),
-            false,
-        );
+        let id = self
+            .activity
+            .queue(label, Route::Section(Section::Artwork), false);
         self.activity.start(id);
         self.index_job = Some(id);
     }

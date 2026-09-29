@@ -52,7 +52,7 @@ fn fixture(context: &egui::Context) -> App {
         detail_generation: 0,
         detail_failed: None,
         activity: Activity::default(),
-        artwork: Artwork::start(context.clone()),
+        artwork: Artwork::with_indexer(context.clone(), None, Arc::new(|_| MediaIndex::default())),
         imagery: super::imagery::Imagery::default(),
         load_job: None,
         artwork_job: None,
@@ -475,11 +475,9 @@ fn museum_titles_offer_details_and_play_routes() {
     let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
     assert!(strings.iter().any(|value| value == "Details"));
     assert!(strings.iter().any(|value| value == "Play"));
-    assert!(
-        strings
-            .iter()
-            .any(|value| value.contains("No picture yet") || value.contains("Loading picture"))
-    );
+    assert!(strings.iter().any(|value| value.contains("No picture yet")
+        || value.contains("Loading picture")
+        || value.contains("Preparing artwork")));
 }
 
 fn frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
@@ -4045,7 +4043,7 @@ fn gui_v2_real_catalogue_timings() {
             states[match picture {
                 Picture::Loading => 0,
                 Picture::Missing => 1,
-                Picture::Failed(_) => 2,
+                Picture::Failed(_) | Picture::Unavailable { .. } => 2,
                 Picture::Ready { .. } => 3,
             }] += 1;
         }
@@ -4195,7 +4193,7 @@ fn gui_v2_real_catalogue_timings() {
         states[match picture {
             Picture::Loading => 0,
             Picture::Missing => 1,
-            Picture::Failed(_) => 2,
+            Picture::Failed(_) | Picture::Unavailable { .. } => 2,
             Picture::Ready { .. } => 3,
         }] += 1;
     }
@@ -4952,4 +4950,187 @@ fn no_route_shows_its_title_more_often_than_the_chrome_explains() {
         }
     }
     assert!(offenders.is_empty(), "{offenders:#?}");
+}
+
+// ---- Artwork startup: any artwork-consuming surface starts the one index ----
+
+/// An app whose artwork index is built by a counting fake (never the real
+/// provider data) and whose only cover is a real local PNG.
+fn startup_fixture(
+    context: &egui::Context,
+    directory: &Path,
+    delay: Duration,
+) -> (App, Arc<std::sync::atomic::AtomicUsize>) {
+    let cover = directory.join("cover.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]))
+        .save(&cover)
+        .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = calls.clone();
+    let mut app = fixture(context);
+    app.artwork = Artwork::with_indexer(
+        context.clone(),
+        Some(directory.join("cache")),
+        Arc::new(move |library| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(delay);
+            let mut index = MediaIndex::default();
+            for game in &library.games {
+                index
+                    .covers
+                    .insert(game.archive.id, Source::Local(cover.clone()));
+            }
+            index
+        }),
+    );
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Crash Test", Some("PSX")),
+        archive(2, "Mario Fixture", Some("SNES")),
+        archive(3, "Mystery Disc", None),
+    ]));
+    app.indices = (0..app.library.games.len()).collect();
+    app.loaded = true;
+    (app, calls)
+}
+
+fn pump_until(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    done: impl Fn(&App) -> bool,
+) -> egui::FullOutput {
+    let start = Instant::now();
+    let mut output = frame(context, app, size);
+    while !done(app) && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(10));
+        app.poll(context);
+        output = frame(context, app, size);
+    }
+    output
+}
+
+#[test]
+fn gui_v2_browse_play_alone_starts_artwork_and_ends_with_a_cover() {
+    let context = egui::Context::default();
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, calls) = startup_fixture(&context, directory.path(), Duration::from_millis(400));
+    // No Museum, no Artwork & Extras: straight to Browse & Play.
+    app.router.current = Route::BrowsePlay;
+    assert!(app.artwork.index.is_none() && !app.artwork.index_loading);
+
+    let first = frame(&context, &mut app, [1280.0, 820.0]);
+    assert!(
+        app.artwork.index_loading,
+        "showing covers must start the index"
+    );
+    assert!(
+        text(&first)
+            .iter()
+            .any(|value| value == "Preparing artwork…"),
+        "an honest preparing state, not a permanent 'Loading picture…'"
+    );
+    assert!(
+        !text(&first).iter().any(|value| value == "Loading picture…"),
+        "nothing is loading yet: there is no index to load from"
+    );
+
+    // The GUI stays interactive: frames keep running while the index builds.
+    let started = Instant::now();
+    frame(&context, &mut app, [1280.0, 820.0]);
+    assert!(started.elapsed() < Duration::from_millis(300));
+
+    pump_until(&context, &mut app, [1280.0, 820.0], |app| {
+        let key = app.artwork.key(1, Kind::Cover);
+        matches!(app.artwork.pictures.get(&key), Some(Picture::Ready { .. }))
+    });
+    let key = app.artwork.key(1, Kind::Cover);
+    assert!(matches!(
+        app.artwork.pictures.get(&key),
+        Some(Picture::Ready { .. })
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gui_v2_artwork_index_is_built_once_however_many_surfaces_ask() {
+    let context = egui::Context::default();
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, calls) = startup_fixture(&context, directory.path(), Duration::from_millis(150));
+    app.router.current = Route::BrowsePlay;
+    // Several frames while the build is running: still one build.
+    for _ in 0..5 {
+        frame(&context, &mut app, [1280.0, 820.0]);
+    }
+    pump_until(&context, &mut app, [1280.0, 820.0], |app| {
+        app.artwork.index.is_some()
+    });
+    let index = app.artwork.index.clone().unwrap();
+    let generation = app.artwork.generation;
+
+    // Museum and Artwork & Extras afterwards reuse it.
+    app.router.current = Route::Section(Section::Museum);
+    frame(&context, &mut app, [1280.0, 820.0]);
+    app.router.current = Route::Task {
+        section: Section::Artwork,
+        game: 1,
+    };
+    frame(&context, &mut app, [1280.0, 820.0]);
+    app.router.current = Route::BrowsePlayGame(2);
+    frame(&context, &mut app, [1280.0, 820.0]);
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no second index build");
+    assert_eq!(app.artwork.generation, generation);
+    assert!(Arc::ptr_eq(&index, app.artwork.index.as_ref().unwrap()));
+}
+
+#[test]
+fn gui_v2_museum_still_starts_the_index_when_it_is_the_first_surface() {
+    let context = egui::Context::default();
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, calls) = startup_fixture(&context, directory.path(), Duration::from_millis(10));
+    app.router.current = Route::Section(Section::Museum);
+    pump_until(&context, &mut app, [1280.0, 820.0], |app| {
+        app.artwork.index.is_some()
+    });
+    app.router.current = Route::BrowsePlay;
+    frame(&context, &mut app, [1280.0, 820.0]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn gui_v2_no_index_build_starts_before_the_catalogue_is_loaded() {
+    let context = egui::Context::default();
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, calls) = startup_fixture(&context, directory.path(), Duration::from_millis(10));
+    app.loaded = false;
+    app.router.current = Route::BrowsePlay;
+    frame(&context, &mut app, [1280.0, 820.0]);
+    assert!(!app.artwork.index_loading);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn gui_v2_switching_games_never_shows_the_previous_games_result() {
+    let context = egui::Context::default();
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, _) = startup_fixture(&context, directory.path(), Duration::from_millis(10));
+    for route in [
+        Route::BrowsePlayGame(1),
+        Route::BrowsePlayGame(2),
+        Route::BrowsePlayGame(3),
+        Route::BrowsePlayGame(1),
+    ] {
+        app.router.current = route;
+        frame(&context, &mut app, [1280.0, 820.0]);
+    }
+    pump_until(&context, &mut app, [1280.0, 820.0], |app| {
+        app.artwork.index.is_some()
+    });
+    // Every stored picture is under its own game's key.
+    for (key, picture) in &app.artwork.pictures {
+        assert_eq!(key.generation, app.artwork.generation);
+        if let Picture::Ready { .. } = picture {
+            assert!((1..=3).contains(&key.game));
+        }
+    }
 }
