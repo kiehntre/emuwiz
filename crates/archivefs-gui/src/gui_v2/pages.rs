@@ -2085,7 +2085,7 @@ impl App {
                     } else { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking saved information and looking for installed emulators…"); }); }
                     ui.add_space(theme::SPACE_SM);
                     ui.horizontal_wrapped(|ui| {
-                        for (label, section) in [("Verify", Section::Check), ("Artwork & Metadata", Section::Artwork), ("Mods & Cheats", Section::Mods), ("Saves & States", Section::Saves), ("Fix Problems", Section::Problems)] {
+                        for (label, section) in [("Verify", Section::Check), ("Artwork, Manuals & Extras", Section::Artwork), ("Mods & Cheats", Section::Mods), ("Saves & States", Section::Saves), ("Fix Problems", Section::Problems)] {
                             if ui.button(label).clicked() {
                                 if matches!(section, Section::Check) {
                                     self.check_platform = Some(game.platform.clone());
@@ -2204,12 +2204,6 @@ impl App {
 
     fn documents_panel(&mut self, ui: &mut egui::Ui, game_id: i64, game: &Game) {
         let path = game.archive.absolute_path.clone();
-        // A stale/mocked catalogue row has no filesystem evidence to browse.
-        // Keep the existing detail layout compact in that case; real local
-        // rows reach the empty state and nearby-document discovery below.
-        if !path.exists() {
-            return;
-        }
         let needs_discovery = self
             .document_cache
             .as_ref()
@@ -2245,10 +2239,13 @@ impl App {
             .as_ref()
             .map(|(_, _, documents)| documents.clone())
             .unwrap_or_default();
-        ui.collapsing("Manuals & Guides", |ui| {
-            ui.label("Local documents only. EmuWiz never downloads, extracts permanently, or changes them.");
+        egui::CollapsingHeader::new("Manuals & Guides")
+            .id_salt(("v2_manuals", game_id))
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("Only documents available on this computer are shown. EmuWiz never downloads or changes them.");
             if documents.is_empty() {
-                ui.weak("No manuals or guides are linked to this game yet.");
+                ui.weak("No manual is associated with this game. No artwork state is affected.");
                 return;
             }
             for document in documents {
@@ -2259,7 +2256,15 @@ impl App {
                     ui.label(format!("{} · {}", document.format.label(), document.page_count.map_or("page count unknown".into(), |count| format!("{count} pages"))));
                     ui.weak(document.kind.label());
                 });
-                ui.label(format!("{} · {} · {}", document.association_reason, document.source_label(), document.path.display()));
+                match &document.association {
+                    super::documents::GameDocumentAssociation::Explicit
+                    | super::documents::GameDocumentAssociation::ExactGameIdentity(_) => {
+                        ui.label("This manual is associated with the selected game.");
+                    }
+                    _ => {
+                        ui.label("Needs review · this document is nearby or its filename resembles the game; ownership is not confirmed.");
+                    }
+                }
                 if let Some(page) = super::documents::safe_resume_page(
                     self.document_preferences.reading.get(&document.path),
                     document.page_count,
@@ -2316,12 +2321,19 @@ impl App {
                         self.preferences_dirty = Some(std::time::Instant::now());
                     }
                     if document.viewer != super::documents::DocumentOpenCapability::Supported {
-                        ui.weak("No supported local viewer");
+                        ui.weak(match document.viewer {
+                            super::documents::DocumentOpenCapability::NoHandler => "No desktop application is available to open this format.",
+                            super::documents::DocumentOpenCapability::UnsupportedFormat => "CBR is recognised, but opening it is not supported by EmuWiz.",
+                            super::documents::DocumentOpenCapability::MissingFile => "The document file is no longer available.",
+                            super::documents::DocumentOpenCapability::Supported => "",
+                        });
                     }
                 });
                 ui.collapsing("View details", |ui| {
+                    ui.label(format!("Association evidence: {}", document.association_reason));
+                    ui.label(format!("Source: {}", document.source_label()));
+                    ui.monospace(format!("Path: {}", document.path.display()));
                     ui.label(format!("File size: {} bytes", document.file_size));
-                    ui.label(format!("Provenance: {}", document.source_label()));
                     ui.label(format!("Association confidence: {}", document.association.label()));
                     ui.label("Opening a document uses your desktop viewer; the source file is read-only to EmuWiz.");
                 });
@@ -2419,6 +2431,8 @@ impl App {
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        workflows.show_artwork_provider_setup(ui, &mut self.activity);
+        ui.separator();
         workflows.show_sources(ui, &mut self.activity);
         ui.separator();
         self.hackhash.show(ui);
@@ -2532,7 +2546,7 @@ impl App {
             .id_salt(("v2_artwork_metadata", selected))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.label("Existing local media and provider evidence is matched by exact game identity. EmuWiz does not guess from similar titles.");
+                ui.label("Review artwork, manuals and supported extras for one game. Provider setup stays in Sources & Providers.");
                 if ui
                     .add_enabled(!self.artwork.index_loading, egui::Button::new("Recheck providers"))
                     .clicked()
@@ -2550,10 +2564,9 @@ impl App {
                     );
                     ui.heading("Library artwork");
                     ui.label(format!("{covers} covers · {screenshots} games with screenshots · {descriptions} metadata descriptions"));
-                    let workflows = self.native_workflows.get_or_insert_with(|| {
-                        super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
-                    });
-                    workflows.show_artwork_provider_setup(ui, &mut self.activity);
+                    if ui.button("Configure artwork sources").clicked() {
+                        self.go(Route::Section(Section::SourcesProviders));
+                    }
                     if library.games.is_empty() {
                         ui.label("No games are available yet. Add or scan a source first.");
                         if primary(ui, "Open Sources") {
@@ -2561,7 +2574,7 @@ impl App {
                         }
                     } else {
                         if library.games.len() > 200 {
-                            ui.label("Showing the first 200 games here. Open any other game from Games, then choose Artwork & Metadata.");
+                            ui.label("Showing the first 200 games here. Open any other game from Games, then choose Artwork, Manuals & Extras.");
                         }
                         for game in library.games.iter().take(200) {
                             ui.push_id(game.archive.id, |ui| {
@@ -2572,7 +2585,7 @@ impl App {
                                         ui.strong(&game.title);
                                         ui.label(&game.platform);
                                         ui.label(self.artwork_summary(game.archive.id, game.screenscraper.is_some()));
-                                        if ui.button("View artwork and metadata").clicked() {
+                                        if ui.button("View artwork, manuals & extras").clicked() {
                                             self.go(Route::Task { section: Section::Artwork, game: game.archive.id });
                                         }
                                     });
@@ -2589,6 +2602,7 @@ impl App {
                 };
                 ui.heading(&game.title);
                 ui.label(&game.platform);
+                ui.label("Artwork and documents shown here use the selected game's existing identity and association evidence.");
                 let workflows = self.native_workflows.get_or_insert_with(|| {
                     super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
                 });
@@ -2596,6 +2610,7 @@ impl App {
                 if let Some((config, overlays, core)) = retroarch_scope {
                     self.bezel.set_retroarch_scope(Some(config), Some(overlays), core);
                 }
+                ui.heading("Extras");
                 self.bezel.set_game(&game.title, &game.platform);
                 egui::CollapsingHeader::new("Bezel & decorations")
                     .id_salt(("v2_bezel_panel", game_id))
@@ -2605,6 +2620,14 @@ impl App {
                 ui.horizontal_top(|ui| {
                     self.picture(ui, game, Kind::Cover, egui::vec2(180.0, 240.0));
                     ui.vertical(|ui| {
+                        ui.strong("Box art");
+                        if self.artwork.index.as_ref().is_some_and(|index| !index.covers.contains_key(&game_id)) {
+                            ui.label("No box art is available for this game.");
+                            if ui.button("Configure artwork sources").clicked() {
+                                self.go(Route::Section(Section::SourcesProviders));
+                            }
+                        }
+                        self.artwork_provenance(ui, game_id, game.screenscraper.as_ref());
                         ui.strong("Metadata");
                         if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&game_id)) {
                             ui.scope(|ui| {
@@ -2621,14 +2644,15 @@ impl App {
                         } else {
                             ui.label("No metadata record matched this game.");
                         }
-                        self.artwork_provenance(ui, game_id, game.screenscraper.as_ref());
                     });
                 });
+                self.documents_panel(ui, game_id, game);
                 let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&game_id)).map_or(0, Vec::len);
                 ui.separator();
+                ui.heading("Artwork");
                 ui.strong("Screenshots");
                 if count == 0 {
-                    ui.label(if self.artwork.index_loading { "Looking for screenshots…" } else { "No screenshot found. Advanced Details explains which providers were checked." });
+                    ui.label(if self.artwork.index_loading { "Looking for screenshots…" } else { "No screenshot is available for this game." });
                 } else {
                     for ordinal in 0..count {
                         self.picture(ui, game, Kind::Screenshot(ordinal), egui::vec2(320.0, 220.0));
@@ -2641,6 +2665,16 @@ impl App {
                         ui.label(format!("Match evidence: {}", saved.receipt.match_basis));
                     }
                     if let Some(index) = &self.artwork.index {
+                        if let Some(Source::Local(path)) = index.covers.get(&game_id) {
+                            ui.monospace(format!("Artwork path: {}", path.display()));
+                        }
+                        if let Some(resolved) = index.resolved.get(&game_id) {
+                            for (kind, candidate) in &resolved.artwork {
+                                ui.label(format!("{kind:?}: {} · {} · cached={}", candidate.provenance.provider.label(), candidate.path.display(), candidate.cached));
+                                ui.label(format!("Provenance: {:?}", candidate.provenance));
+                            }
+                            ui.label(format!("Retained metadata alternatives: {}", resolved.conflicts.len()));
+                        }
                         if let Some(diagnostic) = index.diagnostics.get(&game_id) { ui.label(diagnostic); }
                         ui.label(format!("Provider lookup: {} ms", index.elapsed_ms));
                         for warning in &index.warnings { ui.label(warning); }
@@ -2690,53 +2724,35 @@ impl App {
             &archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment,
         >,
     ) {
-        ui.strong("Sources");
+        ui.strong("Artwork source");
         let index = self.artwork.index.as_ref();
-        if let Some(resolved) = index.and_then(|index| index.resolved.get(&game)) {
-            if let Some(candidate) = resolved
-                .artwork
-                .get(&archivefs_core::metadata_aggregation::AssetKind::CoverFront)
-            {
-                ui.label(format!(
-                    "Resolved cover: {}",
-                    candidate.provenance.provider.label()
-                ));
-                if candidate.cached {
-                    ui.label("Resolved asset is available from the local cache (including stale-cache policy where permitted).");
-                }
+        let resolved_winner =
+            index
+                .and_then(|index| index.resolved.get(&game))
+                .and_then(|resolved| {
+                    resolved
+                        .artwork
+                        .get(&archivefs_core::metadata_aggregation::AssetKind::CoverFront)
+                });
+        if let Some(candidate) = resolved_winner {
+            ui.label(format!("Using: {}", candidate.provenance.provider.label()));
+            if candidate.cached {
+                ui.label("Using a cached copy of this artwork.");
             }
-            if !resolved.conflicts.is_empty() {
-                ui.label(format!(
-                    "{} descriptive conflict(s) retained for inspection.",
-                    resolved.conflicts.len()
-                ));
-            }
-            if resolved.artwork.values().any(|candidate| {
-                candidate.provenance.source_class
-                    == archivefs_core::metadata_aggregation::SourceClass::LocalOverride
-            }) {
-                ui.label("Local artwork override is active.");
-            }
-        }
-        if let Some(source) = index.and_then(|index| index.covers.get(&game)) {
+        } else if let Some(source) = index.and_then(|index| index.covers.get(&game)) {
             ui.label(match source {
-                Source::Local(path) => format!("Local file · {}", path.display()),
-                Source::Remote { record, .. } => {
-                    format!("RomM · record {}", record.provider_game_id)
-                }
+                Source::Local(_) => "Using local artwork".to_string(),
+                Source::Remote { .. } => "Using RomM artwork".to_string(),
             });
         }
-        if let Some(saved) = screenscraper {
-            ui.label(format!(
-                "ScreenScraper · record {}",
-                saved.receipt.provider_record_id
-            ));
+        if screenscraper.is_some() && index.is_none_or(|index| !index.covers.contains_key(&game)) {
+            ui.label("ScreenScraper metadata is saved for this game.");
         }
         if index.is_some_and(|index| {
             !index.covers.contains_key(&game) && !index.descriptions.contains_key(&game)
         }) && screenscraper.is_none()
         {
-            ui.label("No provider record matched.");
+            ui.label("No artwork source matched this game.");
         }
     }
 

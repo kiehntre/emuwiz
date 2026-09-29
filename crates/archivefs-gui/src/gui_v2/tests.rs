@@ -2651,7 +2651,7 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
         "Play",
         "Checking whether this game is ready",
         "Verify",
-        "Artwork & Metadata",
+        "Artwork, Manuals & Extras",
         "Mods & Cheats",
         "Fix Problems",
         "Open Folder",
@@ -3298,9 +3298,18 @@ fn gui_v2_artwork_metadata_has_library_and_selected_game_views() {
     };
     let selected_output = frame(&context, &mut app, [1280.0, 820.0]);
     let selected_text = text(&selected_output);
+    assert!(selected_text.iter().any(|value| value == "Rez"));
     assert!(selected_text.iter().any(|value| value == "Metadata"));
-    assert!(selected_text.iter().any(|value| value
-        == "No screenshot found. Advanced Details explains which providers were checked."));
+    assert!(
+        selected_text
+            .iter()
+            .any(|value| value.contains("No box art is available"))
+    );
+    assert!(
+        selected_text
+            .iter()
+            .any(|value| value.contains("No manual is associated"))
+    );
     assert!(
         !selected_text
             .iter()
@@ -3368,11 +3377,11 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
 }
 
 #[test]
-fn gui_v2_artwork_route_contains_native_provider_setup_without_legacy_handoff() {
+fn gui_v2_sources_route_owns_native_provider_setup_without_legacy_handoff() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.artwork.index = Some(Arc::new(MediaIndex::default()));
-    app.router.current = Route::Section(Section::Artwork);
+    app.router.current = Route::Section(Section::Sources);
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
 
@@ -3463,11 +3472,12 @@ fn gui_v2_artwork_metadata_displays_local_romm_and_screenscraper_provenance() {
     let output = frame(&context, &mut app, [1280.0, 820.0]);
     let strings = text(&output);
     assert!(strings.iter().any(|value| value == "RomM description"));
-    assert!(strings.iter().any(|value| value.contains("Local file")));
+    assert!(strings.iter().any(|value| value == "Using local artwork"));
+    assert!(!strings.iter().any(|value| value.contains("ss-42")));
     assert!(
-        strings
+        !strings
             .iter()
-            .any(|value| value.contains("ScreenScraper · record ss-42"))
+            .any(|value| value.contains("/cache/cover.png"))
     );
 }
 

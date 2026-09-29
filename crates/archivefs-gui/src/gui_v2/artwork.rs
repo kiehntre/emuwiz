@@ -448,8 +448,8 @@ fn resolve(request: &Request, transport: &TimedTransport) -> Result<Option<Pixel
                     );
                 }
                 let start = Instant::now();
-                let token = load_token_file(settings.token_path.as_deref()).map_err(|_| "Artwork access needs attention. Open Artwork & Metadata to check the connection.")?;
-                let source = ValidatedRommSource::validate(settings, &token, &request.index.trusted_roots, &SystemResolver).map_err(|_| "The artwork connection could not be approved. Check its setup in Artwork & Metadata.")?;
+                let token = load_token_file(settings.token_path.as_deref()).map_err(|_| "Artwork access needs attention. Open Sources & Providers to check the connection.")?;
+                let source = ValidatedRommSource::validate(settings, &token, &request.index.trusted_roots, &SystemResolver).map_err(|_| "The artwork connection could not be approved. Check its setup in Sources & Providers.")?;
                 transport.reset();
                 let now = std::time::SystemTime::now()
                     .duration_since(UNIX_EPOCH)

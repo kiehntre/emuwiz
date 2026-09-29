@@ -100,7 +100,7 @@ impl Section {
             Self::Emulators => "Emulator Setup",
             Self::Firmware => "BIOS / Firmware",
             Self::Mods => "Mods & Cheats",
-            Self::Artwork => "Artwork & Metadata",
+            Self::Artwork => "Artwork, Manuals & Extras",
             Self::Sources => "Sources",
             Self::Romm => "RomM Library",
             Self::Dat => "DAT Management",
@@ -297,7 +297,9 @@ impl FeatureFamily {
             Self::SavesStates => "Manage saves, snapshots, restores and memory-card workflows.",
             Self::Emulators => "Set up emulators and review the firmware they require.",
             Self::Mame => "Inspect MAME collections without hiding the existing MAME workflows.",
-            Self::ArtworkExtras => "Find artwork, metadata and supporting collection material.",
+            Self::ArtworkExtras => {
+                "Review a game's artwork, associated manuals and supported extras together."
+            }
             Self::Conversion => "Open the existing verified conversion workflows.",
             Self::Organisation => "Choose how verified games are arranged or published.",
             Self::ProblemsRepair => "Review the global problems inbox and safe repair paths.",
@@ -556,36 +558,13 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
                 Normal,
             ),
         ],
-        FeatureFamily::ArtworkExtras => vec![
-            action(
-                "artwork",
-                "Artwork",
-                "Manage covers and screenshots.",
-                Route::Section(Section::Artwork),
-                Normal,
-            ),
-            action(
-                "metadata",
-                "Metadata",
-                "Review metadata in the existing artwork workflow.",
-                Route::Section(Section::Artwork),
-                Normal,
-            ),
-            action(
-                "bezels",
-                "Bezels / Decorations",
-                "Open the existing artwork extras workflow.",
-                Route::Section(Section::Artwork),
-                Normal,
-            ),
-            action(
-                "manuals",
-                "Manuals / Guides",
-                "Open the existing document and artwork workflow.",
-                Route::Section(Section::Artwork),
-                Normal,
-            ),
-        ],
+        FeatureFamily::ArtworkExtras => vec![action(
+            "artwork-manuals-extras",
+            "Artwork, Manuals & Extras",
+            "Review the selected game's artwork, associated manuals and supported extras together.",
+            Route::Section(Section::Artwork),
+            Normal,
+        )],
         FeatureFamily::Conversion => vec![
             action(
                 "disc-conversion",
