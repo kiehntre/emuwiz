@@ -9,10 +9,13 @@ use eframe::egui;
 
 use super::library::Game;
 
+pub(super) fn applies(game: &Game) -> bool {
+    game.platform.eq_ignore_ascii_case("Saturn")
+        || game.platform.eq_ignore_ascii_case("Sega Saturn")
+}
+
 pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
-    if !game.platform.eq_ignore_ascii_case("Saturn")
-        && !game.platform.eq_ignore_ascii_case("Sega Saturn")
-    {
+    if !applies(game) {
         return;
     }
     egui::CollapsingHeader::new("Saturn disc layout")

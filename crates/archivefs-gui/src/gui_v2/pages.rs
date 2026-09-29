@@ -2088,10 +2088,9 @@ impl App {
             .cloned();
         self.hackhash
             .inspect_selected_rom(&game.archive.absolute_path);
-        self.hackhash.show_selected_rom_evidence(ui);
-        super::dreamcast_ipbin::show(ui, game);
-        super::wiiu_disc::show(ui, game);
-        super::saturn_manifest::show(ui, game);
+        let key = self.artwork.key(id, Kind::Cover);
+        // One scroll area holds the whole page. Specialist evidence used to be
+        // drawn above it, which pushed the title and Play off small windows.
         egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
             let wide = ui.available_width() >= 760.0;
             let cover = if wide { egui::vec2(240.0, 320.0) } else { egui::vec2(168.0, 224.0) };
@@ -2099,14 +2098,14 @@ impl App {
                 self.picture(ui, game, Kind::Cover, cover);
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
+                    ui.label(RichText::new(&game.title).size(theme::PAGE_TITLE_SIZE).strong());
                     ui.horizontal(|ui| {
-                        self.imagery.platform_icon(ui, &game.platform, 52.0);
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&game.platform).size(theme::SECTION_TITLE_SIZE).strong());
-                            ui.label(RichText::new(format!("Media: {}", media_kind_label(&game.archive.archive_kind))).color(theme::muted(ui)));
-                        });
+                        self.imagery.platform_icon(ui, &game.platform, 28.0);
+                        ui.label(RichText::new(format!("{} · {}", game.platform, media_kind_label(&game.archive.archive_kind))).color(theme::muted(ui)));
                     });
                     ui.add_space(theme::SPACE_SM);
+                    // The readiness card owns the single primary action: Play
+                    // when the game is ready, otherwise the step that fixes it.
                     let readiness_route = {
                         let workflows = self
                             .native_workflows
@@ -2122,55 +2121,31 @@ impl App {
                     if let Some(route) = readiness_route {
                         self.go(route);
                     }
-                    ui.weak("Current readiness is authoritative. Previous launch results remain historical and are shown separately in the Launch workflow.");
                     ui.add_space(theme::SPACE_SM);
-                    ui.label(format!("Identity: {}", game.identity_summary()));
-                    if primary(ui, "Play") { self.go(Route::Task { section: Section::Launch, game: id }); }
-                    ui.label("Next: review the existing launch check. Nothing starts until you choose Launch there.");
-                    ui.add_space(theme::SPACE_SM);
-                    ui.label(format!("Source: {}", game.archive.relative_path.display()));
                     if let Some(status) = &latest_verification {
                         ui.label(format!("Latest verification: {status}"));
                     }
                     if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
                         if latest_verification.is_none() { ui.label(if detail.saved_checks > 0 { "Previous verification available" } else { "Not verified yet" }); }
-                        if !detail.file_present { ui.label("Needs attention · game file is unavailable"); }
-                        else if !detail.unchanged { ui.label("Needs attention · game file changed since the last scan"); }
-                        ui.label(detail.emulator_status());
+                        if !detail.file_present { ui.colored_label(theme::WARNING, "Needs attention · game file is unavailable"); }
+                        else if !detail.unchanged { ui.colored_label(theme::WARNING, "Needs attention · game file changed since the last scan"); }
                         if detail.saved_checks > 0 && ui.button("View verification result").clicked() {
                             self.go(Route::Section(Section::Check));
                         }
                     } else if self.detail_failed == Some(id) {
-                        ui.label("Readiness could not be checked. Your game has not been changed.");
-                        if ui.button("Retry readiness check").clicked() { self.detail_failed = None; }
-                    } else { ui.horizontal(|ui| { ui.spinner(); ui.label("Checking saved information and looking for installed emulators…"); }); }
+                        ui.label("Saved checks could not be read. Your game has not been changed.");
+                        if ui.button("Try again").clicked() { self.detail_failed = None; }
+                    }
                     ui.add_space(theme::SPACE_SM);
+                    ui.label(RichText::new("More for this game").color(theme::muted(ui)));
                     ui.horizontal_wrapped(|ui| {
                         for (label, section) in [("Verify", Section::Check), ("Artwork, Manuals & Extras", Section::Artwork), ("Mods & Cheats", Section::Mods), ("Saves & States", Section::Saves), ("Fix Problems", Section::Problems)] {
                             if ui.button(label).clicked() {
                                 if matches!(section, Section::Check) {
                                     self.check_platform = Some(game.platform.clone());
-                                    self.go(Route::Task { section, game: id });
-                                } else {
-                                    self.go(Route::Task { section, game: id });
                                 }
+                                self.go(Route::Task { section, game: id });
                             }
-                        }
-                        if crate::tape_analysis_page::is_tape_path(&game.archive.absolute_path)
-                            && ui.button("Inspect tape").clicked()
-                        {
-                            self.go(Route::Task {
-                                section: Section::Tape,
-                                game: id,
-                            });
-                        }
-                        if super::archive_inspector::is_supported_archive(&game.archive.archive_kind)
-                            && ui.button("Inspect archive").clicked()
-                        {
-                            self.go(Route::Task {
-                                section: Section::Advanced,
-                                game: id,
-                            });
                         }
                         if ui.button("Open Folder").clicked() {
                             let job = self.activity.queue("Opening the game folder", Route::Game(id), false);
@@ -2179,7 +2154,6 @@ impl App {
                     });
                 });
             });
-            let key = self.artwork.key(id, Kind::Cover);
             if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_))) && ui.button("Retry picture").clicked() { self.artwork.retry(key); }
             if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&id)) {
                 ui.add_space(theme::SPACE_MD);
@@ -2196,7 +2170,7 @@ impl App {
             if self.artwork.index.is_none() {
                 ui.horizontal(|ui| { ui.spinner(); ui.label("Looking for screenshots…"); });
             } else if count == 0 {
-                empty_state(ui, &mut self.imagery, EmptyArt::Platform(&game.platform), "No screenshots yet", "No screenshots available. See Advanced details for the search results.", None);
+                ui.weak("No screenshots found for this game.");
             } else {
                 // The first screenshot is shown straight away; the rest load
                 // only when asked for, keeping a game visit to two pictures.
@@ -2212,27 +2186,57 @@ impl App {
                 });
                 if !self.screenshots && count > 1 && ui.button(format!("Show all screenshots ({count})")).clicked() { self.screenshots = true; }
             }
+            self.save_backups_panel(ui, game);
+            self.documents_panel(ui, id, game, false);
+            // Everything below is reference material, closed by default and
+            // always last so it never pushes the useful parts down.
+            if super::dreamcast_ipbin::applies(game)
+                || super::wiiu_disc::applies(game)
+                || super::saturn_manifest::applies(game)
+                || self.hackhash.has_selected_evidence()
+            {
+                ui.add_space(theme::SPACE_MD);
+                egui::CollapsingHeader::new("Disc & ROM evidence")
+                    .id_salt(("v2_detail_evidence", id))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        self.hackhash.show_selected_rom_evidence(ui);
+                        super::dreamcast_ipbin::show(ui, game);
+                        super::wiiu_disc::show(ui, game);
+                        super::saturn_manifest::show(ui, game);
+                    });
+            }
+            ui.add_space(theme::SPACE_MD);
             ui.collapsing("Advanced details", |ui| {
                 ui.label(if game.identified { "Identified in the saved game list" } else { "Identity is not confirmed" });
+                ui.monospace(format!("Source: {}", game.archive.relative_path.display()));
                 ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
-                if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) { ui.label(&detail.technical); }
+                if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
+                    ui.label(detail.emulator_status());
+                    ui.label(&detail.technical);
+                }
                 if let Some(index) = &self.artwork.index
                     && let Some(diagnostic) = index.diagnostics.get(&id)
                 {
                     ui.label(diagnostic);
                 }
-                ui.label("An installed emulator is not proof that this game can launch. The existing launch planner rechecks identity, media, firmware and profiles.");
+                ui.label("An installed emulator is not proof that this game can launch. The launch check also rechecks identity, media, firmware and profiles.");
                 match self.artwork.pictures.get(&key) {
-                    Some(Picture::Ready { timings, .. }) => {
-                        ui.monospace(format!("{timings:#?}"));
-                        ui.label("Remote provider processing includes the existing core's decode, resize and cache publication. V2 decode/resize timings describe the delivered thumbnail; the core does not expose separate internal timings.");
-                    }
+                    Some(Picture::Ready { timings, .. }) => { ui.monospace(format!("{timings:#?}")); }
                     Some(Picture::Failed(error)) => { ui.label(error); }
                     _ => {}
                 }
+                if crate::tape_analysis_page::is_tape_path(&game.archive.absolute_path)
+                    && ui.button("Inspect tape").clicked()
+                {
+                    self.go(Route::Task { section: Section::Tape, game: id });
+                }
+                if super::archive_inspector::is_supported_archive(&game.archive.archive_kind)
+                    && ui.button("Inspect archive").clicked()
+                {
+                    self.go(Route::Task { section: Section::Advanced, game: id });
+                }
             });
-            self.save_backups_panel(ui, game);
-            self.documents_panel(ui, id, game);
         });
     }
 
@@ -2251,10 +2255,6 @@ impl App {
                         game: game.archive.id,
                     });
                 }
-                ui.add_enabled(false, egui::Button::new("Compare"))
-                    .on_hover_text("Choose a snapshot in the Saves & States page; comparison is being introduced in this foundation.");
-                ui.add_enabled(false, egui::Button::new("Restore"))
-                    .on_hover_text("Restore remains preview-only until a complete filesystem transaction is available.");
             });
             ui.collapsing("Advanced details", |ui| {
                 ui.label("Snapshots are stored locally, hashed on this machine, and published only after the copy is complete.");
@@ -2263,7 +2263,15 @@ impl App {
         });
     }
 
-    fn documents_panel(&mut self, ui: &mut egui::Ui, game_id: i64, game: &Game) {
+    /// `explain_empty` is true on the Artwork, Manuals & Extras page, where a
+    /// missing manual is an answer; Game Details omits an empty section.
+    fn documents_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        game_id: i64,
+        game: &Game,
+        explain_empty: bool,
+    ) {
         let path = game.archive.absolute_path.clone();
         let needs_discovery = self
             .document_cache
@@ -2300,15 +2308,18 @@ impl App {
             .as_ref()
             .map(|(_, _, documents)| documents.clone())
             .unwrap_or_default();
+        if documents.is_empty() && !explain_empty {
+            return;
+        }
         egui::CollapsingHeader::new("Manuals & Guides")
             .id_salt(("v2_manuals", game_id))
             .default_open(true)
             .show(ui, |ui| {
                 ui.label("Only documents available on this computer are shown. EmuWiz never downloads or changes them.");
-            if documents.is_empty() {
-                ui.weak("No manual is associated with this game. No artwork state is affected.");
-                return;
-            }
+                if documents.is_empty() {
+                    ui.weak("No manual is associated with this game. No artwork state is affected.");
+                    return;
+                }
             for document in documents {
             ui.push_id(("document", &document.path), |ui| {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -2694,7 +2705,7 @@ impl App {
                         }
                     });
                 });
-                self.documents_panel(ui, game_id, game);
+                self.documents_panel(ui, game_id, game, true);
                 let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&game_id)).map_or(0, Vec::len);
                 ui.separator();
                 ui.heading("Artwork");

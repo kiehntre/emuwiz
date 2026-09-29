@@ -706,6 +706,47 @@ fn gui_v2_sidebar_wheel_hover_and_focus_do_not_activate_routes() {
     assert_eq!(app.router.current, Route::BrowsePlay);
 }
 
+/// Clicks the centre of the (collapsing header or button) text `label`, then
+/// returns a settled frame so the result of the click can be inspected.
+fn click_label(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    label: &str,
+) -> egui::FullOutput {
+    // Header opening is animated; settle it instantly so one frame is enough.
+    context.style_mut(|style| style.animation_time = 0.0);
+    let layout = frame(context, app, size);
+    let point = text_bounds(&layout, label)
+        .into_iter()
+        .find(|rect| rect.min.y > 64.0)
+        .unwrap_or_else(|| panic!("{label} not on screen"))
+        .center();
+    for pressed in [true, false] {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(size[0], size[1]),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+    }
+    frame(context, app, size);
+    frame(context, app, size)
+}
+
 fn state_record(state_type: PersistentStateType, emulator: StateEmulator) -> PersistentStateRecord {
     PersistentStateRecord {
         emulator,
@@ -907,8 +948,9 @@ fn gui_v2_arcade_set_is_a_logical_library_row_with_plain_details() {
     app.router.current = Route::Game(7);
     let strings = text(&frame(&context, &mut app, [1280.0, 1200.0]));
 
-    assert!(strings.iter().any(|value| value == "Media: Arcade set"));
-    assert!(strings.iter().any(|value| value == "Source: pacman"));
+    assert!(strings.iter().any(|value| value.ends_with("· Arcade set")));
+    // The set folder is reference material, kept behind Advanced details.
+    assert!(!strings.iter().any(|value| value == "Source: pacman"));
     assert!(!strings.iter().any(|value| value.contains("unknown media")));
 }
 
@@ -2991,6 +3033,102 @@ fn gui_v2_game_detail_exposes_contextual_actions_and_lazy_screenshots() {
     assert_eq!(app.artwork.requested, 0);
 }
 
+fn bounds_below_chrome(output: &egui::FullOutput, wanted: &str) -> Option<egui::Rect> {
+    // The top bar repeats the game title in its breadcrumb; the page body
+    // starts below it.
+    text_bounds(output, wanted)
+        .into_iter()
+        .find(|rect| rect.min.y > 64.0)
+}
+
+#[test]
+fn gui_v2_game_details_lead_with_title_and_play_and_keep_reference_material_last() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(
+        1,
+        "Example Game",
+        Some("Saturn"),
+    )]));
+    app.router.current = Route::Game(1);
+    let output = frame(&context, &mut app, [1280.0, 2400.0]);
+    let y = |label: &str| {
+        bounds_below_chrome(&output, label)
+            .unwrap_or_else(|| panic!("{label} missing: {:?}", text(&output)))
+            .min
+            .y
+    };
+    // The page names the game itself, then offers Play, then secondary
+    // tools, and only then reference material.
+    let order = [
+        y("Example Game"),
+        y("Play"),
+        y("Verify"),
+        y("Screenshots"),
+        y("Disc & ROM evidence"),
+        y("Advanced details"),
+    ];
+    assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    let texts = text(&output);
+    assert_eq!(texts.iter().filter(|line| *line == "Play").count(), 1);
+    // Closed by default: no raw path, enum name or specialist panel body.
+    assert!(!texts.iter().any(|line| line.contains("Example Game.iso")));
+    assert!(!texts.iter().any(|line| line.starts_with("Media kind:")));
+    assert!(!texts.iter().any(|line| line == "Saturn disc layout"));
+}
+
+#[test]
+fn gui_v2_game_details_keep_play_on_screen_in_a_short_window_for_specialist_media() {
+    // Specialist evidence used to render above the scroll area and push the
+    // title and Play out of a small window.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(
+        1,
+        "Example Game",
+        Some("Saturn"),
+    )]));
+    app.router.current = Route::Game(1);
+    let output = frame(&context, &mut app, [1000.0, 560.0]);
+    for label in ["Example Game", "Play"] {
+        let rect = bounds_below_chrome(&output, label).unwrap_or_else(|| panic!("{label} missing"));
+        assert!(rect.max.y < 560.0, "{label} is pushed off-screen: {rect:?}");
+    }
+}
+
+#[test]
+fn gui_v2_game_details_show_evidence_section_only_when_the_media_has_evidence() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Plain Game", Some("PS2"))]));
+    app.router.current = Route::Game(1);
+    let output = frame(&context, &mut app, [1280.0, 1600.0]);
+    assert!(
+        !text(&output)
+            .iter()
+            .any(|line| line == "Disc & ROM evidence")
+    );
+    // With nothing associated, Game Details has no empty Manuals section.
+    assert!(!text(&output).iter().any(|line| line == "Manuals & Guides"));
+}
+
+#[test]
+fn gui_v2_game_details_do_not_carry_expanded_screenshots_to_another_game() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "First", Some("PS2")),
+        archive(2, "Second", Some("PS2")),
+    ]));
+    app.go(Route::Game(1));
+    app.screenshots = true;
+    app.go(Route::Game(2));
+    assert!(
+        !app.screenshots,
+        "a new game starts with only its first picture"
+    );
+}
+
 #[test]
 fn gui_v2_browser_virtualizes_large_collection() {
     let context = egui::Context::default();
@@ -3425,11 +3563,7 @@ fn gui_v2_refresh_readiness_error_retains_an_obvious_retry() {
     app.router.current = Route::Game(1);
     app.detail_failed = Some(1);
     let output = frame(&context, &mut app, [1280.0, 1200.0]);
-    assert!(
-        text(&output)
-            .iter()
-            .any(|line| line == "Retry readiness check")
-    );
+    assert!(text(&output).iter().any(|line| line == "Try again"));
     assert!(
         text(&output)
             .iter()
@@ -3661,7 +3795,19 @@ fn gui_v2_selected_dreamcast_game_shows_native_ipbin_boundary() {
     app.library = Arc::new(Library::new(vec![archive(9, "Rez", Some("Dreamcast"))]));
     app.router.current = Route::Game(9);
 
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
+    assert!(
+        !closed
+            .iter()
+            .any(|value| value == "Dreamcast boot metadata")
+    );
+    let strings = text(&click_label(
+        &context,
+        &mut app,
+        [1280.0, 1600.0],
+        "Disc & ROM evidence",
+    ));
     assert!(
         strings
             .iter()
@@ -3688,7 +3834,15 @@ fn gui_v2_selected_saturn_game_shows_read_only_disc_manifest_boundary() {
     )]));
     app.router.current = Route::Game(9);
 
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    let closed = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    assert!(closed.iter().any(|value| value == "Disc & ROM evidence"));
+    assert!(!closed.iter().any(|value| value == "Saturn disc layout"));
+    let strings = text(&click_label(
+        &context,
+        &mut app,
+        [1280.0, 2600.0],
+        "Disc & ROM evidence",
+    ));
     assert!(strings.iter().any(|value| value == "Saturn disc layout"));
     assert!(
         strings
@@ -3935,11 +4089,10 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     strings.extend(text(&scroll_page(&context, &mut app, [1280.0, 1200.0])));
     for expected in [
         "Play",
-        "PSX",
-        "Media: Game image",
+        "PSX · Game image",
         "Verify",
         "Open Folder",
-        "No screenshots yet",
+        "No screenshots found for this game.",
     ] {
         assert!(
             strings.iter().any(|value| value == expected),

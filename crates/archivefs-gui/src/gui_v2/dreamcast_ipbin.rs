@@ -4,8 +4,12 @@ use eframe::egui;
 
 use super::library::Game;
 
+pub(super) fn applies(game: &Game) -> bool {
+    game.platform.eq_ignore_ascii_case("Dreamcast")
+}
+
 pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
-    if !game.platform.eq_ignore_ascii_case("Dreamcast") {
+    if !applies(game) {
         return;
     }
     let report = game.archive.identity_report.as_ref();
