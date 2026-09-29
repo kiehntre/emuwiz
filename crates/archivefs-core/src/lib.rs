@@ -232,6 +232,7 @@ pub mod playing_library;
 /// exact read-only boundary and the Phase 2 execution seam.
 pub mod publisher_profile;
 
+pub mod setup_portability;
 /// Generic, read-only contract for auditing and planning source-root changes.
 pub mod source_root_migration;
 

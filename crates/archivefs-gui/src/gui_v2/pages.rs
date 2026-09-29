@@ -3043,6 +3043,7 @@ impl App {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
+        self.setup_portability.render(ui);
         ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
         ui.separator();
         ui.heading("Beginner guidance");

@@ -109,6 +109,7 @@ fn fixture(context: &egui::Context) -> App {
         romm_library_job: None,
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
+        setup_portability: super::setup_portability::SetupPortabilityState::default(),
     }
 }
 
@@ -5442,4 +5443,23 @@ fn gui_v2_game_details_keep_the_action_on_screen_for_a_long_wrapping_title() {
         rect.max.y < 520.0,
         "Play must stay above the footer: {rect:?}"
     );
+}
+
+#[test]
+fn gui_v2_setup_portability_is_visible_in_settings() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Settings);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    for expected in [
+        "Move your setup to another device",
+        "Prepare setup export",
+        "Preview setup file",
+        "Applying imports is not available yet",
+    ] {
+        assert!(
+            strings.iter().any(|value| value.contains(expected)),
+            "missing setup portability content: {expected}"
+        );
+    }
 }

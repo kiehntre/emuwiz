@@ -26,6 +26,7 @@ mod romm_library;
 mod routes;
 mod saturn_manifest;
 mod saves_states;
+mod setup_portability;
 mod sources_providers;
 #[cfg(test)]
 mod tape_tests;
@@ -298,6 +299,7 @@ pub(super) struct App {
     romm_library_job: Option<u64>,
     document_preferences: documents::DocumentPreferences,
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
+    setup_portability: setup_portability::SetupPortabilityState,
 }
 
 impl App {
@@ -375,6 +377,7 @@ impl App {
             romm_library_job: None,
             document_preferences: documents::DocumentPreferences::default(),
             document_cache: None,
+            setup_portability: setup_portability::SetupPortabilityState::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
