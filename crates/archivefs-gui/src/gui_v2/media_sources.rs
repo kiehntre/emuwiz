@@ -1404,6 +1404,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn same_title_on_two_platforms_resolves_only_its_own_artwork() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("downloaded_media");
+        for dir in ["apple2", "bbcmicro"] {
+            std::fs::create_dir_all(media.join(dir).join("covers")).unwrap();
+            std::fs::write(media.join(dir).join("covers/Adventure.png"), dir.as_bytes()).unwrap();
+        }
+        let xml =
+            b"<gameList><game><path>./Adventure.zip</path><name>Adventure</name></game></gameList>";
+        let index_for = |dir: &str| {
+            parse_and_index_gamelist_with_roots(
+                Path::new("/es/gamelists/x/gamelist.xml"),
+                xml,
+                dir,
+                1,
+                &media,
+                Some(Path::new("/roms")),
+            )
+        };
+        let apple = index_for("apple2");
+        let bbc = index_for("bbcmicro");
+        // Each platform resolves exactly its own file, via its own index.
+        let apple_hit = apple
+            .lookup_path("Apple II", Path::new("/roms/apple2/Adventure.zip"))
+            .unwrap();
+        let bbc_hit = bbc
+            .lookup_path("BBC Micro", Path::new("/roms/bbcmicro/Adventure.zip"))
+            .unwrap();
+        assert_eq!(
+            apple_hit.entry.media.cover,
+            Some(media.join("apple2/covers/Adventure.png"))
+        );
+        assert_eq!(
+            bbc_hit.entry.media.cover,
+            Some(media.join("bbcmicro/covers/Adventure.png"))
+        );
+        // Same title AND same file name, asked under the other platform: no hit
+        // from either index, so nothing can fall back to the wrong cover.
+        assert!(
+            apple
+                .lookup_path("BBC Micro", Path::new("/roms/apple2/Adventure.zip"))
+                .is_none()
+        );
+        assert!(
+            bbc.lookup_path("Apple II", Path::new("/roms/bbcmicro/Adventure.zip"))
+                .is_none()
+        );
+        assert!(
+            apple
+                .lookup_path("Apple II", Path::new("/roms/bbcmicro/Adventure.zip"))
+                .is_none()
+        );
+        // The resolver only ever sees the candidates of the matched index.
+        let apple_candidates = esde_artwork_candidates(&apple_hit);
+        assert!(
+            apple_candidates
+                .iter()
+                .all(|(candidate, _)| candidate.path.starts_with(media.join("apple2")))
+        );
+    }
+
+    #[test]
+    fn wrapper_rule_same_file_name_on_two_platforms_claims_only_its_own_platform() {
+        let records = records(vec![
+            record("1", "/g/a/Game.zip", "Sharp X68000", true),
+            record("2", "/g/b/Game.zip", "MegaDrive", true),
+        ]);
+        let rows = vec![
+            row(1, "Sharp X68000", "/g/a/Wrap/Game.zip"),
+            row(2, "MegaDrive", "/g/b/Wrap/Game.zip"),
+            // Right directory, wrong platform for that record.
+            row(3, "MegaDrive", "/g/a/Wrap2/Game.zip"),
+        ];
+        let forward = wrapper_record_matches(&library(rows.clone()), &records);
+        let mut reversed_rows = rows;
+        reversed_rows.reverse();
+        let reversed = wrapper_record_matches(&library(reversed_rows), &records);
+        // Row order never changes the outcome.
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.len(), 2);
+        assert_eq!(
+            forward[Path::new("/g/a/Wrap/Game.zip")],
+            PathBuf::from("/g/a/Game.zip")
+        );
+        assert_eq!(
+            forward[Path::new("/g/b/Wrap/Game.zip")],
+            PathBuf::from("/g/b/Game.zip")
+        );
+        assert!(!forward.contains_key(Path::new("/g/a/Wrap2/Game.zip")));
+    }
+
     // --- diagnostics ----------------------------------------------------
 
     #[test]

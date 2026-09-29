@@ -673,4 +673,54 @@ mod tests {
             "recovered cover never became ready"
         );
     }
+
+    #[test]
+    fn a_retry_that_fails_again_waits_a_full_delay_and_a_later_success_replaces_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let cover = directory.path().join("late.png");
+        let context = egui::Context::default();
+        let mut artwork =
+            Artwork::with_cache(context.clone(), Some(directory.path().join("cache")));
+        let mut index = MediaIndex::default();
+        index.covers.insert(5, Source::Local(cover.clone()));
+        artwork.index = Some(Arc::new(index));
+        let key = artwork.key(5, Kind::Cover);
+        artwork
+            .pictures
+            .insert(key, Picture::Failed("earlier".into()));
+        let old = Instant::now() - artwork.failure_retry - Duration::from_secs(1);
+        artwork.failed_at.insert(key, old);
+        // Retry #1: the file is still absent, so it fails again...
+        artwork.request(5, Kind::Cover);
+        for _ in 0..400 {
+            artwork.begin_frame(&context);
+            if matches!(artwork.pictures.get(&key), Some(Picture::Failed(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            artwork.pictures.get(&key),
+            Some(Picture::Failed(_))
+        ));
+        // ...and is stamped anew, so repeated requests do not busy-loop.
+        assert!(artwork.failed_at[&key] > old);
+        artwork.request(5, Kind::Cover);
+        artwork.request(5, Kind::Cover);
+        assert_eq!(artwork.active(), 0);
+        assert!(matches!(
+            artwork.pictures.get(&key),
+            Some(Picture::Failed(_))
+        ));
+        // The cover appears later; once the delay passes the retry succeeds and
+        // replaces the failed state.
+        write_png(&cover);
+        artwork.failed_at.insert(
+            key,
+            Instant::now() - artwork.failure_retry - Duration::from_secs(1),
+        );
+        artwork.request(5, Kind::Cover);
+        assert!(wait_for(&mut artwork, &context, key));
+        assert!(!artwork.failed_at.contains_key(&key));
+    }
 }
