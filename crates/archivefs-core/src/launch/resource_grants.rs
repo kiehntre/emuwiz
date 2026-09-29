@@ -28,6 +28,9 @@ pub enum LaunchResourceRole {
     TemporaryRuntime,
     Metadata,
     Artwork,
+    /// Cheat source files (read-only) and generated launch-scoped cheat
+    /// derivatives. Never persistent user state.
+    CheatMaterial,
     Unknown,
 }
 

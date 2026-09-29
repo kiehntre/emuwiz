@@ -42,6 +42,7 @@ mod cheat_install_result;
 mod cheat_installer;
 mod cheat_ir;
 mod cheat_journey;
+mod cheat_launch_derivative;
 mod cheat_loadability;
 mod cheat_pack_preview;
 mod cheat_provenance;
@@ -340,6 +341,11 @@ pub use cheat_journey::{
     CheatJourneyUndoConfirmation, CheatJourneyUndoOptions, CheatJourneyUndoPreview,
     apply_cheat_journey, discover_cheat_journey, preview_cheat_journey, preview_cheat_journey_undo,
     select_cheat_journey_candidate, undo_cheat_journey,
+};
+pub use cheat_launch_derivative::{
+    CheatDerivativeEntryRecord, CheatDerivativeError, CheatDerivativeInput, CheatLaunchDerivative,
+    CheatLaunchDerivativeKind, CheatSourceReference, MAX_LAUNCH_DERIVATIVE_ENTRIES,
+    render_retroarch_selected_derivative,
 };
 pub use cheat_loadability::{
     CheatEnablementEvidence, CheatIdentityStrength, CheatInstalledFileCheck,

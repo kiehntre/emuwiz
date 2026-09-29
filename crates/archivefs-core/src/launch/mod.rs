@@ -116,6 +116,7 @@ pub mod ppsspp_command;
 pub mod ppsspp_execution;
 pub mod process_spawn;
 pub use process_spawn::LaunchCommandSpec;
+pub mod cheat_launch_plan;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
@@ -195,6 +196,14 @@ pub use cemu_execution::{
     CemuLaunchPreflightError, CemuLaunchPreflightErrorKind, CemuLaunchSpawnError,
     CemuPreflightRequest, LaunchedCemuProcess, preflight_and_launch_cemu, preflight_cemu_launch,
     spawn_cemu,
+};
+pub use cheat_launch_plan::{
+    CheatApplicabilityState, CheatCandidate, CheatEmulatorCapability, CheatLaunchBlockReason,
+    CheatLaunchCommandError, CheatLaunchFormat, CheatLaunchMode, CheatLaunchPlan,
+    CheatLaunchPlanStatus, CheatLaunchRequest, CheatLaunchSelection, CheatLaunchTarget,
+    CheatVariant, LaunchStateClass, LaunchStateExpectation, RetroArchLaunchFacts,
+    RetroArchProfileIsolation, capture_baseline, cheat_launch_capability,
+    command_with_cheat_launch_plan, plan_cheat_launch, verify_expectation,
 };
 pub use desmume_command::{
     DESMUME_SUPPORTED_PLATFORM_ID, DesmumeCommand, DesmumeCommandPlan, DesmumeCommandSelection,
