@@ -1611,6 +1611,324 @@ impl NativeWorkflows {
         self.observe_metadata_activity(activity);
     }
 
+    /// One status overview over existing source/provider owners. It does not
+    /// configure anything itself; every action opens the canonical setup page.
+    pub(super) fn show_sources_providers_overview(&mut self, ui: &mut egui::Ui) -> Option<Route> {
+        use super::sources_providers::{
+            HubAction, ProviderCard, SourceGroup, SourceNature, SourceStatus,
+        };
+
+        let mut cards = Vec::new();
+        let dat = self
+            .app
+            .sources_ui
+            .dat_sources_page
+            .as_ref()
+            .map(|page| page.view());
+        let mut dat_advanced = Vec::new();
+        let dat_status = if let Some(view) = dat.as_ref() {
+            dat_advanced.push(format!("validated_sources={}", view.rows.len()));
+            dat_advanced.push("provider_id=dat-sources".into());
+            dat_advanced.extend(view.rows.iter().map(|row| {
+                format!(
+                    "{} · {} · {:?}{}",
+                    row.display_name,
+                    row.path,
+                    row.health_state,
+                    if row.health_stale {
+                        " · stale validation"
+                    } else {
+                        ""
+                    }
+                )
+            }));
+            dat_advanced.extend(view.managed_rows.iter().map(|row| {
+                format!(
+                    "{} · configured={} · installed={} · status={:?}",
+                    row.source_label, row.configured, row.installed, row.status
+                )
+            }));
+            let enabled = view
+                .rows
+                .iter()
+                .filter(|row| row.enabled)
+                .collect::<Vec<_>>();
+            if view.rows.is_empty() && !view.managed_rows.iter().any(|row| row.installed) {
+                SourceStatus::NeedsSetup
+            } else if !enabled.is_empty()
+                && enabled.iter().all(|row| {
+                    row.health_state == archivefs_core::dat::sources::DatHealthState::Unreadable
+                        || row.health_state == archivefs_core::dat::sources::DatHealthState::Invalid
+                })
+            {
+                SourceStatus::Problem
+            } else if enabled.iter().any(|row| {
+                row.health_state == archivefs_core::dat::sources::DatHealthState::Unreadable
+                    || row.health_state == archivefs_core::dat::sources::DatHealthState::Invalid
+            }) {
+                SourceStatus::NeedsAttention
+            } else if enabled.iter().any(|row| row.health_stale) {
+                SourceStatus::Stale
+            } else if enabled.iter().any(|row| {
+                row.health_state == archivefs_core::dat::sources::DatHealthState::Valid
+                    || row.health_state
+                        == archivefs_core::dat::sources::DatHealthState::ValidWithWarnings
+            }) || view.managed_rows.iter().any(|row| row.installed)
+            {
+                SourceStatus::Ready
+            } else if !view.rows.is_empty() && enabled.is_empty() {
+                SourceStatus::Disabled
+            } else {
+                SourceStatus::NotChecked
+            }
+        } else {
+            dat_advanced.push("The DAT registry has not been opened in this session.".into());
+            SourceStatus::NotChecked
+        };
+        let dat_reason = match dat_status {
+            SourceStatus::NeedsSetup => "No DAT source is configured. Game identity verification needs a trusted DAT source.".into(),
+            SourceStatus::Problem => "A DAT source cannot currently be read or validated. Review its details.".into(),
+            SourceStatus::Stale => "A DAT source changed since validation. Refresh its validation.".into(),
+            SourceStatus::Disabled => "Configured DAT sources are disabled. Enable one to use it for verification.".into(),
+            SourceStatus::Ready => "A usable DAT source is available for game identity and verification.".into(),
+            _ => "DAT status has not been checked here. Open DAT Sources to review the registry.".into(),
+        };
+        cards.push(ProviderCard {
+            id: "dat-sources",
+            group: SourceGroup::Identity,
+            name: "DAT sources".into(),
+            purpose: "Game identity and verification against trusted release data.".into(),
+            status: dat_status,
+            reason: dat_reason,
+            nature: SourceNature::Local,
+            action: Some("Manage DAT sources"),
+            target: Some(HubAction::DatSources),
+            advanced: dat_advanced,
+        });
+
+        let configured_roots = self
+            .app
+            .gui_config
+            .source_roots()
+            .ok()
+            .unwrap_or_default()
+            .to_vec();
+        let snapshot = self.app.database_state.snapshot();
+        let source_state = crate::source_state::merge_configured_sources(
+            &configured_roots,
+            snapshot.map(|snapshot| snapshot.source_views.as_slice()),
+        );
+        let roots = source_state
+            .sources
+            .iter()
+            .map(|source| source.path.display().to_string())
+            .collect::<Vec<_>>();
+        let enabled_sources = source_state
+            .sources
+            .iter()
+            .filter(|source| source.enabled)
+            .collect::<Vec<_>>();
+        let local_status = if source_state.sources.is_empty() {
+            SourceStatus::NeedsSetup
+        } else if enabled_sources.is_empty() {
+            SourceStatus::Disabled
+        } else if enabled_sources
+            .iter()
+            .all(|source| source.availability == SourceAvailability::Available)
+        {
+            SourceStatus::Ready
+        } else if enabled_sources
+            .iter()
+            .any(|source| source.availability == SourceAvailability::ScanFailed)
+        {
+            SourceStatus::NeedsAttention
+        } else {
+            SourceStatus::Unavailable
+        };
+        cards.push(ProviderCard {
+            id: "local-game-folders", group: SourceGroup::Local, name: "Game folders".into(),
+            purpose: "Find games stored in folders you choose.".into(), status: local_status,
+            reason: match local_status {
+                SourceStatus::NeedsSetup => "No game folders are configured. Browsing remains available, but no local games are indexed yet.".into(),
+                SourceStatus::Disabled => "Configured game folders are disabled.".into(),
+                SourceStatus::Ready => format!("{} configured folder(s) are available.", enabled_sources.len()),
+                SourceStatus::NeedsAttention => "A recent scan needs review.".into(),
+                _ => "At least one configured path is missing or cannot be read.".into(),
+            }, nature: SourceNature::Local, action: Some("Manage local folders"), target: Some(HubAction::LocalSources), advanced: roots,
+        });
+
+        cards.push(ProviderCard {
+            id: "local-artwork",
+            group: SourceGroup::Artwork,
+            name: "Local artwork & metadata".into(),
+            purpose: "Reuse media and metadata already present in your local collection.".into(),
+            status: SourceStatus::NotChecked,
+            reason: "Optional local data; Browse & Play still works if artwork is missing.".into(),
+            nature: SourceNature::Local,
+            action: Some("Open Artwork & Metadata"),
+            target: Some(HubAction::ArtworkProviders),
+            advanced: vec!["Local/project identity evidence remains authoritative.".into()],
+        });
+        cards.push(ProviderCard {
+            id: "bundled-assets", group: SourceGroup::Local, name: "Bundled interface assets".into(),
+            purpose: "Built-in EmuWiz icons and interface artwork; not a game identity or metadata provider.".into(),
+            status: SourceStatus::Ready, reason: "Available offline.".into(), nature: SourceNature::Bundled,
+            action: None, target: None, advanced: vec!["Bundled with the application.".into()],
+        });
+
+        let es_de_state = self.app.artwork_media.es_de_media.state();
+        let (es_de_status, es_de_reason, es_de_advanced) = match es_de_state {
+            crate::es_de_media_state::EsDeProviderState::NotStarted => (SourceStatus::NotChecked, "ES-DE has not been checked yet. Open Artwork & Metadata to inspect the local ES-DE folder.".into(), vec!["Expected local folder: ~/ES-DE".into()]),
+            crate::es_de_media_state::EsDeProviderState::Loading => (SourceStatus::NotChecked, "Checking local ES-DE metadata and media references.".into(), Vec::new()),
+            crate::es_de_media_state::EsDeProviderState::Ready(snapshot) => {
+                let count: usize = snapshot.indexes.iter().map(|index| index.entries.len()).sum();
+                (if snapshot.warnings.is_empty() { SourceStatus::Ready } else { SourceStatus::NeedsAttention }, format!("Local ES-DE data contains {count} indexed artwork/media entries."), vec![format!("root={}", snapshot.root.display()), format!("generation={}", snapshot.generation), format!("warnings={:?}", snapshot.warnings)])
+            }
+            crate::es_de_media_state::EsDeProviderState::Error(error) => {
+                let status = if error.starts_with("ES-DE root is not configured") { SourceStatus::NeedsSetup } else { SourceStatus::Unavailable };
+                let reason = if status == SourceStatus::NeedsSetup {
+                    "The local ES-DE folder was not found. Check the path in your ES-DE setup.".into()
+                } else {
+                    "ES-DE data could not be read. Review the reason under Advanced details.".into()
+                };
+                (status, reason, vec![format!("error={error}")])
+            }
+        };
+        cards.push(ProviderCard {
+            id: "es-de",
+            group: SourceGroup::External,
+            name: "ES-DE".into(),
+            purpose: "Reuse local ES-DE metadata and artwork references where supported.".into(),
+            status: es_de_status,
+            reason: es_de_reason,
+            nature: SourceNature::Local,
+            action: Some("Check ES-DE in Artwork & Metadata"),
+            target: Some(HubAction::ArtworkProviders),
+            advanced: es_de_advanced,
+        });
+
+        let scraper = &self.app.screenscraper_page;
+        let scraper_status = match scraper.status() {
+            crate::screenscraper_page::ScreenScraperUiStatus::Ready => SourceStatus::Ready,
+            crate::screenscraper_page::ScreenScraperUiStatus::Testing => SourceStatus::NotChecked,
+            crate::screenscraper_page::ScreenScraperUiStatus::NotConfigured => {
+                SourceStatus::NeedsSetup
+            }
+            crate::screenscraper_page::ScreenScraperUiStatus::AuthenticationError
+            | crate::screenscraper_page::ScreenScraperUiStatus::QuotaExhausted
+            | crate::screenscraper_page::ScreenScraperUiStatus::TemporarilyUnavailable
+            | crate::screenscraper_page::ScreenScraperUiStatus::Offline => {
+                SourceStatus::NeedsAttention
+            }
+        };
+        let scraper_reason = if scraper_status == SourceStatus::NeedsSetup {
+            super::sources_providers::screenscraper_missing_credentials_reason(
+                !scraper.developer_id.trim().is_empty(),
+                !scraper.developer_password.trim().is_empty(),
+            )
+        } else {
+            match scraper.status() {
+                crate::screenscraper_page::ScreenScraperUiStatus::Ready => "Optional metadata lookup is ready when you choose to use it.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::Testing => "Testing the ScreenScraper connection.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::AuthenticationError => "ScreenScraper rejected the configured credentials. Review the developer and optional user details.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::QuotaExhausted => "ScreenScraper has reached its request limit. Try again after the quota resets.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::TemporarilyUnavailable => "ScreenScraper returned a temporary or invalid response. Try again later.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::Offline => "ScreenScraper could not be reached. EmuWiz remains usable offline.".into(),
+                crate::screenscraper_page::ScreenScraperUiStatus::NotConfigured => unreachable!(),
+            }
+        };
+        cards.push(ProviderCard {
+            id: "screenscraper",
+            group: SourceGroup::Artwork,
+            name: "ScreenScraper".into(),
+            purpose: "Optional online metadata candidates; EmuWiz identity remains authoritative."
+                .into(),
+            status: scraper_status,
+            reason: scraper_reason,
+            nature: SourceNature::Remote,
+            action: Some("Configure ScreenScraper"),
+            target: Some(HubAction::ArtworkProviders),
+            advanced: vec![
+                "provider_id=screenscraper".into(),
+                "endpoint=https://www.screenscraper.fr/api2".into(),
+                format!("configured={}", scraper.is_configured()),
+                format!("last_success={:?}", scraper.last_success_unix_seconds()),
+                format!("raw_error={:?}", scraper.last_error()),
+            ],
+        });
+
+        let romm = crate::romm_source::build_card_view(
+            self.app.romm_ui.snapshot.as_deref(),
+            self.app
+                .romm_ui
+                .operation
+                .as_ref()
+                .map(|running| &running.operation),
+            self.app
+                .romm_ui
+                .operation
+                .as_ref()
+                .is_some_and(|running| running.cancellation_requested),
+        );
+        let romm_status = match romm.state_label.as_str() {
+            "Ready" | "Ready (offline)" => SourceStatus::Ready,
+            "Stale" => SourceStatus::Stale,
+            "Disabled" => SourceStatus::Disabled,
+            "Not configured" => SourceStatus::NeedsSetup,
+            "Error" => SourceStatus::Problem,
+            "Enabled, nothing imported yet" => SourceStatus::NeedsAttention,
+            _ => SourceStatus::NotChecked,
+        };
+        let romm_reason = match romm.state_label.as_str() {
+            "Stale" if romm.offline_browsing => "Using cached data. Refresh recommended.".into(),
+            "Stale" => "RomM data is stale and may not be usable. Review the provider status.".into(),
+            "Ready (offline)" => "Using the imported snapshot. RomM is currently unavailable; cached browsing still works.".into(),
+            "Not configured" => "RomM address and read-only token are not configured. Configure them in Artwork & Metadata.".into(),
+            "Disabled" => "The RomM source is disabled. Enable it in RomM setup to refresh data.".into(),
+            "Enabled, nothing imported yet" => "RomM is configured, but no library snapshot has been imported yet.".into(),
+            "Error" => "RomM reported a problem. Review the provider details under Advanced.".into(),
+            _ => romm.state_detail.clone().unwrap_or_else(|| "RomM is an optional external library; its GUI-v2 browser reads the imported snapshot.".into()),
+        };
+        let mut romm_advanced = romm
+            .summary_rows
+            .iter()
+            .map(|row| format!("{}={}", row.label, row.value))
+            .collect::<Vec<_>>();
+        romm_advanced.push("provider_id=romm".into());
+        romm_advanced.push(format!("state_detail={:?}", romm.state_detail));
+        if let Some(error) = &romm.last_error {
+            romm_advanced.push(format!("raw_error={error}"));
+        }
+        cards.push(ProviderCard {
+            id: "romm",
+            group: SourceGroup::External,
+            name: "RomM".into(),
+            purpose: super::sources_providers::romm_purpose().into(),
+            status: romm_status,
+            reason: romm_reason,
+            nature: SourceNature::Remote,
+            action: Some(if romm_status == SourceStatus::Ready {
+                "Open RomM library"
+            } else {
+                "Review RomM setup"
+            }),
+            target: Some(if romm_status == SourceStatus::Ready {
+                HubAction::RommLibrary
+            } else {
+                HubAction::ArtworkProviders
+            }),
+            advanced: romm_advanced,
+        });
+
+        match super::sources_providers::show(ui, &cards) {
+            Some(HubAction::LocalSources) => Some(Route::Section(Section::Sources)),
+            Some(HubAction::DatSources) => Some(Route::Section(Section::Dat)),
+            Some(HubAction::ArtworkProviders) => Some(Route::Section(Section::Artwork)),
+            Some(HubAction::RommLibrary) => Some(Route::Section(Section::Romm)),
+            None => None,
+        }
+    }
+
     fn show_native_romm_provider(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let view = crate::romm_source::build_card_view(
             self.app.romm_ui.snapshot.as_deref(),

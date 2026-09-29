@@ -26,6 +26,7 @@ mod romm_library;
 mod routes;
 mod saturn_manifest;
 mod saves_states;
+mod sources_providers;
 #[cfg(test)]
 mod tape_tests;
 #[cfg(test)]

@@ -675,6 +675,15 @@ impl App {
         let Some(family) = family_for_route(&Route::Section(section)) else {
             return;
         };
+        if family == FeatureFamily::SourcesProviders {
+            let workflows = self.native_workflows.get_or_insert_with(|| {
+                super::native_workflows::NativeWorkflows::new(ui.ctx().clone())
+            });
+            if let Some(route) = workflows.show_sources_providers_overview(ui) {
+                self.go(route);
+            }
+            return;
+        }
         ui.heading(family.label());
         ui.label(family.purpose());
         ui.label("These are shortcuts to existing GUI-v2 workflows; opening a shortcut does not change your files.");
