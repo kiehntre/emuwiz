@@ -8,7 +8,7 @@ use super::{
     library::{DuplicateGroup, Game, media_kind_label},
     media_sources::{Kind, Source},
     onboarding,
-    problems::{Category, Problem, ProblemDestination, ProblemFilter, Severity},
+    problems::{Category, Problem, ProblemFilter, Severity},
     romm_library::PresenceFilter,
     routes::{
         FamilyVariant, FeatureFamily, HOME_TASKS, Route, SECTIONS, Section, breadcrumb_labels,
@@ -1729,11 +1729,7 @@ impl App {
                         ui.label(&problem.location);
                         ui.label(format!("Next: {}", problem.action));
                         if ui.button(problem.destination.label()).clicked() {
-                            match problem.destination {
-                                ProblemDestination::CheckGames => self.go(Route::Section(Section::Check)),
-                                ProblemDestination::Games => self.go(Route::Section(Section::Games)),
-                                ProblemDestination::Duplicates => self.go(Route::Section(Section::Duplicates)),
-                            }
+                            self.go(problem.destination.route());
                         }
                         if problem.category == Category::Duplicates
                             && self.repair_preview.is_none()
@@ -1998,11 +1994,7 @@ impl App {
             self.go(Route::Game(game_id));
         }
         if primary(ui, problem.destination.label()) {
-            match problem.destination {
-                ProblemDestination::CheckGames => self.go(Route::Section(Section::Check)),
-                ProblemDestination::Games => self.go(Route::Section(Section::Games)),
-                ProblemDestination::Duplicates => self.go(Route::Section(Section::Duplicates)),
-            }
+            self.go(problem.destination.route());
         }
         ui.collapsing("Advanced details", |ui| {
             ui.monospace(&problem.technical);

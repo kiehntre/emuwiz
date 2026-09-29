@@ -5,6 +5,8 @@
 //! the saved library state and the existing exact-duplicate proof.
 
 use super::library::{DuplicateReport, Game, Library};
+use super::routes::{Route, Section};
+use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -40,6 +42,10 @@ pub(super) enum ProblemDestination {
     CheckGames,
     Games,
     Duplicates,
+    /// Findings that existing typed evidence proves are MAME set findings.
+    /// MAME sets are judged as complete sets, so these go to the dedicated
+    /// MAME workflow rather than a generic rename/repair page.
+    Mame,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -71,9 +77,36 @@ impl ProblemDestination {
             Self::CheckGames => "Open Check Games",
             Self::Games => "Review Games",
             Self::Duplicates => "Review Duplicates",
+            Self::Mame => "Review in MAME",
+        }
+    }
+
+    /// The existing route this destination opens. `MameWorkflow` is a global
+    /// route with no set/game payload, so no context is invented for it.
+    pub(super) fn route(self) -> Route {
+        match self {
+            Self::CheckGames => Route::Section(Section::Check),
+            Self::Games => Route::Section(Section::Games),
+            Self::Duplicates => Route::Section(Section::Duplicates),
+            Self::Mame => Route::MameWorkflow,
         }
     }
 }
+
+/// True only when the game's own identity evidence carries a verified exact
+/// MAME machine name (from a checksum-pinned MAME DAT). The platform label,
+/// file name, or folder never counts.
+pub(super) fn proves_mame(game: &Game) -> bool {
+    game.archive.identity_report.as_ref().is_some_and(|report| {
+        report.evidence.iter().any(|evidence| {
+            evidence.kind == IdentityKind::MameMachineName
+                && evidence.status == IdentityStatus::Verified
+                && evidence.value.is_some()
+        })
+    })
+}
+
+const MAME_ACTION: &str = "Review this set in the MAME workflow. MAME sets are judged as complete sets, so individual files are not renamed or repaired from this page.";
 
 impl Severity {
     pub(super) fn label(self) -> &'static str {
@@ -209,7 +242,11 @@ fn file_problem(game: &Game) -> Problem {
         category: Category::Files,
         severity: Severity::NeedsAttention,
         state: ProblemState::Current,
-        destination: ProblemDestination::Games,
+        destination: if proves_mame(game) {
+            ProblemDestination::Mame
+        } else {
+            ProblemDestination::Games
+        },
         affected: format!("{} · {}", game.platform, game.title),
         location: if path_is_current {
             format!("Current path: {}", game.archive.absolute_path.display())
@@ -217,7 +254,11 @@ fn file_problem(game: &Game) -> Problem {
             format!("Last recorded path: {}", game.archive.absolute_path.display())
         },
         why: "EmuWiz cannot safely verify or prepare this game until the recorded file is available and readable.".into(),
-        action: "Review the game and its folder, then run verification again.".into(),
+        action: if proves_mame(game) {
+            MAME_ACTION.into()
+        } else {
+            "Review the game and its folder, then run verification again.".into()
+        },
         safety: "Read-only. Browsing and verification do not rename, move, delete, or repair the source file.".into(),
         undo: "No file change was made, so there is nothing to undo.".into(),
         technical: format!(
@@ -237,13 +278,21 @@ fn identity_problem(game: &Game) -> Problem {
         category: Category::Identity,
         severity: Severity::Warning,
         state: ProblemState::NeedsEvidence,
-        destination: ProblemDestination::CheckGames,
+        destination: if proves_mame(game) {
+            ProblemDestination::Mame
+        } else {
+            ProblemDestination::CheckGames
+        },
         affected: format!("{} · {}", game.platform, game.title),
         location: format!("Current path: {}", game.archive.absolute_path.display()),
         why:
             "EmuWiz has not established enough trusted evidence to say exactly which game this is."
                 .into(),
-        action: "Open the game details or verification page to review available evidence.".into(),
+        action: if proves_mame(game) {
+            MAME_ACTION.into()
+        } else {
+            "Open the game details or verification page to review available evidence.".into()
+        },
         safety: "Read-only. EmuWiz will not turn a filename hint into a verified identity.".into(),
         undo: "No file change was made, so there is nothing to undo.".into(),
         technical: format!("Catalogue id {} · identified=false", game.archive.id),
@@ -396,5 +445,117 @@ mod tests {
             undo: "none".into(),
             technical: "id".into(),
         }));
+    }
+
+    fn mame_game(id: i64, title: &str, missing: bool, verified: bool) -> Game {
+        use archivefs_core::game_identity::*;
+        let mut game = game(id, title, verified, missing);
+        game.archive.identity_report = Some(GameIdentityReport {
+            archive_path: game.archive.absolute_path.clone(),
+            platform: IdentityPlatform::Arcade,
+            format: IdentityImageFormat::LooseCartridgeRom,
+            evidence: vec![IdentityEvidence {
+                kind: IdentityKind::MameMachineName,
+                status: if verified {
+                    IdentityStatus::Verified
+                } else {
+                    IdentityStatus::Candidate
+                },
+                value: Some("pacman".into()),
+                confidence: IdentityConfidence::ExactBytes,
+                provenance: IdentityProvenance {
+                    archive_path: game.archive.absolute_path.clone(),
+                    member_path: None,
+                    member_index: None,
+                    method: "fixture".into(),
+                },
+                diagnostic: "fixture".into(),
+            }],
+            warnings: vec![],
+            bytes_read: 1,
+            archive_members_inspected: 0,
+            metadata_paths_inspected: 0,
+            nested_container_depth: 0,
+            complete: true,
+        });
+        game
+    }
+
+    fn summary_for(games: Vec<Game>) -> ProblemSummary {
+        let mut library = Library::new(Vec::new());
+        library.games = games;
+        ProblemSummary::from_library(&library, None)
+    }
+
+    #[test]
+    fn proven_mame_problem_opens_the_existing_mame_workflow() {
+        let summary = summary_for(vec![mame_game(10, "pacman", true, true)]);
+        let problem = &summary.problems[0];
+        assert_eq!(problem.destination, ProblemDestination::Mame);
+        assert_eq!(problem.destination.label(), "Review in MAME");
+        assert_eq!(problem.destination.route(), Route::MameWorkflow);
+        // the game is retained for the separate Game Details link only;
+        // MameWorkflow carries no set/game payload, so none is invented
+        assert_eq!(problem.game_id, Some(10));
+    }
+
+    #[test]
+    fn mame_problem_offers_no_generic_rename_or_repair() {
+        let summary = summary_for(vec![mame_game(10, "pacman", true, true)]);
+        let action = summary.problems[0].action.to_lowercase();
+        assert!(action.contains("mame workflow"));
+        assert!(action.contains("not renamed or repaired"));
+        assert_ne!(summary.problems[0].destination, ProblemDestination::Games);
+        assert_ne!(summary.problems[0].destination.label(), "Review Games");
+    }
+
+    #[test]
+    fn non_mame_and_unproven_problems_keep_existing_destinations() {
+        // Arcade platform label alone, a candidate-only MAME name, and no
+        // report at all are all not proof.
+        let summary = summary_for(vec![
+            game(1, "Plain arcade missing", true, true),
+            mame_game(2, "candidate", true, false),
+            game(3, "Plain unknown", false, false),
+        ]);
+        for problem in &summary.problems {
+            assert_ne!(
+                problem.destination,
+                ProblemDestination::Mame,
+                "{}",
+                problem.id
+            );
+        }
+        let by_id = |id: &str| summary.problems.iter().find(|p| p.id == id).unwrap();
+        assert_eq!(by_id("missing-1").destination, ProblemDestination::Games);
+        assert_eq!(by_id("missing-2").destination, ProblemDestination::Games);
+        assert_eq!(
+            by_id("identity-3").destination,
+            ProblemDestination::CheckGames
+        );
+        assert_eq!(
+            ProblemDestination::Games.route(),
+            Route::Section(Section::Games)
+        );
+    }
+
+    #[test]
+    fn filter_and_search_do_not_change_mame_classification() {
+        let summary = summary_for(vec![mame_game(10, "pacman", true, true)]);
+        let before = summary.problems[0].destination;
+        for filter in [ProblemFilter::Actionable, ProblemFilter::All] {
+            let _ = filter.accepts(&summary.problems[0]);
+        }
+        let query = "pacman";
+        let _visible = summary.problems[0].title.to_lowercase().contains(query);
+        assert_eq!(summary.problems[0].destination, before);
+        assert_eq!(before, ProblemDestination::Mame);
+    }
+
+    #[test]
+    fn proves_mame_needs_verified_machine_name_only() {
+        assert!(proves_mame(&mame_game(1, "a", false, true)));
+        assert!(!proves_mame(&mame_game(2, "b", false, false)));
+        assert!(!proves_mame(&game(3, "c", true, false)));
     }
 }

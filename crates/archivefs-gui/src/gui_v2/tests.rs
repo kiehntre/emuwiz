@@ -3865,3 +3865,188 @@ fn gui_v2_real_catalogue_timings() {
         states[0], states[1], states[2], states[3]
     );
 }
+
+// --- reconciliation loose ends: Problems -> MAME, Sources primary action ---
+
+fn clip_visible(output: &egui::FullOutput, needle: &str) -> bool {
+    fn shape_visible(shape: &egui::Shape, clip: egui::Rect, needle: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text) => {
+                text.galley.text() == needle
+                    && clip.contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            egui::Shape::Vec(shapes) => shapes
+                .iter()
+                .any(|shape| shape_visible(shape, clip, needle)),
+            _ => false,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .any(|shape| shape_visible(&shape.shape, shape.clip_rect, needle))
+}
+
+fn sources_frame(size: [f32; 2]) -> (egui::Context, App, egui::FullOutput) {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.router.current = Route::Section(Section::Sources);
+    frame(&context, &mut app, size);
+    let output = frame(&context, &mut app, size);
+    (context, app, output)
+}
+
+#[test]
+fn sources_add_source_and_provider_setup_coexist() {
+    // Primary action visible at the compact supported viewport.
+    let (_, _, compact) = sources_frame([1024.0, 600.0]);
+    assert!(
+        clip_visible(&compact, "Add source"),
+        "Add source clipped at 1024x600"
+    );
+    assert!(
+        text(&compact)
+            .iter()
+            .any(|value| value == "Artwork and metadata providers"),
+        "provider setup is not on the Sources page"
+    );
+    // Provider status fully visible at the normal viewport, alongside the action.
+    let (_, _, normal) = sources_frame([1280.0, 820.0]);
+    assert!(clip_visible(&normal, "Add source"));
+    for label in [
+        "Artwork and metadata providers",
+        "Local artwork",
+        "RomM",
+        "ES-DE",
+        "ScreenScraper",
+    ] {
+        assert!(
+            clip_visible(&normal, label),
+            "{label} not visible at 1280x820"
+        );
+    }
+}
+
+#[test]
+fn sources_primary_action_is_stable_across_repeats_order_and_entry() {
+    for _ in 0..3 {
+        let (_, _, output) = sources_frame([1024.0, 600.0]);
+        assert!(clip_visible(&output, "Add source"));
+    }
+    // After rendering related Artwork/Providers pages first, in the same
+    // context and app.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    for route in [
+        Route::Section(Section::Artwork),
+        Route::Section(Section::SourcesProviders),
+        Route::Section(Section::Sources),
+    ] {
+        app.router.current = route;
+        frame(&context, &mut app, [1024.0, 600.0]);
+    }
+    let output = frame(&context, &mut app, [1024.0, 600.0]);
+    assert!(clip_visible(&output, "Add source"));
+    // Entering through navigation instead of assigning the route directly.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Sources));
+    frame(&context, &mut app, [1024.0, 600.0]);
+    let output = frame(&context, &mut app, [1024.0, 600.0]);
+    assert!(clip_visible(&output, "Add source"));
+}
+
+#[test]
+fn sources_paint_only_rendering_does_not_mutate_state_or_reuse_ids() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.artwork.index = Some(Arc::new(MediaIndex::default()));
+    app.router.current = Route::Section(Section::Sources);
+    let roots = |app: &App| {
+        app.native_workflows.as_ref().and_then(|workflows| {
+            workflows
+                .app
+                .gui_config
+                .source_roots()
+                .ok()
+                .map(|r| r.to_vec())
+        })
+    };
+    // First frame creates the workflow state; everything after is paint-only.
+    frame(&context, &mut app, [1024.0, 600.0]);
+    let roots_before = roots(&app);
+    for size in [[1024.0, 600.0], [1280.0, 820.0], [1024.0, 600.0]] {
+        let output = frame(&context, &mut app, size);
+        assert!(
+            !text(&output).iter().any(|value| value.starts_with('🔥')),
+            "duplicate widget id at {size:?}"
+        );
+    }
+    assert_eq!(app.router.current, Route::Section(Section::Sources));
+    assert_eq!(roots(&app), roots_before);
+}
+
+fn mame_archive(id: i64, title: &str) -> PersistedArchive {
+    use archivefs_core::game_identity::*;
+    let mut row = archive(id, title, Some("Arcade"));
+    row.identity_report = Some(GameIdentityReport {
+        archive_path: row.absolute_path.clone(),
+        platform: IdentityPlatform::Arcade,
+        format: IdentityImageFormat::LooseCartridgeRom,
+        evidence: vec![IdentityEvidence {
+            kind: IdentityKind::MameMachineName,
+            status: IdentityStatus::Verified,
+            value: Some("pacman".into()),
+            confidence: IdentityConfidence::ExactBytes,
+            provenance: IdentityProvenance {
+                archive_path: row.absolute_path.clone(),
+                member_path: None,
+                member_index: None,
+                method: "fixture".into(),
+            },
+            diagnostic: "fixture".into(),
+        }],
+        warnings: vec![],
+        bytes_read: 1,
+        archive_members_inspected: 0,
+        metadata_paths_inspected: 0,
+        nested_container_depth: 0,
+        complete: true,
+    });
+    row
+}
+
+#[test]
+fn problems_page_hands_proven_mame_findings_to_the_mame_workflow() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        mame_archive(1, "Missing Pac-Man"),
+        archive(2, "Missing Plain", Some("PS2")),
+    ]));
+    let summary = Arc::new(ProblemSummary::from_library(&app.library, None));
+    app.problem_summary = Some(summary.clone());
+    app.problem_selected = None;
+    app.router.current = Route::Section(Section::Problems);
+    let output = frame(&context, &mut app, [1280.0, 1600.0]);
+    let strings = text(&output);
+    assert!(strings.iter().any(|value| value == "Review in MAME"));
+    // The non-MAME problem keeps its own destination.
+    assert!(strings.iter().any(|value| value == "Review Games"));
+    // Painting does not mutate problem state, selection or route.
+    frame(&context, &mut app, [1280.0, 1600.0]);
+    assert_eq!(app.problem_summary.as_deref(), Some(&*summary));
+    assert_eq!(app.problem_selected, None);
+    assert_eq!(app.router.current, Route::Section(Section::Problems));
+    // The destination resolves to the existing MAME workflow route.
+    let mame = summary
+        .problems
+        .iter()
+        .find(|p| p.id == "missing-1")
+        .unwrap();
+    app.go(mame.destination.route());
+    assert_eq!(app.router.current, Route::MameWorkflow);
+    assert_eq!(app.router.current.section(), Section::Mame);
+}
