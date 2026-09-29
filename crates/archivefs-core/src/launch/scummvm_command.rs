@@ -212,8 +212,10 @@ fn blocked_or_binding(
         },
         |trainer| {
             vec![
-                OsString::from("--config"),
+                OsString::from("-c"),
                 trainer.configuration.as_os_str().to_os_string(),
+                OsString::from("-p"),
+                game_folder.as_os_str().to_os_string(),
                 OsString::from(trainer.target_name.clone()),
             ]
         },

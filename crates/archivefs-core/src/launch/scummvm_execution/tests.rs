@@ -100,3 +100,259 @@ fn fresh_detector_disagreement_refuses_before_command_creation() {
         ScummVmLaunchPreflightErrorKind::IdentityMismatch
     );
 }
+
+#[cfg(target_os = "linux")]
+fn trainer_request(root: &std::path::Path) -> ScummVmLaunchRequest {
+    let folder = root.join("game with spaces");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("resource.dat"), b"synthetic game").unwrap();
+    let config = root.join("owned.ini");
+    std::fs::write(&config, format!("[scummvm]\nsavepath={}\n[emuwiz-game]\nengineid=hypno\ngameid=demo\npath={}\ninfiniteHealth=true\n", root.join("saves").display(), folder.display())).unwrap();
+    ScummVmLaunchRequest {
+        selected_game_folder: folder,
+        expected_game_key: "hypno:demo".into(),
+        expected_executable: executable_fixture(root, "Game ID: hypno:demo"),
+        trainer: Some(ScummVmTrainerLaunchBinding {
+            configuration: config,
+            target_name: "emuwiz-game".into(),
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_preflight_is_repeatable_and_preserves_config_media_and_saves() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let before = std::fs::read(config).unwrap();
+    std::fs::create_dir(root.path().join("saves")).unwrap();
+    let save = root.path().join("saves/existing.sav");
+    std::fs::write(&save, b"valuable save fixture").unwrap();
+    let command = preflight_scummvm_launch(&request).unwrap();
+    assert_eq!(command, preflight_scummvm_launch(&request).unwrap());
+    assert_eq!(
+        command.arguments,
+        vec![
+            std::ffi::OsString::from("-c"),
+            config.as_os_str().into(),
+            "-p".into(),
+            request.selected_game_folder.as_os_str().into(),
+            "emuwiz-game".into()
+        ]
+    );
+    assert_eq!(std::fs::read(config).unwrap(), before);
+    assert_eq!(
+        std::fs::read(request.selected_game_folder.join("resource.dat")).unwrap(),
+        b"synthetic game"
+    );
+    assert_eq!(std::fs::read(save).unwrap(), b"valuable save fixture");
+    assert!(
+        !command
+            .arguments
+            .iter()
+            .any(|a| a.to_string_lossy().contains("savepath"))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_target_mismatch_is_blocked_before_detector_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    // Removing the executable proves the config rejection happens first.
+    std::fs::remove_file(&request.expected_executable).unwrap();
+    for changed in [
+        original.replace("engineid=hypno", "engineid=scumm"),
+        original.replace("gameid=demo", "gameid=other"),
+        original.replace("gameid=demo", "gameid=hypno:demo"),
+        original.replace(
+            &request.selected_game_folder.display().to_string(),
+            "/other/game",
+        ),
+        original.replace("emuwiz-game", "another-target"),
+    ] {
+        std::fs::write(config, &changed).unwrap();
+        assert_eq!(
+            preflight_scummvm_launch(&request).unwrap_err().kind,
+            ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), changed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_malformed_duplicate_and_missing_bindings_fail_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    for changed in [
+        original.replace("engineid=hypno\n", ""),
+        original.replace("gameid=demo\n", ""),
+        original.replace("gameid=demo", "gameid=demo\ngameid=other"),
+        original.replace("gameid=demo", "gameid=demo\nGAMEID=demo"),
+        format!("{original}[emuwiz-game]\ngameid=demo\n"),
+        original.replace("[emuwiz-game]", "[emuwiz-game"),
+        format!("{original}junk\n"),
+        format!("{original}\0\n"),
+        String::new(),
+    ] {
+        std::fs::write(config, changed).unwrap();
+        assert_eq!(
+            preflight_scummvm_launch(&request).unwrap_err().kind,
+            ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_missing_oversized_long_line_and_invalid_utf8_are_bounded() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    std::fs::remove_file(config).unwrap();
+    assert_eq!(
+        preflight_scummvm_launch(&request).unwrap_err().kind,
+        ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+    );
+    for bytes in [
+        vec![b'x'; trainer_config::MAX_CONFIG_BYTES + 1],
+        vec![b'x'; 8193],
+        vec![0xff],
+    ] {
+        std::fs::write(config, bytes).unwrap();
+        assert_eq!(
+            preflight_scummvm_launch(&request).unwrap_err().kind,
+            ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_symlinks_and_special_files_are_refused_without_blocking() {
+    use std::os::unix::fs::symlink;
+    let root = tempfile::tempdir().unwrap();
+    let mut request = trainer_request(root.path());
+    let config = request.trainer.as_ref().unwrap().configuration.clone();
+    let link = root.path().join("linked.ini");
+    symlink(&config, &link).unwrap();
+    request.trainer.as_mut().unwrap().configuration = link;
+    assert_eq!(
+        preflight_scummvm_launch(&request).unwrap_err().kind,
+        ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+    );
+    let directory = root.path().join("linked-parent");
+    symlink(root.path(), &directory).unwrap();
+    request.trainer.as_mut().unwrap().configuration = directory.join("owned.ini");
+    assert_eq!(
+        preflight_scummvm_launch(&request).unwrap_err().kind,
+        ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+    );
+    let fifo = root.path().join("fifo.ini");
+    let fifo_c =
+        std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(fifo.as_os_str())).unwrap();
+    // SAFETY: fifo_c is a live NUL-terminated fixture path; no pointer escapes.
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+    request.trainer.as_mut().unwrap().configuration = fifo;
+    assert_eq!(
+        preflight_scummvm_launch(&request).unwrap_err().kind,
+        ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+    );
+    assert!(config.is_file());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_validation_accepts_native_bom_crlf_comments_and_literal_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    std::fs::write(
+        config,
+        format!(
+            "\u{feff}# native comment\r\n{}",
+            original.replace('\n', "\r\n")
+        ),
+    )
+    .unwrap();
+    assert!(preflight_scummvm_launch(&request).is_ok());
+    std::fs::write(
+        config,
+        original.replace(
+            &request.selected_game_folder.display().to_string(),
+            &format!("\"{}\"", request.selected_game_folder.display()),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        preflight_scummvm_launch(&request).unwrap_err().kind,
+        ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn changed_trainer_binding_is_rejected_again_at_spawn() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let command = preflight_scummvm_launch(&request).unwrap();
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let changed = std::fs::read_to_string(config)
+        .unwrap()
+        .replace("gameid=demo", "gameid=other");
+    std::fs::write(config, changed).unwrap();
+    assert!(
+        matches!(spawn_scummvm(command), Err(ScummVmLaunchSpawnError::Spawn(e)) if e.kind() == std::io::ErrorKind::InvalidInput)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_requires_explicit_native_savepath_with_target_precedence() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    let without = original
+        .lines()
+        .filter(|line| !line.starts_with("savepath="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for text in [
+        without,
+        format!("{original}\nsavepath=relative\n"),
+        format!("{original}\nsavepath=\n"),
+        format!("{original}\nsavepath=/saves/../other\n"),
+    ] {
+        std::fs::write(config, text).unwrap();
+        assert_eq!(
+            preflight_scummvm_launch(&request).unwrap_err().kind,
+            ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+        );
+    }
+    // Native target savepath takes precedence over the global setting.
+    let override_text = format!(
+        "{}\nsavepath={}\n",
+        original.replace(
+            &format!("savepath={}", root.path().join("saves").display()),
+            "savepath=relative"
+        ),
+        root.path().join("target-saves").display()
+    );
+    std::fs::write(config, &override_text).unwrap();
+    let command = preflight_scummvm_launch(&request).unwrap();
+    assert_eq!(std::fs::read_to_string(config).unwrap(), override_text);
+    assert!(
+        !command
+            .arguments
+            .iter()
+            .any(|a| a.to_string_lossy().contains("savepath"))
+    );
+}

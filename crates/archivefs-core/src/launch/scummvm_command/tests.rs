@@ -89,8 +89,10 @@ fn documented_trainer_profile_uses_alternate_config_and_exact_target() {
     assert_eq!(
         plan.command.unwrap().arguments,
         vec![
-            std::ffi::OsString::from("--config"),
+            std::ffi::OsString::from("-c"),
             std::ffi::OsString::from("/emuwiz/scummvm/hypno-demo.ini"),
+            std::ffi::OsString::from("-p"),
+            std::ffi::OsString::from("/games/game"),
             std::ffi::OsString::from("emuwiz-hypno-demo")
         ]
     );

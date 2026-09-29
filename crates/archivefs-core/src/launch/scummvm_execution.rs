@@ -3,8 +3,9 @@
 //! Preflight re-runs the installed ScummVM detector against the selected
 //! folder, then rebuilds the structured command from that fresh evidence.
 //! Spawning delegates to the shared direct-argv process watcher; no shell is
-//! ever involved and no ScummVM configuration is rewritten or isolated for
-//! the actual launch.
+//! ever involved. Trainer preflight reads the caller's EmuWiz-owned target
+//! configuration; it never rewrites it or changes its savepath. ScummVM itself
+//! may persist metadata to that configuration during the actual launch.
 
 use std::fs;
 use std::path::PathBuf;
@@ -17,6 +18,8 @@ use crate::launch::scummvm_command::{
     ScummVmCommand, ScummVmTrainerLaunchBinding, build_scummvm_command_plan_with_trainer,
     resolve_scummvm_native_launch_binding_at,
 };
+
+mod trainer_config;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScummVmLaunchRequest {
@@ -39,6 +42,7 @@ pub enum ScummVmLaunchPreflightErrorKind {
     BindingDrift,
     CommandBlocked,
     CommandMissing,
+    TrainerConfigurationInvalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +114,10 @@ pub fn preflight_scummvm_launch(
             ScummVmLaunchPreflightErrorKind::ContentNotDirectory,
             "ScummVM launch requires an extracted game directory",
         ));
+    }
+
+    if let Some(trainer) = &request.trainer {
+        trainer_config::validate(trainer, &request.expected_game_key, folder)?;
     }
 
     let binding = resolve_scummvm_native_launch_binding_at(&request.expected_executable)
@@ -193,6 +201,34 @@ impl LaunchedScummVmProcess {
 pub fn spawn_scummvm(
     command: ScummVmCommand,
 ) -> Result<LaunchedScummVmProcess, ScummVmLaunchSpawnError> {
+    // Re-check the native target at the final process boundary too. The CLI
+    // path pins the selected folder while its existing savepath is retained.
+    if command.arguments.first().is_some_and(|a| a == "-c") {
+        let invalid = |detail| {
+            ScummVmLaunchSpawnError::Spawn(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                detail,
+            ))
+        };
+        if command.arguments.len() != 5
+            || command.arguments[2] != "-p"
+            || command.arguments[3] != command.selection.game_folder.as_os_str()
+        {
+            return Err(invalid("invalid ScummVM trainer command shape".to_string()));
+        }
+        let target_name = command.arguments[4]
+            .to_str()
+            .ok_or_else(|| invalid("invalid ScummVM trainer target name".to_string()))?;
+        trainer_config::validate(
+            &ScummVmTrainerLaunchBinding {
+                configuration: PathBuf::from(&command.arguments[1]),
+                target_name: target_name.into(),
+            },
+            &command.selection.game_id,
+            &command.selection.game_folder,
+        )
+        .map_err(|e| invalid(e.detail))?;
+    }
     let prepared = PreparedProcessCommand {
         executable: command.executable.clone(),
         arguments: command.arguments.clone(),

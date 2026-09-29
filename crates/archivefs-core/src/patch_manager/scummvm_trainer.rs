@@ -212,7 +212,7 @@ pub fn scummvm_trainer_options(
 pub fn build_scummvm_trainer_preview(
     request: &ScummVmTrainerRequest,
 ) -> Result<ScummVmTrainerPreview, ScummVmTrainerError> {
-    let (engine_id, _game_id) = split_game_id(&request.identity.game_id)?;
+    let (engine_id, game_id) = split_game_id(&request.identity.game_id)?;
     if engine_id != "hypno" {
         return Err(ScummVmTrainerError::UnsupportedGame(
             "this ScummVM identity has no implemented trainer projection".into(),
@@ -233,8 +233,10 @@ pub fn build_scummvm_trainer_preview(
     }
     let document = parse_ini(&configuration)?;
     if let Some(entries) = document.sections.get(&request.identity.target_name)
-        && let Some((_, _, configured_id)) = entries.iter().find(|(_, key, _)| key == "gameid")
-        && configured_id != &request.identity.game_id
+        && entries.iter().any(|(_, key, value)| {
+            (key == "gameid" && value != &request.identity.game_id && value != game_id)
+                || (key == "engineid" && value != engine_id)
+        })
     {
         return Err(ScummVmTrainerError::Conflict(vec![
             ScummVmTrainerConflict {
@@ -385,11 +387,11 @@ fn render_scummvm_config(
     let mut document = parse_ini(configuration)?;
     let section = identity.target_name.clone();
     let mut rendered = BTreeMap::new();
-    rendered.insert("gameid".to_string(), identity.game_id.clone());
-    rendered.insert(
-        "engineid".to_string(),
-        identity.game_id.split(':').next().unwrap().into(),
-    );
+    // Qualified IDs are detector/CLI identity. Native target sections store
+    // the engine and the unqualified game ID separately.
+    let (engine, game) = split_game_id(&identity.game_id)?;
+    rendered.insert("gameid".to_string(), game.into());
+    rendered.insert("engineid".to_string(), engine.into());
     rendered.insert(
         "path".to_string(),
         identity.game_folder.display().to_string(),
@@ -424,14 +426,30 @@ fn render_scummvm_config(
                 document.lines[index].clear();
             }
         }
+        let mut missing = Vec::new();
         for (key, value) in &rendered {
             if !document.sections[&section]
                 .iter()
                 .any(|(_, candidate, _)| candidate == key)
             {
-                document.lines.push(format!("{key}={value}"));
+                missing.push(format!("{key}={value}"));
             }
         }
+        // New binding/options belong to this target, not the final unrelated
+        // section in the file. Preserve all other sections in place.
+        let start = document
+            .lines
+            .iter()
+            .position(|line| line.trim() == format!("[{section}]"))
+            .ok_or(ScummVmTrainerError::InvalidTarget(section.clone()))?;
+        let end = document
+            .lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, line)| line.trim().starts_with('['))
+            .map_or(document.lines.len(), |(i, _)| i);
+        document.lines.splice(end..end, missing);
     } else {
         if !document.lines.is_empty() && !document.lines.last().unwrap().is_empty() {
             document.lines.push(String::new());
@@ -608,7 +626,51 @@ mod tests {
         let text = String::from_utf8(first).unwrap();
         assert!(text.contains("fullscreen=true"));
         assert!(text.contains("infiniteAmmo=true"));
-        assert!(text.contains("gameid=hypno:demo"));
+        assert!(text.contains("gameid=demo"));
+        assert!(text.contains("engineid=hypno"));
+    }
+
+    #[test]
+    fn regenerated_native_target_keeps_new_fields_before_unrelated_sections_and_savepath() {
+        let root = tempdir().unwrap();
+        let config = root.path().join("game.ini");
+        let request = request(root.path(), &config);
+        let source = b"[scummvm]\nsavepath=/real/user/saves\n[emuwiz-hypno-demo]\ngameid=hypno:demo\n[other]\npath=/other\nkeep=true\n";
+        fs::write(&config, source).unwrap();
+        let first = render_scummvm_config(source, &request.identity, &request.selections).unwrap();
+        let document = parse_ini(&first).unwrap();
+        let target = &document.sections["emuwiz-hypno-demo"];
+        assert!(target.iter().any(|(_, k, v)| k == "gameid" && v == "demo"));
+        assert!(
+            target
+                .iter()
+                .any(|(_, k, v)| k == "engineid" && v == "hypno")
+        );
+        assert!(
+            target
+                .iter()
+                .any(|(_, k, v)| k == "infiniteHealth" && v == "true")
+        );
+        assert_eq!(
+            document.sections["other"]
+                .iter()
+                .map(|(_, k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("path", "/other"), ("keep", "true")]
+        );
+        assert!(
+            document.sections["scummvm"]
+                .iter()
+                .any(|(_, k, v)| k == "savepath" && v == "/real/user/saves")
+        );
+        assert_eq!(
+            render_scummvm_config(&first, &request.identity, &request.selections).unwrap(),
+            first
+        );
+        assert_eq!(fs::read(&config).unwrap(), source);
+        // A correctly regenerated unqualified ID is accepted on subsequent previews.
+        fs::write(&config, &first).unwrap();
+        assert!(build_scummvm_trainer_preview(&request).is_ok());
     }
 
     #[test]
