@@ -680,147 +680,88 @@ fn exclusion_kind_order(kind: CatalogueEntryExclusionKind) -> u8 {
     }
 }
 
-/// Parses the same `cheatN_*`/`cheats = N` key-value text format as
-/// `retroarch_inventory::parse_cheat_summary`, but keeps one
-/// [`CheatDefinition`] per entry index instead of only aggregate counts.
-/// Deliberately re-implemented rather than importing that function:
-/// `retroarch_inventory` exposes no `pub(crate)` parser today, and
-/// widening its visibility is out of scope for this milestone's file-level
-/// boundary (see the module doc comment). Cheat *code* lines
-/// (`cheatN_code`, `cheatN_code_type`, ...) are read only far enough to
-/// confirm a non-empty `cheatN_code` exists; their values are never stored
-/// anywhere in this module's output.
-///
-/// The `cheats = N` header is validated only for being syntactically a
-/// number, never compared against how many `cheatN_...` entries actually
-/// follow it (2026-08-22, live-QA Phase 8): real, working Libretro `.cht`
-/// files hand-edited over time routinely drift out of sync between the two,
-/// and RetroArch itself never enforces them matching when it loads cheats.
-/// Treating that mismatch as fatal was excluding genuinely usable files
-/// wholesale under a "MalformedCht" label; every entry actually found and
-/// successfully parsed is returned regardless of what the header claimed.
-///
-/// A stray/malformed line (no `=`, an unrecognised `cheatN_*` shape, a
-/// non-numeric `cheats` value, ...) is likewise never fatal by itself
-/// (2026-08-23, real-corpus audit: 85 of 28,308 real files had exactly this -
-/// a bare `false`, a stray quote, a parenthetical note, an orphaned `_L`
-/// continuation line, or similar hand-edit debris alongside otherwise-valid
-/// `cheatN_*` entries). Each such line is skipped and recorded as a warning
-/// diagnostic; parsing continues. A file is only rejected outright
-/// (`complete = false`) when it ends up with **zero** usable `cheatN_*`
-/// entries *and* contained at least one malformed line - i.e. it looks like
-/// non-RetroArch content rather than a RetroArch cheat file with typos. A
-/// clean file that legitimately declares `cheats = 0` and defines no
-/// entries (and has no malformed lines) remains valid.
-///
-/// A `cheatN_*` entry's numeric index is not capped here: this parser only
-/// ever materialises one [`CheatDefinition`] per *distinct* index actually
-/// present in the file, so memory use tracks the file's line count (already
-/// bounded by [`MAX_CATALOGUE_FILE_BYTES`]), never the index's numeric
-/// value. Rejecting a file solely because a real, valid index happened to
-/// exceed the old `MAX_CHEATS_PER_GAME` cap (2 of 28,308 real files did)
-/// was protecting against nothing this bound doesn't already cover.
+/// Metadata projection of the shared bounded parser. Catalogue records
+/// deliberately retain incomplete entry metadata for review; selection always
+/// reparses source bytes and refuses blocking entry warnings. Legacy decoding
+/// stays explicit in `decode_cht_text`, never in the installation parser.
 fn parse_cht_cheats(
     text: &str,
     path: &Path,
 ) -> (Vec<CheatDefinition>, bool, Vec<CatalogueDiagnostic>) {
-    use std::collections::BTreeMap;
-
-    let mut descriptions = BTreeMap::<u32, String>::new();
-    let mut enabled = BTreeSet::<u32>::new();
-    let mut seen_indices = BTreeSet::<u32>::new();
-    let mut code_indices = BTreeSet::<u32>::new();
-    let mut diagnostics = Vec::new();
-    let mut saw_malformed_line = false;
-
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            saw_malformed_line = true;
-            diagnostics.push(malformed_line_diagnostic(path, line_number));
-            continue;
-        };
-        let key = raw_key.trim();
-        let value = unquote_cht_value(raw_value.trim());
-        if key == "cheats" {
-            // The declared count is read only far enough to confirm it is
-            // syntactically a number - a non-numeric value is genuinely
-            // malformed syntax. The count itself is not compared against
-            // how many `cheatN_...` entries actually follow; see the doc
-            // comment below `seen_indices` is finalised for why.
-            if value.parse::<u32>().is_err() {
-                saw_malformed_line = true;
-                diagnostics.push(malformed_line_diagnostic(path, line_number));
-            }
-            continue;
-        }
-        let Some(remainder) = key.strip_prefix("cheat") else {
-            continue;
-        };
-        let digit_count = remainder.bytes().take_while(u8::is_ascii_digit).count();
-        if digit_count == 0 || !remainder[digit_count..].starts_with('_') {
-            saw_malformed_line = true;
-            diagnostics.push(malformed_line_diagnostic(path, line_number));
-            continue;
-        }
-        let Ok(entry_index) = remainder[..digit_count].parse::<u32>() else {
-            saw_malformed_line = true;
-            diagnostics.push(malformed_line_diagnostic(path, line_number));
-            continue;
-        };
-        seen_indices.insert(entry_index);
-        let field = &remainder[digit_count + 1..];
-        if field == "desc" && !value.is_empty() {
-            descriptions
-                .entry(entry_index)
-                .or_insert_with(|| value.to_string());
-        }
-        if field == "enable" && value.eq_ignore_ascii_case("true") {
-            enabled.insert(entry_index);
-        }
-        if field == "code" && !value.is_empty() {
-            code_indices.insert(entry_index);
-        }
-    }
-
-    let cheats: Vec<CheatDefinition> = seen_indices
-        .into_iter()
-        .map(|index| CheatDefinition {
-            description: descriptions.remove(&index),
-            enabled_by_default: enabled.contains(&index),
-            declared_index: Some(index),
-        })
-        .collect();
-    // Existing broad catalogue indexing intentionally retains metadata-only
-    // `cheatN_*` records; the strict full-fidelity parser is used before
-    // selection and installation. But a malformed file with no non-empty
-    // code at all cannot become an installable candidate merely because it
-    // had a `cheatN_desc` field.
-    let complete = (!cheats.is_empty() || !saw_malformed_line)
-        && !(saw_malformed_line && code_indices.is_empty() && !cheats.is_empty());
-    (cheats, complete, diagnostics)
-}
-
-fn malformed_line_diagnostic(path: &Path, line: u32) -> CatalogueDiagnostic {
-    CatalogueDiagnostic {
-        code: "catalogue_cht_malformed_line",
+    use super::cht_document::{ChtDocumentWarningKind, MAX_CHT_DOCUMENT_WARNINGS, parse_cht_text};
+    let diagnostic = |code, line: Option<u32>| CatalogueDiagnostic {
+        code,
         severity: ArtifactDiagnosticSeverity::Warning,
         path: Some(EncodedPath {
-            display: format!("{}:{line}", EncodedPath::from_path(path).display),
-            lossy: false,
+            display: match line {
+                Some(line) => format!("{}:{line}", EncodedPath::from_path(path).display),
+                None => EncodedPath::from_path(path).display,
+            },
+            lossy: EncodedPath::from_path(path).lossy,
         }),
+    };
+    let document = match parse_cht_text(text) {
+        Ok(document) => document,
+        Err(_) => {
+            return (
+                Vec::new(),
+                false,
+                vec![diagnostic("catalogue_cht_malformed_line", None)],
+            );
+        }
+    };
+    let saw_malformed_line = document.warnings.iter().any(|warning| {
+        matches!(
+            warning.kind,
+            ChtDocumentWarningKind::MalformedLine
+                | ChtDocumentWarningKind::MalformedEntryIndex
+                | ChtDocumentWarningKind::EntryIndexOutOfRange
+                | ChtDocumentWarningKind::MalformedDeclaredCount
+                | ChtDocumentWarningKind::OversizedLine
+                | ChtDocumentWarningKind::InvalidFieldValue
+        )
+    });
+    let has_code = document.entries.iter().any(|entry| {
+        entry
+            .code
+            .as_deref()
+            .is_some_and(|code| !code.trim().is_empty())
+    });
+    let complete = (!document.entries.is_empty() || !saw_malformed_line)
+        && !(saw_malformed_line && !has_code && !document.entries.is_empty());
+    let mut diagnostics: Vec<_> = document
+        .warnings
+        .iter()
+        .map(|warning| {
+            let code = if warning.kind == ChtDocumentWarningKind::MalformedLine {
+                "catalogue_cht_malformed_line"
+            } else {
+                warning.kind.code()
+            };
+            diagnostic(code, warning.line)
+        })
+        .collect();
+    for entry in &document.entries {
+        for warning in &entry.warnings {
+            if diagnostics.len() >= MAX_CHT_DOCUMENT_WARNINGS {
+                if let Some(last) = diagnostics.last_mut() {
+                    *last = diagnostic("cht_limit_reached", None);
+                }
+                break;
+            }
+            diagnostics.push(diagnostic(warning.kind.code(), warning.line));
+        }
     }
-}
-
-fn unquote_cht_value(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
+    let cheats = document
+        .entries
+        .into_iter()
+        .map(|entry| CheatDefinition {
+            description: entry.description,
+            enabled_by_default: entry.enabled_by_default,
+            declared_index: Some(entry.index),
+        })
+        .collect();
+    (cheats, complete, diagnostics)
 }
 
 // ---------------------------------------------------------------------

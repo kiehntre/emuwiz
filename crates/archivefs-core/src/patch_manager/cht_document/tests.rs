@@ -110,7 +110,7 @@ fn quoted_values_containing_escaped_quotes_are_rejected_without_rewriting_them()
     let text = "cheats = 1\ncheat0_desc = \"Say \\\"hello\\\"\"\ncheat0_code = \"ABCD\"\n";
     let document = parse(text);
     let entry = &document.entries[0];
-    assert_eq!(entry.description.as_deref(), Some("Say \"hello\""));
+    assert_eq!(entry.description.as_deref(), Some(r#"Say \"hello\""#));
     assert!(
         entry
             .warnings
@@ -189,8 +189,8 @@ fn a_malformed_entry_index_is_rejected_safely() {
 
 #[test]
 fn an_out_of_range_entry_index_is_rejected_rather_than_allocated() {
-    let text = format!("cheats = 1\ncheat{MAX_CHT_ENTRIES}_desc = \"A\"\ncheat0_code = \"B\"\n");
-    let document = parse(&text);
+    let text = "cheats = 1\ncheat4294967296_desc = \"A\"\ncheat0_code = \"B\"\n";
+    let document = parse(text);
     assert!(
         document
             .warnings
@@ -258,8 +258,9 @@ fn a_duplicate_field_keeps_the_first_value_and_reports_the_conflict() {
         entry
             .warnings
             .iter()
-            .any(|warning| warning.kind == ChtEntryWarningKind::DuplicateField)
+            .any(|warning| warning.kind == ChtEntryWarningKind::ConflictingDuplicate)
     );
+    assert!(!entry.is_selectable());
 }
 
 #[test]
@@ -268,7 +269,10 @@ fn an_unparsable_enable_value_defaults_to_disabled_and_reports_it() {
     let document = parse(text);
     let entry = &document.entries[0];
     assert!(!entry.enabled_by_default);
-    assert!(entry.is_selectable(), "the cheat itself is still valid");
+    assert!(
+        !entry.is_selectable(),
+        "an unknown default is unsafe to install"
+    );
     assert!(
         entry
             .warnings
@@ -521,4 +525,417 @@ fn a_rendered_file_parses_back_to_the_same_selection() {
         ]
     );
     assert_eq!(reparsed.entries[1].code.as_deref(), Some("PANKGOLA"));
+}
+
+#[test]
+fn minimal_valid_and_missing_count_preserve_actual_evidence() {
+    for (header, expected_count) in [("cheats = 1\n", Some(1)), ("", None)] {
+        let document = parse(&format!(
+            "{header}cheat0_desc = Lives\ncheat0_code = VALID\n"
+        ));
+        assert_eq!(document.declared_count, expected_count);
+        assert_eq!(document.selectable_count(), 1);
+        assert_eq!(
+            document
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == ChtDocumentWarningKind::MissingDeclaredCount),
+            header.is_empty()
+        );
+    }
+}
+
+#[test]
+fn declared_counts_are_evidence_never_allocation_instructions() {
+    for (count, kind) in [
+        ("4294967295", ChtDocumentWarningKind::OversizedDeclaredCount),
+        (
+            "99999999999999999999",
+            ChtDocumentWarningKind::MalformedDeclaredCount,
+        ),
+        ("-1", ChtDocumentWarningKind::MalformedDeclaredCount),
+        ("no", ChtDocumentWarningKind::MalformedDeclaredCount),
+        ("", ChtDocumentWarningKind::MalformedDeclaredCount),
+        ("\"1", ChtDocumentWarningKind::MalformedDeclaredCount),
+    ] {
+        let document = parse(&format!(
+            "cheats = {count}\ncheat0_desc = Lives\ncheat0_code = VALID\n"
+        ));
+        assert_eq!(document.entries.len(), 1, "{count}");
+        assert_eq!(document.selectable_count(), 1, "{count}");
+        assert!(
+            document.warnings.iter().any(|warning| warning.kind == kind),
+            "{count}"
+        );
+    }
+    // Even a malformed count-only file retains its typed diagnostic.
+    assert!(
+        parse("cheats = -1")
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::MalformedDeclaredCount)
+    );
+}
+
+#[test]
+fn sparse_high_indices_are_sorted_and_count_range_disagreement_is_visible() {
+    let document = parse(
+        "cheats = 3\ncheat4_code = C\ncheat0_code = A\ncheat2_code = B\ncheat4294967295_code = D\n",
+    );
+    assert_eq!(
+        document
+            .entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>(),
+        vec![0, 2, 4, u32::MAX]
+    );
+    assert_eq!(document.selectable_count(), 4);
+    assert!(
+        document
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::DeclaredCountMismatch)
+    );
+    let document = parse("cheats = 2\ncheat0_code = A\ncheat4_code = B\n");
+    assert!(
+        document
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::DeclaredCountMismatch)
+    );
+}
+
+#[test]
+fn duplicates_are_observable_and_conflicts_block_only_the_affected_index() {
+    for field in ["desc", "code", "enable", "handler", "future_field"] {
+        let value = match field {
+            "enable" => "true",
+            "handler" => "1",
+            _ => "VALID",
+        };
+        for (later, kind, selectable) in [
+            (value, ChtEntryWarningKind::DuplicateField, true),
+            (
+                "DIFFERENT",
+                ChtEntryWarningKind::ConflictingDuplicate,
+                false,
+            ),
+        ] {
+            let other_fields = match field {
+                "desc" => "cheat1_code = VALID\n",
+                "code" => "cheat1_desc = Lives\n",
+                _ => "cheat1_desc = Lives\ncheat1_code = VALID\n",
+            };
+            let text = format!(
+                "cheats = 3\ncheat0_code = A\n{other_fields}cheat1_{field} = {value}\ncheat1_{field} = {later}\ncheat2_code = B\n"
+            );
+            let document = parse(&text);
+            let entry = document.entry(1).unwrap();
+            assert_eq!(entry.is_selectable(), selectable, "{field} {later}");
+            let warning = entry
+                .warnings
+                .iter()
+                .find(|warning| warning.kind == kind)
+                .unwrap();
+            assert!(warning.line.is_some());
+            assert!(warning.raw_source.as_ref().unwrap().contains(later));
+            assert!(document.entry(0).unwrap().is_selectable());
+            assert!(document.entry(2).unwrap().is_selectable());
+        }
+    }
+}
+
+#[test]
+fn duplicate_index_blocks_conflicting_entry_blocks_instead_of_merging_them() {
+    let document = parse(
+        "cheats = 1\ncheat0_desc = First\ncheat0_code = AAA\ncheat00_desc = Second\ncheat00_code = BBB\n",
+    );
+    assert_eq!(document.entries.len(), 1);
+    assert_eq!(document.entries[0].code.as_deref(), Some("AAA"));
+    assert_eq!(document.entries[0].description.as_deref(), Some("First"));
+    assert!(!document.entries[0].is_selectable());
+    assert_eq!(
+        document.entries[0]
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == ChtEntryWarningKind::ConflictingDuplicate)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn duplicate_count_and_global_keys_keep_first_evidence_with_typed_diagnostics() {
+    for (later, kind) in [
+        ("1", ChtDocumentWarningKind::DuplicateField),
+        ("2", ChtDocumentWarningKind::ConflictingDuplicate),
+    ] {
+        let document = parse(&format!(
+            "cheats = 1\nCHEATS = {later}\ncustom = 1\ncustom = {later}\ncheat0_code = A\n"
+        ));
+        assert_eq!(document.declared_count, Some(1));
+        assert_eq!(
+            document.global_fields,
+            vec![("custom".to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            document
+                .warnings
+                .iter()
+                .filter(|warning| warning.kind == kind)
+                .count(),
+            2
+        );
+        assert_eq!(document.selectable_count(), 1);
+    }
+}
+
+#[test]
+fn unknown_fields_remain_preserved_and_nonblocking() {
+    let document = parse(
+        "cheats = 1\ncustom_tool = safe\ncheat0_desc = A\ncheat0_code = B\ncheat0_future_setting = xyz\n",
+    );
+    let entry = &document.entries[0];
+    assert!(entry.is_selectable());
+    assert_eq!(
+        entry.extra_fields,
+        vec![("future_setting".to_string(), "xyz".to_string())]
+    );
+    assert!(
+        entry
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtEntryWarningKind::UnsupportedField)
+    );
+}
+
+#[test]
+fn malformed_scalar_fields_block_entries_without_inventing_values() {
+    for (field, value) in [
+        ("handler", "-1"),
+        ("value", "4294967296"),
+        ("address", "0xZZ"),
+        ("repeat_count", "maybe"),
+        ("memory_search_size", ""),
+        ("big_endian", "yes"),
+        ("bad-field", "1"),
+    ] {
+        let document = parse(&format!(
+            "cheats = 1\ncheat0_code = VALID\ncheat0_{field} = {value}\n"
+        ));
+        let entry = &document.entries[0];
+        assert!(!entry.is_selectable(), "{field} {value}");
+        assert!(
+            entry
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == ChtEntryWarningKind::InvalidFieldValue)
+        );
+        assert_eq!(entry.extra_fields[0].1, value);
+    }
+    for value in ["0", "4294967295", "0xFF"] {
+        let document = parse(&format!("cheat0_code = VALID\ncheat0_value = {value}\n"));
+        assert!(document.entries[0].is_selectable());
+    }
+}
+
+#[test]
+fn malformed_entry_fixture_set_keeps_both_valid_neighbors() {
+    for broken in [
+        "cheat1_desc = Broken\n",
+        "cheat1_code =\n",
+        "cheat1_code = \"\"\n",
+        "cheat1_code = \"unterminated",
+        "cheat1_code = VALID\ncheat1_enable = maybe",
+        "cheat1_code = VALID\ncheat1_code",
+        "cheat1_code = VALID\ncheat1_ = x",
+        "cheat1_code = +",
+        "cheat1_code = A++B",
+        "cheat1_code = \" \"",
+        "cheat1_code = \u{fffd}",
+        "cheat1_code = X\0Y",
+    ] {
+        let text = format!(
+            "cheats = 3\ncheat0_desc = Lives\ncheat0_code = A\n{broken}\ncheat2_desc = Levels\ncheat2_code = B\n"
+        );
+        let document = parse(&text);
+        assert_eq!(document.entries.len(), 3, "{broken:?}");
+        assert_eq!(document.selectable_count(), 2, "{broken:?}");
+        assert!(!document.entry(1).unwrap().is_selectable(), "{broken:?}");
+        assert!(!document.entry(1).unwrap().warnings.is_empty());
+    }
+    // End-of-file without a newline is valid when the value is closed.
+    assert_eq!(parse("cheat0_code = \"A\"").selectable_count(), 1);
+    let truncated = parse("cheat0_code = A\ncheat1_code = \"B");
+    assert_eq!(truncated.selectable_count(), 1);
+    assert!(
+        truncated
+            .entry(1)
+            .unwrap()
+            .warnings
+            .iter()
+            .any(
+                |warning| warning.kind == ChtEntryWarningKind::TruncatedValue
+                    && warning.line == Some(2)
+            )
+    );
+}
+
+#[test]
+fn bounded_values_lines_and_file_sizes_are_enforced_at_both_parser_entrypoints() {
+    for size in [MAX_CHT_FIELD_BYTES + 1, MAX_CHT_LINE_BYTES + 1] {
+        let text = format!(
+            "cheats = 2\ncheat0_code = {}\ncheat1_code = A\n",
+            "é".repeat(size)
+        );
+        let document = parse(&text);
+        assert_eq!(document.selectable_count(), 1);
+        let entry = document.entry(0).unwrap();
+        assert!(entry.code.as_ref().unwrap().len() <= MAX_CHT_FIELD_BYTES);
+        assert!(
+            entry
+                .warnings
+                .iter()
+                .any(|warning| warning.kind == ChtEntryWarningKind::OversizedField)
+        );
+        for warning in &entry.warnings {
+            assert!(
+                warning
+                    .raw_source
+                    .as_ref()
+                    .is_none_or(|raw| raw.len() <= MAX_CHT_LINE_BYTES)
+            );
+        }
+    }
+    // An '=' past the line bound cannot conceal an unsafe duplicate assignment.
+    let text = format!(
+        "cheat0_code = A\ncheat0_code{}=B",
+        " ".repeat(MAX_CHT_LINE_BYTES)
+    );
+    assert_eq!(parse(&text).selectable_count(), 0);
+    let oversized = "x".repeat(MAX_CHT_FILE_BYTES + 1);
+    assert_eq!(
+        parse_cht_text(&oversized).unwrap_err().kind,
+        ChtParseErrorKind::OversizedInput
+    );
+    assert_eq!(
+        parse_cht_bytes(oversized.as_bytes()).unwrap_err().kind,
+        ChtParseErrorKind::OversizedInput
+    );
+}
+
+#[test]
+fn code_component_field_entry_and_warning_limits_cannot_hide_bad_evidence() {
+    let document = parse(&format!(
+        "cheat0_code = {}",
+        vec!["A"; MAX_CHT_CODE_LINES + 1].join("+")
+    ));
+    assert_eq!(document.selectable_count(), 0);
+    assert!(
+        document.entries[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtEntryWarningKind::MalformedCode)
+    );
+    let mut text = String::from("cheat0_code = A\n");
+    for i in 0..MAX_CHT_EXTRA_FIELDS_PER_ENTRY + 1 {
+        text.push_str(&format!("cheat0_future_{i} = x\n"));
+    }
+    let document = parse(&text);
+    assert_eq!(document.selectable_count(), 0);
+    assert_eq!(
+        document.entries[0].extra_fields.len(),
+        MAX_CHT_EXTRA_FIELDS_PER_ENTRY
+    );
+    assert!(document.entries[0].warnings.len() <= MAX_CHT_ENTRY_WARNINGS);
+    let mut text = String::from("cheat0_code = A\n");
+    for _ in 0..MAX_CHT_ENTRY_WARNINGS + 20 {
+        text.push_str("cheat0_code = A\n");
+    }
+    text.push_str("cheat0_code = B\n");
+    let document = parse(&text);
+    assert_eq!(document.entries[0].warnings.len(), MAX_CHT_ENTRY_WARNINGS);
+    assert_eq!(document.selectable_count(), 0);
+    assert!(
+        document.entries[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtEntryWarningKind::LimitReached)
+    );
+    let mut text = String::new();
+    for i in 0..MAX_CHT_ENTRIES + 2 {
+        text.push_str(&format!("cheat{i}_code = A\n"));
+    }
+    // Existing entries are still parsed after reaching the distinct-entry cap.
+    text.push_str("cheat0_enable = maybe\n");
+    let document = parse(&text);
+    assert_eq!(document.entries.len(), MAX_CHT_ENTRIES);
+    assert!(!document.entry(0).unwrap().is_selectable());
+    assert!(
+        document
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::LimitReached)
+    );
+}
+
+#[test]
+fn deterministic_generated_malformed_input_is_panic_free_and_bounded() {
+    // Dependency-free mutation loop covers every truncation point, malformed
+    // key/value combinations, and arbitrary bytes using a fixed PRNG seed.
+    let fixture = b"cheats = 3\ncheat0_desc = Lives\ncheat0_code = VALID\ncheat1_code = \"Broken\ncheat2_code = VALID\n";
+    for end in 0..=fixture.len() {
+        let _ = parse_cht_bytes(&fixture[..end]);
+    }
+    let mut seed = 0x12345678u32;
+    for _ in 0..512 {
+        let mut input = fixture.to_vec();
+        for _ in 0..16 {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            let offset = seed as usize % input.len();
+            input[offset] = (seed >> 24) as u8;
+        }
+        if let Ok(document) = parse_cht_bytes(&input) {
+            assert!(document.entries.len() <= MAX_CHT_ENTRIES);
+            assert!(document.warnings.len() <= MAX_CHT_DOCUMENT_WARNINGS);
+            for entry in &document.entries {
+                assert!(entry.warnings.len() <= MAX_CHT_ENTRY_WARNINGS);
+                if !entry.is_selectable() {
+                    assert!(ChtInstallEntry::from_entry(entry, true).is_none());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn padding_and_invalid_global_values_cannot_hide_duplicate_evidence() {
+    let text = format!(
+        "cheat0_code = A\n{}cheat0_code = B",
+        " ".repeat(MAX_CHT_LINE_BYTES)
+    );
+    let document = parse(&text);
+    assert!(!document.entries[0].is_selectable());
+    assert!(
+        document.entries[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtEntryWarningKind::ConflictingDuplicate)
+    );
+    let document = parse("cheat0_code = A\ncustom = \"unfinished\ncustom = safe\n");
+    assert_eq!(document.global_fields[0].1, "unfinished");
+    assert!(
+        document
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::InvalidFieldValue)
+    );
+    assert!(
+        document
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::ConflictingDuplicate)
+    );
+    assert_eq!(document.selectable_count(), 1);
 }

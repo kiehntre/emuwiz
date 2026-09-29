@@ -1882,3 +1882,42 @@ fn module_source_never_reads_home_or_xdg_env_directly() {
         );
     }
 }
+
+#[test]
+fn shared_parser_diagnostics_preserve_mixed_catalogue_evidence_and_source_hash() {
+    let root = temp_root("cht-shared-diagnostics");
+    let text = "cheats = 99\ncheat0_desc = Lives\ncheat0_code = A\ncheat1_desc = Broken\ncheat1_code = \"unfinished\ncheat2_desc = Levels\ncheat2_code = B\ncheat2_code = C\n";
+    let path = root.join("Game.cht");
+    fs::write(&path, text).unwrap();
+    let snapshot = load_cheat_catalogue_snapshot(&HostReadOnlyFilesystem, "Fixture", &root);
+    assert_eq!(snapshot.games.len(), 1);
+    let record = &snapshot.games[0];
+    assert_eq!(
+        record.cheat_count, 3,
+        "metadata retains malformed evidence for review"
+    );
+    for code in [
+        "cht_declared_count_mismatch",
+        "cht_entry_truncated_value",
+        "cht_entry_conflicting_duplicate",
+    ] {
+        assert!(
+            record
+                .parsing_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == code),
+            "{code}"
+        );
+    }
+    assert_eq!(
+        record.source_file_hash.as_deref(),
+        Some(hex_sha256(text.as_bytes()).as_str())
+    );
+    assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+    assert_eq!(
+        super::super::cht_document::parse_cht_bytes(text.as_bytes())
+            .unwrap()
+            .selectable_count(),
+        1
+    );
+}

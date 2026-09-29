@@ -1,23 +1,11 @@
 //! Full-fidelity, panic-free parsing and deterministic rendering of
 //! RetroArch/libretro `.cht` cheat files.
 //!
-//! ## Why this exists alongside the two existing `.cht` readers
+//! ## Metadata readers and installation
 //!
-//! - `retroarch_inventory::parse_cheat_summary` answers "how many cheats
-//!   does this installed file declare, and did it parse cleanly?" and
-//!   keeps aggregate counts only.
-//! - `cheat_catalogue::parse_cht_cheats` keeps one description and
-//!   enabled-by-default flag per entry, and deliberately never retains a
-//!   cheat *code* body.
-//!
-//! Neither can answer "install exactly these three cheats", because
-//! generating an installable file requires the code bodies. This module is
-//! the first reader that retains them, and it is therefore also the first
-//! one that can *write* a `.cht` file. It is used only on the explicit
-//! install path (a user has selected one candidate and is choosing which
-//! of its cheats to install); catalogue indexing still uses the
-//! metadata-only parser, so the broad indexing pass keeps its existing
-//! memory profile.
+//! Catalogue and inventory adapters project this parser's bounded evidence
+//! into metadata; code bodies are retained only in this document, never in
+//! their reports. Selection and installation use the same field validation.
 //!
 //! ## Guarantees
 //!
@@ -39,7 +27,16 @@ use serde::Serialize;
 
 /// Mirrors `cheat_catalogue::MAX_CHEATS_PER_GAME` and
 /// `retroarch_inventory::MAX_CHEAT_ENTRIES_PER_FILE`.
-pub const MAX_CHT_ENTRIES: usize = 16_384;
+pub const MAX_CHT_ENTRIES: usize = super::retroarch_inventory::MAX_CHEAT_ENTRIES_PER_FILE;
+/// Matches the existing catalogue read limit; checked before decoding.
+pub const MAX_CHT_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Includes key, quoting and whitespace. Oversized lines are rejected locally.
+pub const MAX_CHT_LINE_BYTES: usize = 8 * 1024;
+/// Code is opaque across cores, but its byte and `+` component counts are bounded.
+pub const MAX_CHT_CODE_BYTES: usize = MAX_CHT_FIELD_BYTES;
+pub const MAX_CHT_CODE_LINES: usize = 256;
+/// Includes a blocking overflow marker so dropped evidence cannot enable an entry.
+pub const MAX_CHT_ENTRY_WARNINGS: usize = 32;
 /// One `cheatN_*` value, after unquoting. Longer values are truncated and
 /// the entry is marked unselectable rather than silently shortened.
 pub const MAX_CHT_FIELD_BYTES: usize = 4 * 1024;
@@ -66,8 +63,11 @@ pub enum ChtParseErrorKind {
     /// The file declares no `cheats = N` key and contains no `cheatN_*`
     /// entry at all - it is not a cheat file.
     NotACheatFile,
-    /// More than [`MAX_CHT_ENTRIES`] distinct entry indexes.
+    /// Reserved whole-file entry-limit failure for existing API consumers.
+    /// This parser instead warns and stops accepting new indices at the limit.
     TooManyEntries,
+    /// Input exceeds the standalone parser file bound.
+    OversizedInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -93,14 +93,12 @@ pub enum ChtEntryWarningKind {
     MissingCode,
     /// `cheatN_code` present but empty after unquoting. Blocking.
     EmptyCode,
-    /// No `cheatN_desc`. Not blocking - a synthetic, index-derived
-    /// description is rendered instead.
+    /// No `cheatN_desc`. Not blocking; the UI label is explicitly index-derived.
     MissingDescription,
-    /// A `cheatN_*` key appeared twice. The first value wins; the later one
-    /// is dropped. Not blocking.
+    /// An identical decoded field appeared twice. Observable, not blocking.
     DuplicateField,
     /// `cheatN_enable` had a value other than `true`/`false`. Treated as
-    /// `false`. Not blocking.
+    /// `false` for display only. Blocking: the source default is unknown.
     UnparsableEnableValue,
     /// A value exceeded [`MAX_CHT_FIELD_BYTES`]. Blocking, because the
     /// retained value is not the source value.
@@ -112,6 +110,18 @@ pub enum ChtEntryWarningKind {
     /// The value contained a control character (newline, NUL, ...) that
     /// cannot appear in a RetroArch config value. Blocking.
     ControlCharacter,
+    /// Different decoded values for the same field. First retained for review only.
+    ConflictingDuplicate,
+    /// A quoted value was not closed on its source line.
+    TruncatedValue,
+    /// A known numeric/boolean field cannot be interpreted safely.
+    InvalidFieldValue,
+    /// Opaque code has empty components or too many components.
+    MalformedCode,
+    /// Unknown forward-compatible field, preserved verbatim.
+    UnsupportedField,
+    /// Dropped fields or warning evidence: installing a partial entry is unsafe.
+    LimitReached,
 }
 
 impl ChtEntryWarningKind {
@@ -124,6 +134,12 @@ impl ChtEntryWarningKind {
                 | Self::EmptyCode
                 | Self::OversizedField
                 | Self::ControlCharacter
+                | Self::UnparsableEnableValue
+                | Self::ConflictingDuplicate
+                | Self::TruncatedValue
+                | Self::InvalidFieldValue
+                | Self::MalformedCode
+                | Self::LimitReached
                 // Rendering a quote as a different character changes the
                 // source value. Never make that uncertain correction to a
                 // cheat entry merely to produce output.
@@ -142,6 +158,12 @@ impl ChtEntryWarningKind {
             Self::OversizedField => "cht_entry_oversized_field",
             Self::QuoteNormalized => "cht_entry_quote_normalized",
             Self::ControlCharacter => "cht_entry_control_character",
+            Self::ConflictingDuplicate => "cht_entry_conflicting_duplicate",
+            Self::TruncatedValue => "cht_entry_truncated_value",
+            Self::InvalidFieldValue => "cht_entry_invalid_field_value",
+            Self::MalformedCode => "cht_entry_malformed_code",
+            Self::UnsupportedField => "cht_entry_unsupported_field",
+            Self::LimitReached => "cht_entry_limit_reached",
         }
     }
 }
@@ -152,7 +174,7 @@ pub struct ChtEntryWarning {
     /// 1-based source line when the rejected field was present in the
     /// source. Missing-field warnings use the entry's first known line.
     pub line: Option<u32>,
-    /// Original source line, bounded by the enclosing file bound. This is
+    /// Original source line or bounded prefix for an oversized line. This is
     /// retained for review; it is never rendered into an installed file.
     pub raw_source: Option<String>,
     pub detail: String,
@@ -168,7 +190,7 @@ pub enum ChtDocumentWarningKind {
     MalformedDeclaredCount,
     /// A `cheatN_` key whose `N` is not a plain decimal index.
     MalformedEntryIndex,
-    /// An entry index at or beyond [`MAX_CHT_ENTRIES`].
+    /// An index outside the supported unsigned 32-bit range.
     EntryIndexOutOfRange,
     /// `cheats = N` disagrees with the number of distinct parsed indexes.
     DeclaredCountMismatch,
@@ -180,6 +202,12 @@ pub enum ChtDocumentWarningKind {
     /// [`MAX_CHT_EXTRA_FIELDS_PER_ENTRY`], [`MAX_CHT_DOCUMENT_WARNINGS`])
     /// was reached and later content of that kind was dropped.
     LimitReached,
+    MissingDeclaredCount,
+    OversizedDeclaredCount,
+    OversizedLine,
+    InvalidFieldValue,
+    DuplicateField,
+    ConflictingDuplicate,
 }
 
 impl ChtDocumentWarningKind {
@@ -193,6 +221,12 @@ impl ChtDocumentWarningKind {
             Self::DeclaredCountMismatch => "cht_declared_count_mismatch",
             Self::NonContiguousIndexes => "cht_non_contiguous_indexes",
             Self::LimitReached => "cht_limit_reached",
+            Self::MissingDeclaredCount => "cht_missing_declared_count",
+            Self::OversizedDeclaredCount => "cht_oversized_declared_count",
+            Self::OversizedLine => "cht_oversized_line",
+            Self::InvalidFieldValue => "cht_invalid_field_value",
+            Self::DuplicateField => "cht_duplicate_field",
+            Self::ConflictingDuplicate => "cht_conflicting_duplicate",
         }
     }
 }
@@ -289,6 +323,7 @@ impl ChtDocument {
 /// (see [`ChtParseErrorKind`]); a file with individually broken lines still
 /// parses, with warnings.
 pub fn parse_cht_bytes(bytes: &[u8]) -> Result<ChtDocument, ChtParseError> {
+    check_file_size(bytes.len())?;
     if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         return Err(ChtParseError {
             kind: ChtParseErrorKind::UnsupportedUtf16Encoding,
@@ -310,6 +345,8 @@ pub fn parse_cht_bytes(bytes: &[u8]) -> Result<ChtDocument, ChtParseError> {
 /// Parses already-decoded text. Prefer [`parse_cht_bytes`] for catalogue
 /// input so encoding problems are reported rather than assumed away.
 pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
+    check_file_size(text.len())?;
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     use std::collections::BTreeMap;
 
     struct Draft {
@@ -317,12 +354,13 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         first_raw_source: String,
         description: Option<String>,
         code: Option<String>,
-        enable: Option<bool>,
+        enable: Option<String>,
         extra_fields: Vec<(String, String)>,
         warnings: Vec<ChtEntryWarning>,
     }
 
     let mut declared_count: Option<u32> = None;
+    let mut declared_value: Option<String> = None;
     let mut drafts: BTreeMap<u32, Draft> = BTreeMap::new();
     let mut preserved_comments: Vec<String> = Vec::new();
     let mut global_fields: Vec<(String, String)> = Vec::new();
@@ -336,12 +374,33 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                         detail: String| {
         if warnings.len() < MAX_CHT_DOCUMENT_WARNINGS {
             warnings.push(ChtDocumentWarning { kind, line, detail });
+        } else {
+            warnings[MAX_CHT_DOCUMENT_WARNINGS - 1] = ChtDocumentWarning {
+                kind: ChtDocumentWarningKind::LimitReached,
+                line,
+                detail: "document warning limit reached; further evidence omitted".to_string(),
+            };
         }
     };
 
     for (offset, raw_line) in text.lines().enumerate() {
         let line_number = u32::try_from(offset + 1).unwrap_or(u32::MAX);
-        let line = raw_line.trim();
+        // Never decode or copy an unbounded line. Keep enough of an oversized
+        // assignment to attribute it to its entry, which must remain blocked.
+        let oversized_line = raw_line.len() > MAX_CHT_LINE_BYTES;
+        let bounded_line = bounded_prefix(raw_line, MAX_CHT_LINE_BYTES);
+        // Leading whitespace must not conceal an attributable entry key
+        // beyond the evidence prefix. Trimming scans bounded input, allocates
+        // nothing, and the oversized assignment still blocks its entry.
+        let line = bounded_prefix(raw_line.trim(), MAX_CHT_LINE_BYTES);
+        if oversized_line {
+            push_warning(
+                &mut warnings,
+                ChtDocumentWarningKind::OversizedLine,
+                Some(line_number),
+                format!("line {line_number} exceeds {MAX_CHT_LINE_BYTES} bytes"),
+            );
+        }
         if line.is_empty() {
             continue;
         }
@@ -351,29 +410,84 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             }
             continue;
         }
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            seen_any_body_line = true;
+        let missing_separator = !line.contains('=');
+        let (raw_key, raw_value) = line.split_once('=').unwrap_or_else(|| {
             push_warning(
                 &mut warnings,
                 ChtDocumentWarningKind::MalformedLine,
                 Some(line_number),
-                format!("line {line_number} has no '=' separator and was ignored"),
+                format!("line {line_number} has no '=' separator"),
             );
-            continue;
-        };
+            (line.split_whitespace().next().unwrap_or(line), "")
+        });
         seen_any_body_line = true;
         let key = raw_key.trim();
         let (value, mut value_warnings) = decode_value(raw_value.trim());
+        if missing_separator {
+            value_warnings.push(entry_warning(
+                ChtEntryWarningKind::InvalidFieldValue,
+                line_number,
+                bounded_line,
+                "assignment has no '=' separator".to_string(),
+            ));
+        }
+        if oversized_line {
+            value_warnings.push(entry_warning(
+                ChtEntryWarningKind::OversizedField,
+                line_number,
+                bounded_line,
+                "source line exceeds the line bound".to_string(),
+            ));
+        }
 
         if key.eq_ignore_ascii_case("cheats") {
-            match value.parse::<u32>() {
-                Ok(count) => declared_count = Some(count),
-                Err(_) => push_warning(
+            if let Some(first) = &declared_value {
+                push_warning(
                     &mut warnings,
-                    ChtDocumentWarningKind::MalformedDeclaredCount,
+                    if first == &value {
+                        ChtDocumentWarningKind::DuplicateField
+                    } else {
+                        ChtDocumentWarningKind::ConflictingDuplicate
+                    },
                     Some(line_number),
-                    format!("line {line_number}: 'cheats' value {value:?} is not a number"),
-                ),
+                    format!(
+                        "duplicate cheats declaration: first {first:?}, later {value:?}; first retained"
+                    ),
+                );
+            } else {
+                declared_value = Some(value.clone());
+                if !value_warnings.is_empty() {
+                    push_warning(
+                        &mut warnings,
+                        ChtDocumentWarningKind::MalformedDeclaredCount,
+                        Some(line_number),
+                        "cheats declaration has an unsafe value".to_string(),
+                    );
+                } else {
+                    match value.parse::<u32>() {
+                        Ok(count) => {
+                            declared_count = Some(count);
+                            if count as usize > MAX_CHT_ENTRIES {
+                                push_warning(
+                                    &mut warnings,
+                                    ChtDocumentWarningKind::OversizedDeclaredCount,
+                                    Some(line_number),
+                                    format!(
+                                        "declared count {count} exceeds {MAX_CHT_ENTRIES}; only actual bounded entries are parsed"
+                                    ),
+                                );
+                            }
+                        }
+                        Err(_) => push_warning(
+                            &mut warnings,
+                            ChtDocumentWarningKind::MalformedDeclaredCount,
+                            Some(line_number),
+                            format!(
+                                "line {line_number}: 'cheats' value {value:?} is not an unsigned 32-bit count"
+                            ),
+                        ),
+                    }
+                }
             }
             continue;
         }
@@ -386,10 +500,32 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             .strip_prefix("cheat")
             .filter(|remainder| !remainder.starts_with('_'));
         let Some(remainder) = entry_key else {
-            if global_fields.len() < MAX_CHT_GLOBAL_FIELDS {
-                if !global_fields.iter().any(|(name, _)| name == key) {
-                    global_fields.push((key.to_string(), value));
-                }
+            if !value_warnings.is_empty() || key.is_empty() {
+                push_warning(
+                    &mut warnings,
+                    ChtDocumentWarningKind::InvalidFieldValue,
+                    Some(line_number),
+                    format!("global key {key:?} has an unsafe value; retained for review only"),
+                );
+            }
+            if key.is_empty() {
+                continue;
+            }
+            if let Some((_, first)) = global_fields.iter().find(|(name, _)| name == key) {
+                push_warning(
+                    &mut warnings,
+                    if first == &value {
+                        ChtDocumentWarningKind::DuplicateField
+                    } else {
+                        ChtDocumentWarningKind::ConflictingDuplicate
+                    },
+                    Some(line_number),
+                    format!(
+                        "duplicate global key {key:?}: first {first:?}, later {value:?}; first retained"
+                    ),
+                );
+            } else if global_fields.len() < MAX_CHT_GLOBAL_FIELDS {
+                global_fields.push((key.to_string(), value));
             } else if !limit_reported {
                 limit_reported = true;
                 push_warning(
@@ -415,33 +551,27 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         let Ok(entry_index) = remainder[..digit_count].parse::<u32>() else {
             push_warning(
                 &mut warnings,
-                ChtDocumentWarningKind::MalformedEntryIndex,
+                ChtDocumentWarningKind::EntryIndexOutOfRange,
                 Some(line_number),
                 format!("line {line_number}: entry index in {key:?} is out of numeric range"),
             );
             continue;
         };
-        if entry_index as usize >= MAX_CHT_ENTRIES {
+        let field = &remainder[digit_count + 1..];
+        if !drafts.contains_key(&entry_index) && drafts.len() >= MAX_CHT_ENTRIES {
             push_warning(
                 &mut warnings,
-                ChtDocumentWarningKind::EntryIndexOutOfRange,
+                ChtDocumentWarningKind::LimitReached,
                 Some(line_number),
                 format!(
-                    "line {line_number}: entry index {entry_index} is past the supported limit"
+                    "more than {MAX_CHT_ENTRIES} distinct entries; new index {entry_index} omitted"
                 ),
             );
             continue;
         }
-        let field = &remainder[digit_count + 1..];
-        if !drafts.contains_key(&entry_index) && drafts.len() >= MAX_CHT_ENTRIES {
-            return Err(ChtParseError {
-                kind: ChtParseErrorKind::TooManyEntries,
-                detail: format!("file declares more than {MAX_CHT_ENTRIES} cheat entries"),
-            });
-        }
         let draft = drafts.entry(entry_index).or_insert_with(|| Draft {
             first_line: line_number,
-            first_raw_source: raw_line.to_string(),
+            first_raw_source: bounded_line.to_string(),
             description: None,
             code: None,
             enable: None,
@@ -450,7 +580,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         });
         for warning in &mut value_warnings {
             warning.line = Some(line_number);
-            warning.raw_source = Some(raw_line.to_string());
+            warning.raw_source = Some(bounded_line.to_string());
         }
         draft.warnings.extend(value_warnings);
 
@@ -461,43 +591,51 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 "desc",
                 entry_index,
                 line_number,
-                raw_line,
+                bounded_line,
                 &mut draft.warnings,
             ),
-            "code" => set_once(
-                &mut draft.code,
-                value,
-                "code",
-                entry_index,
-                line_number,
-                raw_line,
-                &mut draft.warnings,
-            ),
-            "enable" => {
-                if draft.enable.is_some() {
-                    draft.warnings.push(ChtEntryWarning {
-                        kind: ChtEntryWarningKind::DuplicateField,
-                        line: Some(line_number),
-                        raw_source: Some(raw_line.to_string()),
-                        detail: format!("cheat{entry_index}_enable appeared more than once"),
-                    });
-                } else if value.eq_ignore_ascii_case("true") {
-                    draft.enable = Some(true);
-                } else if value.eq_ignore_ascii_case("false") {
-                    draft.enable = Some(false);
-                } else {
-                    draft.enable = Some(false);
-                    draft.warnings.push(ChtEntryWarning {
-                        kind: ChtEntryWarningKind::UnparsableEnableValue,
-                        line: Some(line_number),
-                        raw_source: Some(raw_line.to_string()),
-                        detail: format!(
-                            "cheat{entry_index}_enable value {value:?} is not true/false; treated as false"
-                        ),
-                    });
+            "code" => {
+                if value.len() > MAX_CHT_CODE_BYTES
+                    || value.split('+').count() > MAX_CHT_CODE_LINES
+                    || (!value.trim().is_empty()
+                        && value.split('+').any(|part| part.trim().is_empty()))
+                {
+                    draft.warnings.push(entry_warning(ChtEntryWarningKind::MalformedCode,
+                        line_number, bounded_line,
+                        format!("cheat{entry_index}_code has empty components or exceeds the code bounds")));
                 }
+                set_once(
+                    &mut draft.code,
+                    value,
+                    "code",
+                    entry_index,
+                    line_number,
+                    bounded_line,
+                    &mut draft.warnings,
+                );
+            }
+            "enable" => {
+                if !value.eq_ignore_ascii_case("true") && !value.eq_ignore_ascii_case("false") {
+                    draft.warnings.push(entry_warning(ChtEntryWarningKind::UnparsableEnableValue,
+                        line_number, bounded_line, format!("cheat{entry_index}_enable value {value:?} is not true/false; source default is unknown")));
+                }
+                set_once(
+                    &mut draft.enable,
+                    value,
+                    "enable",
+                    entry_index,
+                    line_number,
+                    bounded_line,
+                    &mut draft.warnings,
+                );
             }
             "" => {
+                draft.warnings.push(entry_warning(
+                    ChtEntryWarningKind::InvalidFieldValue,
+                    line_number,
+                    bounded_line,
+                    "entry field name is empty".to_string(),
+                ));
                 push_warning(
                     &mut warnings,
                     ChtDocumentWarningKind::MalformedEntryIndex,
@@ -506,16 +644,45 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 );
             }
             other => {
-                if draft.extra_fields.len() < MAX_CHT_EXTRA_FIELDS_PER_ENTRY
-                    && !draft.extra_fields.iter().any(|(name, _)| name == other)
+                if let Some((_, first)) = draft
+                    .extra_fields
+                    .iter_mut()
+                    .find(|(name, _)| name == other)
                 {
+                    let mut slot = Some(first.clone());
+                    set_once(
+                        &mut slot,
+                        value,
+                        other,
+                        entry_index,
+                        line_number,
+                        bounded_line,
+                        &mut draft.warnings,
+                    );
+                } else if draft.extra_fields.len() >= MAX_CHT_EXTRA_FIELDS_PER_ENTRY {
+                    draft.warnings.push(entry_warning(
+                        ChtEntryWarningKind::LimitReached,
+                        line_number,
+                        bounded_line,
+                        "extra field limit reached; entry is incomplete".to_string(),
+                    ));
+                } else {
+                    if let Some(kind) = validate_extra_field(other, &value) {
+                        draft.warnings.push(entry_warning(
+                            kind,
+                            line_number,
+                            bounded_line,
+                            format!("cheat{entry_index}_{other} = {value:?}: {}", kind.code()),
+                        ));
+                    }
                     draft.extra_fields.push((other.to_string(), value));
                 }
             }
         }
+        bound_entry_warnings(&mut draft.warnings);
     }
 
-    if declared_count.is_none() && drafts.is_empty() {
+    if declared_value.is_none() && drafts.is_empty() {
         return Err(ChtParseError {
             kind: ChtParseErrorKind::NotACheatFile,
             detail: "no 'cheats' key and no cheatN_* entry was found".to_string(),
@@ -532,7 +699,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 raw_source: Some(draft.first_raw_source.clone()),
                 detail: format!("cheat{index} has no cheat{index}_code key"),
             }),
-            Some("") => entry_warnings.push(ChtEntryWarning {
+            Some(code) if code.trim().is_empty() => entry_warnings.push(ChtEntryWarning {
                 kind: ChtEntryWarningKind::EmptyCode,
                 line: Some(draft.first_line),
                 raw_source: Some(draft.first_raw_source.clone()),
@@ -540,6 +707,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             }),
             Some(_) => {}
         }
+
         if draft
             .description
             .as_deref()
@@ -552,25 +720,37 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 detail: format!("cheat{index} has no usable cheat{index}_desc key"),
             });
         }
+        bound_entry_warnings(&mut entry_warnings);
         entries.push(ChtEntry {
             index,
             description: draft.description,
             code: draft.code,
-            enabled_by_default: draft.enable.unwrap_or(false),
+            enabled_by_default: draft
+                .enable
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("true")),
             extra_fields: draft.extra_fields,
             warnings: entry_warnings,
         });
     }
 
+    if declared_value.is_none() {
+        push_warning(
+            &mut warnings,
+            ChtDocumentWarningKind::MissingDeclaredCount,
+            None,
+            "no cheats declaration; only actual entries were parsed".to_string(),
+        );
+    }
     if let Some(count) = declared_count
-        && count as usize != entries.len()
+        && (count as usize != entries.len() || entries.iter().any(|entry| entry.index >= count))
     {
         push_warning(
             &mut warnings,
             ChtDocumentWarningKind::DeclaredCountMismatch,
             None,
             format!(
-                "file declares cheats = {count} but {} distinct entries were parsed",
+                "file declares cheats = {count}; {} distinct entries were parsed (count or index range disagrees)",
                 entries.len()
             ),
         );
@@ -607,13 +787,14 @@ fn set_once(
     raw_source: &str,
     warnings: &mut Vec<ChtEntryWarning>,
 ) {
-    if slot.is_some() {
+    if let Some(first) = slot {
         warnings.push(ChtEntryWarning {
-            kind: ChtEntryWarningKind::DuplicateField,
+            kind: if first == &value { ChtEntryWarningKind::DuplicateField }
+                else { ChtEntryWarningKind::ConflictingDuplicate },
             line: Some(line),
             raw_source: Some(raw_source.to_string()),
             detail: format!(
-                "cheat{index}_{field} appeared more than once; the first value is kept"
+                "cheat{index}_{field} appeared more than once: first {first:?}, later {value:?}; first retained for review"
             ),
         });
         return;
@@ -621,77 +802,145 @@ fn set_once(
     *slot = Some(value);
 }
 
-/// Unquotes and bounds one raw value, reporting anything that makes it
-/// unsafe to write back out.
-///
-/// RetroArch's own `config_file` reader has no escape syntax inside a
-/// quoted value, so this deliberately does *not* invent one: a `\"`
-/// sequence is decoded (it is what some third-party generators emit) but a
-/// bare interior quote is only flagged, never used to end the value early.
+fn check_file_size(size: usize) -> Result<(), ChtParseError> {
+    if size > MAX_CHT_FILE_BYTES {
+        return Err(ChtParseError {
+            kind: ChtParseErrorKind::OversizedInput,
+            detail: format!("input exceeds {MAX_CHT_FILE_BYTES} bytes"),
+        });
+    }
+    Ok(())
+}
+
+fn bounded_prefix(value: &str, limit: usize) -> &str {
+    let mut boundary = value.len().min(limit);
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
+}
+
+fn entry_warning(
+    kind: ChtEntryWarningKind,
+    line: u32,
+    raw: &str,
+    detail: String,
+) -> ChtEntryWarning {
+    ChtEntryWarning {
+        kind,
+        line: Some(line),
+        raw_source: Some(raw.to_string()),
+        detail,
+    }
+}
+
+fn bound_entry_warnings(warnings: &mut Vec<ChtEntryWarning>) {
+    if warnings.len() > MAX_CHT_ENTRY_WARNINGS {
+        warnings.truncate(MAX_CHT_ENTRY_WARNINGS);
+        warnings[MAX_CHT_ENTRY_WARNINGS - 1] = ChtEntryWarning {
+            kind: ChtEntryWarningKind::LimitReached,
+            line: None,
+            raw_source: None,
+            detail: "entry warning limit reached; further evidence omitted".to_string(),
+        };
+    }
+}
+
+/// Validate only known RetroArch scalar fields. Unknown fields stay observable
+/// and preserved, without guessing at their semantics or core-specific ranges.
+fn validate_extra_field(field: &str, value: &str) -> Option<ChtEntryWarningKind> {
+    let numeric = matches!(
+        field,
+        "handler"
+            | "memory_search_size"
+            | "cheat_type"
+            | "address"
+            | "address_mask"
+            | "value"
+            | "repeat_count"
+            | "repeat_add_to_address"
+            | "repeat_add_to_value"
+            | "rumble_type"
+            | "rumble_value"
+            | "rumble_port"
+            | "rumble_primary_strength"
+            | "rumble_primary_duration"
+            | "rumble_secondary_strength"
+            | "rumble_secondary_duration"
+    );
+    if numeric {
+        let valid = if let Some(hex) = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+        {
+            !hex.is_empty()
+                && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && u32::from_str_radix(hex, 16).is_ok()
+        } else {
+            !value.is_empty()
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u32>().is_ok()
+        };
+        return (!valid).then_some(ChtEntryWarningKind::InvalidFieldValue);
+    }
+    if field == "big_endian" {
+        return (!value.eq_ignore_ascii_case("true") && !value.eq_ignore_ascii_case("false"))
+            .then_some(ChtEntryWarningKind::InvalidFieldValue);
+    }
+    if !field
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Some(ChtEntryWarningKind::InvalidFieldValue);
+    }
+    Some(ChtEntryWarningKind::UnsupportedField)
+}
+
+/// Decode quoting only; RetroArch values have no backslash escape syntax.
+/// Retain the bounded source value for review, never repair a malformed value.
 fn decode_value(raw: &str) -> (String, Vec<ChtEntryWarning>) {
     let mut warnings = Vec::new();
     let unquoted = match raw.strip_prefix('"') {
-        Some(rest) => rest.strip_suffix('"').unwrap_or(rest),
+        Some(rest) => match rest.strip_suffix('"') {
+            Some(value) => value,
+            None => {
+                warnings.push(ChtEntryWarning {
+                    kind: ChtEntryWarningKind::TruncatedValue,
+                    line: None,
+                    raw_source: None,
+                    detail: "quoted value has no closing quote".to_string(),
+                });
+                rest
+            }
+        },
         None => raw,
     };
-
-    let mut decoded = String::with_capacity(unquoted.len());
-    let mut characters = unquoted.chars();
-    while let Some(character) = characters.next() {
-        if character == '\\' {
-            match characters.next() {
-                Some('"') => decoded.push('"'),
-                Some('\\') => decoded.push('\\'),
-                Some('n') => decoded.push('\n'),
-                Some(other) => {
-                    decoded.push('\\');
-                    decoded.push(other);
-                }
-                None => decoded.push('\\'),
-            }
-            continue;
-        }
-        decoded.push(character);
-    }
-
-    if decoded
+    if unquoted
         .chars()
-        .any(|character| character.is_control() && character != '\t' || character == '\u{0}')
+        .any(|character| character.is_control() || character == '\u{fffd}')
     {
-        warnings.push(ChtEntryWarning {
-            kind: ChtEntryWarningKind::ControlCharacter,
-            line: None,
-            raw_source: None,
-            detail:
-                "value contains a control character that cannot appear in a RetroArch config value"
-                    .to_string(),
-        });
+        warnings.push(ChtEntryWarning { kind: ChtEntryWarningKind::ControlCharacter,
+            line: None, raw_source: None,
+            detail: "value contains a control or replacement character; original bytes cannot be safely inferred".to_string() });
     }
-    if decoded.contains('"') {
+    if unquoted.contains('"') {
         warnings.push(ChtEntryWarning {
             kind: ChtEntryWarningKind::QuoteNormalized,
             line: None,
             raw_source: None,
-            detail: "value contains a double quote and is skipped because RetroArch config \
-                     values have no escape syntax"
+            detail: "value contains an interior quote; RetroArch values have no escape syntax"
                 .to_string(),
         });
     }
-    if decoded.len() > MAX_CHT_FIELD_BYTES {
-        let mut boundary = MAX_CHT_FIELD_BYTES;
-        while boundary > 0 && !decoded.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        decoded.truncate(boundary);
-        warnings.push(ChtEntryWarning {
-            kind: ChtEntryWarningKind::OversizedField,
-            line: None,
-            raw_source: None,
-            detail: format!("value exceeded {MAX_CHT_FIELD_BYTES} bytes and was truncated"),
-        });
+    if unquoted.len() > MAX_CHT_FIELD_BYTES {
+        warnings.push(ChtEntryWarning { kind: ChtEntryWarningKind::OversizedField,
+            line: None, raw_source: None,
+            detail: format!("value exceeded {MAX_CHT_FIELD_BYTES} bytes; bounded prefix retained for review only") });
     }
-
-    (decoded, warnings)
+    (
+        bounded_prefix(unquoted, MAX_CHT_FIELD_BYTES).to_string(),
+        warnings,
+    )
 }
 
 // ---------------------------------------------------------------------

@@ -405,10 +405,11 @@ pub use cheatbase::{
 };
 pub use cht_document::{
     ChtDocument, ChtDocumentWarning, ChtDocumentWarningKind, ChtEntry, ChtEntryWarning,
-    ChtEntryWarningKind, ChtInstallEntry, ChtParseError, ChtParseErrorKind,
-    MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_EXTRA_FIELDS_PER_ENTRY,
-    MAX_CHT_FIELD_BYTES, MAX_CHT_GLOBAL_FIELDS, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes,
-    parse_cht_text, render_cht_file,
+    ChtEntryWarningKind, ChtInstallEntry, ChtParseError, ChtParseErrorKind, MAX_CHT_CODE_BYTES,
+    MAX_CHT_CODE_LINES, MAX_CHT_DOCUMENT_WARNINGS, MAX_CHT_ENTRIES, MAX_CHT_ENTRY_WARNINGS,
+    MAX_CHT_EXTRA_FIELDS_PER_ENTRY, MAX_CHT_FIELD_BYTES, MAX_CHT_FILE_BYTES, MAX_CHT_GLOBAL_FIELDS,
+    MAX_CHT_LINE_BYTES, MAX_CHT_PRESERVED_COMMENTS, parse_cht_bytes, parse_cht_text,
+    render_cht_file,
 };
 pub use classic_game_genie::{
     ClassicCheatFormat, GameGenieDecodeResult, GameGenieDecodeStatus, GameGenieDetection,

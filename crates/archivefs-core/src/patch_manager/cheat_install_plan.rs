@@ -203,9 +203,9 @@ pub fn load_candidate_document(
             | ChtParseErrorKind::UnsupportedUtf16Encoding => {
                 CheatInstallPlanErrorKind::CandidateUnsupportedEncoding
             }
-            ChtParseErrorKind::NotACheatFile | ChtParseErrorKind::TooManyEntries => {
-                CheatInstallPlanErrorKind::CandidateMalformed
-            }
+            ChtParseErrorKind::NotACheatFile
+            | ChtParseErrorKind::TooManyEntries
+            | ChtParseErrorKind::OversizedInput => CheatInstallPlanErrorKind::CandidateMalformed,
         };
         error(kind, Some(&absolute), failure.detail)
     })?;

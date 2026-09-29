@@ -1353,6 +1353,32 @@ cheat0_enable = true
     }
 
     #[test]
+    fn malformed_cht_entries_keep_import_provenance_and_neighbor_evidence() {
+        let root = tempdir().unwrap();
+        let bytes = b"cheats = 3\ncheat0_code = A\ncheat1_code = \"unfinished\ncheat2_code = B\ncheat2_enable = maybe\n";
+        let path = write(root.path(), "Mixed.cht", bytes);
+        let report = scan_user_cheat_file(&path, &[]).unwrap();
+        let candidate = &report.candidates[0];
+        assert_eq!(candidate.cheat_count, 3);
+        assert_eq!(candidate.provenance.source_sha256, sha256_hex(bytes));
+        assert_eq!(candidate.provenance.original_path, path);
+        assert!(
+            candidate
+                .parser_warnings
+                .iter()
+                .any(|warning| warning.contains("closing quote"))
+        );
+        assert!(
+            candidate
+                .parser_warnings
+                .iter()
+                .any(|warning| warning.contains("source default is unknown"))
+        );
+        assert!(!report.writes_performed);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
     fn valid_pnach_import_uses_existing_patch_validator_and_exact_identity() {
         let root = tempdir().unwrap();
         let path = write(

@@ -869,79 +869,76 @@ fn read_cheat_summary(
 }
 
 fn parse_cheat_summary(text: &str) -> CheatFileSummary {
-    let mut declared_cheat_count = None;
-    let mut entries = BTreeSet::<usize>::new();
-    let mut enabled = BTreeSet::<usize>::new();
-    let mut description = None;
-    let mut malformed_lines = Vec::new();
-    let mut complete = true;
-
-    for (index, raw_line) in text.lines().enumerate() {
-        let line_number = u32::try_from(index + 1).unwrap_or(u32::MAX);
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    use super::cht_document::{ChtEntryWarningKind, parse_cht_text};
+    let document = match parse_cht_text(text) {
+        Ok(document) => document,
+        Err(_) => {
+            return CheatFileSummary {
+                description: None,
+                declared_cheat_count: None,
+                parsed_cheat_entries: 0,
+                enabled_cheat_entries: 0,
+                any_cheats_enabled: false,
+                malformed_lines: Vec::new(),
+                complete: false,
+            };
         }
-        let Some((raw_key, raw_value)) = line.split_once('=') else {
-            malformed_lines.push(line_number);
-            continue;
-        };
-        let key = raw_key.trim();
-        let value = unquote(raw_value.trim());
-        if key == "cheats" {
-            match value.parse::<u32>() {
-                Ok(count) => declared_cheat_count = Some(count),
-                Err(_) => malformed_lines.push(line_number),
-            }
-            continue;
-        }
-        let Some(remainder) = key.strip_prefix("cheat") else {
-            continue;
-        };
-        let digit_count = remainder.bytes().take_while(u8::is_ascii_digit).count();
-        if digit_count == 0 || !remainder[digit_count..].starts_with('_') {
-            malformed_lines.push(line_number);
-            continue;
-        }
-        let Ok(entry_index) = remainder[..digit_count].parse::<usize>() else {
-            malformed_lines.push(line_number);
-            continue;
-        };
-        if entry_index >= MAX_CHEAT_ENTRIES_PER_FILE {
-            complete = false;
-            continue;
-        }
-        entries.insert(entry_index);
-        let field = &remainder[digit_count + 1..];
-        if field == "desc" && description.is_none() && !value.is_empty() {
-            description = Some(value.to_string());
-        }
-        if field == "enable" && value.eq_ignore_ascii_case("true") {
-            enabled.insert(entry_index);
-        }
+    };
+    // This remains a metadata summary: missing code/name alone does not
+    // make its metadata incomplete. Selection uses the full document.
+    let relevant_entry_warning = |kind| {
+        !matches!(
+            kind,
+            ChtEntryWarningKind::MissingCode
+                | ChtEntryWarningKind::MissingDescription
+                | ChtEntryWarningKind::UnsupportedField
+        )
+    };
+    let mut malformed_lines: Vec<u32> = document
+        .warnings
+        .iter()
+        .filter_map(|warning| warning.line)
+        .collect();
+    for entry in &document.entries {
+        malformed_lines.extend(
+            entry
+                .warnings
+                .iter()
+                .filter(|warning| relevant_entry_warning(warning.kind))
+                .filter_map(|warning| warning.line),
+        );
     }
-    if declared_cheat_count.is_some_and(|count| count as usize != entries.len()) {
-        complete = false;
-    }
-    if !malformed_lines.is_empty() {
-        complete = false;
-    }
+    malformed_lines.sort_unstable();
+    malformed_lines.dedup();
+    let enabled_cheat_entries = document
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.enabled_by_default
+                && !entry.warnings.iter().any(|warning| {
+                    relevant_entry_warning(warning.kind) && warning.kind.is_blocking()
+                })
+        })
+        .count();
+    let complete = document.warnings.is_empty()
+        && !document.entries.iter().any(|entry| {
+            entry
+                .warnings
+                .iter()
+                .any(|warning| relevant_entry_warning(warning.kind))
+        });
     CheatFileSummary {
-        description,
-        declared_cheat_count,
-        parsed_cheat_entries: entries.len(),
-        enabled_cheat_entries: enabled.len(),
-        any_cheats_enabled: !enabled.is_empty(),
+        description: document
+            .entries
+            .iter()
+            .find_map(|entry| entry.description.clone()),
+        declared_cheat_count: document.declared_count,
+        parsed_cheat_entries: document.entries.len(),
+        enabled_cheat_entries,
+        any_cheats_enabled: enabled_cheat_entries > 0,
         malformed_lines,
         complete,
     }
-}
-
-fn unquote(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value)
 }
 
 fn mark_duplicates(findings: &mut [RetroArchArtifactFinding]) {
@@ -1233,9 +1230,25 @@ mod tests {
     fn cheat_entry_limit_marks_summary_incomplete() {
         let summary = parse_cheat_summary(&format!(
             "cheats = 1\ncheat{}_desc = \"outside bound\"\n",
-            MAX_CHEAT_ENTRIES_PER_FILE
+            "4294967296"
         ));
         assert_eq!(summary.parsed_cheat_entries, 0);
+        assert!(!summary.complete);
+    }
+}
+
+#[cfg(test)]
+mod malformed_input_tests {
+    use super::*;
+
+    #[test]
+    fn shared_parser_summary_surfaces_unsafe_fields_and_keeps_neighbor_metadata() {
+        let summary = parse_cheat_summary(
+            "cheats = 3\ncheat0_code = A\ncheat0_enable = true\ncheat1_code = \"unfinished\ncheat2_code = B\n",
+        );
+        assert_eq!(summary.parsed_cheat_entries, 3);
+        assert_eq!(summary.enabled_cheat_entries, 1);
+        assert!(summary.malformed_lines.contains(&4));
         assert!(!summary.complete);
     }
 }
