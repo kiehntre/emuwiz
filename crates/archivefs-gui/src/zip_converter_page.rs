@@ -172,6 +172,7 @@ pub(crate) fn show(ui: &mut egui::Ui, state: &mut ZipConverterPageState) {
     }
     if let Some(preview) = &state.preview {
         ui.separator();
+        ui.label("Review the output before creating it. The source is unchanged and existing destinations are refused.");
         ui.label(format!(
             "{} files · {} bytes",
             preview
@@ -218,14 +219,51 @@ pub(crate) fn show(ui: &mut egui::Ui, state: &mut ZipConverterPageState) {
         ui.label(&result.verification);
     }
     if let Some(error) = &state.error {
-        ui.colored_label(egui::Color32::from_rgb(220, 150, 80), "Needs attention");
-        ui.label(error);
+        let collision = error.contains("Destination already exists");
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 150, 80),
+            if collision {
+                "Blocked"
+            } else {
+                "Needs attention"
+            },
+        );
+        if collision {
+            ui.label("Blocked: this output already exists. EmuWiz will not replace it; choose another destination.");
+        } else {
+            ui.label(error);
+        }
+        crate::ui::components::technical_details(ui, ("zip-conversion-error",), |ui| {
+            ui.label(error);
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rendered_text(output: &egui::FullOutput) -> String {
+        fn collect(shape: &egui::Shape, output: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    output.push_str(text.galley.text());
+                    output.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        text
+    }
 
     #[test]
     fn mode_switch_clears_previous_preview() {
@@ -241,5 +279,47 @@ mod tests {
         state.set_mode(ZipMode::Extract);
         assert!(state.preview.is_none());
         assert!(state.source.is_empty());
+    }
+
+    #[test]
+    fn zip_preview_explains_copy_safety_before_create() {
+        let mut state = ZipConverterPageState {
+            source: "games/source".into(),
+            destination: "out.zip".into(),
+            preview: Some(ZipPreview {
+                source: "games/source".into(),
+                destination: "out.zip".into(),
+                entries: Vec::new(),
+                total_size: 0,
+            }),
+            ..Default::default()
+        };
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+        });
+        let text = rendered_text(&output);
+        assert!(text.contains("Review the output before creating it"));
+        assert!(text.contains("source is unchanged"));
+        assert!(text.contains("Destination: out.zip"));
+        assert!(text.contains("Create ZIP"));
+        assert!(state.result.is_none());
+    }
+
+    #[test]
+    fn zip_destination_conflict_is_a_blocker_not_an_overwrite_action() {
+        let mut state = ZipConverterPageState {
+            error: Some("Destination already exists.".into()),
+            ..Default::default()
+        };
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+        });
+        let text = rendered_text(&output);
+        assert!(text.contains("Blocked"));
+        assert!(text.contains("EmuWiz will not replace it"));
+        assert!(!text.contains("Force"));
+        assert!(state.result.is_none());
     }
 }

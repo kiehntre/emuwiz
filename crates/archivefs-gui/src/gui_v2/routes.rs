@@ -588,18 +588,18 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
         ],
         FeatureFamily::Conversion => vec![
             action(
-                "easy-conversion",
-                "Easy Conversion",
-                "Open the verified conversion workflow.",
+                "disc-conversion",
+                "Disc Conversion",
+                "Review supported disc conversion formats and safety before applying.",
                 Route::Section(Section::Converter),
-                Easy,
+                Normal,
             ),
             action(
-                "advanced-conversion",
-                "Advanced Conversion",
-                "Open the same conversion backend with its specialist controls.",
-                Route::Section(Section::Converter),
-                Advanced,
+                "conversion-history",
+                "History & Undo",
+                "Review completed operations and available undo actions.",
+                Route::Section(Section::History),
+                Normal,
             ),
         ],
         FeatureFamily::Organisation => vec![

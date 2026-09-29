@@ -14,9 +14,7 @@ use crate::optical_conversion_page;
 use crate::selected_evidence_page;
 use crate::ui::{components as widgets, theme};
 use crate::zip_converter_page::ZipConverterPageState;
-use archivefs_core::conversion_queue::{
-    CompressionPreview, ConversionPlanningInput, ConversionQueue, SpaceEstimate,
-};
+use archivefs_core::conversion_queue::{ConversionPlanningInput, ConversionQueue, SpaceEstimate};
 use archivefs_core::psp_reversible_shrink::{
     PspShrinkInspection, PspShrinkResult, PspShrinkTrust, convert_psp_iso_to_cso, inspect_psp_iso,
 };
@@ -61,14 +59,16 @@ fn candidate_bucket(candidate: &Candidate) -> CandidateBucket {
         // The conversion/verification tool itself is not available - worth
         // reviewing, not a statement about this particular disc set.
         ChdConversionError::ChdmanUnavailable(_) => CandidateBucket::NeedsReview,
-        ChdConversionError::InvalidSource(_) => {
-            match conversion_blocker_label(error) {
-                "Ambiguous disc set" | "Missing CUE partner" => CandidateBucket::NeedsReview,
-                // "Unsupported format" and any other InvalidSource detail
-                // this build has no specific reviewed wording for.
-                _ => CandidateBucket::Unsupported,
-            }
+        ChdConversionError::InvalidSource(reason)
+            if reason.contains("multiple data tracks")
+                || reason.contains("data file is missing")
+                || reason.contains("BIN: ") =>
+        {
+            CandidateBucket::Blocked
         }
+        // Unsupported layouts are understood as inputs but this build has no
+        // valid target workflow for them.
+        ChdConversionError::InvalidSource(_) => CandidateBucket::Unsupported,
         // These variants are only ever produced by `convert()` itself
         // (post-plan, mid-transaction), never by the plan builder `scan`/
         // `preview_selected` call - listed for exhaustiveness, not because
@@ -91,11 +91,14 @@ fn candidate_bucket(candidate: &Candidate) -> CandidateBucket {
 fn conversion_blocker_label(error: &ChdConversionError) -> &'static str {
     let message = error.to_string();
     match error {
-        ChdConversionError::InvalidTarget(_) => "Destination collision",
-        ChdConversionError::ChdmanUnavailable(_) => "Verification prerequisite failed",
+        ChdConversionError::InvalidTarget(reason) if reason.contains("already exists") => {
+            "Destination exists"
+        }
+        ChdConversionError::InvalidTarget(_) => "Destination blocked",
+        ChdConversionError::ChdmanUnavailable(_) => "Conversion tool unavailable",
         ChdConversionError::InvalidSource(_) => {
             if message.contains("multiple data tracks") {
-                "Ambiguous disc set"
+                "Unsupported multi-track layout"
             } else if message.contains("data file is missing") || message.contains("BIN: ") {
                 "Missing CUE partner"
             } else {
@@ -107,6 +110,49 @@ fn conversion_blocker_label(error: &ChdConversionError) -> &'static str {
         ChdConversionError::StaleSource(_) => "Source changed during conversion",
         ChdConversionError::StaleOutput(_) => "Staged output changed",
         ChdConversionError::Transaction(_) => "Conversion transaction failed",
+    }
+}
+
+fn conversion_blocker_reason(error: &ChdConversionError) -> &'static str {
+    match error {
+        ChdConversionError::InvalidTarget(reason) if reason.contains("already exists") => {
+            "A file already exists at the planned output destination. EmuWiz will not replace it; move that file or rename the source before trying again."
+        }
+        ChdConversionError::InvalidTarget(_) => {
+            "The output destination is not safe or available. The source will not be changed."
+        }
+        ChdConversionError::ChdmanUnavailable(_) => {
+            "The required CHD conversion tool is unavailable, so EmuWiz cannot apply this conversion."
+        }
+        ChdConversionError::InvalidSource(reason) if reason.contains("multiple data tracks") => {
+            "This disc has a multi-track or unsupported track layout. The current verifier cannot establish a safe conversion, so conversion is blocked."
+        }
+        ChdConversionError::InvalidSource(reason)
+            if reason.contains("data file is missing") || reason.contains("BIN: ") =>
+        {
+            "The CUE sheet references a missing track file. Restore that file before preview; no output will be created."
+        }
+        ChdConversionError::InvalidSource(reason) if reason.contains("audio") => {
+            "This disc includes audio-track evidence the current workflow cannot verify. It will not be flattened to a single ISO."
+        }
+        ChdConversionError::InvalidSource(_) => {
+            "This source does not match the CUE/BIN layout that the current verifier supports. No conversion is available for it."
+        }
+        ChdConversionError::ProcessFailed(_) => {
+            "The conversion process failed. Review the technical reason below; the staged output was not accepted."
+        }
+        ChdConversionError::VerificationFailed(_) => {
+            "The output did not pass verification and was not accepted."
+        }
+        ChdConversionError::StaleSource(_) => {
+            "The source changed after preview. Review it again before converting."
+        }
+        ChdConversionError::StaleOutput(_) => {
+            "The staged output changed before publication and was refused."
+        }
+        ChdConversionError::Transaction(_) => {
+            "The conversion transaction could not be completed safely. Review the technical reason below."
+        }
     }
 }
 
@@ -587,7 +633,7 @@ fn show_intro_card(ui: &mut egui::Ui, state: &mut OpticalConversionPageState) {
     widgets::card(ui, |ui| {
         ui.label(
             egui::RichText::new(
-                "Convert supported disc images into space-efficient CHD files while keeping \
+                "Create a CHD copy of a supported disc image while keeping \
                  the original source untouched until you explicitly apply the plan.",
             )
             .size(15.0),
@@ -599,12 +645,13 @@ fn show_intro_card(ui: &mut egui::Ui, state: &mut OpticalConversionPageState) {
         });
         ui.add_space(theme::SPACE_SM);
         ui.label(egui::RichText::new("Why convert to CHD?").strong());
-        ui.label("• Usually a much smaller storage footprint than raw CUE/BIN");
+        ui.label("• Store the supported disc data in one CHD file; actual size savings vary");
         ui.label("• One file instead of a CUE sheet plus its BIN track(s)");
         ui.label("• The original source stays exactly as it is until you confirm and apply");
         ui.label(
             "• The new CHD is fingerprint-verified against the source before it counts as done",
         );
+        ui.label("This workflow accepts only layouts the current verifier supports. Multi-track or audio discs that do not fit that evidence are blocked; EmuWiz will not flatten them to a generic ISO.");
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
@@ -688,8 +735,8 @@ fn show_detection_summary(ui: &mut egui::Ui, candidates: &[Candidate]) {
             );
             widgets::status_badge(
                 ui,
-                format!("{} ready to convert", counts.ready_to_convert),
-                widgets::StatusTone::Success,
+                format!("{} ready to preview", counts.ready_to_convert),
+                widgets::StatusTone::Info,
             );
             if counts.needs_review > 0 {
                 widgets::status_badge(
@@ -749,7 +796,7 @@ fn next_step_hint(state: &OpticalConversionPageState) -> &'static str {
 /// Disc/DSK Conversion's real, ordered workflow. Never fabricated: each
 /// step corresponds to an actual state `show_optical_conversion_page`
 /// already renders differently for.
-const WORKFLOW_STEPS: [&str; 5] = ["Choose", "Inspect", "Convert", "Verify", "Keep original"];
+const WORKFLOW_STEPS: [&str; 5] = ["Choose", "Review", "Preview", "Convert", "Verify"];
 
 /// Which step of [`WORKFLOW_STEPS`] the page is currently on. `execute_chd_
 /// conversion` verifies the staged output before it ever becomes a result
@@ -762,6 +809,9 @@ fn workflow_step(state: &OpticalConversionPageState) -> usize {
         return 4;
     }
     if state.confirm || state.conversion_failure.is_some() {
+        return 3;
+    }
+    if state.previewed {
         return 2;
     }
     if !state.candidates.is_empty() || state.selected_context.is_some() {
@@ -876,91 +926,141 @@ pub(crate) fn show_optical_conversion_page(
     // Keep the route's text identity available to accessibility/search
     // output even when the approved hero asset supplies the visual title.
     ui.label(egui::RichText::new("Disc Conversion · CUE/BIN → CHD").heading());
-    widgets::card(ui, |ui| {
-        crate::conversion_queue_page::show(ui, &mut state.conversion_queue);
-    });
+    egui::CollapsingHeader::new("Conversion plan list · preview only")
+        .id_salt("conversion-plan-list")
+        .default_open(false)
+        .show(ui, |ui| {
+            widgets::card(ui, |ui| {
+                crate::conversion_queue_page::show(ui, &mut state.conversion_queue);
+            });
+        });
+    if let Some(context) = state.selected_context.clone() {
+        widgets::card(ui, |ui| {
+            ui.heading("Selected media");
+            let file_name = context
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Selected media");
+            ui.strong(file_name);
+            let extension = context
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("");
+            let format = match extension.to_ascii_lowercase().as_str() {
+                "cue" => "CUE/BIN".to_string(),
+                "chd" => "CHD".to_string(),
+                "iso" => "ISO".to_string(),
+                "cso" => "CSO".to_string(),
+                "zip" => "ZIP".to_string(),
+                "" => "Unknown format".to_string(),
+                other => other.to_ascii_uppercase(),
+            };
+            ui.label(format!("Current format: {format}"));
+            if let Some(size) = std::fs::metadata(&context.path)
+                .ok()
+                .map(|metadata| metadata.len())
+            {
+                ui.label(format!(
+                    "Selected file size: {}",
+                    widgets::format_size(Some(size))
+                ));
+            }
+            if let Some(platform) = &context.platform {
+                ui.label(format!("Platform: {platform}"));
+            }
+            let selected_extension = context.path.extension().and_then(|value| value.to_str());
+            if selected_extension.is_some_and(|extension| extension.eq_ignore_ascii_case("chd")) {
+                ui.label("This file is already CHD; no conversion is required in this workflow.");
+            } else if supported_capability_for_extension(selected_extension).is_some() {
+                ui.label("This file type can be reviewed for the existing CUE/BIN → CHD workflow.");
+                if ui.button("Review conversion").clicked() {
+                    state.preview_selected();
+                }
+            } else {
+                ui.label("No supported conversion is available for this selected format.");
+            }
+            widgets::technical_details(ui, ("selected-conversion-source", &context.path), |ui| {
+                ui.label(format!("Source path: {}", context.path.display()));
+            });
+        });
+        ui.add_space(theme::SECTION_GAP);
+    } else if state.candidates.is_empty() && !state.scanned {
+        ui.label("No media selected. Choose a source folder below or select a game to review a supported conversion.");
+    }
     ui.add_space(theme::SECTION_GAP);
     widgets::workflow_strip(ui, &WORKFLOW_STEPS, workflow_step(state));
     ui.add_space(theme::SPACE_SM);
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
-            "Supported disc formats",
-            Some("EmuWiz can preview, convert, and verify this pair today."),
+            "Supported disc conversion",
+            Some(
+                "CUE/BIN with a verifier-supported data track → CHD. Other layouts remain unsupported or blocked.",
+            ),
         );
         widgets::format_chip_row(ui, &SUPPORTED_DISC_FORMAT_CHIPS);
     });
     ui.add_space(theme::SPACE_SM);
-    show_psp_shrink_card(ui, &mut state.psp_shrink);
-    ui.add_space(theme::SECTION_GAP);
-    widgets::card(ui, |ui| {
-        crate::zip_converter_page::show(ui, &mut state.zip_converter);
-    });
-    ui.add_space(theme::SECTION_GAP);
+    egui::CollapsingHeader::new("Other supported conversions")
+        .id_salt("other-conversion-workflows")
+        .default_open(false)
+        .show(ui, |ui| {
+            show_psp_shrink_card(ui, &mut state.psp_shrink);
+            ui.label("No PS2 disc-image conversion is available in this build. Existing PS2 save export is a separate workflow.");
+            ui.add_space(theme::SECTION_GAP);
+            widgets::card(ui, |ui| {
+                crate::zip_converter_page::show(ui, &mut state.zip_converter);
+            });
+        });
 
-    if state.candidates.is_empty() && !state.scanned {
+    if state.candidates.is_empty() && !state.scanned && state.selected_context.is_none() {
         show_intro_card(ui, state);
         ui.add_space(theme::SECTION_GAP);
     }
 
-    if let Some(context) = state.selected_context.clone() {
+    if !state.source_root_draft.trim().is_empty()
+        || state.scanned
+        || state.selected_context.is_some()
+    {
         widgets::card(ui, |ui| {
-            ui.heading("Selected file");
-            ui.label(context.path.display().to_string());
-            if let Some(platform) = &context.platform {
-                ui.label(format!("Platform: {platform}"));
-            }
-            if let Some(capability) = supported_capability_for_extension(
-                context.path.extension().and_then(|value| value.to_str()),
-            ) {
-                ui.label(format!(
-                    "{} → {} · preview, conversion, and verification supported",
-                    capability.source_format, capability.target_format
-                ));
-                if ui.button("Prepare preview").clicked() {
-                    state.preview_selected();
+            ui.heading("Source discovery");
+            ui.horizontal_wrapped(|ui| {
+                let source_folder = PathBuf::from(state.source_root_draft.trim());
+                let folder_label = source_folder
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("No folder selected");
+                ui.label(format!("Source folder: {folder_label}"));
+                if ui.button("Choose folder").clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    state.source_root_draft = path.display().to_string();
                 }
-            } else {
-                ui.label("No safe conversion is currently available for this format.");
-            }
+                if ui.button("Find supported files").clicked() {
+                    state.scan();
+                }
+            });
+            widgets::technical_details(ui, ("conversion-source-folder",), |ui| {
+                ui.label("Source folder path:");
+                ui.add_sized(
+                    [ui.available_width().clamp(220.0, 520.0), 24.0],
+                    egui::TextEdit::singleline(&mut state.source_root_draft),
+                );
+            });
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Scanning and previewing never modifies your files.")
+                        .small()
+                        .color(theme::muted(ui)),
+                )
+                .wrap(),
+            );
         });
         ui.add_space(theme::SECTION_GAP);
     }
-    widgets::card(ui, |ui| {
-        ui.heading("Source discovery");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Source folder:");
-            ui.add_sized(
-                [ui.available_width().clamp(220.0, 520.0), 24.0],
-                egui::TextEdit::singleline(&mut state.source_root_draft),
-            );
-            if ui.button("Choose folder").clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
-            {
-                state.source_root_draft = path.display().to_string();
-            }
-            if ui.button("Find supported files").clicked() {
-                state.scan();
-            }
-        });
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(state.source_root_draft.as_str())
-                    .monospace()
-                    .color(theme::muted(ui)),
-            )
-            .wrap(),
-        );
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new("Scanning and previewing never modifies your files.")
-                    .small()
-                    .color(theme::muted(ui)),
-            )
-            .wrap(),
-        );
-    });
-    ui.add_space(theme::SECTION_GAP);
     widgets::card(ui, |ui| {
         ui.heading("Conversion safety");
         let mut quarantine = state.source_mode == ChdConversionSourceMode::QuarantineSource;
@@ -1041,59 +1141,126 @@ pub(crate) fn show_optical_conversion_page(
         let plan = state.candidates[index].plan.clone();
         let error = state.candidates[index].error.clone();
         let eligible = plan.is_some();
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .selectable_label(
-                    state.selected == Some(index),
-                    candidate_path.display().to_string(),
-                )
-                .clicked()
-                && eligible
-            {
-                state.selected = Some(index);
-                state.confirm = false;
-                state.previewed = false;
-                state.result = None;
-                state.transaction = None;
-                state.error = None;
-                state.conversion_failure = None;
-            }
-            if eligible {
-                widgets::status_badge(ui, "Ready to convert", widgets::StatusTone::Success);
-            } else if let Some(error) = &error {
-                widgets::status_badge(
+        let display_name = candidate_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Disc image");
+        ui.push_id(("conversion-candidate", &candidate_path), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .selectable_label(state.selected == Some(index), display_name)
+                    .clicked()
+                    && eligible
+                {
+                    state.selected = Some(index);
+                    state.confirm = false;
+                    state.previewed = false;
+                    state.result = None;
+                    state.transaction = None;
+                    state.error = None;
+                    state.conversion_failure = None;
+                }
+                if eligible {
+                    let (label, tone) = match candidate_bucket(&state.candidates[index]) {
+                        CandidateBucket::ReadyToConvert
+                            if state.selected == Some(index) && state.previewed =>
+                        {
+                            ("Ready to convert", widgets::StatusTone::Success)
+                        }
+                        CandidateBucket::ReadyToConvert => {
+                            ("Ready to preview", widgets::StatusTone::Info)
+                        }
+                        CandidateBucket::NeedsReview => {
+                            ("Needs attention", widgets::StatusTone::Warning)
+                        }
+                        CandidateBucket::Unsupported => {
+                            ("Unsupported", widgets::StatusTone::Pending)
+                        }
+                        CandidateBucket::Blocked => ("Blocked", widgets::StatusTone::Blocked),
+                    };
+                    widgets::status_badge(ui, label, tone);
+                } else if let Some(error) = &error {
+                    let tone =
+                        if candidate_bucket(&state.candidates[index]) == CandidateBucket::Blocked {
+                            widgets::StatusTone::Blocked
+                        } else {
+                            widgets::StatusTone::Warning
+                        };
+                    widgets::status_badge(ui, conversion_blocker_label(error), tone);
+                }
+            });
+            if !eligible && let Some(error) = &error {
+                ui.label(conversion_blocker_reason(error));
+                if matches!(error, ChdConversionError::InvalidTarget(_)) {
+                    ui.label(format!(
+                        "Planned output: {}",
+                        candidate_path.with_extension("chd").display()
+                    ));
+                }
+                widgets::technical_details(
                     ui,
-                    conversion_blocker_label(error),
-                    widgets::StatusTone::Warning,
+                    ("conversion-candidate-blocker", &candidate_path),
+                    |ui| {
+                        ui.label(format!("Source: {}", candidate_path.display()));
+                        ui.monospace(error.to_string());
+                    },
                 );
             }
         });
-        if !eligible && let Some(error) = &error {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(error.to_string())
-                        .small()
-                        .color(theme::muted(ui)),
-                )
-                .wrap(),
-            );
-        }
         if state.selected == Some(index)
             && let Some(plan) = &plan
         {
             widgets::card(ui, |ui| {
-                ui.heading("Conversion preview");
-                ui.label(format!("Source: {}", plan.cue_path.display()));
+                ui.heading(if state.previewed {
+                    "Conversion preview"
+                } else {
+                    "Plan summary"
+                });
                 ui.label(format!(
-                    "Detected format: CUE/BIN (required member: {})",
-                    plan.bin_path.display()
+                    "Source: {}",
+                    plan.cue_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Disc image")
                 ));
+                ui.label("Current format: CUE/BIN · target format: CHD");
+                let source_set_size = std::fs::metadata(&plan.cue_path)
+                    .ok()
+                    .map(|metadata| metadata.len())
+                    .zip(
+                        std::fs::metadata(&plan.bin_path)
+                            .ok()
+                            .map(|metadata| metadata.len()),
+                    )
+                    .map(|(cue, bin)| cue.saturating_add(bin));
+                if let Some(size) = source_set_size {
+                    ui.label(format!(
+                        "Source set size: {}",
+                        widgets::format_size(Some(size))
+                    ));
+                }
                 ui.label(format!("Destination: {}", plan.target_path.display()));
-                ui.label("Expected output: one fingerprint-verified CHD file.");
-                widgets::status_badge(ui, "Ready to convert", widgets::StatusTone::Success);
+                ui.label("Expected output: one new CHD file, verified against the source's supported data sectors.");
+                widgets::status_badge(
+                    ui,
+                    if state.previewed {
+                        "Ready to convert"
+                    } else {
+                        "Ready to preview"
+                    },
+                    if state.previewed {
+                        widgets::StatusTone::Success
+                    } else {
+                        widgets::StatusTone::Info
+                    },
+                );
                 ui.add_space(theme::SPACE_SM);
-                ui.label("The source set is read-only during conversion.");
-                ui.label("The staged CHD is fingerprint-verified before it is finalized.");
+                ui.label(if state.source_mode == ChdConversionSourceMode::KeepSource {
+                    "Your original CUE/BIN files will remain unchanged."
+                } else {
+                    "After verification, the original files will be moved to quarantine; Undo is available."
+                });
+                ui.label("Verification checks the supported data-sector fingerprint; unsupported audio or track layouts are refused, not converted as a generic ISO.");
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new("Preview does not modify your files.")
@@ -1102,26 +1269,53 @@ pub(crate) fn show_optical_conversion_page(
                     )
                     .wrap(),
                 );
-                widgets::technical_details(ui, ("optical-conversion-plan", index), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("Target: {}", plan.target_path.display()))
+                widgets::technical_details(
+                    ui,
+                    ("optical-conversion-plan", &candidate_path),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Source CUE: {}",
+                                    plan.cue_path.display()
+                                ))
                                 .monospace(),
-                        )
-                        .wrap(),
-                    );
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!(
-                                "{} sectors · canonical SHA-256 {}",
-                                plan.source_fingerprint.structure.logical_sector_count,
-                                plan.source_fingerprint.canonical_sha256
-                            ))
-                            .monospace(),
-                        )
-                        .wrap(),
-                    );
-                });
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Source track: {}",
+                                    plan.bin_path.display()
+                                ))
+                                .monospace(),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "Target: {}",
+                                    plan.target_path.display()
+                                ))
+                                .monospace(),
+                            )
+                            .wrap(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!(
+                                    "{} sectors · canonical SHA-256 {}",
+                                    plan.source_fingerprint.structure.logical_sector_count,
+                                    plan.source_fingerprint.canonical_sha256
+                                ))
+                                .monospace(),
+                            )
+                            .wrap(),
+                        );
+                    },
+                );
                 if ui
                     .button("Add this preview to the conversion queue")
                     .clicked()
@@ -1140,7 +1334,7 @@ pub(crate) fn show_optical_conversion_page(
                         .selected_context
                         .as_ref()
                         .and_then(|context| context.platform.clone());
-                    let queue_id = state.conversion_queue.add(ConversionPlanningInput {
+                    state.conversion_queue.add(ConversionPlanningInput {
                         source_path: plan.cue_path.clone(),
                         source_format: "CUE/BIN".into(),
                         destination_path: plan.target_path.clone(),
@@ -1156,21 +1350,6 @@ pub(crate) fn show_optical_conversion_page(
                         readiness_reason: None,
                         available_space_override: None,
                     });
-                    if let Some(item) = state
-                        .conversion_queue
-                        .items
-                        .iter_mut()
-                        .find(|item| item.id == queue_id)
-                    {
-                        item.compression = Some(CompressionPreview {
-                            expected_type: "CHD cdlz/cdzl/cdfl".into(),
-                            space_saving: SpaceEstimate::Unknown,
-                            lossless: true,
-                            preservation_equivalent: true,
-                            round_trip_identity_expected: true,
-                            retain_original: true,
-                        });
-                    }
                 }
             });
             if !state.previewed {
@@ -1294,8 +1473,10 @@ fn show_psp_shrink_card(ui: &mut egui::Ui, state: &mut PspShrinkPageState) {
     widgets::card(ui, |ui| {
         widgets::section_header(
             ui,
-            "Reversible Shrink",
-            Some("Create a verified, reversible CSO from a PSP ISO."),
+            "PSP ISO → CSO",
+            Some(
+                "Create a CSO copy for PSP software that supports this format; verify it by restoring it to the original ISO.",
+            ),
         );
         ui.label("Supported operation: PSP ISO → CSO");
         ui.label("The original ISO is never deleted, replaced, or modified.");
@@ -1322,12 +1503,20 @@ fn show_psp_shrink_card(ui: &mut egui::Ui, state: &mut PspShrinkPageState) {
                 .desired_width(ui.available_width()),
         );
         ui.horizontal_wrapped(|ui| {
-            if widgets::action_button(ui, "Inspect source", widgets::ActionStyle::Secondary, true)
-                .clicked()
+            if widgets::action_button(
+                ui,
+                "Preview and verify source",
+                widgets::ActionStyle::Secondary,
+                true,
+            )
+            .clicked()
             {
                 state.inspect();
             }
-            let can_convert = state.inspection.is_some();
+            let output = PathBuf::from(state.output_draft.trim());
+            let output_missing = state.output_draft.trim().is_empty();
+            let output_conflict = !output_missing && output.exists();
+            let can_convert = state.inspection.is_some() && !output_missing && !output_conflict;
             if widgets::action_button(
                 ui,
                 "Convert to CSO",
@@ -1345,7 +1534,17 @@ fn show_psp_shrink_card(ui: &mut egui::Ui, state: &mut PspShrinkPageState) {
                 "Original ISO · {}",
                 widgets::format_size(Some(inspection.source_size))
             ));
-            ui.label("Ready to create a new CSO; preview made no changes.");
+            ui.label(format!("Output destination: {}", state.output_draft));
+            ui.label("Ready to create a new CSO copy. Inspecting made no changes; the original ISO remains unchanged.");
+            if !state.output_draft.trim().is_empty()
+                && PathBuf::from(state.output_draft.trim()).exists()
+            {
+                ui.label("Blocked: this output file already exists. Choose another destination; EmuWiz will not replace it.");
+            }
+        } else if state.output_draft.trim().is_empty() {
+            ui.label("Choose an output destination. Inspect the ISO before converting.");
+        } else {
+            ui.label("Inspect the ISO first. Convert is unavailable until EmuWiz verifies that it is a usable PSP ISO.");
         }
         if let Some(result) = &state.result {
             let compressed_size = result.compressed_size.unwrap_or_default();
@@ -1478,7 +1677,7 @@ mod tests {
         );
         assert_eq!(
             conversion_blocker_label(state.candidates[0].error.as_ref().unwrap()),
-            "Destination collision"
+            "Destination exists"
         );
     }
 
@@ -1629,7 +1828,7 @@ mod tests {
         let output = render(&mut state);
         assert!(rendered_text_contains(
             &output,
-            "space-efficient CHD files while keeping"
+            "Create a CHD copy of a supported disc image"
         ));
         assert!(rendered_text_contains(&output, "Why convert to CHD?"));
         assert!(rendered_text_contains(&output, "Choose source folder"));
@@ -1661,12 +1860,29 @@ mod tests {
         let output = render(&mut state);
         assert!(rendered_text_contains(
             &output,
-            "No safe conversion is currently available for this format."
+            "No supported conversion is available for this selected format."
         ));
+        assert!(rendered_text_contains(&output, "game.iso"));
+        assert!(!rendered_text_contains(&output, "/library/game.iso"));
         assert!(!rendered_text_contains(
             &output,
             "preview, conversion, and verification supported"
         ));
+    }
+
+    #[test]
+    fn already_chd_selection_says_no_conversion_is_required() {
+        let mut state = OpticalConversionPageState::default();
+        state.set_selected_context(Some(SelectedConversionContext {
+            path: PathBuf::from("/library/Game.chd"),
+            platform: Some("PlayStation".into()),
+        }));
+        let output = render(&mut state);
+        assert!(rendered_text_contains(
+            &output,
+            "This file is already CHD; no conversion is required"
+        ));
+        assert!(!rendered_text_contains(&output, "Review conversion"));
     }
 
     /// 4. Detection counts are shown after a scan, from the existing
@@ -1679,7 +1895,7 @@ mod tests {
         let output = render(&mut state);
         assert!(rendered_text_contains(&output, "1 files scanned"));
         assert!(rendered_text_contains(&output, "1 supported disc sets"));
-        assert!(rendered_text_contains(&output, "1 ready to convert"));
+        assert!(rendered_text_contains(&output, "1 ready to preview"));
     }
 
     /// 5. A supported item's preview (source/format/destination/status) is
@@ -1690,12 +1906,21 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ready_candidate_state(directory.path());
         state.selected = Some(0);
+        state.previewed = true;
         let output = render(&mut state);
         assert!(rendered_text_contains(&output, "Conversion preview"));
         assert!(rendered_text_contains(&output, "Source:"));
-        assert!(rendered_text_contains(&output, "Detected format: CUE/BIN"));
+        assert!(rendered_text_contains(
+            &output,
+            "Current format: CUE/BIN · target format: CHD"
+        ));
         assert!(rendered_text_contains(&output, "Destination:"));
         assert!(rendered_text_contains(&output, "Expected output:"));
+        assert!(rendered_text_contains(
+            &output,
+            "unsupported audio or track layouts are refused"
+        ));
+        assert!(!rendered_text_contains(&output, "Lossless"));
         assert!(rendered_text_contains(&output, "Ready to convert"));
     }
 
@@ -1713,7 +1938,12 @@ mod tests {
         };
         state.scan();
         let output = render(&mut state);
-        assert!(rendered_text_contains(&output, "Destination collision"));
+        assert!(rendered_text_contains(&output, "Destination exists"));
+        assert!(rendered_text_contains(
+            &output,
+            "EmuWiz will not replace it"
+        ));
+        assert!(rendered_text_contains(&output, "Planned output:"));
         assert!(rendered_text_contains(&output, "1 blocked"));
     }
 
@@ -1841,7 +2071,7 @@ mod tests {
         let mut state = OpticalConversionPageState::default();
         let output = render_at(&mut state, egui::vec2(1024.0, 600.0));
         assert!(state.hero_texture.is_some());
-        assert!(rendered_text_contains(&output, "Supported disc formats"));
+        assert!(rendered_text_contains(&output, "Supported disc conversion"));
     }
 
     /// 13. The final section (the Result card) is reachable by scrolling
@@ -1902,10 +2132,10 @@ mod tests {
 
         state.selected = Some(0);
         state.previewed = true;
-        assert_eq!(workflow_step(&state), 1);
+        assert_eq!(workflow_step(&state), 2);
 
         state.confirm = true;
-        assert_eq!(workflow_step(&state), 2);
+        assert_eq!(workflow_step(&state), 3);
 
         state.result = Some(ChdConversionResult {
             target_path: directory.path().join("out.chd"),
@@ -2133,10 +2363,141 @@ mod tests {
     fn psp_reversible_shrink_card_is_present_and_advanced_details_are_collapsed() {
         let mut state = OpticalConversionPageState::default();
         let output = render(&mut state);
-        assert!(rendered_text_contains(&output, "Reversible Shrink"));
-        assert!(rendered_text_contains(&output, "PSP ISO → CSO"));
-        assert!(rendered_text_contains(&output, "Choose PSP ISO"));
+        assert!(rendered_text_contains(
+            &output,
+            "Other supported conversions"
+        ));
+        assert!(!rendered_text_contains(&output, "PSP ISO → CSO"));
         assert!(!rendered_text_contains(&output, "Original SHA-256:"));
+    }
+
+    #[test]
+    fn psp_conversion_uses_player_facing_copy() {
+        let context = egui::Context::default();
+        let mut state = PspShrinkPageState::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show_psp_shrink_card(ui, &mut state));
+        });
+        assert!(rendered_text_contains(
+            &output,
+            "PSP software that supports this format"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "original ISO is never deleted, replaced, or modified"
+        ));
+        assert!(!rendered_text_contains(&output, "codec"));
+    }
+
+    #[test]
+    fn selected_media_summary_is_readable_and_keeps_path_advanced() {
+        let mut state = OpticalConversionPageState::default();
+        state.set_selected_context(Some(SelectedConversionContext {
+            path: PathBuf::from("/library/Game Disc.cue"),
+            platform: Some("PlayStation".into()),
+        }));
+        let output = render(&mut state);
+        assert!(rendered_text_contains(&output, "Game Disc.cue"));
+        assert!(rendered_text_contains(&output, "Current format: CUE/BIN"));
+        assert!(rendered_text_contains(&output, "Platform: PlayStation"));
+        assert!(!rendered_text_contains(&output, "/library/Game Disc.cue"));
+    }
+
+    #[test]
+    fn candidate_requires_explicit_preview_before_ready_to_convert() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ready_candidate_state(directory.path());
+        state.selected = Some(0);
+        let output = render(&mut state);
+        assert!(rendered_text_contains(&output, "Plan summary"));
+        assert!(rendered_text_contains(&output, "Ready to preview"));
+        assert!(!rendered_text_contains(&output, "Ready to convert"));
+        assert!(!rendered_text_contains(&output, "Confirm and convert"));
+    }
+
+    #[test]
+    fn multi_data_track_blocker_is_explained_without_raw_enum() {
+        let mut state = OpticalConversionPageState::default();
+        state.candidates.push(Candidate {
+            path: PathBuf::from("/library/Multi Track.cue"),
+            plan: None,
+            error: Some(ChdConversionError::InvalidSource(
+                "multiple data tracks".into(),
+            )),
+        });
+        let output = render(&mut state);
+        assert!(rendered_text_contains(
+            &output,
+            "multi-track or unsupported track layout"
+        ));
+        assert!(!rendered_text_contains(&output, "InvalidSource"));
+        assert!(rendered_text_contains(&output, "Technical details"));
+    }
+
+    #[test]
+    fn unsupported_layout_and_unavailable_tool_have_distinct_readiness() {
+        let unsupported = Candidate {
+            path: PathBuf::from("Unsupported.cue"),
+            plan: None,
+            error: Some(ChdConversionError::InvalidSource("MODE2 track".into())),
+        };
+        let unavailable = Candidate {
+            path: PathBuf::from("Ready.cue"),
+            plan: None,
+            error: Some(ChdConversionError::ChdmanUnavailable(
+                "missing reviewed tool".into(),
+            )),
+        };
+        assert_eq!(candidate_bucket(&unsupported), CandidateBucket::Unsupported);
+        assert_eq!(candidate_bucket(&unavailable), CandidateBucket::NeedsReview);
+        assert_eq!(
+            conversion_blocker_label(unavailable.error.as_ref().unwrap()),
+            "Conversion tool unavailable"
+        );
+        assert!(
+            conversion_blocker_reason(unavailable.error.as_ref().unwrap())
+                .contains("cannot apply this conversion")
+        );
+    }
+
+    #[test]
+    fn repeated_candidate_widgets_have_stable_semantic_ids() {
+        let first = PathBuf::from("/games/First.cue");
+        let same = first.clone();
+        let other = PathBuf::from("/games/Second.cue");
+        assert_eq!(
+            egui::Id::new(("conversion-candidate", &first)),
+            egui::Id::new(("conversion-candidate", &same))
+        );
+        assert_ne!(
+            egui::Id::new(("conversion-candidate", &first)),
+            egui::Id::new(("conversion-candidate", &other))
+        );
+    }
+
+    #[test]
+    fn painting_does_not_advance_conversion_or_confirmation_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ready_candidate_state(directory.path());
+        state.selected = Some(0);
+        let before = (
+            state.selected,
+            state.previewed,
+            state.confirm,
+            state.result.is_some(),
+            state.conversion_failure.is_some(),
+        );
+        let _ = render(&mut state);
+        assert_eq!(
+            before,
+            (
+                state.selected,
+                state.previewed,
+                state.confirm,
+                state.result.is_some(),
+                state.conversion_failure.is_some(),
+            )
+        );
     }
 
     #[test]

@@ -9,9 +9,9 @@ use archivefs_core::conversion_queue::{
 use eframe::egui;
 
 pub(crate) fn show(ui: &mut egui::Ui, queue: &mut ConversionQueue) {
-    ui.heading("Conversion Queue");
-    ui.label("EmuWiz will convert these one at a time and verify each result.");
-    ui.small("Preview only: no files are created, replaced or deleted from this panel.");
+    ui.heading("Conversion plan list");
+    ui.label("This list organizes reviewed plans only; it does not run conversions.");
+    ui.small("Apply each conversion from its supported workflow. This panel never creates, replaces or deletes files.");
 
     let summary = queue.summary();
     ui.horizontal_wrapped(|ui| {
@@ -37,7 +37,9 @@ pub(crate) fn show(ui: &mut egui::Ui, queue: &mut ConversionQueue) {
     });
 
     if queue.items.is_empty() {
-        ui.label("No conversions are queued. Add an inspected conversion below.");
+        ui.label(
+            "No conversion plans are listed. Add a reviewed plan from a workflow that supports it.",
+        );
         return;
     }
 
@@ -59,65 +61,66 @@ pub(crate) fn show(ui: &mut egui::Ui, queue: &mut ConversionQueue) {
             }
             ui.end_row();
             for item in &queue.items {
-                ui.label(item.platform.as_deref().unwrap_or("Unknown platform"));
-                ui.label(format!(
-                    "{} → {}",
-                    item.source_format, item.destination_format
-                ));
-                ui.label(match item.readiness {
-                    ConversionReadiness::Ready => "Ready",
-                    ConversionReadiness::Waiting => "Waiting",
-                    ConversionReadiness::Refused => "Refused",
-                });
-                ui.label(format!("{} B", item.estimate.source_size));
-                ui.label(item.estimate.destination_size.display());
-                ui.label(item.estimate.temporary_space.display());
-                ui.label(format_state(item.state));
-                ui.end_row();
-                if let Some(reason) = &item.refusal_or_warning {
-                    ui.label(egui::RichText::new(reason).small());
-                    ui.end_row();
-                }
-                ui.collapsing("Advanced details", |ui| {
-                    ui.label(format!("Source: {}", item.source_path.display()));
-                    ui.label(format!("Destination: {}", item.destination_path.display()));
-                    ui.label(format!("Converter: {}", item.converter));
-                    ui.label(format!("Verification: {}", item.verification_plan));
-                    ui.label(format!("Provenance: {}", item.provenance));
+                ui.push_id(("conversion-plan", item.id), |ui| {
+                    ui.label(item.platform.as_deref().unwrap_or("Unknown platform"));
                     ui.label(format!(
-                        "Atomic publication duplicate space: {}",
-                        if item.estimate.atomic_publication_requires_duplicate {
-                            "yes"
-                        } else {
-                            "no or unknown"
-                        }
+                        "{} → {}",
+                        item.source_format, item.destination_format
                     ));
-                    if let Some(compression) = &item.compression {
-                        ui.label(format!("Compression: {}", compression.expected_type));
-                        ui.label(format!(
-                            "Space saving: {}",
-                            compression.space_saving.display()
-                        ));
-                        ui.label(if compression.preservation_equivalent {
-                            "Preservation-equivalent: yes"
-                        } else {
-                            "Convenience/playback representation: yes"
-                        });
-                        ui.label(if compression.retain_original {
-                            "Original: retain"
-                        } else {
-                            "Original: review before any later deletion"
-                        });
+                    ui.label(match item.readiness {
+                        ConversionReadiness::Ready => "Ready to review",
+                        ConversionReadiness::Waiting => "Waiting for review",
+                        ConversionReadiness::Refused => "Blocked",
+                    });
+                    ui.label(format!("{} B", item.estimate.source_size));
+                    ui.label(item.estimate.destination_size.display());
+                    ui.label(item.estimate.temporary_space.display());
+                    ui.label(format_state(item.state));
+                    ui.end_row();
+                    if let Some(reason) = &item.refusal_or_warning {
+                        ui.label(egui::RichText::new(reason).small());
+                        ui.end_row();
                     }
-                });
-                if matches!(
-                    item.state,
-                    ConversionQueueState::Ready | ConversionQueueState::Waiting
-                ) {
-                    if ui.small_button("Remove").clicked() {
+                    ui.collapsing("Advanced details", |ui| {
+                        ui.label(format!("Source: {}", item.source_path.display()));
+                        ui.label(format!("Destination: {}", item.destination_path.display()));
+                        ui.label(format!("Converter: {}", item.converter));
+                        ui.label(format!("Verification: {}", item.verification_plan));
+                        ui.label(format!("Provenance: {}", item.provenance));
+                        ui.label(format!(
+                            "Atomic publication duplicate space: {}",
+                            if item.estimate.atomic_publication_requires_duplicate {
+                                "yes"
+                            } else {
+                                "no or unknown"
+                            }
+                        ));
+                        if let Some(compression) = &item.compression {
+                            ui.label(format!("Compression: {}", compression.expected_type));
+                            ui.label(format!(
+                                "Space saving: {}",
+                                compression.space_saving.display()
+                            ));
+                            ui.label(if compression.preservation_equivalent {
+                                "Preservation-equivalent: yes"
+                            } else {
+                                "Convenience/playback representation: yes"
+                            });
+                            ui.label(if compression.retain_original {
+                                "Original: retain"
+                            } else {
+                                "Original: review before any later deletion"
+                            });
+                        }
+                    });
+                    if matches!(
+                        item.state,
+                        ConversionQueueState::Ready | ConversionQueueState::Waiting
+                    ) && ui.small_button("Remove plan").clicked()
+                    {
                         remove = Some(item.id);
                     }
-                }
+                });
             }
         });
     ui.horizontal(|ui| {
@@ -145,7 +148,7 @@ fn format_state(state: ConversionQueueState) -> &'static str {
         ConversionQueueState::Waiting => "Waiting",
         ConversionQueueState::Running => "Running",
         ConversionQueueState::Verifying => "Verifying",
-        ConversionQueueState::Completed => "Completed",
+        ConversionQueueState::Completed => "Completed · verification shown by workflow",
         ConversionQueueState::Failed => "Failed",
         ConversionQueueState::Refused => "Refused",
         ConversionQueueState::Cancelled => "Cancelled",
@@ -158,6 +161,28 @@ mod tests {
     use archivefs_core::conversion_queue::{ConversionPlanningInput, SpaceEstimate};
     use std::path::PathBuf;
 
+    fn text(output: &egui::FullOutput) -> String {
+        fn collect(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(children) => {
+                    for child in children {
+                        collect(child, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut out);
+        }
+        out
+    }
+
     #[test]
     fn empty_queue_has_plain_language_preview() {
         let mut queue = ConversionQueue::default();
@@ -166,6 +191,10 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut queue));
         });
         assert!(output.platform_output.commands.is_empty());
+        let rendered = text(&output);
+        assert!(rendered.contains("Conversion plan list"));
+        assert!(rendered.contains("does not run conversions"));
+        assert!(rendered.contains("No conversion plans are listed"));
     }
 
     #[allow(dead_code)]
@@ -186,5 +215,12 @@ mod tests {
             readiness_reason: Some("Direct workflow only".into()),
             available_space_override: Some(1),
         }
+    }
+
+    #[test]
+    fn completed_process_state_does_not_claim_output_verification() {
+        let label = format_state(ConversionQueueState::Completed);
+        assert!(label.contains("verification shown by workflow"));
+        assert!(!label.contains("Verified"));
     }
 }

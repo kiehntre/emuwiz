@@ -1495,7 +1495,14 @@ fn gui_v2_family_children_preserve_canonical_workflows() {
     assert!(
         routes::family_children(FeatureFamily::Conversion)
             .iter()
-            .any(|action| action.route == Route::Section(Section::Converter))
+            .any(|action| action.label == "Disc Conversion"
+                && action.route == Route::Section(Section::Converter))
+    );
+    assert!(
+        routes::family_children(FeatureFamily::Conversion)
+            .iter()
+            .any(|action| action.label == "History & Undo"
+                && action.route == Route::Section(Section::History))
     );
     assert!(
         routes::family_children(FeatureFamily::Organisation)
