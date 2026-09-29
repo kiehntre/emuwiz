@@ -514,6 +514,33 @@ fn saves_frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::
     )
 }
 
+fn scroll_page(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    frame(context, app, size);
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(size[0] * 0.6, size[1] - 150.0)),
+                egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -250.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    for _ in 0..20 {
+        frame(context, app, size);
+    }
+    frame(context, app, size)
+}
+
 fn text(output: &egui::FullOutput) -> Vec<String> {
     fn gather(shape: &egui::Shape, output: &mut Vec<String>) {
         match shape {
@@ -531,6 +558,152 @@ fn text(output: &egui::FullOutput) -> Vec<String> {
         gather(&shape.shape, &mut texts);
     }
     texts
+}
+
+fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
+    fn gather(shape: &egui::Shape, wanted: &str, output: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == wanted => {
+                output.push(egui::Rect::from_min_size(text.pos, text.galley.size()));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    gather(shape, wanted, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut bounds = Vec::new();
+    for shape in &output.shapes {
+        gather(&shape.shape, wanted, &mut bounds);
+    }
+    bounds
+}
+
+#[test]
+fn gui_v2_guidance_precedes_large_problem_body_and_stays_visible_when_scrolling() {
+    for height in [600.0, 1080.0] {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(Section::Problems);
+        app.library = Arc::new(Library::new(vec![archive(1, "Missing Game", Some("PS2"))]));
+        let mut summary = ProblemSummary::from_library(&app.library, None);
+        let template = summary.problems[0].clone();
+        summary.problems = (0..132_064)
+            .map(|index| {
+                let mut problem = template.clone();
+                problem.id = format!("missing-{index}");
+                problem.title = format!("Missing Game {index}");
+                problem
+            })
+            .collect();
+        summary
+            .category_indices
+            .insert(template.category, (0..132_064).collect());
+        app.problem_summary = Some(Arc::new(summary));
+        frame(&context, &mut app, [1280.0, height]);
+        let output = frame(&context, &mut app, [1280.0, height]);
+        let guidance = text_bounds(&output, "Mr Wiz · Explain");
+        assert_eq!(guidance.len(), 1);
+        let controls = text_bounds(&output, "Inbox view")[0];
+        let header = text_bounds(&output, "Problems & Repair")
+            .into_iter()
+            .find(|rect| rect.left() >= controls.left())
+            .unwrap();
+        assert!(header.bottom() < guidance[0].top());
+        assert!(guidance[0].bottom() < controls.top());
+        assert!(guidance[0].bottom() < height - 80.0);
+        let scrolled = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, height),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(900.0, height - 100.0)),
+                    egui::Event::MouseWheel {
+                        phase: egui::TouchPhase::Move,
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -1800.0),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+        assert_eq!(text_bounds(&scrolled, "Mr Wiz · Explain"), guidance);
+        app.beginner_hints_enabled = false;
+        assert!(
+            text_bounds(
+                &frame(&context, &mut app, [1280.0, height]),
+                "Mr Wiz · Explain"
+            )
+            .is_empty()
+        );
+    }
+}
+
+#[test]
+fn gui_v2_sidebar_wheel_hover_and_focus_do_not_activate_routes() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let initial = app.router.current.clone();
+    frame(&context, &mut app, [1024.0, 600.0]);
+    for step in 0..80 {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 600.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(80.0, 180.0 + (step % 6) as f32 * 55.0)),
+                    egui::Event::MouseWheel {
+                        phase: egui::TouchPhase::Move,
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, if step % 20 < 10 { -180.0 } else { 180.0 }),
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::Key {
+                        key: egui::Key::Tab,
+                        physical_key: None,
+                        pressed: step % 2 == 0,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+        assert_eq!(app.router.current, initial, "wheel/focus pass {step}");
+    }
+    let output = frame(&context, &mut app, [1024.0, 600.0]);
+    let point = text_bounds(&output, "Browse & Play")[0].center();
+    for pressed in [true, false] {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 600.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+    }
+    assert_eq!(app.router.current, Route::BrowsePlay);
 }
 
 fn state_record(state_type: PersistentStateType, emulator: StateEmulator) -> PersistentStateRecord {
@@ -571,6 +744,7 @@ fn gui_v2_saves_empty_state_explains_read_only_discovery() {
 
     let strings = text(&saves_frame(&context, &mut app, [1280.0, 720.0]));
     for expected in [
+        "Review your saved progress",
         "Your progress, preserved safely.",
         "No saves found yet",
         "game saves, memory cards and savestates",
@@ -637,7 +811,12 @@ fn gui_v2_saves_remains_readable_at_narrow_width() {
     app.router.current = Route::Section(Section::Saves);
 
     let strings = text(&saves_frame(&context, &mut app, [620.0, 480.0]));
-    assert!(strings.iter().any(|value| value.contains("Saves & States")));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Review your saved progress")
+    );
+    assert!(!strings.iter().any(|value| value == "Saves & States"));
     assert!(strings.iter().any(|value| value.contains("Savestate")));
     assert!(
         strings
@@ -2987,8 +3166,11 @@ fn gui_v2_detail_keeps_screenshot_diagnostics_secondary() {
         .insert(1, "PRIVATE DIAGNOSTIC 85674".into());
     app.artwork.index = Some(Arc::new(index));
     app.router.current = Route::Game(1);
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
-    assert!(strings.iter().any(|s| s == "Play"));
+    let mut strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    // The upper guidance strip now takes space ahead of this scrollable body.
+    // Check real scroll reachability, not an artificially taller viewport.
+    strings.extend(text(&scroll_page(&context, &mut app, [1280.0, 820.0])));
+    assert!(strings.iter().any(|s| s == "Play"), "{strings:?}");
     assert!(!strings.iter().any(|s| s.contains("PRIVATE DIAGNOSTIC")));
 }
 
@@ -3747,7 +3929,10 @@ fn gui_v2_game_details_keep_artwork_actions_and_metadata_together() {
     let context = egui::Context::default();
     let mut app = visual_fixture(&context);
     app.go(Route::Game(1));
-    let strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
+    let mut strings = text(&pump_imagery(&context, &mut app, [1280.0, 1200.0]));
+    // Screenshots may be below the fold after the upper guidance/readiness
+    // content; they must remain reachable with ordinary page scrolling.
+    strings.extend(text(&scroll_page(&context, &mut app, [1280.0, 1200.0])));
     for expected in [
         "Play",
         "PSX",
@@ -4742,6 +4927,7 @@ fn no_route_shows_its_title_more_often_than_the_chrome_explains() {
     // introduced itself again. A tall viewport keeps the whole sidebar drawn.
     let mut offenders = Vec::new();
     for section in super::routes::SECTIONS.iter().copied() {
+        eprintln!("Checking title repetition on {section:?}");
         if section == Section::Home {
             continue;
         }
@@ -4756,11 +4942,9 @@ fn no_route_shows_its_title_more_often_than_the_chrome_explains() {
         frame(&context, &mut app, [1280.0, 4000.0]);
         let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
         let seen = strings.iter().filter(|value| *value == title).count();
-        // sidebar entries + breadcrumb + page heading. Two painted hero banners
-        // still repeat their page title; they are known and deferred (changing
-        // them is a visual redesign), so the exception is explicit, not hidden.
-        let known_hero_repeat = matches!(section, Section::Saves | Section::Problems);
-        let allowed = sidebar_entries + 2 + usize::from(known_hero_repeat);
+        // Sidebar entries + breadcrumb + page heading. Hero copy complements
+        // the page title; no page is exempt from the duplicate-title guard.
+        let allowed = sidebar_entries + 2;
         if seen > allowed {
             offenders.push(format!(
                 "{section:?} shows {title:?} {seen}x (allowed {allowed})"

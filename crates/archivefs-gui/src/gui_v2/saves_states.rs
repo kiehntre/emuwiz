@@ -147,9 +147,9 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         ui,
         checkpoint_motif,
         if selected_game.is_some() {
-            "Saves & States for this game"
+            "Review this game's saved progress"
         } else {
-            "Saves & States"
+            "Review your saved progress"
         },
         if selected_game.is_some() {
             "Review explicitly associated progress and restore evidence."

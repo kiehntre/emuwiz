@@ -909,13 +909,16 @@ fn show_disc_conversion_hero(ui: &mut egui::Ui, state: &mut OpticalConversionPag
     );
 
     let panel = |index: usize| hero_action_zone(rect, index);
+    // These are overlays on an already allocated image. `put` advances the
+    // parent cursor to the button's bottom (inside the image); `place` leaves
+    // the full image allocation intact for the heading and feedback below it.
     let transparent = || {
         egui::Button::new("")
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
     };
     if ui
-        .put(panel(0), transparent())
+        .place(panel(0), transparent())
         .on_hover_text("Choose the folder containing your disc images")
         .clicked()
     {
@@ -923,7 +926,7 @@ fn show_disc_conversion_hero(ui: &mut egui::Ui, state: &mut OpticalConversionPag
         state.hero_hint = Some(hero_scan_hint(state, "No folder was chosen."));
     }
     if ui
-        .put(panel(1), transparent())
+        .place(panel(1), transparent())
         .on_hover_text("Find supported CUE/BIN disc sets")
         .clicked()
     {
@@ -933,7 +936,7 @@ fn show_disc_conversion_hero(ui: &mut egui::Ui, state: &mut OpticalConversionPag
     let can_prepare = state.selected.is_some() || state.selected_context.is_some();
     if !can_prepare
         && ui
-            .put(panel(2), transparent())
+            .place(panel(2), transparent())
             .on_hover_text("Choose a disc set below first")
             .clicked()
     {
@@ -944,7 +947,7 @@ fn show_disc_conversion_hero(ui: &mut egui::Ui, state: &mut OpticalConversionPag
     }
     if (state.selected.is_some() || state.selected_context.is_some())
         && ui
-            .put(panel(2), transparent())
+            .place(panel(2), transparent())
             .on_hover_text("Prepare the selected CUE/BIN to CHD preview")
             .clicked()
     {
@@ -2625,6 +2628,41 @@ mod tests {
         source(directory.path());
         state.scan();
         assert!(hero_scan_hint(&state, "x").contains("Found 1 CUE/BIN disc set"));
+    }
+
+    #[test]
+    fn hero_overlays_leave_following_content_below_the_complete_image() {
+        for width in [480.0, 1024.0, 1280.0, 1920.0] {
+            for selected in [false, true] {
+                let context = egui::Context::default();
+                let mut state = OpticalConversionPageState::default();
+                // Exercise both versions of the third overlay without clicking.
+                state.selected = selected.then_some(0);
+                let _ = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 1080.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |context| {
+                        egui::CentralPanel::default().show(context, |ui| {
+                            let top = ui.cursor().top();
+                            let image_height = disc_conversion_hero_size(ui.available_width()).y;
+                            assert!(show_disc_conversion_hero(ui, &mut state));
+                            let heading = ui.heading("Disc Conversion · CUE/BIN → CHD");
+                            assert!(
+                                heading.rect.top() >= top + image_height,
+                                "width={width}, selected={selected}: {:?} overlaps image bottom {}",
+                                heading.rect,
+                                top + image_height
+                            );
+                        });
+                    },
+                );
+            }
+        }
     }
 
     #[test]

@@ -447,8 +447,15 @@ impl App {
             }
             let route = self.router.current.clone();
             let guidance = self.guidance_context(&route);
-            let show_guidance = self.beginner_hints_enabled
-                && ui.ctx().input(|input| input.screen_rect().height()) >= 720.0;
+            // Keep contextual guidance in the bounded upper interaction area.
+            // A virtualised/nested page body can occupy thousands of rows;
+            // appending the strip after that body makes it effectively invisible.
+            if self.beginner_hints_enabled
+                && let Some(guidance) = guidance
+            {
+                super::guidance::show(ui, &mut self.guidance, guidance);
+                ui.add_space(theme::SPACE_SM);
+            }
             egui::ScrollArea::vertical()
                 .id_salt(("v2_page_content", route.section()))
                 .auto_shrink([false, false])
@@ -534,9 +541,7 @@ impl App {
                         } => self.tape_inspector(ui, Some(game)),
                         Route::Task { section, .. } => self.handoff(ui, section),
                     }
-                    if show_guidance && let Some(guidance) = guidance {
-                        super::guidance::show(ui, &mut self.guidance, guidance);
-                    }
+                    // Contextual guidance stays above this potentially unbounded body.
                 });
         });
         if self.confirm_scan {
@@ -1655,8 +1660,8 @@ impl App {
                         ui.put(rect.shrink(7.0), egui::Image::new(&mascot).fit_to_exact_size(size - egui::vec2(14.0, 14.0)));
                     }
                 },
-                "Problems & Repair",
-                "Read-only diagnostic bench for the things EmuWiz can prove.",
+                "Review what needs attention",
+                "Check the evidence and choose a supported next step.",
                 Some((if summary.is_none() { "Checking saved evidence" } else if attention > 0 { "Needs attention" } else { "Ready for review" }, if summary.is_none() { StatusTone::Active } else if attention > 0 { StatusTone::Warning } else { StatusTone::Success })),
                 Some("Read-only first. Preview any supported repair before it changes a file."),
                 |ui| {
