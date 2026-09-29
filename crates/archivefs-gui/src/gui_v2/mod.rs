@@ -548,6 +548,9 @@ impl App {
         self.index_job = Some(id);
     }
     fn go(&mut self, route: Route) {
+        if route == Route::MameWorkflow {
+            self.organisation.view = organisation::OrganisationView::MameNormalizer;
+        }
         self.router.go(route);
         self.navigation_changed();
     }

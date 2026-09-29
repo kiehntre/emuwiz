@@ -53,6 +53,7 @@ pub(super) struct OrganisationState {
     pub(super) mame_publish_pending: bool,
     pub(super) mame_undo_pending: Option<String>,
     pub(super) mame_history: Vec<RenameTransaction>,
+    mame_history_loaded: bool,
 }
 
 impl Default for OrganisationState {
@@ -68,6 +69,7 @@ impl Default for OrganisationState {
             mame_publish_pending: false,
             mame_undo_pending: None,
             mame_history: Vec::new(),
+            mame_history_loaded: false,
         }
     }
 }
@@ -382,26 +384,56 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             plan.destination.display()
         ));
         ui.label(format!(
-            "{} required members · {} verified source members",
+            "{} required file(s); {} verified source member(s).",
             plan.required_members.len(),
             plan.sources.len()
         ));
+        if !plan.sources.is_empty() {
+            ui.strong("Verified source files");
+            for source in plan.sources.iter().take(8) {
+                ui.push_id((&source.archive_path, &source.member_path), |ui| {
+                    ui.label(format!("{} → {}", source.current_name, source.target_name));
+                });
+            }
+            if plan.sources.len() > 8 {
+                ui.label(format!(
+                    "and {} more source member(s)",
+                    plan.sources.len() - 8
+                ));
+            }
+        }
+        if !plan.missing_members.is_empty() {
+            ui.label(format!(
+                "{} required file(s) are missing.",
+                plan.missing_members.len()
+            ));
+        }
+        if !plan.collisions.is_empty() {
+            ui.label(format!(
+                "{} output collision(s) prevent reconstruction.",
+                plan.collisions.len()
+            ));
+        }
         for (label, values) in [
-            ("Missing", &plan.missing_members),
+            ("Missing file details", &plan.missing_members),
             ("Duplicate candidates", &plan.duplicate_candidates),
-            ("Bad hashes", &plan.hash_mismatches),
-            ("Unresolved ownership", &plan.unresolved_ownership),
-            ("Collisions", &plan.collisions),
+            ("Wrong hash evidence", &plan.hash_mismatches),
+            (
+                "Parent/clone evidence needs review",
+                &plan.unresolved_ownership,
+            ),
+            ("Output collision details", &plan.collisions),
         ] {
             if !values.is_empty() {
                 ui.label(format!("{label}: {}", values.join(", ")));
             }
         }
         ui.label(if plan.ready_to_apply {
-            "Ready to publish after explicit confirmation; source archives remain untouched and the transaction can be undone."
+            "Ready to publish after explicit confirmation; source archives remain untouched."
         } else {
             "Publish blocked: missing members, collisions, or insufficient ownership evidence must be resolved first."
         });
+        ui.label("Publishing creates a separate output; source archives remain untouched, and a completed transaction can be undone.");
         ui.label("Verification plan: re-check the published output against the reviewed member evidence after publication.");
         ui.collapsing("Advanced reconstruction evidence", |ui| {
             for reason in &plan.reasons {
@@ -585,6 +617,13 @@ fn load_mame_history() -> Vec<RenameTransaction> {
 }
 
 impl OrganisationState {
+    pub(super) fn ensure_mame_history_loaded(&mut self) {
+        if !self.mame_history_loaded {
+            self.mame_history = load_mame_history();
+            self.mame_history_loaded = true;
+        }
+    }
+
     pub(super) fn publish_mame(&mut self) {
         let (Some(plan), Some(root), Some(dat_path)) = (
             self.mame_plan.clone(),
@@ -972,14 +1011,24 @@ impl App {
                         ui.label("ROM member: a file inside that set. Parent and clone relationships explain which shared files are required.");
                         ui.label("A clone may use files stored in its parent set. Missing member, wrong hash, duplicate, and collision are separate outcomes.");
                         ui.label("BAD_DUMP is a known imperfect reference dump. NO_DUMP means no verified dump is known; neither is an ordinary rename repair.");
-                        ui.label("Packed ZIP member repair and CHD changes remain unsupported or preview-only where the backend says so.");
+                        ui.label("Packed ZIP member in-place repair is unsupported.");
+                        ui.label("CHD repair is preview-only.");
                     });
+                    self.organisation.ensure_mame_history_loaded();
+                    super::mame_collection_health::show(ui);
+                    if ui.button("Build a MAME Playing Library").clicked() {
+                        selected = Some(Some(PlayingLibraryDestination::Generic));
+                    }
                     show_mame_normalizer(ui, &mut self.organisation);
                 }
             });
 
         if back {
-            self.organisation.view = OrganisationView::Landing;
+            if self.router.current == Route::MameWorkflow {
+                self.go(Route::Section(Section::Mame));
+            } else {
+                self.organisation.view = OrganisationView::Landing;
+            }
         }
         if let Some(destination) = selected {
             match destination {
@@ -1004,6 +1053,7 @@ impl App {
             self.go(Route::Section(Section::History));
         }
         if open_mame_history {
+            self.organisation.ensure_mame_history_loaded();
             self.organisation.view = OrganisationView::MameNormalizer;
         }
         if let Some(action) = canonical_action {
@@ -1232,6 +1282,44 @@ mod tests {
         let blocked_text = rendered_mame_text(&mut blocked).join("\n");
         assert!(blocked_text.contains("Publish blocked"));
         assert!(!blocked_text.contains("Publish reconstructed merged output"));
+    }
+
+    #[test]
+    fn mame_reconstruction_preview_summarizes_target_sources_collisions_and_verification() {
+        let mut plan = mame_plan(false);
+        plan.parent = "pacman".into();
+        plan.destination = PathBuf::from("/output/pacman.zip");
+        plan.sources.push(
+            archivefs_core::dat::mame_merged_reconstruction::ReconstructionMemberSource {
+                archive_path: PathBuf::from("/roms/pacman.zip"),
+                member_path: PathBuf::from("/roms/pacman.zip/board.bin"),
+                current_name: "board.bin".into(),
+                target_name: "maincpu.bin".into(),
+                observed_sha1: Some("abc".into()),
+                observed_crc32: Some("1234".into()),
+            },
+        );
+        plan.collisions
+            .push("/output/pacman.zip already exists".into());
+        let mut state = OrganisationState {
+            mame_plan: Some(plan),
+            ..OrganisationState::default()
+        };
+        let text = rendered_mame_text(&mut state).join("\n");
+        for expected in [
+            "Target parent set: pacman",
+            "Verified source files",
+            "board.bin → maincpu.bin",
+            "/output/pacman.zip",
+            "output collision(s) prevent reconstruction",
+            "Verification plan:",
+            "transaction can be undone",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing reconstruction preview summary: {expected}"
+            );
+        }
     }
 
     #[test]

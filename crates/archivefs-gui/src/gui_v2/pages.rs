@@ -404,6 +404,7 @@ impl App {
                         Route::Home | Route::Section(Section::Home) => self.home(ui),
                         Route::BrowsePlay => self.browse_play(ui, None),
                         Route::BrowsePlayGame(id) => self.browse_play(ui, Some(id)),
+                        Route::MameWorkflow => self.organisation_page(ui),
                         Route::Section(Section::Games | Section::Launch) => self.games(ui),
                         Route::Section(Section::Saves) => self.saves_states(ui, None),
                         Route::Section(Section::Emulators) => self.emulator_setup(ui),
@@ -501,6 +502,7 @@ impl App {
         let page = match route {
             Route::Home => GuidancePage::Home,
             Route::BrowsePlay | Route::BrowsePlayGame(_) => GuidancePage::Games,
+            Route::MameWorkflow => GuidancePage::Organisation,
             Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
             Route::Section(Section::Sources) => GuidancePage::Sources,
             Route::Section(Section::Launch)
@@ -2412,7 +2414,6 @@ impl App {
         ui.separator();
         self.hackhash.show(ui);
         ui.separator();
-        super::mame_collection_health::show(ui);
     }
 
     fn dat_sources(&mut self, ui: &mut egui::Ui) {
