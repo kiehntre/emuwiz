@@ -730,6 +730,17 @@ fn map_patch_recovery_error(error: PatchOutputRecoveryError) -> StandalonePatchE
 }
 
 fn apply_ips(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError> {
+    if base.len() as u64 > MAX_APPLY_BYTES || patch.len() > MAX_PATCH_BYTES {
+        return Err(StandalonePatchError::TooLarge);
+    }
+    // Validate before copying the ROM or applying writes, including calls
+    // that did not arrive through the public inspection/plan workflow.
+    let (state, fields) = parse_ips(patch);
+    if state != PatchInspectionState::Valid {
+        return Err(StandalonePatchError::Malformed(
+            fields.error.unwrap_or_else(|| "invalid IPS patch".into()),
+        ));
+    }
     let mut out = base.to_vec();
     let mut p = 5;
     while p < patch.len() {
@@ -777,7 +788,9 @@ fn apply_ips(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
             if end as u64 > MAX_APPLY_BYTES {
                 return Err(StandalonePatchError::TooLarge);
             };
-            out.resize(end, 0);
+            if end > out.len() {
+                out.resize(end, 0);
+            }
             for x in &mut out[at..end] {
                 *x = value
             }
@@ -795,7 +808,9 @@ fn apply_ips(base: &[u8], patch: &[u8]) -> Result<Vec<u8>, StandalonePatchError>
             if end as u64 > MAX_APPLY_BYTES {
                 return Err(StandalonePatchError::TooLarge);
             };
-            out.resize(end, 0);
+            if end > out.len() {
+                out.resize(end, 0);
+            }
             out[at..end].copy_from_slice(&patch[p..p + size]);
             p += size;
             continue;
@@ -1289,6 +1304,12 @@ fn invalid(_format: StandalonePatchFormat, msg: &str) -> (PatchInspectionState, 
 }
 
 fn parse_ips(b: &[u8]) -> (PatchInspectionState, Fields) {
+    if b.len() < 8 || !b.starts_with(b"PATCH") {
+        return invalid(
+            StandalonePatchFormat::Ips,
+            "truncated or invalid IPS header",
+        );
+    }
     let mut f = Fields::default();
     let mut p = 5;
     let mut records = 0;
@@ -1299,10 +1320,14 @@ fn parse_ips(b: &[u8]) -> (PatchInspectionState, Fields) {
             if p < b.len() && b.len() - p != 3 {
                 return invalid(StandalonePatchFormat::Ips, "trailing bytes after IPS EOF");
             }
-            return (PatchInspectionState::Valid, {
-                f.target_size = Some(max);
-                f
-            });
+            // The largest hunk end is only a minimum required extent. IPS
+            // normally preserves the rest of the selected source; only the
+            // explicit EOF-size extension declares an exact output length.
+            if b.len() - p == 3 {
+                f.target_size =
+                    Some(((b[p] as u64) << 16) | ((b[p + 1] as u64) << 8) | b[p + 2] as u64);
+            }
+            return (PatchInspectionState::Valid, f);
         }
         if b.len() - p < 5 {
             return invalid(StandalonePatchFormat::Ips, "truncated IPS record");
@@ -1565,6 +1590,10 @@ fn crc32(b: &[u8]) -> u32 {
     }
     !crc
 }
+
+#[cfg(test)]
+#[path = "standalone_patch/ips_tests.rs"]
+mod ips_tests;
 
 #[cfg(test)]
 mod tests {
