@@ -202,7 +202,7 @@ pub struct UserCheatImportReport {
 }
 
 impl UserCheatImportReport {
-    fn new(root: &Path) -> Self {
+    pub(crate) fn new(root: &Path) -> Self {
         Self {
             read_only: true,
             writes_performed: false,
@@ -222,7 +222,11 @@ impl UserCheatImportReport {
         }
     }
 
-    fn diagnostic(&mut self, diagnostic: UserCheatDiagnostic, limits: &UserCheatImportLimits) {
+    pub(crate) fn diagnostic(
+        &mut self,
+        diagnostic: UserCheatDiagnostic,
+        limits: &UserCheatImportLimits,
+    ) {
         if self.diagnostics.len() < limits.max_warnings {
             self.diagnostics.push(diagnostic);
         } else {
@@ -485,72 +489,135 @@ pub fn scan_user_cheat_directory_with_limits(
     Ok(report)
 }
 
-fn collect_files(
+/// Shared bounded, sorted enumeration for the summary index and pack preview.
+/// Overflowing directories are rejected as a whole: choosing an arbitrary
+/// read_dir prefix would make a bounded scan depend on enumeration order.
+pub(crate) fn collect_files(
     directory: &Path,
     depth: usize,
     limits: &UserCheatImportLimits,
     report: &mut UserCheatImportReport,
     files: &mut Vec<PathBuf>,
 ) -> Result<(), UserCheatImportError> {
-    if depth > limits.max_depth {
-        report.truncated = true;
+    let mut visited = 0;
+    collect_files_inner(directory, depth, limits, report, files, &mut visited)
+}
+
+fn collect_files_inner(
+    directory: &Path,
+    depth: usize,
+    limits: &UserCheatImportLimits,
+    report: &mut UserCheatImportReport,
+    files: &mut Vec<PathBuf>,
+    visited: &mut usize,
+) -> Result<(), UserCheatImportError> {
+    let diagnostic = |report: &mut UserCheatImportReport, kind, path: PathBuf, message: String| {
         report.diagnostic(
             UserCheatDiagnostic {
-                kind: UserCheatDiagnosticKind::DepthLimitReached,
-                path: directory.to_path_buf(),
-                message: format!("directory depth exceeds {}", limits.max_depth),
+                kind,
+                path,
+                message,
             },
             limits,
         );
+    };
+    if depth > limits.max_depth {
+        report.truncated = true;
+        diagnostic(
+            report,
+            UserCheatDiagnosticKind::DepthLimitReached,
+            directory.into(),
+            format!("directory depth exceeds {}", limits.max_depth),
+        );
         return Ok(());
     }
-    let mut entries = fs::read_dir(directory)
+    #[cfg(target_os = "linux")]
+    let directory_handle =
+        open_source_no_follow(directory).map_err(|error| map_metadata_error(directory, error))?;
+    #[cfg(target_os = "linux")]
+    let enumeration_path = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", directory_handle.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let enumeration_path = directory.to_path_buf();
+    let mut entries = fs::read_dir(&enumeration_path)
         .map_err(|error| map_metadata_error(directory, error))?
+        .take(limits.max_files_visited.saturating_add(1))
         .collect::<Result<Vec<_>, io::Error>>()
-        .map_err(|error| UserCheatImportError::Io {
-            path: directory.to_path_buf(),
-            message: error.to_string(),
-        })?;
-    entries.sort_by_key(|left| path_sort_key(&left.path()));
+        .map_err(|error| map_metadata_error(directory, error))?;
+    if entries.len() > limits.max_files_visited {
+        report.truncated = true;
+        diagnostic(
+            report,
+            UserCheatDiagnosticKind::FileLimitReached,
+            directory.into(),
+            "directory enumeration exceeds the entry budget; entire directory skipped".into(),
+        );
+        return Ok(());
+    }
+    entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        let path = entry.path();
-        validate_path_length(&path)?;
-        let metadata = match fs::symlink_metadata(&path) {
+        if *visited >= limits.max_files_visited {
+            report.truncated = true;
+            diagnostic(
+                report,
+                UserCheatDiagnosticKind::FileLimitReached,
+                directory.into(),
+                "tree enumeration reached its entry budget".into(),
+            );
+            break;
+        }
+        *visited += 1;
+        let path = directory.join(entry.file_name());
+        if let Err(error) = validate_path_length(&path) {
+            diagnostic(
+                report,
+                UserCheatDiagnosticKind::PathTooLong,
+                path,
+                error.to_string(),
+            );
+            continue;
+        }
+        let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
-                report.diagnostic(
-                    UserCheatDiagnostic {
-                        kind: UserCheatDiagnosticKind::ReadError,
-                        path,
-                        message: error.to_string(),
-                    },
-                    limits,
+                diagnostic(
+                    report,
+                    UserCheatDiagnosticKind::ReadError,
+                    path,
+                    error.to_string(),
                 );
                 continue;
             }
         };
         if metadata.file_type().is_symlink() {
             report.skipped_symlinks += 1;
-            report.diagnostic(
-                UserCheatDiagnostic {
-                    kind: UserCheatDiagnosticKind::SymlinkSkipped,
-                    path,
-                    message: "symlink was not followed".to_string(),
-                },
-                limits,
+            diagnostic(
+                report,
+                UserCheatDiagnosticKind::SymlinkSkipped,
+                path,
+                "symlink was not followed".into(),
             );
         } else if metadata.is_dir() {
-            collect_files(&path, depth + 1, limits, report, files)?;
+            if let Err(error) =
+                collect_files_inner(&path, depth + 1, limits, report, files, visited)
+            {
+                diagnostic(
+                    report,
+                    diagnostic_kind_for_error(&error),
+                    path,
+                    error.to_string(),
+                );
+            }
         } else if metadata.is_file() {
             files.push(path);
         } else {
-            report.diagnostic(
-                UserCheatDiagnostic {
-                    kind: UserCheatDiagnosticKind::NotRegularFile,
-                    path,
-                    message: "entry is not a regular file".to_string(),
-                },
-                limits,
+            diagnostic(
+                report,
+                UserCheatDiagnosticKind::NotRegularFile,
+                path,
+                "entry is not a regular file".into(),
             );
         }
     }
@@ -1165,7 +1232,7 @@ fn apply_duplicate_groups(
     }
 }
 
-fn format_for_path(path: &Path) -> Option<UserCheatFormat> {
+pub(crate) fn format_for_path(path: &Path) -> Option<UserCheatFormat> {
     let file_name = path.file_name()?.to_str()?.to_ascii_lowercase();
     if file_name.ends_with(".patch.toml") && file_name.len() > ".patch.toml".len() {
         return Some(UserCheatFormat::XeniaPatchToml);
@@ -1179,7 +1246,7 @@ fn format_for_path(path: &Path) -> Option<UserCheatFormat> {
     }
 }
 
-fn infer_platform_hint(path: &Path) -> Option<String> {
+pub(crate) fn infer_platform_hint(path: &Path) -> Option<String> {
     path.ancestors()
         .skip(1)
         .filter_map(|ancestor| ancestor.file_name())
@@ -1188,14 +1255,84 @@ fn infer_platform_hint(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn read_bounded(path: &Path, length: u64, maximum: u64) -> Result<Vec<u8>, UserCheatImportError> {
+/// Open every component relative to an already open directory. A swapped
+/// parent symlink cannot redirect the read; nonblocking leaf open also avoids
+/// waiting on a regular file replaced with a FIFO.
+#[cfg(target_os = "linux")]
+fn open_source_no_follow(path: &Path) -> io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+    let absolute = if path.is_absolute() {
+        path.into()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")?;
+    let components: Vec<_> = absolute
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir | Component::CurDir))
+        .collect();
+    for (i, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "parent traversal is not accepted",
+            ));
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | if i + 1 == components.len() {
+                0
+            } else {
+                libc::O_DIRECTORY
+            };
+        // SAFETY: parent is a live owned fd, name is NUL terminated; openat
+        // returns a fresh owned fd or -1, checked before constructing File.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is the fresh successful openat result; File owns it once.
+        parent = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(parent)
+}
+
+pub(crate) fn read_bounded(
+    path: &Path,
+    length: u64,
+    maximum: u64,
+) -> Result<Vec<u8>, UserCheatImportError> {
+    let mut consumed = 0;
+    read_bounded_with_counter(path, length, maximum, &mut consumed)
+}
+
+/// Count partial reads even if decoding/growth/IO later refuses the file.
+pub(crate) fn read_bounded_with_counter(
+    path: &Path,
+    length: u64,
+    maximum: u64,
+    consumed: &mut u64,
+) -> Result<Vec<u8>, UserCheatImportError> {
     if length > maximum {
         return Err(UserCheatImportError::Io {
             path: path.to_path_buf(),
             message: format!("file exceeds {maximum} byte limit"),
         });
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    let file = open_source_no_follow(path).map_err(|error| map_metadata_error(path, error))?;
+    #[cfg(all(unix, not(target_os = "linux")))]
     let file = {
         use std::os::unix::fs::OpenOptionsExt;
         OpenOptions::new()
@@ -1206,13 +1343,20 @@ fn read_bounded(path: &Path, length: u64, maximum: u64) -> Result<Vec<u8>, UserC
     };
     #[cfg(not(unix))]
     let file = File::open(path).map_err(|error| map_metadata_error(path, error))?;
+    if !file
+        .metadata()
+        .map_err(|error| map_metadata_error(path, error))?
+        .is_file()
+    {
+        return Err(UserCheatImportError::SourceIsNotRegularFile(path.into()));
+    }
     let mut bytes = Vec::with_capacity(length as usize);
-    file.take(maximum.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| UserCheatImportError::Io {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
+    let result = file.take(maximum.saturating_add(1)).read_to_end(&mut bytes);
+    *consumed = consumed.saturating_add(bytes.len() as u64);
+    result.map_err(|error| UserCheatImportError::Io {
+        path: path.into(),
+        message: error.to_string(),
+    })?;
     if bytes.len() as u64 > maximum {
         return Err(UserCheatImportError::Io {
             path: path.to_path_buf(),
@@ -1222,7 +1366,7 @@ fn read_bounded(path: &Path, length: u64, maximum: u64) -> Result<Vec<u8>, UserC
     Ok(bytes)
 }
 
-fn validate_limits(limits: &UserCheatImportLimits) -> Result<(), UserCheatImportError> {
+pub(crate) fn validate_limits(limits: &UserCheatImportLimits) -> Result<(), UserCheatImportError> {
     if limits.max_file_bytes == 0
         || limits.max_total_bytes < limits.max_file_bytes
         || limits.max_files_visited == 0
@@ -1236,7 +1380,7 @@ fn validate_limits(limits: &UserCheatImportLimits) -> Result<(), UserCheatImport
     Ok(())
 }
 
-fn validate_path_length(path: &Path) -> Result<(), UserCheatImportError> {
+pub(crate) fn validate_path_length(path: &Path) -> Result<(), UserCheatImportError> {
     if path.as_os_str().len() > USER_CHEAT_MAX_PATH_BYTES {
         return Err(UserCheatImportError::PathTooLong(path.to_path_buf()));
     }
@@ -1269,7 +1413,7 @@ fn diagnostic_kind_for_error(error: &UserCheatImportError) -> UserCheatDiagnosti
     }
 }
 
-fn is_executable_or_script(path: &Path, metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_executable_or_script(path: &Path, metadata: &fs::Metadata) -> bool {
     if is_known_unsafe_extension(path) {
         return true;
     }
@@ -1309,7 +1453,7 @@ fn path_sort_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn normalize_title(value: &str) -> String {
+pub(crate) fn normalize_title(value: &str) -> String {
     value
         .chars()
         .filter(|character| character.is_alphanumeric())

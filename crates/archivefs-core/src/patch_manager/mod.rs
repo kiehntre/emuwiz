@@ -44,6 +44,7 @@ mod cheat_ir;
 mod cheat_journey;
 mod cheat_loadability;
 mod cheat_provenance;
+mod cheat_pack_preview;
 mod cheat_provider;
 pub use cheat_provenance::{
     CheatApplicabilityEvidence, CheatApplicabilityKind, CheatNormalizationStatus,
@@ -346,6 +347,13 @@ pub use cheat_loadability::{
     CheatLoadabilityIssue, CheatLoadabilityReport, CheatLoadabilityState, CheatRestartRequirement,
     EmulatorProcessObservation, assess_cheat_loadability, cheat_restart_requirement,
     observe_emulator_process, parse_config_bool, read_config_bool, verify_installed_cheat_file,
+};
+pub use cheat_pack_preview::{
+    CheatPackAction, CheatPackApplicability, CheatPackAssociation, CheatPackCatalogueGame,
+    CheatPackDiagnostic, CheatPackFile, CheatPackFileState, CheatPackGame, CheatPackGameMatch,
+    CheatPackIdentityRequirement, CheatPackLimits, CheatPackLogicalCheat, CheatPackMatchStrength,
+    CheatPackObservation, CheatPackPreview, CheatPackRelationship, CheatPackTotals,
+    plan_cheat_pack_preview, preview_cheat_pack,
 };
 pub use cheat_provider::{
     CheatProviderIdentity, CheatProviderLicence, CheatProviderLicenceStatus,

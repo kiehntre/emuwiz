@@ -897,7 +897,7 @@ pub fn supported_targets_for(document: &CheatDocument) -> Vec<TargetCapability> 
         .collect()
 }
 
-fn reconciliation_title(title: &str) -> String {
+pub(crate) fn reconciliation_title(title: &str) -> String {
     title
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -993,7 +993,7 @@ fn possible_raw_fingerprint(entry: &CheatReconciliationEntry) -> Option<String> 
     Some(hex_digest(hash.finalize()))
 }
 
-fn semantic_fingerprint(document: &CheatDocument) -> Option<String> {
+pub(crate) fn semantic_fingerprint(document: &CheatDocument) -> Option<String> {
     if !operation_semantics_known(document) {
         return None;
     }
