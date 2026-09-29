@@ -2724,6 +2724,7 @@ impl App {
                             ui.label(format!("Retained metadata alternatives: {}", resolved.conflicts.len()));
                         }
                         if let Some(diagnostic) = index.diagnostics.get(&game_id) { ui.label(diagnostic); }
+                        ui.label(format!("Cover diagnosis: {}", index.explain_cover(&game)));
                         ui.label(format!("Provider lookup: {} ms", index.elapsed_ms));
                         for warning in &index.warnings { ui.label(warning); }
                     }

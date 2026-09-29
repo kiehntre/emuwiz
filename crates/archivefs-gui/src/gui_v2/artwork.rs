@@ -19,6 +19,9 @@ use std::{
 pub(super) const LOCAL_WORKERS: usize = 2;
 pub(super) const REMOTE_WORKERS: usize = 1;
 const MAX_QUEUE: usize = 96;
+/// A failed picture (for example an unreachable provider) is asked for again
+/// after this long, instead of staying failed until the library is reloaded.
+const FAILURE_RETRY: Duration = Duration::from_secs(120);
 const MAX_TEXTURES: usize = 192;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -72,6 +75,8 @@ pub(super) struct Artwork {
     pub index: Option<Arc<MediaIndex>>,
     pub generation: u64,
     pub pictures: HashMap<Key, Picture>,
+    failed_at: HashMap<Key, Instant>,
+    failure_retry: Duration,
     pending: HashMap<Key, Arc<AtomicBool>>,
     wanted: HashSet<Key>,
     last_seen: HashMap<Key, u64>,
@@ -204,6 +209,8 @@ impl Artwork {
             generation: 0,
             cache,
             pictures: HashMap::new(),
+            failed_at: HashMap::new(),
+            failure_retry: FAILURE_RETRY,
             pending: HashMap::new(),
             wanted: HashSet::new(),
             last_seen: HashMap::new(),
@@ -290,6 +297,7 @@ impl Artwork {
                             }
                             Err(error) => {
                                 self.failures += 1;
+                                self.failed_at.insert(key, Instant::now());
                                 Picture::Failed(error)
                             }
                         };
@@ -315,6 +323,17 @@ impl Artwork {
         let key = self.key(game, kind);
         self.wanted.insert(key);
         self.last_seen.insert(key, self.frame);
+        // A failure is not permanent: once it is old enough, forget it so the
+        // picture is requested again.
+        if matches!(self.pictures.get(&key), Some(Picture::Failed(_)))
+            && self
+                .failed_at
+                .get(&key)
+                .is_some_and(|at| at.elapsed() >= self.failure_retry)
+        {
+            self.pictures.remove(&key);
+            self.failed_at.remove(&key);
+        }
         if self.paused || self.pictures.contains_key(&key) || self.pending.contains_key(&key) {
             return key;
         }
@@ -367,6 +386,7 @@ impl Artwork {
     pub fn retry(&mut self, key: Key) {
         if !self.pending.contains_key(&key) {
             self.pictures.remove(&key);
+            self.failed_at.remove(&key);
         }
         self.paused = false;
     }
@@ -549,5 +569,108 @@ mod tests {
         request.remote = true;
         assert!(resolve(&request, &transport).is_err()); // disabled provider, never a request
         assert_eq!(transport.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_failed_picture_is_requested_again_after_the_retry_delay_not_never() {
+        let context = egui::Context::default();
+        let mut artwork = Artwork::start(context);
+        let mut index = MediaIndex::default();
+        index.covers.insert(
+            1,
+            Source::Local(std::path::PathBuf::from("/definitely/not/here.png")),
+        );
+        artwork.index = Some(Arc::new(index));
+        artwork.paused = false;
+        let key = artwork.key(1, Kind::Cover);
+        artwork
+            .pictures
+            .insert(key, Picture::Failed("provider unreachable".into()));
+        artwork.failed_at.insert(key, Instant::now());
+        // Fresh failure: not re-requested yet.
+        artwork.request(1, Kind::Cover);
+        assert!(matches!(
+            artwork.pictures.get(&key),
+            Some(Picture::Failed(_))
+        ));
+        // Old failure: forgotten and queued again.
+        artwork.failed_at.insert(
+            key,
+            Instant::now() - artwork.failure_retry - Duration::from_secs(1),
+        );
+        artwork.request(1, Kind::Cover);
+        assert!(matches!(artwork.pictures.get(&key), Some(Picture::Loading)));
+        assert_eq!(artwork.active(), 1);
+    }
+
+    fn write_png(path: &std::path::Path) {
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]))
+            .save(path)
+            .unwrap();
+    }
+
+    fn wait_for(artwork: &mut Artwork, context: &egui::Context, key: Key) -> bool {
+        for _ in 0..400 {
+            artwork.begin_frame(context);
+            if matches!(artwork.pictures.get(&key), Some(Picture::Ready { .. })) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_resolved_local_cover_reaches_the_gui_as_a_ready_texture() {
+        let directory = tempfile::tempdir().unwrap();
+        let cover = directory.path().join("cover.png");
+        write_png(&cover);
+        let context = egui::Context::default();
+        let mut artwork =
+            Artwork::with_cache(context.clone(), Some(directory.path().join("cache")));
+        let mut index = MediaIndex::default();
+        index.covers.insert(7, Source::Local(cover));
+        artwork.index = Some(Arc::new(index));
+        let key = artwork.request(7, Kind::Cover);
+        assert!(matches!(artwork.pictures.get(&key), Some(Picture::Loading)));
+        assert!(
+            wait_for(&mut artwork, &context, key),
+            "cover never became ready"
+        );
+        // A game with no resolved source is Missing, not a wrong picture.
+        let other = artwork.request(8, Kind::Cover);
+        assert!(matches!(
+            artwork.pictures.get(&other),
+            Some(Picture::Missing)
+        ));
+    }
+
+    #[test]
+    fn a_historical_no_cover_recovers_when_a_refreshed_index_has_the_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let cover = directory.path().join("cover.png");
+        write_png(&cover);
+        let context = egui::Context::default();
+        let mut artwork =
+            Artwork::with_cache(context.clone(), Some(directory.path().join("cache")));
+        artwork.index = Some(Arc::new(MediaIndex::default()));
+        let first = artwork.request(3, Kind::Cover);
+        assert!(matches!(
+            artwork.pictures.get(&first),
+            Some(Picture::Missing)
+        ));
+        // What `reload` does when providers/assets become available: a new
+        // generation, dropped pictures, and the new index.
+        artwork.generation += 1;
+        artwork.pictures.clear();
+        let mut refreshed = MediaIndex::default();
+        refreshed.covers.insert(3, Source::Local(cover));
+        artwork.index = Some(Arc::new(refreshed));
+        let second = artwork.request(3, Kind::Cover);
+        assert_ne!(first.generation, second.generation);
+        assert!(
+            wait_for(&mut artwork, &context, second),
+            "recovered cover never became ready"
+        );
     }
 }

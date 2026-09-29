@@ -187,6 +187,56 @@ pub fn provider_path_key(platform: &str, path: &Path) -> String {
     format!("{platform}\0{}", normalize_provider_path(path).display())
 }
 
+const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
+
+/// ES-DE's own `ROMDirectory` setting (`settings/es_settings.xml`). ES-DE
+/// gamelist paths (`./file.zip`) are relative to `<ROMDirectory>/<system>/`, so
+/// this is the root that makes them comparable with catalogue paths. Bounded
+/// read; only a plain absolute path with no `..` component is accepted, and the
+/// directory is never listed or created. An empty or missing value is `None`.
+pub fn configured_rom_directory(es_de_root: &Path) -> Option<PathBuf> {
+    let path = es_de_root.join("settings").join("es_settings.xml");
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SETTINGS_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    fs::File::open(&path)
+        .ok()?
+        .take(MAX_SETTINGS_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    parse_rom_directory_setting(&text)
+}
+
+fn parse_rom_directory_setting(text: &str) -> Option<PathBuf> {
+    let start = text.find("name=\"ROMDirectory\"")?;
+    let rest = &text[start..];
+    let end = rest.find("/>").or_else(|| rest.find('>'))?;
+    let element = &rest[..end];
+    let value_at = element.find("value=\"")? + "value=\"".len();
+    let value = &element[value_at..];
+    let value = &value[..value.find('"')?];
+    let value = value
+        .replace("&amp;", "&")
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
+    let value = value.trim();
+    let candidate = Path::new(value);
+    if value.is_empty()
+        || value.contains('\0')
+        || !candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+    Some(candidate.to_path_buf())
+}
+
 /// Build the one lookup index and cache existence/readability of every
 /// referenced media item.  This intentionally performs no recursive scan.
 pub fn index_snapshot(snapshot: &EsDeProviderSnapshot, generation: u64) -> EsDeProviderIndex {
@@ -380,7 +430,7 @@ pub fn parse_and_index_gamelist_with_roots(
     media_root: &Path,
     canonical_rom_root: Option<&Path>,
 ) -> EsDeProviderIndex {
-    let snapshot = parse_gamelist_with_media_root(
+    let mut snapshot = parse_gamelist_with_media_root(
         gamelist_path,
         xml,
         system,
@@ -388,7 +438,76 @@ pub fn parse_and_index_gamelist_with_roots(
         Some(media_root),
         canonical_rom_root,
     );
+    apply_downloaded_media_convention(&mut snapshot, media_root, system);
     index_snapshot(&snapshot, generation)
+}
+
+const MEDIA_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+
+/// ES-DE stores scraped media as
+/// `downloaded_media/<system>/<type>/<ROM file stem>.<ext>` whether or not the
+/// gamelist mentions it (a gamelist without `<image>` tags still has covers on
+/// disk). For an entry that has no tag-derived cover/screenshot, look for that
+/// conventional file. The name comes from the entry's own ROM path, not from a
+/// title, so this is ES-DE's own file-to-media mapping, and only regular files
+/// that exist are used. Tag-derived references always win. Bounded: a few
+/// direct `stat` calls per entry, no directory listing.
+fn apply_downloaded_media_convention(
+    snapshot: &mut EsDeProviderSnapshot,
+    media_root: &Path,
+    system: &str,
+) {
+    if system.is_empty()
+        || Path::new(system)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return;
+    }
+    for entry in &mut snapshot.entries {
+        let Some(stem) = entry.path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if stem.is_empty() || stem.contains('/') || stem.contains('\\') {
+            continue;
+        }
+        let find = |categories: &[&str]| -> Option<PathBuf> {
+            for category in categories {
+                for extension in MEDIA_EXTENSIONS {
+                    let path = media_root
+                        .join(system)
+                        .join(category)
+                        .join(format!("{stem}.{extension}"));
+                    if fs::symlink_metadata(&path)
+                        .map(|metadata| metadata.is_file())
+                        .unwrap_or(false)
+                    {
+                        return Some(path);
+                    }
+                }
+            }
+            None
+        };
+        let mut applied = Vec::new();
+        if entry.media.cover.is_none()
+            && let Some(path) = find(&["covers", "miximages"])
+        {
+            entry.media.cover = Some(path);
+            applied.push("cover");
+        }
+        if entry.media.screenshot.is_none()
+            && let Some(path) = find(&["screenshots", "titlescreens"])
+        {
+            entry.media.screenshot = Some(path);
+            applied.push("screenshot");
+        }
+        if !applied.is_empty() {
+            entry.provenance.push_str(&format!(
+                "; {} from ES-DE downloaded_media naming convention",
+                applied.join("+")
+            ));
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1006,5 +1125,111 @@ mod tests {
         {
             assert!(path.starts_with(&media_root));
         }
+    }
+
+    #[test]
+    fn rom_directory_setting_is_read_from_es_settings_text() {
+        let xml = "<?xml version=\"1.0\"?>\n<string name=\"MediaDirectory\" value=\"\" />\n<string name=\"ROMDirectory\" value=\"/mnt/usb &amp; games\" />\n";
+        assert_eq!(
+            parse_rom_directory_setting(xml),
+            Some(PathBuf::from("/mnt/usb & games"))
+        );
+    }
+
+    #[test]
+    fn rom_directory_setting_refuses_empty_relative_and_parent_paths() {
+        for value in ["", "relative/dir", "/a/../b"] {
+            let xml = format!("<string name=\"ROMDirectory\" value=\"{value}\" />");
+            assert_eq!(parse_rom_directory_setting(&xml), None, "{value:?}");
+        }
+        assert_eq!(
+            parse_rom_directory_setting("<string name=\"Other\" value=\"/x\" />"),
+            None
+        );
+    }
+
+    #[test]
+    fn rom_directory_is_read_only_from_a_bounded_regular_file() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(configured_rom_directory(directory.path()), None);
+        fs::create_dir_all(directory.path().join("settings")).unwrap();
+        fs::write(
+            directory.path().join("settings/es_settings.xml"),
+            "<string name=\"ROMDirectory\" value=\"/roms\" />",
+        )
+        .unwrap();
+        assert_eq!(
+            configured_rom_directory(directory.path()),
+            Some(PathBuf::from("/roms"))
+        );
+    }
+
+    #[test]
+    fn conventional_media_is_found_for_entries_without_tags() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("downloaded_media");
+        fs::create_dir_all(media.join("apple2/covers")).unwrap();
+        fs::create_dir_all(media.join("apple2/screenshots")).unwrap();
+        fs::write(media.join("apple2/covers/Adventure (USA).png"), b"png").unwrap();
+        fs::write(media.join("apple2/screenshots/Adventure (USA).jpg"), b"jpg").unwrap();
+        let xml = b"<gameList><game><path>./Adventure (USA).dsk</path><name>Adventure</name></game><game><path>./Other (USA).dsk</path></game></gameList>";
+        let index = parse_and_index_gamelist_with_roots(
+            Path::new("/es/gamelists/apple2/gamelist.xml"),
+            xml,
+            "apple2",
+            1,
+            &media,
+            Some(Path::new("/roms")),
+        );
+        let found = index
+            .lookup_path("Apple II", Path::new("/roms/apple2/Adventure (USA).dsk"))
+            .expect("exact platform + path match");
+        assert_eq!(
+            found.entry.media.cover,
+            Some(media.join("apple2/covers/Adventure (USA).png"))
+        );
+        assert_eq!(found.media.cover.map(|m| m.exists), Some(true));
+        assert_eq!(
+            found.entry.media.screenshot,
+            Some(media.join("apple2/screenshots/Adventure (USA).jpg"))
+        );
+        assert!(found.entry.provenance.contains("naming convention"));
+        // No file on disk, no invented media; a similar title never matches.
+        let other = index
+            .lookup_path("Apple II", Path::new("/roms/apple2/Other (USA).dsk"))
+            .unwrap();
+        assert_eq!(other.entry.media.cover, None);
+        assert!(
+            index
+                .lookup_path("Apple II", Path::new("/roms/apple2/Adventure (Europe).dsk"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gamelist_tags_win_over_the_naming_convention() {
+        let directory = tempfile::tempdir().unwrap();
+        let media = directory.path().join("downloaded_media");
+        fs::create_dir_all(media.join("snes/covers")).unwrap();
+        fs::create_dir_all(media.join("snes/miximages")).unwrap();
+        fs::write(media.join("snes/covers/Game.png"), b"convention").unwrap();
+        fs::write(media.join("snes/miximages/Game.png"), b"tagged").unwrap();
+        let xml = b"<gameList><game><path>./Game.sfc</path><image>./images/Game-image.png</image></game></gameList>";
+        let index = parse_and_index_gamelist_with_roots(
+            Path::new("/es/gamelists/snes/gamelist.xml"),
+            xml,
+            "snes",
+            1,
+            &media,
+            Some(Path::new("/roms")),
+        );
+        let found = index
+            .lookup_path("SNES", Path::new("/roms/snes/Game.sfc"))
+            .unwrap();
+        assert_eq!(
+            found.entry.media.cover,
+            Some(media.join("snes/miximages/Game.png"))
+        );
+        assert!(!found.entry.provenance.contains("naming convention"));
     }
 }

@@ -91,6 +91,19 @@ pub fn run() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    if args.iter().any(|arg| arg == "--diagnose-artwork") {
+        match archivefs_core::default_database_path()
+            .map_err(|error| error.to_string())
+            .and_then(|path| backend::load_library(&path))
+        {
+            Ok(library) => {
+                let index = media_sources::MediaIndex::discover_with_stats(&library);
+                println!("{}", index.diagnostic_report(&library));
+            }
+            Err(error) => eprintln!("Artwork diagnosis failed: {error}"),
+        }
+        return Ok(());
+    }
     let handoff = args.iter().position(|arg| arg == "--legacy").map(|index| {
         let section = args
             .get(index + 1)
