@@ -641,6 +641,50 @@ fn overflowing_directory_is_rejected_deterministically_not_arbitrary_prefix() {
     assert!(p.diagnostics.iter().any(|d|matches!(d,CheatPackDiagnostic::Source(s) if s.kind==super::super::user_cheat_import::UserCheatDiagnosticKind::FileLimitReached)));
 }
 #[test]
+fn nested_enumeration_shares_budget_and_preserves_collected_root_neighbour() {
+    let r = tempdir().unwrap();
+    for i in 0..4 {
+        write(r.path(), &format!("a/{i}.cht"), &cht("A"));
+    }
+    write(r.path(), "b/hidden.cht", &cht("B"));
+    let root_bytes = cht("ROOT");
+    let root_file = write(r.path(), "z.cht", &root_bytes);
+    let mut limits = CheatPackLimits::default();
+    // Three root entries leave three entries for the entire descendant tree.
+    // The four-entry child is refused as a whole and exhausts that remainder.
+    limits.source.max_files_visited = 6;
+    let preview =
+        || preview_cheat_pack(r.path(), &[], &BTreeMap::new(), &BTreeSet::new(), &limits).unwrap();
+    let p = preview();
+    assert!(!p.complete);
+    assert_eq!(p.files.len(), 1);
+    assert_eq!(p.files[0].path, PathBuf::from("z.cht"));
+    assert_eq!(p.totals.observations, 1);
+    assert!(p.actions_reconcile());
+    let diagnostic_paths: Vec<_> = p
+        .diagnostics
+        .iter()
+        .filter_map(|d| {
+            match d {
+            CheatPackDiagnostic::Source(s)
+                if s.kind
+                    == super::super::user_cheat_import::UserCheatDiagnosticKind::FileLimitReached =>
+            {
+                Some(s.path.strip_prefix(r.path()).unwrap().to_path_buf())
+            }
+            _ => None,
+        }
+        })
+        .collect();
+    assert_eq!(
+        diagnostic_paths,
+        vec![PathBuf::from("a"), PathBuf::from("b")]
+    );
+    assert_eq!(p, preview());
+    assert_eq!(fs::read(root_file).unwrap(), root_bytes);
+    assert!(!p.can_apply());
+}
+#[test]
 fn file_line_code_and_observation_bounds_are_explicit() {
     let r = tempdir().unwrap();
     write(r.path(), "oversize.cht", &vec![b'A'; 9000]);

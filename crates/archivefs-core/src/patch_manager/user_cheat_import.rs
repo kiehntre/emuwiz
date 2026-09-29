@@ -531,6 +531,17 @@ fn collect_files_inner(
         );
         return Ok(());
     }
+    let remaining = limits.max_files_visited.saturating_sub(*visited);
+    if remaining == 0 {
+        report.truncated = true;
+        diagnostic(
+            report,
+            UserCheatDiagnosticKind::FileLimitReached,
+            directory.into(),
+            "tree enumeration reached its entry budget".into(),
+        );
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     let directory_handle =
         open_source_no_follow(directory).map_err(|error| map_metadata_error(directory, error))?;
@@ -541,34 +552,33 @@ fn collect_files_inner(
     };
     #[cfg(not(target_os = "linux"))]
     let enumeration_path = directory.to_path_buf();
-    let mut entries = fs::read_dir(&enumeration_path)
+    let collected: Vec<_> = fs::read_dir(&enumeration_path)
         .map_err(|error| map_metadata_error(directory, error))?
-        .take(limits.max_files_visited.saturating_add(1))
-        .collect::<Result<Vec<_>, io::Error>>()
-        .map_err(|error| map_metadata_error(directory, error))?;
-    if entries.len() > limits.max_files_visited {
+        .take(remaining.saturating_add(1))
+        .collect();
+    // Charge enumeration immediately, including entries in a directory that
+    // is later refused. Otherwise many overflowing children can each consume
+    // a fresh full-tree budget. Only one additional overflow probe is read.
+    *visited += collected.len().min(remaining);
+    if collected.len() > remaining {
         report.truncated = true;
         diagnostic(
             report,
             UserCheatDiagnosticKind::FileLimitReached,
             directory.into(),
-            "directory enumeration exceeds the entry budget; entire directory skipped".into(),
+            "directory enumeration exceeds the remaining tree entry budget; entire directory skipped".into(),
         );
         return Ok(());
     }
+    let mut entries = collected
+        .into_iter()
+        .collect::<Result<Vec<_>, io::Error>>()
+        .map_err(|error| map_metadata_error(directory, error))?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
-        if *visited >= limits.max_files_visited {
-            report.truncated = true;
-            diagnostic(
-                report,
-                UserCheatDiagnosticKind::FileLimitReached,
-                directory.into(),
-                "tree enumeration reached its entry budget".into(),
-            );
-            break;
-        }
-        *visited += 1;
+        // This entry was already charged above. Process collected neighbours
+        // even after a child exhausted the budget; further recursion refuses
+        // before opening a directory or allocating its entries.
         let path = directory.join(entry.file_name());
         if let Err(error) = validate_path_length(&path) {
             diagnostic(

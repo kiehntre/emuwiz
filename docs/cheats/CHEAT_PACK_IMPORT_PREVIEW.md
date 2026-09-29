@@ -194,6 +194,11 @@ retained totals are incomplete, not estimated full-pack counts.
 The shared importer walk now bounds directory collection itself and the whole
 tree, including empty directories. An overflowing directory is skipped as a
 whole: retaining the first arbitrary `read_dir` prefix would be nondeterministic.
+Collection charges the remaining tree budget immediately, including entries
+in a subtree later refused for overflow. At most one extra enumeration probe
+detects overflow; subsequent descendants are refused before opening them.
+Already collected parent entries still receive their individual outcomes, so
+an overflowing child does not hide an independent parent-level file.
 All retained files sort by native path; maps/sets have deterministic ordering.
 
 Symlink entries are skipped. On Linux directory enumeration is anchored to an
@@ -230,7 +235,7 @@ The large synthetic pack exercises 2,048 files without pairwise duplicate
 materialization. Source/ROM/save/config/database byte snapshots, unchanged
 input objects and no new filesystem output provide read-only evidence.
 
-## Focused validation results
+## Original focused validation results
 
 Commands were run with `--offline` in the feature worktree; no full workspace,
 full GUI, release or live GUI validation was run.
@@ -252,3 +257,59 @@ tests completed in 1.32 seconds after compilation. This measures the bounded
 fixture on this machine, not a general performance guarantee. The malformed
 fixture sweep, overflow cases, parent/leaf symlinks, unchanged filesystem
 snapshots and repeated-output assertions passed.
+
+## Continuation audit
+
+The continuation request described uncommitted work on base
+`a5e604e7456c183c9835ac6a3081a981b91a2c03`. The actual worktree was clean at
+`dfc4ea09c4ad45b28629473b5aee975f5c655ea5`, which had already committed all
+seven Batch 6 files above that base. That implementation was preserved. No
+branch recreation, reset, restore, clean, rebase, cherry-pick, merge, push or
+promotion was performed.
+
+The audit read the complete existing preview, source adapters, tests and
+documentation, and the tracked import/reconciliation/export changes. The
+existing 60 preview tests passed before further edits. The model, matching,
+grouping, stable identities, native parser adapters, mutation safety and
+prospective action accounting were already present; they were not replaced.
+
+One remaining bounds inconsistency was corrected in the shared importer
+walker: it had capped each directory independently and charged only processed
+entries. Repeated overflowing children could therefore enumerate more than
+the advertised tree budget, and a child could consume the budget before an
+already collected parent neighbour received its outcome. Collection now
+consumes one global remaining budget before processing, including refused
+subtrees, with one extra overflow probe and no further directory reads after
+exhaustion. A single regression test covers the missing nested-budget case,
+parent-neighbour isolation, deterministic repeated output, source bytes and
+reconcilable action totals. Existing tests were retained without duplication.
+
+The continuation changes only `user_cheat_import.rs`,
+`cheat_pack_preview/tests.rs`, and this document. The original seven-file
+Batch 6 implementation remains in its existing commit. Batches 1–5 remain
+separate and explicitly deferred to the final integration lane.
+
+## Continuation focused validation results
+
+All test commands used `cargo test --offline -p archivefs-core --lib` with
+the named filter. Only the focused modules below were run.
+
+| Filter or check | Result |
+|---|---:|
+| `cheat_pack_preview` | 61 passed |
+| `user_cheat_import` | 14 passed |
+| `cht_document` | 33 passed |
+| `cheat_ir` | 32 passed |
+| `cheat_reconciliation_plan` | 10 passed |
+| `cargo fmt --all -- --check` | passed |
+| `git diff --check` | passed |
+| Task scope / GUI root boundary | passed |
+
+The 150 focused tests passed with no failures. Preview tests completed in
+1.43 seconds after compilation; the 2,048-file fixture took 1.151 seconds on
+this run. The changed `archivefs-core` library and its test binary compiled
+successfully. A separate targeted `cargo check` was not needed or rerun in
+this continuation; the earlier check above belongs to the original commit.
+No full workspace/GUI suite, release build or live GUI smoke was run. The
+follow-up is a local commit on the existing branch; no push or promotion is
+part of this batch.
