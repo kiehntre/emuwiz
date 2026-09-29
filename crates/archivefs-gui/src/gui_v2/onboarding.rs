@@ -68,7 +68,6 @@ pub(super) fn show(
     imagery: &mut Imagery,
 ) -> Option<Action> {
     let Some(snapshot) = snapshot else {
-        ui.heading("Setup & Doctor");
         ui.label("Checking this computer. You can keep browsing while this finishes.");
         ui.spinner();
         return None;
@@ -83,8 +82,6 @@ pub(super) fn show(
         .id_salt("v2_setup_doctor")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.heading("Setup & Doctor");
-            ui.label("See what EmuWiz can use now, what needs attention, and the next safe step.");
 
             if snapshot.both_roots_conflict {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -179,37 +176,54 @@ pub(super) fn show(
                     action = Some(Action::Refresh);
                 }
             } else {
-                for emulator in &snapshot.lifecycle {
-                    ui.push_id(("emulator", &emulator.emulator_id), |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.strong(&emulator.emulator_id);
-                            status(ui, lifecycle_state_label(emulator.state), lifecycle_state_tone(emulator.state));
-                        });
-                        if emulator.installations.is_empty() {
-                            ui.label(lifecycle_empty_explanation(emulator.state));
-                            if matches!(
-                                emulator.state,
-                                archivefs_core::emulator_lifecycle::LifecycleState::Missing
-                                    | archivefs_core::emulator_lifecycle::LifecycleState::Broken
-                            ) && button(ui, "Open Emulator Setup")
-                            {
-                                action = Some(Action::Open(Section::Emulators));
-                            }
-                            ui.collapsing("Advanced details", |ui| {
-                                ui.label("Checked PATH, configured executable paths, known user AppImage locations and bounded Flatpak metadata.");
-                                ui.label("No executable or package binding was proven automatically for this emulator.");
-                            });
-                        } else {
-                            for installation in &emulator.installations {
-                                ui.push_id(
-                                    ("installation", format!("{:?}", installation.exact_binding)),
-                                    |ui| lifecycle_installation_card(ui, installation),
+                let (attention, others): (Vec<_>, Vec<_>) = snapshot
+                    .lifecycle
+                    .iter()
+                    .partition(|emulator| lifecycle_needs_attention(emulator));
+                let (missing, working): (Vec<_>, Vec<_>) = others.into_iter().partition(|emulator| {
+                    matches!(
+                        emulator.state,
+                        archivefs_core::emulator_lifecycle::LifecycleState::Missing
+                    )
+                });
+                if attention.is_empty() {
+                    ui.label("No emulator needs your attention right now.");
+                } else {
+                    ui.strong(format!("Needs your attention ({})", attention.len()));
+                    for emulator in &attention {
+                        lifecycle_emulator_card(ui, emulator, &mut action);
+                    }
+                }
+                if !missing.is_empty() {
+                    ui.add_space(4.0);
+                    ui.strong(format!("Not installed ({})", missing.len()));
+                    ui.label("These supported emulators were not found automatically. You only need the ones for systems you play.");
+                    for emulator in &missing {
+                        ui.push_id(("missing-emulator", &emulator.emulator_id), |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(&emulator.emulator_id);
+                                status(
+                                    ui,
+                                    lifecycle_state_label(emulator.state),
+                                    lifecycle_state_tone(emulator.state),
                                 );
-                            }
-                        }
+                            });
                         });
-                    });
+                    }
+                    if button(ui, "Open Emulator Setup") {
+                        action = Some(Action::Open(Section::Emulators));
+                    }
+                }
+                if !working.is_empty() {
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(format!("Working emulators ({})", working.len()))
+                        .id_salt("v2_setup_working_emulators")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for emulator in &working {
+                                lifecycle_emulator_card(ui, emulator, &mut action);
+                            }
+                        });
                 }
             }
 
@@ -275,6 +289,62 @@ pub(super) fn show(
     action
 }
 
+/// Only states that genuinely need the user, not merely incomplete evidence.
+fn lifecycle_needs_attention(
+    emulator: &archivefs_core::emulator_lifecycle::EmulatorLifecycleProjection,
+) -> bool {
+    use archivefs_core::emulator_lifecycle::LifecycleState::*;
+    emulator.stale_selected
+        || matches!(
+            emulator.state,
+            Broken | MultipleInstallations | InstalledUnsupportedVersion
+        )
+}
+
+fn lifecycle_emulator_card(
+    ui: &mut egui::Ui,
+    emulator: &archivefs_core::emulator_lifecycle::EmulatorLifecycleProjection,
+    action: &mut Option<Action>,
+) {
+    ui.push_id(("emulator", &emulator.emulator_id), |ui| {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&emulator.emulator_id);
+                status(
+                    ui,
+                    lifecycle_state_label(emulator.state),
+                    lifecycle_state_tone(emulator.state),
+                );
+            });
+            if emulator.stale_selected {
+                ui.label("Your selected installation can no longer be found.");
+            }
+            if emulator.installations.is_empty() {
+                ui.label(lifecycle_empty_explanation(emulator.state));
+                if matches!(
+                    emulator.state,
+                    archivefs_core::emulator_lifecycle::LifecycleState::Missing
+                        | archivefs_core::emulator_lifecycle::LifecycleState::Broken
+                ) && button(ui, "Open Emulator Setup")
+                {
+                    *action = Some(Action::Open(Section::Emulators));
+                }
+                ui.collapsing("Advanced details", |ui| {
+                    ui.label("Checked PATH, configured executable paths, known user AppImage locations and bounded Flatpak metadata.");
+                    ui.label("No executable or package binding was proven automatically for this emulator.");
+                });
+            } else {
+                for installation in &emulator.installations {
+                    ui.push_id(
+                        ("installation", format!("{:?}", installation.exact_binding)),
+                        |ui| lifecycle_installation_card(ui, installation),
+                    );
+                }
+            }
+        });
+    });
+}
+
 fn lifecycle_empty_explanation(
     state: archivefs_core::emulator_lifecycle::LifecycleState,
 ) -> &'static str {
@@ -327,26 +397,27 @@ fn lifecycle_installation_card(
     ui: &mut egui::Ui,
     installation: &archivefs_core::emulator_lifecycle::EmulatorLifecycleInstallation,
 ) {
-    use archivefs_core::emulator_lifecycle::ExactBinding;
+    use archivefs_core::emulator_inventory::InstallationType;
+    use archivefs_core::emulator_lifecycle::{ExactBinding, UpdateAuthority};
     ui.group(|ui| {
-        let selected = if installation.selected {
-            " · Currently selected"
-        } else {
-            ""
-        };
-        ui.label(format!(
-            "{}{}",
-            installation_type_label(installation.installation_type),
-            selected
+        // Lead with what is known. "Unknown" values are not repeated here;
+        // they are listed once under Advanced details.
+        let mut summary = Vec::new();
+        if installation.installation_type != InstallationType::Unknown {
+            summary.push(installation_type_label(installation.installation_type).to_string());
+        }
+        summary.push(format!(
+            "Version {}",
+            installation
+                .version
+                .version
+                .as_deref()
+                .unwrap_or("not detected")
         ));
-        ui.label(format!(
-            "Version: {}",
-            installation.version.version.as_deref().unwrap_or("unknown")
-        ));
-        ui.label(format!(
-            "Updates: {}",
-            update_authority_label(installation.update_authority)
-        ));
+        if installation.selected {
+            summary.push("Currently selected".into());
+        }
+        ui.label(summary.join(" · "));
         ui.label(format!(
             "Health: {}",
             local_health_label(installation.local_health)
@@ -354,14 +425,28 @@ fn lifecycle_installation_card(
         if let Some(readiness) = installation.launch_readiness {
             ui.label(format!("Launch: {}", launch_readiness_label(readiness)));
         }
-        ui.label(format!(
-            "Update status: {}",
-            installation
-                .update_status
-                .map(update_status_label)
-                .unwrap_or("Latest version unknown")
-        ));
+        if installation.update_authority != UpdateAuthority::Unknown
+            && let Some(status) = installation.update_status
+        {
+            ui.label(format!(
+                "Updates: {} · {}",
+                update_authority_label(installation.update_authority),
+                update_status_label(status)
+            ));
+        }
         ui.collapsing("Advanced details", |ui| {
+            ui.label(installation_type_label(installation.installation_type));
+            ui.label(format!(
+                "Updates: {}",
+                update_authority_label(installation.update_authority)
+            ));
+            ui.label(format!(
+                "Update status: {}",
+                installation
+                    .update_status
+                    .map(update_status_label)
+                    .unwrap_or("Latest version unknown")
+            ));
             match &installation.exact_binding {
                 ExactBinding::FlatpakApp { app_id } => {
                     ui.label(format!("Flatpak app ID: {app_id}"))

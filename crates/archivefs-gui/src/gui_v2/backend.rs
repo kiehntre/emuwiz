@@ -278,7 +278,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                             id,
                             done: progress.records_fetched as u64,
                             total: progress.reported_total.unwrap_or(0),
-                            item: format!("Fetched {} RomM record(s)", progress.records_fetched),
+                            item: format!("Fetched {} RomM game(s)", progress.records_fetched),
                         });
                     }
                     crate::romm_source::RommProgressEvent::Note(note) => {

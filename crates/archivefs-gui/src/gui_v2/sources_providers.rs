@@ -143,7 +143,6 @@ pub(super) fn romm_purpose() -> &'static str {
 }
 
 pub(super) fn show(ui: &mut egui::Ui, cards: &[ProviderCard]) -> Option<HubAction> {
-    ui.heading("Sources & Providers");
     ui.label("Review what EmuWiz can use, what it contributes, and where to configure it.");
     ui.label("Missing optional artwork does not stop browsing. Game identity verification needs a usable DAT source.");
     ui.label("EmuWiz's local and project evidence remains authoritative; online provider metadata stays a candidate until you accept it.");

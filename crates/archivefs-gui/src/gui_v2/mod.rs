@@ -233,6 +233,9 @@ pub(super) struct App {
     interacted: bool,
     loaded: bool,
     notice: Option<Notice>,
+    /// Non-alarming confirmation that a separate window was opened; cleared on
+    /// navigation or dismissal.
+    handoff_status: Option<String>,
     confirm_scan: bool,
     screenshots: bool,
     check_platform: Option<String>,
@@ -309,6 +312,7 @@ impl App {
             interacted: false,
             loaded: false,
             notice: None,
+            handoff_status: None,
             confirm_scan: false,
             screenshots: false,
             check_platform: None,
@@ -576,6 +580,7 @@ impl App {
             self.organisation.view = organisation::OrganisationView::MameNormalizer;
         }
         self.router.go(route);
+        self.handoff_status = None;
         self.navigation_changed();
     }
 
@@ -777,11 +782,19 @@ impl App {
             .game()
             .and_then(|id| self.library.game(id))
             .map(|game| game.archive.absolute_path.clone());
-        if let Err(error) = legacy::open(section, path.as_deref()) {
-            self.notice = Some(Notice {
-                message: "The existing workflow could not be opened.".into(),
-                technical: error,
-            });
+        match legacy::open(section, path.as_deref()) {
+            Ok(()) => {
+                self.handoff_status = Some(
+                    "Opened in a separate window. If you cannot see it, look behind this window; GUI v2 is still open."
+                        .into(),
+                );
+            }
+            Err(error) => {
+                self.notice = Some(Notice {
+                    message: "The existing workflow could not be opened.".into(),
+                    technical: error,
+                });
+            }
         }
     }
 

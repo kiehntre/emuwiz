@@ -243,6 +243,9 @@ pub(crate) struct OpticalConversionPageState {
     hero_texture: Option<egui::TextureHandle>,
     hero_load_attempted: bool,
     hero_preview_scroll: bool,
+    /// One-line outcome of the last hero action, shown directly under the hero
+    /// so a click always has a visible result.
+    hero_hint: Option<String>,
     psp_shrink: PspShrinkPageState,
     zip_converter: ZipConverterPageState,
     conversion_queue: ConversionQueue,
@@ -353,6 +356,7 @@ impl Default for OpticalConversionPageState {
             hero_texture: None,
             hero_load_attempted: false,
             hero_preview_scroll: false,
+            hero_hint: None,
             psp_shrink: PspShrinkPageState::default(),
             zip_converter: ZipConverterPageState::default(),
             conversion_queue: ConversionQueue::default(),
@@ -708,6 +712,22 @@ fn show_intro_card(ui: &mut egui::Ui, state: &mut OpticalConversionPageState) {
     });
 }
 
+/// Outcome line for the scan-type hero actions, from state the scan already set.
+fn hero_scan_hint(state: &OpticalConversionPageState, empty: &str) -> String {
+    if state.source_root_draft.trim().is_empty() {
+        return empty.into();
+    }
+    if state.error.is_some() {
+        return "That folder could not be scanned. Choose an existing folder.".into();
+    }
+    let found = state.candidates.len();
+    if found == 0 {
+        "No CUE/BIN disc sets were found in that folder.".into()
+    } else {
+        format!("Found {found} CUE/BIN disc set(s). Pick one below to review it.")
+    }
+}
+
 fn choose_source_folder(state: &mut OpticalConversionPageState) {
     if let Some(path) = rfd::FileDialog::new().pick_folder() {
         state.source_root_draft = path.display().to_string();
@@ -835,6 +855,28 @@ fn disc_conversion_hero_size(width: f32) -> egui::Vec2 {
     egui::vec2(image_width, disc_conversion_hero_height(image_width))
 }
 
+/// Where the three buttons are painted inside the hero PNG, as fractions of
+/// the image. The invisible click zones must sit exactly on them: zones that
+/// are offset make a painted button do nothing, or trigger its neighbour. A
+/// test re-measures the asset so these cannot drift from it.
+const HERO_BUTTON_X: [(f32, f32); 3] = [(0.181, 0.364), (0.370, 0.554), (0.560, 0.736)];
+const HERO_BUTTON_Y: (f32, f32) = (0.682, 0.865);
+
+fn hero_action_zone(image: egui::Rect, index: usize) -> egui::Rect {
+    let (left, right) = HERO_BUTTON_X[index];
+    let (top, bottom) = HERO_BUTTON_Y;
+    egui::Rect::from_min_max(
+        egui::pos2(
+            image.left() + image.width() * left,
+            image.top() + image.height() * top,
+        ),
+        egui::pos2(
+            image.left() + image.width() * right,
+            image.top() + image.height() * bottom,
+        ),
+    )
+}
+
 fn show_disc_conversion_hero(ui: &mut egui::Ui, state: &mut OpticalConversionPageState) -> bool {
     if !state.hero_load_attempted {
         state.hero_load_attempted = true;
@@ -866,36 +908,43 @@ fn show_disc_conversion_hero(ui: &mut egui::Ui, state: &mut OpticalConversionPag
         egui::Color32::WHITE,
     );
 
-    let panel_top = rect.top() + image_size.y * 0.648;
-    let panel_height = image_size.y * 0.177;
-    let panel = |left: f32, right: f32| {
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left() + image_size.x * left, panel_top),
-            egui::pos2(rect.left() + image_size.x * right, panel_top + panel_height),
-        )
-    };
+    let panel = |index: usize| hero_action_zone(rect, index);
     let transparent = || {
         egui::Button::new("")
             .fill(egui::Color32::TRANSPARENT)
             .stroke(egui::Stroke::NONE)
     };
     if ui
-        .put(panel(0.025, 0.219), transparent())
+        .put(panel(0), transparent())
         .on_hover_text("Choose the folder containing your disc images")
         .clicked()
     {
         choose_source_folder(state);
+        state.hero_hint = Some(hero_scan_hint(state, "No folder was chosen."));
     }
     if ui
-        .put(panel(0.226, 0.435), transparent())
+        .put(panel(1), transparent())
         .on_hover_text("Find supported CUE/BIN disc sets")
         .clicked()
     {
         state.scan();
+        state.hero_hint = Some(hero_scan_hint(state, "Choose a source folder first."));
+    }
+    let can_prepare = state.selected.is_some() || state.selected_context.is_some();
+    if !can_prepare
+        && ui
+            .put(panel(2), transparent())
+            .on_hover_text("Choose a disc set below first")
+            .clicked()
+    {
+        state.hero_hint = Some(
+            "Find your disc sets first, then pick one from the list below to prepare its preview."
+                .into(),
+        );
     }
     if (state.selected.is_some() || state.selected_context.is_some())
         && ui
-            .put(panel(0.442, 0.642), transparent())
+            .put(panel(2), transparent())
             .on_hover_text("Prepare the selected CUE/BIN to CHD preview")
             .clicked()
     {
@@ -905,6 +954,7 @@ fn show_disc_conversion_hero(ui: &mut egui::Ui, state: &mut OpticalConversionPag
             state.previewed = true;
         }
         state.hero_preview_scroll = true;
+        state.hero_hint = Some("Preview prepared below. Nothing has been converted.".into());
     }
     true
 }
@@ -925,6 +975,11 @@ pub(crate) fn show_optical_conversion_page(
     }
     // Keep the route's text identity available to accessibility/search
     // output even when the approved hero asset supplies the visual title.
+    if let Some(hint) = &state.hero_hint {
+        widgets::card(ui, |ui| {
+            ui.label(hint);
+        });
+    }
     ui.label(egui::RichText::new("Disc Conversion · CUE/BIN → CHD").heading());
     egui::CollapsingHeader::new("Conversion plan list · preview only")
         .id_salt("conversion-plan-list")
@@ -2551,5 +2606,135 @@ mod tests {
         );
         assert_eq!(std::fs::read(&source).unwrap(), before);
         assert_eq!(std::fs::read(&output).unwrap(), b"keep this output");
+    }
+
+    #[test]
+    fn hero_actions_always_report_a_visible_outcome() {
+        let mut state = OpticalConversionPageState::default();
+        assert_eq!(
+            hero_scan_hint(&state, "Choose a source folder first."),
+            "Choose a source folder first."
+        );
+        state.source_root_draft = "/does/not/exist".into();
+        state.scan();
+        assert!(hero_scan_hint(&state, "x").contains("could not be scanned"));
+        let directory = tempfile::tempdir().unwrap();
+        state.source_root_draft = directory.path().display().to_string();
+        state.scan();
+        assert!(hero_scan_hint(&state, "x").contains("No CUE/BIN disc sets"));
+        source(directory.path());
+        state.scan();
+        assert!(hero_scan_hint(&state, "x").contains("Found 1 CUE/BIN disc set"));
+    }
+
+    #[test]
+    fn hero_hint_is_rendered_under_the_hero_and_scan_does_not_mutate_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let cue = source(directory.path());
+        let before = std::fs::read(&cue).unwrap();
+        let mut state = OpticalConversionPageState {
+            hero_hint: Some("Find your disc sets first, then pick one.".into()),
+            ..Default::default()
+        };
+        let context = egui::Context::default();
+        let output = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                show_optical_conversion_page(ui, &mut state);
+            });
+        });
+        let mut texts = Vec::new();
+        fn gather(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| gather(shape, out)),
+                _ => {}
+            }
+        }
+        for shape in &output.shapes {
+            gather(&shape.shape, &mut texts);
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|value| value.contains("Find your disc sets first"))
+        );
+        assert_eq!(std::fs::read(&cue).unwrap(), before);
+    }
+
+    /// Painted-button borders measured from the PNG: cyan, thin, high blue.
+    fn measured_hero_borders() -> (Vec<f32>, Vec<f32>) {
+        let decoded = image::load_from_memory(DISC_CONVERSION_HERO_PNG)
+            .unwrap()
+            .to_rgb8();
+        let (width, height) = decoded.dimensions();
+        let (y0, y1) = ((height as f32 * 0.60) as u32, (height as f32 * 0.90) as u32);
+        let border = |x: u32, y: u32| {
+            let pixel = decoded.get_pixel(x, y).0;
+            pixel[2] > 150 && pixel[0] < 110 && pixel[1] > 100
+        };
+        let groups = |counts: Vec<u32>, threshold: u32| {
+            let mut found: Vec<(usize, usize)> = Vec::new();
+            for (index, count) in counts.iter().enumerate() {
+                if *count > threshold {
+                    match found.last_mut() {
+                        Some(last) if index - last.1 <= 3 => last.1 = index,
+                        _ => found.push((index, index)),
+                    }
+                }
+            }
+            found
+        };
+        let columns: Vec<u32> = (0..width)
+            .map(|x| (y0..y1).filter(|&y| border(x, y)).count() as u32)
+            .collect();
+        let rows: Vec<u32> = (y0..y1)
+            .map(|y| (0..width).filter(|&x| border(x, y)).count() as u32)
+            .collect();
+        (
+            groups(columns, 60)
+                .into_iter()
+                .map(|(start, _)| start as f32 / width as f32)
+                .collect(),
+            groups(rows, 300)
+                .into_iter()
+                .map(|(start, _)| (start as u32 + y0) as f32 / height as f32)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn hero_click_zones_sit_on_the_painted_buttons() {
+        let (columns, rows) = measured_hero_borders();
+        let near =
+            |wanted: f32, found: &[f32]| found.iter().any(|value| (value - wanted).abs() < 0.008);
+        for (left, right) in HERO_BUTTON_X {
+            assert!(
+                near(left, &columns),
+                "left {left} not on a painted border {columns:?}"
+            );
+            assert!(
+                near(right, &columns),
+                "right {right} not on a painted border {columns:?}"
+            );
+        }
+        assert!(near(HERO_BUTTON_Y.0, &rows), "top {rows:?}");
+        assert!(near(HERO_BUTTON_Y.1, &rows), "bottom {rows:?}");
+    }
+
+    #[test]
+    fn each_painted_button_centre_hits_only_its_own_zone() {
+        let image = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(1150.0, 493.0));
+        for index in 0..3 {
+            let zone = hero_action_zone(image, index);
+            assert!(zone.width() > 100.0 && zone.height() > 50.0);
+            for other in 0..3 {
+                let hit = hero_action_zone(image, other).contains(zone.center());
+                assert_eq!(hit, other == index, "button {index} centre vs zone {other}");
+            }
+            // The whole painted button is clickable, and zones never overlap.
+            for other in (0..3).filter(|other| *other != index) {
+                assert!(!zone.intersects(hero_action_zone(image, other)));
+            }
+        }
     }
 }

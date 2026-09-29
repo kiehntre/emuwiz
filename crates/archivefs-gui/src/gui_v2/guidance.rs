@@ -43,6 +43,9 @@ pub(super) enum MascotState {
     Welcome,
     Explorer,
     Launch,
+    /// Part of the art-direction set. Ordinary Problems guidance deliberately
+    /// uses the neutral `Explain`/`Thinking`/`Success` states instead.
+    #[allow(dead_code)]
     Repair,
     Organise,
     Tinker,
@@ -68,6 +71,16 @@ pub(super) enum GuidancePage {
     DatManagement,
     BiosFirmware,
     EmulatorSetup,
+    Setup,
+    CheckGames,
+    Activity,
+    History,
+    Saves,
+    Converter,
+    Artwork,
+    Romm,
+    Advanced,
+    Settings,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -81,6 +94,10 @@ pub(super) struct GuidanceEvidence {
     pub(super) tape_blocks: Option<usize>,
     pub(super) dat_name: Option<String>,
     pub(super) operation_succeeded: Option<bool>,
+    /// Current findings in the Problems inbox: `None` while still checking.
+    pub(super) problems_actionable: Option<usize>,
+    pub(super) problems_needing_attention: Option<usize>,
+    pub(super) jobs_running: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,20 +224,42 @@ fn applicable_tips(context: &GuidanceContext) -> Vec<GuidanceTip> {
             }
         }
         GuidancePage::ProblemsRepair => {
+            // Ordinary problem guidance is neutral and helpful: it says what
+            // is happening and what to do next. It is not an alarm.
             if let Some(blocker) = &e.blocker {
                 tips.push(tip(
                     "problem-blocker",
                     GuidanceCategory::WhyBlocked,
-                    MascotState::Repair,
+                    MascotState::Explain,
                     blocker.clone(),
                 ));
             } else {
-                tips.push(tip(
-                    "problem-review",
-                    GuidanceCategory::Tip,
-                    MascotState::Repair,
-                    "Review the evidence and preview a repair before confirming it.",
-                ));
+                match (e.problems_actionable, e.problems_needing_attention) {
+                    (None, _) => tips.push(tip(
+                        "problem-checking",
+                        GuidanceCategory::Explain,
+                        MascotState::Thinking,
+                        "EmuWiz is checking what it already knows about your games. You can keep browsing.",
+                    )),
+                    (Some(0), _) => tips.push(tip(
+                        "problem-none",
+                        GuidanceCategory::Success,
+                        MascotState::Success,
+                        "Nothing needs your attention right now. Nothing was changed while checking.",
+                    )),
+                    (Some(count), attention) => tips.push(tip(
+                        "problem-review",
+                        GuidanceCategory::Explain,
+                        MascotState::Explain,
+                        format!(
+                            "{count} finding(s) to look at{}. Open one to see what happened and what EmuWiz can safely do. Nothing changes until you confirm a preview.",
+                            match attention {
+                                Some(attention) if attention > 0 => format!(", {attention} needing attention first"),
+                                _ => String::new(),
+                            }
+                        ),
+                    )),
+                }
             }
         }
         GuidancePage::Organisation => {
@@ -294,6 +333,74 @@ fn applicable_tips(context: &GuidanceContext) -> Vec<GuidanceTip> {
             GuidanceCategory::Explain,
             MascotState::Explain,
             "Emulator Setup reports detected installations and readiness; it does not prove that every game can launch.",
+        )),
+        GuidancePage::Setup => tips.push(tip(
+            "setup-fix-first",
+            GuidanceCategory::Explain,
+            MascotState::Explain,
+            "Fix the items marked as needing attention first; everything else here is for information.",
+        )),
+        GuidancePage::CheckGames => tips.push(tip(
+            "check-platform",
+            GuidanceCategory::Explain,
+            MascotState::Explain,
+            "Choose a platform to see which of its games are verified, unknown or need attention. Checking never renames anything.",
+        )),
+        GuidancePage::Activity => match e.jobs_running {
+            Some(0) | None => tips.push(tip(
+                "activity-idle",
+                GuidanceCategory::Explain,
+                MascotState::Explain,
+                "Nothing is running. Finished work stays listed here with its result.",
+            )),
+            Some(count) => tips.push(tip(
+                "activity-busy",
+                GuidanceCategory::Explain,
+                MascotState::Thinking,
+                format!("{count} task(s) active. You can keep browsing; work continues in the background."),
+            )),
+        },
+        GuidancePage::History => tips.push(tip(
+            "history-undo",
+            GuidanceCategory::Explain,
+            MascotState::Explain,
+            "History lists changes EmuWiz made. Select an entry to see whether it can be undone.",
+        )),
+        GuidancePage::Saves => tips.push(tip(
+            "saves-kinds",
+            GuidanceCategory::Explain,
+            MascotState::Archive,
+            "Save data, save states and memory cards are kept separate. A restore always shows a preview first.",
+        )),
+        GuidancePage::Converter => tips.push(tip(
+            "converter-preview",
+            GuidanceCategory::Explain,
+            MascotState::Organise,
+            "Pick a disc set, review the preview, then convert. Your original files are kept unless you choose otherwise.",
+        )),
+        GuidancePage::Artwork => tips.push(tip(
+            "artwork-game",
+            GuidanceCategory::Explain,
+            MascotState::Explain,
+            "Artwork and manuals are shown for the selected game. Provider setup lives in Sources & Providers.",
+        )),
+        GuidancePage::Romm => tips.push(tip(
+            "romm-readonly",
+            GuidanceCategory::Explain,
+            MascotState::Explain,
+            "RomM is browsed read-only here. Its information never replaces what EmuWiz has verified locally.",
+        )),
+        GuidancePage::Advanced => tips.push(tip(
+            "advanced-inspect",
+            GuidanceCategory::Explain,
+            MascotState::Explain,
+            "These tools inspect things without changing them. Everyday tasks have their own pages.",
+        )),
+        GuidancePage::Settings => tips.push(tip(
+            "settings-hints",
+            GuidanceCategory::Explain,
+            MascotState::Explain,
+            "You can turn these hints off below; no control or page is ever hidden by them.",
         )),
         GuidancePage::Games => tips.push(tip(
             "games-browse",
@@ -398,5 +505,94 @@ mod tests {
             MascotState::Thinking,
         ];
         assert_eq!(states.len(), 11);
+    }
+
+    fn problems(actionable: Option<usize>, attention: Option<usize>) -> GuidanceTip {
+        let mut context = GuidanceContext::new(GuidancePage::ProblemsRepair);
+        context.evidence.problems_actionable = actionable;
+        context.evidence.problems_needing_attention = attention;
+        GuidanceState::default().select(&context)
+    }
+
+    #[test]
+    fn problems_guidance_is_neutral_helpful_and_evidence_driven() {
+        let checking = problems(None, None);
+        assert_eq!(checking.mascot, MascotState::Thinking);
+        assert!(checking.message.contains("checking"));
+        let clear = problems(Some(0), Some(0));
+        assert_eq!(clear.category, GuidanceCategory::Success);
+        assert_eq!(clear.mascot, MascotState::Success);
+        let busy = problems(Some(3), Some(2));
+        assert_eq!(busy.category, GuidanceCategory::Explain);
+        assert_eq!(busy.mascot, MascotState::Explain);
+        assert!(busy.message.contains("3 finding(s)"));
+        assert!(busy.message.contains("2 needing attention"));
+        assert!(busy.message.contains("Nothing changes until you confirm"));
+        // Ordinary findings never use the alarm tone or the warning mascot.
+        for tip in [&checking, &clear, &busy] {
+            assert_ne!(tip.category, GuidanceCategory::Warning);
+            assert_ne!(tip.mascot, MascotState::Warning);
+        }
+    }
+
+    #[test]
+    fn an_explicit_blocker_explains_why_without_the_warning_mascot() {
+        let mut context = GuidanceContext::new(GuidancePage::ProblemsRepair);
+        context.evidence.blocker = Some("Repair is blocked because the archive changed.".into());
+        let tip = GuidanceState::default().select(&context);
+        assert_eq!(tip.category, GuidanceCategory::WhyBlocked);
+        assert_ne!(tip.mascot, MascotState::Warning);
+    }
+
+    #[test]
+    fn every_page_answers_what_why_or_what_next_and_none_repeat_browse_first() {
+        let pages = [
+            GuidancePage::Sources,
+            GuidancePage::Games,
+            GuidancePage::Launch,
+            GuidancePage::ProblemsRepair,
+            GuidancePage::Organisation,
+            GuidancePage::CheatsMods,
+            GuidancePage::Museum,
+            GuidancePage::TapeInspector,
+            GuidancePage::ArchiveInspector,
+            GuidancePage::DatManagement,
+            GuidancePage::BiosFirmware,
+            GuidancePage::EmulatorSetup,
+            GuidancePage::Setup,
+            GuidancePage::CheckGames,
+            GuidancePage::Activity,
+            GuidancePage::History,
+            GuidancePage::Saves,
+            GuidancePage::Converter,
+            GuidancePage::Artwork,
+            GuidancePage::Romm,
+            GuidancePage::Advanced,
+            GuidancePage::Settings,
+        ];
+        for page in pages {
+            let tip = GuidanceState::default().select(&GuidanceContext::new(page));
+            assert!(!tip.message.starts_with("Browse first"), "{page:?}");
+            assert!(tip.message.len() > 30, "{page:?} is a bare label");
+        }
+    }
+
+    #[test]
+    fn activity_guidance_uses_the_real_running_count() {
+        let mut context = GuidanceContext::new(GuidancePage::Activity);
+        context.evidence.jobs_running = Some(0);
+        assert!(
+            GuidanceState::default()
+                .select(&context)
+                .message
+                .contains("Nothing is running")
+        );
+        context.evidence.jobs_running = Some(2);
+        assert!(
+            GuidanceState::default()
+                .select(&context)
+                .message
+                .contains("2 task(s) active")
+        );
     }
 }

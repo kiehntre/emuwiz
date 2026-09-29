@@ -599,8 +599,6 @@ impl NativeWorkflows {
         ui: &mut egui::Ui,
         environment: Option<&EnvironmentSnapshot>,
     ) {
-        ui.heading("Check Emulators");
-        ui.label("Review emulator installation and readiness before launching a game.");
         if let Some(environment) = environment {
             lifecycle_setup_panel(ui, &environment.lifecycle, &mut self.app);
         }
@@ -617,7 +615,10 @@ impl NativeWorkflows {
             .id_salt("v2_native_firmware")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.app.emulator_readiness.bios_projection_page.show(ui);
+                self.app
+                    .emulator_readiness
+                    .bios_projection_page
+                    .show_body(ui);
             });
         if self
             .app
@@ -676,7 +677,6 @@ impl NativeWorkflows {
 
         self.poll_remote_source_probes(ui.ctx());
 
-        ui.heading("Sources");
         ui.label("Add existing game folders, review what EmuWiz knows about them, then scan only when you choose.");
         ui.horizontal_wrapped(|ui| {
             ui.label("Add game folder");
@@ -1234,8 +1234,7 @@ impl NativeWorkflows {
     ) -> Option<Route> {
         let Some(game) = selected else {
             crate::ui::components::card(ui, |ui| {
-                ui.label("Choose a game first");
-                ui.heading("Put a game on the bench first");
+                ui.heading("Select a game first");
                 ui.label("Open a game from Games, then choose Mods & Cheats to review its gameplay codes.");
                 ui.label("No cheat is changed by browsing; original game files stay untouched.");
             });

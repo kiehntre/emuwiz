@@ -61,6 +61,7 @@ fn fixture(context: &egui::Context) -> App {
         interacted: false,
         loaded: true,
         notice: None,
+        handoff_status: None,
         confirm_scan: false,
         screenshots: false,
         check_platform: None,
@@ -328,7 +329,9 @@ fn gui_v2_romm_browser_has_explicit_empty_failure_state() {
     ));
     app.router.current = Route::Section(Section::Romm);
     let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
-    assert!(strings.iter().any(|value| value == "RomM library"));
+    // The single page title comes from the page header.
+    assert!(strings.iter().any(|value| value == "RomM Library"));
+    assert!(!strings.iter().any(|value| value == "RomM library"));
     assert!(strings.iter().any(|value| value.contains("unavailable")));
     assert!(strings.iter().any(|value| value.contains("Local EmuWiz")));
 }
@@ -1308,7 +1311,7 @@ fn gui_v2_cheats_tab_is_native_and_has_a_safe_empty_state() {
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
 
-    assert!(strings.iter().any(|value| value == "Choose a game first"));
+    assert!(strings.iter().any(|value| value == "Select a game first"));
     assert!(
         strings
             .iter()
@@ -3358,7 +3361,13 @@ fn gui_v2_advanced_is_a_specialist_escape_not_a_duplicate_dat_route() {
     app.router.current = Route::Section(Section::Advanced);
 
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
-    assert!(strings.iter().any(|value| value == "Advanced tools"));
+    // The page header supplies the single title and description.
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == Section::Advanced.purpose())
+    );
+    assert!(!strings.iter().any(|value| value == "Advanced tools"));
     assert!(
         strings
             .iter()
@@ -4194,4 +4203,569 @@ fn problems_page_hands_proven_mame_findings_to_the_mame_workflow() {
     app.go(mame.destination.route());
     assert_eq!(app.router.current, Route::MameWorkflow);
     assert_eq!(app.router.current.section(), Section::Mame);
+}
+
+#[test]
+fn no_route_repeats_its_introductory_sentence() {
+    // Page chrome supplies one title and one description. A body that repeats
+    // a full sentence is the duplicated-header bug. Organisation shows the same
+    // workflow tile text on two separate cards by design.
+    for section in super::routes::SECTIONS.iter().copied() {
+        if section == Section::Build {
+            continue;
+        }
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(section);
+        frame(&context, &mut app, [1280.0, 900.0]);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+        for value in &strings {
+            if value.len() >= 30 && value.ends_with('.') {
+                *seen.entry(value.as_str()).or_default() += 1;
+            }
+        }
+        let repeated: Vec<_> = seen.iter().filter(|(_, n)| **n > 1).collect();
+        assert!(repeated.is_empty(), "{section:?} repeats {repeated:?}");
+    }
+}
+
+#[test]
+fn hub_pages_show_one_title_and_one_description() {
+    for section in [
+        Section::AdvancedDiagnostics,
+        Section::DatVerification,
+        Section::EmulatorsFamily,
+        Section::SavesStates,
+        Section::Mame,
+        Section::Conversion,
+    ] {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(section);
+        frame(&context, &mut app, [1280.0, 900.0]);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        let family = super::routes::family_for_route(&Route::Section(section)).unwrap();
+        // The family purpose is the page description and appears exactly once.
+        assert_eq!(
+            strings.iter().filter(|v| *v == family.purpose()).count(),
+            1,
+            "{section:?} description"
+        );
+        // The section-level generic line is no longer stacked under it.
+        assert!(
+            !strings.iter().any(|v| v == section.purpose())
+                || section.purpose() == family.purpose()
+        );
+    }
+    // Pages that used to introduce themselves a second time in the body.
+    for (section, body_intro) in [
+        (Section::Advanced, "Advanced tools"),
+        (
+            Section::Emulators,
+            "Review emulator installation and readiness before launching a game.",
+        ),
+        (
+            Section::Museum,
+            "Browse the current v2 catalogue by platform, cover and title. Nothing here changes your files.",
+        ),
+    ] {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(section);
+        frame(&context, &mut app, [1280.0, 900.0]);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            !strings.iter().any(|v| v == body_intro),
+            "{section:?} still repeats {body_intro:?}"
+        );
+    }
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Setup);
+    frame(&context, &mut app, [1280.0, 900.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    // sidebar entry + breadcrumb + page title only
+    assert_eq!(strings.iter().filter(|v| *v == "Setup & Doctor").count(), 3);
+}
+
+#[test]
+fn sidebar_shows_each_group_heading_once_before_its_entries() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Games);
+    frame(&context, &mut app, [1280.0, 4000.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+    for group in ["LIBRARY", "PLAY", "TOOLS", "FAMILIES"] {
+        assert_eq!(
+            strings.iter().filter(|v| *v == group).count(),
+            1,
+            "{group} heading repeated"
+        );
+    }
+    // Every family entry still appears, after the single heading.
+    let heading = strings.iter().position(|v| v == "FAMILIES").unwrap();
+    for family in [
+        "DATs & Verification",
+        "Cheats & Mods",
+        "Saves & States",
+        "Emulators",
+        "MAME",
+    ] {
+        assert!(
+            strings.iter().skip(heading).any(|v| v == family),
+            "{family} missing from Families"
+        );
+    }
+    // Every section is still reachable from the sidebar exactly once.
+    for section in super::routes::SECTIONS.iter().copied() {
+        assert!(
+            strings.iter().any(|v| v == section.title()),
+            "{section:?} missing"
+        );
+    }
+}
+
+fn zip_row(id: i64, title: &str, path: std::path::PathBuf) -> PersistedArchive {
+    let mut row = archive(id, title, Some("PSX"));
+    row.archive_kind = "zip".into();
+    row.absolute_path = path;
+    row
+}
+
+#[test]
+fn archive_inspector_lists_each_physical_archive_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("Game.zip");
+    std::fs::write(&file, b"zip").unwrap();
+    let alias = directory.path().join(".").join("Game.zip");
+    let other = directory.path().join("Other.zip");
+    std::fs::write(&other, b"zip").unwrap();
+    let library = Library::new(vec![
+        zip_row(1, "Game", file.clone()),
+        // the same file reached through another catalogue row / spelling
+        zip_row(2, "Game", alias),
+        zip_row(3, "Game", file),
+        zip_row(4, "Other", other),
+    ]);
+    let rows = super::archive_inspector::inspector_rows(&library.games);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].id, 1);
+    assert_eq!(rows[1].title, "Other");
+    assert!(rows.iter().all(|row| row.location.is_none()));
+}
+
+#[test]
+fn archive_inspector_keeps_distinct_files_distinct_and_tells_them_apart() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut archives = Vec::new();
+    for (id, folder) in [(1, "EU"), (2, "US")] {
+        let path = directory.path().join(folder);
+        std::fs::create_dir_all(&path).unwrap();
+        let file = path.join("Game.zip");
+        std::fs::write(&file, format!("zip-{folder}")).unwrap();
+        archives.push(zip_row(id, "Game", file));
+    }
+    let library = Library::new(archives);
+    let rows = super::archive_inspector::inspector_rows(&library.games);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].location.as_deref(), Some("in EU"));
+    assert_eq!(rows[1].location.as_deref(), Some("in US"));
+}
+
+#[test]
+fn archive_inspector_rows_do_not_accumulate_on_route_reentry() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("Game.zip");
+    std::fs::write(&file, b"zip").unwrap();
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![
+        zip_row(1, "Game", file.clone()),
+        zip_row(2, "Game", file),
+    ]));
+    let mut counts = Vec::new();
+    for _ in 0..3 {
+        app.router.current = Route::Section(Section::Advanced);
+        frame(&context, &mut app, [1280.0, 900.0]);
+        app.router.current = Route::Home;
+        frame(&context, &mut app, [1280.0, 900.0]);
+        app.router.current = Route::Section(Section::Advanced);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        counts.push(strings.iter().filter(|v| v.starts_with("Game · ")).count());
+    }
+    assert_eq!(counts, vec![1, 1, 1]);
+}
+
+#[test]
+fn romm_preview_action_names_what_it_previews() {
+    assert_eq!(
+        super::pages::romm_preview_button_label(crate::romm_source::SAMPLE_IMPORT_RECORDS),
+        format!(
+            "Preview import (first {} games)",
+            crate::romm_source::SAMPLE_IMPORT_RECORDS
+        )
+    );
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Romm);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|v| v.starts_with("Preview import (first "))
+    );
+    assert!(!strings.iter().any(|v| v.contains("records)")));
+}
+
+#[test]
+fn hackhash_normal_view_is_plain_english_and_keeps_internals_under_advanced() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Sources);
+    frame(&context, &mut app, [1280.0, 4000.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+    for jargon in [
+        "Fetch candidate",
+        "Choose detailed JSON",
+        "Review validation",
+        "Activate snapshot",
+        "Detailed JSON URL:",
+    ] {
+        assert!(
+            !strings.iter().any(|v| v == jargon),
+            "{jargon} in normal view"
+        );
+    }
+    assert!(!strings.iter().any(|v| v.starts_with("Parser schema")));
+    for plain in [
+        "Check for a newer list",
+        "Download list",
+        "Load list from a file…",
+        "Review downloaded list",
+        "Use this list",
+    ] {
+        assert!(strings.iter().any(|v| v == plain), "missing {plain}");
+    }
+    assert!(
+        strings
+            .iter()
+            .any(|v| v.starts_with("Download address: not set"))
+    );
+    assert!(strings.iter().any(|v| v == "Advanced details"));
+}
+
+#[test]
+fn mods_without_a_game_says_select_a_game_first() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Mods);
+    let strings = text(&frame(&context, &mut app, [1280.0, 1200.0]));
+    assert!(!strings.iter().any(|v| v.contains("on the bench")));
+    assert!(
+        strings
+            .iter()
+            .any(|v| v == "Select a game first" || v == "No game selected yet"),
+        "no plain select-a-game instruction: {:?}",
+        strings.iter().take(40).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn browse_first_guidance_is_home_only_and_hubs_show_no_unrelated_tip() {
+    for section in super::routes::SECTIONS.iter().copied() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(section);
+        frame(&context, &mut app, [1280.0, 3200.0]);
+        let strings = text(&frame(&context, &mut app, [1280.0, 3200.0]));
+        let browse_first = strings.iter().any(|v| v.starts_with("Browse first:"));
+        assert!(!browse_first || section == Section::Home, "{section:?}");
+        if section == Section::Home {
+            // An empty library gets its own guidance instead of the generic tip.
+            assert!(
+                strings
+                    .iter()
+                    .any(|v| v.starts_with("No games are listed yet")),
+                "Home guidance missing"
+            );
+        }
+    }
+    // Family hubs have no page-specific guidance: no strip at all.
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::DatVerification);
+    frame(&context, &mut app, [1280.0, 3200.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 3200.0]));
+    assert!(!strings.iter().any(|v| v.starts_with("Mr Wiz")));
+}
+
+#[test]
+fn problems_page_guidance_follows_the_loaded_summary() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Problems);
+    let checking = text(&frame(&context, &mut app, [1280.0, 2400.0]));
+    assert!(
+        checking
+            .iter()
+            .any(|v| v.contains("EmuWiz is checking what it already knows"))
+    );
+    app.library = Arc::new(Library::new(vec![archive(1, "Missing Game", Some("PS2"))]));
+    app.problem_summary = Some(Arc::new(ProblemSummary::from_library(&app.library, None)));
+    let loaded = text(&frame(&context, &mut app, [1280.0, 2400.0]));
+    assert!(loaded.iter().any(|v| v.contains("finding(s) to look at")));
+    // Deterministic for an unchanged context.
+    let again = text(&frame(&context, &mut app, [1280.0, 2400.0]));
+    assert!(again.iter().any(|v| v.contains("finding(s) to look at")));
+}
+
+fn lifecycle_fixture(
+    id: &str,
+    state: archivefs_core::emulator_lifecycle::LifecycleState,
+    installations: usize,
+) -> archivefs_core::emulator_lifecycle::EmulatorLifecycleProjection {
+    use archivefs_core::emulator_inventory::{InstallationType, VersionConfidence, VersionSource};
+    use archivefs_core::emulator_lifecycle::*;
+    EmulatorLifecycleProjection {
+        schema_version: 1,
+        emulator_id: id.into(),
+        state,
+        selected: None,
+        stale_selected: false,
+        installations: (0..installations)
+            .map(|index| EmulatorLifecycleInstallation {
+                emulator_id: id.into(),
+                exact_binding: ExactBinding::NativeExecutable {
+                    path: format!("/opt/{id}/{index}/bin").into(),
+                },
+                installation_type: InstallationType::Unknown,
+                ownership_category: OwnershipCategory::Unknown,
+                version: VersionEvidence {
+                    version: None,
+                    raw_output: None,
+                    source: VersionSource::Unknown,
+                    confidence: VersionConfidence::Unknown,
+                },
+                channel: LifecycleChannel::Unknown,
+                local_health: LocalHealth::Unknown,
+                launch_readiness: None,
+                package: None,
+                update_authority: UpdateAuthority::Unknown,
+                update_status: None,
+                selected: false,
+                provenance: LifecycleProvenance {
+                    discovered_by: vec!["fixture".into()],
+                    selected_by: Vec::new(),
+                    package_manager: None,
+                    flatpak_scope: None,
+                    metadata_timestamp_unix: None,
+                },
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn setup_and_doctor_leads_with_problems_and_collapses_healthy_installations() {
+    use archivefs_core::emulator_lifecycle::LifecycleState::*;
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.environment = Some(super::environment::EnvironmentSnapshot {
+        config_present: true,
+        lifecycle: vec![
+            lifecycle_fixture("duckstation", InstalledUnknownVersion, 2),
+            lifecycle_fixture("retroarch", MultipleInstallations, 2),
+            lifecycle_fixture("rpcs3", Missing, 0),
+            lifecycle_fixture("pcsx2", Broken, 0),
+        ],
+        ..Default::default()
+    });
+    app.welcome_dismissed = true;
+    app.router.current = Route::Section(Section::Setup);
+    frame(&context, &mut app, [1280.0, 3200.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 3200.0]));
+    let has = |needle: &str| strings.iter().any(|v| v == needle);
+    // Real problems come first and stay visible.
+    assert!(has("Needs your attention (2)"));
+    assert!(has("retroarch") && has("pcsx2"));
+    assert!(has("Multiple installations found"));
+    // Missing emulators are visible, compact, and offer the setup route.
+    assert!(has("Not installed (1)"));
+    assert!(has("rpcs3"));
+    assert!(has("Open Emulator Setup"));
+    // Healthy/boring installations are collapsed by default.
+    assert!(has("Working emulators (1)"));
+    assert!(!has("duckstation"));
+    // The repeated "unknown" boilerplate is not a wall of text.
+    for boring in [
+        "Installation type unknown",
+        "Latest version unknown",
+        "Updates: Update owner unknown",
+    ] {
+        assert!(!has(boring), "{boring} repeated in the default view");
+    }
+    assert!(!strings.iter().any(|v| v.starts_with("Updates: ")));
+}
+
+#[test]
+fn setup_and_doctor_with_no_problems_says_so_and_keeps_details_reachable() {
+    use archivefs_core::emulator_lifecycle::LifecycleState::*;
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.environment = Some(super::environment::EnvironmentSnapshot {
+        config_present: true,
+        lifecycle: vec![lifecycle_fixture("duckstation", InstalledCurrent, 1)],
+        ..Default::default()
+    });
+    app.welcome_dismissed = true;
+    app.router.current = Route::Section(Section::Setup);
+    frame(&context, &mut app, [1280.0, 3200.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 3200.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|v| v == "No emulator needs your attention right now.")
+    );
+    assert!(strings.iter().any(|v| v == "Working emulators (1)"));
+}
+
+#[test]
+fn separate_window_confirmation_is_visible_calm_and_cleared_by_navigation() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Advanced);
+    app.handoff_status = Some("Opened in a separate window. If you cannot see it, look behind this window; GUI v2 is still open.".into());
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(strings.iter().any(|v| v == "Separate window"));
+    assert!(
+        strings
+            .iter()
+            .any(|v| v.starts_with("Opened in a separate window."))
+    );
+    // A success confirmation is not presented as a problem.
+    assert!(!strings.iter().any(|v| v == "Needs attention"));
+    // The action it confirms is still offered, and navigating away clears it.
+    assert!(strings.iter().any(|v| v == "Open specialist interface"));
+    app.go(Route::Home);
+    assert!(app.handoff_status.is_none());
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(!strings.iter().any(|v| v == "Separate window"));
+}
+
+#[test]
+fn archive_inspector_tells_apart_same_named_folders_under_different_parents() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut archives = Vec::new();
+    for (id, parent) in [(1, "a"), (2, "b")] {
+        let folder = directory.path().join(parent).join("PS1");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("Game.zip");
+        std::fs::write(&file, format!("zip-{parent}")).unwrap();
+        archives.push(zip_row(id, "Game", file));
+    }
+    let library = Library::new(archives);
+    let rows = super::archive_inspector::inspector_rows(&library.games);
+    assert_eq!(rows.len(), 2);
+    let labels: Vec<_> = rows
+        .iter()
+        .map(|row| row.location.clone().unwrap())
+        .collect();
+    assert_ne!(labels[0], labels[1], "{labels:?}");
+    // Deterministic: the same input always gives the same rows.
+    assert_eq!(
+        rows,
+        super::archive_inspector::inspector_rows(&library.games)
+    );
+}
+
+#[test]
+fn archive_inspector_rows_follow_a_replaced_library() {
+    let directory = tempfile::tempdir().unwrap();
+    let one = directory.path().join("One.zip");
+    let two = directory.path().join("Two.zip");
+    std::fs::write(&one, b"1").unwrap();
+    std::fs::write(&two, b"2").unwrap();
+    let mut state = super::archive_inspector::ArchiveInspectorPageState::default();
+    let first = Arc::new(Library::new(vec![zip_row(1, "One", one.clone())]));
+    assert_eq!(state.rows(&first).len(), 1);
+    assert_eq!(state.rows(&first).len(), 1);
+    drop(first);
+    // A new library, possibly allocated where the old one was, must not be
+    // served the old library's rows.
+    let second = Arc::new(Library::new(vec![
+        zip_row(1, "One", one),
+        zip_row(2, "Two", two),
+    ]));
+    assert_eq!(state.rows(&second).len(), 2);
+}
+
+#[test]
+fn no_route_repeats_its_title_with_different_capitalisation() {
+    // "RomM Library" in the page header and "RomM library" as a body heading is
+    // the same duplicated title. Compare all rendered text ignoring case.
+    // Home pairs each task tile heading with its button ("Browse My Games" and
+    // "Browse my games"), which is not a repeated page title.
+    let mut offenders = Vec::new();
+    for section in super::routes::SECTIONS.iter().copied() {
+        if section == Section::Home {
+            continue;
+        }
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(section);
+        frame(&context, &mut app, [1280.0, 900.0]);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        let mut by_lowercase =
+            std::collections::BTreeMap::<String, std::collections::BTreeSet<&str>>::new();
+        for value in &strings {
+            if value.len() >= 6 {
+                by_lowercase
+                    .entry(value.to_lowercase())
+                    .or_default()
+                    .insert(value.as_str());
+            }
+        }
+        for (_, variants) in by_lowercase {
+            if variants.len() > 1 {
+                offenders.push(format!("{section:?}: {variants:?}"));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "{offenders:#?}");
+}
+
+#[test]
+fn no_route_shows_its_title_more_often_than_the_chrome_explains() {
+    // The title legitimately appears once per sidebar entry with that title,
+    // once in the breadcrumb and once as the page heading. More means the body
+    // introduced itself again. A tall viewport keeps the whole sidebar drawn.
+    let mut offenders = Vec::new();
+    for section in super::routes::SECTIONS.iter().copied() {
+        if section == Section::Home {
+            continue;
+        }
+        let title = section.title();
+        let sidebar_entries = super::routes::SECTIONS
+            .iter()
+            .filter(|other| other.title() == title)
+            .count();
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(section);
+        frame(&context, &mut app, [1280.0, 4000.0]);
+        let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+        let seen = strings.iter().filter(|value| *value == title).count();
+        // sidebar entries + breadcrumb + page heading. Two painted hero banners
+        // still repeat their page title; they are known and deferred (changing
+        // them is a visual redesign), so the exception is explicit, not hidden.
+        let known_hero_repeat = matches!(section, Section::Saves | Section::Problems);
+        let allowed = sidebar_entries + 2 + usize::from(known_hero_repeat);
+        if seen > allowed {
+            offenders.push(format!(
+                "{section:?} shows {title:?} {seen}x (allowed {allowed})"
+            ));
+        }
+    }
+    assert!(offenders.is_empty(), "{offenders:#?}");
 }

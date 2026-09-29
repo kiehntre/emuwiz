@@ -172,7 +172,9 @@ impl Section {
             | Self::ProblemsRepair
             | Self::SourcesProviders
             | Self::HistoryUndo
-            | Self::AdvancedDiagnostics => "Choose a workflow. Opening a shortcut changes nothing.",
+            | Self::AdvancedDiagnostics => family_for_route(&Route::Section(self))
+                .map(FeatureFamily::purpose)
+                .unwrap_or("Choose a workflow. Opening a shortcut changes nothing."),
         }
     }
 

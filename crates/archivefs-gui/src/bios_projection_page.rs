@@ -45,6 +45,12 @@ impl BiosProjectionPageState {
             "BIOS / Firmware",
             "Prepare firmware required by your emulators.",
         );
+        self.show_body(ui);
+    }
+
+    /// Everything below the header. GUI v2 already shows the page title and
+    /// description in its own page header, so it calls this directly.
+    pub(crate) fn show_body(&mut self, ui: &mut egui::Ui) {
         crate::widgets::folder_picker(ui, "BIOS folder", &mut self.master_root);
         if crate::widgets::action_button(
             ui,

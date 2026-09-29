@@ -56,13 +56,116 @@ enum Status {
 
 pub(crate) struct ArchiveInspectorPageState {
     status: Status,
+    rows: Option<(std::sync::Weak<super::library::Library>, Vec<InspectorRow>)>,
 }
 
 impl Default for ArchiveInspectorPageState {
     fn default() -> Self {
         Self {
             status: Status::Idle,
+            rows: None,
         }
+    }
+}
+
+/// One physical archive in the inspector list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InspectorRow {
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    pub(crate) media: String,
+    /// Set only when two different files would otherwise look identical.
+    pub(crate) location: Option<String>,
+}
+
+/// Lists each physical archive once. Catalogue rows that point at the same
+/// file (for example two overlapping source folders) collapse to the first
+/// row; distinct files stay distinct, and are told apart by location when
+/// their titles collide. Pure and read-only apart from resolving paths.
+pub(crate) fn inspector_rows(games: &[super::library::Game]) -> Vec<InspectorRow> {
+    let mut seen = std::collections::HashSet::new();
+    let mut rows: Vec<(InspectorRow, PathBuf)> = Vec::new();
+    for game in games {
+        if !is_supported_archive(&game.archive.archive_kind) {
+            continue;
+        }
+        let path = &game.archive.absolute_path;
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        rows.push((
+            InspectorRow {
+                id: game.archive.id,
+                title: game.title.clone(),
+                media: super::library::media_kind_label(&game.archive.archive_kind).to_string(),
+                location: None,
+            },
+            canonical,
+        ));
+    }
+    let mut counts = std::collections::HashMap::<(String, String), usize>::new();
+    for (row, _) in &rows {
+        *counts
+            .entry((row.title.clone(), row.media.clone()))
+            .or_default() += 1;
+    }
+    for (row, path) in &mut rows {
+        if counts[&(row.title.clone(), row.media.clone())] > 1 {
+            row.location = Some(
+                path.parent()
+                    .and_then(|parent| parent.file_name())
+                    .map(|name| format!("in {}", name.to_string_lossy()))
+                    .unwrap_or_else(|| path.display().to_string()),
+            );
+        }
+    }
+    // A short folder name can still collide (for example two `PS1` folders
+    // under different parents). Rows that remain identical fall back to the
+    // full folder so distinct files are always distinguishable.
+    let mut label_counts = std::collections::HashMap::<(String, String, String), usize>::new();
+    for (row, _) in &rows {
+        if let Some(location) = &row.location {
+            *label_counts
+                .entry((row.title.clone(), row.media.clone(), location.clone()))
+                .or_default() += 1;
+        }
+    }
+    for (row, path) in &mut rows {
+        let collides = row.location.as_ref().is_some_and(|location| {
+            label_counts[&(row.title.clone(), row.media.clone(), location.clone())] > 1
+        });
+        if collides {
+            row.location = Some(format!(
+                "in {}",
+                path.parent().unwrap_or(path.as_path()).display()
+            ));
+        }
+    }
+    rows.into_iter().map(|(row, _)| row).collect()
+}
+
+impl ArchiveInspectorPageState {
+    /// Rows for the current library snapshot, recomputed only when the
+    /// snapshot changes so re-entering the page never re-scans or accumulates.
+    pub(crate) fn rows(
+        &mut self,
+        library: &std::sync::Arc<super::library::Library>,
+    ) -> Vec<InspectorRow> {
+        // A `Weak` keeps the allocation reserved, so a later library can never
+        // be mistaken for this one by reusing the same address.
+        let current = std::sync::Arc::downgrade(library);
+        if self
+            .rows
+            .as_ref()
+            .is_none_or(|(cached, _)| !cached.ptr_eq(&current))
+        {
+            self.rows = Some((current, inspector_rows(&library.games)));
+        }
+        self.rows
+            .as_ref()
+            .map(|(_, rows)| rows.clone())
+            .unwrap_or_default()
     }
 }
 

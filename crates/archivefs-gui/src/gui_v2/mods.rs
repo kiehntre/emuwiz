@@ -188,7 +188,7 @@ fn selected_game_strip(ui: &mut egui::Ui, game: Option<&crate::gui_v2::library::
                 }
                 None => {
                     ui.label(
-                        egui::RichText::new("No game on the bench yet")
+                        egui::RichText::new("No game selected yet")
                             .size(theme::SECTION_TITLE_SIZE)
                             .strong(),
                     );
@@ -203,7 +203,7 @@ fn selected_game_strip(ui: &mut egui::Ui, game: Option<&crate::gui_v2::library::
 
 fn workshop_lanes(ui: &mut egui::Ui, tab: &mut Tab) {
     ui.label(
-        egui::RichText::new("Choose your workbench")
+        egui::RichText::new("Choose what to work on")
             .size(theme::SECTION_TITLE_SIZE)
             .strong(),
     );
@@ -260,16 +260,13 @@ fn lane_card(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool, choos
                 });
                 ui.label(egui::RichText::new(detail).color(theme::muted(ui)));
                 ui.label(
-                    egui::RichText::new(if selected {
-                        "Selected workbench"
-                    } else {
-                        "Open this workbench"
-                    })
-                    .color(if selected {
-                        theme::TEAL
-                    } else {
-                        theme::muted(ui)
-                    }),
+                    egui::RichText::new(if selected { "Selected" } else { "Open" }).color(
+                        if selected {
+                            theme::TEAL
+                        } else {
+                            theme::muted(ui)
+                        },
+                    ),
                 );
             });
         })
@@ -394,7 +391,7 @@ fn add_package(
 ) {
     let Some(game) = game else {
         widgets::card(ui, |ui| {
-            ui.heading("Put a game on the bench first");
+            ui.heading("Select a game first");
             ui.label("Open a game from Games, then choose Mods & Cheats to inspect a compatible package.");
             ui.label("Browsing is safe: no original files are changed by opening this page.");
         });

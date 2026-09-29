@@ -313,53 +313,55 @@ impl HackHashPageState {
     }
 
     pub(super) fn show(&mut self, ui: &mut egui::Ui) {
-        ui.heading("HackHash provider snapshot");
-        ui.label("HackHash is external community evidence. Network access occurs only after you press Check for update or Fetch candidate.");
-        ui.label("EmuWiz sends only this export URL; it never uploads ROMs, sends ROM paths or local ROM hashes, logs in, or invents authentication.");
-        ui.label(format!("Parser schema: {HACKHASH_PARSER_SCHEMA_VERSION}"));
+        ui.heading("ROM hack identification (HackHash)");
+        ui.label("HackHash is a community list of known ROM hacks. EmuWiz uses it only as extra evidence to help recognise hacked games; it never replaces your verified identification.");
+        ui.label("EmuWiz only downloads the list. It never uploads your games, file names or file fingerprints.");
+        // Status, in plain words.
         if let Some(active) = &self.active {
-            ui.label(format!(
-                "Active snapshot: {} · imported {} · {} records",
-                active.sha256,
-                active.retrieved_at_unix_seconds,
-                active.record_count.unwrap_or(0)
-            ));
-            if let Some(export) = &self.active_export {
-                let platforms = export
+            let hacks = active.record_count.unwrap_or(0);
+            let platforms = self.active_export.as_ref().map(|export| {
+                export
                     .machines
                     .iter()
                     .map(|record| record.platform.as_str())
-                    .collect::<std::collections::BTreeSet<_>>();
-                ui.label(format!(
-                    "Platform coverage: {}",
-                    platforms.into_iter().collect::<Vec<_>>().join(", ")
-                ));
-            }
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            });
+            ui.label(match platforms {
+                Some(platforms) => {
+                    format!("Installed list: {hacks} known hacks across {platforms} platform(s).")
+                }
+                None => format!("Installed list: {hacks} known hacks."),
+            });
         } else {
-            ui.label("No active HackHash snapshot.");
+            ui.label("No HackHash list is installed yet. Hacked games are simply not recognised until one is.");
         }
         if let Some(path) = &self.selected_path {
-            ui.label(format!("Selected: {}", path.display()));
+            ui.label(format!("Chosen file: {}", path.display()));
+        }
+        // Where the list comes from.
+        if self.remote_url.trim().is_empty() {
+            ui.label("Download address: not set. Enter the address of a HackHash export under Advanced details, or load a copy you already downloaded.");
+        } else {
+            ui.label(format!("Downloads from: {}", self.remote_url.trim()));
         }
         if let Some(staged) = &self.staged {
             ui.separator();
-            ui.strong("Validated export waiting for review");
+            ui.strong("A downloaded list is waiting for your review");
             ui.label(format!(
-                "Candidate: {} · retrieved {} · {} records",
-                staged.candidate.snapshot.sha256,
-                staged.candidate.snapshot.retrieved_at_unix_seconds,
+                "It contains {} known hacks.",
                 staged.validation.export.machines.len()
             ));
             ui.label(
                 if self.fetch_state == Some(HackHashFetchState::AlreadyCurrent) {
-                    "Candidate content is already current. Activation is still explicit."
+                    "It is the same as your installed list. Nothing changes unless you choose to use it."
                 } else {
-                    "Candidate content differs from the active snapshot."
+                    "It differs from your installed list. Nothing changes unless you choose to use it."
                 },
             );
             if !staged.validation.warnings.is_empty() {
                 ui.label(format!(
-                    "{} validation warning(s)",
+                    "{} thing(s) to be aware of:",
                     staged.validation.warnings.len()
                 ));
                 for warning in &staged.validation.warnings {
@@ -369,35 +371,42 @@ impl HackHashPageState {
         }
         if let Some(preview) = &self.preview {
             ui.separator();
-            ui.strong("Activation preview");
+            ui.strong("Ready to use");
             ui.label(format!("{}", preview.validation_status));
-            if let Some(old) = &preview.old {
-                ui.label(format!("Previous snapshot retained: {}", old.sha256));
+            if preview.old.is_some() {
+                ui.label("Your previous list is kept, so this can be undone.");
             }
         }
         if let Some(error) = &self.error {
             ui.colored_label(
                 ui.visuals().error_fg_color,
-                format!("HackHash import: {error}"),
+                format!("HackHash list: {error}"),
             );
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label("Detailed JSON URL:");
-            ui.add(egui::TextEdit::singleline(&mut self.remote_url).desired_width(360.0));
-            if ui.button("Check for update").clicked() {
+            if ui
+                .button("Check for a newer list")
+                .on_hover_text("Asks the download address whether a newer list exists. Nothing is downloaded.")
+                .clicked()
+            {
                 self.check_for_update();
             }
-            if ui.button("Fetch candidate").clicked() {
+            if ui
+                .button("Download list")
+                .on_hover_text("Downloads the list from the address shown above. It is not used until you review it and confirm.")
+                .clicked()
+            {
                 self.fetch_candidate();
             }
-            if ui.button("Choose detailed JSON").clicked() {
+            if ui
+                .button("Load list from a file…")
+                .on_hover_text("Use a HackHash export you already downloaded (a .json file).")
+                .clicked()
+            {
                 self.choose_and_validate();
             }
             if ui
-                .add_enabled(
-                    self.staged.is_some(),
-                    egui::Button::new("Review validation"),
-                )
+                .add_enabled(self.staged.is_some(), egui::Button::new("Review downloaded list"))
                 .clicked()
             {
                 self.review();
@@ -405,7 +414,7 @@ impl HackHashPageState {
             if ui
                 .add_enabled(
                     self.staged.is_some() && self.preview.is_some(),
-                    egui::Button::new("Activate snapshot"),
+                    egui::Button::new("Use this list"),
                 )
                 .clicked()
             {
@@ -415,13 +424,50 @@ impl HackHashPageState {
         if let Some(update) = &self.update {
             ui.label(match update {
                 UpdateCheck::Available { .. } => {
-                    "Update metadata says a candidate may be available; fetch is still explicit."
+                    "A newer list may be available. Downloading it is still your choice."
                 }
-                UpdateCheck::Unchanged { .. } => "Update metadata says the source is unchanged.",
-                UpdateCheck::Offline { .. } => "No network check performed.",
+                UpdateCheck::Unchanged { .. } => "Your list is up to date.",
+                UpdateCheck::Offline { .. } => "No network check was made.",
             });
         }
-        ui.collapsing("Evidence boundary", |ui| {
+        ui.collapsing("Advanced details", |ui| {
+            ui.label(format!("Parser schema: {HACKHASH_PARSER_SCHEMA_VERSION}"));
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Export address (detailed JSON URL):");
+                ui.add(egui::TextEdit::singleline(&mut self.remote_url).desired_width(360.0));
+            });
+            if let Some(active) = &self.active {
+                ui.label(format!(
+                    "Installed list: SHA-256 {} · imported {} · {} records",
+                    active.sha256,
+                    active.retrieved_at_unix_seconds,
+                    active.record_count.unwrap_or(0)
+                ));
+                if let Some(export) = &self.active_export {
+                    let platforms = export
+                        .machines
+                        .iter()
+                        .map(|record| record.platform.as_str())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    ui.label(format!(
+                        "Platform coverage: {}",
+                        platforms.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+            if let Some(staged) = &self.staged {
+                ui.label(format!(
+                    "Waiting candidate: SHA-256 {} · retrieved {} · {} records",
+                    staged.candidate.snapshot.sha256,
+                    staged.candidate.snapshot.retrieved_at_unix_seconds,
+                    staged.validation.export.machines.len()
+                ));
+            }
+            if let Some(preview) = &self.preview
+                && let Some(old) = &preview.old
+            {
+                ui.label(format!("Previous snapshot retained: {}", old.sha256));
+            }
             ui.label("Hash matches are indexed as HackHash external evidence. They never become EmuWiz native Verified identity and conflicting local/No-Intro/Redump evidence is retained.");
         });
     }

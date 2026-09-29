@@ -74,7 +74,6 @@ fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(
 
 impl App {
     fn romm_library_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("RomM library");
         ui.label("Read-only provider browsing. Local EmuWiz evidence is never replaced by RomM metadata.");
         let busy = self.romm_library.operation.is_some();
         let mut refresh = false;
@@ -87,7 +86,15 @@ impl App {
                 refresh = true;
             }
             if ui
-                .add_enabled(!busy, egui::Button::new("Preview import (25 records)"))
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(romm_preview_button_label(
+                        crate::romm_source::SAMPLE_IMPORT_RECORDS,
+                    )),
+                )
+                .on_hover_text(
+                    "Fetches a small sample of games from your RomM server to show what an import would add. Nothing is saved or published.",
+                )
                 .clicked()
             {
                 preview = true;
@@ -111,7 +118,7 @@ impl App {
         }
         if let Some(summary) = &self.romm_library.last_preview {
             ui.label(format!(
-                "Import preview: {} record(s), {} platform(s); nothing was published.",
+                "Import preview: {} game(s) on {} platform(s) in the sample; nothing was saved or published.",
                 summary.records, summary.platforms
             ));
         }
@@ -361,11 +368,34 @@ impl App {
                 egui::ScrollArea::vertical()
                     .id_salt("v2_sidebar_scroll")
                     .show(ui, |ui| {
+                        // One heading per group, followed by all of its entries;
+                        // ungrouped entries keep their position.
+                        let mut shown_groups: Vec<&str> = Vec::new();
+                        let mut ordered: Vec<Section> = Vec::new();
                         for section in SECTIONS {
-                            if let Some(group) = section.group() {
+                            match section.group() {
+                                None => ordered.push(*section),
+                                Some(group) if !shown_groups.contains(&group) => {
+                                    shown_groups.push(group);
+                                    ordered.extend(
+                                        SECTIONS
+                                            .iter()
+                                            .copied()
+                                            .filter(|other| other.group() == Some(group)),
+                                    );
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                        let mut current_group: Option<&str> = None;
+                        for section in &ordered {
+                            if let Some(group) = section.group()
+                                && current_group != Some(group)
+                            {
                                 ui.separator();
                                 ui.strong(group);
                             }
+                            current_group = section.group();
                             let selected = self.router.current.section() == *section;
                             ui.push_id(("v2_sidebar_section", *section), |ui| {
                                 if ui
@@ -402,6 +432,17 @@ impl App {
                 });
                 if dismiss {
                     self.notice = None;
+                }
+            }
+            if let Some(status) = self.handoff_status.clone() {
+                let mut dismiss = false;
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.strong("Separate window");
+                    ui.label(status);
+                    dismiss = ui.button("Dismiss").clicked();
+                });
+                if dismiss {
+                    self.handoff_status = None;
                 }
             }
             let route = self.router.current.clone();
@@ -493,7 +534,7 @@ impl App {
                         } => self.tape_inspector(ui, Some(game)),
                         Route::Task { section, .. } => self.handoff(ui, section),
                     }
-                    if show_guidance {
+                    if show_guidance && let Some(guidance) = guidance {
                         super::guidance::show(ui, &mut self.guidance, guidance);
                     }
                 });
@@ -509,10 +550,10 @@ impl App {
         }
     }
 
-    fn guidance_context(&self, route: &Route) -> super::guidance::GuidanceContext {
+    fn guidance_context(&self, route: &Route) -> Option<super::guidance::GuidanceContext> {
         use super::guidance::{GuidanceContext, GuidancePage};
         let page = match route {
-            Route::Home => GuidancePage::Home,
+            Route::Home | Route::Section(Section::Home) => GuidancePage::Home,
             Route::BrowsePlay | Route::BrowsePlayGame(_) => GuidancePage::Games,
             Route::MameWorkflow => GuidancePage::Organisation,
             Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
@@ -522,9 +563,17 @@ impl App {
                 section: Section::Launch,
                 ..
             } => GuidancePage::Launch,
-            Route::Section(Section::Problems) | Route::Section(Section::Check) => {
-                GuidancePage::ProblemsRepair
-            }
+            Route::Section(Section::Problems) => GuidancePage::ProblemsRepair,
+            Route::Section(Section::Check) => GuidancePage::CheckGames,
+            Route::Section(Section::Setup) => GuidancePage::Setup,
+            Route::Section(Section::Activity) => GuidancePage::Activity,
+            Route::Section(Section::History) => GuidancePage::History,
+            Route::Section(Section::Saves) => GuidancePage::Saves,
+            Route::Section(Section::Converter) => GuidancePage::Converter,
+            Route::Section(Section::Artwork) => GuidancePage::Artwork,
+            Route::Section(Section::Romm) => GuidancePage::Romm,
+            Route::Section(Section::Advanced) => GuidancePage::Advanced,
+            Route::Section(Section::Settings) => GuidancePage::Settings,
             Route::Section(Section::Build) => GuidancePage::Organisation,
             Route::Section(Section::Mods) => GuidancePage::CheatsMods,
             Route::Section(Section::Museum) => GuidancePage::Museum,
@@ -540,18 +589,31 @@ impl App {
             Route::Section(Section::Dat) | Route::QuickRename => GuidancePage::DatManagement,
             Route::Section(Section::Firmware) => GuidancePage::BiosFirmware,
             Route::Section(Section::Emulators) => GuidancePage::EmulatorSetup,
-            _ => GuidancePage::Home,
+            // No page-specific guidance: show none rather than an unrelated tip.
+            _ => return None,
         };
         let mut context = GuidanceContext::new(page);
         match route {
-            Route::Home => context.evidence.has_games = Some(!self.library.games.is_empty()),
+            Route::Home | Route::Section(Section::Home) => {
+                context.evidence.has_games = Some(!self.library.games.is_empty())
+            }
             Route::Game(id) | Route::Task { game: id, .. } => {
                 context.evidence.launch_identity_verified =
                     self.library.game(*id).map(|game| game.identified);
             }
+            Route::Section(Section::Problems) => {
+                if let Some(summary) = &self.problem_summary {
+                    context.evidence.problems_actionable = Some(summary.actionable_count());
+                    context.evidence.problems_needing_attention =
+                        Some(summary.count(super::problems::Severity::NeedsAttention));
+                }
+            }
+            Route::Section(Section::Activity) => {
+                context.evidence.jobs_running = Some(self.activity.running());
+            }
             _ => {}
         }
-        context
+        Some(context)
     }
 
     fn saves_states(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
@@ -668,12 +730,8 @@ impl App {
             ui.label("Your game's information, readiness and next actions, in one place.");
         } else if let Some(family) = family {
             if family_home(family).section() == self.router.current.section() {
+                // One concise description; the body must not repeat it.
                 ui.label(family.purpose());
-                // Keep the stable route-level purpose visible alongside the
-                // richer family projection. Existing route coverage and
-                // accessibility checks rely on every Section retaining its
-                // own plain-language purpose.
-                ui.label(self.router.current.section().purpose());
             } else {
                 ui.label(self.router.current.section().purpose());
             }
@@ -696,9 +754,9 @@ impl App {
             }
             return;
         }
-        ui.heading(family.label());
-        ui.label(family.purpose());
-        ui.label("These are shortcuts to existing GUI-v2 workflows; opening a shortcut does not change your files.");
+        // Title and purpose come from the page header; only the shortcut note
+        // is specific to this body.
+        ui.label("These are shortcuts to existing workflows; opening a shortcut does not change your files.");
         ui.add_space(theme::SPACE_SM);
         for action in family_children(family) {
             let variant = match action.variant {
@@ -1082,8 +1140,6 @@ impl App {
         }
 
         let library = self.library.clone();
-        ui.heading("Museum");
-        ui.label("Browse the current v2 catalogue by platform, cover and title. Nothing here changes your files.");
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("{} catalogued games", library.games.len()));
             ui.label(format!("{} platforms", library.platforms.len()));
@@ -1463,11 +1519,7 @@ impl App {
                     }
                     ui.add_space(theme::SPACE_MD);
                     ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Duplicates")
-                                .size(theme::PAGE_TITLE_SIZE)
-                                .strong(),
-                        );
+                        // The page title is already in the page header.
                         ui.label(
                             RichText::new(
                                 "Mr Wiz checks the copy in the mirror before anything moves.",
@@ -2464,25 +2516,9 @@ impl App {
     }
 
     fn advanced(&mut self, ui: &mut egui::Ui) {
-        let archive_games: Vec<_> = self
-            .library
-            .games
-            .iter()
-            .filter(|game| {
-                super::archive_inspector::is_supported_archive(&game.archive.archive_kind)
-            })
-            .map(|game| {
-                (
-                    game.archive.id,
-                    game.title.clone(),
-                    game.archive.archive_kind.clone(),
-                )
-            })
-            .collect();
+        let archive_games = self.archive_inspector.rows(&self.library);
         let mut inspect_game = None;
         check_scroll(ui, None, |ui| {
-            ui.heading("Advanced tools");
-            ui.label("These tools are for specialist inspection and troubleshooting. Normal organisation, identification data and setup have their own native pages.");
             if primary(ui, "Open specialist interface") {
                 self.legacy(Section::Advanced);
             }
@@ -2492,12 +2528,17 @@ impl App {
             if archive_games.is_empty() {
                 ui.label("No archive-backed games are currently in the catalogue.");
             } else {
-                for (id, title, kind) in &archive_games {
-                    ui.push_id(("archive-game", id), |ui| {
+                for row in &archive_games {
+                    ui.push_id(("archive-game", row.id), |ui| {
                         ui.horizontal_wrapped(|ui| {
-                            ui.label(format!("{title} · {}", media_kind_label(kind)));
+                            ui.label(match &row.location {
+                                Some(location) => {
+                                    format!("{} · {} · {location}", row.title, row.media)
+                                }
+                                None => format!("{} · {}", row.title, row.media),
+                            });
                             if ui.button("Inspect contents").clicked() {
-                                inspect_game = Some(*id);
+                                inspect_game = Some(row.id);
                             }
                         });
                     });
@@ -2944,4 +2985,9 @@ pub(super) fn duplicate_readiness_label(
         GroupQuarantineReadiness::NeedsReview(_) => "Review needed · no automatic action",
         GroupQuarantineReadiness::Blocked(_) => "Blocked from automatic action",
     }
+}
+
+/// Button label for the RomM sample preview, from the real sample size.
+pub(super) fn romm_preview_button_label(games: usize) -> String {
+    format!("Preview import (first {games} games)")
 }
