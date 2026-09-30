@@ -79,6 +79,8 @@ pub struct ArcadeSetDirectory {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArcadeSetDiscovery {
+    /// Read errors or enumeration bounds mean this is not a complete walk.
+    pub scan_errors_total: usize,
     pub sets: Vec<ArcadeSetDirectory>,
     pub diagnostics: ArcadeIngestionDiagnostics,
 }
@@ -161,12 +163,18 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
     for entry in std::fs::read_dir(root)? {
         let entry = match entry {
             Ok(entry) => entry,
-            Err(_) => continue,
+            Err(_) => {
+                result.scan_errors_total += 1;
+                continue;
+            }
         };
         let path = entry.path();
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(_) => {
+                result.scan_errors_total += 1;
+                continue;
+            }
         };
         if metadata.file_type().is_symlink() {
             continue;
@@ -178,6 +186,9 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
         }
     }
     directories.sort();
+    if directories.len() > MAX_SET_DIRECTORIES {
+        result.scan_errors_total += 1;
+    }
     for path in directories.into_iter().take(MAX_SET_DIRECTORIES) {
         if support_material_kind(&path, root, SourceRole::ArcadeRomset).is_some() {
             continue;
@@ -187,6 +198,7 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
             continue;
         };
         let Ok(entries) = std::fs::read_dir(&path) else {
+            result.scan_errors_total += 1;
             result.diagnostics.unresolved_items += 1;
             continue;
         };
@@ -194,11 +206,13 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
         let mut malformed = false;
         for entry in entries.take(MAX_SET_MEMBERS + 1) {
             let Ok(entry) = entry else {
+                result.scan_errors_total += 1;
                 malformed = true;
                 continue;
             };
             let member = entry.path();
             let Ok(metadata) = std::fs::symlink_metadata(&member) else {
+                result.scan_errors_total += 1;
                 malformed = true;
                 continue;
             };
@@ -209,6 +223,9 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
             members.push(member);
         }
         members.sort();
+        if members.len() > MAX_SET_MEMBERS {
+            result.scan_errors_total += 1;
+        }
         if malformed || members.len() < 2 || members.len() > MAX_SET_MEMBERS {
             result.diagnostics.unresolved_items += 1;
             continue;
