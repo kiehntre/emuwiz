@@ -260,3 +260,127 @@ fn failed_run_cannot_use_a_prior_complete_coverage_proof() {
             .is_none()
     );
 }
+
+#[test]
+fn migration_safety_bookkeeping_is_additive_idempotent_and_atomic() {
+    let temp = tempfile::tempdir().unwrap();
+    for version in [16, 21, 22] {
+        let path = temp.path().join(format!("schema-{version}"));
+        let mut connection = open_connection(&path).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..version]).unwrap();
+        connection.execute("INSERT INTO source_folders(id,path,first_seen_at,last_seen_in_config_at) VALUES(1,?1,'old','old')",[b"/historical/source".as_slice()]).unwrap();
+        connection.execute("INSERT INTO archives(id,source_folder_id,relative_path,absolute_path_cached,file_name_cached,archive_kind,display_name,normalized_name,first_seen_at,last_seen_at,last_verified_missing_at,created_at,updated_at) VALUES(1,1,X'61',X'62',X'61','zip','a','a','old','old','missing','old','old')",[]).unwrap();
+        if version == 22 {
+            connection.execute_batch("CREATE TRIGGER reject_23 BEFORE INSERT ON schema_migrations WHEN NEW.version=23 BEGIN SELECT RAISE(ABORT,'injected bookkeeping failure'); END;").unwrap();
+            assert!(apply_migrations(&mut connection, MIGRATIONS).is_err());
+            assert_eq!(
+                connection
+                    .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                22
+            );
+            assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('source_scan_bindings','catalogue_health_epoch')",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+            connection.execute_batch("DROP TRIGGER reject_23").unwrap();
+        }
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            23
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT last_verified_missing_at FROM archives WHERE id=1",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "missing"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM source_scan_bindings", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT revision FROM catalogue_health_epoch", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert!(
+            connection
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query([])
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn root_changed_after_folder_persistence_refuses_the_outer_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    fs::create_dir(&root).unwrap();
+    let path = root.join("game.zip");
+    fs::write(&path, b"fixture").unwrap();
+    let mut db = Database::open_or_create(temp.path().join("db")).unwrap();
+    let source = db
+        .register_source_folders(std::slice::from_ref(&root))
+        .unwrap()
+        .remove(0);
+    let id = db
+        .upsert_archive(source.id, &root, &Archive::from_path(&path).unwrap())
+        .unwrap()
+        .archive_id;
+    db.begin_catalogue_refresh().unwrap();
+    let run = db.start_scan_run("late root change", None).unwrap();
+    let identity = crate::catalogue_health::source_root_identity(&root).unwrap();
+    assert!(db.bind_scan_source(source.id, identity).unwrap());
+    db.record_scan_coverage(
+        run,
+        &SourceScanCoverage {
+            source_id: source.id,
+            root_identity: Some(identity),
+            root: root.clone(),
+            state: ScanCoverageState::Complete,
+            excluded_roots: vec![],
+            diagnostic: None,
+        },
+    )
+    .unwrap();
+    db.connection
+        .execute(
+            "UPDATE archives SET last_verified_missing_at='staged-before-outer-commit' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    fs::rename(&root, temp.path().join("original")).unwrap();
+    fs::create_dir(&root).unwrap();
+    assert!(db.validate_scan_source_commit(run).is_err());
+    db.rollback_catalogue_refresh();
+    assert_eq!(
+        db.load_archives().unwrap()[0].last_verified_missing_at,
+        None
+    );
+    assert_eq!(
+        fs::read(temp.path().join("original/game.zip")).unwrap(),
+        b"fixture"
+    );
+}

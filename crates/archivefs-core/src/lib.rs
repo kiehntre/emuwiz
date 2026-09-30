@@ -3760,7 +3760,17 @@ pub fn scan_all_enabled_sources_at(
         .filter(|folder| enabled_paths.contains(&folder.path))
         .collect();
 
-    let summary = scan_and_persist_folders(&mut database, &enabled_folders, triggered_by)?;
+    let skipped: Vec<_> = sources
+        .iter()
+        .filter(|s| !s.enabled)
+        .map(|s| s.path.clone())
+        .collect();
+    let summary = database::scan_and_persist_folders_with_skipped(
+        &mut database,
+        &enabled_folders,
+        triggered_by,
+        &skipped,
+    )?;
     let paths = enabled_folders
         .iter()
         .map(|folder| folder.path.clone())
@@ -5883,6 +5893,23 @@ impl<'a> ArchiveScanner<'a> {
                 if file_type.is_symlink() {
                     continue;
                 }
+                let mut metadata_error = None;
+                let candidate = if file_type.is_file() {
+                    self.archive_from_fingerprint_or_path(
+                        &path,
+                        source_root,
+                        source_id,
+                        fingerprints,
+                        &mut discovery.timings,
+                        &mut metadata_error,
+                    )
+                } else {
+                    None
+                };
+                if let Some(error) = metadata_error {
+                    discovery.record_scan_error(path.clone(), error);
+                    continue;
+                }
                 if file_type.is_dir() {
                     if excluded_roots.contains(&path) {
                         debug!(
@@ -5907,15 +5934,7 @@ impl<'a> ArchiveScanner<'a> {
                         continue;
                     }
                     child_directories.push((path, depth + 1));
-                } else if file_type.is_file()
-                    && let Some(archive) = self.archive_from_fingerprint_or_path(
-                        &path,
-                        source_root,
-                        source_id,
-                        fingerprints,
-                        &mut discovery.timings,
-                    )
-                {
+                } else if let Some(archive) = candidate {
                     if archive.identity.size_bytes.is_none() {
                         discovery.record_scan_error(
                             path.clone(),
@@ -5961,6 +5980,16 @@ impl<'a> ArchiveScanner<'a> {
                             reason,
                         });
                     }
+                    let non_archive_metadata = match fs::metadata(&path) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            discovery.record_scan_error(
+                                path.clone(),
+                                ArchiveFsError::io(path.clone(), error).to_string(),
+                            );
+                            continue;
+                        }
+                    };
                     if discovery.non_archive_fingerprints.len()
                         < MAX_RETAINED_NON_ARCHIVE_FINGERPRINTS
                         && !self.non_archive_fingerprint_is_current(
@@ -5968,9 +5997,10 @@ impl<'a> ArchiveScanner<'a> {
                             source_root,
                             source_id,
                             fingerprints,
+                            &non_archive_metadata,
                         )
-                        && let Ok(metadata) = fs::metadata(&path)
                     {
+                        let metadata = non_archive_metadata;
                         let modified_time_ns = metadata
                             .modified()
                             .ok()
@@ -6043,10 +6073,17 @@ impl<'a> ArchiveScanner<'a> {
         source_id: Option<i64>,
         fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
         timings: &mut ScanPhaseTimings,
+        metadata_error: &mut Option<String>,
     ) -> Option<Archive> {
         timings.candidates += 1;
         let metadata_started = Instant::now();
-        let metadata = fs::metadata(path).ok()?;
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                *metadata_error = Some(ArchiveFsError::io(path.to_path_buf(), error).to_string());
+                return None;
+            }
+        };
         timings.files_statted += 1;
         timings.stat_metadata_ns += metadata_started.elapsed().as_nanos();
         let relative = path.strip_prefix(source_root).ok()?;
@@ -6122,11 +6159,9 @@ impl<'a> ArchiveScanner<'a> {
         source_root: &Path,
         source_id: Option<i64>,
         fingerprints: &HashMap<(i64, PathBuf), &ScanFingerprint>,
+        metadata: &fs::Metadata,
     ) -> bool {
         let Some(source_id) = source_id else {
-            return false;
-        };
-        let Ok(metadata) = fs::metadata(path) else {
             return false;
         };
         let Ok(relative) = path.strip_prefix(source_root) else {

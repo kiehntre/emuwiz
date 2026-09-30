@@ -230,6 +230,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "record explicit per-source scan coverage",
         sql: include_str!("migrations/0022_scan_source_coverage.sql"),
     },
+    Migration {
+        version: 23,
+        description: "catalogue_safety_bindings",
+        sql: include_str!("migrations/0023_catalogue_safety_bindings.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -5912,6 +5917,58 @@ impl Database {
                 "covered source changed or became unavailable before reconciliation".into(),
             ));
         }
+        let source_guard =
+            crate::catalogue_health::BoundRoot::open(&coverage.root).ok_or_else(|| {
+                ArchiveFsError::Database("source unavailable at missing boundary".into())
+            })?;
+        if Some(source_guard.identity) != coverage.root_identity || !source_guard.current() {
+            return Err(ArchiveFsError::Database(
+                "source changed while opening missing authority".into(),
+            ));
+        }
+        let current_ownership = self.initial_scan_coverage(&[])?;
+        let mut delegated: Vec<_> = current_ownership
+            .iter()
+            .filter(|s| {
+                s.state != crate::catalogue_health::ScanCoverageState::Removed
+                    && s.source_id != source_folder_id
+                    && s.root.starts_with(&coverage.root)
+            })
+            .map(|s| s.root.clone())
+            .collect();
+        let mut recorded = coverage.excluded_roots.clone();
+        delegated.sort();
+        recorded.sort();
+        if delegated != recorded {
+            return Err(ArchiveFsError::Database(
+                "source ownership changed since coverage proof".into(),
+            ));
+        }
+        if let Some((binding, generation)) = self.source_binding(source_folder_id)? {
+            let recorded:Option<i64> = self.connection.query_row("SELECT source_generation FROM scan_source_coverage WHERE scan_run_id=?1 AND source_folder_id=?2",params![scan_run_id,source_folder_id],|r|r.get(0)).map_err(|e|db_error("read coverage generation",e))?;
+            if recorded != Some(generation)
+                || serde_json::to_string(&source_guard.binding).ok().as_deref()
+                    != Some(binding.as_str())
+            {
+                return Err(ArchiveFsError::Database(
+                    "source generation changed; new scan required".into(),
+                ));
+            }
+        }
+        if self.source_binding(source_folder_id)?.is_none()
+            && self
+                .connection
+                .query_row(
+                    "SELECT last_successful_scan_at IS NOT NULL FROM source_folders WHERE id=?1",
+                    [source_folder_id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .map_err(|e| db_error("verify legacy missing authority", e))?
+        {
+            return Err(ArchiveFsError::Database(
+                "historical source needs reviewed initial binding".into(),
+            ));
+        }
         let mut stmt = self
             .connection
             .prepare(
@@ -5928,6 +5985,7 @@ impl Database {
         drop(stmt);
 
         let seen: HashSet<i64> = seen_archive_ids.iter().copied().collect();
+        let mut unsafe_probe = false;
         let missing: Vec<i64> = candidates
             .into_iter()
             .filter_map(|(id, bytes, kind)| {
@@ -5941,11 +5999,29 @@ impl Database {
                 {
                     return None;
                 }
-                (crate::catalogue_health::observe_path(&path, kind == "arcade_set_directory").probe
-                    == crate::emulator_environment::FsProbe::Missing)
-                    .then_some(id)
+                let probe = source_guard
+                    .probe(&path, kind == "arcade_set_directory")
+                    .probe;
+                if matches!(
+                    probe,
+                    crate::emulator_environment::FsProbe::IoError
+                        | crate::emulator_environment::FsProbe::Inaccessible
+                ) {
+                    unsafe_probe = true;
+                }
+                (probe == crate::emulator_environment::FsProbe::Missing).then_some(id)
             })
             .collect();
+        if unsafe_probe {
+            return Err(ArchiveFsError::Database(
+                "owned candidate could not be probed; missing reconciliation withheld".into(),
+            ));
+        }
+        if !source_guard.current() {
+            return Err(ArchiveFsError::Database(
+                "source changed while probing missing candidates".into(),
+            ));
+        }
         if missing.is_empty() {
             return Ok(0);
         }
@@ -5956,6 +6032,17 @@ impl Database {
             .savepoint()
             .map_err(|error| db_error("failed to start mark-missing transaction", error))?;
         for archive_id in &missing {
+            let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
+            let path = PathBuf::from(OsString::from_vec(bytes));
+            if source_guard
+                .probe(&path, kind == "arcade_set_directory")
+                .probe
+                != crate::emulator_environment::FsProbe::Missing
+            {
+                return Err(ArchiveFsError::Database(
+                    "missing candidate changed at commit".into(),
+                ));
+            }
             tx.execute(
                 "UPDATE archives SET last_verified_missing_at = ?2, updated_at = ?2 WHERE id = ?1",
                 params![archive_id, now],
@@ -5967,6 +6054,11 @@ impl Database {
                 params![scan_run_id, archive_id, now],
             )
             .map_err(|error| db_error("failed to record missing observation", error))?;
+        }
+        if !source_guard.current() {
+            return Err(ArchiveFsError::Database(
+                "source changed before missing commit".into(),
+            ));
         }
         tx.commit()
             .map_err(|error| db_error("failed to commit mark-missing", error))?;
@@ -8306,10 +8398,23 @@ pub(crate) fn scan_and_persist_folders(
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
 ) -> Result<ScanPersistSummary> {
+    scan_and_persist_folders_with_skipped(database, folders, triggered_by, &[])
+}
+
+pub(crate) fn scan_and_persist_folders_with_skipped(
+    database: &mut Database,
+    folders: &[RegisteredSourceFolder],
+    triggered_by: &str,
+    skipped: &[PathBuf],
+) -> Result<ScanPersistSummary> {
     database.begin_catalogue_refresh()?;
-    let result = scan_and_persist_folders_transaction(database, folders, triggered_by);
+    let result = scan_and_persist_folders_transaction(database, folders, triggered_by, skipped);
     match result {
         Ok(summary) => {
+            if let Err(error) = database.validate_scan_source_commit(summary.scan_run_id) {
+                database.rollback_catalogue_refresh();
+                return Err(error);
+            }
             if let Err(error) = database.commit_catalogue_refresh() {
                 database.rollback_catalogue_refresh();
                 return Err(error);
@@ -8327,6 +8432,7 @@ fn scan_and_persist_folders_transaction(
     database: &mut Database,
     folders: &[RegisteredSourceFolder],
     triggered_by: &str,
+    skipped: &[PathBuf],
 ) -> Result<ScanPersistSummary> {
     database.mark_interrupted_scan_runs()?;
     let scan_run_id = database.start_scan_run(triggered_by, None)?;
@@ -8338,6 +8444,13 @@ fn scan_and_persist_folders_transaction(
 
     use crate::catalogue_health::ScanCoverageState;
     let mut coverage = database.initial_scan_coverage(folders)?;
+    crate::catalogue_health::validate_source_ownership(
+        &coverage
+            .iter()
+            .filter(|s| s.state != ScanCoverageState::Removed)
+            .map(|s| s.root.clone())
+            .collect::<Vec<_>>(),
+    )?;
     let mut counts = ScanRunCounts::default();
     let mut folder_errors = Vec::new();
     let mut platform_assignment_warnings = Vec::new();
@@ -8375,6 +8488,17 @@ fn scan_and_persist_folders_transaction(
         }
 
         covered.root_identity = crate::catalogue_health::source_root_identity(&folder.path);
+        if let Some(identity) = covered.root_identity
+            && !database.bind_scan_source(folder.id, identity)?
+        {
+            covered.state = ScanCoverageState::Failed;
+            covered.diagnostic = Some(
+                "source differs from its accepted generation; reviewed rebind required".into(),
+            );
+            counts.errors_count += 1;
+            folder_errors.push((folder.path.clone(), covered.diagnostic.clone().unwrap()));
+            continue;
+        }
         let folder_config = Config {
             source_folders: vec![folder.path.clone()],
             mount_root: PathBuf::new(),
@@ -8396,6 +8520,11 @@ fn scan_and_persist_folders_transaction(
                 .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("arcade"))
         {
             Some(folder.path.clone())
+        } else if folder.path.ancestors().skip(1).any(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("arcade"))
+        }) {
+            Some(folder.path.clone())
         } else {
             let nested = folder.path.join("arcade");
             nested.is_dir().then_some(nested)
@@ -8413,7 +8542,12 @@ fn scan_and_persist_folders_transaction(
                     .iter()
                     .any(|excluded| root.starts_with(excluded))
             })
-            .map(|root| crate::ingestion::discover_extracted_sets(root));
+            .map(|root| {
+                crate::ingestion::discover_extracted_sets_excluding(
+                    root,
+                    &folder.excluded_source_roots,
+                )
+            });
         let arcade_complete = arcade_sets.as_ref().is_none_or(|result| {
             result
                 .as_ref()
@@ -8656,6 +8790,17 @@ fn scan_and_persist_folders_transaction(
             }
         }
 
+        if covered.root_identity.is_none()
+            || crate::catalogue_health::source_root_identity(&folder.path) != covered.root_identity
+            || !database.source_binding_current(folder.id, &folder.path)?
+        {
+            covered.state = ScanCoverageState::Failed;
+            covered.diagnostic =
+                Some("source changed during enumeration; catalogue evidence preserved".into());
+            counts.errors_count += 1;
+            folder_errors.push((folder.path.clone(), covered.diagnostic.clone().unwrap()));
+            continue;
+        }
         database.record_scan_coverage(scan_run_id, covered)?;
         database.begin_folder_refresh()?;
         let db_write_started = std::time::Instant::now();
@@ -8673,6 +8818,17 @@ fn scan_and_persist_folders_transaction(
         } else {
             persist_one_folder(database, scan_run_id, folder, &archives, discovery_complete)
         };
+        let persisted = persisted.and_then(|result| {
+            if crate::catalogue_health::source_root_identity(&folder.path) != covered.root_identity
+                || !database.source_binding_current(folder.id, &folder.path)?
+            {
+                Err(ArchiveFsError::Database(
+                    "source changed before folder commit".into(),
+                ))
+            } else {
+                Ok(result)
+            }
+        });
         match persisted {
             Ok(folder_counts) => {
                 let db_write_ms = db_write_started.elapsed().as_millis();
@@ -8742,12 +8898,11 @@ fn scan_and_persist_folders_transaction(
     }
 
     for covered in &mut coverage {
-        if covered.state == ScanCoverageState::NotAttempted {
+        if covered.state == ScanCoverageState::NotAttempted && skipped.contains(&covered.root) {
+            covered.state = ScanCoverageState::Skipped;
+            covered.diagnostic = Some("source intentionally disabled in configuration".into());
+        } else if covered.state == ScanCoverageState::NotAttempted {
             covered.diagnostic = Some("source was not attempted by this run".into());
-            folder_errors.push((
-                covered.root.clone(),
-                "source was not attempted by this run; its catalogue evidence was preserved".into(),
-            ));
         } else if covered.state == ScanCoverageState::Partial && covered.diagnostic.is_none() {
             covered.diagnostic =
                 Some("incomplete enumeration; missing reconciliation withheld".into());
@@ -8775,6 +8930,19 @@ fn scan_and_persist_folders_transaction(
         )
     };
 
+    for covered in &coverage {
+        if matches!(
+            covered.state,
+            ScanCoverageState::Complete | ScanCoverageState::Partial
+        ) && (crate::catalogue_health::source_root_identity(&covered.root)
+            != covered.root_identity
+            || !database.source_binding_current(covered.source_id, &covered.root)?)
+        {
+            return Err(ArchiveFsError::Database(
+                "source changed before scan commit; scan rolled back".into(),
+            ));
+        }
+    }
     if let Err(error) = database.complete_scan_run(scan_run_id, &counts, error_message.as_deref()) {
         let _ = database.fail_scan_run(scan_run_id, &error.to_string());
         return Err(error);
@@ -8822,7 +8990,24 @@ fn persist_one_folder(
     let mut counts = ScanRunCounts::default();
     let mut seen_archive_ids = Vec::with_capacity(archives.len());
 
+    let identity = crate::catalogue_health::source_root_identity(&folder.path);
     for archive in archives {
+        if folder
+            .excluded_source_roots
+            .iter()
+            .any(|root| archive.path.starts_with(root))
+            || !crate::catalogue_health::observe_owned(
+                &folder.path,
+                identity,
+                &archive.path,
+                archive.kind == ArchiveKind::ArcadeSetDirectory,
+            )
+            .is_present()
+        {
+            return Err(ArchiveFsError::Database(
+                "positive observation outside safe source ownership".into(),
+            ));
+        }
         revalidate_archive_for_catalogue(archive)?;
         let outcome = database.upsert_archive(folder.id, &folder.path, archive)?;
         database.persist_scan_fingerprint(folder.id, &folder.path, archive)?;
@@ -9454,18 +9639,18 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 22);
-        assert_eq!(report.applied_versions, vec![17, 18, 19, 20, 21, 22]);
+        assert_eq!(report.to_version, 23);
+        assert_eq!(report.applied_versions, vec![17, 18, 19, 20, 21, 22, 23]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 22);
+        assert_eq!(upgraded.schema_version().unwrap(), 23);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22]
+            vec![20, 21, 22, 23]
         );
 
         let quick_check: String = upgraded
@@ -9485,11 +9670,11 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 22);
-        assert_eq!(report.applied_versions, vec![21, 22]);
+        assert_eq!(report.to_version, 23);
+        assert_eq!(report.applied_versions, vec![21, 22, 23]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 22);
+        assert_eq!(upgraded.schema_version().unwrap(), 23);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
@@ -9504,7 +9689,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 22);
+        assert_eq!(reopened.schema_version().unwrap(), 23);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -10344,6 +10529,7 @@ mod tests {
             vec![
                 "archive_scan_observations",
                 "archives",
+                "catalogue_health_epoch",
                 "dat_expected_entries",
                 "dat_expected_inventory_meta",
                 "dat_set_audit_dependencies",
@@ -10361,6 +10547,7 @@ mod tests {
                 "schema_migrations",
                 "screenscraper_enrichments",
                 "source_folders",
+                "source_scan_bindings",
                 "verified_identity_facts",
             ]
         );
@@ -18778,7 +18965,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 22);
+            assert_eq!(latest_known_version(MIGRATIONS), 23);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

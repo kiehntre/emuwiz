@@ -1,7 +1,8 @@
 //! Coverage proofs and explicit presence-only reconciliation. No cleanup or relink.
 use super::*;
 use crate::catalogue_health::{
-    CatalogueHealthReport, ScanCoverageState, SourceScanCoverage, observe_path,
+    BoundRoot, CatalogueHealthReport, ScanCoverageState, SourceRootBinding, SourceScanCoverage,
+    source_root_identity,
 };
 
 impl Database {
@@ -22,6 +23,127 @@ impl Database {
             connection,
             path: path.to_path_buf(),
         })
+    }
+
+    pub(crate) fn catalogue_health_epoch(&self) -> Result<Option<i64>> {
+        if self.schema_version()? < 23 {
+            return Ok(None);
+        }
+        self.connection
+            .query_row(
+                "SELECT revision FROM catalogue_health_epoch WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .map_err(|e| db_error("read catalogue preview epoch", e))
+    }
+
+    pub(crate) fn catalogue_source_binding(&self, source: i64) -> Result<Option<(String, i64)>> {
+        if self.schema_version()? < 23 {
+            return Ok(None);
+        }
+        self.source_binding(source)
+    }
+
+    pub(super) fn source_binding(&self, source: i64) -> Result<Option<(String, i64)>> {
+        self.connection.query_row("SELECT root_identity_json,generation FROM source_scan_bindings WHERE source_folder_id=?1", [source], |r| Ok((r.get(0)?,r.get(1)?)))
+            .optional().map_err(|e| db_error("read source scan binding",e))
+    }
+
+    pub(super) fn source_binding_current(&self, source: i64, root: &Path) -> Result<bool> {
+        let Some((expected, _)) = self.source_binding(source)? else {
+            return Ok(false);
+        };
+        Ok(SourceRootBinding::inspect(root)
+            .and_then(|r| serde_json::to_string(&r).ok())
+            .as_deref()
+            == Some(expected.as_str()))
+    }
+
+    /// First actual scan establishes a binding. Subsequent mismatches require
+    /// an explicit reviewed rebind, never an automatic acceptance of a new disk.
+    pub(super) fn bind_scan_source(&self, source: i64, identity: (u64, u64)) -> Result<bool> {
+        let bytes: Vec<u8> = self
+            .connection
+            .query_row(
+                "SELECT path FROM source_folders WHERE id=?1",
+                [source],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_error("read source binding path", e))?;
+        let root = PathBuf::from(OsString::from_vec(bytes));
+        let Some(binding) = SourceRootBinding::inspect(&root) else {
+            return Ok(false);
+        };
+        if (binding.device, binding.inode) != identity {
+            return Ok(false);
+        }
+        let json =
+            serde_json::to_string(&binding).map_err(|e| ArchiveFsError::Database(e.to_string()))?;
+        if let Some((old, _)) = self.source_binding(source)? {
+            return Ok(old == json);
+        }
+        let historical: bool = self
+            .connection
+            .query_row(
+                "SELECT last_successful_scan_at IS NOT NULL FROM source_folders WHERE id=?1",
+                [source],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_error("check unbound historical source", e))?;
+        if historical {
+            return Ok(false);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO source_scan_bindings VALUES (?1,?2,1)",
+                params![source, json],
+            )
+            .map_err(|e| db_error("bind first source scan", e))?;
+        Ok(true)
+    }
+
+    /// Administrative boundary for a separately reviewed legitimate restore or
+    /// remount. Caller must supply the generation they reviewed. Does not change
+    /// catalogue membership or missing evidence; a new scan is still required.
+    pub fn rebind_source_after_review(
+        &mut self,
+        source: i64,
+        expected_generation: i64,
+        expected_binding: SourceRootBinding,
+    ) -> Result<()> {
+        let root: Vec<u8> = self
+            .connection
+            .query_row(
+                "SELECT path FROM source_folders WHERE id=?1 AND removed_from_config_at IS NULL",
+                [source],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_error("review source root", e))?;
+        let root = PathBuf::from(OsString::from_vec(root));
+        if SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding) {
+            return Err(ArchiveFsError::Database(
+                "reviewed source root changed".into(),
+            ));
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| db_error("begin source rebind", e))?;
+        let json = serde_json::to_string(&expected_binding)
+            .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
+        let changed = if expected_generation == 0 {
+            tx.execute("INSERT INTO source_scan_bindings(source_folder_id,root_identity_json,generation) SELECT ?1,?2,1 WHERE NOT EXISTS (SELECT 1 FROM source_scan_bindings WHERE source_folder_id=?1)",params![source,json])
+        } else {
+            tx.execute("UPDATE source_scan_bindings SET root_identity_json=?3,generation=generation+1 WHERE source_folder_id=?1 AND generation=?2",params![source,expected_generation,json])
+        }.map_err(|e|db_error("reviewed source rebind",e))?;
+        if changed != 1 || SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding) {
+            return Err(ArchiveFsError::Database(
+                "source generation changed; review again".into(),
+            ));
+        }
+        tx.commit().map_err(|e| db_error("commit source rebind", e))
     }
 
     pub(crate) fn catalogue_archive_hashes(&self) -> Result<HashMap<i64, String>> {
@@ -98,7 +220,7 @@ impl Database {
             .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
         let excluded = serde_json::to_string(&excluded)
             .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
-        self.connection.execute("INSERT INTO scan_source_coverage(scan_run_id,source_folder_id,state,excluded_roots_json,diagnostic,root_identity_json) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(scan_run_id,source_folder_id) DO UPDATE SET state=excluded.state, excluded_roots_json=excluded.excluded_roots_json,diagnostic=excluded.diagnostic,root_identity_json=excluded.root_identity_json", params![run,coverage.source_id,state,excluded,coverage.diagnostic,root_identity]).map_err(|e| db_error("record source coverage",e))?;
+        self.connection.execute("INSERT INTO scan_source_coverage(scan_run_id,source_folder_id,state,excluded_roots_json,diagnostic,root_identity_json,source_generation) VALUES(?1,?2,?3,?4,?5,?6,(SELECT generation FROM source_scan_bindings WHERE source_folder_id=?2)) ON CONFLICT(scan_run_id,source_folder_id) DO UPDATE SET state=excluded.state, excluded_roots_json=excluded.excluded_roots_json,diagnostic=excluded.diagnostic,root_identity_json=excluded.root_identity_json,source_generation=excluded.source_generation", params![run,coverage.source_id,state,excluded,coverage.diagnostic,root_identity]).map_err(|e| db_error("record source coverage",e))?;
         Ok(())
     }
 
@@ -139,6 +261,24 @@ impl Database {
         Ok(coverage)
     }
 
+    /// Final outer transaction boundary: status/history writes between folder
+    /// persistence and COMMIT must not leave a root replacement unchecked.
+    pub(super) fn validate_scan_source_commit(&self, run: i64) -> Result<()> {
+        for covered in self.scan_coverage(run)? {
+            if matches!(
+                covered.state,
+                ScanCoverageState::Complete | ScanCoverageState::Partial
+            ) && (source_root_identity(&covered.root) != covered.root_identity
+                || !self.source_binding_current(covered.source_id, &covered.root)?)
+            {
+                return Err(ArchiveFsError::Database(
+                    "source changed at scan commit; catalogue evidence preserved".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Explicit apply of a same-database preview. Rechecks every correction
     /// before any update and commits all corrections/history atomically.
     /// Does not change identities, metadata, paths or source membership.
@@ -147,9 +287,17 @@ impl Database {
         &mut self,
         report: &CatalogueHealthReport,
     ) -> Result<usize> {
+        crate::validate_configured_source_roots(&report.configured_roots)?;
         if report.database_path != self.path {
             return Err(ArchiveFsError::Database(
                 "presence preview belongs to another database".into(),
+            ));
+        }
+        // Even an empty plan must not validate a materially stale preview.
+        // Legacy read-only previews need a fresh preview after schema upgrade.
+        if report.epoch.is_none() || report.epoch != self.catalogue_health_epoch()? {
+            return Err(ArchiveFsError::Database(
+                "presence preview changed; preview again before applying".into(),
             ));
         }
         let corrections: Vec<_> = report
@@ -160,22 +308,64 @@ impl Database {
         if corrections.is_empty() {
             return Ok(0);
         }
+        let roots: HashMap<_, _> = report
+            .sources
+            .iter()
+            .filter_map(|s| {
+                let root = BoundRoot::open(&s.root)?;
+                (Some(root.identity) == s.root_identity
+                    && report.source_bindings.get(&s.source_id) == Some(&root.binding))
+                .then_some((s.source_id, root))
+            })
+            .collect();
         let now = now_utc_string();
         let tx = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| db_error("begin presence reconciliation", e))?;
+        let epoch: i64 = tx
+            .query_row(
+                "SELECT revision FROM catalogue_health_epoch WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_error("revalidate preview epoch", e))?;
+        if report.epoch != Some(epoch) {
+            return Err(ArchiveFsError::Database(
+                "presence preview changed; preview again before applying".into(),
+            ));
+        }
         for row in &corrections {
-            let current:Option<(Vec<u8>,Option<String>)>=tx.query_row("SELECT absolute_path_cached,last_verified_missing_at FROM archives WHERE id=?1",[row.archive.id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e| db_error("recheck presence row",e))?;
+            let source = report
+                .sources
+                .iter()
+                .find(|s| s.source_id == row.archive.source_folder_id)
+                .ok_or_else(|| ArchiveFsError::Database("preview source binding absent".into()))?;
+            let current: (Vec<u8>,i64,String,Option<String>)=tx.query_row("SELECT absolute_path_cached,source_folder_id,archive_kind,last_verified_missing_at FROM archives WHERE id=?1",[row.archive.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|e|db_error("revalidate preview row",e))?;
             if current
-                != Some((
+                != (
                     row.archive.absolute_path.as_os_str().as_bytes().to_vec(),
+                    row.archive.source_folder_id,
+                    row.archive.archive_kind.clone(),
                     row.archive.last_verified_missing_at.clone(),
-                ))
-                || observe_path(
-                    &row.archive.absolute_path,
-                    row.archive.archive_kind == "arcade_set_directory",
-                ) != row.observation
+                )
+            {
+                return Err(ArchiveFsError::Database(
+                    "preview representation changed".into(),
+                ));
+            }
+            // The epoch binds every archive/source mutation, including ABA
+            // delete/recreate, representation, identity and new scan history.
+            if roots
+                .get(&source.source_id)
+                .map(|root| {
+                    root.probe(
+                        &row.archive.absolute_path,
+                        row.archive.archive_kind == "arcade_set_directory",
+                    )
+                })
+                .as_ref()
+                != Some(&row.observation)
             {
                 return Err(ArchiveFsError::Database(
                     "presence preview changed; preview again before applying".into(),
@@ -185,8 +375,59 @@ impl Database {
         tx.execute("INSERT INTO scan_runs(started_at,finished_at,triggered_by,status,archives_seen,archives_updated) VALUES(?1,?1,'catalogue-presence-reconciliation','completed',?2,?2)",params![now,corrections.len() as i64]).map_err(|e| db_error("record presence reconciliation",e))?;
         let run = tx.last_insert_rowid();
         for row in &corrections {
+            let source = report
+                .sources
+                .iter()
+                .find(|s| s.source_id == row.archive.source_folder_id)
+                .unwrap();
+            if roots
+                .get(&source.source_id)
+                .map(|root| {
+                    root.probe(
+                        &row.archive.absolute_path,
+                        row.archive.archive_kind == "arcade_set_directory",
+                    )
+                })
+                .as_ref()
+                != Some(&row.observation)
+            {
+                return Err(ArchiveFsError::Database(
+                    "presence changed at commit; preview again".into(),
+                ));
+            }
             tx.execute("UPDATE archives SET last_verified_missing_at=NULL,last_seen_at=?2,updated_at=?2 WHERE id=?1",params![row.archive.id,now]).map_err(|e| db_error("clear stale missing evidence",e))?;
             tx.execute("INSERT INTO archive_scan_observations(scan_run_id,archive_id,observation,size_bytes,modified_time_unix_seconds,observed_at) VALUES(?1,?2,'restored',?3,?4,?5)",params![run,row.archive.id,row.observation.size.map(|v|v as i64),row.observation.modified,now]).map_err(|e| db_error("record current presence evidence",e))?;
+        }
+        for row in &corrections {
+            let source = report
+                .sources
+                .iter()
+                .find(|s| s.source_id == row.archive.source_folder_id)
+                .unwrap();
+            if roots
+                .get(&source.source_id)
+                .map(|root| {
+                    root.probe(
+                        &row.archive.absolute_path,
+                        row.archive.archive_kind == "arcade_set_directory",
+                    )
+                })
+                .as_ref()
+                != Some(&row.observation)
+            {
+                return Err(ArchiveFsError::Database(
+                    "presence changed before reconciliation commit".into(),
+                ));
+            }
+        }
+        for source in &report.sources {
+            if source.root_identity.is_some()
+                && source_root_identity(&source.root) != source.root_identity
+            {
+                return Err(ArchiveFsError::Database(
+                    "source changed at reconciliation commit".into(),
+                ));
+            }
         }
         tx.commit()
             .map_err(|e| db_error("commit presence reconciliation", e))?;

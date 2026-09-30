@@ -1,5 +1,190 @@
 # Catalogue Health Repair — Pass 1
 
+## Safety hardening after independent rejection — 30 September 2026
+
+Starting candidate: `6487d135db4a93403b1c7bf523a27ac9c64abfc4`.
+Independent review: `/tmp/emuwiz-catalogue-health-independent-review/REVIEW.txt`.
+The root-cause diagnosis below remains confirmed. Its original validation and
+readiness claims are historical; this section supersedes them. Main remains
+`dffed242fd9ad5e36febcaec8c93d23098d794b2`. No promotion, push, GUI change,
+real-database migration or real reconciliation has been performed.
+
+### Five repaired boundaries
+
+1. **Ancestor traversal:** the new focused `catalogue_health/path_probe.rs`
+   uses Linux `openat2`, source descriptors, `RESOLVE_NO_SYMLINKS`,
+   `RESOLVE_BENEATH` and `RESOLVE_NO_XDEV`. It checks the root itself without
+   following ancestor symlinks, probes targets relative to a pinned root,
+   compares two target observations and rechecks the root pathname. Final
+   symlinks are detected through descriptor metadata. No canonicalize fallback
+   or path-string stat is accepted as an ownership proof. A symlink, mount
+   crossing, loop, changed target or unreliable probe cannot prove presence or
+   absence. Hash reads also use the same anchored traversal.
+2. **Source continuity:** migration 23 stores accepted source generations,
+   including root device/inode, filesystem type and filesystem ID. Device/inode
+   collisions alone cannot transfer authority to a different filesystem.
+   Scans compare that binding before enumeration, after enumeration, after
+   persistence and before the outer commit. Missing reconciliation holds its
+   authorized root descriptor through probing and savepoint commit, verifies
+   that descriptor against the preflight proof, and checks the generation,
+   current ownership and root continuity again at the write boundary. Changed
+   roots invalidate coverage and preserve prior evidence. A normal reopen or a
+   bind mount of the same tree remains usable; a changed binding requires
+   `rebind_source_after_review` with the reviewed generation and exact
+   `SourceRootBinding::inspect` result. Rebinding changes no archive evidence
+   and invalidates old coverage: a new scan is required. Previously successfully scanned legacy sources
+   without a stored binding require explicit initial review (generation zero),
+   rather than inheriting trust from whatever disk currently occupies the path.
+   Fresh sources establish their first binding on their first actual scan.
+3. **Ownership:** both scanners exclude configured descendants; logical Arcade
+   sets cannot aggregate across a delegated descendant either. A configured
+   extracted-set leaf below Arcade is catalogued by its own source, rather than
+   lost or duplicated under the parent. Most-specific ownership is tested over
+   three levels. Duplicate lexical roots and filesystem/bind aliases are
+   diagnosed before catalogue persistence. Missing writes recheck the current
+   delegation graph against the coverage proof and remain source scoped.
+4. **Preview binding:** migration 23 adds a monotonic catalogue revision with
+   triggers over archive/source/identity/observation/scan/coverage/binding and
+   platform changes. Apply starts an immediate transaction, checks that exact
+   revision, and rechecks ID, path, source, representation, missing stamp,
+   root/volume binding and target device/inode plus nanosecond metadata.
+   Ownership changes, delete/recreate ABA, remove/reattach and a new scan reject
+   old previews. Any drift refuses the apply atomically; no subset silently
+   succeeds. Even an empty plan rejects a stale database revision; schema-21/22
+   read-only previews require a fresh preview after upgrade. A fresh preview can succeed. Current presence is checked before
+   updates and again before commit. Empty fresh plans remain a no-op.
+5. **I/O coverage:** owned-file metadata errors are explicit discovery errors;
+   they no longer become unsupported-file skips. Non-archive cache checks reuse
+   checked metadata instead of swallowing another stat error. EIO/read-dir/
+   entry/permission failures prevent Complete coverage. An unreliable missing
+   candidate probe also withholds the entire missing reconciliation. Safely
+   observed positives remain usable with Partial enumeration.
+
+Migration 22 is unchanged. Migration 23 only adds safety bookkeeping, triggers
+and a coverage-generation column. Schema opening does not reconcile archives
+or invent historical root bindings. Populated 16/21/22 fixtures test upgrades,
+repeat opening and injected migration-bookkeeping rollback. A real-sized
+schema-21 copy upgraded to 23 with every original table row unchanged.
+
+The original broad failures were two stale schema assertions and the real
+regression treating disabled sources as scan errors. Exact migration/table
+inventories now include the legitimate additions; their feature boundaries
+remain enforced. Scan All records deliberately disabled sources as Skipped,
+without errors or false partial status; targeted unattempted sources remain
+NotAttempted/partial. Two further exact schema/table assertions affected by
+migration 23 were updated for the same reason.
+
+### Adversarial and full validation
+
+The independent 20 assertions were imported into
+`tests/catalogue_health_adversarial.rs` without weakening them. Final result:
+**20 passed, zero failed**, including all five process-local injection cases.
+`tests/fixtures/catalogue_faults.c` retains disposable `/tmp` guards and also
+hooks descriptor-relative probes. Seven additional special cases all passed:
+root replacement during enumeration; replacement between preflight and opening
+its descriptor; ancestor symlink insertion between both preview and apply probe
+phases; bind/remount versus wrong filesystem; duplicate configured bind aliases;
+and an actual mount detaching at candidate probing. Mount tests ran in private
+user/mount namespaces, never changing host mounts.
+
+Final full `cargo test --offline --locked -p archivefs-core`:
+**10,027 library tests passed, zero failed; 21 integration binaries passed
+(196 ordinary tests).** The final focused run passed all 15 ordinary independent
+cases and 34 ordinary health cases. All 12 special cases skipped by ordinary
+Cargo invocation were explicitly executed and passed with the fault shim or
+private mount namespace. Remaining unexecuted existing ignores:
+
+- `database::authority::tests::performance_100k_catalogue_and_inventory`
+- `identity_source::no_intro::pack_import::tests::manual_real_love_pack_verification`
+- `tests::scanner_streams_a_directory_larger_than_the_former_global_limit`
+
+The full suite includes scanner, coverage, database, Arcade, migration and
+library-view tests. New cases also cover every symlink position/loops, stale
+path/missing/identity/representation/membership changes, source recovery and
+reviewed rebinding, root filesystem-ID mismatch, deterministic duplicate-name
+bounds and original content preservation. Core doctests passed (zero tests).
+Workspace `cargo check --offline --locked --workspace` passed with the same five
+existing GUI warnings. `cargo fmt --all -- --check` and `git diff --check` passed.
+No GUI tests or GUI source changes were needed.
+
+Reproduce the ordinary assertions with the two integration test targets. For
+special cases compile the checked-in C shim with `cc -shared -fPIC -O2 ... -ldl`,
+then run the built test binaries individually with `--include-ignored --exact
+CASE --test-threads=1`, `TMPDIR=/tmp`, `LD_PRELOAD=<shim>` and
+`EMUWIZ_INJECT_FAULTS=1`. Mount cases additionally run through
+`unshare --user --map-root-user --mount` with `EMUWIZ_TEST_MOUNTS=1`; plain mount
+cases do not require preload. Logs, exact IDs and copy comparisons are retained
+under `/tmp/emuwiz-catalogue-health-hardening`.
+
+### Exact real-sized result and preservation
+
+Fresh read-only copies still classify:
+
+| Fact | Rows |
+|---|---:|
+| Total | 132,064 |
+| Present, stale missing | 69,034 |
+| Present, clean | 28,899 |
+| PresentVerified (existing identity/fingerprint) | 15,658 |
+| PresentNotVerified | 82,275 |
+| PossiblyMoved | 18,606 |
+| Missing | 2,120 |
+| OrphanedSource | 13,405 |
+| NotChecked | 0 |
+| Filename-candidate rows | 30,964 |
+| Ambiguous candidate rows | 101 |
+| Strong SHA candidate rows | 0 |
+
+All **69,034 IDs** exactly match the independent review's ordered list, not
+just its count. Artifact: `/tmp/emuwiz-catalogue-health-hardening/eligible-ids.json`.
+SHA-256 of that list encoded with Python `json.dumps`:
+`43bfdbc17e5ad0c12857849f6ea23a4a83f849a9fd11a17354165551c6c388b9`.
+
+On a separate fresh copy the final rebuilt driver applied exactly 69,034 changes
+and appended 69,034 restoration observations plus one named run. Second preview
+proposed zero; repeated apply returned zero. Exact comparisons preserve archive
+paths, source IDs, platforms, identity, original observations, source membership
+and every untouched archive row, including orphan/move/missing rows. Remaining
+missing flags: 20,729. SQLite integrity and foreign-key checks passed on migration
+and apply copies. Opening alone changed no original catalogue/evidence rows.
+All explicit audit, migration and reconciliation drivers used copies; the real
+file was byte-copied and hashed. No migration or reconciliation was directed at
+the real database.
+
+Real database before SHA-256:
+`2f2a69e31fbd0bd9df80a4eab7e88815472deb17878565ab4b9128ea759e0ab4`.
+Real database after SHA-256:
+`2f2a69e31fbd0bd9df80a4eab7e88815472deb17878565ab4b9128ea759e0ab4`.
+
+### Performance and limits
+
+Indexing remains once per report. Basename and historical-SHA groups retain at
+most 256 detail relationships each, with explicit truncation on oversized
+groups and group-level ambiguity retained. The adversarial duplicate-name test
+proves deterministic bounded details rather than a Cartesian-product explosion.
+No relink, deletion or filename identity is introduced. Optional SHA reads have
+a 256 MiB declared-byte budget and abort if a file grows past its observed size;
+no payload was hashed on the real corpus (it has no archive hashes).
+
+Measured previews include 9.30 seconds during the first copy apply, 12.43 seconds
+with concurrent compilation, and 16.73 seconds for a fresh-copy run with substantial I/O waiting. Final
+copy apply: 5.47-second preview and 12.17-second application. Peak standalone
+preview RSS was approximately 312 MiB versus the independent 281 MiB baseline,
+reflecting retained filesystem/preview bindings; CPU time remained close to the
+baseline. Cold I/O explains the slower wall-clock observations, rather than
+quadratic candidate work. The final warm repeat took 5.52 seconds, with 3.33 seconds user CPU and 2.06
+seconds system CPU. Timing logs retain the slower observations too. No source payload hashing or recursive per-row directory enumeration occurs.
+
+Linux `openat2` support is required; unsupported kernels fail closed without a
+weaker fallback. Filesystem identifiers are metadata continuity evidence, not
+cryptographic game identity: indistinguishable cloned filesystems need external
+review, and unstable network/removable bindings may require reviewed rebinding.
+Physical removable-device/reboot/NFS QA was not performed; actual isolated bind,
+wrong-filesystem and detach tests were. GUI projection remains Pass 2. Pending
+mount health, existing identity semantics and Cheat Core APIs remain unchanged.
+
+## Original repair record (historical validation)
+
 Base: `dffed242fd9ad5e36febcaec8c93d23098d794b2`; local main equalled
 fresh origin/main and was tracked-clean. Branch `fix/catalogue-health-truth`,
 worktree `/home/davedap/emuwiz-catalogue-health-truth`. No promotion or push.
@@ -222,7 +407,7 @@ Reproduce the read-only report from this worktree:
 ```sh
 cargo run --offline --locked -p archivefs-core \
   --example catalogue_health_preview -- \
-  /home/davedap/.local/share/archivefs/library.sqlite3 \
+  DATABASE_COPY.sqlite3 \
   /home/davedap/.config/archivefs/config.toml
 ```
 

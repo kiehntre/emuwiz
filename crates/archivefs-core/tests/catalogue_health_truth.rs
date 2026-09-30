@@ -1,5 +1,5 @@
 use archivefs_core::catalogue_health::{
-    CatalogueHealth, MoveEvidence, ScanCoverageState, preview_catalogue_health,
+    CatalogueHealth, MoveEvidence, ScanCoverageState, SourceRootBinding, preview_catalogue_health,
 };
 use archivefs_core::{Archive, Config, Database, scan_and_persist};
 use rusqlite::{Connection, params};
@@ -474,7 +474,21 @@ fn historical_hash_mismatch_cannot_strengthen_a_name_match() {
 fn preceding_schema_preview_does_not_migrate_or_write() {
     let mut f = Fixture::new(&["games"]);
     f.add(0, "game.zip");
-    f.sql().execute_batch("DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version=22; PRAGMA user_version=21;").unwrap();
+    let sql = f.sql();
+    let triggers: Vec<String> = sql
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'catalogue_epoch_%'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for trigger in triggers {
+        sql.execute_batch(&format!("DROP TRIGGER {trigger}"))
+            .unwrap();
+    }
+    sql.execute_batch("DROP TABLE source_scan_bindings; DROP TABLE catalogue_health_epoch; DELETE FROM schema_migrations WHERE version=23; DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version=22; PRAGMA user_version=21;").unwrap();
     let before = fs::read(f.db.path()).unwrap();
     let read_only = Database::open_catalogue_health_read_only(f.db.path()).unwrap();
     assert_eq!(
@@ -486,4 +500,570 @@ fn preceding_schema_preview_does_not_migrate_or_write() {
     );
     assert_eq!(read_only.schema_version().unwrap(), 21);
     assert_eq!(fs::read(f.db.path()).unwrap(), before);
+}
+
+#[test]
+fn every_symlink_position_and_loop_refuses_presence() {
+    use std::os::unix::fs::symlink;
+    for position in ["root", "parent", "middle", "leaf", "loop"] {
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "SNES/deeper/game.zip");
+        f.stale(id);
+        let target = match position {
+            "root" => f.roots[0].clone(),
+            "parent" => f.roots[0].join("SNES"),
+            "middle" | "loop" => path.parent().unwrap().to_path_buf(),
+            _ => path.clone(),
+        };
+        let outside = f.temp.path().join("saved");
+        fs::rename(&target, &outside).unwrap();
+        symlink(
+            if position == "loop" {
+                &target
+            } else {
+                &outside
+            },
+            &target,
+        )
+        .unwrap();
+        assert_eq!(f.preview().counts.rows_would_change, 0, "{position}");
+        assert!(f.flag(id).is_some());
+    }
+}
+
+#[test]
+fn introduced_ancestor_symlink_invalidates_an_existing_preview() {
+    use std::os::unix::fs::symlink;
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "SNES/deeper/game.zip");
+    f.stale(id);
+    let preview = f.preview();
+    let parent = path.parent().unwrap();
+    let saved = f.temp.path().join("saved");
+    fs::rename(parent, &saved).unwrap();
+    symlink(&saved, parent).unwrap();
+    assert!(f.db.apply_presence_reconciliation(&preview).is_err());
+    assert!(f.flag(id).is_some());
+}
+
+#[test]
+fn stale_preview_refuses_database_changes_including_aba() {
+    for change in [
+        "path",
+        "missing",
+        "removed",
+        "reattached",
+        "delete_recreate",
+        "new_scan",
+        "identity",
+    ] {
+        let mut f = Fixture::new(&["games"]);
+        let (id, _) = f.add(0, "game.zip");
+        f.stale(id);
+        let preview = f.preview();
+        let sql = f.sql();
+        match change {
+            "path" => {
+                sql.execute(
+                    "UPDATE archives SET absolute_path_cached=?1 WHERE id=?2",
+                    params![
+                        f.roots[0].join("other.zip").as_os_str().as_encoded_bytes(),
+                        id
+                    ],
+                )
+                .unwrap();
+            }
+            "missing" => {
+                sql.execute(
+                    "UPDATE archives SET last_verified_missing_at='new-evidence' WHERE id=?1",
+                    [id],
+                )
+                .unwrap();
+            }
+            "removed" => {
+                sql.execute(
+                    "UPDATE source_folders SET removed_from_config_at='removed'",
+                    [],
+                )
+                .unwrap();
+            }
+            "reattached" => {
+                sql.execute_batch("UPDATE source_folders SET removed_from_config_at='removed'; UPDATE source_folders SET removed_from_config_at=NULL;").unwrap();
+            }
+            "delete_recreate" => {
+                sql.execute_batch("CREATE TEMP TABLE saved AS SELECT * FROM archives; DELETE FROM archives; INSERT INTO archives SELECT * FROM saved;").unwrap();
+            }
+            "new_scan" => {
+                f.db.start_scan_run("new scan", None).unwrap();
+            }
+            _ => {
+                sql.execute(
+                    "UPDATE archives SET archive_hash=?1 WHERE id=?2",
+                    params!["f".repeat(64), id],
+                )
+                .unwrap();
+            }
+        }
+        assert!(
+            f.db.apply_presence_reconciliation(&preview).is_err(),
+            "{change}"
+        );
+        if change != "path" {
+            assert_eq!(
+                f.preview().counts.rows_would_change,
+                1,
+                "fresh preview: {change}"
+            );
+        }
+    }
+}
+
+#[test]
+fn known_root_replacement_requires_reviewed_generation_and_new_scan() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, _) = f.add(0, "SNES/game.zip");
+    let scan = f.scan();
+    let source = f.db.load_archives().unwrap()[0].source_folder_id;
+    fs::rename(&f.roots[0], f.temp.path().join("preserved")).unwrap();
+    fs::create_dir(&f.roots[0]).unwrap();
+    let blocked = f.scan();
+    assert_eq!(blocked.counts.archives_missing, 0);
+    assert_eq!(f.flag(id), None);
+    let identity = SourceRootBinding::inspect(&f.roots[0]).unwrap();
+    assert!(
+        f.db.rebind_source_after_review(source, 99, identity.clone())
+            .is_err()
+    );
+    f.db.rebind_source_after_review(source, 1, identity)
+        .unwrap();
+    assert!(
+        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[])
+            .is_err()
+    );
+    assert_eq!(f.flag(id), None);
+    assert_eq!(f.scan().counts.archives_missing, 1);
+}
+
+#[test]
+fn unavailable_then_same_source_restored_keeps_its_generation() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, _) = f.add(0, "game.zip");
+    f.scan();
+    let saved = f.temp.path().join("disconnected");
+    fs::rename(&f.roots[0], &saved).unwrap();
+    assert_eq!(f.scan().counts.archives_missing, 0);
+    assert_eq!(f.flag(id), None);
+    fs::rename(saved, &f.roots[0]).unwrap();
+    drop(f.db);
+    f.db = Database::open_or_create(f.temp.path().join("library.sqlite3")).unwrap();
+    assert!(f.scan().folder_errors.is_empty());
+    assert_eq!(
+        f.sql()
+            .query_row("SELECT generation FROM source_scan_bindings", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn ownership_is_most_specific_across_three_levels_and_specialist_leaf() {
+    let mut f = Fixture::new(&[
+        "games",
+        "games/arcade/ownedset",
+        "games/extra",
+        "games/extra/inner",
+    ]);
+    fs::write(f.roots[1].join("chip.u1"), b"one").unwrap();
+    fs::write(f.roots[1].join("chip.u2"), b"two").unwrap();
+    let parentset = f.roots[0].join("arcade/parentset");
+    fs::create_dir_all(&parentset).unwrap();
+    fs::write(parentset.join("chip.u1"), b"one").unwrap();
+    fs::write(parentset.join("chip.u2"), b"two").unwrap();
+    f.add(0, "SNES/game.zip");
+    f.add(0, "PS2/game.zip");
+    f.add(2, "own.zip");
+    f.add(3, "deep.zip");
+    let summary = f.scan();
+    assert!(
+        summary.folder_errors.is_empty(),
+        "{:?}",
+        summary.folder_errors
+    );
+    let rows = f.db.load_archives().unwrap();
+    let sources = f.db.list_source_folders().unwrap();
+    for row in &rows {
+        let owner = sources
+            .iter()
+            .filter(|s| row.absolute_path.starts_with(&s.path))
+            .max_by_key(|s| s.path.components().count())
+            .unwrap();
+        assert_eq!(
+            row.source_folder_id,
+            owner.id,
+            "{}",
+            row.absolute_path.display()
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.absolute_path == row.absolute_path)
+                .count(),
+            1
+        );
+    }
+    assert!(
+        rows.iter()
+            .any(|r| r.absolute_path == f.roots[1] && r.archive_kind == "arcade_set_directory")
+    );
+    assert!(rows.iter().any(|r| r.absolute_path == parentset));
+    assert_eq!(rows.len(), 6);
+}
+
+#[test]
+fn duplicate_basenames_have_bounded_deterministic_review_details() {
+    let mut f = Fixture::new(&["games"]);
+    for i in 0..300 {
+        f.add(0, &format!("present/{i}/game.zip"));
+    }
+    for i in 0..300 {
+        let (_, p) = f.add(0, &format!("absent/{i}/game.zip"));
+        fs::remove_file(p).unwrap();
+    }
+    let preview = f.preview();
+    assert_eq!(preview.counts.possibly_moved, 300);
+    assert_eq!(preview.counts.ambiguous_move_candidates, 300);
+    for row in preview
+        .rows
+        .iter()
+        .filter(|r| r.health == CatalogueHealth::PossiblyMoved)
+    {
+        assert_eq!(row.move_candidates.len(), 256);
+        assert!(row.move_candidates_truncated);
+    }
+    assert_eq!(preview, f.preview());
+}
+
+#[test]
+fn historical_unbound_source_requires_explicit_initial_review() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    fs::remove_file(path).unwrap();
+    f.sql()
+        .execute(
+            "UPDATE source_folders SET last_successful_scan_at='legacy-scan'",
+            [],
+        )
+        .unwrap();
+    let before = f.db.load_archives().unwrap();
+    let blocked = f.scan();
+    assert_eq!(blocked.counts.archives_missing, 0);
+    assert_eq!(f.db.load_archives().unwrap(), before);
+    let source = before[0].source_folder_id;
+    f.db.rebind_source_after_review(source, 0, SourceRootBinding::inspect(&f.roots[0]).unwrap())
+        .unwrap();
+    assert_eq!(f.scan().counts.archives_missing, 1);
+    assert!(f.flag(id).is_some());
+}
+
+#[test]
+#[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+fn mount_bind_and_wrong_filesystem_fail_closed_without_remount_trap() {
+    use std::ffi::CString;
+    assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+    struct Mounted(CString);
+    impl Drop for Mounted {
+        fn drop(&mut self) {
+            assert_eq!(
+                unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) },
+                0
+            );
+        }
+    }
+    let mut f = Fixture::new(&["games"]);
+    let (id, _) = f.add(0, "game.zip");
+    f.scan();
+    let target = CString::new(f.roots[0].as_os_str().as_encoded_bytes()).unwrap();
+    // Same tree through a bind mount is a legitimate reopening of the source.
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                target.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let bind = Mounted(target.clone());
+    assert!(f.scan().folder_errors.is_empty());
+    drop(bind);
+    // An unrelated filesystem at that path is not the accepted generation.
+    let tmpfs = CString::new("tmpfs").unwrap();
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                tmpfs.as_ptr(),
+                target.as_ptr(),
+                tmpfs.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let other = Mounted(target);
+    let blocked = f.scan();
+    assert_eq!(blocked.counts.archives_missing, 0);
+    assert_eq!(f.flag(id), None);
+    drop(other);
+    assert!(f.scan().folder_errors.is_empty());
+    // A mount under the source must never import outside content or restore
+    // stale evidence, even a bind mount with the same st_dev.
+    let (id, path) = f.add(0, "SNES/game.zip");
+    f.stale(id);
+    let outside = f.temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("game.zip"), b"fixture bytes").unwrap();
+    let src = CString::new(outside.as_os_str().as_encoded_bytes()).unwrap();
+    let dst = CString::new(path.parent().unwrap().as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let nested = Mounted(dst);
+    assert_eq!(f.preview().counts.rows_would_change, 0);
+    drop(nested);
+    assert_eq!(f.preview().counts.rows_would_change, 1);
+}
+
+#[test]
+#[ignore = "requires process-local fault shim; run separately"]
+fn root_replaced_during_enumeration_preserves_catalogue_evidence() {
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "SNES/game.zip");
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &path);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+    }
+    let summary = f.scan();
+    assert_eq!(summary.counts.archives_missing, 0);
+    assert_eq!(f.flag(id), None);
+    assert_eq!(
+        f.db.scan_coverage(summary.scan_run_id).unwrap()[0].state,
+        ScanCoverageState::Failed
+    );
+    assert!(
+        f.roots[0]
+            .with_extension("saved-original")
+            .join("SNES/game.zip")
+            .exists()
+    );
+}
+
+#[test]
+#[ignore = "requires isolated mount namespace and process-local fault shim"]
+fn mount_disappearing_at_candidate_probe_preserves_missing_evidence() {
+    use std::ffi::CString;
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games"]);
+    let target = CString::new(f.roots[0].as_os_str().as_encoded_bytes()).unwrap();
+    let tmpfs = CString::new("tmpfs").unwrap();
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                tmpfs.as_ptr(),
+                target.as_ptr(),
+                tmpfs.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let (id, path) = f.add(0, "game.zip");
+    let scan = f.scan();
+    let source = f.db.load_archives().unwrap()[0].source_folder_id;
+    let old = fs::metadata(&f.roots[0]).unwrap();
+    fs::remove_file(&path).unwrap();
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &path);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_UNMOUNT", "1");
+    }
+    assert!(
+        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[])
+            .is_err()
+    );
+    assert_ne!(
+        fs::metadata(&f.roots[0]).unwrap().dev(),
+        old.dev(),
+        "fault must detach the mount"
+    );
+    assert_eq!(f.flag(id), None);
+}
+
+#[test]
+fn filesystem_id_collision_with_same_device_inode_is_not_accepted() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, _) = f.add(0, "game.zip");
+    let scan = f.scan();
+    f.stale(id);
+    let source = f.db.load_archives().unwrap()[0].source_folder_id;
+    let current = SourceRootBinding::inspect(&f.roots[0]).unwrap();
+    let mut other = current.clone();
+    other.filesystem_id[0] ^= 0xff;
+    f.sql()
+        .execute(
+            "UPDATE source_scan_bindings SET root_identity_json=?1",
+            [serde_json::to_string(&other).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(f.preview().counts.rows_would_change, 0);
+    assert!(
+        f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[])
+            .is_err()
+    );
+    assert_eq!(f.scan().counts.archives_missing, 0);
+    assert!(f.flag(id).is_some());
+    f.db.rebind_source_after_review(source, 1, current).unwrap();
+    assert_eq!(f.scan().counts.archives_restored, 1);
+    assert_eq!(f.flag(id), None);
+}
+
+#[test]
+#[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+fn duplicate_configured_bind_aliases_are_diagnosed_without_catalogue_writes() {
+    use std::ffi::CString;
+    assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games", "alias"]);
+    f.add(0, "game.zip");
+    let before = f.db.load_archives().unwrap();
+    let src = CString::new(f.roots[0].as_os_str().as_encoded_bytes()).unwrap();
+    let dst = CString::new(f.roots[1].as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let config = Config {
+        source_folders: f.roots.clone(),
+        mount_root: f.temp.path().join("mounts"),
+        ratarmount_bin: "ratarmount".into(),
+        master_rom_root: None,
+    };
+    let result = scan_and_persist(&mut f.db, &config, "duplicate bind alias");
+    assert_eq!(unsafe { libc::umount2(dst.as_ptr(), libc::MNT_DETACH) }, 0);
+    assert!(result.is_err());
+    assert_eq!(f.db.load_archives().unwrap(), before);
+}
+
+fn inject_parent_link_between_target_probes(apply: bool) {
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "SNES/deeper/game.zip");
+    f.stale(id);
+    let preview = f.preview();
+    let parent = path.parent().unwrap();
+    let outside = f.temp.path().join("outside-original");
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &path);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_PROBE_NUMBER", "2");
+        std::env::set_var("EMUWIZ_FAULT_PARENT_LINK", parent);
+        std::env::set_var("EMUWIZ_FAULT_LINK_TARGET", &outside);
+    }
+    if apply {
+        assert!(f.db.apply_presence_reconciliation(&preview).is_err());
+    } else {
+        assert_eq!(f.preview().counts.rows_would_change, 0);
+    }
+    assert!(
+        fs::symlink_metadata(parent)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "injection must happen between the target probes"
+    );
+    assert_eq!(
+        fs::read(outside.join("game.zip")).unwrap(),
+        b"fixture bytes"
+    );
+    assert!(f.flag(id).is_some());
+}
+
+#[test]
+#[ignore = "requires process-local fault shim; run separately"]
+fn ancestor_symlink_inserted_between_presence_probe_phases_is_refused() {
+    inject_parent_link_between_target_probes(false);
+}
+
+#[test]
+#[ignore = "requires process-local fault shim; run separately"]
+fn ancestor_symlink_inserted_between_apply_probe_phases_is_refused() {
+    inject_parent_link_between_target_probes(true);
+}
+
+#[test]
+#[ignore = "requires process-local fault shim; run separately"]
+fn root_replaced_between_preflight_and_descriptor_binding_is_refused() {
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games"]);
+    let (id, _) = f.add(0, "game.zip");
+    let source = f.db.load_archives().unwrap()[0].source_folder_id;
+    let old = fs::metadata(&f.roots[0]).unwrap();
+    let run = f.db.start_scan_run("preflight swap", None).unwrap();
+    f.sql().execute("INSERT INTO scan_source_coverage(scan_run_id,source_folder_id,state,excluded_roots_json,root_identity_json) VALUES(?1,?2,'\"complete\"','[]',?3)",params![run,source,serde_json::to_string(&(old.dev(),old.ino())).unwrap()]).unwrap();
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_PROBE_NUMBER", "3");
+    }
+    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert_ne!(
+        fs::metadata(&f.roots[0]).unwrap().ino(),
+        old.ino(),
+        "fault must replace the root after the two preflight probes"
+    );
+    assert_eq!(f.flag(id), None);
+    assert!(
+        f.roots[0]
+            .with_extension("saved-original")
+            .join("game.zip")
+            .exists()
+    );
+}
+
+#[test]
+fn empty_preview_is_refused_after_missing_evidence_changes() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, _) = f.add(0, "game.zip");
+    let empty = f.preview();
+    assert_eq!(empty.counts.rows_would_change, 0);
+    f.stale(id);
+    assert!(f.db.apply_presence_reconciliation(&empty).is_err());
+    let fresh = f.preview();
+    assert_eq!(f.db.apply_presence_reconciliation(&fresh).unwrap(), 1);
+    let next = f.preview();
+    assert_eq!(f.db.apply_presence_reconciliation(&next).unwrap(), 0);
 }

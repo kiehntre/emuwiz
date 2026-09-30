@@ -158,8 +158,17 @@ fn path_context_contains(path: &Path, source_root: &Path, names: &[&str]) -> boo
 /// platform evidence; the set name remains a candidate identity until MAME/
 /// DAT evidence resolves it.
 pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscovery> {
+    discover_extracted_sets_excluding(root, &[])
+}
+
+pub(crate) fn discover_extracted_sets_excluding(
+    root: &Path,
+    excluded: &[std::path::PathBuf],
+) -> std::io::Result<ArcadeSetDiscovery> {
     let mut result = ArcadeSetDiscovery::default();
     let mut directories = Vec::new();
+    let mut direct_members = Vec::new();
+    let mut root_malformed = false;
     for entry in std::fs::read_dir(root)? {
         let entry = match entry {
             Ok(entry) => entry,
@@ -169,6 +178,9 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
             }
         };
         let path = entry.path();
+        if excluded.iter().any(|owned| path.starts_with(owned)) {
+            continue;
+        }
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
@@ -177,19 +189,59 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
             }
         };
         if metadata.file_type().is_symlink() {
+            root_malformed = true;
             continue;
         }
         if metadata.is_dir() {
             directories.push(path);
         } else if metadata.is_file() {
             result.diagnostics.raw_files_considered += 1;
+            direct_members.push(path);
+        } else {
+            root_malformed = true;
         }
+    }
+    // A separately configured leaf below an Arcade namespace owns its own
+    // extracted set. Never aggregate across a configured descendant boundary.
+    let below_arcade = root.ancestors().skip(1).any(|p| {
+        p.file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("arcade"))
+    });
+    if below_arcade
+        && directories.is_empty()
+        && !root_malformed
+        && result.scan_errors_total == 0
+        && (2..=MAX_SET_MEMBERS).contains(&direct_members.len())
+        && !excluded.iter().any(|p| p.starts_with(root))
+        && direct_members.iter().all(|p| {
+            !p.extension().is_some_and(|e| {
+                matches!(
+                    e.to_string_lossy().to_ascii_lowercase().as_str(),
+                    "zip" | "7z" | "rar" | "cue" | "iso"
+                )
+            })
+        })
+        && let Some(set_name) = safe_set_name(root)
+    {
+        direct_members.sort();
+        result.diagnostics.logical_sets_aggregated += 1;
+        result.diagnostics.logical_set_members += direct_members.len();
+        result.diagnostics.playable_games_created += 1;
+        result.sets.push(ArcadeSetDirectory {
+            path: root.to_path_buf(),
+            set_name,
+            members: direct_members,
+        });
     }
     directories.sort();
     if directories.len() > MAX_SET_DIRECTORIES {
         result.scan_errors_total += 1;
     }
     for path in directories.into_iter().take(MAX_SET_DIRECTORIES) {
+        // A logical set cannot absorb a delegated descendant either.
+        if excluded.iter().any(|owned| owned.starts_with(&path)) {
+            continue;
+        }
         if support_material_kind(&path, root, SourceRole::ArcadeRomset).is_some() {
             continue;
         }

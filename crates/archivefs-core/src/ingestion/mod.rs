@@ -47,6 +47,7 @@ pub mod structural_probe;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use arcade::discover_extracted_sets_excluding;
 pub use arcade::{
     ArcadeIngestionDiagnostics, ArcadeSetDirectory, ArcadeSetDiscovery, SupportMaterialKind,
     discover_extracted_sets, support_material_kind,
