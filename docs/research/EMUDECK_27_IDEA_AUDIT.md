@@ -242,3 +242,113 @@ rerun; production parser behavior was not changed.
 No full workspace/GUI suite, release build, network provider smoke or live GUI
 smoke was run. Native file dialogs and local GUI interaction still require
 manual review. The candidate is a local feature commit only.
+
+## Promotion review (30 September 2026)
+
+Starting main: `54d0503b8fa2eaa48f3cf5a0ca71fe935a126384`.
+Original candidate: `e35a75b8f8a6ac112ed0e437724d75d272326fe8`.
+The candidate was rebased first onto `08e32a0c` (Game Details), then onto
+`245e75a6fc93b2cdb1222628b9ff2b65f6bc0fbe` (Browse & Play and IPS fixes).
+Both sets of concurrent work are preserved. The reviewed source after the
+second rebase is `bd0078a6f8a66d38dd2bfd00f5f3e7f5124d1c72`.
+
+The final pre-promotion fetch then found two additional ScummVM launch fixes,
+bringing main to `5eb79001b6eb2eacf37c029f6707c51e0f18be45`. A third clean
+rebase preserved them. Comparing the complete portability code patches before
+and after that rebase produced identical bytes; its reviewed code revision is
+`591697e05ec2190e781e76d89c15df45efef34d5`. Neither intervening commit changed
+the portability model or GUI. The completed canonical GUI suite below was
+not repeated; affected focused checks and the release build were rerun.
+
+The complete diff retains the typed version-1 manifest, deterministic output,
+bounded reads, explicit omissions, machine-specific original paths and exact
+preview-only location choices. It adds no apply API, credential transfer,
+ROM/save/emulator-config payloads or network activity.
+
+The real XFCE/X11 session was verified through `loginctl`, XRandR and Xfwm4:
+`DISPLAY=:0`, 1920×1080, session `c1`, the user's existing session bus.
+The release target was initially empty and isolated at
+`/tmp/emuwiz-portability-review-release-20260930`.
+GUI actions were scoped to the candidate's PID/window and dialog parent.
+Concurrent desktop focus changes interrupted some automation; explicit parent
+and title guards prevented entering fixture paths into unrelated dialogs.
+Review configuration and synthetic credential fixtures live outside the repo.
+
+The first native save smoke found an untitled, unparented GTK portal dialog
+behind the candidate. The portability module now creates titled dialog
+builders from eframe's live native-window context; startup adds only the
+parent-context hook. Save/open/location cancellation has visible feedback,
+the action reads **Export setup…**, and switching workflows clears the old
+summary rather than displaying export and import together. A regression test
+covers that workflow separation.
+
+Successful native save/open and cancellation were exercised on the real
+session. The exported 3,718-byte JSON contained two game-folder references,
+one DAT registration with matching preferences, one manual emulator selection
+and RomM metadata. Unix permissions were `0600`. All synthetic URL userinfo,
+base-path/query/fragment secrets, token bytes and token-file references were
+absent; only `https://romm.example:8443` survived as server metadata. An export
+from the first rebased release was byte-identical to the earlier reviewed file.
+
+The import screen explicitly says **Import preview — no changes applied**.
+Reusable preferences, local-location choices, missing selected emulator files,
+credential setup and excluded categories were inspected. Exact paths and
+preference details remain collapsed. Malformed input and format version 99
+produced visible, redacted errors with no partial preview. Confirming missing
+DAT/executable paths showed missing-location messages; confirming an existing
+folder did not claim verified contents or compatibility. Moving an empty
+review game-folder fixture made its original location visibly missing; the
+fixture was restored after the check.
+
+Six fixture settings/credential files, including GUI preferences, and the
+original exported setup file were verified byte-identical after the workflows.
+The nine normal domain-settings files in the separate baseline were unchanged;
+the shared GUI navigation-preferences file changed during concurrent GUI
+reviews and is not claimed as an unchanged global baseline. No user credential
+was entered or transferred. Evidence screenshots and hashes remain under
+`/tmp/emuwiz-portability-gui-review`.
+
+The daemon interruption stopped an in-progress GUI test compilation, not a
+completed suite. Final validation is recorded below after rerunning on the
+second rebased source. The prior foundation-only cadence above describes the
+implementation lane; this promotion review additionally runs the requested
+canonical GUI suite, workspace check and release build.
+
+After the desktop was reserved for this review, the final rebased release
+passed the native open flow, malformed/version-99 failures, unavailable-path
+review and preview-only native folder selection. The folder selection reported
+that its location exists while contents and compatibility still need checking.
+Its final export was byte-identical to the earlier export. Open and save
+cancellation were visible and harmless; all six isolated settings/credential
+hashes matched the baseline after these final workflows. The candidate closed
+normally through the window manager with exit status zero.
+
+| Final promotion validation on `bd0078a6` | Result |
+|---|---|
+| Focused core setup-portability integration tests | 26 passed |
+| Focused GUI setup-portability tests | 8 passed |
+| Affected emulator setup-override tests | 13 passed |
+| Canonical GUI-v2 suite, single test thread | 370 passed, 1 ignored |
+| `cargo check --workspace` | Passed; five existing GUI warnings |
+| `cargo fmt --all -- --check` | Passed |
+| Working-tree and candidate `git diff --check` | Passed |
+| `cargo build --workspace --release`, locked/offline, isolated target | Passed |
+| Release `emuwiz --version` | `emuwiz 0.9.0 · GUI v2 (native-v2)` |
+
+No import application, controller/display setup, saves, ROM transfer or
+credential transfer was added. The portability surface remains a summary
+export and read-only preview. Native dialogs were exercised on Linux/XFCE;
+other desktop platforms were not tested in this review.
+
+The third-rebase release build passed again (4m 43s) and reported the same
+version. On the same verified XFCE session, its native save/open dialogs,
+export/import summaries, credential-attention wording and omitted categories
+passed a final smoke. Its export remained byte-identical to the original.
+All six isolated settings/credential files and the original setup file still
+matched their baselines, including after normal window-manager exit (status
+zero). The candidate was closed and the desktop released after this smoke.
+
+Third-rebase affected validation passed: 26 core portability tests, 8 GUI
+portability tests, `cargo check --workspace`, `cargo fmt --all -- --check`,
+working-tree/candidate diff checks and the task scope/root-boundary guards.
+The workspace check retained the same five existing GUI warnings.
