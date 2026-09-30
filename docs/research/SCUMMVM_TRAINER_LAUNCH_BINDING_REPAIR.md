@@ -96,7 +96,8 @@ The read is capped at 1 MiB plus one overflow probe byte; individual lines
 are capped at 8 KiB. Absolute paths are capped at 4 KiB, target names at 96
 ASCII identifier characters. Parent traversal, reserved application targets,
 missing bindings, invalid UTF-8, control characters, malformed native INI,
-duplicate sections and keys (including case variants) fail closed.
+duplicate native domains and keys (including game-domain/key case variants)
+fail closed.
 No value is repaired, unquoted, or interpreted as a filename heuristic.
 
 Linux opens every configuration component with `openat`/`O_NOFOLLOW`; the leaf
@@ -191,7 +192,7 @@ Official tagged sources were fetched read-only into the same disposable root.
 The persistence results above are runtime observations, not assumptions from
 those sources.
 
-## Validation
+## Original candidate validation
 
 Focused ScummVM tests, a targeted core check, formatting and diff hygiene are
 the validation scope. No full workspace suite, GUI suite/smoke or release build
@@ -208,3 +209,120 @@ was run for this branch.
 - Exact seven-file scope guard and GUI boundary check: passed; zero GUI changes.
 - Recorded runtime-result assertions: passed for engine load, child exit,
   byte preservation, new saves at configured savepath and native config writes.
+
+## Promotion-review savepath repair
+
+Starting reviewed candidate: `eb7252ddbbdb58f5fdc225567aee4356d6f2dfa9`.
+The same `fix/scummvm-trainer-launch-binding` branch was retained. Before the
+repair, it rebased cleanly onto main `973228c9fb3fbfd1d3dfb4de1121159ebe2aa9ea`.
+Only the launch validator, its tests and this report were edited for the repair.
+
+The promotion review reproduced two unsafe acceptances: `[SCUMMVM]` falsely
+satisfied the global savepath requirement, and Unicode trimming falsely made
+a U+00A0-prefixed value appear absolute. Native runtime respectively saved to
+the default profile directory or failed to save. These observations supersede
+the original candidate's implicit claim that all accepted savepath bindings
+match native parsing.
+
+The fixed rules are derived from the official **v2.8.0** sources, fetched into
+`/tmp/emuwiz-scummvm-native-semantics-source`:
+
+- `ConfigManager::addDomain` recognizes the application singleton only by
+  exact `scummvm` spelling. `[SCUMMVM]` and `[ScummVM]` are other domains and
+  cannot provide a global savepath. `[ scummvm ]` is invalid native syntax.
+  Canonical `[scummvm]` and a differently spelled misc domain can coexist;
+  only the canonical domain contributes application settings.
+- Game/misc target names use the explicitly case-insensitive `DomainMap`
+  declared in
+  [config-manager.h](https://github.com/scummvm/scummvm/blob/v2.8.0/common/config-manager.h).
+  Selected game-target matching now follows that comparison, while ambiguous
+  duplicate native domains remain rejected. Reserved trainer target names
+  retain the existing conservative refusal.
+- Native keys use the case-insensitive `StringMap` in
+  [hash-str.h](https://github.com/scummvm/scummvm/blob/v2.8.0/common/hash-str.h).
+  Duplicate keys, including identical or case-variant savepaths, are refused
+  in either the application or selected target domain.
+- [Common::String::trim](https://github.com/scummvm/scummvm/blob/v2.8.0/common/str-base.cpp)
+  calls [Common::isSpace](https://github.com/scummvm/scummvm/blob/v2.8.0/common/util.cpp),
+  which first rejects bytes outside ASCII and then calls C `isspace`.
+  Validation trims only space, tab, LF, CR, VT and FF, never Unicode whitespace.
+  The existing strict line/control-character gate still applies. Native ASCII
+  padding around keys/values is parsed internally without rewriting the file.
+- A U+00A0/U+2003/U+202F/U+3000 prefix stays literal, so a prefixed savepath
+  fails the absolute-path gate. Unicode whitespace inside or at the end of a
+  genuinely absolute POSIX filename stays literal; no path content is silently
+  repaired. The explicit selected target savepath retains precedence over the
+  canonical global savepath, and an invalid target value does not fall back.
+
+Six regression tests cover canonical and near-match application domains,
+native target-case matching and duplicate targets, ASCII padding, Unicode
+prefixes in paths/keys/identity evidence, literal Unicode path preservation,
+and duplicate application/target savepaths. The original 72 tests remain in
+the focused ScummVM test selection.
+
+### Repaired runtime evidence
+
+ScummVM 2.8.0 / SDL 2.30.0 was retested under
+`/tmp/emuwiz-scummvm-savepath-repair-proof/repaired`, with private Xvfb,
+HOME/XDG config/data/cache, media, logs and save directories. The existing
+91-byte synthetic AGI save/quit fixture was copied only from the disposable
+fixture root; no user content or saves were used. SHA-256 snapshots and
+assertions checked every case, including all pre-existing save sentinels and
+the entire media tree. Results are in that root's `results.json`.
+
+The disposable Rust client links the production `archivefs-core` library,
+calls the real preflight API, and invokes `spawn_scummvm` with the reviewed
+`-c FILE -p FOLDER TARGET` command. The spawn API revalidates the config using
+the same native-config gate. Invalid configs fail both gates with no emulator
+process, no profile/cache/save files and no config changes.
+
+**Existing detector limitation discovered:** real ScummVM 2.8.0 `--detect`
+prints a qualified-ID table. Current EmuWiz only parses labelled `Game:` /
+`Game ID:` records, so valid fixture configs pass the config gate but their
+full preflight then refuses with `ScummVmGameIdUnavailable`. This unrelated
+parser was deliberately not changed. For accepted-config runtime proof, the
+client supplies the fixture's independently observed native
+`agi:agi-fanmade` identity directly at the public spawn boundary. Every accepted
+case records real native detection output before launch; there is no fake
+detector executable or fabricated detector response. This proves the repaired
+config/spawn behavior, not a successful end-to-end installed-detector launch.
+
+| Case | Observed config gate / native runtime outcome |
+|---|---|
+| Canonical `[scummvm]` global savepath | Spawned; exit 0; save and timestamps in `global-saves` |
+| `[SCUMMVM]`, no target savepath | Preflight `TrainerConfigurationInvalid`; spawn `InvalidInput`; no process or writes |
+| Target-specific savepath, no global savepath | Spawned; exit 0; save and timestamps in `target-saves` |
+| U+00A0-prefixed global savepath | Preflight `TrainerConfigurationInvalid`; spawn `InvalidInput`; no process or writes |
+| Target-over-global savepath | Spawned; exit 0; writes only in `target-saves` |
+| Leading/trailing ASCII space/tab around savepath | Spawned; exit 0; native-trimmed `global-saves` used |
+| Mixed-case game target section | Spawned; exit 0; selected `target-saves` used |
+| Absolute target savepath ending in literal U+00A0 | Spawned; exit 0; exact Unicode-named save directory used |
+
+No accepted case created a save or timestamp in the disposable default
+`data/scummvm/saves` directory. Source media and all existing save sentinels
+were byte-identical. Accepted runs rewrote only their owned INI and generated
+expected saves/timestamps, logs and disposable Mesa cache. All accepted runs
+quit themselves; no forced termination was required. The Xvfb harness also
+exited successfully. Hypno gameplay effects remain untested; the original
+ownership, concurrent-writer and non-Linux limitations still apply.
+
+### Repair validation
+
+Fresh isolated test target:
+`/tmp/emuwiz-scummvm-savepath-repair-target-Ss9xkq`. Test debug symbols were
+disabled with `CARGO_PROFILE_TEST_DEBUG=0`; tests remained unoptimized with
+debug assertions enabled. No artifacts from the prior review target were reused.
+
+- Focused `cargo test -p archivefs-core --lib scummvm_execution::tests --offline`:
+  **17 passed**, zero failures.
+- Existing focused selection `cargo test -p archivefs-core --lib scummvm --offline`:
+  **78 passed**, zero failures (original 72 plus six regressions).
+- `cargo check -p archivefs-core --offline`: passed using the separate fresh
+  runtime target `/tmp/emuwiz-scummvm-savepath-runtime-target-vtmfEv`.
+- A targeted production library build in that runtime target enabled the
+  disposable real-API harness; no release/workspace build was performed.
+- `cargo fmt --all -- --check`, `git diff --check` and the exact three-file
+  scope guard: passed.
+- Runtime assertions for all eight cases: passed.
+
+No GUI smoke, GUI suite or full workspace suite was run.

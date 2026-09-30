@@ -356,3 +356,157 @@ fn trainer_requires_explicit_native_savepath_with_target_precedence() {
             .any(|a| a.to_string_lossy().contains("savepath"))
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_global_savepath_requires_exact_native_application_section() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    assert!(preflight_scummvm_launch(&request).is_ok());
+    for section in ["SCUMMVM", "ScummVM", " scummvm "] {
+        let text = original.replace("[scummvm]", &format!("[{section}]"));
+        std::fs::write(config, &text).unwrap();
+        assert_eq!(
+            preflight_scummvm_launch(&request).unwrap_err().kind,
+            ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), text);
+    }
+    // The noncanonical misc domain does not replace the canonical application
+    // domain, and its savepath must not contribute to the selected game.
+    std::fs::write(config, format!("[SCUMMVM]\nsavepath=relative\n{original}")).unwrap();
+    assert!(preflight_scummvm_launch(&request).is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_game_target_lookup_uses_native_case_insensitive_domain_map() {
+    let root = tempfile::tempdir().unwrap();
+    let mut request = trainer_request(root.path());
+    let config = request.trainer.as_ref().unwrap().configuration.clone();
+    let original = std::fs::read_to_string(&config).unwrap();
+    let mixed = original.replace("[emuwiz-game]", "[EmuWiz-Game]");
+    std::fs::write(&config, &mixed).unwrap();
+    assert!(preflight_scummvm_launch(&request).is_ok());
+    request.trainer.as_mut().unwrap().target_name = "EMUWIZ-GAME".into();
+    assert!(preflight_scummvm_launch(&request).is_ok());
+    for text in [
+        mixed.replace("[EmuWiz-Game]", "[another-game]"),
+        mixed.replace("[EmuWiz-Game]", "[ EmuWiz-Game ]"),
+        format!("{mixed}\n[emuwiz-game]\ngameid=demo\n"),
+    ] {
+        std::fs::write(&config, &text).unwrap();
+        assert_eq!(
+            preflight_scummvm_launch(&request).unwrap_err().kind,
+            ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+        );
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_ascii_savepath_whitespace_matches_native_trim_without_rewriting() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    let absolute = root.path().join("saves").display().to_string();
+    for value in [
+        absolute.clone(),
+        format!(" {absolute}"),
+        format!("{absolute} "),
+        format!(" \t{absolute}\t "),
+    ] {
+        let text = original.replace(
+            &format!("savepath={absolute}"),
+            &format!(" \tSAVEPATH \t= {value}"),
+        );
+        std::fs::write(config, &text).unwrap();
+        assert!(preflight_scummvm_launch(&request).is_ok());
+        assert_eq!(std::fs::read_to_string(config).unwrap(), text);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_unicode_whitespace_cannot_fake_an_absolute_savepath_or_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    let absolute = root.path().join("saves").display().to_string();
+    // These malformed inputs must be refused before invoking any executable.
+    std::fs::remove_file(&request.expected_executable).unwrap();
+    for space in ['\u{a0}', '\u{2003}', '\u{202f}', '\u{3000}'] {
+        for text in [
+            original.replace(
+                &format!("savepath={absolute}"),
+                &format!("savepath={space}{absolute}"),
+            ),
+            format!("{original}\nsavepath={space}{absolute}\n"),
+            original.replace("gameid=demo", &format!("gameid={space}demo")),
+            original.replace("engineid=hypno", &format!("engineid=hypno{space}")),
+            original.replace("savepath=", &format!("{space}savepath=")),
+            format!("{space}\n{original}"),
+        ] {
+            std::fs::write(config, &text).unwrap();
+            assert_eq!(
+                preflight_scummvm_launch(&request).unwrap_err().kind,
+                ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+            );
+            assert_eq!(std::fs::read_to_string(config).unwrap(), text);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_literal_unicode_savepath_is_preserved_with_native_target_precedence() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    // Unicode whitespace inside/at the end of an absolute POSIX path is
+    // literal filename data, not whitespace to trim or silently repair.
+    let saves = root.path().join("saves\u{2003}literal\u{a0}");
+    std::fs::create_dir(&saves).unwrap();
+    let sentinel = saves.join("existing.sav");
+    std::fs::write(&sentinel, b"unchanged save").unwrap();
+    let text = format!("{original}\nsavepath={}\n", saves.display());
+    std::fs::write(config, &text).unwrap();
+    assert!(preflight_scummvm_launch(&request).is_ok());
+    assert_eq!(std::fs::read_to_string(config).unwrap(), text);
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged save");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trainer_duplicate_savepaths_are_rejected_in_application_and_target_domains() {
+    let root = tempfile::tempdir().unwrap();
+    let request = trainer_request(root.path());
+    let config = &request.trainer.as_ref().unwrap().configuration;
+    let original = std::fs::read_to_string(config).unwrap();
+    let absolute = root.path().join("saves").display().to_string();
+    for text in [
+        original.replace(
+            &format!("savepath={absolute}"),
+            &format!("savepath={absolute}\nsavepath={absolute}"),
+        ),
+        original.replace(
+            &format!("savepath={absolute}"),
+            &format!("savepath={absolute}\nSAVEPATH=/other"),
+        ),
+        format!("{original}\nsavepath={absolute}\nsavepath={absolute}\n"),
+        format!("{original}\nsavepath={absolute}\nSAVEPATH=/other\n"),
+    ] {
+        std::fs::write(config, &text).unwrap();
+        assert_eq!(
+            preflight_scummvm_launch(&request).unwrap_err().kind,
+            ScummVmLaunchPreflightErrorKind::TrainerConfigurationInvalid
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), text);
+    }
+}

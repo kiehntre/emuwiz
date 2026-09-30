@@ -78,7 +78,7 @@ pub(super) fn validate(
         if line.len() > MAX_LINE_BYTES || line.chars().any(|c| c.is_control() && c != '\t') {
             return Err(malformed());
         }
-        if line.trim().is_empty() || line.starts_with('#') {
+        if line.trim_matches(native_space).is_empty() || line.starts_with('#') {
             continue;
         }
         if line.starts_with('[') {
@@ -87,7 +87,16 @@ pub(super) fn validate(
                 .and_then(|s| s.strip_suffix(']'))
                 .filter(|s| identifier(s))
                 .ok_or_else(malformed)?;
-            if !sections.insert(section.to_ascii_lowercase()) {
+            // Native singleton domains use exact names. Game/misc domains
+            // use ConfigManager::DomainMap's IgnoreCase comparison instead.
+            // In particular, [SCUMMVM] is not the application domain.
+            let singleton = matches!(section, "scummvm" | "keymapper" | "cloud");
+            let domain = if singleton {
+                section.to_string()
+            } else {
+                section.to_ascii_lowercase()
+            };
+            if !sections.insert((singleton, domain)) {
                 return Err(malformed());
             }
             current = section.into();
@@ -95,15 +104,21 @@ pub(super) fn validate(
         } else {
             // ScummVM's native parser recognizes only column-zero # comments
             // and section headers. Do not accept a more permissive INI dialect.
-            let (key, value) = line.trim_start().split_once('=').ok_or_else(malformed)?;
-            let key = key.trim().to_ascii_lowercase();
+            let (key, value) = line
+                .trim_start_matches(native_space)
+                .split_once('=')
+                .ok_or_else(malformed)?;
+            // Native StringMap keys are case-insensitive. Common::String::trim
+            // uses Common::isSpace, which explicitly refuses non-ASCII bytes.
+            let key = key.trim_matches(native_space).to_ascii_lowercase();
+            let value = value.trim_matches(native_space);
             if current.is_empty() || !identifier(&key) || !keys.insert(key.clone()) {
                 return Err(malformed());
             }
-            if current == trainer.target_name {
-                target.insert(key, value.trim());
-            } else if current.eq_ignore_ascii_case("scummvm") {
-                application.insert(key, value.trim());
+            if current == "scummvm" {
+                application.insert(key, value);
+            } else if current.eq_ignore_ascii_case(&trainer.target_name) {
+                target.insert(key, value);
             }
         }
     }
@@ -129,6 +144,10 @@ pub(super) fn validate(
         ));
     }
     Ok(())
+}
+
+fn native_space(value: char) -> bool {
+    matches!(value, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}')
 }
 
 fn identifier(value: &str) -> bool {
