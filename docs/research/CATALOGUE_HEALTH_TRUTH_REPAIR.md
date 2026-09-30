@@ -156,6 +156,22 @@ Real database before SHA-256:
 Real database after SHA-256:
 `2f2a69e31fbd0bd9df80a4eab7e88815472deb17878565ab4b9128ea759e0ab4`.
 
+### Nested filesystem boundaries (independent re-review blocker)
+
+The scan walker records every directory whose device differs from its parent's
+(a nested mount) in `source_nested_boundaries` (added to unreleased migration 23;
+the first observation is never overwritten). On each later scan, and again at the
+`mark_unseen_archives_missing` write boundary, every remembered boundary must
+still resolve, beneath the pinned root without symlinks, to the identical
+device/inode/filesystem type/filesystem ID. A vanished mount, a replacement
+filesystem or an uninspectable mountpoint makes the source's coverage `Partial`
+with a `nested filesystem boundary ... not proven continuous` diagnostic: no
+`last_verified_missing_at` is written and existing evidence is preserved. Coverage
+is source-wide (coarse by design). Remounting the same filesystem restores
+authority; a replaced one stays refused until it matches again. NO_XDEV probing is
+unchanged. Boundaries never observed before this change cannot be recognised, and
+the read-only preview does not consult this table.
+
 ### Performance and limits
 
 Indexing remains once per report. Basename and historical-SHA groups retain at

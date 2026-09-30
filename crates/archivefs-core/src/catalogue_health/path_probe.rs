@@ -20,6 +20,15 @@ const BENEATH: u64 = 0x08;
 const NO_XDEV: u64 = 0x01;
 
 fn open(fd: i32, path: &Path, read: bool, owned: bool) -> io::Result<File> {
+    open_resolving(
+        fd,
+        path,
+        read,
+        NO_SYMLINKS | if owned { BENEATH | NO_XDEV } else { 0 },
+    )
+}
+
+fn open_resolving(fd: i32, path: &Path, read: bool, resolve: u64) -> io::Result<File> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(io::ErrorKind::InvalidInput.into());
     }
@@ -33,7 +42,7 @@ fn open(fd: i32, path: &Path, read: bool, owned: bool) -> io::Result<File> {
         } | libc::O_NOFOLLOW
             | libc::O_CLOEXEC) as u64,
         mode: 0,
-        resolve: NO_SYMLINKS | if owned { BENEATH | NO_XDEV } else { 0 },
+        resolve,
     };
     // SAFETY: arguments reference live NUL terminated/path and repr(C) storage;
     // on success File takes sole ownership. ENOSYS fails closed: no fallback.
@@ -178,6 +187,29 @@ impl BoundRoot {
     }
     /// Metadata of one atomically resolved, no-symlink target. A final
     /// symlink yields link metadata, never its target's.
+    /// Filesystem identity of a directory beneath this root, resolved without
+    /// symlinks but *allowing* mount crossings, so a nested boundary can be
+    /// compared with what was previously observed there.
+    pub(crate) fn nested_binding(&self, path: &Path) -> io::Result<SourceRootBinding> {
+        let relative = path
+            .strip_prefix(&self.path)
+            .map_err(|_| io::ErrorKind::InvalidInput)?;
+        let file = open_resolving(
+            self.file.as_raw_fd(),
+            relative,
+            false,
+            NO_SYMLINKS | BENEATH,
+        )?;
+        let result = binding(&file);
+        if self.current() {
+            result
+        } else {
+            Err(io::ErrorKind::Other.into())
+        }
+    }
+    pub(crate) fn root_path(&self) -> &Path {
+        &self.path
+    }
     pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
         self.target(path, false)?.metadata()
     }

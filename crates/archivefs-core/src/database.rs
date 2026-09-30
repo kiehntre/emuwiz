@@ -5926,6 +5926,13 @@ impl Database {
                 "source changed while opening missing authority".into(),
             ));
         }
+        let unproven = self.unproven_nested_boundaries(source_folder_id, &source_guard)?;
+        if let Some((path, reason)) = unproven.first() {
+            return Err(ArchiveFsError::Database(format!(
+                "nested filesystem boundary {} is not proven continuous ({reason}); missing reconciliation withheld",
+                path.display()
+            )));
+        }
         let current_ownership = self.initial_scan_coverage(&[])?;
         let mut delegated: Vec<_> = current_ownership
             .iter()
@@ -8585,7 +8592,41 @@ fn scan_and_persist_folders_transaction(
                 continue;
             }
         };
-        let discovery_complete = discovery.is_complete() && arcade_complete;
+        // A nested filesystem seen on an earlier scan that has vanished or been
+        // replaced makes everything beneath it unprovable, not deleted.
+        let mut boundary_diagnostic = None;
+        if let Some(root) = crate::catalogue_health::BoundRoot::open(&folder.path)
+            && Some(root.identity) == covered.root_identity
+        {
+            let unproven = database.unproven_nested_boundaries(folder.id, &root)?;
+            database.record_nested_boundaries(folder.id, &root, &discovery.nested_boundaries)?;
+            if !unproven.is_empty() {
+                boundary_diagnostic = Some(
+                    unproven
+                        .iter()
+                        .map(|(path, reason)| {
+                            format!("nested filesystem boundary {} ({reason})", path.display())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                );
+            }
+        }
+        if let Some(detail) = &boundary_diagnostic {
+            log::warn!(
+                "{detail}; catalogue evidence preserved and missing reconciliation withheld"
+            );
+            counts.errors_count += 1;
+            folder_errors.push((
+                folder.path.clone(),
+                format!(
+                    "{detail} is not proven continuous; catalogue evidence preserved and missing reconciliation withheld"
+                ),
+            ));
+            covered.diagnostic = Some(detail.clone());
+        }
+        let discovery_complete =
+            discovery.is_complete() && arcade_complete && boundary_diagnostic.is_none();
         covered.state = if discovery_complete {
             ScanCoverageState::Complete
         } else {
@@ -10547,6 +10588,7 @@ mod tests {
                 "schema_migrations",
                 "screenscraper_enrichments",
                 "source_folders",
+                "source_nested_boundaries",
                 "source_scan_bindings",
                 "verified_identity_facts",
             ]

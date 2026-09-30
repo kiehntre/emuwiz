@@ -7,6 +7,15 @@ CREATE TABLE source_scan_bindings (
     root_identity_json TEXT NOT NULL,
     generation INTEGER NOT NULL CHECK (generation > 0)
 );
+-- Nested filesystem boundaries (mounts) first observed beneath a source. A later
+-- scan that cannot prove the same filesystem is still there withholds Missing
+-- evidence beneath it, so an unmounted volume is never mistaken for deleted files.
+CREATE TABLE source_nested_boundaries (
+    source_folder_id INTEGER NOT NULL REFERENCES source_folders(id),
+    relative_path BLOB NOT NULL,
+    binding_json TEXT NOT NULL,
+    PRIMARY KEY (source_folder_id, relative_path)
+);
 CREATE TRIGGER catalogue_epoch_archives_insert AFTER INSERT ON archives BEGIN UPDATE catalogue_health_epoch SET revision = revision + 1 WHERE id = 1; END;
 CREATE TRIGGER catalogue_epoch_archives_update AFTER UPDATE ON archives BEGIN UPDATE catalogue_health_epoch SET revision = revision + 1 WHERE id = 1; END;
 CREATE TRIGGER catalogue_epoch_archives_delete AFTER DELETE ON archives BEGIN UPDATE catalogue_health_epoch SET revision = revision + 1 WHERE id = 1; END;

@@ -5640,6 +5640,10 @@ pub struct ArchiveScanDiscovery {
     /// Compact fingerprints for deterministic skipped files. This is retained
     /// under a fixed memory bound and contains no file payload.
     pub non_archive_fingerprints: Vec<ScanFingerprint>,
+    /// Topmost directories whose filesystem device differs from their parent's
+    /// (nested mounts). Remembered so a later scan that finds one gone or
+    /// replaced cannot treat the files formerly beneath it as deleted.
+    pub nested_boundaries: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5829,9 +5833,13 @@ impl<'a> ArchiveScanner<'a> {
     ) -> Result<()> {
         const MAX_SCAN_DEPTH: usize = 128;
 
+        use std::os::unix::fs::MetadataExt as _;
         let source_identity = validate_source_root(source_root)?;
-        let mut directories = vec![(source.to_path_buf(), 0_usize)];
-        while let Some((directory, depth)) = directories.pop() {
+        let root_device = fs::symlink_metadata(source)
+            .map(|metadata| metadata.dev())
+            .ok();
+        let mut directories = vec![(source.to_path_buf(), 0_usize, root_device)];
+        while let Some((directory, depth, parent_device)) = directories.pop() {
             discovery.timings.directories_visited += 1;
             let traversal_started = Instant::now();
             let before = match fs::symlink_metadata(&directory) {
@@ -5854,6 +5862,10 @@ impl<'a> ArchiveScanner<'a> {
                 );
                 continue;
             }
+            if depth > 0 && Some(before.dev()) != parent_device {
+                discovery.nested_boundaries.push(directory.clone());
+            }
+            let directory_device = Some(before.dev());
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(error) => {
@@ -5933,7 +5945,7 @@ impl<'a> ArchiveScanner<'a> {
                         discovery.record_scan_error(path.clone(), format!("source scan exceeded the {MAX_SCAN_DEPTH} directory depth limit at {}", path.display()));
                         continue;
                     }
-                    child_directories.push((path, depth + 1));
+                    child_directories.push((path, depth + 1, directory_device));
                 } else if let Some(archive) = candidate {
                     if archive.identity.size_bytes.is_none() {
                         discovery.record_scan_error(

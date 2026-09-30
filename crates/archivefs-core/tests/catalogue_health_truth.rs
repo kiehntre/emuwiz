@@ -1067,3 +1067,167 @@ fn empty_preview_is_refused_after_missing_evidence_changes() {
     let next = f.preview();
     assert_eq!(f.db.apply_presence_reconciliation(&next).unwrap(), 0);
 }
+
+mod nested_mounts {
+    use super::*;
+    use std::ffi::CString;
+
+    fn cstr(path: &std::path::Path) -> CString {
+        CString::new(path.as_os_str().as_encoded_bytes()).unwrap()
+    }
+    fn mount_tmpfs(target: &std::path::Path) {
+        let fs_type = CString::new("tmpfs").unwrap();
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    fs_type.as_ptr(),
+                    cstr(target).as_ptr(),
+                    fs_type.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+    }
+    fn bind(source: &std::path::Path, target: &std::path::Path) {
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    cstr(source).as_ptr(),
+                    cstr(target).as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+    }
+    fn detach(target: &std::path::Path) {
+        assert_eq!(
+            unsafe { libc::umount2(cstr(target).as_ptr(), libc::MNT_DETACH) },
+            0
+        );
+    }
+    fn setup() -> (Fixture, PathBuf, i64, PathBuf) {
+        assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+        let mut f = Fixture::new(&["games"]);
+        let sub = f.roots[0].join("sub");
+        fs::create_dir(&sub).unwrap();
+        mount_tmpfs(&sub);
+        let (id, inner) = f.add(0, "sub/inner.zip");
+        (f, sub, id, inner)
+    }
+    fn assert_boundary_withheld(f: &mut Fixture, id: i64) {
+        let s = f.scan();
+        assert_eq!(s.counts.archives_missing, 0);
+        assert_eq!(f.flag(id), None);
+        assert_eq!(
+            f.db.scan_coverage(s.scan_run_id).unwrap()[0].state,
+            ScanCoverageState::Partial
+        );
+        assert!(
+            s.folder_errors
+                .iter()
+                .any(|(_, m)| m.contains("nested filesystem boundary")),
+            "{:?}",
+            s.folder_errors
+        );
+    }
+
+    #[test]
+    #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+    fn vanished_nested_mount_does_not_mark_files_beneath_missing() {
+        let (mut f, sub, id, _) = setup();
+        f.scan();
+        assert_eq!(f.flag(id), None);
+        detach(&sub);
+        assert!(!sub.join("inner.zip").exists(), "empty mountpoint remains");
+        assert_boundary_withheld(&mut f, id);
+        // Still preserved on every later scan while the mountpoint stays empty.
+        assert_boundary_withheld(&mut f, id);
+        let source = f.db.load_archives().unwrap()[0].source_folder_id;
+        let run = f.scan().scan_run_id;
+        // Partial coverage is non-authoritative, so the write boundary refuses.
+        assert_eq!(
+            f.db.mark_unseen_archives_missing(run, source, &[]).ok(),
+            Some(0)
+        );
+        assert_eq!(f.flag(id), None);
+    }
+
+    #[test]
+    #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+    fn unchanged_nested_mount_never_writes_missing_evidence() {
+        let (mut f, _sub, id, _) = setup();
+        for _ in 0..2 {
+            let s = f.scan();
+            assert_eq!(s.counts.archives_missing, 0);
+            assert_eq!(f.flag(id), None);
+            assert!(
+                !s.folder_errors
+                    .iter()
+                    .any(|(_, m)| m.contains("nested filesystem boundary")),
+                "an intact boundary must not be reported: {:?}",
+                s.folder_errors
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+    fn different_filesystem_replacing_nested_mount_is_refused() {
+        let (mut f, sub, id, _) = setup();
+        f.scan();
+        detach(&sub);
+        mount_tmpfs(&sub);
+        assert!(!sub.join("inner.zip").exists());
+        assert_boundary_withheld(&mut f, id);
+    }
+
+    #[test]
+    #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+    fn remounting_the_same_filesystem_recovers_authority_safely() {
+        assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+        let mut f = Fixture::new(&["games"]);
+        let store = f.temp.path().join("store");
+        fs::create_dir(&store).unwrap();
+        mount_tmpfs(&store);
+        let sub = f.roots[0].join("sub");
+        fs::create_dir(&sub).unwrap();
+        bind(&store, &sub);
+        let (keep, _) = f.add(0, "keep.zip");
+        f.scan();
+        // Removing a file outside the boundary is still legitimate evidence
+        // while the nested filesystem is provably the same one.
+        let (gone, gone_path) = f.add(0, "gone.zip");
+        fs::remove_file(gone_path).unwrap();
+        assert_eq!(f.scan().counts.archives_missing, 1);
+        assert!(f.flag(gone).is_some());
+        detach(&sub);
+        let (later, later_path) = f.add(0, "later.zip");
+        fs::remove_file(later_path).unwrap();
+        assert_boundary_withheld(&mut f, later);
+        bind(&store, &sub);
+        let s = f.scan();
+        assert_eq!(s.counts.archives_missing, 1, "{:?}", s.folder_errors);
+        assert!(f.flag(later).is_some());
+        assert_eq!(f.flag(keep), None);
+    }
+}
+
+#[test]
+fn ordinary_local_deletion_still_produces_missing_evidence() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "SNES/game.zip");
+    f.scan();
+    fs::remove_file(path).unwrap();
+    let s = f.scan();
+    assert_eq!(s.counts.archives_missing, 1);
+    assert!(f.flag(id).is_some());
+    assert_eq!(
+        f.db.scan_coverage(s.scan_run_id).unwrap()[0].state,
+        ScanCoverageState::Complete
+    );
+}
