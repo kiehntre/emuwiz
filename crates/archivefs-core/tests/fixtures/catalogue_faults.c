@@ -19,7 +19,8 @@ static void replace_at_probe_t(const char *path,const char *tag);
 static void replace_at_probe_t(const char *path,const char *tag) {
     const char *trigger=getenv("EMUWIZ_FAULT_PATH"), *root=getenv("EMUWIZ_FAULT_ROOT");
     if (replaced || !trigger || !root || strncmp(root,"/tmp/",5)) return;
-    if (getenv("EMUWIZ_FAULT_TRACE") && strstr(path,"SNES")) fprintf(stderr,"TRACE %s %s\n",tag,path);
+    const char *trace=getenv("EMUWIZ_FAULT_TRACE");
+    if (trace && strstr(path,strcmp(trace,"1")?trace:"SNES")) fprintf(stderr,"TRACE %s %s\n",tag,path);
     if (strcmp(path,trigger)) return;
     // Arm only after N hardened (openat2) probes of the trigger: the fault then
     // fires at the next resolution, whatever ordinary or hardened call it is.

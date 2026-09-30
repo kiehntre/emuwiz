@@ -1,8 +1,8 @@
 //! Coverage proofs and explicit presence-only reconciliation. No cleanup or relink.
 use super::*;
 use crate::catalogue_health::{
-    BoundRoot, CatalogueHealthReport, ScanCoverageState, SourceRootBinding, SourceScanCoverage,
-    source_root_identity,
+    BoundRoot, CatalogueHealthReport, NestedBoundaryObservation, NestedState, ScanCoverageState,
+    SourceRootBinding, SourceScanCoverage, source_root_identity,
 };
 
 impl Database {
@@ -61,64 +61,104 @@ impl Database {
             == Some(expected.as_str()))
     }
 
-    /// Remembers newly observed nested filesystem boundaries. An existing
-    /// record is never overwritten: a replaced filesystem must not become
-    /// the accepted one merely because a scan walked it.
+    /// Remembers newly observed nested filesystem boundaries. A boundary is
+    /// accepted only while the exact mount the walker saw is still there, both
+    /// before and after the record is written; otherwise nothing is stored and
+    /// it is returned as unproven. An existing record is never overwritten.
     pub(crate) fn record_nested_boundaries(
         &self,
         source: i64,
         root: &BoundRoot,
-        observed: &[PathBuf],
-    ) -> Result<()> {
-        for path in observed {
-            let (Ok(relative), Ok(binding)) = (
-                path.strip_prefix(root.root_path()),
-                root.nested_binding(path),
-            ) else {
+        observed: &[NestedBoundaryObservation],
+    ) -> Result<Vec<(PathBuf, &'static str)>> {
+        let mut unproven = Vec::new();
+        for seen in observed {
+            let Ok(relative) = seen.path.strip_prefix(root.root_path()) else {
                 continue;
             };
-            let json = serde_json::to_string(&binding)
+            let key = relative.as_os_str().as_bytes();
+            let stored: Option<Option<String>> = self
+                .connection
+                .query_row(
+                    "SELECT binding_json FROM source_nested_boundaries WHERE source_folder_id=?1 AND relative_path=?2",
+                    params![source, key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| db_error("read nested boundary", e))?;
+            // Accepted records are checked by `unproven_nested_boundaries`.
+            if matches!(stored, Some(Some(_))) {
+                continue;
+            }
+            let same_mount = |state: &NestedState| {
+                state.is_mount_root()
+                    && state.mount_id == seen.mount_id
+                    && state.binding.device == seen.device
+                    && state.binding.inode == seen.inode
+            };
+            let Some(state) = root
+                .nested_state(&seen.path)
+                .ok()
+                .filter(|state| same_mount(state))
+            else {
+                self.connection
+                    .execute(
+                        "INSERT OR IGNORE INTO source_nested_boundaries(source_folder_id,relative_path,binding_json) VALUES(?1,?2,NULL)",
+                        params![source, key],
+                    )
+                    .map_err(|e| db_error("quarantine unproven nested boundary", e))?;
+                unproven.push((
+                    seen.path.clone(),
+                    "mount disappeared or changed before its identity could be recorded",
+                ));
+                continue;
+            };
+            let json = serde_json::to_string(&state.binding)
                 .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
             self.connection
                 .execute(
-                    "INSERT OR IGNORE INTO source_nested_boundaries(source_folder_id,relative_path,binding_json) VALUES(?1,?2,?3)",
-                    params![source, relative.as_os_str().as_bytes(), json],
+                    "INSERT INTO source_nested_boundaries(source_folder_id,relative_path,binding_json) VALUES(?1,?2,?3) ON CONFLICT(source_folder_id,relative_path) DO UPDATE SET binding_json=excluded.binding_json",
+                    params![source, key, json],
                 )
                 .map_err(|e| db_error("record nested filesystem boundary", e))?;
+            if !root
+                .nested_state(&seen.path)
+                .ok()
+                .is_some_and(|after| same_mount(&after))
+            {
+                self.connection
+                    .execute(
+                        "UPDATE source_nested_boundaries SET binding_json=NULL WHERE source_folder_id=?1 AND relative_path=?2",
+                        params![source, key],
+                    )
+                    .map_err(|e| db_error("withdraw unproven nested boundary acceptance", e))?;
+                unproven.push((
+                    seen.path.clone(),
+                    "mount disappeared or changed while its identity was recorded",
+                ));
+            }
         }
-        Ok(())
+        Ok(unproven)
     }
 
-    /// Previously observed nested boundaries that are gone, replaced, or can no
-    /// longer be proven to be the same filesystem. Returns each absolute path
-    /// with the reason. Anything beneath such a path is not authoritative.
     pub(crate) fn unproven_nested_boundaries(
         &self,
         source: i64,
         root: &BoundRoot,
     ) -> Result<Vec<(PathBuf, &'static str)>> {
-        let mut stmt = self
-            .connection
-            .prepare("SELECT relative_path,binding_json FROM source_nested_boundaries WHERE source_folder_id=?1 ORDER BY relative_path")
-            .map_err(|e| db_error("prepare nested boundaries", e))?;
-        let rows: Vec<(Vec<u8>, String)> = stmt
-            .query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))
-            .map_err(|e| db_error("read nested boundaries", e))?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(|e| db_error("decode nested boundaries", e))?;
-        let mut unproven = Vec::new();
-        for (relative, json) in rows {
-            let path = root
-                .root_path()
-                .join(PathBuf::from(OsString::from_vec(relative)));
-            let expected: Option<SourceRootBinding> = serde_json::from_str(&json).ok();
-            match root.nested_binding(&path) {
-                Ok(current) if expected.as_ref() == Some(&current) => {}
-                Ok(_) => unproven.push((path, "filesystem there changed or was unmounted")),
-                Err(_) => unproven.push((path, "mountpoint is missing or cannot be inspected")),
-            }
+        unproven_nested_boundaries_on(&self.connection, source, root)
+    }
+
+    /// Schema-21/22 databases have no boundary table; nothing was ever remembered.
+    pub(crate) fn preview_unproven_nested_boundaries(
+        &self,
+        source: i64,
+        root: &BoundRoot,
+    ) -> Result<Vec<(PathBuf, &'static str)>> {
+        if self.schema_version()? < 23 {
+            return Ok(Vec::new());
         }
-        Ok(unproven)
+        self.unproven_nested_boundaries(source, root)
     }
 
     /// First actual scan establishes a binding. Subsequent mismatches require
@@ -335,6 +375,18 @@ impl Database {
                     "source changed at scan commit; catalogue evidence preserved".into(),
                 ));
             }
+            // Authority that was proven earlier must still hold at commit.
+            if covered.state == ScanCoverageState::Complete
+                && let Some(root) = BoundRoot::open(&covered.root)
+                && !self
+                    .unproven_nested_boundaries(covered.source_id, &root)?
+                    .is_empty()
+            {
+                return Err(ArchiveFsError::Database(
+                    "nested filesystem boundary changed at scan commit; catalogue evidence preserved"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -493,4 +545,37 @@ impl Database {
             .map_err(|e| db_error("commit presence reconciliation", e))?;
         Ok(corrections.len())
     }
+}
+
+/// Previously observed nested boundaries that are gone, no longer a mount root
+/// of their own, replaced, or cannot be inspected. Anything beneath such a path
+/// is not authoritative. Works on a plain connection so it can run inside the
+/// very savepoint that writes Missing evidence.
+pub(super) fn unproven_nested_boundaries_on(
+    connection: &Connection,
+    source: i64,
+    root: &BoundRoot,
+) -> Result<Vec<(PathBuf, &'static str)>> {
+    let mut stmt = connection
+        .prepare("SELECT relative_path,binding_json FROM source_nested_boundaries WHERE source_folder_id=?1 ORDER BY relative_path")
+        .map_err(|e| db_error("prepare nested boundaries", e))?;
+    let rows: Vec<(Vec<u8>, Option<String>)> = stmt
+        .query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| db_error("read nested boundaries", e))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| db_error("decode nested boundaries", e))?;
+    let mut unproven = Vec::new();
+    for (relative, json) in rows {
+        let path = root
+            .root_path()
+            .join(PathBuf::from(OsString::from_vec(relative)));
+        let expected: Option<SourceRootBinding> =
+            json.and_then(|json| serde_json::from_str(&json).ok());
+        match root.nested_state(&path) {
+            Ok(state) if state.is_mount_root() && expected.as_ref() == Some(&state.binding) => {}
+            Ok(_) => unproven.push((path, "filesystem there changed or was unmounted")),
+            Err(_) => unproven.push((path, "mountpoint is missing or cannot be inspected")),
+        }
+    }
+    Ok(unproven)
 }

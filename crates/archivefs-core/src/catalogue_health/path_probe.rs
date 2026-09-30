@@ -133,6 +133,77 @@ pub(super) fn probe(path: &Path, directory: bool) -> PathObservation {
     }
 }
 
+/// Kernel mount identity of one directory. IDs are unique per mount instance
+/// (`STATX_MNT_ID_UNIQUE`) where supported, so a bind mount on the same device
+/// differs from the directory beneath which it is mounted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MountObservation {
+    pub(crate) mount_id: u64,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NestedState {
+    pub(crate) binding: SourceRootBinding,
+    pub(crate) mount_id: u64,
+    pub(crate) parent_mount_id: u64,
+}
+impl NestedState {
+    pub(crate) fn is_mount_root(&self) -> bool {
+        self.mount_id != self.parent_mount_id
+    }
+}
+
+const STATX_INO: u32 = 0x100;
+const STATX_MNT_ID: u32 = 0x1000;
+const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+
+fn statx_mount(fd: i32, path: &std::ffi::CStr, flags: i32) -> io::Result<MountObservation> {
+    let mut out = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: valid NUL-terminated path and writable statx storage.
+    let rc = unsafe {
+        libc::statx(
+            fd,
+            path.as_ptr(),
+            flags,
+            STATX_INO | STATX_MNT_ID | STATX_MNT_ID_UNIQUE,
+            out.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let out = unsafe { out.assume_init() };
+    // A kernel without mount IDs must fail closed, never guess "no boundary".
+    if out.stx_mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "kernel does not report mount IDs",
+        ));
+    }
+    Ok(MountObservation {
+        mount_id: out.stx_mnt_id,
+        device: libc::makedev(out.stx_dev_major, out.stx_dev_minor),
+        inode: out.stx_ino,
+    })
+}
+
+fn mount_of(file: &File) -> io::Result<MountObservation> {
+    statx_mount(
+        file.as_raw_fd(),
+        c"",
+        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+    )
+}
+
+/// Mount identity of a directory by pathname (no final symlink follow).
+pub(crate) fn directory_mount(path: &Path) -> io::Result<MountObservation> {
+    let name =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    statx_mount(libc::AT_FDCWD, &name, libc::AT_SYMLINK_NOFOLLOW)
+}
+
 pub(crate) struct BoundRoot {
     file: File,
     path: PathBuf,
@@ -187,22 +258,33 @@ impl BoundRoot {
     }
     /// Metadata of one atomically resolved, no-symlink target. A final
     /// symlink yields link metadata, never its target's.
-    /// Filesystem identity of a directory beneath this root, resolved without
-    /// symlinks but *allowing* mount crossings, so a nested boundary can be
-    /// compared with what was previously observed there.
-    pub(crate) fn nested_binding(&self, path: &Path) -> io::Result<SourceRootBinding> {
+    /// Identity of a directory beneath this root, resolved without symlinks but
+    /// *allowing* mount crossings, plus whether it is a mount root of its own
+    /// (its mount ID differs from its parent directory's). The mount ID is
+    /// what recognises same-device bind mounts, which share `st_dev`.
+    pub(crate) fn nested_state(&self, path: &Path) -> io::Result<NestedState> {
         let relative = path
             .strip_prefix(&self.path)
             .map_err(|_| io::ErrorKind::InvalidInput)?;
-        let file = open_resolving(
-            self.file.as_raw_fd(),
-            relative,
-            false,
-            NO_SYMLINKS | BENEATH,
-        )?;
-        let result = binding(&file);
+        let resolve = NO_SYMLINKS | BENEATH;
+        let file = open_resolving(self.file.as_raw_fd(), relative, false, resolve)?;
+        let binding = binding(&file)?;
+        let mount = mount_of(&file)?;
+        let parent = match relative.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => mount_of(&open_resolving(
+                self.file.as_raw_fd(),
+                parent,
+                false,
+                resolve,
+            )?)?,
+            _ => mount_of(&self.file)?,
+        };
         if self.current() {
-            result
+            Ok(NestedState {
+                binding,
+                mount_id: mount.mount_id,
+                parent_mount_id: parent.mount_id,
+            })
         } else {
             Err(io::ErrorKind::Other.into())
         }

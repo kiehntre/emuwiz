@@ -172,6 +172,18 @@ authority; a replaced one stays refused until it matches again. NO_XDEV probing 
 unchanged. Boundaries never observed before this change cannot be recognised, and
 the read-only preview does not consult this table.
 
+Final-review hardening of the same mechanism: boundaries are detected by kernel
+mount ID (`statx` `STATX_MNT_ID_UNIQUE`, falling back to `STATX_MNT_ID`), so
+same-device bind mounts count; a kernel without mount IDs makes the scan partial
+rather than assuming no boundary. A boundary is accepted only if the exact mount
+the walker saw is still there before and after the record is written; otherwise a
+`NULL` (quarantined) record keeps the path unproven on later scans until a
+continuous capture succeeds. Continuity is re-checked inside the Missing-writing
+savepoint (before the writes and before commit) and at scan commit. The read-only
+preview classifies entries beneath an unproven boundary as `NotChecked`, marks the
+source `Partial` and lists a diagnostic; the 69,034-ID safe-repair set (hash
+`43bfdbc1...c388b9`) is unchanged.
+
 ### Performance and limits
 
 Indexing remains once per report. Basename and historical-SHA groups retain at

@@ -5640,10 +5640,10 @@ pub struct ArchiveScanDiscovery {
     /// Compact fingerprints for deterministic skipped files. This is retained
     /// under a fixed memory bound and contains no file payload.
     pub non_archive_fingerprints: Vec<ScanFingerprint>,
-    /// Topmost directories whose filesystem device differs from their parent's
-    /// (nested mounts). Remembered so a later scan that finds one gone or
+    /// Directories that are mount roots of their own (mount ID differs from the
+    /// parent directory's, so same-device bind mounts count). Remembered so a later scan that finds one gone or
     /// replaced cannot treat the files formerly beneath it as deleted.
-    pub nested_boundaries: Vec<PathBuf>,
+    pub nested_boundaries: Vec<catalogue_health::NestedBoundaryObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5833,13 +5833,12 @@ impl<'a> ArchiveScanner<'a> {
     ) -> Result<()> {
         const MAX_SCAN_DEPTH: usize = 128;
 
-        use std::os::unix::fs::MetadataExt as _;
         let source_identity = validate_source_root(source_root)?;
-        let root_device = fs::symlink_metadata(source)
-            .map(|metadata| metadata.dev())
-            .ok();
-        let mut directories = vec![(source.to_path_buf(), 0_usize, root_device)];
-        while let Some((directory, depth, parent_device)) = directories.pop() {
+        let root_mount = catalogue_health::directory_mount(source)
+            .map(|mount| mount.mount_id)
+            .map_err(|error| ArchiveFsError::io(source.to_path_buf(), error))?;
+        let mut directories = vec![(source.to_path_buf(), 0_usize, root_mount)];
+        while let Some((directory, depth, parent_mount)) = directories.pop() {
             discovery.timings.directories_visited += 1;
             let traversal_started = Instant::now();
             let before = match fs::symlink_metadata(&directory) {
@@ -5862,10 +5861,31 @@ impl<'a> ArchiveScanner<'a> {
                 );
                 continue;
             }
-            if depth > 0 && Some(before.dev()) != parent_device {
-                discovery.nested_boundaries.push(directory.clone());
+            let directory_mount = match catalogue_health::directory_mount(&directory) {
+                Ok(mount) => mount,
+                Err(error) => {
+                    // Without a mount identity a boundary cannot be excluded.
+                    discovery.record_scan_error(
+                        directory.clone(),
+                        format!(
+                            "mount identity unavailable for {}: {error}",
+                            directory.display()
+                        ),
+                    );
+                    continue;
+                }
+            };
+            if depth > 0 && directory_mount.mount_id != parent_mount {
+                discovery
+                    .nested_boundaries
+                    .push(catalogue_health::NestedBoundaryObservation {
+                        path: directory.clone(),
+                        device: directory_mount.device,
+                        inode: directory_mount.inode,
+                        mount_id: directory_mount.mount_id,
+                    });
             }
-            let directory_device = Some(before.dev());
+            let directory_device = directory_mount.mount_id;
             let read_dir = match fs::read_dir(&directory) {
                 Ok(read_dir) => read_dir,
                 Err(error) => {

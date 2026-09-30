@@ -6038,6 +6038,22 @@ impl Database {
             .connection
             .savepoint()
             .map_err(|error| db_error("failed to start mark-missing transaction", error))?;
+        let ensure_boundaries_hold = |connection: &Connection| -> Result<()> {
+            if let Some((path, reason)) = catalogue_health::unproven_nested_boundaries_on(
+                connection,
+                source_folder_id,
+                &source_guard,
+            )?
+            .first()
+            {
+                return Err(ArchiveFsError::Database(format!(
+                    "nested filesystem boundary {} is not proven continuous ({reason}); no missing evidence written",
+                    path.display()
+                )));
+            }
+            Ok(())
+        };
+        ensure_boundaries_hold(&tx)?;
         for archive_id in &missing {
             let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
             let path = PathBuf::from(OsString::from_vec(bytes));
@@ -6067,6 +6083,8 @@ impl Database {
                 "source changed before missing commit".into(),
             ));
         }
+        // Last authority check: an early return here drops (rolls back) `tx`.
+        ensure_boundaries_hold(&tx)?;
         tx.commit()
             .map_err(|error| db_error("failed to commit mark-missing", error))?;
         Ok(missing.len() as i64)
@@ -8598,8 +8616,14 @@ fn scan_and_persist_folders_transaction(
         if let Some(root) = crate::catalogue_health::BoundRoot::open(&folder.path)
             && Some(root.identity) == covered.root_identity
         {
-            let unproven = database.unproven_nested_boundaries(folder.id, &root)?;
-            database.record_nested_boundaries(folder.id, &root, &discovery.nested_boundaries)?;
+            let mut unproven = database.unproven_nested_boundaries(folder.id, &root)?;
+            unproven.extend(database.record_nested_boundaries(
+                folder.id,
+                &root,
+                &discovery.nested_boundaries,
+            )?);
+            unproven.sort();
+            unproven.dedup_by(|a, b| a.0 == b.0);
             if !unproven.is_empty() {
                 boundary_diagnostic = Some(
                     unproven

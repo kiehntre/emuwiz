@@ -13,7 +13,9 @@ CREATE TABLE source_scan_bindings (
 CREATE TABLE source_nested_boundaries (
     source_folder_id INTEGER NOT NULL REFERENCES source_folders(id),
     relative_path BLOB NOT NULL,
-    binding_json TEXT NOT NULL,
+    -- NULL: a mount was seen here but its identity could not be captured
+    -- continuously. It stays unproven until a later scan captures it.
+    binding_json TEXT,
     PRIMARY KEY (source_folder_id, relative_path)
 );
 CREATE TRIGGER catalogue_epoch_archives_insert AFTER INSERT ON archives BEGIN UPDATE catalogue_health_epoch SET revision = revision + 1 WHERE id = 1; END;

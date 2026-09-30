@@ -1186,6 +1186,188 @@ mod nested_mounts {
         assert_boundary_withheld(&mut f, id);
     }
 
+    fn boundary_rows(f: &Fixture) -> (i64, i64) {
+        f.sql()
+            .query_row(
+                "SELECT COUNT(*), COUNT(binding_json) FROM source_nested_boundaries",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+    fn inject_unmount(trigger: &std::path::Path, root: &std::path::Path, skip: Option<&str>) {
+        unsafe {
+            std::env::set_var("EMUWIZ_FAULT_PATH", trigger);
+            std::env::set_var("EMUWIZ_FAULT_ROOT", root);
+            std::env::set_var("EMUWIZ_FAULT_UNMOUNT", "1");
+            if let Some(skip) = skip {
+                std::env::set_var("EMUWIZ_FAULT_PROBE_NUMBER", skip);
+            }
+        }
+    }
+
+    // Blocker 1: the mount vanishes after the walker saw it but before its
+    // identity is accepted. The exposed parent must never become the boundary.
+    // Hits of the mountpoint path: four walker/statx observations, then the
+    // hardened opens of the pre-record check (5th) and post-record check (6th).
+    #[test]
+    #[ignore = "requires isolated mount namespace and process-local fault shim"]
+    fn first_capture_race_before_recording_never_accepts_the_exposed_parent() {
+        first_capture_race("5");
+    }
+    #[test]
+    #[ignore = "requires isolated mount namespace and process-local fault shim"]
+    fn first_capture_race_after_recording_never_accepts_the_exposed_parent() {
+        first_capture_race("6");
+    }
+    fn first_capture_race(skip: &str) {
+        assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+        let (mut f, sub, id, _) = setup();
+        inject_unmount(&sub, &sub, Some(skip));
+        let s = f.scan();
+        assert!(
+            !sub.join("inner.zip").exists(),
+            "fault must detach the mount"
+        );
+        assert_eq!(s.counts.archives_missing, 0);
+        assert_eq!(f.flag(id), None);
+        // Non-authoritative: the seen file is refused persistence (Failed) or the
+        // boundary withholds reconciliation (Partial); never Complete.
+        assert!(matches!(
+            f.db.scan_coverage(s.scan_run_id).unwrap()[0].state,
+            ScanCoverageState::Partial | ScanCoverageState::Failed
+        ));
+        assert!(
+            s.folder_errors.iter().any(|(_, m)| m.contains("identity")),
+            "{:?}",
+            s.folder_errors
+        );
+        assert_eq!(boundary_rows(&f).1, 0, "no accepted identity may be stored");
+        // The unproven boundary keeps protecting later scans.
+        assert_boundary_withheld(&mut f, id);
+        assert_eq!(boundary_rows(&f).1, 0);
+    }
+
+    // Blocker 3: the mount vanishes after continuity validation, before the
+    // Missing write. Zero facts may be written.
+    #[test]
+    #[ignore = "requires isolated mount namespace and process-local fault shim"]
+    fn write_time_disappearance_writes_no_missing_facts() {
+        assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+        let mut f = Fixture::new(&["games"]);
+        let sub = f.roots[0].join("sub");
+        fs::create_dir(&sub).unwrap();
+        mount_tmpfs(&sub);
+        let scan = f.scan();
+        assert_eq!(boundary_rows(&f), (1, 1));
+        let (id, inner) = f.add(0, "sub/inner.zip");
+        let source = f.db.load_archives().unwrap()[0].source_folder_id;
+        inject_unmount(&inner, &sub, None);
+        let result =
+            f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[]);
+        assert!(
+            !sub.join("inner.zip").exists(),
+            "fault must detach the mount"
+        );
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(f.flag(id), None);
+        let observations: i64 = f
+            .sql()
+            .query_row(
+                "SELECT COUNT(*) FROM archive_scan_observations WHERE observation='missing'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(observations, 0);
+    }
+
+    // Blocker 4: preview agrees with persistence.
+    #[test]
+    #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+    fn preview_under_a_discontinuous_boundary_is_not_authoritative_missing() {
+        let (mut f, sub, id, _) = setup();
+        f.scan();
+        let (stale, _) = f.add(0, "stale.zip");
+        f.stale(stale);
+        let live = f.preview();
+        assert!(live.diagnostics.is_empty());
+        detach(&sub);
+        let preview = f.preview();
+        let row = preview.rows.iter().find(|r| r.archive.id == id).unwrap();
+        assert_eq!(row.health, CatalogueHealth::NotChecked);
+        assert_eq!(preview.counts.missing, 0);
+        assert!(
+            preview
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("nested filesystem boundary")),
+            "{:?}",
+            preview.diagnostics
+        );
+        // The independent safe repair is unaffected.
+        assert_eq!(preview.counts.rows_would_change, 1);
+        assert_eq!(f.flag(id), None);
+    }
+
+    fn bind_setup() -> (Fixture, PathBuf, PathBuf, i64) {
+        assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+        let mut f = Fixture::new(&["games"]);
+        let store = f.temp.path().join("store");
+        fs::create_dir(&store).unwrap();
+        let sub = f.roots[0].join("sub");
+        fs::create_dir(&sub).unwrap();
+        bind(&store, &sub);
+        let (id, _) = f.add(0, "sub/inner.zip");
+        (f, store, sub, id)
+    }
+
+    // Blocker 2: a bind mount on the same device shares st_dev.
+    #[test]
+    #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+    fn same_device_bind_mount_is_a_remembered_boundary() {
+        use std::os::unix::fs::MetadataExt;
+        let (mut f, store, sub, id) = bind_setup();
+        assert_eq!(
+            fs::metadata(&sub).unwrap().dev(),
+            fs::metadata(f.roots[0].as_path()).unwrap().dev(),
+            "fixture must be same-device"
+        );
+        // Present: unchanged, safe, recorded.
+        let s = f.scan();
+        assert_eq!(s.counts.archives_missing, 0);
+        assert_eq!(f.flag(id), None);
+        assert_eq!(boundary_rows(&f), (1, 1));
+        // Detached.
+        detach(&sub);
+        assert_boundary_withheld(&mut f, id);
+        // Replaced by a different directory on the same device.
+        let other = f.temp.path().join("other");
+        fs::create_dir(&other).unwrap();
+        bind(&other, &sub);
+        assert_boundary_withheld(&mut f, id);
+        detach(&sub);
+        // The original mount returning is safe.
+        bind(&store, &sub);
+        assert_eq!(f.scan().counts.archives_missing, 0);
+        assert_eq!(f.flag(id), None);
+    }
+
+    #[test]
+    #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
+    fn ordinary_directories_are_not_boundaries() {
+        assert_eq!(std::env::var("EMUWIZ_TEST_MOUNTS").as_deref(), Ok("1"));
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "plain/dir/inner.zip");
+        assert_eq!(f.scan().counts.archives_missing, 0);
+        assert_eq!(boundary_rows(&f), (0, 0));
+        fs::remove_file(path).unwrap();
+        let s = f.scan();
+        assert_eq!(s.counts.archives_missing, 1);
+        assert!(f.flag(id).is_some());
+    }
+
     #[test]
     #[ignore = "run in an isolated user/mount namespace with EMUWIZ_TEST_MOUNTS=1"]
     fn remounting_the_same_filesystem_recovers_authority_safely() {

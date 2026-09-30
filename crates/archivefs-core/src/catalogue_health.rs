@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 mod path_probe;
-pub(crate) use path_probe::BoundRoot;
+pub(crate) use path_probe::{BoundRoot, NestedState, directory_mount};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,16 @@ impl SourceRootBinding {
     pub fn inspect(path: &Path) -> Option<Self> {
         BoundRoot::open(path).map(|root| root.binding)
     }
+}
+
+/// A nested mount root exactly as the scan walker saw it. Recording it as the
+/// accepted boundary requires the same mount to still be there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedBoundaryObservation {
+    pub path: PathBuf,
+    pub device: u64,
+    pub inode: u64,
+    pub mount_id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +173,8 @@ pub struct CatalogueHealthCounts {
 pub struct CatalogueHealthReport {
     pub counts: CatalogueHealthCounts,
     pub rows: Vec<CatalogueHealthRow>,
+    /// Source-level continuity findings that qualify the row classifications.
+    pub diagnostics: Vec<String>,
     pub(crate) database_path: PathBuf,
     pub(crate) epoch: Option<i64>,
     pub(crate) sources: Vec<SourceScanCoverage>,
@@ -257,6 +269,35 @@ pub fn preview_catalogue_health(
             (Some(root.identity) == s.root_identity).then_some((s.source_id, root))
         })
         .collect();
+    // Remembered nested mounts that are gone or replaced make everything
+    // beneath them unprovable: report that as NotChecked, exactly as the scan
+    // refuses to write Missing evidence there, and say why.
+    let mut diagnostics = Vec::new();
+    let mut unproven_prefixes = HashMap::<i64, Vec<PathBuf>>::new();
+    for source in &mut sources {
+        if let Some(root) = bound_roots.get(&source.source_id) {
+            let unproven = database.preview_unproven_nested_boundaries(source.source_id, root)?;
+            if unproven.is_empty() {
+                continue;
+            }
+            let detail = unproven
+                .iter()
+                .map(|(path, reason)| {
+                    format!("nested filesystem boundary {} ({reason})", path.display())
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            diagnostics.push(format!(
+                "{detail} is not proven continuous; entries beneath it are not checked"
+            ));
+            source.state = ScanCoverageState::Partial;
+            source.diagnostic = Some(detail);
+            unproven_prefixes.insert(
+                source.source_id,
+                unproven.into_iter().map(|(path, _)| path).collect(),
+            );
+        }
+    }
     let source_state: HashMap<_, _> = sources
         .iter()
         .map(|s| {
@@ -276,6 +317,12 @@ pub fn preview_catalogue_health(
                     .iter()
                     .any(|r| a.absolute_path.starts_with(r))
             }) {
+                return path_probe::unsafe_observation();
+            }
+            if unproven_prefixes
+                .get(&a.source_folder_id)
+                .is_some_and(|p| p.iter().any(|r| a.absolute_path.starts_with(r)))
+            {
                 return path_probe::unsafe_observation();
             }
             bound_roots
@@ -474,6 +521,7 @@ pub fn preview_catalogue_health(
     Ok(CatalogueHealthReport {
         counts,
         rows,
+        diagnostics,
         database_path: database.path().to_path_buf(),
         epoch,
         source_bindings: bound_roots
