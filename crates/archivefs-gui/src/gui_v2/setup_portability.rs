@@ -19,6 +19,8 @@ pub(super) struct SetupPortabilityState {
     remaps: SetupPathRemaps,
     worker: Option<Receiver<Result<Outcome, String>>>,
     status: Option<String>,
+    // Built from the live native window; headless tests leave this unset.
+    dialog: Option<rfd::FileDialog>,
 }
 
 enum Outcome {
@@ -29,6 +31,14 @@ enum Outcome {
 }
 
 impl SetupPortabilityState {
+    pub(super) fn set_dialog_parent(&mut self, parent: &eframe::CreationContext<'_>) {
+        self.dialog = Some(rfd::FileDialog::new().set_parent(parent));
+    }
+
+    fn dialog(&self, title: &str) -> rfd::FileDialog {
+        self.dialog.clone().unwrap_or_default().set_title(title)
+    }
+
     pub(super) fn render(&mut self, ui: &mut egui::Ui) {
         self.poll();
         ui.separator();
@@ -40,23 +50,29 @@ impl SetupPortabilityState {
         let busy = self.worker.is_some();
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Prepare setup export").clicked() {
+                if ui.button("Export setup…").clicked() {
                     self.export = None;
                     self.start(ui.ctx(), || collect_setup_default().map(Outcome::Collected));
                 }
-                if ui.button("Preview setup file…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
+                if ui.button("Preview setup file…").clicked() {
+                    if let Some(path) = self
+                        .dialog("Preview EmuWiz setup — no changes applied")
                         .add_filter("EmuWiz setup", &["json"])
                         .pick_file()
-                {
-                    self.imported = None;
-                    self.preview = None;
-                    self.remaps.clear();
-                    self.start(ui.ctx(), move || {
-                        let manifest = read_setup_manifest(&path)?;
-                        let preview = preview_setup_import(&manifest, &SetupPathRemaps::new())?;
-                        Ok(Outcome::Imported(manifest, preview))
-                    });
+                    {
+                        self.export = None;
+                        self.imported = None;
+                        self.preview = None;
+                        self.remaps.clear();
+                        self.start(ui.ctx(), move || {
+                            let manifest = read_setup_manifest(&path)?;
+                            let preview = preview_setup_import(&manifest, &SetupPathRemaps::new())?;
+                            Ok(Outcome::Imported(manifest, preview))
+                        });
+                    } else {
+                        self.status =
+                            Some("Opening cancelled. Your settings were unchanged.".into());
+                    }
                 }
             });
         });
@@ -98,18 +114,24 @@ impl SetupPortabilityState {
             if ui
                 .add_enabled(!busy, egui::Button::new("Save setup file…"))
                 .clicked()
-                && let Some(path) = rfd::FileDialog::new()
+            {
+                if let Some(path) = self
+                    .dialog("Export EmuWiz setup")
                     .add_filter("EmuWiz setup", &["json"])
                     .set_file_name("emuwiz-setup.json")
                     .save_file()
-            {
-                let manifest = manifest.clone();
-                self.start(ui.ctx(), move || {
-                    export_setup_new(&path, &manifest).map(|_| Outcome::Exported)
-                });
+                {
+                    let manifest = manifest.clone();
+                    self.start(ui.ctx(), move || {
+                        export_setup_new(&path, &manifest).map(|_| Outcome::Exported)
+                    });
+                } else {
+                    self.status = Some("Saving cancelled. No setup file was written.".into());
+                }
             }
         }
         let mut remap = None;
+        let location_dialog = self.dialog("Choose a location for this preview only");
         if let Some(preview) = &self.preview {
             ui.group(|ui| {
                 ui.strong("Import preview — no changes applied");
@@ -131,9 +153,10 @@ impl SetupPortabilityState {
                                 ui.label(path_summary(review.proposal.classification));
                                 ui.horizontal_wrapped(|ui| {
                                     if ui.button("Choose local location…").clicked() {
-                                        let dialog = rfd::FileDialog::new();
+                                        let dialog = location_dialog.clone();
                                         let path = if review.reference.kind == SetupPathKind::Directory { dialog.pick_folder() } else { dialog.pick_file() };
                                         if let Some(path) = path { remap = Some((review.reference.id.clone(), path)); }
+                                        else { self.status = Some("Location choice cancelled. This preview and your settings were unchanged.".into()); }
                                     }
                                     if ui.button("Use original location").clicked() {
                                         remap = Some((review.reference.id.clone(), review.reference.path.clone()));
@@ -198,9 +221,15 @@ impl SetupPortabilityState {
             Ok(result) => {
                 self.worker = None;
                 match result {
-                    Ok(Outcome::Collected(manifest)) => self.export = Some(manifest),
+                    Ok(Outcome::Collected(manifest)) => {
+                        self.imported = None;
+                        self.preview = None;
+                        self.remaps.clear();
+                        self.export = Some(manifest);
+                    }
                     Ok(Outcome::Imported(manifest, preview)) => {
                         self.remaps.clear();
+                        self.export = None;
                         self.imported = Some(manifest);
                         self.preview = Some(preview);
                     }
@@ -378,6 +407,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let mut state = SetupPortabilityState {
             worker: Some(receiver),
+            export: Some(SetupManifest::default()),
             ..Default::default()
         };
         state
@@ -388,9 +418,37 @@ mod tests {
             .unwrap();
         state.poll();
         assert_eq!(state.imported, Some(manifest));
+        assert!(state.export.is_none());
         assert!(state.remaps.is_empty());
         assert!(state.preview.as_ref().unwrap().read_only);
         assert!(state.worker.is_none());
+    }
+
+    #[test]
+    fn preparing_export_replaces_import_preview_and_transient_choices() {
+        let manifest = SetupManifest::default();
+        let preview = preview_setup_import(&manifest, &SetupPathRemaps::new()).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let mut state = SetupPortabilityState {
+            worker: Some(receiver),
+            imported: Some(manifest.clone()),
+            preview: Some(preview),
+            remaps: [("old.location".into(), "/old/path".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        sender
+            .send(Ok(Outcome::Collected(manifest.clone())))
+            .unwrap();
+        state.poll();
+        assert_eq!(state.export, Some(manifest));
+        assert!(state.imported.is_none());
+        assert!(state.preview.is_none());
+        assert!(state.remaps.is_empty());
+        let strings = rendered_text(&mut state, [1280.0, 900.0]);
+        assert!(strings.iter().any(|text| text == "Export preview"));
+        assert!(!strings.iter().any(|text| text.contains("Import preview —")));
     }
 
     #[test]

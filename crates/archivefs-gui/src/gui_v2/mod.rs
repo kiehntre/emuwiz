@@ -137,7 +137,9 @@ pub fn run() -> eframe::Result<()> {
                     path,
                 )))
             } else {
-                Ok(Box::new(App::new(context.egui_ctx.clone())))
+                let mut app = App::new(context.egui_ctx.clone());
+                app.setup_portability.set_dialog_parent(context);
+                Ok(Box::new(app))
             }
         }),
     )

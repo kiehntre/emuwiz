@@ -5453,7 +5453,7 @@ fn gui_v2_setup_portability_is_visible_in_settings() {
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
     for expected in [
         "Move your setup to another device",
-        "Prepare setup export",
+        "Export setup",
         "Preview setup file",
         "Applying imports is not available yet",
     ] {
