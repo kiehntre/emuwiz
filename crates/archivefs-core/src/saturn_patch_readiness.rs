@@ -552,7 +552,9 @@ pub fn assess_saturn_patch_readiness(
                 result.base_evidence = SaturnPatchBaseEvidence::ExactTargetHash;
             }
             result.audio_expected_untouched = true;
-            result.topology_expected_untouched = inspection.target_size == inspection.source_size;
+            // Two unknown sizes do not establish unchanged track topology.
+            result.topology_expected_untouched = inspection.source_size.is_some()
+                && inspection.target_size == inspection.source_size;
             if !result.topology_expected_untouched {
                 result
                     .reasons
@@ -627,7 +629,8 @@ pub fn assess_saturn_patch_readiness(
                 .reasons
                 .push(SaturnPatchReadinessReason::AudioImpactUnknown);
         }
-        result.topology_expected_untouched = inspection.target_size == inspection.source_size;
+        result.topology_expected_untouched =
+            inspection.source_size.is_some() && inspection.target_size == inspection.source_size;
         if !result.topology_expected_untouched {
             result
                 .reasons
@@ -795,6 +798,64 @@ mod tests {
         assert_eq!(fs::read(root.join("data.bin")).unwrap(), before_source);
         assert_eq!(fs::read(&patch).unwrap(), before_patch);
         assert_eq!(result, assess_saturn_patch_readiness(&request));
+    }
+
+    #[test]
+    fn unknown_ips_sizes_do_not_prove_unchanged_track_topology() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = manifest(dir.path(), false);
+        let component = &manifest.components[0];
+        let patch = dir.path().join("grow.ips");
+        // A valid IPS write beyond this 2048-byte source grows its output.
+        // The format provides no source size or exact final output size.
+        let patch_bytes = b"PATCH\0\x10\0\0\x01XEOF";
+        fs::write(&patch, patch_bytes).unwrap();
+        let source_before = fs::read(&component.path).unwrap();
+        let targets = [
+            SaturnPatchTarget::LogicalDataTrack {
+                track_number: 1,
+                sha256: manifest.tracks[0].data_logical_sha256.clone().unwrap(),
+            },
+            SaturnPatchTarget::ComponentBin {
+                component: component.path.clone(),
+                sha256: component.sha256.clone(),
+            },
+            SaturnPatchTarget::FullRawImage {
+                component: component.path.clone(),
+                sha256: component.sha256.clone(),
+            },
+        ];
+        for target in targets {
+            let request = SaturnPatchReadinessRequest {
+                manifest: manifest.clone(),
+                expected_manifest_fingerprint: Some(saturn_manifest_fingerprint(&manifest)),
+                patch_path: patch.clone(),
+                target,
+                provenance: SaturnPatchProvenance::default(),
+                expected_output: Some(SaturnExpectedOutput {
+                    manifest_fingerprint: None,
+                    target_sha256: None,
+                    target_size: Some(4097),
+                }),
+                external_evidence: Vec::new(),
+            };
+            let result = assess_saturn_patch_readiness(&request);
+            assert_eq!(
+                result.base_evidence,
+                SaturnPatchBaseEvidence::ExactManifestFingerprint
+            );
+            assert!(!result.topology_expected_untouched);
+            assert!(
+                result
+                    .reasons
+                    .contains(&SaturnPatchReadinessReason::TrackTopologyImpactUnknown)
+            );
+            assert_eq!(result.state, SaturnPatchReadinessState::NotReady);
+            assert!(!result.native_verified);
+            assert_eq!(result, assess_saturn_patch_readiness(&request));
+            assert_eq!(fs::read(&component.path).unwrap(), source_before);
+            assert_eq!(fs::read(&patch).unwrap(), patch_bytes);
+        }
     }
 
     #[test]

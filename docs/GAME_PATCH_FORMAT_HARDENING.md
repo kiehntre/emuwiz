@@ -225,3 +225,59 @@ root boundary passed. A separate targeted Cargo check was not needed: the
 focused Cargo test build compiled the changed crate. No full workspace/GUI
 suite, release build or live GUI smoke was run. Only the three allowed files
 are committed on the feature branch; main is not modified, pushed or promoted.
+
+## Independent promotion review
+
+The promotion review started from candidate
+`b4c9237cd9bf7185ce55df943ccb15dd5c21f178`. A fresh fetch confirmed that
+main and origin/main initially still equalled the audited base.
+All 60 original focused tests and a targeted archivefs-core check passed in
+the new isolated target directory `/tmp/emuwiz-ips-promotion-target-y4pPme`.
+During validation main advanced to
+`08e32a0c0c18840fced3246679349a422c4e6d04`, adding two Game Details GUI
+commits with no patch-file overlap. Both patch commits were rebased onto that
+main without conflicts, preserving its GUI changes. The rebase did not change
+any core source, dependencies or repository instructions from the validated
+correction.
+
+The review found one consumer regression that those tests did not cover:
+Saturn readiness compared optional source and target sizes directly. Correctly
+reporting an ordinary IPS target size as unknown made `None == None` true,
+which could incorrectly claim unchanged track topology and allow readiness
+for a patch that grows the image. Both topology comparisons now require a
+known source size as well as equal sizes. This narrowly adds
+`crates/archivefs-core/src/saturn_patch_readiness.rs` to the candidate scope;
+no Saturn models, rebuilders, GUI or launch adapters change.
+
+One new public-readiness regression covers logical data tracks, component BIN
+targets and full raw-image targets. Its valid IPS fixture writes beyond a
+2048-byte source. Even with exact source-manifest evidence, unknown format
+sizes retain TrackTopologyImpactUnknown and NotReady. The test also checks
+repeatable results and unchanged source/patch bytes.
+
+A temporary harness copied the actual IPS parser, applier and new tail
+regression without editing the repository. The candidate passed; reverting
+either the literal or RLE grow-only guard made that same test fail. The harness
+was removed, and no mutation changes were left behind.
+
+Before rebasing, the corrected candidate passed all six focused Cargo filters:
+standalone_patch 33, patch_package_composition 7, patch_output_recovery 5,
+hackhash_apply 3, archived_mod_package 3 and saturn_patch_readiness 10 (61 total,
+no failures or ignored tests). The targeted archivefs-core check, workspace
+format check and diff check also passed. No full workspace/GUI suite or live
+GUI smoke was run.
+
+After rebasing, all six focused Cargo filters passed again with the same
+61-test total, followed by a successful targeted archivefs-core check.
+`cargo fmt --all -- --check` and both working-tree/candidate diff checks
+passed on the rebased tree. Validation stayed in the same isolated target;
+concurrent worktrees and their build directories were not used or changed.
+
+Main then advanced again to `973228c9fb3fbfd1d3dfb4de1121159ebe2aa9ea`
+with the Browse & Play GUI commit and its research evidence. A second rebase
+also completed without conflicts. The core tree still matched the validated
+build (`1b2e597617013ff5c562d86d9d0d8cab8581835d`), and comparison excluding
+GUI/docs showed no source, dependency or configuration changes. All 61 tests
+were rerun successfully from that freshly built isolated test executable,
+then the targeted Cargo check passed again on the latest base. Formatting
+and diff checks passed again. No shared-cache binary was used.
