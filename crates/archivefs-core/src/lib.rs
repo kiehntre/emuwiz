@@ -6232,24 +6232,22 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
             archive.path.display()
         )));
     }
-    let relative = archive
-        .path
-        .strip_prefix(&archive.identity.source_root)
-        .map_err(|_| ArchiveFsError::Scanner("archive source binding changed".to_string()))?;
-    let mut current = archive.identity.source_root.clone();
-    for component in relative.components() {
-        current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current)
-            .map_err(|error| ArchiveFsError::io(current.clone(), error))?;
-        if metadata.file_type().is_symlink() {
-            return Err(ArchiveFsError::Scanner(format!(
-                "archive path contains a symlink after scan: {}",
-                current.display()
-            )));
-        }
-    }
-    let metadata = fs::symlink_metadata(&archive.path)
-        .map_err(|error| ArchiveFsError::io(archive.path.clone(), error))?;
+    // One descriptor-relative resolution (no symlinks, beneath, no xdev): a
+    // component swapped after the scan cannot redirect to outside content.
+    let root = catalogue_health::BoundRoot::open(&archive.identity.source_root)
+        .filter(|root| root.identity == (source_identity.device, source_identity.inode))
+        .ok_or_else(|| {
+            ArchiveFsError::Scanner(format!(
+                "source root changed after scan: {}",
+                archive.identity.source_root.display()
+            ))
+        })?;
+    let metadata = root.metadata(&archive.path).map_err(|error| {
+        ArchiveFsError::Scanner(format!(
+            "archive path unsafe after scan: {}: {error}",
+            archive.path.display()
+        ))
+    })?;
     let identity = filesystem_identity(&metadata);
     let expected_shape = if archive.kind == ArchiveKind::ArcadeSetDirectory {
         metadata.is_dir()
@@ -6265,6 +6263,12 @@ pub(crate) fn revalidate_archive_for_catalogue(archive: &Archive) -> Result<()> 
         return Err(ArchiveFsError::Scanner(format!(
             "archive changed after scan: {}",
             archive.path.display()
+        )));
+    }
+    if !root.current() {
+        return Err(ArchiveFsError::Scanner(format!(
+            "source root changed after scan: {}",
+            archive.identity.source_root.display()
         )));
     }
     Ok(())

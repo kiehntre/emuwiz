@@ -641,3 +641,116 @@ fn orphan_has_precedence_over_present_stale_and_move_hint() {
     assert_eq!(old.move_candidates.len(), 1);
     assert!(f.flag(id).is_some());
 }
+
+/// Public scan path. The fault is armed by the two hardened observe_owned
+/// probes and fires at the next resolution of the file: catalogue revalidation.
+fn post_probe_scan_attack(mode: &str) {
+    if std::env::var("EMUWIZ_INJECT_FAULTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mut f = F::new(&["games"]);
+    let (id, file) = f.add(0, "SNES/game.zip");
+    let parent = f.roots[0].join("SNES");
+    let moved = if mode == "recreate" {
+        f.roots[0].join("SNES.moved")
+    } else {
+        f.t.path().join("preserved-original")
+    };
+    f.sql()
+        .execute(
+            "UPDATE archives SET last_verified_missing_at='must-preserve' WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+    let observations = |f: &F| -> i64 {
+        f.sql()
+            .query_row(
+                "SELECT count(*) FROM archive_scan_observations WHERE archive_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let before = observations(&f);
+    let (trigger, moved_file) = match mode {
+        "leaf" => (file.clone(), moved.clone()),
+        _ => (file.clone(), moved.join("game.zip")),
+    };
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &trigger);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_ARM_OPENAT2", "2");
+        match mode {
+            "symlink" => {
+                std::env::set_var("EMUWIZ_FAULT_PARENT_LINK", &parent);
+                std::env::set_var("EMUWIZ_FAULT_LINK_TARGET", &moved);
+            }
+            "recreate" => std::env::set_var("EMUWIZ_FAULT_PARENT_LINK", &parent),
+            _ => std::env::set_var("EMUWIZ_FAULT_LEAF_LINK", &moved),
+        }
+        if mode == "recreate" {
+            std::env::set_var("EMUWIZ_FAULT_RECREATE", "1");
+        }
+    }
+    let result = scan_and_persist(
+        &mut f.db,
+        &Config {
+            source_folders: f.roots.clone(),
+            mount_root: f.t.path().join("mounts"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        },
+        "post-probe-attack",
+    );
+    for k in [
+        "EMUWIZ_FAULT_PATH",
+        "EMUWIZ_FAULT_ROOT",
+        "EMUWIZ_FAULT_ARM_OPENAT2",
+        "EMUWIZ_FAULT_PARENT_LINK",
+        "EMUWIZ_FAULT_LINK_TARGET",
+        "EMUWIZ_FAULT_LEAF_LINK",
+        "EMUWIZ_FAULT_RECREATE",
+    ] {
+        unsafe { std::env::remove_var(k) };
+    }
+    let changed = match mode {
+        "leaf" => fs::symlink_metadata(&file)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        _ => fs::symlink_metadata(&parent).is_ok() && moved.exists(),
+    };
+    assert!(changed, "fault did not fire");
+    assert!(moved_file.exists(), "original content must be preserved");
+    assert_eq!(
+        f.flag(id).as_deref(),
+        Some("must-preserve"),
+        "post-probe replacement must not clear Missing evidence"
+    );
+    assert_eq!(observations(&f), before, "no restoration observation");
+    match result {
+        Ok(summary) => {
+            assert!(summary.counts.errors_count > 0 && !summary.folder_errors.is_empty());
+            assert_eq!(summary.counts.archives_restored, 0);
+        }
+        Err(_) => {}
+    }
+}
+
+#[test]
+#[ignore = "requires a process-local LD_PRELOAD fault shim; run separately"]
+fn ancestor_symlink_after_probe_cannot_restore_missing_via_scan_persistence() {
+    post_probe_scan_attack("symlink");
+}
+
+#[test]
+#[ignore = "requires a process-local LD_PRELOAD fault shim; run separately"]
+fn ancestor_recreated_after_probe_cannot_restore_missing_via_scan_persistence() {
+    post_probe_scan_attack("recreate");
+}
+
+#[test]
+#[ignore = "requires a process-local LD_PRELOAD fault shim; run separately"]
+fn leaf_symlink_after_probe_cannot_restore_missing_via_scan_persistence() {
+    post_probe_scan_attack("leaf");
+}

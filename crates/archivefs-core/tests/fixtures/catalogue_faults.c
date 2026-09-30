@@ -14,9 +14,17 @@
 #include <unistd.h>
 
 static int replaced=0, enumerated=0, enumeration_failed=0, probed=0;
-static void replace_at_probe(const char *path) {
+static void replace_at_probe_t(const char *path,const char *tag);
+#define replace_at_probe(p) replace_at_probe_t(p,__func__)
+static void replace_at_probe_t(const char *path,const char *tag) {
     const char *trigger=getenv("EMUWIZ_FAULT_PATH"), *root=getenv("EMUWIZ_FAULT_ROOT");
-    if (replaced || !trigger || !root || strncmp(root,"/tmp/",5) || strcmp(path,trigger)) return;
+    if (replaced || !trigger || !root || strncmp(root,"/tmp/",5)) return;
+    if (getenv("EMUWIZ_FAULT_TRACE") && strstr(path,"SNES")) fprintf(stderr,"TRACE %s %s\n",tag,path);
+    if (strcmp(path,trigger)) return;
+    // Arm only after N hardened (openat2) probes of the trigger: the fault then
+    // fires at the next resolution, whatever ordinary or hardened call it is.
+    static int armed=0; const char *arm=getenv("EMUWIZ_FAULT_ARM_OPENAT2");
+    if(arm && armed<atoi(arm)){ if(!strcmp(tag,"syscall")) armed++; return; }
     const char *phase=getenv("EMUWIZ_FAULT_PROBE_NUMBER");
     if(phase && ++probed<atoi(phase))return;
     replaced=1;
@@ -25,6 +33,18 @@ static void replace_at_probe(const char *path) {
         size_t n=strlen(root);
         if(strncmp(parent,root,n)||parent[n]!='/'||strncmp(outside,"/tmp/",5))abort();
         if(rename(parent,outside)||symlink(outside,parent))abort();return;
+    }
+    const char *leaf=getenv("EMUWIZ_FAULT_LEAF_LINK");
+    if(leaf){
+        size_t n=strlen(root);
+        if(strncmp(path,root,n)||path[n]!='/'||strncmp(leaf,"/tmp/",5))abort();
+        if(rename(path,leaf)||symlink(leaf,path))abort();return;
+    }
+    if(parent && getenv("EMUWIZ_FAULT_RECREATE")){
+        char tmp[4096];snprintf(tmp,sizeof(tmp),"%s.moved",parent);size_t n=strlen(root);
+        if(strncmp(parent,root,n)||parent[n]!='/')abort();
+        if(rename(parent,tmp)||mkdir(parent,0700))abort();
+        FILE *f=fopen(path,"w");if(!f)abort();fputs("different bytes",f);fclose(f);return;
     }
     if(getenv("EMUWIZ_FAULT_UNMOUNT")){if(umount2(root,MNT_DETACH))abort();return;}
     char saved[4096]; snprintf(saved,sizeof(saved),"%s.saved-original",root);

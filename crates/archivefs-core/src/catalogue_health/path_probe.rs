@@ -176,6 +176,11 @@ impl BoundRoot {
             unsafe_observation()
         }
     }
+    /// Metadata of one atomically resolved, no-symlink target. A final
+    /// symlink yields link metadata, never its target's.
+    pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+        self.target(path, false)?.metadata()
+    }
     pub(super) fn read_file(&self, path: &Path, expected: &PathObservation) -> Option<File> {
         let file = self.target(path, true).ok()?;
         let current = observation(file.try_clone().map_err(io::Error::other), false);
