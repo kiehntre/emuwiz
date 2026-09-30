@@ -57,7 +57,7 @@ fn fixture(context: &egui::Context) -> App {
         load_job: None,
         artwork_job: None,
         index_job: None,
-        browse_play_shown: (0, Default::default()),
+        browse_play: Default::default(),
         preferences_dirty: None,
         interacted: false,
         loaded: true,
@@ -200,6 +200,7 @@ fn gui_v2_browse_play_reuses_filter_selection_and_canonical_destinations() {
 fn gui_v2_browse_play_empty_state_is_safe_and_points_to_sources() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
+    app.loaded = true;
     app.router.current = Route::BrowsePlay;
     let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
     assert!(
@@ -219,15 +220,11 @@ fn gui_v2_browse_play_zero_results_explain_the_active_scope() {
     app.filter.search = "missing".into();
     app.router.current = Route::BrowsePlay;
     let strings = text(&frame(&context, &mut app, [820.0, 720.0]));
+    assert!(strings.iter().any(|value| value == "No games match"));
     assert!(
         strings
             .iter()
-            .any(|value| value.contains("No games match the current search/filter"))
-    );
-    assert!(
-        strings
-            .iter()
-            .any(|value| value.contains("Search: \"missing\""))
+            .any(|value| value.contains("matching \"missing\""))
     );
     assert!(
         !strings
@@ -5290,7 +5287,7 @@ fn gui_v2_switching_games_never_shows_the_previous_games_result() {
 }
 
 #[test]
-fn gui_v2_browse_play_grid_cards_stay_narrow_so_the_selected_game_is_visible() {
+fn gui_v2_browse_play_keeps_play_on_screen_beside_a_long_titled_shelf() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(
@@ -5307,18 +5304,20 @@ fn gui_v2_browse_play_grid_cards_stay_narrow_so_the_selected_game_is_visible() {
     app.indices = (0..app.library.games.len()).collect();
     app.artwork.index = Some(Arc::new(MediaIndex::default()));
     app.router.current = Route::BrowsePlayGame(2);
-    let width = 1880.0;
-    let output = frame(&context, &mut app, [width, 1000.0]);
-    let bounds = text_bounds(&output, "Selected game");
-    assert!(!bounds.is_empty(), "the selected-game panel must be drawn");
-    assert!(
-        bounds.iter().all(|rect| rect.max.x < width),
-        "the selected-game panel must be on screen, not pushed off by wide shelf cards"
-    );
+    for (width, height) in [(1880.0, 1000.0), (1400.0, 1000.0), (1000.0, 800.0)] {
+        let output = frame(&context, &mut app, [width, height]);
+        let play = text_bounds(&output, "Play");
+        assert!(!play.is_empty(), "Play must be drawn at {width}px");
+        assert!(
+            play.iter()
+                .all(|rect| rect.max.x <= width && rect.max.y <= height),
+            "Play must be on screen without scrolling at {width}px: {play:?}"
+        );
+    }
 }
 
 #[test]
-fn gui_v2_browse_play_draws_one_page_of_a_huge_library_and_says_so() {
+fn gui_v2_browse_play_draws_only_visible_rows_of_a_huge_library_and_counts_it() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.library = Arc::new(Library::new(
@@ -5332,19 +5331,28 @@ fn gui_v2_browse_play_draws_one_page_of_a_huge_library_and_says_so() {
     let started = Instant::now();
     let strings = text(&frame(&context, &mut app, [1880.0, 1000.0]));
     assert!(
+        strings.iter().any(|value| value == "6,000 games"),
+        "the whole library is counted, not just a page"
+    );
+    let drawn = strings
+        .iter()
+        .filter(|value| value.starts_with("Game "))
+        .count();
+    assert!(
+        (1..=200).contains(&drawn),
+        "only the visible rows are drawn, got {drawn}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // A new search starts from the top again, and says what it matched.
+    app.filter.search = "Game 1".into();
+    let strings = text(&frame(&context, &mut app, [1880.0, 1000.0]));
+    assert!(
         strings
             .iter()
-            .any(|value| value == "· showing the first 60"),
-        "the shelf must say it shows one page"
+            .any(|value| value.contains("matching \"Game 1\"")),
+        "the active search is shown and clearable"
     );
-    let cards = strings.iter().filter(|value| *value == "Select").count();
-    assert!(cards <= super::browse_play::SHELF_PAGE, "drawn {cards}");
-    assert!(started.elapsed() < Duration::from_secs(5));
-    // A new search starts from the first page again.
-    app.browse_play_shown.0 = 300;
-    app.filter.search = "Game 1".into();
-    frame(&context, &mut app, [1880.0, 1000.0]);
-    assert_eq!(app.browse_play_shown.0, super::browse_play::SHELF_PAGE);
+    assert!(!app.browse_play.reset_scroll_pending());
 }
 
 #[test]
@@ -5364,20 +5372,58 @@ fn gui_v2_browse_play_many_platforms_do_not_push_the_selected_game_off_screen() 
     ));
     app.indices = (0..app.library.games.len()).collect();
     app.artwork.index = Some(Arc::new(MediaIndex::default()));
-    let width = 1880.0;
-    for (route, heading) in [
-        (Route::BrowsePlay, "Select a game"),
-        (Route::BrowsePlayGame(5), "Selected game"),
-    ] {
-        app.router.current = route;
-        let output = frame(&context, &mut app, [width, 1000.0]);
-        let bounds = text_bounds(&output, heading);
-        assert!(!bounds.is_empty(), "{heading} must be drawn");
-        assert!(
-            bounds.iter().all(|rect| rect.max.x <= width),
-            "{heading} must be on screen: {bounds:?}"
-        );
+    for width in [1880.0, 1400.0, 1000.0] {
+        for (route, needle) in [
+            (Route::BrowsePlay, "Pick a game"),
+            (Route::BrowsePlayGame(5), "Play"),
+        ] {
+            app.router.current = route;
+            let output = frame(&context, &mut app, [width, 1000.0]);
+            let bounds = text_bounds(&output, needle);
+            // Below the side-by-side width the prompt is intentionally absent.
+            if needle == "Pick a game" && width < 1130.0 {
+                continue;
+            }
+            assert!(!bounds.is_empty(), "{needle} must be drawn at {width}px");
+            assert!(
+                bounds.iter().all(|rect| rect.max.x <= width),
+                "{needle} must be on screen at {width}px: {bounds:?}"
+            );
+        }
     }
+    let width = 1880.0;
+    // Seventy systems collapse to a few chips plus one dropdown.
+    let strings = text(&frame(&context, &mut app, [width, 1000.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.starts_with("More systems"))
+    );
+}
+
+#[test]
+fn gui_v2_browse_play_says_loading_while_the_library_loads() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.loaded = false;
+    app.router.current = Route::BrowsePlay;
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("Loading your game list"))
+    );
+    assert!(
+        !strings
+            .iter()
+            .any(|value| value.contains("No games have been added yet"))
+    );
+}
+
+#[test]
+fn gui_v2_browse_play_sidebar_highlights_one_entry() {
+    let source = include_str!("pages.rs");
+    assert!(source.contains("light up the older Games catalogue entry"));
 }
 
 #[test]

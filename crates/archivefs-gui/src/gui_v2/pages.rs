@@ -396,7 +396,13 @@ impl App {
                                 ui.strong(group);
                             }
                             current_group = section.group();
-                            let selected = self.router.current.section() == *section;
+                            // Browse & Play has its own button above; it must not also
+                            // light up the older Games catalogue entry.
+                            let selected = self.router.current.section() == *section
+                                && !matches!(
+                                    self.router.current,
+                                    Route::BrowsePlay | Route::BrowsePlayGame(_)
+                                );
                             ui.push_id(("v2_sidebar_section", *section), |ui| {
                                 if ui
                                     .add_sized(
@@ -455,6 +461,13 @@ impl App {
             {
                 super::guidance::show(ui, &mut self.guidance, guidance);
                 ui.add_space(theme::SPACE_SM);
+            }
+            // Browse & Play is an application layout: the shelf scrolls, the page
+            // does not, so the selected game and its Play button stay in view.
+            if let Route::BrowsePlay | Route::BrowsePlayGame(_) = route {
+                let selected = route.game();
+                self.browse_play(ui, selected);
+                return;
             }
             egui::ScrollArea::vertical()
                 .id_salt(("v2_page_content", route.section()))
@@ -559,7 +572,8 @@ impl App {
         use super::guidance::{GuidanceContext, GuidancePage};
         let page = match route {
             Route::Home | Route::Section(Section::Home) => GuidancePage::Home,
-            Route::BrowsePlay | Route::BrowsePlayGame(_) => GuidancePage::Games,
+            // The page explains itself; a tip repeating it would only cost room.
+            Route::BrowsePlay | Route::BrowsePlayGame(_) => return None,
             Route::MameWorkflow => GuidancePage::Organisation,
             Route::Game(_) | Route::Section(Section::Games) => GuidancePage::Games,
             Route::Section(Section::Sources) => GuidancePage::Sources,
@@ -735,9 +749,7 @@ impl App {
             self.router.current,
             Route::BrowsePlay | Route::BrowsePlayGame(_)
         ) {
-            ui.label(
-                "Browse platforms, choose a game, and launch it through the existing planner.",
-            );
+            ui.label("Find a game, check that it is ready, then play.");
         } else if self.router.current.game().is_some() {
             ui.label("Your game's information, readiness and next actions, in one place.");
         } else if let Some(family) = family {
@@ -1082,6 +1094,29 @@ impl App {
     }
 
     pub(super) fn picture(&mut self, ui: &mut egui::Ui, game: &Game, kind: Kind, size: egui::Vec2) {
+        self.picture_in(ui, game, kind, size, true);
+    }
+
+    /// A picture for a crowded shelf: the short reason is painted on the tile,
+    /// the longer explanation is left to the tooltip.
+    pub(super) fn picture_tile(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: &Game,
+        kind: Kind,
+        size: egui::Vec2,
+    ) {
+        self.picture_in(ui, game, kind, size, false);
+    }
+
+    fn picture_in(
+        &mut self,
+        ui: &mut egui::Ui,
+        game: &Game,
+        kind: Kind,
+        size: egui::Vec2,
+        detail_on_tile: bool,
+    ) {
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
         if !ui.is_rect_visible(rect) {
             return;
@@ -1117,7 +1152,7 @@ impl App {
             let wrap = (size.x - 12.0).max(40.0);
             let galleys: Vec<_> = if labelled {
                 std::iter::once(label.headline.to_string())
-                    .chain(label.detail.clone())
+                    .chain(label.detail.clone().filter(|_| detail_on_tile))
                     .map(|text| {
                         ui.painter()
                             .layout(text, font.clone(), theme::SECONDARY_TEXT, wrap)
