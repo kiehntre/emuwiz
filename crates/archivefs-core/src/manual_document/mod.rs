@@ -67,9 +67,9 @@ pub struct ManualLimits {
     pub max_member_bytes: u64,
     /// Sum of declared uncompressed sizes of all members.
     pub max_total_uncompressed_bytes: u64,
-    /// A member larger than `ratio_floor_bytes` whose expansion ratio exceeds
-    /// this is treated as a decompression bomb.
+    /// Absolute expansion ceiling for every member, including tiny members.
     pub max_expansion_ratio: u64,
+    /// Compatibility field; clamped to zero. No member is exempt from the ratio.
     pub ratio_floor_bytes: u64,
     /// Pages listed or reported.
     pub max_pages: usize,
@@ -100,7 +100,7 @@ impl Default for ManualLimits {
             max_member_bytes: 64 * 1024 * 1024,
             max_total_uncompressed_bytes: 2 * 1024 * 1024 * 1024,
             max_expansion_ratio: 200,
-            ratio_floor_bytes: 1024 * 1024,
+            ratio_floor_bytes: 0,
             max_pages: 10_000,
             max_image_dimension: 16_384,
             max_image_pixels: 100_000_000,

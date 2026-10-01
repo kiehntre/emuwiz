@@ -11,7 +11,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use archivefs_core::manual_document::{ManualLimits, ManualViewerAction, inspect_manual};
+use archivefs_core::manual_document::{
+    ManualDocumentKind, ManualLimits, ManualReadiness, ManualViewerAction, inspect_manual,
+};
 use serde::{Deserialize, Serialize};
 
 const MAX_ROOTS: usize = 16;
@@ -209,6 +211,12 @@ pub(crate) struct GameDocument {
     pub(crate) page_count: Option<usize>,
     pub(crate) file_size: u64,
     pub(crate) viewer: DocumentOpenCapability,
+    /// Internal reading capability, independent of the external desktop opener.
+    /// Recomputed from bytes during discovery, never restored as authority.
+    #[serde(skip)]
+    pub(crate) readiness: Option<ManualReadiness>,
+    #[serde(default)]
+    pub(crate) refusal_reason: Option<String>,
 }
 
 impl GameDocument {
@@ -426,7 +434,8 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                 continue;
             }
             let format = GameDocumentFormat::from_path(&canonical);
-            let (page_count, viewer) = inspect_capability(&canonical, format);
+            let (page_count, viewer, format, readiness, refusal_reason) =
+                inspect_capability(&canonical, format);
             let title = path
                 .file_stem()
                 .and_then(|v| v.to_str())
@@ -450,6 +459,8 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                 page_count,
                 file_size: metadata.len(),
                 viewer,
+                readiness,
+                refusal_reason,
             });
         }
     }
@@ -512,23 +523,46 @@ fn infer_kind(title: &str) -> GameDocumentKind {
 
 fn inspect_capability(
     path: &Path,
-    format: GameDocumentFormat,
-) -> (Option<usize>, DocumentOpenCapability) {
-    // One canonical inspector decides what a file is and how many pages it has
-    // (`archivefs_core::manual_document`); discovery only asks it. It is bounded
-    // and read-only, and trusts content signatures over the extension.
-    let page_count = match format {
-        GameDocumentFormat::Pdf | GameDocumentFormat::Cbz => {
-            inspect_manual(path, &ManualLimits::default())
-                .ok()
-                .and_then(|inspection| inspection.page_count)
+    _extension_format: GameDocumentFormat,
+) -> (
+    Option<usize>,
+    DocumentOpenCapability,
+    GameDocumentFormat,
+    Option<ManualReadiness>,
+    Option<String>,
+) {
+    match inspect_manual(path, &ManualLimits::default()) {
+        Ok(inspection) => {
+            let format = match inspection.kind {
+                ManualDocumentKind::Pdf => GameDocumentFormat::Pdf,
+                ManualDocumentKind::Cbz => GameDocumentFormat::Cbz,
+                ManualDocumentKind::Cbr => GameDocumentFormat::Cbr,
+            };
+            let reason = match inspection.readiness {
+                ManualReadiness::Viewable => None,
+                ManualReadiness::InspectOnly { missing }
+                | ManualReadiness::Unsupported { missing } => Some(missing.detail().to_string()),
+            };
+            (
+                inspection.page_count,
+                document_open_capability_with(path, format, external_handler_available()),
+                format,
+                Some(inspection.readiness),
+                reason,
+            )
         }
-        GameDocumentFormat::Cbr | GameDocumentFormat::Unknown => None,
-    };
-    (
-        page_count,
-        document_open_capability_with(path, format, external_handler_available()),
-    )
+        Err(error) => (
+            None,
+            if path.is_file() {
+                DocumentOpenCapability::UnsupportedFormat
+            } else {
+                DocumentOpenCapability::MissingFile
+            },
+            GameDocumentFormat::Unknown,
+            None,
+            Some(error.user_message().to_string()),
+        ),
+    }
 }
 
 /// The OS-opener program EmuWiz already uses
@@ -631,7 +665,7 @@ pub(crate) fn project_romm_manual_document(
         return Err(DocumentUnavailableReason::NoLongerAvailable);
     }
     let format = GameDocumentFormat::from_path(&path);
-    let (page_count, viewer) = inspect_capability(&path, format);
+    let (page_count, viewer, format, readiness, refusal_reason) = inspect_capability(&path, format);
     let association = match request.verified_identity {
         Some(identity) => {
             GameDocumentAssociation::ExactGameIdentity(ExactIdentityEvidence::from(identity))
@@ -658,6 +692,8 @@ pub(crate) fn project_romm_manual_document(
         page_count,
         file_size,
         viewer,
+        readiness,
+        refusal_reason,
         path,
         format,
     })
@@ -850,6 +886,7 @@ mod tests {
         let bad = dir.path().join("bad.cbz");
         fs::write(&bad, b"not zip").unwrap();
         assert!(inspect_cbz(&bad).is_err());
+        fs::write(dir.path().join("x.cbr"), b"Rar!\x1A\x07\x01\x00").unwrap();
         assert_eq!(
             inspect_capability(&dir.path().join("x.cbr"), GameDocumentFormat::Cbr).1,
             DocumentOpenCapability::UnsupportedFormat
@@ -1033,7 +1070,7 @@ mod tests {
     #[test]
     fn romm_document_maps_into_common_model() {
         let root = tempdir().unwrap();
-        fs::write(root.path().join("manual.pdf"), b"%PDF").unwrap();
+        fs::write(root.path().join("manual.pdf"), minimal_pdf(1)).unwrap();
         let mapping = romm_mapping(root.path());
         let manual = romm_manual("/assets/romm/resources/manual.pdf");
         let document = project_romm_manual_document(RommDocumentRequest {
@@ -1144,6 +1181,8 @@ mod tests {
             page_count: None,
             file_size: 0,
             viewer: DocumentOpenCapability::Supported,
+            readiness: None,
+            refusal_reason: None,
         };
         let mut two = one.clone();
         two.path = dir.path().join("b.pdf");
@@ -1291,5 +1330,63 @@ mod tests {
                 "unexpected network-shaped token: {forbidden}"
             );
         }
+    }
+    #[test]
+    fn discovery_preserves_canonical_format_readiness_and_refusal() {
+        let dir = tempdir().unwrap();
+        let game = dir.path().join("game.bin");
+        fs::write(&game, b"game").unwrap();
+        for (name, bytes, format, viewable) in [
+            (
+                "guide.cbz",
+                b"Rar!\x1A\x07\x01\x00".to_vec(),
+                GameDocumentFormat::Cbr,
+                false,
+            ),
+            ("guide.cbr", minimal_pdf(1), GameDocumentFormat::Pdf, false),
+            (
+                "guide.pdf",
+                b"unknown".to_vec(),
+                GameDocumentFormat::Unknown,
+                false,
+            ),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            let docs = discover_documents(DocumentDiscoveryRequest {
+                game_id: 1,
+                game_title: "game",
+                platform: "SNES",
+                game_path: &game,
+                roots: &[],
+                associations: &BTreeMap::new(),
+                verified_identity: None,
+            });
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0].format, format);
+            assert_eq!(
+                docs[0].readiness.is_some_and(ManualReadiness::can_view),
+                viewable
+            );
+            assert!(docs[0].refusal_reason.is_some());
+            if format != GameDocumentFormat::Pdf {
+                assert_eq!(docs[0].viewer, DocumentOpenCapability::UnsupportedFormat);
+            }
+            fs::remove_file(path).unwrap();
+        }
+        let path = dir.path().join("guide.cbr");
+        cbz(&path, &["1.png"]);
+        let docs = discover_documents(DocumentDiscoveryRequest {
+            game_id: 1,
+            game_title: "game",
+            platform: "SNES",
+            game_path: &game,
+            roots: &[],
+            associations: &BTreeMap::new(),
+            verified_identity: None,
+        });
+        assert_eq!(docs[0].format, GameDocumentFormat::Cbz);
+        assert_eq!(docs[0].readiness, Some(ManualReadiness::Viewable));
+        assert!(docs[0].refusal_reason.is_none());
     }
 }

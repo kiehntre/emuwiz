@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::Cursor;
 
 use super::detect::ManualFormatEvidence;
 use super::order::{compare_page_names, page_group};
@@ -100,79 +100,36 @@ fn classify(name: &str) -> Classified {
     }
 }
 
-/// The member count the archive's own end-of-central-directory record
-/// declares, including ZIP64. The `zip` crate indexes members by name, so it
-/// silently collapses duplicates: its `len()` can be smaller than what the file
-/// actually lists. Comparing the two exposes hidden duplicates and keeps the
-/// member-count bound honest.
-fn declared_entry_count(file: &mut File) -> Result<Option<u64>, ManualViewerError> {
-    const EOCD_LEN: usize = 22;
-    const MAX_COMMENT: u64 = 65_535;
-    let io = |e: std::io::Error| ManualViewerError::Io(e.to_string());
-    let len = file.seek(SeekFrom::End(0)).map_err(io)?;
-    let span = len.min(EOCD_LEN as u64 + MAX_COMMENT);
-    let start = len - span;
-    file.seek(SeekFrom::Start(start)).map_err(io)?;
-    let mut tail = Vec::with_capacity(span as usize);
-    (&mut *file).take(span).read_to_end(&mut tail).map_err(io)?;
-    let Some(at) = (0..=tail.len().saturating_sub(EOCD_LEN)).rev().find(|&i| {
-        tail[i..].starts_with(b"PK\x05\x06")
-            && tail.len() >= i + EOCD_LEN
-            && i + EOCD_LEN + usize::from(u16::from_le_bytes([tail[i + 20], tail[i + 21]]))
-                == tail.len()
-    }) else {
-        return Ok(None);
-    };
-    let total = u64::from(u16::from_le_bytes([tail[at + 10], tail[at + 11]]));
-    if total != 0xFFFF {
-        return Ok(Some(total));
-    }
-    // ZIP64: the locator sits just before the EOCD and points at the real record.
-    if at < 20 || !tail[at - 20..].starts_with(b"PK\x06\x07") {
-        return Ok(None);
-    }
-    let record_at = u64::from_le_bytes(tail[at - 12..at - 4].try_into().expect("8 bytes"));
-    if record_at.checked_add(56).is_none_or(|end| end > len) {
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(record_at)).map_err(io)?;
-    let mut record = [0u8; 56];
-    file.read_exact(&mut record).map_err(io)?;
-    if !record.starts_with(b"PK\x06\x06") {
-        return Ok(None);
-    }
-    Ok(Some(u64::from_le_bytes(
-        record[32..40].try_into().expect("8 bytes"),
-    )))
-}
-
 pub(super) fn inspect(
     mut file: File,
     id: ManualDocumentId,
     evidence: ManualFormatEvidence,
     limits: &ManualLimits,
 ) -> Result<ManualInspection, ManualViewerError> {
-    let declared = declared_entry_count(&mut file)?;
-    // The bound applies to what the file *declares*, before anything is indexed.
-    if let Some(count) = declared.filter(|c| *c > limits.max_members as u64) {
-        return Err(ManualViewerError::TooManyMembers {
-            count: usize::try_from(count).unwrap_or(usize::MAX),
+    // Canonical physical enumeration precedes the name-deduplicating ZIP index.
+    // Its complete central-directory check also refuses trailing junk, rather
+    // than letting a missing end record disable the bounds.
+    use crate::dat::archive::{
+        limits::ArchiveLimits,
+        zip_preflight::{ZipPreflightError, preflight_zip},
+    };
+    let archive_limits = ArchiveLimits {
+        max_members: limits.max_members,
+        ..ArchiveLimits::default()
+    };
+    let physical = preflight_zip(
+        &mut file,
+        id.len,
+        &archive_limits,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(|e| match e {
+        ZipPreflightError::Refused("member count") => ManualViewerError::TooManyMembers {
+            count: limits.max_members.saturating_add(1),
             max: limits.max_members,
-        });
-    }
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|e| ManualViewerError::Malformed(format!("not a readable ZIP: {e}")))?;
-    if archive.len() > limits.max_members {
-        return Err(ManualViewerError::TooManyMembers {
-            count: archive.len(),
-            max: limits.max_members,
-        });
-    }
-    if declared.is_some_and(|count| count > archive.len() as u64) {
-        return Err(ManualViewerError::DuplicateMember {
-            name: "(the archive lists a name more than once)".into(),
-        });
-    }
+        },
+        other => ManualViewerError::Malformed(format!("unsafe ZIP structure: {other:?}")),
+    })?;
     let mut seen = HashSet::new();
     let mut total: u64 = 0;
     let mut ignored = 0usize;
@@ -180,18 +137,25 @@ pub(super) fn inspect(
     let mut first_unsupported: Option<String> = None;
     let mut pages: Vec<(String, ManualPageFormat, usize, u64, u64)> = Vec::new();
 
-    for index in 0..archive.len() {
-        let entry = archive
-            .by_index_raw(index)
-            .map_err(|e| ManualViewerError::Malformed(format!("bad ZIP member: {e}")))?;
-        let raw_name = entry.name().to_string();
+    for (index, entry) in physical.entries.iter().enumerate() {
+        if index >= limits.max_members {
+            return Err(ManualViewerError::TooManyMembers {
+                count: index + 1,
+                max: limits.max_members,
+            });
+        }
+        let raw_name = String::from_utf8_lossy(&entry.name_raw);
         let name = validate_member_name(&raw_name, limits).map_err(|reason| {
             ManualViewerError::UnsafeMember {
                 name: sanitise_for_error(&raw_name),
                 reason,
             }
         })?;
-        if let Some(mode) = entry.unix_mode() {
+        if !seen.insert(name.clone()) {
+            return Err(ManualViewerError::DuplicateMember { name });
+        }
+        {
+            let mode = entry.external_attributes >> 16;
             let kind = mode & S_IFMT;
             if kind == S_IFLNK {
                 return Err(ManualViewerError::UnsafeMember {
@@ -206,17 +170,11 @@ pub(super) fn inspect(
                 });
             }
         }
-        if entry.is_dir() {
-            continue;
-        }
-        if entry.encrypted() {
+        if entry.flags & (1 | (1 << 6)) != 0 {
             return Err(ManualViewerError::EncryptedMember { name });
         }
-        if !seen.insert(name.clone()) {
-            return Err(ManualViewerError::DuplicateMember { name });
-        }
-        let size = entry.size();
-        let packed = entry.compressed_size();
+        let size = entry.logical_size;
+        let packed = entry.compressed_size;
         if size > limits.max_member_bytes {
             return Err(ManualViewerError::MemberTooLarge {
                 name,
@@ -231,10 +189,11 @@ pub(super) fn inspect(
                 bytes: total.saturating_add(size),
                 max: limits.max_total_uncompressed_bytes,
             })?;
-        if size > limits.ratio_floor_bytes
-            && (packed == 0 || size / packed > limits.max_expansion_ratio)
-        {
+        if !within_expansion_ratio(size, packed, limits.max_expansion_ratio) {
             return Err(ManualViewerError::SuspiciousCompression { name });
+        }
+        if entry.is_directory || entry.external_attributes >> 16 & S_IFMT == S_IFDIR {
+            continue;
         }
         match classify(&name) {
             Classified::Page(format) => pages.push((name, format, index, packed, size)),
@@ -250,6 +209,24 @@ pub(super) fn inspect(
                 count: pages.len(),
                 max: limits.max_pages,
             });
+        }
+    }
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| ManualViewerError::Malformed(format!("not a readable ZIP: {e}")))?;
+    if archive.len() != physical.entries.len() {
+        return Err(ManualViewerError::DuplicateMember {
+            name: "(duplicate ZIP name)".into(),
+        });
+    }
+    // Keep page ordinals tied to the decoder's interpretation of each name.
+    for (name, _, index, _, _) in &pages {
+        let entry = archive
+            .by_index_raw(*index)
+            .map_err(|e| ManualViewerError::Malformed(e.to_string()))?;
+        if validate_member_name(entry.name(), limits).as_ref() != Ok(name) {
+            return Err(ManualViewerError::Malformed(
+                "ambiguous ZIP member name encoding".into(),
+            ));
         }
     }
     if pages.is_empty() {
@@ -292,6 +269,12 @@ pub(super) fn inspect(
         active_content: Vec::new(),
         warnings,
     })
+}
+
+/// Exact cross multiplication in a wider integer. Empty stored entries are
+/// allowed; zero packed bytes can never justify a nonempty logical member.
+pub(super) fn within_expansion_ratio(size: u64, packed: u64, ratio: u64) -> bool {
+    u128::from(size) <= u128::from(packed) * u128::from(ratio)
 }
 
 /// Names go into error text; keep them printable and short.

@@ -801,6 +801,19 @@ struct Section {
 }
 
 impl Reader<'_> {
+    fn structural_offset(&self, dict: &Dict, key: &str) -> Result<Option<u64>, ManualViewerError> {
+        let Some(value) = dict.get(key) else {
+            return Ok(None);
+        };
+        let offset = value
+            .as_int()
+            .and_then(|n| u64::try_from(n).ok())
+            .and_then(|n| self.header_offset.checked_add(n))
+            .filter(|n| *n < self.file_len)
+            .ok_or_else(|| malformed("malformed structural cross-reference offset"))?;
+        Ok(Some(offset))
+    }
+
     fn merge(&mut self, number: u32, entry: XEntry) -> Result<(), ManualViewerError> {
         if !self.xref.contains_key(&number) {
             if self.xref.len() >= self.limits.pdf_max_objects {
@@ -872,8 +885,12 @@ impl Reader<'_> {
                     return Err(TableErr::NeedMore);
                 }
                 let kind = lexer.word();
-                let object =
-                    u32::try_from(first + i).map_err(|_| bad("object number too large"))?;
+                let object = u32::try_from(
+                    first
+                        .checked_add(i)
+                        .ok_or_else(|| bad("object number overflow"))?,
+                )
+                .map_err(|_| bad("object number too large"))?;
                 let entry = match kind {
                     b"n" => match self
                         .header_offset
@@ -881,7 +898,7 @@ impl Reader<'_> {
                         .filter(|o| *o < self.file_len)
                     {
                         Some(abs) if offset > 0 => XEntry::Offset(abs),
-                        _ => XEntry::Free,
+                        _ => return Err(bad("live cross-reference offset outside file")),
                     },
                     b"f" => XEntry::Free,
                     _ => return Err(bad("bad cross-reference entry type")),
@@ -894,11 +911,9 @@ impl Reader<'_> {
             Err(PErr::Eof) => return Err(TableErr::NeedMore),
             _ => return Err(bad("bad trailer")),
         };
-        let xref_stream = trailer
-            .get("XRefStm")
-            .and_then(Obj::as_int)
-            .and_then(|o| u64::try_from(o).ok())
-            .and_then(|o| self.header_offset.checked_add(o));
+        let xref_stream = self
+            .structural_offset(&trailer, "XRefStm")
+            .map_err(TableErr::Bad)?;
         Ok(Section {
             trailer,
             xref_stream,
@@ -971,8 +986,12 @@ impl Reader<'_> {
                 };
                 let second = field(&slice[widths[0]..widths[0] + widths[1]]);
                 let third = field(&slice[widths[0] + widths[1]..]);
-                let number =
-                    u32::try_from(first + i).map_err(|_| malformed("object number too large"))?;
+                let number = u32::try_from(
+                    first
+                        .checked_add(i)
+                        .ok_or_else(|| malformed("object number overflow"))?,
+                )
+                .map_err(|_| malformed("object number too large"))?;
                 match kind {
                     0 => self.merge(number, XEntry::Free)?,
                     1 => match self
@@ -980,8 +999,8 @@ impl Reader<'_> {
                         .checked_add(second)
                         .filter(|o| *o < self.file_len)
                     {
-                        Some(abs) => self.merge(number, XEntry::Offset(abs))?,
-                        None => self.merge(number, XEntry::Free)?,
+                        Some(abs) if second > 0 => self.merge(number, XEntry::Offset(abs))?,
+                        _ => return Err(malformed("live cross-reference offset outside file")),
                     },
                     2 => self.merge(
                         number,
@@ -996,6 +1015,9 @@ impl Reader<'_> {
                 }
             }
         }
+        // Hybrid streams do not drive the update chain, but damaged references
+        // inside them must not disappear merely because their trailer is unused.
+        self.structural_offset(&dict, "Prev")?;
         Ok(dict)
     }
 }
@@ -1079,18 +1101,15 @@ pub(super) fn inspect(
         if section.trailer.contains_key("Encrypt") {
             return Err(ManualViewerError::Encrypted);
         }
-        if let Some(stream_abs) = section.xref_stream
-            && visited.insert(stream_abs)
-        {
+        if let Some(stream_abs) = section.xref_stream {
+            if !visited.insert(stream_abs) || visited.len() > limits.pdf_max_xref_sections {
+                return Err(malformed(
+                    "cross-reference chain loops or exceeds depth bound",
+                ));
+            }
             reader.read_xref_stream(stream_abs)?;
         }
-        next = section
-            .trailer
-            .get("Prev")
-            .and_then(Obj::as_int)
-            .and_then(|o| u64::try_from(o).ok())
-            .and_then(|o| header_offset.checked_add(o))
-            .filter(|o| *o < file_len);
+        next = reader.structural_offset(&section.trailer, "Prev")?;
         trailers.push(section.trailer);
     }
     let newest = trailers.first().ok_or_else(|| malformed("no trailer"))?;
@@ -1149,6 +1168,13 @@ pub(super) fn inspect(
         if names.contains_key("EmbeddedFiles") {
             active.push(ManualActiveContent::EmbeddedFiles);
         }
+    }
+    if let Some(action) = catalog.get("OpenAction")
+        && let Obj::Dict(action) = reader.deref(action)?
+        && (matches!(action.get("S"), Some(Obj::Name(name)) if name == "JavaScript")
+            || action.contains_key("JS"))
+    {
+        active.push(ManualActiveContent::JavaScript);
     }
     active.sort();
     active.dedup();

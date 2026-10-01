@@ -797,7 +797,7 @@ fn member_count_member_size_and_total_size_are_bounded() {
     );
     assert!(matches!(
         inspect_manual(&five, &tight(|l| l.max_members = 3)),
-        Err(ManualViewerError::TooManyMembers { count: 5, max: 3 })
+        Err(ManualViewerError::TooManyMembers { max: 3, .. })
     ));
     let one = cbz(dir.path(), "one.cbz", &[("1.png", &[0u8; 300])]);
     assert!(matches!(
@@ -1454,4 +1454,350 @@ fn the_state_is_driven_end_to_end_from_a_real_inspection() {
         "3.png"
     );
     assert!(document.decode_page(state.current_page()).is_ok());
+}
+
+// Physical ZIP records, deliberately bypassing ZipWriter's duplicate-name guard.
+fn physical_zip(entries: &[(String, u32, u16)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for (name, logical, flags) in entries {
+        let offset = out.len() as u32;
+        let mut local = vec![0u8; 30];
+        local[..4].copy_from_slice(b"PK\x03\x04");
+        local[4..6].copy_from_slice(&20u16.to_le_bytes());
+        local[6..8].copy_from_slice(&flags.to_le_bytes());
+        local[18..22].copy_from_slice(&1u32.to_le_bytes());
+        local[22..26].copy_from_slice(&logical.to_le_bytes());
+        local[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend(local);
+        out.extend(name.as_bytes());
+        out.push(0);
+        let mut header = vec![0u8; 46];
+        header[..4].copy_from_slice(b"PK\x01\x02");
+        header[4..6].copy_from_slice(&20u16.to_le_bytes());
+        header[6..8].copy_from_slice(&20u16.to_le_bytes());
+        header[8..10].copy_from_slice(&flags.to_le_bytes());
+        header[20..24].copy_from_slice(&1u32.to_le_bytes());
+        header[24..28].copy_from_slice(&logical.to_le_bytes());
+        header[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+        header[42..46].copy_from_slice(&offset.to_le_bytes());
+        central.extend(header);
+        central.extend(name.as_bytes());
+    }
+    let offset = out.len() as u32;
+    let size = central.len() as u32;
+    out.extend(central);
+    let mut end = vec![0u8; 22];
+    end[..4].copy_from_slice(b"PK\x05\x06");
+    end[8..10].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+    end[10..12].copy_from_slice(&(entries.len() as u16).to_le_bytes());
+    end[12..16].copy_from_slice(&size.to_le_bytes());
+    end[16..20].copy_from_slice(&offset.to_le_bytes());
+    out.extend(end);
+    out
+}
+
+#[test]
+fn physical_member_ceiling_includes_duplicates_directories_and_trailing_junk() {
+    let dir = tempfile::tempdir().unwrap();
+    // Valid image pages at the exact ceiling remain inspectable.
+    let names: Vec<_> = (0..10_000).map(|i| format!("{i}.png")).collect();
+    let image = png(1, 1);
+    let entries: Vec<_> = names
+        .iter()
+        .map(|n| (n.as_str(), image.as_slice()))
+        .collect();
+    let valid = zip_of(&entries);
+    assert_eq!(
+        inspect(&write(dir.path(), "valid.cbz", &valid))
+            .unwrap()
+            .pages
+            .len(),
+        10_000
+    );
+    for duplicate in [false, true] {
+        for directories in [false, true] {
+            let entries: Vec<_> = (0..10_001)
+                .map(|i| {
+                    (
+                        if duplicate {
+                            "1.png".into()
+                        } else {
+                            format!("{i}{}", if directories { "/" } else { ".png" })
+                        },
+                        1,
+                        0,
+                    )
+                })
+                .collect();
+            let bytes = physical_zip(&entries);
+            for trailing in [false, true] {
+                let mut bytes = bytes.clone();
+                if trailing {
+                    bytes.extend(b"trailing bytes");
+                }
+                let result = inspect(&write(dir.path(), "count.cbz", &bytes));
+                if trailing {
+                    assert!(result.is_err());
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(ManualViewerError::TooManyMembers { max: 10_000, .. })
+                        ),
+                        "{result:?}"
+                    );
+                }
+            }
+        }
+    }
+    // A lying EOCD count cannot hide physical records beyond its declared count.
+    let mut bytes = physical_zip(&[("a.png".into(), 1, 0), ("b.png".into(), 1, 0)]);
+    let end = bytes.len() - 22;
+    bytes[end + 8..end + 12].copy_from_slice(&[1, 0, 1, 0]);
+    assert!(inspect(&write(dir.path(), "hidden.cbz", &bytes)).is_err());
+}
+
+#[test]
+fn physical_duplicate_names_are_checked_before_indexing_or_page_filtering() {
+    let dir = tempfile::tempdir().unwrap();
+    for (a, b) in [
+        ("1.png", "1.png"),
+        ("a/1.png", "a\\1.png"),
+        ("a/./1.png", "a//1.png"),
+        ("a/", "a/"),
+        ("notes.txt", "./notes.txt"),
+    ] {
+        let bytes = physical_zip(&[(a.into(), 1, 0), (b.into(), 1, 0)]);
+        assert!(
+            matches!(
+                inspect(&write(dir.path(), "dup.cbz", &bytes)),
+                Err(ManualViewerError::DuplicateMember { .. })
+            ),
+            "{a} {b}"
+        );
+        let mut trailing = bytes;
+        trailing.extend(b"junk");
+        assert!(inspect(&write(dir.path(), "trailing.cbz", &trailing)).is_err());
+    }
+}
+
+#[test]
+fn directories_receive_all_generic_safety_checks_without_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    for (size, flags, limits) in [
+        (u32::MAX - 1, 0, ManualLimits::default()),
+        (0, 1, ManualLimits::default()),
+        (200, 0, tight(|l| l.max_total_uncompressed_bytes = 200)),
+        (201, 0, ManualLimits::default()),
+    ] {
+        let bytes = physical_zip(&[("folder/".into(), size, flags), ("1.png".into(), 1, 0)]);
+        assert!(inspect_manual(&write(dir.path(), "dir.cbz", &bytes), &limits).is_err());
+    }
+    let bytes = physical_zip(&[("folder/".into(), 100, 0), ("1.png".into(), 1, 0)]);
+    assert_eq!(
+        inspect(&write(dir.path(), "dir.cbz", &bytes))
+            .unwrap()
+            .pages
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn ratio_is_absolute_exact_and_overflow_safe() {
+    use super::zip_pages::within_expansion_ratio as allowed;
+    assert!(allowed(199_999, 1_000, 200));
+    assert!(allowed(200_000, 1_000, 200));
+    assert!(!allowed(200_001, 1_000, 200));
+    assert!(!allowed(200_838, 1_000, 200));
+    assert!(!allowed(877, 1, 200));
+    assert!(allowed(0, 0, 200));
+    assert!(!allowed(1, 0, 200));
+    assert!(allowed(u64::MAX, u64::MAX, 200));
+    assert!(!allowed(u64::MAX, 1, 200));
+    let dir = tempfile::tempdir().unwrap();
+    for size in [100_000, 2_000_000] {
+        let bytes = zip_with(&[("1.png", &vec![0; size])], CompressionMethod::Deflated);
+        assert!(matches!(
+            inspect(&write(dir.path(), "ratio.cbz", &bytes)),
+            Err(ManualViewerError::SuspiciousCompression { .. })
+        ));
+    }
+}
+
+#[test]
+fn pdf_prev_and_hybrid_offsets_distinguish_absence_from_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        inspect(&write(
+            dir.path(),
+            "absent.pdf",
+            &PdfBuilder::new(1).build()
+        ))
+        .is_ok()
+    );
+    for key in ["Prev", "XRefStm"] {
+        for value in [
+            "-1",
+            "999999999",
+            "1.5",
+            "null",
+            "/bad",
+            "(123)",
+            "18446744073709551616",
+            "[1]",
+            "",
+        ] {
+            let mut builder = PdfBuilder::new(1);
+            builder.trailer_extra = format!("/{key} {value}");
+            assert!(
+                matches!(
+                    inspect(&write(dir.path(), "bad.pdf", &builder.build())),
+                    Err(ManualViewerError::Malformed(_))
+                ),
+                "{key} {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pdf_live_xref_offsets_fail_closed_even_for_unreferenced_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    // Entry 3 is not needed for the declared page count, but must still validate.
+    let text = String::from_utf8(PdfBuilder::new(1).build()).unwrap();
+    let at = text.find("xref\n").unwrap();
+    let entries: Vec<_> = text[at..].lines().collect();
+    let entry = entries[5];
+    for offset in [
+        "9999999999",
+        "-000000001",
+        "000000x123",
+        "18446744073709551616",
+        "0000000000",
+    ] {
+        let bad = text.replace(entry, &format!("{offset} 00000 n "));
+        assert!(
+            matches!(
+                inspect(&write(dir.path(), "bad.pdf", bad.as_bytes())),
+                Err(ManualViewerError::Malformed(_))
+            ),
+            "{offset}"
+        );
+    }
+    let free = text.replace(entry, "0000000000 65535 f ");
+    assert!(inspect(&write(dir.path(), "free.pdf", free.as_bytes())).is_ok());
+}
+
+#[test]
+fn javascript_and_openaction_flags_are_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    for (extra, info, js, open) in [
+        (
+            "/OpenAction << /S /JavaScript /JS (never execute) >>",
+            None,
+            true,
+            true,
+        ),
+        (
+            "/OpenAction 4 0 R",
+            Some("<< /S /JavaScript /JS (never execute) >>"),
+            true,
+            true,
+        ),
+        (
+            "/OpenAction << /S /GoTo /D [3 0 R /Fit] >>",
+            None,
+            false,
+            true,
+        ),
+        (
+            "/Names << /JavaScript << /Names [] >> >>",
+            None,
+            true,
+            false,
+        ),
+    ] {
+        let mut builder = PdfBuilder::new(1);
+        builder.catalog_extra = extra.into();
+        builder.info = info.map(str::to_string);
+        let result = inspect(&write(dir.path(), "actions.pdf", &builder.build())).unwrap();
+        assert_eq!(
+            result
+                .active_content
+                .contains(&ManualActiveContent::JavaScript),
+            js
+        );
+        assert_eq!(
+            result
+                .active_content
+                .contains(&ManualActiveContent::OpenAction),
+            open
+        );
+    }
+}
+
+#[test]
+fn independent_pdf_mutations_never_panic() {
+    let mut builder = PdfBuilder::new(1);
+    builder.trailer_extra = "/Prev 9999999".into();
+    let original = builder.build();
+    let dir = tempfile::tempdir().unwrap();
+    let mut seed = 0x739A5678_u64;
+    for _ in 0..4000 {
+        let mut data = original.clone();
+        for _ in 0..4 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let i = (seed as usize) % data.len();
+            data[i] = (seed >> 32) as u8;
+        }
+        let path = write(dir.path(), "mutated.pdf", &data);
+        assert!(std::panic::catch_unwind(|| inspect(&path)).is_ok());
+    }
+}
+
+#[test]
+fn xref_stream_live_offsets_do_not_turn_into_free_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    for (kind, offset, valid) in [
+        (0, u64::MAX, true),
+        (1, u64::MAX, false),
+        (1, 999999, false),
+        (1, 0, false),
+    ] {
+        let mut body = b"%PDF-1.5\n".to_vec();
+        let root = body.len() as u64;
+        body.extend(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let pages = body.len() as u64;
+        body.extend(b"2 0 obj\n<< /Type /Pages /Count 1 /Kids [] >>\nendobj\n");
+        let xref = body.len();
+        let mut data = Vec::new();
+        for (kind, offset) in [(1, root), (1, pages), (kind, offset)] {
+            data.push(kind);
+            data.extend(offset.to_be_bytes());
+            data.push(0);
+        }
+        body.extend(format!("4 0 obj\n<< /Type /XRef /Size 5 /Root 1 0 R /W [1 8 1] /Index [1 3] /Length {} >>\nstream\n", data.len()).bytes());
+        body.extend(data);
+        body.extend(format!("\nendstream\nendobj\nstartxref\n{xref}\n%%EOF\n").bytes());
+        assert_eq!(
+            inspect(&write(dir.path(), "stream.pdf", &body)).is_ok(),
+            valid,
+            "kind={kind}, offset={offset}"
+        );
+    }
+}
+
+#[test]
+fn lying_zip_size_is_refused_before_decode_or_at_bounded_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = zip_with(&[("1.png", &vec![0; 100_000])], CompressionMethod::Deflated);
+    let at = bytes.windows(4).position(|x| x == b"PK\x01\x02").unwrap();
+    bytes[at + 24..at + 28].copy_from_slice(&10u32.to_le_bytes());
+    let path = write(dir.path(), "lie.cbz", &bytes);
+    match ManualDocument::open(&path, &ManualLimits::default()) {
+        Err(_) => {}
+        Ok(doc) => assert!(doc.read_page_bytes(0).is_err()),
+    }
 }
