@@ -599,9 +599,13 @@ pub mod patch_manager;
 /// cheat/emulator patch manager: it never applies a change or creates history.
 pub mod mod_package;
 
+/// Foundation for trainers on ordinary (non-WHDLoad) Amiga disk images: exact
+/// image identity, typed memory-write trainers, and an immutable-source plan.
+pub mod amiga_adf_trainer;
 /// Read-only inspection and shared-transaction planning for ordinary folder
 /// and ZIP mod packages. No package content is executed or flattened.
 pub mod archive_mod_package;
+
 /// Bounded, read-only inspection of manuals and strategy guides (PDF, CBZ, CBR)
 /// and the deterministic state of an internal page viewer.
 pub mod manual_document;
