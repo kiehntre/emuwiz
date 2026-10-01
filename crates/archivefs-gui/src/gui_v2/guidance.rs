@@ -6,11 +6,13 @@
 use crate::ui::theme;
 use eframe::egui;
 
-// The canonical typed model and the authored-script schema. Nothing selects from
-// them yet; the next commits add the selector and catalogue and then replace the
-// hard-coded tips below.
+// The canonical typed model, the authored-script schema, the deterministic selector
+// and the script catalogue. Nothing here drives a page yet; a later commit replaces
+// the hard-coded tips below with the selector.
+mod catalogue;
 mod model;
 mod script;
+mod select;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum GuidanceCategory {
