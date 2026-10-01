@@ -93,6 +93,9 @@ pub struct VerificationPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversionPlan {
+    /// Admitted ordered CUE facts. This preview is not an executable plan;
+    /// execution must rebuild and revalidate through repair::optical_conversion.
+    pub source_layout: Option<crate::ingestion::cue_bin::CueLayout>,
     pub source: PathBuf,
     pub destination: PathBuf,
     pub platform: ConversionPlatform,
@@ -191,6 +194,7 @@ fn base_plan(
     details: PlanDetails,
 ) -> ConversionPlan {
     ConversionPlan {
+        source_layout: None,
         source: request.source.clone(),
         destination: request.destination.clone(),
         platform: request.platform,
@@ -357,6 +361,16 @@ pub fn plan_chd_conversion(
         ));
     }
     let source_size = validate_request(request)?;
+    let source_layout = match media_kind {
+        ChdMediaKind::Cd => Some(
+            crate::optical_preservation::source_layout(
+                &request.source,
+                crate::repair::optical_conversion::ChdConversionSourceMode::KeepSource,
+            )
+            .map_err(ConversionPlanError::Unsupported)?,
+        ),
+        ChdMediaKind::Dvd => None,
+    };
     let (mode, extract_mode, expectation) = match media_kind {
         ChdMediaKind::Dvd => (
             "createdvd",
@@ -377,7 +391,7 @@ pub fn plan_chd_conversion(
         ],
         restore_output_required: true,
     };
-    Ok(base_plan(
+    let mut plan = base_plan(
         request,
         source_size,
         PlanDetails {
@@ -396,7 +410,9 @@ pub fn plan_chd_conversion(
                 "media topology must be established before selecting createcd or createdvd".into(),
             ],
         },
-    ))
+    );
+    plan.source_layout = source_layout;
+    Ok(plan)
 }
 
 pub fn classify_rvz_route() -> ConversionOperationClass {
@@ -615,7 +631,18 @@ mod tests {
     fn chd_planning_requires_explicit_media_topology() {
         let dir = tempfile::tempdir().unwrap();
         let request = request(dir.path(), ConversionFormat::Chd);
-        let cd = plan_chd_conversion(&request, ChdMediaKind::Cd).unwrap();
+        let cue = dir.path().join("disc.cue");
+        fs::write(dir.path().join("track.bin"), vec![0; 2048]).unwrap();
+        fs::write(
+            &cue,
+            "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        let mut cd_request = request.clone();
+        cd_request.source = cue;
+        cd_request.source_format = ConversionFormat::Unknown;
+        let cd = plan_chd_conversion(&cd_request, ChdMediaKind::Cd).unwrap();
+        assert_eq!(cd.source_layout.as_ref().unwrap().tracks.len(), 1);
         assert_eq!(cd.argv[1], "createcd");
         assert_eq!(
             cd.verification.expectation,

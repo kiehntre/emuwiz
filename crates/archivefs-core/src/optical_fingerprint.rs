@@ -14,7 +14,9 @@ use sha2::{Digest, Sha256};
 
 use crate::chd_identity::{ChdMetadataFact, ChdMetadataOutcome, observe_chd_identity_file};
 use crate::chd_logical_media::open_chd_track_logical_media_file;
-use crate::ingestion::cue_bin::{CueDataTrackMode, CueError, resolve_data_track};
+use crate::ingestion::cue_bin::{
+    CueDataTrackMode, CueError, CueLayout, data_track_from_layout, resolve_cue_layout,
+};
 use crate::logical_media::LogicalMedia;
 use crate::raw_cd_logical_media::{
     open_cooked_cd_file_logical_media_range, open_raw_cd_file_logical_media_range,
@@ -119,7 +121,15 @@ fn hash_logical_media<M: LogicalMedia>(
 pub fn fingerprint_cue_bin(
     path: &Path,
 ) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
-    let track = resolve_data_track(path).map_err(|error| match error {
+    let layout = resolve_cue_layout(path).map_err(OpticalFingerprintError::Cue)?;
+    fingerprint_cue_layout(&layout)
+}
+
+/// Hash the program range from the same layout snapshot admitted by a caller.
+pub(crate) fn fingerprint_cue_layout(
+    layout: &CueLayout,
+) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
+    let track = data_track_from_layout(layout).map_err(|error| match error {
         CueError::AmbiguousDataTracks => {
             OpticalFingerprintError::UnsupportedCueLayout("multiple data tracks".into())
         }
@@ -160,7 +170,7 @@ pub fn fingerprint_cue_bin(
         },
         canonical_sha256,
         representation: OpticalRepresentation::CueBin,
-        source: path.to_path_buf(),
+        source: layout.cue_path.clone(),
     })
 }
 

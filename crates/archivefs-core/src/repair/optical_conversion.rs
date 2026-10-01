@@ -4,6 +4,11 @@
 //! The staged output must independently produce the same canonical optical
 //! fingerprint as the source before the existing journaled Repair engine is
 //! allowed to finalize it.
+//! The admitted original CUE text and output CHD metadata must also satisfy
+//! the same narrow layout contract; payload identity alone cannot prove gaps
+//! or additional indexes survived conversion.
+
+use crate::optical_preservation as layout_contract;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,7 +20,7 @@ use crate::dat::rename_apply::model::RollbackResult;
 use crate::dat::sources::now_unix;
 use crate::optical_fingerprint::{
     CanonicalOpticalFingerprint, OpticalFingerprintComparison, compare_optical_fingerprints,
-    fingerprint_chd, fingerprint_cue_bin,
+    fingerprint_chd, fingerprint_cue_layout,
 };
 use crate::repair::execute::{
     RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairTransactionResult,
@@ -83,6 +88,9 @@ pub struct ChdConversionPlan {
     pub bin_path: PathBuf,
     pub target_path: PathBuf,
     pub source_fingerprint: CanonicalOpticalFingerprint,
+    /// Ordered source facts admitted by the conversion layout contract.
+    /// The original CUE text and BIN remain bound by full-file source hashes.
+    pub source_layout: crate::ingestion::cue_bin::CueLayout,
     pub cue_identity: crate::dat::rename_apply::model::ObjectIdentity,
     pub bin_identity: crate::dat::rename_apply::model::ObjectIdentity,
     pub chdman_path: PathBuf,
@@ -281,18 +289,27 @@ pub fn build_chd_conversion_plan(
     chdman_path: Option<&Path>,
 ) -> Result<ChdConversionPlan, ChdConversionError> {
     safe_regular(cue_path).map_err(|e| ChdConversionError::InvalidSource(format!("CUE: {e}")))?;
-    let layout = crate::ingestion::cue_bin::resolve_cue_layout(cue_path)
-        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    if fs::metadata(cue_path)
+        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?
+        .len()
+        > layout_contract::MAX_CONVERSION_CUE_BYTES
+    {
+        return Err(ChdConversionError::InvalidSource(
+            "CUE exceeds the conversion size limit".into(),
+        ));
+    }
+    let cue_identity =
+        capture_identity(cue_path).map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    let layout = layout_contract::source_layout(cue_path, source_mode)
+        .map_err(ChdConversionError::InvalidSource)?;
     let track = layout
         .supported_single_mode1_2048()
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     safe_regular(&track.path)
         .map_err(|e| ChdConversionError::InvalidSource(format!("BIN: {e}")))?;
-    let source_fingerprint = fingerprint_cue_bin(cue_path)
-        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
-    let cue_identity =
-        capture_identity(cue_path).map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     let bin_identity = capture_identity(&track.path)
+        .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
+    let source_fingerprint = fingerprint_cue_layout(&layout)
         .map_err(|e| ChdConversionError::InvalidSource(e.to_string()))?;
     let parent = target_path
         .parent()
@@ -313,16 +330,19 @@ pub fn build_chd_conversion_plan(
             "target overlaps source".into(),
         ));
     }
-    Ok(ChdConversionPlan {
+    let plan = ChdConversionPlan {
         cue_path: cue_path.to_path_buf(),
         bin_path: track.path.clone(),
         target_path: target_path.to_path_buf(),
         source_fingerprint,
+        source_layout: layout,
         cue_identity,
         bin_identity,
         chdman_path: resolve_chdman(chdman_path)?,
         source_mode,
-    })
+    };
+    revalidate_source(&plan)?;
+    Ok(plan)
 }
 
 fn proposal(
@@ -330,12 +350,8 @@ fn proposal(
     source: &Path,
     destination: &Path,
     reason: String,
+    identity: &crate::dat::rename_apply::model::ObjectIdentity,
 ) -> Result<RepairProposal, ChdConversionError> {
-    let identity = capture_identity(source).map_err(|e| {
-        ChdConversionError::Transaction(RepairExecutionError::Build {
-            detail: e.to_string(),
-        })
-    })?;
     Ok(RepairProposal {
         id: RepairProposalId::new(id).ok_or_else(|| {
             ChdConversionError::Transaction(RepairExecutionError::Build {
@@ -351,7 +367,7 @@ fn proposal(
             RepairEvidenceKind::UserRequestedOrganisation,
             "verified CUE/BIN conversion",
         )],
-        expected_source_identity: Some(identity),
+        expected_source_identity: Some(identity.clone()),
         originating_audit: None,
         safety: SafetyState::Safe,
         blockers: Vec::new(),
@@ -382,6 +398,24 @@ fn plan_for_moves(id: &str, moves: Vec<RepairProposal>) -> Result<RepairPlan, Ch
     ))
 }
 
+fn revalidate_source(plan: &ChdConversionPlan) -> Result<(), ChdConversionError> {
+    if capture_identity(&plan.cue_path).ok().as_ref() != Some(&plan.cue_identity) {
+        return Err(ChdConversionError::StaleSource(plan.cue_path.clone()));
+    }
+    if capture_identity(&plan.bin_path).ok().as_ref() != Some(&plan.bin_identity) {
+        return Err(ChdConversionError::StaleSource(plan.bin_path.clone()));
+    }
+    let fresh_layout = layout_contract::source_layout(&plan.cue_path, plan.source_mode)
+        .map_err(ChdConversionError::InvalidSource)?;
+    if fresh_layout != plan.source_layout
+        || fresh_layout.tracks[0].path != plan.bin_path
+        || capture_identity(&plan.cue_path).ok().as_ref() != Some(&plan.cue_identity)
+    {
+        return Err(ChdConversionError::StaleSource(plan.cue_path.clone()));
+    }
+    Ok(())
+}
+
 pub fn execute_chd_conversion(
     plan: &ChdConversionPlan,
     trusted: TrustedRoots,
@@ -389,17 +423,14 @@ pub fn execute_chd_conversion(
     quarantine_root: &Path,
     cancel: &AtomicBool,
 ) -> Result<(ChdConversionResult, ChdConversionTransaction), ChdConversionError> {
-    if capture_identity(&plan.cue_path).ok().as_ref() != Some(&plan.cue_identity) {
-        return Err(ChdConversionError::StaleSource(plan.cue_path.clone()));
-    }
-    if capture_identity(&plan.bin_path).ok().as_ref() != Some(&plan.bin_identity) {
-        return Err(ChdConversionError::StaleSource(plan.bin_path.clone()));
-    }
-    let fresh = fingerprint_cue_bin(&plan.cue_path)
+    revalidate_source(plan)?;
+    let fresh = fingerprint_cue_layout(&plan.source_layout)
         .map_err(|_| ChdConversionError::StaleSource(plan.cue_path.clone()))?;
     if fresh != plan.source_fingerprint {
         return Err(ChdConversionError::StaleSource(plan.cue_path.clone()));
     }
+    revalidate_source(plan)?;
+    resolve_chdman(Some(&plan.chdman_path))?;
     fs::create_dir_all(journal_dir).map_err(|e| {
         ChdConversionError::Transaction(RepairExecutionError::Build {
             detail: e.to_string(),
@@ -439,7 +470,20 @@ pub fn execute_chd_conversion(
     ];
     crate::run_command_os_with_timeout(&plan.chdman_path.to_string_lossy(), &args, CHDMAN_TIMEOUT)
         .map_err(|e| ChdConversionError::ProcessFailed(e.to_string()))?;
+    revalidate_source(plan)?;
     safe_regular(&staged).map_err(ChdConversionError::VerificationFailed)?;
+    let staged_identity = capture_identity(&staged)
+        .map_err(|e| ChdConversionError::VerificationFailed(e.to_string()))?;
+    layout_contract::verify_output_layout(
+        &staged,
+        plan.source_fingerprint.structure.logical_sector_count,
+    )
+    .map_err(ChdConversionError::VerificationFailed)?;
+    layout_contract::verify_output_storage(
+        &staged,
+        plan.source_fingerprint.structure.logical_sector_count,
+    )
+    .map_err(ChdConversionError::VerificationFailed)?;
     let output_fingerprint = fingerprint_chd(&staged)
         .map_err(|e| ChdConversionError::VerificationFailed(e.to_string()))?;
     if compare_optical_fingerprints(&plan.source_fingerprint, &output_fingerprint)
@@ -449,8 +493,10 @@ pub fn execute_chd_conversion(
             "canonical optical fingerprints differ".into(),
         ));
     }
-    let staged_identity = capture_identity(&staged)
-        .map_err(|e| ChdConversionError::VerificationFailed(e.to_string()))?;
+    revalidate_source(plan)?;
+    if capture_identity(&staged).ok().as_ref() != Some(&staged_identity) {
+        return Err(ChdConversionError::StaleOutput(staged));
+    }
     let output_plan = plan_for_moves(
         &format!("chd-conversion-output-{}", now_unix()),
         vec![RepairProposal {
@@ -512,12 +558,14 @@ pub fn execute_chd_conversion(
             &plan.cue_path,
             &dir.join(plan.cue_path.file_name().unwrap()),
             "quarantine original CUE after verified conversion".into(),
+            &plan.cue_identity,
         )?;
         let p2 = proposal(
             "chd-source-bin",
             &plan.bin_path,
             &dir.join(plan.bin_path.file_name().unwrap()),
             "quarantine original BIN after verified conversion".into(),
+            &plan.bin_identity,
         )?;
         let source_plan = plan_for_moves(
             &format!("chd-conversion-source-{}", now_unix()),

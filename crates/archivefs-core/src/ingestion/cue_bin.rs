@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 /// CUE sheets are a few hundred bytes to a few KiB. Refuse anything larger
 /// as not a genuine CUE sheet rather than reading it.
-const MAX_CUE_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_CUE_BYTES: u64 = 256 * 1024;
 
 /// The maximum number of `FILE` references resolved from one CUE sheet
 /// (multi-track/multi-session discs may reference more than one).
@@ -209,6 +209,18 @@ pub fn resolve_cue_layout(cue_path: &Path) -> Result<CueLayout, CueError> {
     }
     let contents =
         std::fs::read_to_string(cue_path).map_err(|error| CueError::Io(error.to_string()))?;
+    resolve_cue_layout_text(cue_path, &contents)
+}
+
+/// Resolve the same CUE snapshot that a caller has already inspected. This
+/// shares the canonical parser without reopening potentially changed text.
+pub(crate) fn resolve_cue_layout_text(
+    cue_path: &Path,
+    contents: &str,
+) -> Result<CueLayout, CueError> {
+    if contents.len() as u64 > MAX_CUE_BYTES {
+        return Err(CueError::TooLarge);
+    }
     let base = cue_path.parent().unwrap_or_else(|| Path::new("."));
     let canonical_base =
         std::fs::canonicalize(base).map_err(|error| CueError::Io(error.to_string()))?;
@@ -497,6 +509,11 @@ pub fn resolve_cue_all_files_lenient(
 /// which no verified logical-sector view exists.
 pub fn resolve_data_track(cue_path: &Path) -> Result<CueDataTrack, CueError> {
     let layout = resolve_cue_layout(cue_path)?;
+    data_track_from_layout(&layout)
+}
+
+/// Project a previously resolved layout without rereading its CUE sheet.
+pub(crate) fn data_track_from_layout(layout: &CueLayout) -> Result<CueDataTrack, CueError> {
     let data_tracks: Vec<_> = layout
         .tracks
         .iter()
