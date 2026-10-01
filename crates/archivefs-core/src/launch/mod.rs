@@ -106,6 +106,8 @@ pub mod mesen_command;
 pub mod mesen_execution;
 pub mod mgba_command;
 pub mod mgba_execution;
+#[cfg(target_os = "linux")]
+pub mod native_support;
 pub mod openmsx_command;
 pub mod openmsx_execution;
 pub mod pcsx2_command;
@@ -125,6 +127,8 @@ pub mod rmg_command;
 pub mod rmg_execution;
 pub mod rpcs3_command;
 pub mod rpcs3_execution;
+#[cfg(target_os = "linux")]
+pub mod safe_launch_sandbox;
 pub mod sameboy_command;
 pub mod sameboy_execution;
 pub mod scummvm_command;

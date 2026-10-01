@@ -13,12 +13,16 @@
 //!   built via [`std::process::Command::new`] + [`std::process::Command::args`]
 //!   (never a shell), with stdin null, stdout null, stderr piped and
 //!   drained on a background thread bounded at
-//!   [`PROCESS_STDERR_CAPTURE_LIMIT`]. No environment override, no timeout,
+//!   [`PROCESS_STDERR_CAPTURE_LIMIT`]. The default entry point has no environment override, no timeout,
 //!   no automatic kill - the caller owns the returned [`WatchedProcess`] for
 //!   as long as the user wants the launched program running.
 //! - [`read_bounded_stderr`] - the bounded stderr drain
 //!   [`spawn_watched_process`] itself uses, exposed separately so it stays
 //!   independently testable.
+//!
+//! Linux also has a crate-private, opt-in preservation-workspace spawn seam:
+//! per-child environment, inherited workspace lease, and lifecycle callbacks.
+//! Existing callers do not use it and retain their original behavior.
 
 use std::fs;
 use std::io::Read;
@@ -161,26 +165,85 @@ impl WatchedProcess {
 /// - No timeout, no automatic kill: see [`WatchedProcess`]'s own doc
 ///   comment.
 pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Result<WatchedProcess> {
+    spawn_watched_process_inner(command, &[], None, None, None)
+}
+
+/// Opt-in preservation workspace seam. Legacy callers retain their exact
+/// command/env/cwd behavior. The lifecycle callback is owned by the watcher,
+/// not the GUI's selected game, so switching selection cannot delete a live
+/// launch's media. The child inherits the workspace lease across exec.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_watched_process_isolated(
+    command: &PreparedProcessCommand,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    lease: &std::fs::File,
+    on_start: impl FnOnce(u32) + 'static,
+    on_exit: impl FnOnce(&ProcessExitReport) + Send + 'static,
+) -> std::io::Result<WatchedProcess> {
+    use std::os::fd::AsRawFd;
+    spawn_watched_process_inner(
+        command,
+        environment,
+        Some(lease.as_raw_fd()),
+        Some(Box::new(on_start)),
+        Some(Box::new(on_exit)),
+    )
+}
+
+type ExitCallback = Box<dyn FnOnce(&ProcessExitReport) + Send>;
+
+fn spawn_watched_process_inner(
+    command: &PreparedProcessCommand,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    inherited_lease: Option<i32>,
+    on_start: Option<Box<dyn FnOnce(u32)>>,
+    on_exit: Option<ExitCallback>,
+) -> std::io::Result<WatchedProcess> {
     let mut process = Command::new(&command.executable);
     process.args(&command.arguments);
+    process.envs(environment.iter().map(|(key, value)| (key, value)));
     process.stdin(Stdio::null());
     process.stdout(Stdio::null());
     process.stderr(Stdio::piped());
     if let Some(working_directory) = &command.working_directory {
         process.current_dir(working_directory);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = inherited_lease {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe fcntl is called after fork. The
+        // caller keeps this fd alive through spawn; CLOEXEC changes only in
+        // the child, never in another thread/the parent environment.
+        unsafe {
+            process.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = inherited_lease;
     let mut child: Child = spawn_child(&mut process)?;
     let pid = child.id();
+    if let Some(on_start) = on_start {
+        on_start(pid);
+    }
     let stderr = child.stderr.take();
 
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let stderr_bytes = stderr.map(read_bounded_stderr).unwrap_or_default();
         let status = child.wait();
-        let _ = sender.send(ProcessExitReport {
+        let report = ProcessExitReport {
             status,
             stderr: stderr_bytes,
-        });
+        };
+        if let Some(on_exit) = on_exit {
+            on_exit(&report);
+        }
+        let _ = sender.send(report);
     });
 
     Ok(WatchedProcess {
