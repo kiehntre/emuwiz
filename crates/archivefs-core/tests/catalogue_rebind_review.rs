@@ -504,6 +504,51 @@ fn a_rebound_source_is_not_healthy_until_a_new_scan_covers_the_new_generation() 
     assert_eq!(f.health(0).state, SourceHealthState::Healthy);
 }
 
+#[test]
+fn scanning_one_source_does_not_degrade_another_sources_health() {
+    use archivefs_core::{add_source_folder_at, scan_source_folder_at};
+    let temp = tempfile::tempdir().unwrap();
+    let (config, database) = (
+        temp.path().join("config.toml"),
+        temp.path().join("library.sqlite3"),
+    );
+    let folders: Vec<PathBuf> = ["one", "two"]
+        .iter()
+        .map(|n| {
+            let folder = temp.path().join(n);
+            fs::create_dir(&folder).unwrap();
+            fs::write(folder.join("game.zip"), b"game").unwrap();
+            folder
+        })
+        .collect();
+    Database::open_or_create(&database).unwrap();
+    for folder in &folders {
+        add_source_folder_at(&config, &database, folder).unwrap();
+    }
+    scan_source_folder_at(&config, &database, &folders[0], "first").unwrap();
+    // A targeted scan of the second source records NotAttempted for the first.
+    scan_source_folder_at(&config, &database, &folders[1], "second").unwrap();
+    let db = Database::open_or_create(&database).unwrap();
+    let health = db.source_health(&folders).unwrap();
+    assert_eq!(health.len(), 2);
+    for entry in &health {
+        assert_eq!(entry.state, SourceHealthState::Healthy, "{:?}", entry.path);
+    }
+    let not_attempted: i64 = Connection::open(&database)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM scan_source_coverage WHERE state='\"not_attempted\"' \
+             AND source_folder_id=(SELECT id FROM source_folders WHERE path=?1)",
+            [folders[0].as_os_str().as_encoded_bytes()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        not_attempted > 0,
+        "the scenario must actually record NotAttempted rows"
+    );
+}
+
 // --- Migration 21 -> 22 -> 23 on a private copy.
 
 fn downgrade_to_21(connection: &Connection) {

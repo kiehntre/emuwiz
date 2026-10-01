@@ -776,8 +776,12 @@ impl Database {
             let latest: Option<(String, Option<i64>)> = self
                 .connection
                 .query_row(
+                    // A run that did not attempt this source records NotAttempted for
+                    // it (a targeted scan of another folder does). That is not an
+                    // observation of this source, so the latest *attempt* decides.
                     "SELECT state, source_generation FROM scan_source_coverage \
-                     WHERE source_folder_id=?1 ORDER BY scan_run_id DESC LIMIT 1",
+                     WHERE source_folder_id=?1 AND state NOT IN ('\"not_attempted\"','\"removed\"') \
+                     ORDER BY scan_run_id DESC LIMIT 1",
                     [source.source_id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )

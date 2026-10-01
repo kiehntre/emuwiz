@@ -638,6 +638,8 @@ impl NativeWorkflows {
         if let Some(action) = action {
             self.app.start_source_action(ui.ctx().clone(), action);
         }
+        // The reviewed-rebind dialog belongs to whichever Sources page is up.
+        self.app.show_rebind_dialog_and_apply(ui.ctx());
         self.observe_source_activity(activity);
         self.observe_provider_activity(activity);
         self.observe_dat_activity(activity);
@@ -663,6 +665,15 @@ impl NativeWorkflows {
         let archives = snapshot
             .map(|snapshot| snapshot.archives.clone())
             .unwrap_or_default();
+        // The backend's source-level catalogue health, projected for display. A
+        // source it has not answered for reads as unknown, never as healthy.
+        let health_rows = crate::catalogue_health_ui::project_rows(
+            &source_state.sources,
+            snapshot
+                .map(|snapshot| snapshot.source_health.as_slice())
+                .unwrap_or(&[]),
+        );
+        let mut health_action = None;
         let discovery_summary = match &self.app.database_state {
             crate::DatabaseState::Ready {
                 last_scan_summary, ..
@@ -716,6 +727,24 @@ impl NativeWorkflows {
             }
         });
 
+        // Catalogue health comes first: a folder that needs review blocks
+        // scanning and every Missing report, so it must not be buried below
+        // provider setup. Hidden in Discovery, and while there are no folders.
+        if !self.sources_discovery && !source_state.sources.is_empty() {
+            ui.separator();
+            let row_view = self
+                .app
+                .sources_ui
+                .catalogue_row_check
+                .view(self.app.database_generation.0);
+            health_action = crate::catalogue_health_ui::show_health_section(
+                ui,
+                &health_rows,
+                &row_view,
+                busy || self.app.database_state.is_loading(),
+            );
+        }
+
         // Provider setup lives on this page, directly below the primary
         // "Add source" row so that action stays visible.
         ui.separator();
@@ -740,6 +769,7 @@ impl NativeWorkflows {
                     }
                 });
         }
+        self.app.apply_health_action(ui.ctx(), health_action);
         action
     }
 

@@ -729,6 +729,59 @@ impl crate::ArchiveFsApp {
         });
     }
 
+    /// Carries out a click on the health section.
+    pub(crate) fn apply_health_action(
+        &mut self,
+        context: &egui::Context,
+        action: Option<HealthAction>,
+    ) {
+        match action {
+            Some(HealthAction::Review(path)) => self.start_rebind_review(context.clone(), path),
+            Some(HealthAction::CheckRows) => self.start_row_check(context.clone()),
+            None => {}
+        }
+    }
+
+    /// Draws the rebind dialog when one is open and carries out what the person
+    /// chose. Shared by every Sources page so there is one implementation.
+    pub(crate) fn show_rebind_dialog_and_apply(&mut self, context: &egui::Context) {
+        let busy = !self.source_action_available() || self.database_state.is_loading();
+        let action = self
+            .sources_ui
+            .sources_rebind_dialog
+            .as_mut()
+            .and_then(|dialog| show_rebind_dialog(context, dialog, busy));
+        match action {
+            Some(DialogAction::Confirm(review)) => {
+                // Only the loaded, acknowledged review currently on screen can be
+                // committed; anything else is dropped without effect.
+                let on_screen = self
+                    .sources_ui
+                    .sources_rebind_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.confirmable());
+                if on_screen == Some(&*review) {
+                    self.start_source_action(
+                        context.clone(),
+                        crate::SourceAction::Rebind { review },
+                    );
+                }
+            }
+            Some(DialogAction::ReviewAgain) => {
+                if let Some(path) = self
+                    .sources_ui
+                    .sources_rebind_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.path.clone())
+                {
+                    self.start_rebind_review(context.clone(), path);
+                }
+            }
+            Some(DialogAction::Close) => self.sources_ui.sources_rebind_dialog = None,
+            None => {}
+        }
+    }
+
     pub(crate) fn poll_catalogue_health(&mut self, context: &egui::Context) {
         let mut changed = self.sources_ui.catalogue_row_check.poll();
         if let Some(dialog) = self.sources_ui.sources_rebind_dialog.as_mut() {

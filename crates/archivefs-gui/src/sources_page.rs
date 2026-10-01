@@ -3066,51 +3066,8 @@ impl ArchiveFsApp {
                 &mut self.clipboard,
             )
         });
-        match health_action {
-            Some(catalogue_health_ui::HealthAction::Review(path)) => {
-                self.start_rebind_review(context.clone(), path);
-            }
-            Some(catalogue_health_ui::HealthAction::CheckRows) => {
-                self.start_row_check(context.clone());
-            }
-            None => {}
-        }
-        let rebind_busy = source_busy || self.database_state.is_loading();
-        let rebind_action = self
-            .sources_ui
-            .sources_rebind_dialog
-            .as_mut()
-            .and_then(|dialog| {
-                catalogue_health_ui::show_rebind_dialog(context, dialog, rebind_busy)
-            });
-        match rebind_action {
-            Some(catalogue_health_ui::DialogAction::Confirm(review)) => {
-                // Only the loaded, acknowledged review currently on screen can be
-                // committed; anything else is dropped without effect.
-                let on_screen = self
-                    .sources_ui
-                    .sources_rebind_dialog
-                    .as_ref()
-                    .and_then(|dialog| dialog.confirmable());
-                if on_screen == Some(&*review) {
-                    self.start_source_action(context.clone(), SourceAction::Rebind { review });
-                }
-            }
-            Some(catalogue_health_ui::DialogAction::ReviewAgain) => {
-                if let Some(path) = self
-                    .sources_ui
-                    .sources_rebind_dialog
-                    .as_ref()
-                    .map(|dialog| dialog.path.clone())
-                {
-                    self.start_rebind_review(context.clone(), path);
-                }
-            }
-            Some(catalogue_health_ui::DialogAction::Close) => {
-                self.sources_ui.sources_rebind_dialog = None;
-            }
-            None => {}
-        }
+        self.apply_health_action(context, health_action);
+        self.show_rebind_dialog_and_apply(context);
         if let Some(sources_action) = sources_action {
             match sources_action {
                 SourcesPageAction::AddFolder(path) => {

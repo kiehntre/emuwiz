@@ -1410,7 +1410,7 @@ fn persisted_archive_with_platform(
     }
 }
 
-fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
+pub(crate) fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
     let platform_details = archives
         .iter()
         .map(|archive| {

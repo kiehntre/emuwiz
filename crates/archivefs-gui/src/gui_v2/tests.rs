@@ -4477,6 +4477,97 @@ fn sources_paint_only_rendering_does_not_mutate_state_or_reuse_ids() {
     assert_eq!(roots(&app), roots_before);
 }
 
+/// The canonical GUI-v2 Sources page projects the backend's source health: a
+/// source that needs review offers the reviewed rebind, a source the backend has
+/// not answered for reads as unknown, and neither is ever shown as up to date.
+#[test]
+fn sources_page_projects_backend_health_and_offers_reviewed_rebind_only_when_required() {
+    use archivefs_core::catalogue_health::{RebindReason, SourceHealth, SourceHealthState};
+    let view = || archivefs_core::SourceFolderView {
+        path: std::path::PathBuf::from("/games"),
+        role: Default::default(),
+        enabled: true,
+        created_at: None,
+        id: Some(1),
+        availability: archivefs_core::SourceAvailability::Available,
+        last_scan_status: None,
+        last_scan_error: None,
+        last_scan_at: None,
+        last_successful_scan_at: None,
+        last_archive_count: None,
+        assigned_platform: None,
+        unknown_archive_count: 0,
+    };
+    let health = |state, rebind| SourceHealth {
+        source_id: 1,
+        path: std::path::PathBuf::from("/games"),
+        state,
+        rebind,
+        generation: 0,
+        detail: None,
+    };
+    let render = |entries: Vec<SourceHealth>| {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.artwork.index = Some(Arc::new(MediaIndex::default()));
+        app.router.current = Route::Section(Section::Sources);
+        frame(&context, &mut app, [1280.0, 820.0]);
+        let mut snapshot = crate::tests::cached_snapshot(Vec::new());
+        snapshot.source_views = vec![view()];
+        snapshot.source_health = entries;
+        app.native_workflows.as_mut().unwrap().app.database_state = crate::DatabaseState::Ready {
+            snapshot: Box::new(snapshot),
+            last_scan_summary: None,
+        };
+        frame(&context, &mut app, [1280.0, 820.0]);
+        let output = frame(&context, &mut app, [1280.0, 820.0]);
+        text(&output)
+    };
+    // Status badges carry a tone glyph ("× Review needed"), so match the label.
+    let has = |texts: &[String], needle: &str| {
+        texts
+            .iter()
+            .any(|value| value == needle || value.ends_with(&format!(" {needle}")))
+    };
+
+    let legacy = render(vec![health(
+        SourceHealthState::RebindRequired,
+        Some(RebindReason::NeverBound),
+    )]);
+    assert!(has(&legacy, "Review and rebind source"), "{legacy:?}");
+    assert!(has(&legacy, "Review needed"));
+    assert!(!has(&legacy, "Up to date"));
+
+    let swapped = render(vec![health(
+        SourceHealthState::RebindRequired,
+        Some(RebindReason::BackingChanged),
+    )]);
+    assert!(has(&swapped, "Review and rebind source"));
+    assert!(has(&swapped, "Review needed: different storage"));
+
+    // No backend answer for the source: unknown, no review button, never healthy.
+    let unknown = render(Vec::new());
+    assert!(has(&unknown, "Not checked yet"), "{unknown:?}");
+    assert!(!has(&unknown, "Review and rebind source"));
+    assert!(!has(&unknown, "Up to date"));
+
+    // A stale-looking or incomplete state never offers review and never reads healthy.
+    for state in [
+        SourceHealthState::NeedsScan,
+        SourceHealthState::PartialScan,
+        SourceHealthState::CoverageIncomplete,
+        SourceHealthState::SourceUnavailable,
+    ] {
+        let rendered = render(vec![health(state, None)]);
+        assert!(!has(&rendered, "Review and rebind source"), "{state:?}");
+        assert!(!has(&rendered, "Up to date"), "{state:?}");
+    }
+
+    let healthy = render(vec![health(SourceHealthState::Healthy, None)]);
+    assert!(has(&healthy, "Up to date"));
+    assert!(!has(&healthy, "Review and rebind source"));
+}
+
 fn mame_archive(id: i64, title: &str) -> PersistedArchive {
     use archivefs_core::game_identity::*;
     let mut row = archive(id, title, Some("Arcade"));
