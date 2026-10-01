@@ -599,6 +599,10 @@ pub mod mod_package;
 /// Read-only inspection and shared-transaction planning for ordinary folder
 /// and ZIP mod packages. No package content is executed or flattened.
 pub mod archive_mod_package;
+/// Bounded, read-only inspection of manuals and strategy guides (PDF, CBZ, CBR)
+/// and the deterministic state of an internal page viewer.
+pub mod manual_document;
+
 /// Read-only novice-facing projection and cross-package conflict comparison
 /// over ordinary local mod package inspections.
 pub mod mod_package_preview;
