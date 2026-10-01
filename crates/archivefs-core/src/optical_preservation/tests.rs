@@ -655,3 +655,88 @@ fn quarantine_accepts_dot_prefix_but_refuses_component_aliases() {
     source_layout(&cue, ChdConversionSourceMode::KeepSource).unwrap();
     assert!(source_layout(&cue, ChdConversionSourceMode::QuarantineSource).is_err());
 }
+
+const META_SIMPLE: &str = "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n";
+const META_KEEP: ChdConversionSourceMode = ChdConversionSourceMode::KeepSource;
+
+#[test]
+fn track_level_and_non_ascii_metadata_is_admitted_without_changing_the_layout() {
+    let (_dir, cue) = fixture(META_SIMPLE, &[("data.bin", 2048 * 16)]);
+    let expected = source_layout(&cue, META_KEEP).unwrap();
+    for text in [
+        // between TRACK and INDEX, indented as ripping tools write it
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\n  TITLE \"Track\"\n  REM COMMENT x\n  REM GENRE y\nINDEX 01 00:00:00\n",
+        // disc level before FILE and track level together
+        "TITLE \"Disc\"\nFILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\n  TITLE \"Track\"\nINDEX 01 00:00:00\n",
+        // non-ASCII in a quoted TITLE and in REM values (including lowercase REM)
+        "TITLE \"Disc é 日本\"\nREM COMMENT é 日本\nrem genre ü\nFILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+        // bare REM COMMENT without a value
+        "REM COMMENT\nFILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+    ] {
+        std::fs::write(&cue, text).unwrap();
+        assert_eq!(
+            source_layout(&cue, META_KEEP).unwrap(),
+            expected,
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn near_miss_metadata_syntax_and_control_characters_are_refused() {
+    for line in [
+        "REM",
+        "REM DATE 1999",
+        "REM DISCID 12345678",
+        "REM LEAD-OUT 00:00:00",
+        "REM COMMENTS x",
+        "REM GENRES x",
+        "REMCOMMENT x",
+        "REM\u{a0}COMMENT x",
+        "TITLE unquoted",
+        "TITLE é",
+        "TITLE\"x\"",
+        "TITLE \"unterminated",
+        "TITLE \"a\" \"b\"",
+        "TITLES \"x\"",
+        "REM COMMENT a\u{1}b",
+        "TITLE \"a\u{1}b\"",
+    ] {
+        refused(
+            &format!("{line}\n{META_SIMPLE}"),
+            &[("data.bin", 2048 * 16)],
+        );
+    }
+}
+
+#[test]
+fn benign_metadata_cannot_launder_unsafe_directives() {
+    let meta = "REM COMMENT ok\nREM GENRE ok\nTITLE \"ok\"\n";
+    for extra in [
+        "PREGAP 00:00:02",
+        "POSTGAP 00:00:02",
+        "INDEX 00 00:00:00",
+        "INDEX 02 00:00:08",
+        "FLAGS DCP",
+        "CATALOG 0123456789012",
+        "PERFORMER \"x\"",
+        "ISRC ABCDE1234567",
+        "SONGWRITER \"x\"",
+        "CDTEXTFILE \"x.cdt\"",
+    ] {
+        refused(
+            &format!(
+                "{meta}FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\n{extra}\nINDEX 01 00:00:00\n"
+            ),
+            &[("data.bin", 2048 * 16)],
+        );
+    }
+    for body in [
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:01\n",
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n",
+        "FILE \"data.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nTRACK 02 MODE1/2048\nINDEX 01 00:00:08\n",
+    ] {
+        refused(&format!("{meta}{body}"), &[("data.bin", 2048 * 16)]);
+    }
+}

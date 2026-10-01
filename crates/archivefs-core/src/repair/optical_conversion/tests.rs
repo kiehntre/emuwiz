@@ -696,3 +696,51 @@ fn real_chdman_accepts_benign_annotations_without_weakening_verification() {
     assert_eq!(std::fs::read_to_string(cue).unwrap(), text);
     assert_eq!(std::fs::read(bin).unwrap(), bytes);
 }
+
+#[test]
+fn metadata_only_cue_edits_after_preview_are_stale_before_the_converter() {
+    use std::os::unix::fs::PermissionsExt;
+    const WITH_METADATA: &str = "REM GENRE Data\nREM COMMENT \"ripped by hand\"\nTITLE \"Disc ü\"\nFILE \"Track space ü.bin\" BINARY\nTRACK 01 MODE1/2048\n  TITLE \"Track\"\nINDEX 01 00:00:00\n";
+    for change in ["title", "comment", "removed", "added"] {
+        let dir = tempdir().unwrap();
+        let (cue, _bin) = source(dir.path());
+        std::fs::write(&cue, WITH_METADATA).unwrap();
+        let tool = dir.path().join("converter");
+        let marker = dir.path().join("executed");
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\ntouch '{}'\nexit 99\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let target = dir.path().join("output.chd");
+        let plan = build_chd_conversion_plan(
+            &cue,
+            &target,
+            ChdConversionSourceMode::KeepSource,
+            Some(&tool),
+        )
+        .unwrap();
+        let changed = match change {
+            "title" => WITH_METADATA.replace("Disc ü", "Other"),
+            "comment" => WITH_METADATA.replace("ripped by hand", "edited"),
+            "removed" => WITH_METADATA.replace("REM GENRE Data\n", ""),
+            _ => format!("REM COMMENT late\n{WITH_METADATA}"),
+        };
+        std::fs::write(&cue, changed).unwrap();
+        let result = execute_chd_conversion(
+            &plan,
+            TrustedRoots::from_paths([dir.path()]),
+            &dir.path().join("journal"),
+            dir.path(),
+            &AtomicBool::new(false),
+        );
+        assert!(
+            matches!(result, Err(ChdConversionError::StaleSource(_))),
+            "{change}: {result:?}"
+        );
+        assert!(!marker.exists(), "{change}");
+        assert!(!target.exists(), "{change}");
+        assert!(!dir.path().join("journal").exists(), "{change}");
+    }
+}
