@@ -520,3 +520,87 @@ fn cue_admission_refuses_dropped_semantics_and_unicode_directives_without_panic(
         review_saturn_patch(&plan.patch, &destination, &binding(&manifest, &plan.patch)).unwrap();
     reviewed.prepare().unwrap();
 }
+
+fn fresh_published() -> (tempfile::TempDir, Vec<PathBuf>, PathBuf, PreparedTreePatch) {
+    let (temp, plan, destination) = fixture();
+    let prepared = plan.prepare().unwrap();
+    (
+        temp,
+        vec![plan.source.clone(), plan.patch.clone()],
+        destination,
+        prepared,
+    )
+}
+#[test]
+fn shared_contract_published_changes_never_gain_undo_authority() {
+    crate::optical_patch_tree::contract::published_changes_never_gain_undo_authority(
+        &fresh_published,
+    );
+}
+#[test]
+fn shared_contract_interruption_recovery_and_input_immutability() {
+    crate::optical_patch_tree::contract::lifecycle_after_interruption_and_stale_plans_keep_inputs_intact(
+        &fresh_published,
+        &|inputs| {
+            // Change the reviewed patch after review.
+            let mut bytes = fs::read(&inputs[1]).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            fs::write(&inputs[1], bytes).unwrap();
+        },
+    );
+    // Changing an untouched audio component is stale too.
+    let (_temp, plan, destination) = fixture();
+    let prepared = plan.prepare().unwrap();
+    let audio = fs::read_dir(&plan.source)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension().is_some_and(|e| e == "bin") && *path != plan.source.join(&plan.target)
+        })
+        .expect("fixture has an audio component");
+    fs::write(&audio, b"changed audio").unwrap();
+    assert!(publish(&prepared.journal_path).is_err());
+    assert!(!destination.exists());
+}
+#[test]
+fn ips_record_past_eof_grows_in_the_engine_but_never_publishes() {
+    let (_temp, plan, destination) = fixture();
+    let before = crate::optical_patch_tree::contract::snapshot(&plan.source);
+    let size = fs::metadata(plan.source.join("data.bin")).unwrap().len();
+    // One IPS record exactly at EOF: the canonical engine grows the output.
+    let mut patch = b"PATCH".to_vec();
+    patch.extend(&(size as u32).to_be_bytes()[1..]);
+    patch.extend([0, 1, 0x33]);
+    patch.extend(b"EOF");
+    fs::write(&plan.patch, &patch).unwrap();
+    let inspection = inspect_standalone_patch(&plan.patch).unwrap();
+    let engine = build_standalone_patch_apply_plan(
+        &inspection,
+        plan.source.join("data.bin"),
+        &destination,
+        destination.parent().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        prepare_standalone_patch_output(&engine)
+            .unwrap()
+            .bytes
+            .len() as u64,
+        size + 1
+    );
+    // The fixed-layout backend must refuse that growth (the optical layout
+    // would silently change), at review or at preparation.
+    let result = review_saturn_patch(
+        &plan.patch,
+        &destination,
+        &binding(&plan.manifest, &plan.patch),
+    )
+    .and_then(|review| review.prepare());
+    assert!(result.is_err());
+    assert!(!destination.exists());
+    assert_eq!(
+        crate::optical_patch_tree::contract::snapshot(&plan.source),
+        before
+    );
+}

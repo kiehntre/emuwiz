@@ -54,3 +54,30 @@ git diff 1a24276a..HEAD --check
 ```
 
 Safe for focused review: **YES**. GUI wiring and an explicit provider/user review route for source-package bindings remain deferred. Unsupported disc representations and rebuilds remain refusals, not implied capabilities. No launch integration was added.
+
+## Final focused review changes
+
+- **Dreamcast source bound 512 MiB -> 1 GiB.** `MAX_SOURCE_BYTES` bounds the
+  logical size of the COMPLETE reviewed extracted tree. A GD-ROM high-density
+  area is LBA 45000..=549149, 504,150 x 2048 B = 984.7 MiB, so 512 MiB refused
+  most discs that fill more than half the area. `MAX_STAGING_BYTES` becomes
+  1.5 GiB (source + 512 MiB package), compile-time checked against the shared
+  helper's 8 GiB ceiling. A 900 MiB sparse tree passed review, prepare, publish,
+  inspect and undo at 46 MB peak RSS; hashing is the cost (about 9 minutes in a
+  debug build, because the tree is hashed several times).
+- **Saturn bounds unchanged.** Source/staging 1 GiB, patch 128 MiB, allowance
+  <= 1152 MiB are passed explicitly to the shared helper. The 512 MiB component
+  cap equals the canonical engine's in-memory `MAX_APPLY_BYTES`; a Saturn data
+  track above 512 MiB (a full raw 2352-byte disc can reach about 750 MiB) is
+  refused. That limit belongs to the canonical engine, not this adapter, and
+  would need a streaming applier to lift.
+- **Shared helper journal lock.** `tree::load` used a single non-blocking
+  `flock`. A fork in another thread briefly holds an inherited copy of the
+  descriptor until its exec, so a lock the caller had just released reported
+  `WouldBlock`. In the full suite this failed the Saturn recovery tests in 3 of
+  4 runs; module-only runs never failed. `load` now retries for up to 2 s; a
+  real concurrent publish/undo still refuses. 4 of 4 full runs pass after.
+- **Added coverage:** a backend-independent contract run by both adapters
+  (published-tree mutations never gain undo authority, post-rename recovery,
+  repeated undo, collision, stale plans, input immutability), IP.BIN
+  boot-mapping/product/revision/region changes, and IPS growth past EOF.

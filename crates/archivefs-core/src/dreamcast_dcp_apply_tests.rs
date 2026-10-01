@@ -1,4 +1,5 @@
 use super::*;
+use crate::patch_output_recovery::tree::PreparedTreePatch;
 use crate::patch_output_recovery::tree::{TreePatchState, inspect, publish, undo};
 use std::io::Write;
 
@@ -364,4 +365,95 @@ fn ip_bin_length_change_refused() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn extracted_tree_larger_than_512_mib_is_planned_under_the_explicit_policy() {
+    use crate::patch_output_recovery::tree::HARD_MAX_TOTAL_BYTES;
+    const MIB: u64 = 1024 * 1024;
+    // The bound is explicit, checked at compile time against the shared helper
+    // ceiling, and large enough for a full GD-ROM high-density area.
+    const _: () = assert!(MAX_STAGING_BYTES <= HARD_MAX_TOTAL_BYTES);
+    const _: () = assert!(MAX_SOURCE_BYTES >= 504_150 * 2048);
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    fs::create_dir_all(source.join("bootsector")).unwrap();
+    fs::write(source.join("bootsector/IP.BIN"), ip_bin()).unwrap();
+    fs::write(source.join("1ST_READ.BIN"), b"old boot").unwrap();
+    // Just past the former 512 MiB bound, as a sparse file: logical size counts
+    // and nothing proportional to it is held in memory (a 900 MiB tree was
+    // measured at 46 MB peak RSS through review, prepare, publish and undo).
+    File::create(source.join("bulk.bin"))
+        .unwrap()
+        .set_len(513 * MIB)
+        .unwrap();
+    let patch = temp.path().join("patch.dcp");
+    package(&patch, &[("1ST_READ.BIN", b"new boot")]);
+    let plan = review_dreamcast_dcp(
+        &source,
+        &patch,
+        &temp.path().join("published"),
+        &binding(&source, &patch),
+    )
+    .unwrap();
+    assert!(plan.max_total_bytes() > 512 * MIB);
+    assert!(plan.max_total_bytes() <= MAX_STAGING_BYTES);
+}
+
+fn fresh_published() -> (tempfile::TempDir, Vec<PathBuf>, PathBuf, PreparedTreePatch) {
+    let (temp, plan, destination) = fixture();
+    let prepared = plan.prepare().unwrap();
+    (
+        temp,
+        vec![plan.source.clone(), plan.package.path.clone()],
+        destination,
+        prepared,
+    )
+}
+#[test]
+fn shared_contract_published_changes_never_gain_undo_authority() {
+    crate::optical_patch_tree::contract::published_changes_never_gain_undo_authority(
+        &fresh_published,
+    );
+}
+#[test]
+fn shared_contract_interruption_recovery_and_input_immutability() {
+    crate::optical_patch_tree::contract::lifecycle_after_interruption_and_stale_plans_keep_inputs_intact(
+        &fresh_published,
+        &|inputs| fs::write(inputs[0].join("untouched"), b"edited after review").unwrap(),
+    );
+    // A changed package is just as stale as a changed source tree.
+    let (_temp, inputs, destination, prepared) = fresh_published();
+    fs::write(&inputs[1], b"not the reviewed package").unwrap();
+    assert!(publish(&prepared.journal_path).is_err());
+    assert!(!destination.exists());
+}
+#[test]
+fn patched_ip_bin_that_changes_boot_mapping_or_identity_never_publishes() {
+    for variant in ["boot member", "product", "revision", "region"] {
+        let (_temp, plan, destination) = fixture();
+        let mut ip = ip_bin();
+        match variant {
+            // Same length, valid IP.BIN, but boots a different existing file.
+            "boot member" => ip[96..108].copy_from_slice(b"untouched   "),
+            "product" => ip[64..71].copy_from_slice(b"T-9999M"),
+            "revision" => ip[74..80].copy_from_slice(b"V9.999"),
+            _ => ip[48] = b'U',
+        }
+        package(&plan.package.path, &[("bootsector/IP.BIN", &ip)]);
+        let result = review_dreamcast_dcp(
+            &plan.source,
+            &plan.package.path,
+            &destination,
+            &binding(&plan.source, &plan.package.path),
+        )
+        .and_then(|review| review.prepare());
+        assert!(result.is_err(), "{variant}");
+        assert!(!destination.exists(), "{variant}");
+        assert_eq!(
+            fs::read(plan.source.join("bootsector/IP.BIN")).unwrap(),
+            ip_bin(),
+            "{variant}"
+        );
+    }
 }

@@ -161,6 +161,172 @@ impl Contents {
     }
 }
 
+/// Backend-independent publication/recovery/immutability contract, run by both
+/// adapters against their own fixtures.
+#[cfg(test)]
+pub(crate) mod contract {
+    use crate::patch_output_recovery::tree::{self, PreparedTreePatch, TreePatchState};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    pub(crate) type Fresh<'a> =
+        &'a dyn Fn() -> (tempfile::TempDir, Vec<PathBuf>, PathBuf, PreparedTreePatch);
+
+    /// Names, kinds and bytes of everything under `path` (a file is itself).
+    pub(crate) fn snapshot(path: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn walk(base: &Path, path: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+            let meta = fs::symlink_metadata(path).unwrap();
+            let key = path.strip_prefix(base).unwrap().display().to_string();
+            if meta.is_dir() {
+                out.insert(format!("{key}/"), Vec::new());
+                for entry in fs::read_dir(path).unwrap() {
+                    walk(base, &entry.unwrap().path(), out);
+                }
+            } else if meta.file_type().is_symlink() {
+                out.insert(key, b"<symlink>".to_vec());
+            } else {
+                out.insert(key, fs::read(path).unwrap());
+            }
+        }
+        let mut out = BTreeMap::new();
+        if fs::symlink_metadata(path).unwrap().is_dir() {
+            walk(path, path, &mut out);
+        } else {
+            out.insert(String::new(), fs::read(path).unwrap());
+        }
+        out
+    }
+
+    fn staging_of(journal: &Path) -> PathBuf {
+        journal.with_file_name(journal.file_stem().unwrap())
+    }
+
+    fn inputs_unchanged(inputs: &[PathBuf], before: &[BTreeMap<String, Vec<u8>>], what: &str) {
+        assert!(
+            before.iter().all(|snap| !snap.is_empty()),
+            "empty snapshot proves nothing"
+        );
+        let after: Vec<_> = inputs.iter().map(|path| snapshot(path)).collect();
+        assert_eq!(after, before, "source/patch inputs changed: {what}");
+    }
+
+    pub(crate) fn published_changes_never_gain_undo_authority(fresh: Fresh<'_>) {
+        use std::os::unix::fs::symlink;
+        for mutation in [
+            "same-size edit, mtime restored",
+            "size change",
+            "added file",
+            "removed file",
+            "added empty directory",
+            "added symlink",
+            "member replaced by symlink",
+            "hardlink to member",
+        ] {
+            let (_temp, inputs, destination, prepared) = fresh();
+            let before: Vec<_> = inputs.iter().map(|path| snapshot(path)).collect();
+            tree::publish(&prepared.journal_path).unwrap();
+            let published = snapshot(&destination);
+            let member = destination.join(
+                published
+                    .keys()
+                    .find(|key| !key.ends_with('/') && !key.is_empty())
+                    .unwrap(),
+            );
+            match mutation {
+                "same-size edit, mtime restored" => {
+                    let modified = fs::metadata(&member).unwrap().modified().unwrap();
+                    let mut bytes = fs::read(&member).unwrap();
+                    bytes[0] ^= 1;
+                    fs::write(&member, bytes).unwrap();
+                    fs::File::options()
+                        .write(true)
+                        .open(&member)
+                        .unwrap()
+                        .set_modified(modified)
+                        .unwrap();
+                }
+                "size change" => fs::write(&member, b"short").unwrap(),
+                "added file" => fs::write(destination.join("extra"), b"x").unwrap(),
+                "removed file" => fs::remove_file(&member).unwrap(),
+                "added empty directory" => fs::create_dir(destination.join("emptydir")).unwrap(),
+                "added symlink" => symlink("/etc/passwd", destination.join("link")).unwrap(),
+                "member replaced by symlink" => {
+                    fs::remove_file(&member).unwrap();
+                    symlink("/etc/passwd", &member).unwrap();
+                }
+                _ => fs::hard_link(&member, destination.join("hardlink")).unwrap(),
+            }
+            let changed = snapshot(&destination);
+            assert!(tree::inspect(&prepared.journal_path).is_err(), "{mutation}");
+            assert!(tree::undo(&prepared.journal_path).is_err(), "{mutation}");
+            assert!(tree::publish(&prepared.journal_path).is_err(), "{mutation}");
+            // Refusal must leave the changed tree exactly where it was.
+            assert_eq!(snapshot(&destination), changed, "{mutation}");
+            assert!(!staging_of(&prepared.journal_path).exists(), "{mutation}");
+            inputs_unchanged(&inputs, &before, mutation);
+        }
+    }
+
+    pub(crate) fn lifecycle_after_interruption_and_stale_plans_keep_inputs_intact(
+        fresh: Fresh<'_>,
+        stale: &dyn Fn(&[PathBuf]),
+    ) {
+        // prepare -> staged; crash before rename; publish; undo; republish.
+        let (_temp, inputs, destination, prepared) = fresh();
+        let before: Vec<_> = inputs.iter().map(|path| snapshot(path)).collect();
+        assert_eq!(
+            tree::inspect(&prepared.journal_path).unwrap(),
+            TreePatchState::Staged
+        );
+        tree::publish(&prepared.journal_path).unwrap();
+        assert_eq!(
+            tree::inspect(&prepared.journal_path).unwrap(),
+            TreePatchState::Published
+        );
+        tree::undo(&prepared.journal_path).unwrap();
+        assert!(!destination.exists());
+        assert!(tree::undo(&prepared.journal_path).is_err());
+        tree::publish(&prepared.journal_path).unwrap();
+        inputs_unchanged(&inputs, &before, "publish/undo/republish");
+
+        // crash immediately after the rename: only the rename happened.
+        let (_temp, inputs, destination, prepared) = fresh();
+        let before: Vec<_> = inputs.iter().map(|path| snapshot(path)).collect();
+        fs::rename(staging_of(&prepared.journal_path), &destination).unwrap();
+        assert_eq!(
+            tree::inspect(&prepared.journal_path).unwrap(),
+            TreePatchState::Published
+        );
+        assert!(tree::publish(&prepared.journal_path).is_err());
+        tree::undo(&prepared.journal_path).unwrap();
+        assert_eq!(
+            tree::inspect(&prepared.journal_path).unwrap(),
+            TreePatchState::Staged
+        );
+        inputs_unchanged(&inputs, &before, "post-rename recovery");
+
+        // destination appears after review: refused, nothing overwritten.
+        let (_temp, inputs, destination, prepared) = fresh();
+        let before: Vec<_> = inputs.iter().map(|path| snapshot(path)).collect();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("owner"), b"mine").unwrap();
+        assert!(tree::publish(&prepared.journal_path).is_err());
+        assert_eq!(fs::read(destination.join("owner")).unwrap(), b"mine");
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 1);
+        assert_eq!(tree::inspect(&prepared.journal_path).is_err(), true);
+        inputs_unchanged(&inputs, &before, "destination collision");
+
+        // stale plan: the caller changes a reviewed input; publication refuses
+        // and the staged tree is retained untouched.
+        let (_temp, inputs, destination, prepared) = fresh();
+        stale(&inputs);
+        assert!(tree::publish(&prepared.journal_path).is_err());
+        assert!(!destination.exists());
+        assert!(staging_of(&prepared.journal_path).is_dir());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::patch_output_recovery::tree::{self, PreparedTreePatch, TreePatchState};
