@@ -441,9 +441,65 @@ cargo run --offline --locked -p archivefs-core \
 
 The example accepts only database/config paths and has no apply option.
 
+## Reviewed source rebind and the catalogue-health projection (current-main integration)
+
+Migration 23 deliberately leaves every previously scanned source unbound, and a
+scan of an unbound historical source (or one whose storage no longer matches its
+binding) fails with "reviewed rebind required". A backend API alone would leave
+an upgraded user stuck, so the Sources page now carries the whole path.
+
+**One authority model.** Source state is one backend enum,
+`SourceHealthState` (`Healthy`, `NeedsScan`, `PartialScan`,
+`CoverageIncomplete`, `SourceUnavailable`, `RebindRequired`, `NotGameScanned`),
+produced by `Database::source_health` from the same facts the scan and the
+reconciliation use: the accepted binding and generation, the latest
+`scan_source_coverage` row recorded *for that generation*, availability, and the
+remembered nested boundaries. Only `Healthy` can establish new Missing evidence
+(`can_establish_missing`). The GUI projects it and decides nothing: it reads the
+state from the library snapshot (`CachedLibrarySnapshot::source_health`), so it
+always belongs to the same database generation as the rest of the page; a
+superseded load is dropped whole, and every source action produces a new
+snapshot. A source with no backend answer reads as *unknown*, never healthy,
+and an empty source list is never an all-clear.
+
+**Reviewed rebind.** `Database::review_source_rebind` (read-only) returns a
+`SourceRebindReview`: path, accepted generation, the recorded and current
+`SourceRootBinding`, why review is needed (`NeverBound` or `BackingChanged`),
+the catalogue entry count and the last successful scan. It errors in plain
+language when the folder is unreachable, when the source was never scanned (its
+first scan binds it on its own) or when its storage already matches.
+`Database::confirm_source_rebind` re-checks all of it inside one immediate
+transaction: the source is still configured at the same path, the generation and
+the recorded binding are exactly those reviewed, and the folder is still on the
+reviewed storage (before the write and again before commit). Anything else
+refuses with "the source changed since it was reviewed; review it again". It
+writes only `source_scan_bindings`: no archive, identity, observation, coverage
+or Missing evidence changes, and it records no scan. The first generation of a
+never-bound source starts above any generation coverage was ever recorded for,
+so a binding that went missing can never make old coverage look current. Because
+the binding table is covered by the catalogue epoch triggers, a rebind also makes
+any earlier reconciliation preview stale.
+
+**Nothing is automatic.** Migration, startup, scan, preview, and a matching
+device/inode never bind or rebind a source. The GUI requires the person to open
+"Review and rebind source", read the explanation, tick that they checked it is
+the storage they mean, and press the commit button; the dialog commits only the
+review currently on screen.
+
+**Row-level health** (Present, Possibly moved, Missing, From a removed folder,
+Could not be checked) is the backend presence preview run on demand, read-only,
+on a worker thread. The result is tagged with the database generation it was
+computed for and is withheld as out of date when the generation moves; only the
+request in flight can settle the state, so an older result cannot overwrite a
+newer one.
+
+Still deliberately outside this change: Home, Browse, Game Details, Check Games
+and Problems & Repair do not yet show this projection; there is no command-line
+rebind; relink/removal review flows and archive integrity checks are unchanged.
+
 ## Deferred GUI work
 
-No GUI file or wording changed. Pass 2 should project this classification into
+The Sources-page projection and reviewed rebind above are done. Pass 2 should still project this classification into
 Home, Browse, Game Details, Check Games and Problems & Repair; keep never-checked
 identity neutral and candidates distinct from broken files. The stale empty
 Problems summary/loading-generation bug, review/relink/removal flows and archive

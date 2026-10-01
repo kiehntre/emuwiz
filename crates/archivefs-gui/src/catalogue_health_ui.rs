@@ -9,7 +9,7 @@
 //! are tagged with the generation they were computed for. Anything the backend
 //! has not said yet is shown as *unknown*, never as healthy.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use archivefs_core::SourceFolderView;
@@ -249,10 +249,6 @@ pub(crate) struct RowCheckState {
 }
 
 impl RowCheckState {
-    pub(crate) fn is_running(&self) -> bool {
-        self.running.is_some()
-    }
-
     /// Registers a check for database `generation`; returns its request id.
     pub(crate) fn start(&mut self, generation: u64, receiver: Receiver<RowCheckResult>) -> u64 {
         self.next_request += 1;
@@ -756,12 +752,6 @@ fn run_row_check(roots: &[PathBuf]) -> RowCheckResult {
         counts: report.counts.clone(),
         notes: report.diagnostics.clone(),
     })
-}
-
-/// Does the path name a source whose review is open? Used to refuse a stale
-/// confirm for a dialog that has moved on to another source.
-pub(crate) fn dialog_is_for(dialog: &SourcesRebindDialogState, path: &Path) -> bool {
-    dialog.path == path
 }
 
 #[cfg(test)]

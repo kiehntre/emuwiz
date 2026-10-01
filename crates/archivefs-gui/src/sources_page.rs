@@ -3085,7 +3085,16 @@ impl ArchiveFsApp {
             });
         match rebind_action {
             Some(catalogue_health_ui::DialogAction::Confirm(review)) => {
-                self.start_source_action(context.clone(), SourceAction::Rebind { review });
+                // Only the loaded, acknowledged review currently on screen can be
+                // committed; anything else is dropped without effect.
+                let on_screen = self
+                    .sources_ui
+                    .sources_rebind_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.confirmable());
+                if on_screen == Some(&*review) {
+                    self.start_source_action(context.clone(), SourceAction::Rebind { review });
+                }
             }
             Some(catalogue_health_ui::DialogAction::ReviewAgain) => {
                 if let Some(path) = self
