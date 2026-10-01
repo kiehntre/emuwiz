@@ -752,24 +752,27 @@ impl NativeWorkflows {
                 ui.label("Choose an existing folder to add it. EmuWiz will not move, rename or scan anything until you request it.");
             });
         } else {
+            // The full health section sits in the page flow, above the folder
+            // list, not inside the list's own (short) scroll area where it would
+            // collapse to a sliver once provider setup takes the page.
+            {
+                let row_view = self
+                    .app
+                    .sources_ui
+                    .catalogue_row_check
+                    .view(self.app.database_generation.0);
+                let full = crate::catalogue_health_ui::show_health_section(
+                    ui,
+                    &health_rows,
+                    &row_view,
+                    busy || self.app.database_state.is_loading(),
+                );
+                health_action = full.or(health_action.take());
+            }
+            ui.add_space(8.0);
             egui::ScrollArea::vertical()
                 .id_salt("v2_native_sources")
                 .show(ui, |ui| {
-                    {
-                        let row_view = self
-                            .app
-                            .sources_ui
-                            .catalogue_row_check
-                            .view(self.app.database_generation.0);
-                        let full = crate::catalogue_health_ui::show_health_section(
-                            ui,
-                            &health_rows,
-                            &row_view,
-                            busy || self.app.database_state.is_loading(),
-                        );
-                        health_action = full.or(health_action.take());
-                    }
-                    ui.add_space(8.0);
                     for source in &source_state.sources {
                         ui.push_id(&source.path, |ui| {
                             self.show_native_source_card(ui, source, &archives, busy, &mut action);
@@ -1775,6 +1778,19 @@ impl NativeWorkflows {
             .iter()
             .filter(|source| source.enabled)
             .collect::<Vec<_>>();
+        // Folder availability alone is not catalogue health: a folder that is
+        // reachable can still need a reviewed rebind, a scan, or a complete scan
+        // before EmuWiz can trust what it knows about it. Read the backend's own
+        // source health so this card never says Ready while any of that is open.
+        let health_overall = crate::catalogue_health_ui::Overall::from_rows(
+            &crate::catalogue_health_ui::project_rows(
+                &source_state.sources,
+                snapshot
+                    .map(|snapshot| snapshot.source_health.as_slice())
+                    .unwrap_or(&[]),
+            ),
+        );
+        let health_attention = crate::catalogue_health_ui::attention_summary(&health_overall);
         let local_status = if source_state.sources.is_empty() {
             SourceStatus::NeedsSetup
         } else if enabled_sources.is_empty() {
@@ -1783,7 +1799,13 @@ impl NativeWorkflows {
             .iter()
             .all(|source| source.availability == SourceAvailability::Available)
         {
-            SourceStatus::Ready
+            if health_attention.is_some() {
+                SourceStatus::NeedsAttention
+            } else if health_overall.unknown > 0 {
+                SourceStatus::NotChecked
+            } else {
+                SourceStatus::Ready
+            }
         } else if enabled_sources
             .iter()
             .any(|source| source.availability == SourceAvailability::ScanFailed)
@@ -1798,8 +1820,9 @@ impl NativeWorkflows {
             reason: match local_status {
                 SourceStatus::NeedsSetup => "No game folders are configured. Browsing remains available, but no local games are indexed yet.".into(),
                 SourceStatus::Disabled => "Configured game folders are disabled.".into(),
-                SourceStatus::Ready => format!("{} configured folder(s) are available.", enabled_sources.len()),
-                SourceStatus::NeedsAttention => "A recent scan needs review.".into(),
+                SourceStatus::Ready => format!("{} configured folder(s) are available and up to date.", enabled_sources.len()),
+                SourceStatus::NotChecked => format!("{} configured folder(s) are available; their catalogue health has not been read yet.", enabled_sources.len()),
+                SourceStatus::NeedsAttention => health_attention.clone().unwrap_or_else(|| "A recent scan needs review.".into()),
                 _ => "At least one configured path is missing or cannot be read.".into(),
             }, nature: SourceNature::Local, action: Some("Manage local folders"), target: Some(HubAction::LocalSources), advanced: roots,
         });

@@ -4580,6 +4580,75 @@ fn sources_page_projects_backend_health_and_offers_reviewed_rebind_only_when_req
     assert!(!has(&healthy, "Review and rebind source"));
 }
 
+/// The Sources & Providers overview must not call the game folders "Ready" while
+/// the backend says a folder needs review, a scan, or cannot be reached.
+#[test]
+fn sources_overview_card_never_says_ready_while_the_backend_has_open_health_issues() {
+    use archivefs_core::catalogue_health::{RebindReason, SourceHealth, SourceHealthState};
+    let render = |health: Vec<SourceHealth>| {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.artwork.index = Some(Arc::new(MediaIndex::default()));
+        app.router.current = Route::Section(Section::SourcesProviders);
+        frame(&context, &mut app, [1280.0, 3000.0]);
+        let mut snapshot = crate::tests::cached_snapshot(Vec::new());
+        snapshot.source_views = vec![archivefs_core::SourceFolderView {
+            path: std::path::PathBuf::from("/games"),
+            role: Default::default(),
+            enabled: true,
+            created_at: None,
+            id: Some(1),
+            availability: archivefs_core::SourceAvailability::Available,
+            last_scan_status: None,
+            last_scan_error: None,
+            last_scan_at: None,
+            last_successful_scan_at: None,
+            last_archive_count: None,
+            assigned_platform: None,
+            unknown_archive_count: 0,
+        }];
+        snapshot.source_health = health;
+        app.native_workflows.as_mut().unwrap().app.database_state = crate::DatabaseState::Ready {
+            snapshot: Box::new(snapshot),
+            last_scan_summary: None,
+        };
+        frame(&context, &mut app, [1280.0, 3000.0]);
+        text(&frame(&context, &mut app, [1280.0, 3000.0]))
+    };
+    let entry = |state, rebind| SourceHealth {
+        source_id: 1,
+        path: std::path::PathBuf::from("/games"),
+        state,
+        rebind,
+        generation: 1,
+        detail: None,
+    };
+    let has_part = |texts: &[String], part: &str| texts.iter().any(|v| v.contains(part));
+
+    let review = render(vec![entry(
+        SourceHealthState::RebindRequired,
+        Some(RebindReason::BackingChanged),
+    )]);
+    assert!(
+        has_part(&review, "1 folder needs review before scanning"),
+        "{review:?}"
+    );
+    assert!(!has_part(&review, "available and up to date"));
+
+    let unknown = render(Vec::new());
+    assert!(
+        has_part(&unknown, "catalogue health has not been read yet"),
+        "{unknown:?}"
+    );
+    assert!(!has_part(&unknown, "available and up to date"));
+
+    let healthy = render(vec![entry(SourceHealthState::Healthy, None)]);
+    assert!(
+        has_part(&healthy, "available and up to date"),
+        "{healthy:?}"
+    );
+}
+
 fn mame_archive(id: i64, title: &str) -> PersistedArchive {
     use archivefs_core::game_identity::*;
     let mut row = archive(id, title, Some("Arcade"));

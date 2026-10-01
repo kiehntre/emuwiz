@@ -201,6 +201,35 @@ impl Overall {
     }
 }
 
+/// One plain sentence for what stops the catalogue being trusted, or `None` when
+/// nothing the backend has answered is blocking. Unknown sources are reported
+/// separately by the caller; they are not a reason in themselves.
+pub(crate) fn attention_summary(overall: &Overall) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut add = |count: usize, one: &str, many: &str| match count {
+        0 => {}
+        1 => parts.push(format!("1 folder {one}")),
+        n => parts.push(format!("{n} folders {many}")),
+    };
+    add(
+        overall.review_needed,
+        "needs review before scanning",
+        "need review before scanning",
+    );
+    add(
+        overall.unavailable,
+        "cannot be reached right now",
+        "cannot be reached right now",
+    );
+    add(
+        overall.incomplete,
+        "had an incomplete scan",
+        "had an incomplete scan",
+    );
+    add(overall.needs_scan, "needs a scan", "need a scan");
+    (!parts.is_empty()).then(|| format!("{}.", parts.join("; ")))
+}
+
 // --- Row-level counts: on demand, tagged with the generation they describe. --
 
 /// What a finished row-level check found.
@@ -871,6 +900,28 @@ mod tests {
         let overall = Overall::from_rows(&[row(None)]);
         assert!(!overall.all_clear());
         assert_eq!(overall.headline().0, "Checking");
+    }
+
+    #[test]
+    fn attention_summary_names_what_blocks_the_catalogue_and_is_silent_when_clear() {
+        let row = |state| row(Some(state));
+        let clear = Overall::from_rows(&[row(SourceHealthState::Healthy)]);
+        assert_eq!(attention_summary(&clear), None);
+        let blocked = Overall::from_rows(&[
+            row(SourceHealthState::RebindRequired),
+            row(SourceHealthState::RebindRequired),
+            row(SourceHealthState::SourceUnavailable),
+            row(SourceHealthState::PartialScan),
+            row(SourceHealthState::NeedsScan),
+        ]);
+        let text = attention_summary(&blocked).unwrap();
+        assert!(
+            text.contains("2 folders need review before scanning"),
+            "{text}"
+        );
+        assert!(text.contains("1 folder cannot be reached"), "{text}");
+        assert!(text.contains("1 folder had an incomplete scan"), "{text}");
+        assert!(text.contains("1 folder needs a scan"), "{text}");
     }
 
     #[test]
