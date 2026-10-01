@@ -10,6 +10,7 @@ use eframe::egui;
 // and the script catalogue. Nothing here drives a page yet; a later commit replaces
 // the hard-coded tips below with the selector.
 mod catalogue;
+mod exposure;
 mod model;
 mod script;
 mod select;
