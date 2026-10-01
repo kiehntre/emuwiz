@@ -23,9 +23,37 @@ use crate::dat::rename_apply::model::{ObjectIdentity, ObjectKind};
 use crate::dat::rename_apply::noclobber::rename_noreplace;
 
 const MAX_ENTRIES: usize = 16_384;
-const MAX_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
+/// Conservative default for callers that do not select an optical-tree policy.
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Absolute traversal ceiling, with headroom for CD/GD-ROM component trees and
+/// patch inputs. This is a resource limit, not proof of backend format support.
+/// Optical adapters must select an explicit limit appropriate to their scope.
+pub const HARD_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+fn default_max_total_bytes() -> u64 {
+    DEFAULT_MAX_TOTAL_BYTES
+}
+
+fn validate_byte_limit(limit: u64) -> io::Result<()> {
+    if limit == 0 || limit > HARD_MAX_TOTAL_BYTES {
+        return Err(refuse(
+            "patch tree byte policy must be within 1 byte..=8 GiB",
+        ));
+    }
+    Ok(())
+}
+
+fn add_bytes(total: u64, additional: u64, limit: u64) -> io::Result<u64> {
+    let total = total
+        .checked_add(additional)
+        .ok_or_else(|| refuse("tree size overflow"))?;
+    if total > limit {
+        return Err(refuse("patch tree byte bound exceeded"));
+    }
+    Ok(total)
+}
 
 fn refuse(message: &str) -> io::Error {
     io::Error::other(message)
@@ -71,13 +99,15 @@ enum Entry {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Snapshot(BTreeMap<PathBuf, Entry>);
 
-fn snapshot(root: &Path) -> io::Result<Snapshot> {
+fn snapshot(root: &Path, max_total_bytes: u64) -> io::Result<Snapshot> {
+    validate_byte_limit(max_total_bytes)?;
     fn visit(
         root: &Path,
         relative: &Path,
         entries: &mut BTreeMap<PathBuf, Entry>,
         bytes: &mut u64,
         depth: usize,
+        max_total_bytes: u64,
     ) -> io::Result<()> {
         if entries.len() >= MAX_ENTRIES || depth > MAX_DEPTH {
             return Err(refuse("patch tree entry/depth bound exceeded"));
@@ -99,18 +129,14 @@ fn snapshot(root: &Path) -> io::Result<Snapshot> {
                     entries,
                     bytes,
                     depth + 1,
+                    max_total_bytes,
                 )?;
             }
             if directory(&path)? != binding {
                 return Err(refuse("directory changed during inspection"));
             }
         } else if meta.is_file() && !meta.file_type().is_symlink() && meta.nlink() == 1 {
-            *bytes = bytes
-                .checked_add(meta.len())
-                .ok_or_else(|| refuse("tree size overflow"))?;
-            if *bytes > MAX_BYTES {
-                return Err(refuse("patch tree byte bound exceeded"));
-            }
+            *bytes = add_bytes(*bytes, meta.len(), max_total_bytes)?;
             let identity = capture_identity(&path)?;
             if identity.size_bytes != meta.len()
                 || identity.freshness.is_none()
@@ -128,7 +154,14 @@ fn snapshot(root: &Path) -> io::Result<Snapshot> {
     }
     safe_path(root)?;
     let mut entries = BTreeMap::new();
-    visit(root, Path::new(""), &mut entries, &mut 0, 0)?;
+    visit(
+        root,
+        Path::new(""),
+        &mut entries,
+        &mut 0,
+        0,
+        max_total_bytes,
+    )?;
     Ok(Snapshot(entries))
 }
 
@@ -146,10 +179,24 @@ pub struct TreePatchPlan {
     destination: PathBuf,
     parent: Directory,
     inputs: Vec<Input>,
+    #[serde(default = "default_max_total_bytes")]
+    max_total_bytes: u64,
 }
 
 impl TreePatchPlan {
     pub fn review(inputs: &[PathBuf], destination: &Path) -> io::Result<Self> {
+        Self::review_with_max_total_bytes(inputs, destination, DEFAULT_MAX_TOTAL_BYTES)
+    }
+
+    /// Bounds the combined source/package inputs and, separately, the complete
+    /// output tree by logical file lengths (sparse holes count). The same policy
+    /// is retained for every subsequent verification and recovery operation.
+    pub fn review_with_max_total_bytes(
+        inputs: &[PathBuf],
+        destination: &Path,
+        max_total_bytes: u64,
+    ) -> io::Result<Self> {
+        validate_byte_limit(max_total_bytes)?;
         if inputs.is_empty() || inputs.len() > MAX_ENTRIES || destination.file_name().is_none() {
             return Err(refuse(
                 "bounded nonempty input set and destination required",
@@ -174,14 +221,14 @@ impl TreePatchPlan {
             if parent.starts_with(path) || path.starts_with(destination) {
                 return Err(refuse("output staging overlaps source"));
             }
-            let observed = snapshot(path)?;
+            let observed = snapshot(path, max_total_bytes)?;
             total_entries += observed.0.len();
             for entry in observed.0.values() {
                 if let Entry::File(id) = entry {
-                    total_bytes = total_bytes.saturating_add(id.size_bytes);
+                    total_bytes = add_bytes(total_bytes, id.size_bytes, max_total_bytes)?;
                 }
             }
-            if total_entries > MAX_ENTRIES || total_bytes > MAX_BYTES {
+            if total_entries > MAX_ENTRIES {
                 return Err(refuse("input set exceeds bounds"));
             }
             bound.push(Input {
@@ -193,13 +240,15 @@ impl TreePatchPlan {
             destination: destination.to_owned(),
             parent: directory(parent)?,
             inputs: bound,
+            max_total_bytes,
         })
     }
 
     fn revalidate(&self) -> io::Result<()> {
+        validate_byte_limit(self.max_total_bytes)?;
         self.check_parent()?;
         for input in &self.inputs {
-            if snapshot(&input.path)? != input.snapshot {
+            if snapshot(&input.path, self.max_total_bytes)? != input.snapshot {
                 return Err(refuse("patch input changed since preview"));
             }
         }
@@ -265,12 +314,12 @@ where
         if directory(&staging)? != owned {
             return Err(refuse("staging directory replaced"));
         }
-        let output = snapshot(&staging)?;
+        let output = snapshot(&staging, plan.max_total_bytes)?;
         if !output.0.values().any(|e| matches!(e, Entry::File(_))) {
             return Err(refuse("empty output tree"));
         }
         verify(&staging)?;
-        if snapshot(&staging)? != output {
+        if snapshot(&staging, plan.max_total_bytes)? != output {
             return Err(refuse("output changed during verification"));
         }
         plan.revalidate()?;
@@ -348,15 +397,20 @@ fn load(path: &Path) -> io::Result<(File, Receipt)> {
     {
         return Err(refuse("invalid tree journal paths/version"));
     }
+    validate_byte_limit(receipt.plan.max_total_bytes)?;
     receipt.plan.check_parent()?;
     Ok((file, receipt))
 }
 
 fn state(receipt: &Receipt) -> io::Result<TreePatchState> {
-    if absent(&receipt.plan.destination).is_ok() && snapshot(&receipt.staging)? == receipt.output {
+    if absent(&receipt.plan.destination).is_ok()
+        && snapshot(&receipt.staging, receipt.plan.max_total_bytes)? == receipt.output
+    {
         return Ok(TreePatchState::Staged);
     }
-    if absent(&receipt.staging).is_ok() && snapshot(&receipt.plan.destination)? == receipt.output {
+    if absent(&receipt.staging).is_ok()
+        && snapshot(&receipt.plan.destination, receipt.plan.max_total_bytes)? == receipt.output
+    {
         return Ok(TreePatchState::Published);
     }
     Err(refuse(

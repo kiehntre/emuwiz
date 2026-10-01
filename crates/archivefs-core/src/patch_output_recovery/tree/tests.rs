@@ -308,3 +308,150 @@ fn source_change_during_production_prevents_sealing() {
     assert!(result.is_err());
     assert!(!f.plan.destination.exists());
 }
+
+#[test]
+fn explicit_policy_accepts_sparse_input_above_default_without_buffering_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("optical-component.bin");
+    let logical_bytes = DEFAULT_MAX_TOTAL_BYTES + 1;
+    File::create(&source)
+        .unwrap()
+        .set_len(logical_bytes)
+        .unwrap();
+    let output = temp.path().join("output");
+    let inputs = [source.clone()];
+    assert!(
+        TreePatchPlan::review(&inputs, &output)
+            .unwrap_err()
+            .to_string()
+            .contains("byte bound")
+    );
+    let plan = TreePatchPlan::review_with_max_total_bytes(&inputs, &output, logical_bytes).unwrap();
+    assert_eq!(plan.max_total_bytes, logical_bytes);
+    let Entry::File(identity) = &plan.inputs[0].snapshot.0[Path::new("")] else {
+        panic!("full file identity required");
+    };
+    assert_eq!(identity.size_bytes, logical_bytes);
+    assert!(identity.freshness.is_some());
+    assert!(!output.exists());
+}
+
+#[test]
+fn small_policy_bounds_combined_inputs_and_staged_output_before_verification() {
+    let f = Fixture::new();
+    let inputs = [
+        f.temp.path().join("source"),
+        f.temp.path().join("patch.ips"),
+    ];
+    // Each input fits 20 bytes separately; their combined 28 bytes do not.
+    assert!(TreePatchPlan::review_with_max_total_bytes(&inputs, &f.plan.destination, 20).is_err());
+    let plan =
+        TreePatchPlan::review_with_max_total_bytes(&inputs, &f.plan.destination, 32).unwrap();
+    let error = prepare(
+        &plan,
+        |root| {
+            fs::write(root.join("first"), [0; 17])?;
+            fs::write(root.join("second"), [0; 16])
+        },
+        |_| panic!("oversized output must refuse before verification"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("byte bound"));
+    assert!(!plan.destination.exists());
+    assert!(
+        !fs::read_dir(f.temp.path()).unwrap().any(|p| p
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|e| e == "json"))
+    );
+    f.assert_source();
+}
+
+#[test]
+fn byte_policy_ceiling_is_enforced_at_review_and_receipt_load() {
+    let f = Fixture::new();
+    let inputs = [f.temp.path().join("source")];
+    for limit in [0, HARD_MAX_TOTAL_BYTES + 1, u64::MAX] {
+        assert!(
+            TreePatchPlan::review_with_max_total_bytes(&inputs, &f.plan.destination, limit)
+                .is_err()
+        );
+    }
+    TreePatchPlan::review_with_max_total_bytes(&inputs, &f.plan.destination, HARD_MAX_TOTAL_BYTES)
+        .unwrap();
+    let p = f.prepare();
+    let (_, mut receipt) = load(&p.journal_path).unwrap();
+    receipt.plan.max_total_bytes = HARD_MAX_TOTAL_BYTES + 1;
+    fs::write(&p.journal_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    assert!(inspect(&p.journal_path).is_err());
+    assert!(publish(&p.journal_path).is_err());
+    assert!(undo(&p.journal_path).is_err());
+    assert!(!f.plan.destination.exists());
+}
+
+#[test]
+fn byte_accounting_checks_overflow_and_exact_limits() {
+    assert_eq!(add_bytes(31, 1, 32).unwrap(), 32);
+    assert!(
+        add_bytes(32, 1, 32)
+            .unwrap_err()
+            .to_string()
+            .contains("byte bound")
+    );
+    assert!(
+        add_bytes(u64::MAX, 1, HARD_MAX_TOTAL_BYTES)
+            .unwrap_err()
+            .to_string()
+            .contains("overflow")
+    );
+}
+
+#[test]
+fn explicit_policy_survives_publication_undo_and_recovery() {
+    let f = Fixture::new();
+    let plan = TreePatchPlan::review_with_max_total_bytes(
+        &[f.temp.path().join("source")],
+        &f.plan.destination,
+        40,
+    )
+    .unwrap();
+    let p = prepare(
+        &plan,
+        |root| fs::write(root.join("component"), [0; 40]),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let (_, mut receipt) = load(&p.journal_path).unwrap();
+    assert_eq!(receipt.plan.max_total_bytes, 40);
+    publish(&p.journal_path).unwrap();
+    assert_eq!(inspect(&p.journal_path).unwrap(), TreePatchState::Published);
+    undo(&p.journal_path).unwrap();
+    assert_eq!(inspect(&p.journal_path).unwrap(), TreePatchState::Staged);
+    // Recovery must use the persisted allowance, not the default.
+    receipt.plan.max_total_bytes = 39;
+    fs::write(&p.journal_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    assert!(inspect(&p.journal_path).is_err());
+    assert!(publish(&p.journal_path).is_err());
+    assert!(!plan.destination.exists());
+    f.assert_source();
+}
+
+#[test]
+fn receipts_without_a_byte_policy_keep_the_original_default() {
+    let f = Fixture::new();
+    let p = f.prepare();
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&p.journal_path).unwrap()).unwrap();
+    receipt["plan"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_total_bytes");
+    fs::write(&p.journal_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    assert_eq!(
+        load(&p.journal_path).unwrap().1.plan.max_total_bytes,
+        DEFAULT_MAX_TOTAL_BYTES
+    );
+    publish(&p.journal_path).unwrap();
+    undo(&p.journal_path).unwrap();
+}

@@ -116,7 +116,23 @@ explicit components, plus every patch/package) and one new destination:
 Receipt locks serialize cooperating publish/undo calls. The new API has its
 own schema; existing single-file journal schema/behavior is unchanged.
 No generic file-operation engine, backend integration or GUI is added.
-Bounds: 16,384 entries, depth 64, 512 MiB input/output data, 16 MiB receipt.
+Bounds: 16,384 entries, depth 64, 16 MiB receipt. `TreePatchPlan::review`
+retains the 512 MiB byte default. Optical callers must use
+`review_with_max_total_bytes` to select their supported source/package budget,
+within the helper's absolute 8 GiB ceiling (zero and larger limits refuse).
+This ceiling provides headroom for Dreamcast GD-ROM and Saturn CD component
+sets and their patch inputs; it does not claim new format or rebuild support.
+Backend-specific limits remain the adapters' responsibility when integrated.
+
+The configured byte limit applies to the combined input set and separately to
+the complete staged/published tree. Logical lengths count, including sparse
+holes; all accumulated sizes use checked addition. Complete content hashing
+still streams through the existing fixed-memory identity capture. Oversized
+output refuses before semantic verification, receipt sealing, or publication;
+failed staging remains retained as before. The immutable plan/receipt carries
+the limit through revalidation, inspection, publish, and undo. Old receipts
+without that field retain the original 512 MiB default. Entry/depth bounds,
+identity checks, no-clobber rename, and recovery semantics are unchanged.
 Symlinks, hardlinks, special files, output-inside-input and existing targets
 are refused. Backends must include provenance/receipts inside staging before
 sealing when they are part of the required complete output set.
@@ -157,3 +173,19 @@ tracked tree clean. Read-only `git apply --check` passes against that tip.
 No rebase/merge, main edit, push, GUI edit or backend promotion was performed.
 The old conflicted working file still hashes to stage 3, and all three
 unmerged index entries remain unchanged.
+
+## Size-policy follow-up on current main
+
+Recreated `b7d59440` on `1872e1cb` as `626afa87`, then changed only tree
+byte policy, its tests, and this document. The original fourteen tree tests,
+publication/undo functions, standalone decoder and single-file recovery are
+unchanged. Six added tests cover sparse logical input above 512 MiB, combined
+input/staged-output limits, hard-ceiling rejection, checked overflow,
+persisted policy through recovery, and defaulting of older receipts.
+
+Validation: tree 20 passed; standalone filter 33 passed (includes the tree IPS
+composition test); recovery 25 passed; no-clobber primitive 3 passed. Full core:
+10,108 passed, 0 failed, 3 ignored. Offline locked workspace check, formatting,
+diff and scope checks passed. Five existing GUI warnings remain. Full-core
+validation used two test threads and loopback access for the provider tests.
+Main remained at `1872e1cb` with fetched origin parity; no push or promotion.
