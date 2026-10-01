@@ -84,6 +84,7 @@ mod cheat_reconcile;
 mod cheat_source;
 mod cheatbase;
 mod dat;
+mod inspect;
 mod mame_evidence;
 mod mame_normalise;
 mod media_set;
@@ -231,6 +232,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = cli.args.into_iter();
 
     match command.as_str() {
+        "inspect" => inspect::run(args.collect())?,
         "saves" => saves::run(args.collect())?,
         "media-set" => media_set::run(args)?,
         "scan" => {
@@ -5619,6 +5621,9 @@ fn print_help() {
     println!();
     println!("Commands:");
     println!("  media-set <inspect|explain|plan>  Read-only optical/floppy/tape topology (JSON)");
+    println!(
+        "  inspect <path>  Read-only view of what EmuWiz believes one file is, the evidence and provenance, launch topology readiness and why an operation would be blocked. Views: --identity --evidence --readiness --media --provenance (default: all); --json, --platform <name>, --root <dir>. Never opens the database or writes anything."
+    );
     println!("  scan           List supported archives from configured source folders");
     println!("  doctor         Check whether EmuWiz is ready to run");
     println!(
