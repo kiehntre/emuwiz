@@ -62,6 +62,14 @@ pub(crate) struct CachedLibrarySnapshot {
     /// source management is additive display data, not required for
     /// Library/Health/Duplicates to function.
     pub(crate) source_views: Vec<SourceFolderView>,
+    /// Source-level catalogue health for those same sources, projected by the
+    /// backend (`Database::source_health`) in this same pass. It lives in the
+    /// snapshot so it can never describe a different database generation than
+    /// the rest of the page: a superseded load is dropped whole, and every
+    /// source action produces a new snapshot. Empty only when the config
+    /// cannot be read; the GUI treats a source with no entry as *unknown*,
+    /// never as healthy.
+    pub(crate) source_health: Vec<archivefs_core::catalogue_health::SourceHealth>,
     /// Provider-neutral mod records imported explicitly by a caller. This is
     /// metadata only; records without local payload bytes remain browse-only.
     pub(crate) mod_catalogue_records: Vec<archivefs_core::mod_catalogue::ModCatalogueRecord>,
@@ -401,6 +409,13 @@ pub(crate) fn load_snapshot_from(
             build_source_folder_views(&sources, &records)
         })
         .unwrap_or_default();
+    let source_health = load_source_folder_configs_from(config_path)
+        .ok()
+        .map(|sources| {
+            let roots: Vec<_> = sources.iter().map(|s| s.path.clone()).collect();
+            database.source_health(&roots).unwrap_or_default()
+        })
+        .unwrap_or_default();
     let mod_catalogue_records = database.list_mod_catalogue_records().map_err(to_failed)?;
     Ok(CachedLibrarySnapshot {
         database_path: database_path.to_path_buf(),
@@ -415,6 +430,7 @@ pub(crate) fn load_snapshot_from(
         platform_aliases,
         duplicate_report,
         source_views,
+        source_health,
         mod_catalogue_records,
         screenscraper_enrichments,
     })

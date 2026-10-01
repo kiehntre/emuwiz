@@ -31,6 +31,7 @@ pub(crate) enum ActivityAction {
     SourceEnabled,
     SourceDisabled,
     SourceScan,
+    SourceRebound,
     SourceRemoved,
     LibraryViewAdded,
     LibraryViewEdited,
@@ -92,7 +93,7 @@ pub(crate) enum ActivityAction {
 /// Every `ActivityAction`, for the History & Logs "Operation" filter.
 /// Must list each variant exactly once (checked by
 /// `activity_filter_lists_cover_every_variant`).
-pub(crate) const ALL_ACTIVITY_ACTIONS: [ActivityAction; 44] = [
+pub(crate) const ALL_ACTIVITY_ACTIONS: [ActivityAction; 45] = [
     ActivityAction::Refresh,
     ActivityAction::Mount,
     ActivityAction::MountAll,
@@ -112,6 +113,7 @@ pub(crate) const ALL_ACTIVITY_ACTIONS: [ActivityAction; 44] = [
     ActivityAction::SourceEnabled,
     ActivityAction::SourceDisabled,
     ActivityAction::SourceScan,
+    ActivityAction::SourceRebound,
     ActivityAction::SourceRemoved,
     ActivityAction::LibraryViewAdded,
     ActivityAction::LibraryViewEdited,
@@ -238,6 +240,7 @@ impl std::fmt::Display for ActivityAction {
             Self::SourceEnabled => "Source enabled",
             Self::SourceDisabled => "Source disabled",
             Self::SourceScan => "Source scan",
+            Self::SourceRebound => "Source rebound",
             Self::SourceRemoved => "Source removed",
             Self::LibraryViewAdded => "Library View added",
             Self::LibraryViewEdited => "Library View edited",

@@ -169,6 +169,7 @@ use archive_context::ArchiveContext;
 mod archive_inspector_controller;
 mod artwork_media_state;
 mod catalogue_bsfree_ui_state;
+mod catalogue_health_ui;
 mod cheats_mods;
 mod cheats_mods_preview;
 #[allow(dead_code)]
@@ -413,11 +414,11 @@ use archivefs_core::{
     list_source_folder_views_default, load_library_view_configs_default,
     load_read_only_snapshot_default, load_source_folder_configs_from, mount_one_archive_path,
     pending_schema_migration_versions, persisted_archive_has_unknown_platform,
-    plan_stale_mount_directories, read_archive_index, remount_one_archive_path,
-    remove_source_folder_default, scan_all_enabled_sources_default, scan_and_persist,
-    scan_source_folder_default, set_source_folder_enabled_default, set_source_role_default,
-    source_health_issues, unmount_one_archive_path, upgrade_library_database,
-    validate_library_view_destination, validate_new_source_folder,
+    plan_stale_mount_directories, read_archive_index, rebind_source_after_review_default,
+    remount_one_archive_path, remove_source_folder_default, scan_all_enabled_sources_default,
+    scan_and_persist, scan_source_folder_default, set_source_folder_enabled_default,
+    set_source_role_default, source_health_issues, unmount_one_archive_path,
+    upgrade_library_database, validate_library_view_destination, validate_new_source_folder,
 };
 use eframe::egui;
 use ui::components::{

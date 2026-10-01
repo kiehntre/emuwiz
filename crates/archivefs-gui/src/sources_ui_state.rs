@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::catalogue_health_ui::{RowCheckState, SourcesRebindDialogState};
 use crate::dat_authority_dashboard::DashboardState;
 use crate::dat_sources_page::{DatSourcesPageState, DatSourcesPageUi};
 use crate::identity_providers_page::IdentityProvidersPageState;
@@ -28,6 +29,8 @@ pub(crate) struct SourcesUiState {
     pub(crate) sources_add_dialog: Option<SourcesAddDialogState>,
     pub(crate) sources_remove_dialog: Option<SourcesRemoveDialogState>,
     pub(crate) sources_role_dialog: Option<SourcesRoleDialogState>,
+    pub(crate) sources_rebind_dialog: Option<SourcesRebindDialogState>,
+    pub(crate) catalogue_row_check: RowCheckState,
     pub(crate) dat_authority: DashboardState,
     pub(crate) identity_providers: IdentityProvidersPageState,
     pub(crate) pending_source_scan_summary: Option<ScanPersistSummary>,

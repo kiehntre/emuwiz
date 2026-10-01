@@ -2714,6 +2714,7 @@ pub(super) fn show_sources_recent_activity(ui: &mut egui::Ui, history: &Operatio
                     | ActivityAction::SourceEnabled
                     | ActivityAction::SourceDisabled
                     | ActivityAction::SourceScan
+                    | ActivityAction::SourceRebound
                     | ActivityAction::SourceRemoved
                     | ActivityAction::CheatSourceRetrieval
             )
@@ -2995,6 +2996,20 @@ impl ArchiveFsApp {
             LoadState::Loading { .. } | LoadState::Error(_) => None,
         };
 
+        // The backend's source-level health, projected for display. A source it
+        // has not answered for reads as unknown, never as healthy.
+        let health_rows = catalogue_health_ui::project_rows(
+            sources,
+            catalogue_snapshot
+                .map(|snapshot| snapshot.source_health.as_slice())
+                .unwrap_or(&[]),
+        );
+        let row_view = self
+            .sources_ui
+            .catalogue_row_check
+            .view(self.database_generation.0);
+        let health_busy = source_busy || self.database_state.is_loading();
+        let mut health_action = None;
         let sources_action = sources_page::sources_content_column(ui, |ui| {
             if self.ui_mode == GuiMode::Simple {
                 if let Some(last_scan) = &self.sources_ui.sources_last_scan
@@ -3003,6 +3018,13 @@ impl ArchiveFsApp {
                     self.show_skipped_files = true;
                     self.skipped_files_filter = None;
                 }
+                health_action = catalogue_health_ui::show_health_section(
+                    ui,
+                    &health_rows,
+                    &row_view,
+                    health_busy,
+                );
+                ui.add_space(theme::SECTION_GAP);
                 return show_simple_game_folders(ui, sources, source_busy);
             }
             show_sources_overview(
@@ -3020,6 +3042,10 @@ impl ArchiveFsApp {
                 self.show_skipped_files = true;
                 self.skipped_files_filter = None;
             }
+            ui.add_space(theme::SECTION_GAP);
+
+            health_action =
+                catalogue_health_ui::show_health_section(ui, &health_rows, &row_view, health_busy);
             ui.add_space(theme::SECTION_GAP);
 
             show_sources_page_with_mount_root_and_role(
@@ -3040,6 +3066,42 @@ impl ArchiveFsApp {
                 &mut self.clipboard,
             )
         });
+        match health_action {
+            Some(catalogue_health_ui::HealthAction::Review(path)) => {
+                self.start_rebind_review(context.clone(), path);
+            }
+            Some(catalogue_health_ui::HealthAction::CheckRows) => {
+                self.start_row_check(context.clone());
+            }
+            None => {}
+        }
+        let rebind_busy = source_busy || self.database_state.is_loading();
+        let rebind_action = self
+            .sources_ui
+            .sources_rebind_dialog
+            .as_mut()
+            .and_then(|dialog| {
+                catalogue_health_ui::show_rebind_dialog(context, dialog, rebind_busy)
+            });
+        match rebind_action {
+            Some(catalogue_health_ui::DialogAction::Confirm(review)) => {
+                self.start_source_action(context.clone(), SourceAction::Rebind { review });
+            }
+            Some(catalogue_health_ui::DialogAction::ReviewAgain) => {
+                if let Some(path) = self
+                    .sources_ui
+                    .sources_rebind_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.path.clone())
+                {
+                    self.start_rebind_review(context.clone(), path);
+                }
+            }
+            Some(catalogue_health_ui::DialogAction::Close) => {
+                self.sources_ui.sources_rebind_dialog = None;
+            }
+            None => {}
+        }
         if let Some(sources_action) = sources_action {
             match sources_action {
                 SourcesPageAction::AddFolder(path) => {

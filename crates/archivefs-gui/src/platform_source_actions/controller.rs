@@ -506,6 +506,9 @@ impl ArchiveFsApp {
                 if matches!(action, SourceAction::Remove { .. }) {
                     self.sources_ui.sources_remove_dialog = None;
                 }
+                if matches!(action, SourceAction::Rebind { .. }) {
+                    self.sources_ui.sources_rebind_dialog = None;
+                }
                 // Carry this scan's skip detail into the plain snapshot
                 // reload triggered below, so Database Status -> Skipped
                 // files -> Inspect... becomes reachable without a separate
@@ -541,6 +544,15 @@ impl ArchiveFsApp {
                 );
                 if self.gamer_view_scan_pending_review {
                     self.gamer_view_scan_pending_review = false;
+                }
+                // A rebind that was refused (the source changed since it was
+                // reviewed, or could not be committed) leaves its dialog open
+                // on the reason, with nothing committed and a way to review again.
+                if matches!(action, SourceAction::Rebind { .. })
+                    && let Some(dialog) = self.sources_ui.sources_rebind_dialog.as_mut()
+                {
+                    dialog.stage =
+                        crate::catalogue_health_ui::RebindStage::Refused(message.clone());
                 }
                 if gamer_add_failed {
                     // A failed add must never leave a stale pending path that
@@ -844,6 +856,7 @@ pub(crate) fn source_action_log_category(action: &SourceAction) -> ActivityActio
         }
         SourceAction::SetRole { .. } => ActivityAction::SourceScan,
         SourceAction::Remove { .. } => ActivityAction::SourceRemoved,
+        SourceAction::Rebind { .. } => ActivityAction::SourceRebound,
     }
 }
 
@@ -855,6 +868,7 @@ pub(crate) fn source_action_path(action: &SourceAction) -> Option<PathBuf> {
         | SourceAction::AssignPlatform { path, .. }
         | SourceAction::SetRole { path, .. }
         | SourceAction::Remove { path, .. } => Some(path.clone()),
+        SourceAction::Rebind { review } => Some(review.path.clone()),
         SourceAction::ScanAll => None,
     }
 }
@@ -896,6 +910,10 @@ pub(crate) fn source_action_started_message(action: &SourceAction) -> String {
         } => format!(
             "Removing source '{}' and its catalogue entries.",
             path.display()
+        ),
+        SourceAction::Rebind { review } => format!(
+            "Recording the reviewed storage for source '{}'.",
+            review.path.display()
         ),
     }
 }
@@ -953,6 +971,11 @@ pub(crate) fn source_action_success_message(outcome: &SourceActionOutcome) -> St
                 outcome.removed_source.path.display()
             ),
         },
+        SourceActionOutcome::Rebound { path } => format!(
+            "Source rebound: {}. No game was marked missing and no file was changed. Scan it \
+             again to bring its catalogue up to date.",
+            path.display()
+        ),
     }
 }
 
@@ -1003,6 +1026,11 @@ pub(crate) fn run_source_action(
             path,
             keep_catalogue,
         } => remove_source_folder_default(path, *keep_catalogue).map(SourceActionOutcome::Removed),
+        SourceAction::Rebind { review } => {
+            rebind_source_after_review_default(review).map(|()| SourceActionOutcome::Rebound {
+                path: review.path.clone(),
+            })
+        }
     }
 }
 

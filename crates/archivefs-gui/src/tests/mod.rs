@@ -1062,6 +1062,8 @@ pub(crate) fn app_for_operation_tests() -> ArchiveFsApp {
             sources_add_dialog: None,
             sources_remove_dialog: None,
             sources_role_dialog: None,
+            sources_rebind_dialog: None,
+            catalogue_row_check: Default::default(),
             dat_authority: dat_authority_dashboard::DashboardState::default(),
             identity_providers: identity_providers_page::IdentityProvidersPageState::default(),
             pending_source_scan_summary: None,
@@ -1437,6 +1439,7 @@ fn cached_snapshot(archives: Vec<PersistedArchive>) -> CachedLibrarySnapshot {
         platform_aliases: Vec::new(),
         duplicate_report,
         source_views: Vec::new(),
+        source_health: Vec::new(),
         mod_catalogue_records: Vec::new(),
         screenscraper_enrichments: HashMap::new(),
     }

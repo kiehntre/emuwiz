@@ -67,6 +67,7 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.poll_bulk_platform_action(context);
     app.poll_alias_action(context);
     app.poll_source_action(context);
+    app.poll_catalogue_health(context);
     app.poll_bsfree_operation(context);
     app.poll_romm_operation(context);
     app.poll_catalogue_manager(context);

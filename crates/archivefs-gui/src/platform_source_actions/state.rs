@@ -81,12 +81,29 @@ pub(crate) struct RunningAliasAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SourceAction {
     Add(PathBuf),
-    SetEnabled { path: PathBuf, enabled: bool },
+    SetEnabled {
+        path: PathBuf,
+        enabled: bool,
+    },
     ScanOne(PathBuf),
     ScanAll,
-    AssignPlatform { path: PathBuf, platform: String },
-    SetRole { path: PathBuf, role: SourceRole },
-    Remove { path: PathBuf, keep_catalogue: bool },
+    AssignPlatform {
+        path: PathBuf,
+        platform: String,
+    },
+    SetRole {
+        path: PathBuf,
+        role: SourceRole,
+    },
+    Remove {
+        path: PathBuf,
+        keep_catalogue: bool,
+    },
+    /// Commit a rebind the person reviewed and confirmed. Carries the review
+    /// itself so the backend re-checks every part of it at commit time.
+    Rebind {
+        review: Box<archivefs_core::catalogue_health::SourceRebindReview>,
+    },
 }
 
 /// What a completed [`SourceAction`] produced - just enough to let
@@ -107,6 +124,9 @@ pub(crate) enum SourceActionOutcome {
         role: SourceRole,
     },
     Removed(RemoveSourceFolderOutcome),
+    Rebound {
+        path: PathBuf,
+    },
 }
 
 pub(crate) struct RunningSourceAction {
