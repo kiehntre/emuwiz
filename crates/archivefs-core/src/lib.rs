@@ -353,8 +353,10 @@ pub mod playstation_boot_evidence;
 /// Pure, read-only Dreamcast boot-sector (`IP.BIN`) evidence - neutral
 /// [`content_evidence`] facts, never a platform.
 pub mod dreamcast_boot_evidence;
+pub mod dreamcast_dcp_apply;
 /// Read-only Dreamcast DCP/package inspection and fail-closed patch readiness.
 pub mod dreamcast_patch_readiness;
+mod optical_patch_tree;
 
 /// Pure, read-only FAT12/FAT16 root-directory observation for DOS-family
 /// boot media - neutral [`content_evidence`] facts keyed strictly on

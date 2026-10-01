@@ -10,6 +10,8 @@
 //! No patch application, filesystem extraction, image rebuild, or source
 //! mutation is performed here.
 
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -212,15 +214,22 @@ impl std::fmt::Display for DreamcastPatchInspectionError {
 impl std::error::Error for DreamcastPatchInspectionError {}
 
 fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
+    Sha256::digest(bytes.as_ref())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-fn safe_relative_path(name: &str) -> Result<(), DreamcastPatchInspectionError> {
-    if name.is_empty() || name.len() > MAX_DCP_PATH_BYTES || name.contains('\0') {
+pub(crate) fn safe_relative_path(name: &str) -> Result<(), DreamcastPatchInspectionError> {
+    if name.is_empty()
+        || name.len() > MAX_DCP_PATH_BYTES
+        || name.contains('\0')
+        || name.contains(':')
+        || name.contains('\\')
+        || name
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
+    {
         return Err(DreamcastPatchInspectionError::UnsafePath(name.into()));
     }
     let path = Path::new(name);
@@ -275,11 +284,62 @@ pub fn inspect_dreamcast_dcp(
             "package must be a regular non-symlink file".into(),
         ));
     }
-    let bytes =
-        fs::read(&path).map_err(|error| DreamcastPatchInspectionError::Io(error.to_string()))?;
+    if metadata.len() > MAX_DCP_EXPANDED_BYTES {
+        return Err(DreamcastPatchInspectionError::PackageLimit(
+            "compressed package is too large".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(&path)
+        .map_err(|e| DreamcastPatchInspectionError::Io(e.to_string()))?
+        .take(MAX_DCP_EXPANDED_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| DreamcastPatchInspectionError::Io(e.to_string()))?;
+    if bytes.len() as u64 > MAX_DCP_EXPANDED_BYTES {
+        return Err(DreamcastPatchInspectionError::PackageLimit(
+            "compressed package grew beyond bound".into(),
+        ));
+    }
+    // The ZIP library collapses duplicate names in its index and allocates
+    // from untrusted entry counts. Reuse the canonical bounded preflight first.
+    let limits = crate::dat::archive::limits::ArchiveLimits {
+        max_members: MAX_DCP_ENTRIES,
+        max_member_logical_bytes: MAX_DCP_ENTRY_BYTES,
+        max_archive_logical_bytes: MAX_DCP_EXPANDED_BYTES,
+        ..Default::default()
+    };
+    let preflight = crate::dat::archive::zip_preflight::preflight_zip(
+        &mut std::io::Cursor::new(&bytes),
+        bytes.len() as u64,
+        &limits,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+    .map_err(|e| DreamcastPatchInspectionError::Malformed(format!("ZIP preflight: {e:?}")))?;
+    for entry in &preflight.entries {
+        std::str::from_utf8(&entry.name_raw).map_err(|_| {
+            DreamcastPatchInspectionError::UnsafePath("non-UTF8 member name".into())
+        })?;
+        if !matches!(entry.method, 0 | 8)
+            || entry.flags & ((1 << 0) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 13)) != 0
+        {
+            return Err(DreamcastPatchInspectionError::Unsupported(
+                "only unencrypted stored/deflated ZIP members are supported".into(),
+            ));
+        }
+        if entry.is_directory && entry.logical_size != 0 {
+            return Err(DreamcastPatchInspectionError::Malformed(
+                "directory has payload".into(),
+            ));
+        }
+    }
     let package_sha256 = hex_digest(&bytes);
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|error| DreamcastPatchInspectionError::Malformed(error.to_string()))?;
+    if archive.len() != preflight.entry_count {
+        return Err(DreamcastPatchInspectionError::UnsafePath(
+            "duplicate ZIP member names".into(),
+        ));
+    }
     if archive.len() > MAX_DCP_ENTRIES {
         return Err(DreamcastPatchInspectionError::PackageLimit(
             "too many entries".into(),
@@ -287,24 +347,37 @@ pub fn inspect_dreamcast_dcp(
     }
     let mut entries = Vec::new();
     let mut expanded_bytes = 0_u64;
+    let mut names = BTreeSet::new();
+    let mut files = BTreeSet::new();
     let mut warnings = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
             .map_err(|error| DreamcastPatchInspectionError::Malformed(error.to_string()))?;
-        let name = entry.name().replace('\\', "/");
-        safe_relative_path(&name)?;
-        if entry
-            .unix_mode()
-            .is_some_and(|mode| mode & 0o170000 == 0o120000)
-        {
-            return Err(DreamcastPatchInspectionError::UnsafePath(format!(
-                "symlink member {name}"
-            )));
+        let name = entry.name().to_owned();
+        let directory = name.ends_with('/');
+        let relative = if directory {
+            &name[..name.len() - 1]
+        } else {
+            &name
+        };
+        safe_relative_path(relative)?;
+        let normalized = relative.to_ascii_lowercase();
+        if !names.insert(normalized.clone()) {
+            return Err(DreamcastPatchInspectionError::UnsafePath(
+                "duplicate/conflicting member".into(),
+            ));
         }
-        if name.ends_with('/') {
+        let kind = entry.unix_mode().unwrap_or(0) & 0o170000;
+        if kind != 0 && kind != if directory { 0o040000 } else { 0o100000 } {
+            return Err(DreamcastPatchInspectionError::UnsafePath(
+                "special filesystem member".into(),
+            ));
+        }
+        if directory {
             continue;
         }
+        files.insert(normalized);
         let size = entry.size();
         if size > MAX_DCP_ENTRY_BYTES {
             return Err(DreamcastPatchInspectionError::PackageLimit(format!(
@@ -321,6 +394,8 @@ pub fn inspect_dreamcast_dcp(
         }
         let mut member = Vec::with_capacity(size.min(1024 * 1024) as usize);
         entry
+            .by_ref()
+            .take(size + 1)
             .read_to_end(&mut member)
             .map_err(|error| DreamcastPatchInspectionError::Io(error.to_string()))?;
         if member.len() as u64 != size {
@@ -342,6 +417,17 @@ pub fn inspect_dreamcast_dcp(
             filesystem_member,
             warnings: entry_warnings,
         });
+    }
+    for name in &names {
+        let mut parent = Path::new(name).parent();
+        while let Some(p) = parent {
+            if files.contains(p.to_str().unwrap_or("")) {
+                return Err(DreamcastPatchInspectionError::UnsafePath(
+                    "file/directory target conflict".into(),
+                ));
+            }
+            parent = p.parent();
+        }
     }
     entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     let ip_bin_impact = if entries
