@@ -3358,6 +3358,45 @@ pub fn set_source_role_at(
     database.set_source_role(target, role)
 }
 
+/// Read-only review of one configured source's storage binding, against the
+/// library database at `database_path`. See [`Database::review_source_rebind`].
+pub fn review_source_rebind_at(
+    database_path: &Path,
+    target: &Path,
+) -> Result<catalogue_health::SourceRebindReview> {
+    let database = Database::open_or_create(database_path)?;
+    let record = database
+        .list_source_folders()?
+        .into_iter()
+        .find(|record| record.path == target)
+        .ok_or_else(|| {
+            ArchiveFsError::Database(format!(
+                "source folder {} is not registered",
+                target.display()
+            ))
+        })?;
+    database.review_source_rebind(record.id)
+}
+
+pub fn review_source_rebind_default(target: &Path) -> Result<catalogue_health::SourceRebindReview> {
+    review_source_rebind_at(&default_database_path()?, target)
+}
+
+/// Commits a rebind the user reviewed and confirmed. Never scans, never marks
+/// anything Missing, and refuses if anything changed since the review.
+pub fn rebind_source_after_review_at(
+    database_path: &Path,
+    review: &catalogue_health::SourceRebindReview,
+) -> Result<()> {
+    Database::open_or_create(database_path)?.confirm_source_rebind(review)
+}
+
+pub fn rebind_source_after_review_default(
+    review: &catalogue_health::SourceRebindReview,
+) -> Result<()> {
+    rebind_source_after_review_at(&default_database_path()?, review)
+}
+
 pub fn set_source_role_default(target: &Path, role: SourceRole) -> Result<()> {
     set_source_role_at(
         &default_config_path()?,

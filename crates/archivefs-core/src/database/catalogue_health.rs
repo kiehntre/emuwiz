@@ -1,7 +1,8 @@
 //! Coverage proofs and explicit presence-only reconciliation. No cleanup or relink.
 use super::*;
 use crate::catalogue_health::{
-    BoundRoot, CatalogueHealthReport, NestedBoundaryObservation, NestedState, ScanCoverageState,
+    BoundRoot, CatalogueHealthReport, NestedBoundaryObservation, NestedState, REBIND_REVIEW_AGAIN,
+    RebindReason, ScanCoverageState, SourceHealth, SourceHealthState, SourceRebindReview,
     SourceRootBinding, SourceScanCoverage, source_root_identity,
 };
 
@@ -544,6 +545,266 @@ impl Database {
         tx.commit()
             .map_err(|e| db_error("commit presence reconciliation", e))?;
         Ok(corrections.len())
+    }
+}
+
+impl Database {
+    /// One configured, active source: its path and whether it was ever scanned.
+    fn source_review_row(&self, source: i64) -> Result<Option<(PathBuf, bool, Option<String>)>> {
+        self.connection
+            .query_row(
+                "SELECT path, removed_from_config_at IS NOT NULL, last_successful_scan_at \
+                 FROM source_folders WHERE id=?1",
+                [source],
+                |r| {
+                    Ok((
+                        PathBuf::from(OsString::from_vec(r.get::<_, Vec<u8>>(0)?)),
+                        r.get::<_, bool>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| db_error("read source for review", e))
+    }
+
+    /// Whether a source needs a person's review before it can be scanned again,
+    /// and everything that person needs to judge it. Read-only. Errors in plain
+    /// language when there is nothing to review or it cannot be reviewed now.
+    pub fn review_source_rebind(&self, source: i64) -> Result<SourceRebindReview> {
+        if self.schema_version()? < 23 {
+            return Err(ArchiveFsError::Database(
+                "this library database has no source binding to review".into(),
+            ));
+        }
+        let (root, _, last_success) = self
+            .source_review_row(source)?
+            .filter(|(_, removed, _)| !removed)
+            .ok_or_else(|| ArchiveFsError::Database("that source is not configured".into()))?;
+        if fs::read_dir(&root).is_err() {
+            return Err(ArchiveFsError::Database(
+                "the source folder cannot be reached right now; reconnect it and try again".into(),
+            ));
+        }
+        let current = SourceRootBinding::inspect(&root).ok_or_else(|| {
+            ArchiveFsError::Database(
+                "the source folder cannot be inspected right now; reconnect it and try again"
+                    .into(),
+            )
+        })?;
+        let bound = self.source_binding(source)?;
+        let (generation, recorded, reason) = match bound {
+            None if last_success.is_some() => (0, None, RebindReason::NeverBound),
+            None => {
+                return Err(ArchiveFsError::Database(
+                    "this source has never been scanned; its first scan records its storage \
+                     automatically, so there is nothing to review"
+                        .into(),
+                ));
+            }
+            Some((json, generation)) => {
+                if serde_json::to_string(&current).ok().as_deref() == Some(json.as_str()) {
+                    return Err(ArchiveFsError::Database(
+                        "this source is on the same storage it was bound to; nothing to review"
+                            .into(),
+                    ));
+                }
+                (
+                    generation,
+                    serde_json::from_str(&json).ok(),
+                    RebindReason::BackingChanged,
+                )
+            }
+        };
+        let archive_count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM archives WHERE source_folder_id=?1",
+                [source],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_error("count archives for review", e))?;
+        Ok(SourceRebindReview {
+            source_id: source,
+            path: root,
+            generation,
+            recorded,
+            current,
+            reason,
+            archive_count,
+            last_successful_scan_at: last_success,
+        })
+    }
+
+    /// Commits a reviewed rebind. Every part of the review is checked again
+    /// inside one immediate transaction: the source is still configured at the
+    /// same path, its accepted generation and recorded binding are exactly what
+    /// was reviewed, and the folder is still on the reviewed storage. Anything
+    /// else refuses with [`REBIND_REVIEW_AGAIN`].
+    ///
+    /// Writes only `source_scan_bindings`. It never edits archives, identity,
+    /// observations, coverage or Missing evidence, and it records no scan: a new
+    /// complete scan is still required before anything can be marked Missing.
+    pub fn confirm_source_rebind(&mut self, review: &SourceRebindReview) -> Result<()> {
+        let stale = || ArchiveFsError::Database(REBIND_REVIEW_AGAIN.into());
+        if SourceRootBinding::inspect(&review.path).as_ref() != Some(&review.current) {
+            return Err(stale());
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| db_error("begin reviewed source rebind", e))?;
+        let (path, removed): (Vec<u8>, bool) = tx
+            .query_row(
+                "SELECT path, removed_from_config_at IS NOT NULL FROM source_folders WHERE id=?1",
+                [review.source_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| db_error("recheck reviewed source", e))?
+            .ok_or_else(stale)?;
+        if removed || path != review.path.as_os_str().as_bytes() {
+            return Err(stale());
+        }
+        let existing: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT root_identity_json,generation FROM source_scan_bindings WHERE source_folder_id=?1",
+                [review.source_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| db_error("recheck source binding", e))?;
+        let new_json = serde_json::to_string(&review.current)
+            .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
+        let changed = match (&existing, review.generation) {
+            (None, 0) if review.recorded.is_none() => tx.execute(
+                "INSERT INTO source_scan_bindings(source_folder_id,root_identity_json,generation) VALUES(?1,?2,1)",
+                params![review.source_id, new_json],
+            ),
+            (Some((json, generation)), reviewed)
+                if reviewed > 0
+                    && *generation == reviewed
+                    && Some(json.clone())
+                        == review
+                            .recorded
+                            .as_ref()
+                            .and_then(|r| serde_json::to_string(r).ok())
+                    && *json != new_json =>
+            {
+                tx.execute(
+                    "UPDATE source_scan_bindings SET root_identity_json=?3,generation=generation+1 \
+                     WHERE source_folder_id=?1 AND generation=?2",
+                    params![review.source_id, reviewed, new_json],
+                )
+            }
+            _ => return Err(stale()),
+        }
+        .map_err(|e| db_error("reviewed source rebind", e))?;
+        if changed != 1
+            || SourceRootBinding::inspect(&review.path).as_ref() != Some(&review.current)
+        {
+            return Err(stale());
+        }
+        tx.commit()
+            .map_err(|e| db_error("commit reviewed source rebind", e))
+    }
+
+    /// Source-level catalogue state for every configured, active source, from
+    /// the same facts the scan and reconciliation use: the accepted binding and
+    /// generation, the latest coverage recorded for that generation, and the
+    /// remembered nested boundaries. Read-only and cheap; never walks archives.
+    pub fn source_health(&self, configured_roots: &[PathBuf]) -> Result<Vec<SourceHealth>> {
+        let schema_23 = self.schema_version()? >= 23;
+        let mut health = Vec::new();
+        for source in self.initial_scan_coverage(&[])? {
+            if source.state == ScanCoverageState::Removed
+                || !configured_roots.contains(&source.root)
+            {
+                continue;
+            }
+            let last_success = self
+                .source_review_row(source.source_id)?
+                .and_then(|(_, _, last_success)| last_success);
+            let bound = if schema_23 {
+                self.source_binding(source.source_id)?
+            } else {
+                None
+            };
+            let generation = bound.as_ref().map_or(0, |(_, g)| *g);
+            let mut entry = SourceHealth {
+                source_id: source.source_id,
+                path: source.root.clone(),
+                state: SourceHealthState::NeedsScan,
+                rebind: None,
+                generation,
+                detail: None,
+            };
+            let root = BoundRoot::open(&source.root).filter(|_| fs::read_dir(&source.root).is_ok());
+            let Some(root) = root else {
+                entry.state = SourceHealthState::SourceUnavailable;
+                entry.detail = Some("the folder cannot be reached right now".into());
+                health.push(entry);
+                continue;
+            };
+            match &bound {
+                None if last_success.is_some() => {
+                    entry.state = SourceHealthState::RebindRequired;
+                    entry.rebind = Some(RebindReason::NeverBound);
+                    health.push(entry);
+                    continue;
+                }
+                None => {
+                    health.push(entry);
+                    continue;
+                }
+                Some((json, _))
+                    if serde_json::to_string(&root.binding).ok().as_deref()
+                        != Some(json.as_str()) =>
+                {
+                    entry.state = SourceHealthState::RebindRequired;
+                    entry.rebind = Some(RebindReason::BackingChanged);
+                    health.push(entry);
+                    continue;
+                }
+                Some(_) => {}
+            }
+            let latest: Option<(String, Option<i64>)> = self
+                .connection
+                .query_row(
+                    "SELECT state, source_generation FROM scan_source_coverage \
+                     WHERE source_folder_id=?1 ORDER BY scan_run_id DESC LIMIT 1",
+                    [source.source_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(|e| db_error("read latest source coverage", e))?;
+            let covered = latest.as_ref().and_then(|(state, recorded)| {
+                (*recorded == Some(generation))
+                    .then(|| serde_json::from_str::<ScanCoverageState>(state).ok())
+                    .flatten()
+            });
+            let Some(covered) = covered else {
+                health.push(entry);
+                continue;
+            };
+            let unproven = self.unproven_nested_boundaries(source.source_id, &root)?;
+            entry.state = if !unproven.is_empty() {
+                entry.detail = Some(format!(
+                    "{} nested storage location(s) cannot be proven unchanged",
+                    unproven.len()
+                ));
+                SourceHealthState::CoverageIncomplete
+            } else {
+                match covered {
+                    ScanCoverageState::Complete => SourceHealthState::Healthy,
+                    ScanCoverageState::Partial => SourceHealthState::PartialScan,
+                    ScanCoverageState::Skipped => SourceHealthState::NotGameScanned,
+                    _ => SourceHealthState::CoverageIncomplete,
+                }
+            };
+            health.push(entry);
+        }
+        Ok(health)
     }
 }
 

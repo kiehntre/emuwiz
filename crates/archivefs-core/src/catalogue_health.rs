@@ -32,6 +32,105 @@ impl SourceRootBinding {
     }
 }
 
+impl SourceRootBinding {
+    /// A plain-language name for the filesystem type, for review screens only.
+    /// Unknown types are shown as their hexadecimal magic number.
+    pub fn filesystem_name(&self) -> String {
+        match self.filesystem_type as u64 & 0xffff_ffff {
+            0xef53 => "ext2/3/4".into(),
+            0x9123_683e => "btrfs".into(),
+            0x5846_5342 => "XFS".into(),
+            0x2011_bab0 => "exFAT".into(),
+            0x4d44 => "FAT/VFAT".into(),
+            0x5346_544e | 0x7366_746e => "NTFS".into(),
+            0x6969 => "NFS".into(),
+            0xff53_4d42 | 0xfe53_4d42 => "SMB/CIFS".into(),
+            0x6573_5546 => "FUSE".into(),
+            0x0102_1994 => "tmpfs".into(),
+            0x482b => "HFS+".into(),
+            0x3153_464a => "JFS".into(),
+            other => format!("type 0x{other:x}"),
+        }
+    }
+
+    /// Short filesystem identifier for comparing two reviews by eye.
+    pub fn filesystem_id_hex(&self) -> String {
+        self.filesystem_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
+/// Why a source's catalogue authority is blocked until a person reviews it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebindReason {
+    /// The source was scanned before storage continuity was tracked, so it has
+    /// never been bound. Upgrading never binds it automatically.
+    NeverBound,
+    /// The folder exists but is on different storage than the one reviewed.
+    BackingChanged,
+}
+
+/// Source-level catalogue state, from the backend only. A source can establish
+/// new Missing evidence only when it is [`SourceHealthState::Healthy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceHealthState {
+    /// Bound, reachable, and its latest scan for this generation was complete.
+    Healthy,
+    /// Bound (or brand new) but no scan has covered the current generation.
+    NeedsScan,
+    PartialScan,
+    /// Scanned, but coverage cannot be trusted (failed scan, unproven nested
+    /// mount, or an unfinished one).
+    CoverageIncomplete,
+    SourceUnavailable,
+    RebindRequired,
+    /// The source's role keeps it out of game scanning.
+    NotGameScanned,
+}
+
+impl SourceHealthState {
+    pub fn can_establish_missing(self) -> bool {
+        self == Self::Healthy
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceHealth {
+    pub source_id: i64,
+    pub path: PathBuf,
+    pub state: SourceHealthState,
+    /// Set exactly when `state` is `RebindRequired`.
+    pub rebind: Option<RebindReason>,
+    /// Accepted binding generation; 0 means the source has never been bound.
+    pub generation: i64,
+    pub detail: Option<String>,
+}
+
+/// Everything a person needs to decide whether a folder is still the storage
+/// they reviewed before. Produced read-only. Confirming it re-checks every
+/// field; any change means the review is out of date and must be repeated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRebindReview {
+    pub source_id: i64,
+    pub path: PathBuf,
+    /// The accepted generation this review was made against (0 = never bound).
+    pub generation: i64,
+    /// What the source was bound to, if it was ever bound.
+    pub recorded: Option<SourceRootBinding>,
+    /// What the folder is on right now.
+    pub current: SourceRootBinding,
+    pub reason: RebindReason,
+    pub archive_count: i64,
+    pub last_successful_scan_at: Option<String>,
+}
+
+/// Prefix of every refusal caused by a source that changed after review.
+pub const REBIND_REVIEW_AGAIN: &str = "the source changed since it was reviewed; review it again";
+
 /// A nested mount root exactly as the scan walker saw it. Recording it as the
 /// accepted boundary requires the same mount to still be there.
 #[derive(Debug, Clone, PartialEq, Eq)]
