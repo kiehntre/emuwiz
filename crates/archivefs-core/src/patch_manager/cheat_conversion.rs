@@ -364,6 +364,7 @@ mod tests {
 
     fn document() -> CheatDocument {
         CheatDocument {
+            source_evidence: Vec::new(),
             title: "Example".into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::DolphinActionReplay,
@@ -421,6 +422,7 @@ mod tests {
     #[test]
     fn pnach_round_trip_preserves_supported_widths() {
         let doc = CheatDocument {
+            source_evidence: Vec::new(),
             title: "PS2".into(),
             platform: CheatPlatform::Ps2,
             source_format: CheatSourceFormat::Pnach,
@@ -456,6 +458,7 @@ mod tests {
         let mut req = request(false);
         req.target = CheatTargetFormat::DolphinOnFrame;
         let doc = CheatDocument {
+            source_evidence: Vec::new(),
             operations: vec![CheatOperation::OnFrameWrite8 {
                 address: 1,
                 value: 2,

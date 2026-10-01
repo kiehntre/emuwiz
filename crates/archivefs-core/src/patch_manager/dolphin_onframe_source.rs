@@ -59,10 +59,12 @@ pub fn discover_dolphin_onframe_candidates(
         fs::read_to_string(path).map_err(|e| DolphinOnFrameSourceError::Io(e.to_string()))?;
     let mut in_section = false;
     let mut title: Option<String> = None;
+    let mut original_lines = Vec::<String>::new();
     let mut ops = Vec::new();
     let mut issues = Vec::new();
     let mut out = Vec::new();
-    let flush = |title: &mut Option<String>,
+    let flush = |original_lines: &mut Vec<String>,
+                 title: &mut Option<String>,
                  ops: &mut Vec<CheatOperation>,
                  issues: &mut Vec<CheatIssue>,
                  out: &mut Vec<DolphinOnFrameCandidate>| {
@@ -70,6 +72,16 @@ pub fn discover_dolphin_onframe_candidates(
             && (!ops.is_empty() || !issues.is_empty())
         {
             let doc = CheatDocument {
+                source_evidence: vec![super::cheat_provenance::CheatRecordProvenance {
+                    record_index: u32::try_from(out.len()).ok(),
+                    original_description: Some(name.clone()),
+                    original_code: Some(std::mem::take(original_lines).join("\n")),
+                    ..super::cheat_provenance::CheatRecordProvenance::local(
+                        path,
+                        text.as_bytes(),
+                        "dolphin_onframe",
+                    )
+                }],
                 title: name.clone(),
                 platform: platform.clone(),
                 source_format: CheatSourceFormat::DolphinOnFrame,
@@ -94,7 +106,13 @@ pub fn discover_dolphin_onframe_candidates(
         }
         if t.starts_with('[') {
             if in_section {
-                flush(&mut title, &mut ops, &mut issues, &mut out);
+                flush(
+                    &mut original_lines,
+                    &mut title,
+                    &mut ops,
+                    &mut issues,
+                    &mut out,
+                );
             }
             in_section = false;
             continue;
@@ -103,13 +121,20 @@ pub fn discover_dolphin_onframe_candidates(
             continue;
         }
         if let Some(name) = t.strip_prefix('$') {
-            flush(&mut title, &mut ops, &mut issues, &mut out);
+            flush(
+                &mut original_lines,
+                &mut title,
+                &mut ops,
+                &mut issues,
+                &mut out,
+            );
             title = Some(name.trim().to_string());
             continue;
         }
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
+        original_lines.push(line.to_string());
         let mut parts = t.split(':');
         let (Some(a), Some(width), Some(v)) = (parts.next(), parts.next(), parts.next()) else {
             continue;
@@ -143,7 +168,13 @@ pub fn discover_dolphin_onframe_candidates(
         }
     }
     if in_section {
-        flush(&mut title, &mut ops, &mut issues, &mut out);
+        flush(
+            &mut original_lines,
+            &mut title,
+            &mut ops,
+            &mut issues,
+            &mut out,
+        );
     }
     Ok(out)
 }
@@ -203,6 +234,7 @@ mod tests {
             source_path: PathBuf::from("x.ini"),
             platform: CheatPlatform::Wii,
             document: CheatDocument {
+                source_evidence: Vec::new(),
                 title: "x".into(),
                 platform: CheatPlatform::Wii,
                 source_format: CheatSourceFormat::DolphinOnFrame,

@@ -221,6 +221,13 @@ pub fn parse_zx_pok(input: &str) -> Result<Vec<ZxPokTrainer>, ZxPokError> {
 
 pub fn normalize_zx_pok(trainer: &ZxPokTrainer) -> CheatDocument {
     CheatDocument {
+        source_evidence: vec![crate::patch_manager::CheatRecordProvenance {
+            source_kind: crate::patch_manager::CheatSourceKind::GeneratedDerivative,
+            original_description: Some(trainer.title.clone()),
+            source_format: Some("ZX .pok".into()),
+            normalization: crate::patch_manager::CheatNormalizationStatus::Derived,
+            ..Default::default()
+        }],
         title: trainer.title.clone(),
         platform: CheatPlatform::Other("ZX Spectrum".into()),
         source_format: CheatSourceFormat::Other("ZX .pok".into()),

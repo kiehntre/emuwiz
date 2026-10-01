@@ -74,6 +74,7 @@ impl Drop for Fixture {
 
 fn candidate(classification: CheatCandidateClassification) -> CheatCandidate {
     CheatCandidate {
+        source_evidence: Vec::new(),
         catalogue_relative_path: "NES/Game.cht".to_string(),
         display_name: "Game".to_string(),
         platform: Some("NES".to_string()),

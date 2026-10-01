@@ -42,7 +42,13 @@ mod cheat_installer;
 mod cheat_ir;
 mod cheat_journey;
 mod cheat_loadability;
+mod cheat_provenance;
 mod cheat_provider;
+pub use cheat_provenance::{
+    CheatApplicabilityEvidence, CheatApplicabilityKind, CheatNormalizationStatus,
+    CheatRecordProvenance, CheatSourceKind, CheatSourceQuality, cheat_evidence_source_count,
+    order_cheat_provenance,
+};
 mod cheat_reconciliation_plan;
 mod cheat_rollback;
 mod cheat_rollback_result;

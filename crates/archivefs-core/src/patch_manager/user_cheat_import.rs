@@ -137,6 +137,8 @@ pub struct UserCheatMatch {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserCheatCandidate {
+    #[serde(default)]
+    pub source_evidence: Vec<super::cheat_provenance::CheatRecordProvenance>,
     pub format: UserCheatFormat,
     pub provenance: UserCheatProvenance,
     pub title_hints: Vec<String>,
@@ -606,7 +608,7 @@ fn parse_one_file(
             .unwrap_or_default(),
         source_sha256,
     };
-    match format {
+    let mut candidate = match format {
         UserCheatFormat::RetroarchCht => {
             let document = parse_cht_bytes(&bytes).map_err(|error| UserCheatImportError::Io {
                 path: path.to_path_buf(),
@@ -623,7 +625,43 @@ fn parse_one_file(
         UserCheatFormat::XeniaPatchToml => {
             parse_xenia_patch(path, provenance, &bytes, limits, library)
         }
+    }?;
+    if let Some(candidate) = &mut candidate {
+        use super::cheat_provenance::*;
+        use crate::platform_evidence_fusion::evidence_lineage::ClaimStrength;
+        let context = CheatRecordProvenance::local(
+            path,
+            &bytes,
+            match format {
+                UserCheatFormat::RetroarchCht => "retroarch_cht",
+                UserCheatFormat::Pcsx2Pnach => "pcsx2_pnach",
+                UserCheatFormat::DolphinGameSettingsIni => "dolphin_ini",
+                UserCheatFormat::XeniaPatchToml => "xenia_patch_toml",
+            },
+        );
+        if candidate.source_evidence.is_empty() {
+            // Other importers are availability indexes, not per-cheat parsers.
+            // Retain the actual source text without fabricating record indexes.
+            let mut evidence = context.clone();
+            evidence.original_code = std::str::from_utf8(&bytes).ok().map(str::to_owned);
+            candidate.source_evidence.push(evidence);
+        }
+        for evidence in &mut candidate.source_evidence {
+            evidence.source_kind = context.source_kind;
+            evidence.source_quality = context.source_quality;
+            evidence.source_path = context.source_path.clone();
+            evidence.source_format = context.source_format.clone();
+            evidence.artifact = context.artifact.clone();
+            if let Some(title) = candidate.title_hints.first() {
+                evidence.applicability.push(CheatApplicabilityEvidence {
+                    kind: CheatApplicabilityKind::FilenameAssociation,
+                    value: title.clone(),
+                    strength: ClaimStrength::Weak,
+                });
+            }
+        }
     }
+    Ok(candidate)
 }
 
 /// Indexes a Dolphin GameSettings-shaped `.ini`. `.ini` is a generic
@@ -680,6 +718,7 @@ fn parse_dolphin_game_settings(
         .map(|warning| warning.detail.clone())
         .collect();
     Ok(Some(UserCheatCandidate {
+        source_evidence: Vec::new(),
         format: UserCheatFormat::DolphinGameSettingsIni,
         provenance,
         title_hints: vec![title],
@@ -751,6 +790,7 @@ fn parse_xenia_patch(
         .map(|warning| warning.detail.clone())
         .collect();
     Ok(Some(UserCheatCandidate {
+        source_evidence: Vec::new(),
         format: UserCheatFormat::XeniaPatchToml,
         provenance,
         title_hints,
@@ -801,6 +841,19 @@ fn candidate_from_cht(
     );
     let match_state = overall_match_state(&matches);
     UserCheatCandidate {
+        source_evidence: document
+            .entries
+            .iter()
+            .take(limits.max_cheats_per_file)
+            .map(|entry| {
+                let mut evidence = super::cheat_provenance::CheatRecordProvenance::original(
+                    entry.original_description.clone(),
+                    entry.original_code.clone(),
+                );
+                evidence.record_index = Some(entry.index);
+                evidence
+            })
+            .collect(),
         format: UserCheatFormat::RetroarchCht,
         provenance,
         title_hints: vec![title],
@@ -899,6 +952,7 @@ fn parse_pnach(
         library,
     );
     Ok(Some(UserCheatCandidate {
+        source_evidence: Vec::new(),
         format: UserCheatFormat::Pcsx2Pnach,
         provenance,
         title_hints,

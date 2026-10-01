@@ -117,6 +117,8 @@ pub enum DsActionReplayClassification {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheatDocument {
+    #[serde(default)]
+    pub source_evidence: Vec<super::cheat_provenance::CheatRecordProvenance>,
     pub title: String,
     pub platform: CheatPlatform,
     pub source_format: CheatSourceFormat,
@@ -259,6 +261,8 @@ pub enum ConversionCapability {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheatConversionPreview {
+    #[serde(default)]
+    pub source_evidence: Vec<super::cheat_provenance::CheatRecordProvenance>,
     pub title: String,
     pub source_format: CheatSourceFormat,
     pub target_format: CheatTargetFormat,
@@ -618,8 +622,13 @@ pub fn parse_ds_action_replay_document(
             }
         }
     }
+    let title = title.into();
     CheatDocument {
-        title: title.into(),
+        source_evidence: vec![super::cheat_provenance::CheatRecordProvenance::original(
+            Some(title.clone()),
+            Some(text.into()),
+        )],
+        title,
         platform: CheatPlatform::NintendoDs,
         source_format: CheatSourceFormat::ActionReplayDs,
         operations,
@@ -808,6 +817,7 @@ pub fn assess_document_conversion(
     }
     let can_apply = platform_ok && unsupported == 0 && !missing_encoder && warnings.is_empty();
     CheatConversionPreview {
+        source_evidence: document.source_evidence.clone(),
         title: document.title.clone(),
         source_format: document.source_format.clone(),
         target_format: target,
@@ -1061,7 +1071,14 @@ fn entry_quality(entry: &CheatReconciliationEntry) -> CheatEvidenceQuality {
     CheatEvidenceQuality {
         semantics_understood: operation_semantics_known(&entry.document),
         identity_verified: entry.identity_verified,
-        provenance_present: !entry.provenance.is_empty() || !entry.document.provenance.is_empty(),
+        provenance_present: entry.document.source_evidence.iter().any(|e| {
+            e.source_kind != super::cheat_provenance::CheatSourceKind::Unknown
+                || e.source_path.is_some()
+                || e.provider_id.is_some()
+                || e.provider_name.is_some()
+                || e.artifact.is_some()
+        }) || !entry.provenance.is_empty()
+            || !entry.document.provenance.is_empty(),
         warning_count: entry.document.issues.len()
             + entry
                 .document
@@ -1115,6 +1132,7 @@ mod tests {
             source: source.into(),
             source_format: CheatSourceFormat::Gecko,
             document: CheatDocument {
+                source_evidence: Vec::new(),
                 title: title.into(),
                 platform: CheatPlatform::GameCube,
                 source_format: CheatSourceFormat::Gecko,
@@ -1439,6 +1457,7 @@ mod tests {
     #[test]
     fn unsupported_is_not_exact() {
         let d = CheatDocument {
+            source_evidence: Vec::new(),
             title: "x".into(),
             platform: CheatPlatform::Ps2,
             source_format: CheatSourceFormat::Pnach,
@@ -1456,6 +1475,7 @@ mod tests {
     #[test]
     fn direct_writes_have_exact_target_previews() {
         let d = CheatDocument {
+            source_evidence: Vec::new(),
             title: "demo".into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::DolphinActionReplay,
@@ -1490,6 +1510,7 @@ mod tests {
     #[test]
     fn ps2_missing_encoder_is_explicit() {
         let d = CheatDocument {
+            source_evidence: Vec::new(),
             title: "ps2".into(),
             platform: CheatPlatform::Ps2,
             source_format: CheatSourceFormat::Pnach,
@@ -1509,6 +1530,7 @@ mod tests {
     #[test]
     fn service_lists_only_platform_targets_and_preserves_mixed_status() {
         let d = CheatDocument {
+            source_evidence: Vec::new(),
             title: "mixed".into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::Gecko,
@@ -1790,6 +1812,7 @@ mod tests {
     #[test]
     fn ds_action_replay_target_rejects_non_ds_platform_documents() {
         let document = CheatDocument {
+            source_evidence: Vec::new(),
             title: "PS2".into(),
             platform: CheatPlatform::Ps2,
             source_format: CheatSourceFormat::Pnach,
@@ -1872,6 +1895,7 @@ mod tests {
     #[test]
     fn dolphin_on_frame_document_requires_complete_supported_output() {
         let document = CheatDocument {
+            source_evidence: Vec::new(),
             title: "frame patch".into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::DolphinOnFrame,
@@ -1900,6 +1924,7 @@ mod tests {
     #[test]
     fn dolphin_direct_write_conversion_to_on_frame_is_not_assumed() {
         let document = CheatDocument {
+            source_evidence: Vec::new(),
             title: "direct".into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::Gecko,
@@ -1918,5 +1943,54 @@ mod tests {
                 .iter()
                 .any(|capability| capability.target == CheatTargetFormat::DolphinOnFrame)
         );
+    }
+}
+
+impl CheatReconciliationEntry {
+    /// Typed audit projection for both current and legacy report records.
+    /// Legacy provenance text never becomes a claim of source authority.
+    pub fn audit_evidence(&self) -> Vec<super::cheat_provenance::CheatRecordProvenance> {
+        use super::cheat_provenance::*;
+        use crate::platform_evidence_fusion::evidence_lineage::ClaimStrength;
+        let mut evidence = self.document.source_evidence.clone();
+        if evidence.is_empty() {
+            evidence.push(CheatRecordProvenance {
+                provider_name: (!self.source.is_empty()).then(|| self.source.clone()),
+                source_format: Some(format!("{:?}", self.source_format)),
+                ..CheatRecordProvenance::original(Some(self.title.clone()), self.raw_code.clone())
+            });
+        }
+        if self.identity_verified && !self.game_identity.trim().is_empty() {
+            let identity = CheatApplicabilityEvidence {
+                kind: CheatApplicabilityKind::VerifiedGameIdentity,
+                value: self.game_identity.clone(),
+                strength: ClaimStrength::Strong,
+            };
+            for item in &mut evidence {
+                if !item.applicability.contains(&identity) {
+                    item.applicability.push(identity.clone());
+                }
+            }
+        }
+        order_cheat_provenance(&mut evidence);
+        evidence
+    }
+}
+
+impl CheatReconciliationGroup {
+    /// Every observation remains available, including conflicting code values.
+    /// Ordering is independent of the display/canonical entry choice.
+    pub fn source_evidence(
+        &self,
+        report: &CheatReconciliationResult,
+    ) -> Vec<super::cheat_provenance::CheatRecordProvenance> {
+        let mut evidence = self
+            .entry_indices
+            .iter()
+            .filter_map(|i| report.entries.get(*i))
+            .flat_map(CheatReconciliationEntry::audit_evidence)
+            .collect::<Vec<_>>();
+        super::cheat_provenance::order_cheat_provenance(&mut evidence);
+        evidence
     }
 }

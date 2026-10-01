@@ -1099,6 +1099,7 @@ fn an_uninstallable_candidate_can_never_become_the_selection() {
             catalogue_root: PathBuf::from("/catalogue"),
             list: CheatCandidateList {
                 candidates: vec![CheatCandidate {
+                    source_evidence: Vec::new(),
                     catalogue_relative_path: "MegaDrive/a.cht".to_string(),
                     display_name: "a".to_string(),
                     platform: Some("MegaDrive".to_string()),
@@ -1439,6 +1440,7 @@ fn app_with_overflowing_cheats_mods_page() -> ArchiveFsApp {
     let key = cheat_preview_key(app.cheat_workflow.as_ref().unwrap());
     let candidates: Vec<CheatCandidate> = (0..40)
         .map(|index| CheatCandidate {
+            source_evidence: Vec::new(),
             catalogue_relative_path: format!("NES/game{index}.cht"),
             display_name: format!("Game {index}"),
             platform: Some("NES".to_string()),

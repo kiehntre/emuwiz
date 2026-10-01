@@ -45,6 +45,8 @@ pub struct ResolvedCheatEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedCheatDiagnostic {
+    #[serde(default)]
+    pub source_evidence: Vec<super::cheat_provenance::CheatRecordProvenance>,
     pub entry_indices: Vec<usize>,
     pub title: String,
     pub reason: String,
@@ -73,6 +75,9 @@ pub enum ResolvedCheatApplyEligibility {
 /// backup, transaction and rollback.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedCheatPlan {
+    /// Audit snapshot retains disagreement even when a review chooses one representation.
+    #[serde(default)]
+    pub source_report: Option<Box<CheatReconciliationResult>>,
     pub source_report_digest: String,
     pub review_choices_digest: String,
     pub game_identity: String,
@@ -345,6 +350,7 @@ impl ResolvedCheatPlan {
         };
 
         Self {
+            source_report: Some(Box::new(report.clone())),
             source_report_digest: request.source_report_digest.clone(),
             review_choices_digest: choices_digest(choices),
             game_identity: report.game_identity.clone(),
@@ -479,6 +485,13 @@ fn resolved_entry(
     }
     provenance.sort();
     provenance.dedup();
+    let mut document = entry.document.clone();
+    document.source_evidence = duplicate_indices
+        .iter()
+        .filter_map(|i| report.entries.get(*i))
+        .flat_map(|e| e.audit_evidence())
+        .collect();
+    super::cheat_provenance::order_cheat_provenance(&mut document.source_evidence);
     ResolvedCheatEntry {
         canonical_entry_index: index,
         duplicate_entry_indices: duplicate_indices.to_vec(),
@@ -491,7 +504,7 @@ fn resolved_entry(
         title: entry.title.clone(),
         platform: entry.document.platform.clone(),
         source_format: entry.source_format.clone(),
-        document: entry.document.clone(),
+        document,
         provenance,
         selected_by_review: true,
     }
@@ -528,7 +541,14 @@ fn diagnostic(
     }
     provenance.sort();
     provenance.dedup();
+    let mut source_evidence = indices
+        .iter()
+        .filter_map(|i| report.entries.get(*i))
+        .flat_map(|e| e.audit_evidence())
+        .collect::<Vec<_>>();
+    super::cheat_provenance::order_cheat_provenance(&mut source_evidence);
     ResolvedCheatDiagnostic {
+        source_evidence,
         entry_indices: indices.to_vec(),
         title,
         reason: reason.into(),

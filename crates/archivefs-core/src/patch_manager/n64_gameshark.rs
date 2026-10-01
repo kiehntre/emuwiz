@@ -378,8 +378,7 @@ pub fn decode_n64_gameshark(
     let mut required_master_codes = Vec::new();
     let lines: Vec<_> = input
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.trim().is_empty())
         .collect();
     if lines.is_empty() || lines.len() > MAX_LINES {
         issues.push(N64CheatIssue::Malformed {
@@ -452,7 +451,83 @@ pub fn decode_n64_gameshark(
 
 impl N64CheatDecodeResult {
     pub fn to_document(&self) -> CheatDocument {
+        use super::cheat_provenance::{CheatApplicabilityEvidence, CheatApplicabilityKind};
+        use crate::platform_evidence_fusion::evidence_lineage::ClaimStrength;
+        let mut evidence = super::cheat_provenance::CheatRecordProvenance::original(
+            Some(self.title.clone()),
+            Some(
+                self.codes
+                    .iter()
+                    .map(|c| c.raw.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        );
+        evidence.source_format = Some("n64_gameshark".into());
+        let mut add = |kind, value, strength| {
+            evidence.applicability.push(CheatApplicabilityEvidence {
+                kind,
+                value,
+                strength,
+            })
+        };
+        if self.region != N64CheatRegion::Unknown {
+            add(
+                CheatApplicabilityKind::Region,
+                format!("{:?}", self.region),
+                ClaimStrength::Weak,
+            );
+        }
+        match &self.revision {
+            N64CheatRevisionEvidence::ExactRomHash { hash } => add(
+                CheatApplicabilityKind::ContentHashMatch,
+                hash.clone(),
+                ClaimStrength::Strong,
+            ),
+            N64CheatRevisionEvidence::VerifiedIdentity {
+                game_code,
+                revision,
+            } => {
+                add(
+                    CheatApplicabilityKind::VerifiedGameIdentity,
+                    game_code.clone(),
+                    ClaimStrength::Strong,
+                );
+                add(
+                    CheatApplicabilityKind::Revision,
+                    revision.to_string(),
+                    ClaimStrength::Strong,
+                );
+            }
+            N64CheatRevisionEvidence::HeaderIdentity {
+                game_code,
+                revision,
+            } => {
+                add(
+                    CheatApplicabilityKind::SerialMatch,
+                    game_code.clone(),
+                    ClaimStrength::Weak,
+                );
+                add(
+                    CheatApplicabilityKind::Revision,
+                    revision.to_string(),
+                    ClaimStrength::Weak,
+                );
+            }
+            N64CheatRevisionEvidence::RegionOnly(region) => add(
+                CheatApplicabilityKind::Region,
+                format!("{region:?}"),
+                ClaimStrength::Weak,
+            ),
+            N64CheatRevisionEvidence::TitleOnly(title) => add(
+                CheatApplicabilityKind::TitleMatch,
+                title.clone(),
+                ClaimStrength::Weak,
+            ),
+            N64CheatRevisionEvidence::Unknown => {}
+        }
         CheatDocument {
+            source_evidence: vec![evidence],
             title: self.title.clone(),
             platform: CheatPlatform::Nintendo64,
             source_format: CheatSourceFormat::N64GameShark,

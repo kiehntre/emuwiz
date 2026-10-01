@@ -575,8 +575,15 @@ pub fn game_genie_to_document(
         ));
     }
     let operations = vec![instruction.operation.clone()];
+    let title = title.into();
+    let mut evidence = super::cheat_provenance::CheatRecordProvenance::original(
+        Some(title.clone()),
+        Some(result.original.clone()),
+    );
+    evidence.note_comparison(None, Some(result.normalized_code.clone()));
     Some(super::cheat_ir::CheatDocument {
-        title: title.into(),
+        source_evidence: vec![evidence],
+        title,
         platform,
         source_format,
         operations,

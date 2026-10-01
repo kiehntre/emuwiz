@@ -207,8 +207,10 @@ pub struct CheatCandidateEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CheatCandidate {
+    /// Retained for internal audit; ordinary display uses catalogue_relative_path.
+    pub source_evidence: Vec<super::cheat_provenance::CheatRecordProvenance>,
     /// Path relative to the catalogue root - the stable identity the
-    /// install path re-resolves, never an absolute path the GUI retains.
+    /// install path re-resolves and the ordinary GUI displays.
     pub catalogue_relative_path: String,
     pub display_name: String,
     pub platform: Option<String>,
@@ -717,6 +719,11 @@ fn evaluate_record(
 
     let relative_path = catalogue_relative_path(record, snapshot);
     Some(CheatCandidate {
+        source_evidence: record
+            .cheats
+            .iter()
+            .flat_map(|c| c.source_evidence.clone())
+            .collect(),
         catalogue_relative_path: relative_path,
         display_name: record.source_game_name.clone(),
         platform: record.source_platform.clone(),

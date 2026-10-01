@@ -603,6 +603,7 @@ mod tests {
             target_emulator: Some("RetroArch".into()),
             cheat_count: 2,
             cheats: vec![CheatDefinition {
+                source_evidence: Vec::new(),
                 description: Some("Lives".into()),
                 enabled_by_default: false,
                 declared_index: Some(0),

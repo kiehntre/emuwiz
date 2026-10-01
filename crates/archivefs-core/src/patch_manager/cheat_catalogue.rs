@@ -42,8 +42,8 @@
 //! - A `.cht` text parser that keeps per-cheat descriptions and
 //!   enabled-by-default flags ([`CheatDefinition`]), rather than
 //!   `retroarch_inventory::CheatFileSummary`'s aggregate-only counts. Cheat
-//!   *code* bodies (the numeric/hex value lines) are still never parsed or
-//!   stored, matching that module's existing precedent.
+//!   code bodies are retained verbatim as audit evidence, without decoding
+//!   their semantics or making them executable.
 //! - Game-identity matching against a catalogue source name/platform/
 //!   region/serial/content-hash instead of a PNACH filename or playlist
 //!   content path.
@@ -115,9 +115,10 @@ pub enum CheatCatalogueFormat {
     JsonManifest,
 }
 
-/// One cheat's bounded metadata - never the code body itself.
+/// One cheat's bounded metadata and original source evidence.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheatDefinition {
+    pub source_evidence: Vec<super::cheat_provenance::CheatRecordProvenance>,
     pub description: Option<String>,
     pub enabled_by_default: bool,
     /// The declared `cheatN_*` index for a `.cht` source, or the manifest
@@ -318,13 +319,22 @@ fn empty_snapshot_for_unusable_root(
 
 pub struct RetroarchChtDirectorySource {
     source_name: String,
+    source_kind: super::cheat_provenance::CheatSourceKind,
 }
 
 impl RetroarchChtDirectorySource {
     pub fn new(source_name: &str) -> Self {
         Self {
             source_name: source_name.to_string(),
+            source_kind: super::cheat_provenance::CheatSourceKind::LocalFile,
         }
+    }
+}
+
+impl RetroarchChtDirectorySource {
+    pub fn with_source_kind(mut self, kind: super::cheat_provenance::CheatSourceKind) -> Self {
+        self.source_kind = kind;
+        self
     }
 }
 
@@ -432,7 +442,14 @@ impl CheatCatalogueSource for RetroarchChtDirectorySource {
                             continue;
                         }
                         match load_cht_record(filesystem, &path, platform_hint.as_deref()) {
-                            ChtLoadOutcome::Indexed(record) => games.push(*record),
+                            ChtLoadOutcome::Indexed(mut record) => {
+                                attribute_catalogue_record(
+                                    &mut record,
+                                    &self.source_name,
+                                    self.source_kind,
+                                );
+                                games.push(*record);
+                            }
                             ChtLoadOutcome::Excluded(excluded) => {
                                 if !push_excluded_entry(
                                     &mut excluded_entries,
@@ -756,6 +773,14 @@ fn parse_cht_cheats(
         .entries
         .into_iter()
         .map(|entry| CheatDefinition {
+            source_evidence: {
+                let mut evidence = super::cheat_provenance::CheatRecordProvenance::original(
+                    entry.original_description.clone(),
+                    entry.original_code.clone(),
+                );
+                evidence.record_index = Some(entry.index);
+                vec![evidence]
+            },
             description: entry.description,
             enabled_by_default: entry.enabled_by_default,
             declared_index: Some(entry.index),
@@ -770,13 +795,22 @@ fn parse_cht_cheats(
 
 pub struct JsonManifestSource {
     source_name: String,
+    source_kind: super::cheat_provenance::CheatSourceKind,
 }
 
 impl JsonManifestSource {
     pub fn new(source_name: &str) -> Self {
         Self {
             source_name: source_name.to_string(),
+            source_kind: super::cheat_provenance::CheatSourceKind::ImportedDatabase,
         }
+    }
+}
+
+impl JsonManifestSource {
+    pub fn with_source_kind(mut self, kind: super::cheat_provenance::CheatSourceKind) -> Self {
+        self.source_kind = kind;
+        self
     }
 }
 
@@ -862,7 +896,10 @@ impl CheatCatalogueSource for JsonManifestSource {
                 break;
             }
             match build_manifest_record(entry, root, &hash, index) {
-                Ok(record) => games.push(record),
+                Ok(mut record) => {
+                    attribute_catalogue_record(&mut record, &source_name, self.source_kind);
+                    games.push(record);
+                }
                 Err(diagnostic) => {
                     complete = false;
                     diagnostics.push(diagnostic);
@@ -926,6 +963,8 @@ struct ManifestGame {
 #[derive(Debug, Deserialize)]
 struct ManifestCheat {
     #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     enabled_by_default: bool,
@@ -973,7 +1012,18 @@ fn build_manifest_record(
         if let Some(description) = &cheat.description {
             validate_manifest_string("cheat description", description, root, index)?;
         }
+        if let Some(code) = &cheat.code {
+            validate_manifest_string("cheat code", code, root, index)?;
+        }
         cheats.push(CheatDefinition {
+            source_evidence: vec![super::cheat_provenance::CheatRecordProvenance {
+                record_key: Some(format!("games/{index}/cheats/{cheat_index}")),
+                record_index: u32::try_from(cheat_index).ok(),
+                ..super::cheat_provenance::CheatRecordProvenance::original(
+                    cheat.description.clone(),
+                    cheat.code,
+                )
+            }],
             description: cheat.description.filter(|value| !value.trim().is_empty()),
             enabled_by_default: cheat.enabled_by_default,
             declared_index: u32::try_from(cheat_index).ok(),
@@ -2227,3 +2277,74 @@ fn demote_duplicate_staging_destinations(entries: &mut [CheatAvailabilityEntry])
 
 #[cfg(test)]
 mod tests;
+
+/// Attribute successfully parsed records only. Source declarations are weak
+/// applicability evidence until an existing game matcher establishes a match.
+fn attribute_catalogue_record(
+    record: &mut CheatGameRecord,
+    provider_name: &str,
+    source_kind: super::cheat_provenance::CheatSourceKind,
+) {
+    use super::cheat_provenance::*;
+    use crate::platform_evidence_fusion::evidence_lineage::{
+        ClaimStrength, SourceArtifactIdentity, SourceFamily,
+    };
+    let path = std::path::PathBuf::from(&record.source_file_path.display);
+    for cheat in &mut record.cheats {
+        for evidence in &mut cheat.source_evidence {
+            evidence.source_kind = source_kind;
+            evidence.source_quality = match source_kind {
+                CheatSourceKind::LocalFile => CheatSourceQuality::LocalKnown,
+                CheatSourceKind::Unknown => CheatSourceQuality::Unknown,
+                _ => CheatSourceQuality::ImportedUnverified,
+            };
+            evidence.source_path = Some(path.clone());
+            evidence.provider_name = Some(provider_name.into());
+            evidence.source_format = Some(
+                match record.format {
+                    CheatCatalogueFormat::RetroarchChtDirectory => "retroarch_cht",
+                    CheatCatalogueFormat::JsonManifest => "json_manifest",
+                }
+                .into(),
+            );
+            evidence.artifact = Some(SourceArtifactIdentity {
+                source_family: SourceFamily::Unknown,
+                upstream_version: None,
+                artifact_sha256: record.source_file_hash.clone(),
+                artifact_name: path.file_name().and_then(|s| s.to_str()).map(str::to_owned),
+            });
+            evidence.applicability.push(CheatApplicabilityEvidence {
+                kind: match record.format {
+                    CheatCatalogueFormat::RetroarchChtDirectory => {
+                        CheatApplicabilityKind::FilenameAssociation
+                    }
+                    CheatCatalogueFormat::JsonManifest => {
+                        CheatApplicabilityKind::SourcePackAssociation
+                    }
+                },
+                value: record.source_game_name.clone(),
+                strength: ClaimStrength::Weak,
+            });
+            for (kind, value) in [
+                (CheatApplicabilityKind::Region, &record.source_region),
+                (CheatApplicabilityKind::Revision, &record.source_revision),
+                (
+                    CheatApplicabilityKind::SerialMatch,
+                    &record.source_identifier,
+                ),
+                (
+                    CheatApplicabilityKind::ContentHashMatch,
+                    &record.source_content_hash,
+                ),
+            ] {
+                if let Some(value) = value {
+                    evidence.applicability.push(CheatApplicabilityEvidence {
+                        kind,
+                        value: value.clone(),
+                        strength: ClaimStrength::Weak,
+                    });
+                }
+            }
+        }
+    }
+}

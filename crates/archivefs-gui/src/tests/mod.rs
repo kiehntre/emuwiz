@@ -487,6 +487,7 @@ fn workflow_at_cheat_selection_stage(app: &mut ArchiveFsApp) {
     )
     .expect("fixture parses");
     let candidate = CheatCandidate {
+        source_evidence: Vec::new(),
         catalogue_relative_path: "NES/a.cht".to_string(),
         display_name: "a".to_string(),
         platform: Some("NES".to_string()),

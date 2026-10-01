@@ -15,6 +15,7 @@ fn entry(name: &str, source: &str, value: u8) -> CheatReconciliationEntry {
         source_index: None,
         source_fields: vec![],
         document: CheatDocument {
+            source_evidence: Vec::new(),
             title: name.into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::Gecko,
@@ -652,10 +653,12 @@ fn global_source_evidence_is_retained_once_instead_of_copied_into_every_record()
     // every projected record carries it as a review-requiring issue.
     assert!(d.warnings.iter().any(|warning| warning.kind
         == crate::patch_manager::ChtDocumentWarningKind::ConflictingDuplicate));
-    assert!(entries.iter().all(|entry| entry
-        .document
-        .issues
-        .contains(&crate::patch_manager::CheatIssue::SourceMetadataConflict)));
+    assert!(entries.iter().all(|entry| {
+        entry
+            .document
+            .issues
+            .contains(&crate::patch_manager::CheatIssue::SourceMetadataConflict)
+    }));
 }
 
 #[test]
@@ -742,8 +745,12 @@ fn global_field_limit_blocks_lossy_projection_but_identical_repeats_do_not() {
     let d = parse_cht_text(&format!("{fields}custom0 = A\ncheat0_code = A\n")).unwrap();
     assert!(d.entries[0].is_selectable());
     let d = parse_cht_text(&format!("{fields}another = B\ncheat0_code = A\n")).unwrap();
-    assert!(d.warnings.iter().any(|warning| warning.kind
-        == crate::patch_manager::ChtDocumentWarningKind::LimitReached));
+    assert!(
+        d.warnings
+            .iter()
+            .any(|warning| warning.kind
+                == crate::patch_manager::ChtDocumentWarningKind::LimitReached)
+    );
     let projected =
         d.reconciliation_entries("game", true, CheatPlatform::NintendoDs, "local", "x.cht");
     assert!(projected[0].document.issues.iter().any(|issue| matches!(

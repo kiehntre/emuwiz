@@ -32,6 +32,7 @@ fn report() -> CheatReconciliationResult {
             source: format!("Local source {value}"),
             source_format: CheatSourceFormat::Gecko,
             document: CheatDocument {
+                source_evidence: Vec::new(),
                 title: "Lives".into(),
                 platform: CheatPlatform::GameCube,
                 source_format: CheatSourceFormat::Gecko,

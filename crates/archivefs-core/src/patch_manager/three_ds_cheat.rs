@@ -230,7 +230,7 @@ pub fn parse_three_ds_cheat_file(title_id: &str, text: &str) -> ThreeDsCheatFile
             file.readiness = ThreeDsCheatReadiness::ReadyWithOpaqueOps;
         }
         entry.codes.push(ThreeDsCheatCode {
-            original: line.to_string(),
+            original: raw.to_string(),
             normalized: format!("{word:08X} {value:08X}"),
             opcode,
             address,
@@ -319,6 +319,17 @@ pub fn three_ds_cheat_document(
     entry: &ThreeDsCheatEntry,
 ) -> CheatDocument {
     CheatDocument {
+        source_evidence: vec![super::cheat_provenance::CheatRecordProvenance::original(
+            Some(entry.name.clone()),
+            Some(
+                entry
+                    .codes
+                    .iter()
+                    .map(|c| c.original.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        )],
         title: entry.name.clone(),
         platform: CheatPlatform::Other("Nintendo 3DS".into()),
         source_format: CheatSourceFormat::Other("Azahar/Citra Gateway".into()),

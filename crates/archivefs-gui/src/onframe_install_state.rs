@@ -192,6 +192,7 @@ mod tests {
             source_path: PathBuf::from("x.ini"),
             platform: CheatPlatform::GameCube,
             document: CheatDocument {
+                source_evidence: Vec::new(),
                 title: "60 FPS".into(),
                 platform: CheatPlatform::GameCube,
                 source_format: CheatSourceFormat::DolphinOnFrame,

@@ -568,6 +568,7 @@ mod tests {
             source_path: PathBuf::from("source.ini"),
             platform: platform.clone(),
             document: CheatDocument {
+                source_evidence: Vec::new(),
                 title: title.into(),
                 platform,
                 source_format: CheatSourceFormat::DolphinOnFrame,

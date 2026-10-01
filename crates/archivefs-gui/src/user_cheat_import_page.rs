@@ -2606,6 +2606,7 @@ impl UserCheatImportPageState {
             })
             .unwrap_or_else(|| CheatPlatform::Other("unknown".into()));
         let document = CheatDocument {
+            source_evidence: Vec::new(),
             title: candidate.provenance.original_filename.clone(),
             platform,
             source_format: source_format.clone(),

@@ -412,6 +412,7 @@ mod tests {
 
     fn document(title: &str) -> CheatDocument {
         CheatDocument {
+            source_evidence: Vec::new(),
             title: title.into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::DolphinOnFrame,

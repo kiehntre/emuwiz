@@ -133,7 +133,7 @@ pub fn decode_saturn_action_replay(text: &str) -> SaturnCheatDecodeResult {
             result.readiness = SaturnCheatReadiness::Malformed;
             break;
         }
-        let original = line.trim().to_string();
+        let original = line.to_string();
         if !original.is_ascii() {
             result.issues.push(SaturnCheatIssue::NonAscii);
             result.readiness = SaturnCheatReadiness::Malformed;
@@ -222,8 +222,20 @@ pub fn saturn_cheat_document(
     result: &SaturnCheatDecodeResult,
     title: impl Into<String>,
 ) -> CheatDocument {
+    let title = title.into();
     CheatDocument {
-        title: title.into(),
+        source_evidence: vec![super::cheat_provenance::CheatRecordProvenance::original(
+            Some(title.clone()),
+            Some(
+                result
+                    .codes
+                    .iter()
+                    .map(|c| c.original.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        )],
+        title,
         platform: CheatPlatform::Other("Sega Saturn".into()),
         source_format: CheatSourceFormat::Other("Saturn Action Replay".into()),
         operations: result

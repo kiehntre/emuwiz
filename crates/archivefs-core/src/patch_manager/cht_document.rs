@@ -253,6 +253,9 @@ pub struct ChtEntry {
     /// The `cheatN_` index exactly as the source declared it. Rendering
     /// renumbers; this field never does.
     pub index: u32,
+    /// Exact source value before decoding/normalization, including source quotes.
+    pub original_description: Option<String>,
+    pub original_code: Option<String>,
     pub description: Option<String>,
     pub code: Option<String>,
     pub enabled_by_default: bool,
@@ -377,6 +380,16 @@ impl ChtDocument {
                     source: source.into(),
                     source_format: CheatSourceFormat::RetroArch,
                     document: CheatDocument {
+                        source_evidence: vec![super::cheat_provenance::CheatRecordProvenance {
+                            source_path: Some(std::path::PathBuf::from(source_path)),
+                            provider_name: Some(source.into()),
+                            source_format: Some("retroarch_cht".into()),
+                            record_index: Some(entry.index),
+                            ..super::cheat_provenance::CheatRecordProvenance::original(
+                                entry.original_description.clone(),
+                                entry.original_code.clone(),
+                            )
+                        }],
                         title,
                         platform: platform.clone(),
                         source_format: CheatSourceFormat::RetroArch,
@@ -513,6 +526,8 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
     struct Draft {
         first_line: u32,
         first_raw_source: String,
+        original_description: Option<String>,
+        original_code: Option<String>,
         description: Option<String>,
         code: Option<String>,
         enable: Option<String>,
@@ -610,7 +625,11 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         if !is_entry_assignment && !key.is_empty() {
             if source_fields.len() < MAX_CHT_GLOBAL_SOURCE_FIELDS {
                 source_fields.push(CheatSourceFieldEvidence {
-                    field: if key.eq_ignore_ascii_case("cheats") { "cheats".into() } else { key.into() },
+                    field: if key.eq_ignore_ascii_case("cheats") {
+                        "cheats".into()
+                    } else {
+                        key.into()
+                    },
                     value: value.clone(),
                     line: line_number,
                     raw_source: bounded_line.to_string(),
@@ -621,7 +640,9 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                     &mut warnings,
                     ChtDocumentWarningKind::LimitReached,
                     Some(line_number),
-                    format!("more than {MAX_CHT_GLOBAL_SOURCE_FIELDS} file-wide assignments; later evidence omitted"),
+                    format!(
+                        "more than {MAX_CHT_GLOBAL_SOURCE_FIELDS} file-wide assignments; later evidence omitted"
+                    ),
                 );
             }
         }
@@ -758,6 +779,8 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         let draft = drafts.entry(entry_index).or_insert_with(|| Draft {
             first_line: line_number,
             first_raw_source: bounded_line.to_string(),
+            original_description: None,
+            original_code: None,
             description: None,
             code: None,
             enable: None,
@@ -801,7 +824,10 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             .skip(1)
             .find(|item| item.field == field)
         {
-            let rhs = |line: &str| line.split_once('=').map(|(_, value)| value.trim().to_string());
+            let rhs = |line: &str| {
+                line.split_once('=')
+                    .map(|(_, value)| value.trim().to_string())
+            };
             let previous_truncated = draft.warnings.iter().any(|warning| {
                 warning.kind == ChtEntryWarningKind::OversizedField
                     && warning.line == Some(previous.line)
@@ -823,6 +849,12 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         }
         draft.warnings.extend(value_warnings);
 
+        if field == "desc" && draft.original_description.is_none() {
+            draft.original_description = Some(raw_value.trim().to_string());
+        }
+        if field == "code" && draft.original_code.is_none() {
+            draft.original_code = Some(raw_value.trim().to_string());
+        }
         match field {
             "desc" => set_once(
                 &mut draft.description,
@@ -962,6 +994,8 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         bound_entry_warnings(&mut entry_warnings);
         entries.push(ChtEntry {
             index,
+            original_description: draft.original_description,
+            original_code: draft.original_code,
             description: draft.description,
             code: draft.code,
             enabled_by_default: draft
