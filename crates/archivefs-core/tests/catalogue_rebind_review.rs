@@ -235,6 +235,27 @@ fn explicit_reviewed_rebind_succeeds_and_permits_a_later_scan_only() {
 }
 
 #[test]
+fn rebinding_a_never_bound_source_never_revalidates_old_coverage() {
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    f.scan();
+    assert_eq!(f.health(0).state, SourceHealthState::Healthy);
+    // The binding row is gone but coverage recorded for generation 1 remains.
+    f.sql()
+        .execute("DELETE FROM source_scan_bindings", [])
+        .unwrap();
+    f.make_historical();
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    assert_eq!(review.generation, 0);
+    f.db.confirm_source_rebind(&review).unwrap();
+    // A fresh generation, not generation 1 again: the old proof does not count.
+    assert_eq!(f.health(0).generation, 2);
+    assert_eq!(f.health(0).state, SourceHealthState::NeedsScan);
+    f.scan();
+    assert_eq!(f.health(0).state, SourceHealthState::Healthy);
+}
+
+#[test]
 fn rebind_changes_no_archive_identity_observation_or_missing_evidence() {
     let mut f = Fixture::new(&["games", "other"]);
     f.add(0, "a/game.zip");

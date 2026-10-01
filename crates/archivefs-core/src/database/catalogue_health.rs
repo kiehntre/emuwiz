@@ -677,8 +677,13 @@ impl Database {
         let new_json = serde_json::to_string(&review.current)
             .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
         let changed = match (&existing, review.generation) {
+            // The first generation starts above any generation coverage was ever
+            // recorded for, so a binding that went missing can never make old
+            // coverage look current again. (Normally this is exactly 1.)
             (None, 0) if review.recorded.is_none() => tx.execute(
-                "INSERT INTO source_scan_bindings(source_folder_id,root_identity_json,generation) VALUES(?1,?2,1)",
+                "INSERT INTO source_scan_bindings(source_folder_id,root_identity_json,generation) \
+                 VALUES(?1,?2,1+COALESCE((SELECT MAX(source_generation) FROM scan_source_coverage \
+                 WHERE source_folder_id=?1),0))",
                 params![review.source_id, new_json],
             ),
             (Some((json, generation)), reviewed)

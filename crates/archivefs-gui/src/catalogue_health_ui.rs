@@ -1004,6 +1004,71 @@ mod tests {
         assert!(dialog.confirmable().is_none());
     }
 
+    /// The whole path a person takes, against a private temp library: a
+    /// migrated legacy source is blocked, the snapshot says so, the reviewed
+    /// rebind (the exact core calls the Sources action makes) unblocks it
+    /// without marking anything missing, and only a later scan reads healthy.
+    #[test]
+    fn snapshot_health_follows_the_reviewed_rebind_and_never_reads_healthy_early() {
+        use archivefs_core::{Database, add_source_folder_at, scan_source_folder_at};
+
+        let temp = tempfile::tempdir().unwrap();
+        let (config, database, folder) = (
+            temp.path().join("config.toml"),
+            temp.path().join("library.sqlite3"),
+            temp.path().join("games"),
+        );
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("game.zip"), b"game").unwrap();
+        Database::open_or_create(&database).unwrap();
+        add_source_folder_at(&config, &database, &folder).unwrap();
+        scan_source_folder_at(&config, &database, &folder, "setup").unwrap();
+        // Make it look migrated from before storage continuity was recorded.
+        let sql = rusqlite::Connection::open(&database).unwrap();
+        sql.execute("DELETE FROM source_scan_bindings", []).unwrap();
+        sql.execute(
+            "UPDATE source_folders SET last_successful_scan_at='legacy'",
+            [],
+        )
+        .unwrap();
+
+        let rows_for = |label: &str| {
+            let db = Database::open_or_create(&database).unwrap();
+            let snapshot = crate::database_load::load_snapshot_from(&db, &database, &config)
+                .unwrap_or_else(|_| panic!("snapshot load failed ({label})"));
+            let rows = project_rows(&snapshot.source_views, &snapshot.source_health);
+            assert_eq!(rows.len(), 1, "{label}");
+            rows
+        };
+
+        let blocked = rows_for("legacy");
+        let words = wording(blocked[0].health.as_ref());
+        assert!(words.needs_review, "a migrated source must offer review");
+        assert!(!Overall::from_rows(&blocked).all_clear());
+
+        let review = archivefs_core::review_source_rebind_at(&database, &folder).unwrap();
+        archivefs_core::rebind_source_after_review_at(&database, &review).unwrap();
+        let after_rebind = rows_for("rebound");
+        let health = after_rebind[0].health.as_ref().unwrap();
+        assert_eq!(health.state, SourceHealthState::NeedsScan);
+        assert!(
+            !Overall::from_rows(&after_rebind).all_clear(),
+            "rebinding alone must not read as healthy"
+        );
+        let missing: i64 = sql
+            .query_row(
+                "SELECT COUNT(*) FROM archives WHERE last_verified_missing_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, 0, "rebinding marks nothing missing");
+
+        scan_source_folder_at(&config, &database, &folder, "after-review").unwrap();
+        let healthy = rows_for("scanned");
+        assert!(Overall::from_rows(&healthy).all_clear());
+    }
+
     #[test]
     fn device_numbers_read_as_major_minor() {
         assert_eq!(device_label(0x0811), "8:17");
