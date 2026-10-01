@@ -69,6 +69,8 @@ pub mod amiberry_command;
 pub mod amiberry_execution;
 pub mod amiga_whdload_command;
 pub mod amiga_whdload_execution;
+#[cfg(target_os = "linux")]
+pub mod atari800;
 pub mod azahar_command;
 pub mod azahar_execution;
 pub mod cemu_command;

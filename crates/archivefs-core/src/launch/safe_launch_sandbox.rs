@@ -1074,7 +1074,9 @@ impl PreparedSandbox {
         }
     }
 
-    fn environment(&self) -> Vec<(OsString, OsString)> {
+    /// The per-child environment `spawn` applies. Exposed to the crate so
+    /// real-emulator smoke tests can replay exactly what a launch would see.
+    pub(crate) fn environment(&self) -> Vec<(OsString, OsString)> {
         if !matches!(
             self.plan.declaration.config_isolation,
             ConfigIsolation::XdgEnvironment | ConfigIsolation::Combined { .. }
