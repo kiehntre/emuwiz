@@ -107,10 +107,52 @@ autosave to the image's own path. A scratch copy of the whole installation would
 required to isolate any of it.
 
 ## Tests performed
-Shared sandbox 31, native support 7 (policy, hash binding, discovery, registry),
-Atari800 30 (including a real-emulator test), Caprice32 21 (including a real-emulator
-test), b-em 8, NP2kai 7, Oricutron 7. Real-emulator tests skip when the emulator or a
-headless video driver is unavailable.
+Shared sandbox 36, native support 11 (policy, hash binding, merged-/usr paths,
+discovery, registry, preview-only guards), Atari800 32 (including a real-emulator
+test), Caprice32 22 (including a real-emulator test), b-em 8, NP2kai 7, Oricutron 7:
+123 new tests. Real-emulator tests skip when the emulator or a headless video driver
+is unavailable.
+
+## Final focused safety review (rebased onto `e128180e`)
+
+The rebase was mechanical: all 18 files byte-identical to the reviewed tip, no overlap
+with main's intervening changes. Changes made by the review:
+
+- **`NativePreview::scratch_plan()` removed; `bound_sources()` added.** Handing a
+  `SandboxPlan` to generic code would let it `prepare` and `spawn` a preview-only adapter
+  with a hand-built argv. Only the hash-bound provenance is exposed now. A guard test scans
+  b-em, NP2kai and Oricutron for any launch token, and fails (verified) if one is added;
+  a second guard asserts planning, platform_map, readiness and integration do not name the
+  native modules.
+- **Sandbox attack tests** (after `prepare`, before `spawn`): same-size scratch edit,
+  scratch config edit, scratch media replaced by a symlink to the source, source edited,
+  source removed, ownership marker removed, marker rewritten for another transaction. All
+  refuse before the child starts; owned workspaces are cleaned, and workspaces whose
+  ownership cannot be proven are left in place. Look-alike, unmarked and symlinked
+  directories in the root are never deleted by the startup sweep. The child holds the
+  workspace lease while it runs, a startup sweep leaves it alone, cleanup happens once
+  after exit, concurrent children clean only their own workspace, the parent environment
+  is not mutated, and a hostile source name never reaches argv or a shell.
+- **Atari800 / Caprice32:** a missing, unreadable, symlinked or edited scratch config
+  refuses before spawn (both emulators fall back to a user/system config otherwise, so a
+  planted live config is checked to be untouched); changed, removed or symlinked firmware
+  refuses.
+- **Merged-/usr paths:** `/bin -> usr/bin` style parents stay usable and hash-bound; a
+  leaf symlink inside a symlinked parent is still refused; this host's `/bin/sh`
+  (a symlink to dash) is refused as a leaf while `/bin/dash` is accepted.
+- **Real-emulator evidence through the adapters' own prepared commands** (per-process
+  `strace`): Atari800 opened the scratch config and ROM read-only and the scratch ATR
+  read-write, and nothing else write-capable; Caprice32 opened the scratch config, its
+  install ROM and the scratch DSK, all read-only, with no write-capable open or mutation.
+  Both processes also connect to the user's D-Bus sockets (SDL); that is IPC, not file
+  writes, and not something this sandbox isolates.
+- A real-emulator assertion that counted entries in the live HOME was removed: it failed
+  intermittently because other activity changes that directory. It now checks the specific
+  files Caprice32 would create (`~/.cap32.cfg`, `~/.config/cap32.cfg`).
+- **`launch::topology::...one_hundred_thousand_projections...`** (a 10 s wall-clock budget
+  for 100k projections, 2.7 s alone) exceeds its budget on BOTH pristine main and the
+  candidate under the same heavy load (`topology.rs` and `media_set` are unchanged); it is
+  a pre-existing, load-sensitive test.
 
 ## Remaining gaps
 - b-em, NP2kai, Oricutron need an installed binary and a scratch-installation (or

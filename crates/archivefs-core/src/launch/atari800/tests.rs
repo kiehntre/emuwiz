@@ -744,3 +744,54 @@ fn real_atari800_reads_scratch_media_and_config_and_writes_nothing_outside_the_w
     drop(prepared);
     assert!(!workspace.exists());
 }
+
+#[test]
+fn a_missing_unreadable_or_replaced_scratch_config_refuses_before_spawn() {
+    // Atari800 falls back to ~/.atari800.cfg and then /etc/atari800.cfg when its
+    // -config file is absent, so a missing scratch config must never reach it.
+    for attack in ["removed", "unreadable", "symlink", "edited"] {
+        let f = Fixture::new(Atari800MediaFormat::Atr);
+        f.script("touch ran");
+        let prepared = f.prepare();
+        let scratch = prepared.workspace_path().join("config/atari800.cfg");
+        assert!(scratch.is_file());
+        match attack {
+            "removed" => fs::remove_file(&scratch).unwrap(),
+            "unreadable" => fs::set_permissions(&scratch, fs::Permissions::from_mode(0)).unwrap(),
+            "symlink" => {
+                fs::remove_file(&scratch).unwrap();
+                symlink(&f.profile.isolated_seed, &scratch).unwrap();
+            }
+            _ => fs::write(&scratch, "HD_READ_ONLY=0\n").unwrap(),
+        }
+        let workspace = prepared.workspace_path().to_owned();
+        assert!(prepared.spawn(&f.profile, &f.media).is_err(), "{attack}");
+        assert!(!workspace.join("ran").exists(), "{attack}");
+        assert_eq!(
+            fs::read_to_string(&f.profile.isolated_seed).unwrap(),
+            isolated_config_seed(Atari800Machine::Atari800Xl, false)
+        );
+    }
+}
+
+#[test]
+fn changed_removed_or_symlinked_firmware_refuses_before_spawn() {
+    for change in 0..3 {
+        let f = Fixture::new(Atari800MediaFormat::Atr);
+        f.script("touch ran");
+        let prepared = f.prepare();
+        let workspace = prepared.workspace_path().to_owned();
+        match change {
+            0 => fs::write(&f.profile.os.path, vec![0x77; 16384]).unwrap(),
+            1 => fs::remove_file(&f.profile.os.path).unwrap(),
+            _ => {
+                let other = f.temp.path().join("other.rom");
+                fs::write(&other, vec![0x31; 16384]).unwrap();
+                fs::remove_file(&f.profile.os.path).unwrap();
+                symlink(&other, &f.profile.os.path).unwrap();
+            }
+        }
+        assert!(prepared.spawn(&f.profile, &f.media).is_err(), "{change}");
+        assert!(!workspace.join("ran").exists(), "{change}");
+    }
+}

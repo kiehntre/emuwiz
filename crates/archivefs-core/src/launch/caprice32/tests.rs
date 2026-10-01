@@ -530,16 +530,22 @@ fn real_caprice32_reads_scratch_media_and_the_explicit_config_and_writes_nothing
     f.profile.executable = executable.clone();
     let user_cfg = home.join(".cap32.cfg");
     let user_cfg_existed = user_cfg.exists();
-    let install_before = {
-        let dir = executable.parent().unwrap();
-        let mut names: Vec<_> = std::fs::read_dir(dir)
+    let snapshot = |dir: &Path| {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .filter_map(Result::ok)
-            .map(|e| e.file_name())
+            .map(|e| {
+                let meta = e.metadata().unwrap();
+                (e.file_name(), meta.len(), meta.modified().unwrap())
+            })
             .collect();
-        names.sort();
-        names
+        entries.sort();
+        (entries, std::fs::metadata(dir).unwrap().modified().unwrap())
     };
+    let install_before = snapshot(executable.parent().unwrap());
+    // The only HOME locations Caprice32 would create (see getConfigurationFilename).
+    let home_files = [home.join(".cap32.cfg"), home.join(".config/cap32.cfg")];
+    let home_existed: Vec<_> = home_files.iter().map(|p| p.exists()).collect();
     let plan = plan_caprice32(&f.profile, &f.media).unwrap();
     let prepared = plan.prepare(&f.manager, &f.profile, &f.media).unwrap();
     let workspace = prepared.workspace_path().to_owned();
@@ -575,20 +581,59 @@ fn real_caprice32_reads_scratch_media_and_the_explicit_config_and_writes_nothing
         "{stdout}"
     );
     assert_eq!(user_cfg.exists(), user_cfg_existed, "user config created");
-    let install_after = {
-        let dir = executable.parent().unwrap();
-        let mut names: Vec<_> = std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|e| e.file_name())
-            .collect();
-        names.sort();
-        names
-    };
-    assert_eq!(
-        install_before, install_after,
-        "files appeared in the install dir"
-    );
+    let install_after = snapshot(executable.parent().unwrap());
+    assert_eq!(install_before, install_after, "the install dir was written");
+    for (path, existed) in home_files.iter().zip(home_existed) {
+        assert_eq!(path.exists(), existed, "{} was created", path.display());
+    }
     drop(prepared);
     assert!(!workspace.exists());
+}
+
+#[test]
+fn a_missing_unreadable_or_replaced_scratch_config_refuses_before_spawn_and_never_falls_back() {
+    use std::os::unix::fs::PermissionsExt;
+    // Caprice32 falls back to <exe dir>/cap32.cfg when --cfg_file is unreadable;
+    // plant that live config so a fallback would be observable.
+    for attack in [
+        "removed",
+        "unreadable",
+        "symlink to the live config",
+        "edited",
+    ] {
+        let f = Fixture::new(Caprice32MediaFormat::Dsk);
+        let live = f.profile.executable.parent().unwrap().join("cap32.cfg");
+        std::fs::write(&live, "[system]\nmodel=3\n").unwrap();
+        // If the emulator did start it would leave this marker in its workspace.
+        std::fs::write(&f.profile.executable, "#!/bin/sh\ntouch ran\n").unwrap();
+        let prepared = f.prepare();
+        let scratch = prepared.workspace_path().join("config/caprice32.cfg");
+        assert!(scratch.is_file());
+        match attack {
+            "removed" => std::fs::remove_file(&scratch).unwrap(),
+            "unreadable" => {
+                std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0)).unwrap()
+            }
+            "symlink to the live config" => {
+                std::fs::remove_file(&scratch).unwrap();
+                symlink(&live, &scratch).unwrap();
+            }
+            _ => std::fs::write(&scratch, "[system]\nmodel=3\n").unwrap(),
+        }
+        let workspace = prepared.workspace_path().to_owned();
+        assert!(
+            matches!(
+                prepared.spawn(&f.profile, &f.media),
+                Err(Caprice32Error::Sandbox(_))
+            ),
+            "{attack}"
+        );
+        // Nothing ran, so nothing could have read the live config, and the
+        // live config itself is untouched.
+        assert!(!workspace.join("ran").exists());
+        assert_eq!(
+            std::fs::read_to_string(&live).unwrap(),
+            "[system]\nmodel=3\n"
+        );
+    }
 }

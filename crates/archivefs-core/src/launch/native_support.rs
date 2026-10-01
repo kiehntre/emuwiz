@@ -308,9 +308,12 @@ impl NativePreview {
     pub fn unproven(&self) -> &'static [&'static str] {
         self.unproven
     }
-    /// The hash-bound scratch plan that a future, proven launch would copy.
-    pub fn scratch_plan(&self) -> &SandboxPlan {
-        &self.scratch
+    /// The hash-bound sources a future, proven launch would copy. Only the
+    /// provenance is exposed, never the `SandboxPlan`: handing a plan out would
+    /// let generic code `prepare` and `spawn` it with a hand-built argv, which
+    /// is exactly the launch path a preview-only adapter must not offer.
+    pub fn bound_sources(&self) -> impl Iterator<Item = &SourceProvenance> {
+        self.scratch.sources()
     }
     pub fn executable(&self) -> &Path {
         &self.executable
@@ -585,6 +588,51 @@ exit 1 # changed
     }
 
     #[test]
+    fn merged_usr_style_paths_stay_usable_and_hash_bound() {
+        // Built layout: <root>/usr/bin/emu with <root>/bin -> usr/bin and
+        // <root>/lib64 chains of symlinked parents.
+        let dir = tempfile::tempdir().unwrap();
+        let usr_bin = dir.path().join("usr/bin");
+        fs::create_dir_all(&usr_bin).unwrap();
+        make_executable(&usr_bin.join("emu"));
+        symlink("usr/bin", dir.path().join("bin")).unwrap();
+        symlink("bin", dir.path().join("sbin")).unwrap();
+        for path in [
+            dir.path().join("usr/bin/emu"),
+            dir.path().join("bin/emu"),
+            dir.path().join("sbin/emu"),
+        ] {
+            let binding = ExecutableBinding::capture(&path).unwrap();
+            assert!(binding.sha256.is_some());
+            assert!(binding.is_unchanged(&path));
+        }
+        // The same file reached through different parents has one identity.
+        assert_eq!(
+            executable_identity(&dir.path().join("bin/emu")).unwrap(),
+            executable_identity(&dir.path().join("usr/bin/emu")).unwrap()
+        );
+        // A leaf symlink inside a symlinked parent is still refused.
+        symlink(usr_bin.join("emu"), usr_bin.join("alias")).unwrap();
+        assert!(executable_identity(&dir.path().join("bin/alias")).is_err());
+    }
+
+    #[test]
+    fn this_hosts_real_merged_usr_binaries_are_accepted_when_bin_is_a_symlink() {
+        if !fs::symlink_metadata("/bin").is_ok_and(|m| m.file_type().is_symlink()) {
+            return;
+        }
+        let binding = ExecutableBinding::capture(Path::new("/bin/sh"));
+        // /bin/sh is itself a symlink on Debian/Ubuntu (-> dash): the leaf
+        // policy refuses it, while the real target through /bin is accepted.
+        if fs::symlink_metadata("/bin/sh").is_ok_and(|m| m.file_type().is_symlink()) {
+            assert!(binding.is_err());
+            assert!(ExecutableBinding::capture(Path::new("/bin/dash")).is_ok());
+        } else {
+            assert!(binding.is_ok());
+        }
+    }
+
+    #[test]
     fn a_symlinked_parent_directory_is_accepted_like_the_existing_policy() {
         // /bin -> usr/bin on merged-usr systems: the launched file is regular.
         let dir = tempfile::tempdir().unwrap();
@@ -654,5 +702,71 @@ exit 1 # changed
                 .executables
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod preview_only_guard {
+    /// The three preview-only adapters must have no production route to a
+    /// launch. This scans their source (everything before `#[cfg(test)]`) for
+    /// any identifier that builds argv, prepares scratch copies, or starts a
+    /// process, so adding one is a deliberate, reviewed change to this test.
+    #[test]
+    fn b_em_np2kai_and_oricutron_contain_no_launch_capability() {
+        for (name, source) in [
+            ("b_em", include_str!("b_em.rs")),
+            ("np2kai", include_str!("np2kai.rs")),
+            ("oricutron", include_str!("oricutron.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            for token in [
+                "prepare(",
+                "spawn",
+                "PreparedProcessCommand",
+                "PreparedSandbox",
+                "SandboxManager",
+                "SandboxedProcess",
+                "std::process",
+                "Command::new",
+                "working_directory",
+                "config_arguments",
+                "arguments",
+                "SandboxPlan",
+            ] {
+                // Doc comments may name what is absent; code may not use it.
+                let code: String = production
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!code.contains(token), "{name} uses {token}");
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_outside_the_launch_module_names_the_native_adapters() {
+        // No generic routing, GUI or planner references these modules yet; the
+        // read-only registry is the only intended consumer.
+        for (name, source) in [
+            ("planning", include_str!("planning.rs")),
+            ("platform_map", include_str!("platform_map.rs")),
+            ("readiness", include_str!("readiness.rs")),
+            ("integration", include_str!("integration.rs")),
+        ] {
+            for module in [
+                "atari800",
+                "caprice32",
+                "b_em",
+                "np2kai",
+                "oricutron",
+                "native_support",
+            ] {
+                assert!(
+                    !source.contains(&format!("{module}::")),
+                    "{name} routes to {module}"
+                );
+            }
+        }
     }
 }

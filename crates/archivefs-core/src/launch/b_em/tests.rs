@@ -101,7 +101,7 @@ fn ssd_dsd_and_uef_validate_with_spaces_and_unicode_paths() {
     for format in [BEmMediaFormat::Ssd, BEmMediaFormat::Uef] {
         let f = Fixture::new(format);
         let preview = preview_b_em(&f.profile, &f.media).unwrap();
-        assert_eq!(preview.scratch_plan().sources().count(), 1);
+        assert_eq!(preview.bound_sources().count(), 1);
         assert_eq!(preview.platform_id(), "BBC Micro");
     }
 }

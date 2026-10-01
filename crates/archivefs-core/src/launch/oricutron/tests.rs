@@ -147,7 +147,7 @@ fn classification_is_preview_only_and_names_the_exe_directory_finding() {
 fn tap_and_the_reviewed_dsk_subset_validate_with_spaces_and_unicode() {
     for f in [Fixture::tap(), Fixture::dsk()] {
         let preview = preview_oricutron(&f.profile, &f.media).unwrap();
-        assert_eq!(preview.scratch_plan().sources().count(), 1);
+        assert_eq!(preview.bound_sources().count(), 1);
     }
     assert_eq!(Fixture::tap().media.format(), OricMediaFormat::Tap);
     assert_eq!(Fixture::dsk().media.format(), OricMediaFormat::Dsk);

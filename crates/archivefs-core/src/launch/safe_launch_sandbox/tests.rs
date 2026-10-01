@@ -860,3 +860,250 @@ fn a_config_that_names_an_original_path_is_refused_before_spawn() {
     };
     assert!(prepared.spawn(command).is_err());
 }
+
+// ---- Final review: attacks after preparation, ownership and child lifetime ----
+
+fn spawn_command(f: &Fixture, prepared: &PreparedSandbox, body: &str) -> PreparedProcessCommand {
+    PreparedProcessCommand {
+        executable: f.executable(body),
+        arguments: vec![prepared.mappings()[0].scratch_path.clone().into_os_string()],
+        working_directory: None,
+    }
+}
+
+#[test]
+fn every_attack_after_preparation_refuses_spawn_and_only_owned_workspaces_are_removed() {
+    use std::os::unix::fs::OpenOptionsExt;
+    for attack in [
+        "scratch media edited at the same size",
+        "scratch config edited",
+        "scratch media replaced by a symlink to the source",
+        "source edited",
+        "source removed",
+        "ownership marker removed",
+        "ownership marker rewritten for another transaction",
+    ] {
+        let f = Fixture::new();
+        let (plan, _rom) = referenced_plan(&f, "rom = 'media/secondary-01'\n");
+        let source_bytes = host_fs::read(&f.source).unwrap();
+        let prepared = f.manager.prepare(&plan).unwrap();
+        let workspace = prepared.workspace_path().to_owned();
+        let media = prepared.mappings()[0].scratch_path.clone();
+        let config = prepared
+            .mappings()
+            .iter()
+            .find(|m| m.role == MediaRole::Config)
+            .unwrap()
+            .scratch_path
+            .clone();
+        let owned = !attack.starts_with("ownership marker");
+        match attack {
+            "scratch media edited at the same size" => {
+                let mut bytes = host_fs::read(&media).unwrap();
+                bytes[0] ^= 1;
+                host_fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(0)
+                    .open(&media)
+                    .unwrap();
+                host_fs::write(&media, bytes).unwrap();
+            }
+            "scratch config edited" => {
+                let mut text = host_fs::read(&config).unwrap();
+                text.extend(b"; appended\n");
+                host_fs::write(&config, text).unwrap();
+            }
+            "scratch media replaced by a symlink to the source" => {
+                host_fs::remove_file(&media).unwrap();
+                symlink(&f.source, &media).unwrap();
+            }
+            "source edited" => host_fs::write(&f.source, b"edited after prepare").unwrap(),
+            "source removed" => host_fs::remove_file(&f.source).unwrap(),
+            "ownership marker removed" => {
+                host_fs::remove_file(workspace.join(MARKER)).unwrap();
+            }
+            _ => {
+                let marker = host_fs::read_to_string(workspace.join(MARKER)).unwrap();
+                let id = workspace.file_name().unwrap().to_str().unwrap();
+                host_fs::write(
+                    workspace.join(MARKER),
+                    marker.replace(id, "1-0123456789abcdef"),
+                )
+                .unwrap();
+            }
+        }
+        let command = spawn_command(&f, &prepared, "touch \"$PWD/ran\"");
+        assert!(prepared.spawn(command).is_err(), "{attack}");
+        // The child never started.
+        assert!(!workspace.join("ran").exists(), "{attack}");
+        if owned {
+            assert!(!workspace.exists(), "owned workspace not cleaned: {attack}");
+        } else {
+            // Ownership could not be proven, so nothing was deleted.
+            assert!(
+                workspace.exists(),
+                "removed a workspace it could not prove it owned: {attack}"
+            );
+        }
+        // The user's source is never written, and never deleted through a link.
+        if attack == "scratch media replaced by a symlink to the source" {
+            assert_eq!(host_fs::read(&f.source).unwrap(), source_bytes);
+        }
+    }
+}
+
+#[test]
+fn directories_the_manager_does_not_own_are_never_deleted() {
+    let f = Fixture::new();
+    let root = f.manager.root().to_owned();
+    // Looks like a transaction id but has no ownership marker.
+    let lookalike = root.join("1-0123456789abcdef");
+    host_fs::create_dir(&lookalike).unwrap();
+    host_fs::set_permissions(&lookalike, host_fs::Permissions::from_mode(0o700)).unwrap();
+    host_fs::write(lookalike.join("user-file"), b"precious").unwrap();
+    let stranger = root.join("not-a-transaction");
+    host_fs::create_dir(&stranger).unwrap();
+    host_fs::write(stranger.join("user-file"), b"precious").unwrap();
+    let outside = f.temp.path().join("outside-victim");
+    host_fs::create_dir(&outside).unwrap();
+    host_fs::write(outside.join("user-file"), b"precious").unwrap();
+    symlink(&outside, root.join("2-0123456789abcdef")).unwrap();
+    let report = f.manager.startup_cleanup();
+    assert!(report.removed.is_empty(), "{report:?}");
+    for kept in [&lookalike, &stranger, &outside] {
+        assert_eq!(host_fs::read(kept.join("user-file")).unwrap(), b"precious");
+    }
+}
+
+#[test]
+fn the_workspace_and_its_lease_outlive_the_parent_handle_until_the_child_exits_once() {
+    let f = Fixture::new();
+    let plan = f.plan();
+    let prepared = f.manager.prepare(&plan).unwrap();
+    let workspace = prepared.workspace_path().to_owned();
+    let command = spawn_command(&f, &prepared, "sleep 1.2");
+    let mut process = prepared.spawn(command).unwrap();
+    // `prepared` is consumed; only the watcher owns the workspace now.
+    assert!(workspace.exists());
+    assert_eq!(process.cleanup_outcome(), CleanupOutcome::Running);
+    // The child holds the lease: nobody else can take it, and a startup sweep
+    // leaves the live workspace alone.
+    let lease = fs::child(
+        &fs::directory(&f.manager.inner.directory, workspace.file_name().unwrap()).unwrap(),
+        OsStr::new(LEASE),
+        libc::O_RDWR,
+    )
+    .unwrap();
+    assert!(
+        fs::lock(&lease).is_err(),
+        "lease must be held while the child runs"
+    );
+    drop(lease);
+    assert!(f.manager.startup_cleanup().removed.is_empty());
+    assert!(workspace.exists());
+    assert!(
+        wait(&mut process.process)
+            .status
+            .as_ref()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process.cleanup_outcome() == CleanupOutcome::Running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(process.cleanup_outcome(), CleanupOutcome::Removed);
+    assert!(!workspace.exists());
+    // Exactly once: nothing further to remove, and the outcome is stable.
+    assert!(f.manager.startup_cleanup().removed.is_empty());
+    assert_eq!(process.cleanup_outcome(), CleanupOutcome::Removed);
+}
+
+#[test]
+fn concurrent_children_each_clean_up_only_their_own_workspace() {
+    let f = Fixture::new();
+    let plan = f.plan();
+    let slow = f.manager.prepare(&plan).unwrap();
+    let fast = f.manager.prepare(&plan).unwrap();
+    let slow_dir = slow.workspace_path().to_owned();
+    let fast_dir = fast.workspace_path().to_owned();
+    assert_ne!(slow_dir, fast_dir);
+    let slow_command = PreparedProcessCommand {
+        executable: {
+            let path = f.temp.path().join("slow-emulator");
+            host_fs::write(&path, "#!/bin/sh\nsleep 1.5\n").unwrap();
+            host_fs::set_permissions(&path, host_fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        },
+        arguments: vec![slow.mappings()[0].scratch_path.clone().into_os_string()],
+        working_directory: None,
+    };
+    let fast_command = spawn_command(&f, &fast, "exit 0");
+    let mut slow_process = slow.spawn(slow_command).unwrap();
+    let mut fast_process = fast.spawn(fast_command).unwrap();
+    wait(&mut fast_process.process);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fast_process.cleanup_outcome() == CleanupOutcome::Running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(fast_process.cleanup_outcome(), CleanupOutcome::Removed);
+    assert!(!fast_dir.exists());
+    // The other child's workspace is untouched while it still runs.
+    assert!(slow_dir.exists());
+    assert_eq!(slow_process.cleanup_outcome(), CleanupOutcome::Running);
+    wait(&mut slow_process.process);
+}
+
+#[test]
+fn spawn_environment_is_applied_to_the_child_only_and_no_shell_interprets_argv() {
+    let f = Fixture::new();
+    let keys = [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "TMPDIR",
+    ];
+    let before: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
+    let cwd_before = std::env::current_dir().unwrap();
+    let plan = f.plan();
+    let prepared = f.manager.prepare(&plan).unwrap();
+    let workspace = prepared.workspace_path().to_owned();
+    // The executable echoes HOME and its first argument, quoted.
+    let command = spawn_command(&f, &prepared, "printf '%s|%s' \"$HOME\" \"$1\" >&2");
+    let mut process = prepared.spawn(command).unwrap();
+    let report = wait(&mut process.process);
+    let stderr = String::from_utf8_lossy(&report.stderr).into_owned();
+    // HOME is the workspace root (rendered with a trailing slash).
+    let home = stderr
+        .split('|')
+        .next()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_owned();
+    assert_eq!(home, workspace.display().to_string(), "{stderr}");
+    let after: Vec<_> = keys.iter().map(|k| std::env::var_os(k)).collect();
+    assert_eq!(before, after, "parent environment mutated");
+    assert_eq!(std::env::current_dir().unwrap(), cwd_before);
+    // A metacharacter-laden argument is one literal token, never run.
+    let hostile = f.temp.path().join("$(touch pwned);`touch pwned2`;x");
+    host_fs::write(&hostile, b"entirely synthetic disk bytes").unwrap();
+    let member = MediaMember {
+        source: hostile,
+        role: MediaRole::PrimaryMedia,
+        kind: MediaKind::Floppy,
+        suffix: "d88".into(),
+    };
+    let plan = plan_sandbox(declaration(), &[member], ProfileSeed::Empty).unwrap();
+    let prepared = f.manager.prepare(&plan).unwrap();
+    // The scratch name is generated; the hostile source name is never in argv.
+    let command = spawn_command(&f, &prepared, "exit 0");
+    assert!(!command.arguments[0].to_string_lossy().contains("pwned"));
+    let mut process = prepared.spawn(command).unwrap();
+    wait(&mut process.process);
+    assert!(!f.temp.path().join("pwned").exists());
+    assert!(!f.temp.path().join("pwned2").exists());
+}
