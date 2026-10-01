@@ -551,8 +551,9 @@ impl ArchiveFsApp {
                 if matches!(action, SourceAction::Rebind { .. })
                     && let Some(dialog) = self.sources_ui.sources_rebind_dialog.as_mut()
                 {
-                    dialog.stage =
-                        crate::catalogue_health_ui::RebindStage::Refused(message.clone());
+                    dialog.stage = crate::catalogue_health_ui::RebindStage::Refused(
+                        crate::catalogue_health_ui::rebind_refusal_text(&message),
+                    );
                 }
                 if gamer_add_failed {
                     // A failed add must never leave a stale pending path that

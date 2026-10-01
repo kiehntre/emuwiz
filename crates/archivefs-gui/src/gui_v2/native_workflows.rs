@@ -770,15 +770,15 @@ impl NativeWorkflows {
                 health_action = full.or(health_action.take());
             }
             ui.add_space(8.0);
-            egui::ScrollArea::vertical()
-                .id_salt("v2_native_sources")
-                .show(ui, |ui| {
-                    for source in &source_state.sources {
-                        ui.push_id(&source.path, |ui| {
-                            self.show_native_source_card(ui, source, &archives, busy, &mut action);
-                        });
-                    }
-                });
+            // The page itself scrolls. A nested scroll area here collapsed to a
+            // sliver once provider setup and the health section took the page.
+            ui.vertical(|ui| {
+                for source in &source_state.sources {
+                    ui.push_id(&source.path, |ui| {
+                        self.show_native_source_card(ui, source, &archives, busy, &mut action);
+                    });
+                }
+            });
         }
         self.app.apply_health_action(ui.ctx(), health_action);
         action

@@ -381,7 +381,7 @@ impl SourcesRebindDialogState {
                 review: Box::new(review),
                 acknowledged: false,
             },
-            Err(message) => RebindStage::Refused(message),
+            Err(message) => RebindStage::Refused(rebind_refusal_text(&message)),
         };
         true
     }
@@ -406,6 +406,21 @@ pub(crate) enum DialogAction {
 }
 
 /// `major:minor` of a Linux `dev_t`, as `ls -l /dev` shows it.
+/// What a person reads when a review or commit is refused. The backend's
+/// "changed since it was reviewed" refusal is turned into plain language and
+/// the internal "database error:" prefix never reaches the screen.
+pub(crate) fn rebind_refusal_text(message: &str) -> String {
+    if message.contains(archivefs_core::catalogue_health::REBIND_REVIEW_AGAIN) {
+        return "The folder changed after you reviewed it, so nothing was recorded. Review it \
+                again to continue."
+            .to_string();
+    }
+    message
+        .strip_prefix("database error: ")
+        .unwrap_or(message)
+        .to_string()
+}
+
 pub(crate) fn device_label(device: u64) -> String {
     let major = ((device >> 8) & 0xfff) | ((device >> 32) & !0xfff);
     let minor = (device & 0xff) | ((device >> 12) & !0xff);
@@ -1193,6 +1208,24 @@ mod tests {
         scan_source_folder_at(&config, &database, &folder, "after-review").unwrap();
         let healthy = rows_for("scanned");
         assert!(Overall::from_rows(&healthy).all_clear());
+    }
+
+    #[test]
+    fn refusals_are_plain_language_without_internal_prefixes() {
+        let stale = format!(
+            "database error: {}",
+            archivefs_core::catalogue_health::REBIND_REVIEW_AGAIN
+        );
+        let shown = rebind_refusal_text(&stale);
+        assert!(shown.contains("changed after you reviewed it"));
+        assert!(shown.contains("nothing was recorded"));
+        assert!(!shown.contains("database error"));
+        assert_eq!(
+            rebind_refusal_text(
+                "database error: the source folder cannot be reached right now; reconnect it and try again"
+            ),
+            "the source folder cannot be reached right now; reconnect it and try again"
+        );
     }
 
     #[test]
