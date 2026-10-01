@@ -135,15 +135,35 @@ or stale ownership records fail closed on later runs; late partial failures rema
 possible. Errors state `destination changed during installation`, refuse further
 publication, and explicitly warn that earlier assets may remain unrecorded.
 
-Close native EmuWiz processes before changed-byte upgrades: Linux refuses writes
-to running executable inodes with `ETXTBSY`. Such failures preserve the old bytes
-and manifest; upgrading after the process exits works. Changed-byte updates to
+Native EmuWiz processes must be closed before changed-byte upgrades: Linux refuses
+writes to running executable inodes with `ETXTBSY`. The installer finds this out
+**before publishing anything**. For each EmuWiz-owned native binary whose incoming
+bytes differ, it opens the already-verified inode (through the pinned parent
+directory, `O_NOFOLLOW`, identity and digest rechecked) for non-truncating write
+access and closes it again. That is the very operation the in-place update needs,
+the kernel refuses it with `ETXTBSY` exactly while the inode is executing, and it
+changes no byte and no inode field. Process names, `pgrep` and PIDs are not used.
+Both binaries are checked before the first publication, so a running GUI cannot
+leave the CLI published but unrecorded. The installer then stops with "EmuWiz is
+currently running and needs to be closed before it can be updated", the manifest
+and every asset untouched, and a plain re-run after closing EmuWiz succeeds
+without `--replace-foreign`. A binary whose bytes are unchanged is never probed,
+so reinstalling the same release while EmuWiz runs still works. A process started
+in the short window after the preflight gets the same plain message from the
+publication step, but earlier files may already have been published; installation
+remains nontransactional. Changed-byte updates to
 hardlinked owned files also refuse, preserving neighbouring links. Existing
 cooperating installer/uninstaller locking remains unchanged. As with the manifest
 repair, this lock does not prevent another same-user process from editing held
 inodes or creating hardlinks; it is not a general isolation boundary against that
 user. Pathname substitutions cannot make these publication operations overwrite
 their replacement objects.
+
+Known limitations deliberately left as they are (recorded, not addressed here):
+the installer is not transactional and late-failure messages stay generic;
+trailing data after the manifest `end` line; uninstall reads by pathname;
+staging temporaries can be left behind by an interrupted run; the Python 3
+dependency; filesystems without hardlink support; and installer performance.
 
 References: [Linux link/linkat documentation](https://man7.org/linux/man-pages/man2/link.2.html),
 [Linux open/openat documentation](https://man7.org/linux/man-pages/man2/open.2.html),

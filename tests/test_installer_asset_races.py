@@ -190,25 +190,6 @@ class AssetRaceTests(unittest.TestCase):
                 self.assertEqual((c.data / f"icons/hicolor/{size}x{size}/apps/io.github.kiehntre.emuwiz.png").read_bytes(),
                                  (c.bundle / f"assets/branding/emuwiz-logo-{size}.png").read_bytes())
 
-    def test_running_native_binary_update_fails_closed(self):
-        c = self.case
-        ownership.shutil.copyfile(ownership.shutil.which("cat"), c.bundle / "bin/emuwiz-cli")
-        c.installed()
-        running = subprocess.Popen([str(c.bin / "emuwiz-cli")], stdin=subprocess.PIPE,
-                                   stdout=subprocess.DEVNULL)
-        try:
-            result = c.run_install()
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Text file busy", result.stderr)
-            self.assertEqual((c.bin / "emuwiz-cli").read_bytes(), c.original_cli)
-            self.assertEqual(c.manifest.read_bytes(), c.original_manifest)
-            running.communicate(timeout=30)  # EOF, no timing-based race
-            self.assertEqual(c.run_install().returncode, 0)
-        finally:
-            if running.poll() is None:
-                running.kill()
-            running.communicate()
-
     def test_owned_open_does_not_follow_a_last_window_symlink(self):
         c = self.case
         c.installed()
@@ -505,6 +486,326 @@ class AssetHelperTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.publish()
         self.assertFalse((self.parent / "destination").exists())
+
+    # --- preflight(): busy detection bound to the verified inode --------------
+
+    def owned_binary(self, content=b"old bytes\n", mode=0o644):
+        path = self.parent / "destination"
+        path.write_bytes(content)
+        path.chmod(mode)  # before the snapshot: chmod changes mode and ctime
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            digest = self.helper["fingerprint"](fd)
+        finally:
+            os.close(fd)
+        return path, self.helper["snapshot"]("destination"), digest
+
+    def preflight(self, expected, digest):
+        self.helper["preflight"](str(self.staged), "destination", expected, digest,
+                                 str(self.parent), str(self.parent))
+
+    def test_direct_preflight_accepts_an_idle_owned_binary_without_touching_it(self):
+        path, expected, digest = self.owned_binary()
+        before = path.stat()
+        self.preflight(expected, digest)
+        after = path.stat()
+        self.assertEqual(path.read_bytes(), b"old bytes\n")
+        for field in ("st_ino", "st_mode", "st_size", "st_nlink", "st_mtime_ns", "st_ctime_ns"):
+            self.assertEqual(getattr(before, field), getattr(after, field), field)
+
+    def test_direct_preflight_reports_the_executing_inode_as_busy_and_leaves_it_alone(self):
+        path, expected, digest = self.owned_binary(Path(ownership.shutil.which("cat")).read_bytes(), 0o755)
+        running = subprocess.Popen([str(path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        try:
+            before = path.stat()
+            with self.assertRaises(self.helper["Busy"]):
+                self.preflight(expected, digest)
+            after = path.stat()
+            # Verifying the digest reads the file (atime may move, as with the
+            # installer's own gate); nothing the write probe could change does.
+            for field in ("st_ino", "st_mode", "st_size", "st_nlink", "st_mtime_ns", "st_ctime_ns"):
+                self.assertEqual(getattr(before, field), getattr(after, field), field)
+            self.assertEqual(path.read_bytes(), Path(ownership.shutil.which("cat")).read_bytes())
+            self.assertEqual(self.helper["snapshot"]("destination"), expected)
+            running.communicate(timeout=30)
+            self.preflight(expected, digest)  # the same call succeeds once it exits
+        finally:
+            if running.poll() is None:
+                running.kill()
+            running.communicate()
+
+    def test_direct_preflight_does_not_follow_or_accept_a_replaced_pathname(self):
+        path, expected, digest = self.owned_binary()
+        replacement = self.parent / "replacement"
+        replacement.write_bytes(path.read_bytes())  # identical bytes, different inode
+        os.replace(replacement, path)
+        with self.assertRaisesRegex(RuntimeError, "changed"):
+            self.preflight(expected, digest)
+        path.unlink()
+        path.symlink_to(self.staged)
+        with self.assertRaises(OSError):  # O_NOFOLLOW: never opens the link target
+            self.preflight(expected, digest)
+
+    def test_direct_preflight_skips_the_write_probe_when_bytes_are_identical(self):
+        path, expected, digest = self.owned_binary(self.staged.read_bytes())
+        real_open = os.open
+        flags = []
+
+        def recording_open(name, flag, *args, **kwargs):
+            flags.append(flag)
+            return real_open(name, flag, *args, **kwargs)
+
+        with mock.patch.object(self.helper["os"], "open", recording_open):
+            self.preflight(expected, digest)
+        self.assertTrue(flags)
+        self.assertFalse([flag for flag in flags if flag & os.O_ACCMODE == os.O_WRONLY])
+
+
+class RunningBinaryTests(unittest.TestCase):
+    """Upgrading while EmuWiz is running: refuse first, publish nothing."""
+
+    HUMAN = ("currently running", "Close EmuWiz and try again")
+
+    def setUp(self):
+        self.case = ownership.OwnershipTests()
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        self.processes = []
+        self.addCleanup(self.stop_everything)
+        c = self.case
+        self.elf = Path(ownership.shutil.which("cat")).read_bytes()
+        for name in ("emuwiz", "emuwiz-cli"):
+            (c.bundle / "bin" / name).write_bytes(self.elf)
+            (c.bundle / "bin" / name).chmod(0o755)
+        result = c.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.installed_state = self.tree_state()
+        self.installed_manifest = c.manifest.read_bytes()
+
+    def stop_everything(self):
+        for process in self.processes:
+            if process.poll() is None:
+                process.stdin.close()
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+    def start(self, name, directory=None):
+        """A real executing copy of the installed ELF. Popen returns after exec."""
+        path = (directory or self.case.bin) / name
+        process = subprocess.Popen([str(path)], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        self.processes.append(process)
+        return process
+
+    def close(self, process):
+        process.stdin.close()
+        process.wait(timeout=30)  # EOF, never a sleep
+
+    def tree_state(self):
+        """Every entry, staging dot-files and the bookkeeping directory included."""
+        c = self.case
+        state = {}
+        for base in (c.bin, c.data / "applications", c.data / "icons", c.directory):
+            for path in sorted([base, *base.rglob("*")]):
+                st = path.lstat()
+                content = os.readlink(path) if path.is_symlink() else (
+                    path.read_bytes() if path.is_file() else None)
+                state[str(path)] = (st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, content)
+        return state
+
+    def release(self, cli=True, gui=True, everything=True):
+        """Stage a new release. By default every managed file changes."""
+        c = self.case
+        for name, changed in (("emuwiz-cli", cli), ("emuwiz", gui)):
+            (c.bundle / "bin" / name).write_bytes(self.elf + (b"\0release-2" if changed else b""))
+        if everything:
+            template = c.bundle / "assets/linux/io.github.kiehntre.emuwiz.desktop.in"
+            template.write_text(template.read_text() + "# release 2\n")
+            for size in (32, 64, 128, 256, 512):
+                icon = c.bundle / f"assets/branding/emuwiz-logo-{size}.png"
+                icon.write_bytes(icon.read_bytes() + b"release 2")
+
+    def assert_refused_untouched(self, result, named):
+        c = self.case
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        for phrase in self.HUMAN:
+            self.assertIn(phrase, result.stderr)
+        self.assertIn(f"{c.bin}/{named} is being executed", result.stderr)
+        for cryptic in ("Text file busy", "Errno", "/proc/self/fd", "destination changed"):
+            self.assertNotIn(cryptic, result.stderr)
+        self.assertEqual(c.manifest.read_bytes(), self.installed_manifest)  # byte-identical
+        # Nothing published, no staged leftover, no new inode anywhere.
+        self.assertEqual(self.tree_state(), self.installed_state)
+
+    # 1-3: refuse before ANY publication -----------------------------------
+
+    def test_gui_running_with_changed_bytes_publishes_nothing(self):
+        self.release()
+        self.start("emuwiz")
+        self.assert_refused_untouched(self.case.run_install(), "emuwiz")
+
+    def test_cli_running_with_changed_bytes_publishes_nothing(self):
+        self.release()
+        self.start("emuwiz-cli")
+        self.assert_refused_untouched(self.case.run_install(), "emuwiz-cli")
+
+    def test_both_running_with_changed_bytes_publishes_nothing(self):
+        self.release()
+        self.start("emuwiz")
+        self.start("emuwiz-cli")
+        self.assert_refused_untouched(self.case.run_install(), "emuwiz-cli")
+
+    def test_running_gui_cannot_leave_an_idle_changed_cli_published(self):
+        # The reported failure: CLI idle and changed, GUI running and changed.
+        # The CLI is published first, so the preflight has to stop it.
+        self.release()
+        self.start("emuwiz")
+        result = self.case.run_install()
+        self.assert_refused_untouched(result, "emuwiz")
+        self.assertEqual((self.case.bin / "emuwiz-cli").read_bytes(), self.elf)
+
+    # 4-5: no unnecessary refusal -------------------------------------------
+
+    def test_running_binary_with_identical_bytes_is_not_refused(self):
+        c = self.case
+        self.release(cli=False, gui=False, everything=False)
+        self.start("emuwiz")
+        self.start("emuwiz-cli")
+        inodes = {name: (c.bin / name).stat().st_ino for name in ("emuwiz", "emuwiz-cli")}
+        result = c.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(inodes, {name: (c.bin / name).stat().st_ino for name in inodes})
+        self.assertEqual((c.bin / "emuwiz").read_bytes(), self.elf)
+
+    def test_running_unchanged_gui_does_not_block_an_idle_changed_cli(self):
+        c = self.case
+        self.release(cli=True, gui=False, everything=False)
+        self.start("emuwiz")
+        result = c.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((c.bin / "emuwiz-cli").read_bytes(), self.elf + b"\0release-2")
+        self.assertEqual((c.bin / "emuwiz").read_bytes(), self.elf)
+
+    def test_idle_owned_binaries_with_changed_bytes_upgrade(self):
+        c = self.case
+        self.release()
+        result = c.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("emuwiz", "emuwiz-cli"):
+            self.assertEqual((c.bin / name).read_bytes(), self.elf + b"\0release-2")
+        self.assertNotEqual(c.manifest.read_bytes(), self.installed_manifest)
+
+    # 6-7: bound to the verified object ------------------------------------
+
+    def test_an_unrelated_running_copy_does_not_make_an_idle_binary_busy(self):
+        # Same bytes, same name, different inode: busy-ness is per inode, not
+        # per name, content or process.
+        c = self.case
+        elsewhere = c.root / "elsewhere"
+        elsewhere.mkdir()
+        for name in ("emuwiz", "emuwiz-cli"):
+            (elsewhere / name).write_bytes(self.elf)
+            (elsewhere / name).chmod(0o755)
+            self.start(name, elsewhere)
+        self.release()
+        result = c.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((c.bin / "emuwiz").read_bytes(), self.elf + b"\0release-2")
+
+    def test_pathname_replacement_between_gate_and_preflight_is_refused_not_misread(self):
+        c = self.case
+        self.release()
+        running = self.start("emuwiz")  # the verified inode is executing...
+        path = c.bin / "emuwiz"
+        # ...and the name is swapped for an idle foreign file just before the
+        # preflight opens it: that file must neither be inspected as the owned
+        # object nor written.
+        script = c.script.read_text()
+        anchor = "    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=7)\n    held = os.fstat(fd)\n    if not stat.S_ISREG(held.st_mode) or identity(held) != expected:\n        raise RuntimeError(\"destination changed during installation\")\n    if fingerprint(fd) != digest:"
+        self.assertEqual(script.count(anchor), 1)
+        mutation = (f"    if name == 'emuwiz':\n        os.unlink({str(path)!r})\n"
+                    f"        open({str(path)!r}, 'wb').write({FOREIGN!r})\n")
+        c.script.write_text(script.replace(anchor, mutation + anchor))
+        result = c.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("destination changed during installation", result.stderr)
+        self.assertNotIn("currently running", result.stderr)
+        self.assertEqual(path.read_bytes(), FOREIGN)
+        self.assertEqual(c.manifest.read_bytes(), self.installed_manifest)
+        self.assertIsNone(running.poll())
+
+    # 8-9: existing protections unchanged ----------------------------------
+
+    def test_user_hardlink_still_refuses_changed_bytes(self):
+        c = self.case
+        neighbour = c.bin / "hardlinked-neighbour"
+        os.link(c.bin / "emuwiz-cli", neighbour)
+        self.release(gui=False, everything=False)
+        result = c.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("hardlinks", result.stderr)
+        self.assertEqual(neighbour.read_bytes(), self.elf)
+        self.assertEqual(c.manifest.read_bytes(), self.installed_manifest)
+
+    def test_foreign_destination_is_still_never_overwritten(self):
+        c = self.case
+        self.release()
+        (c.bin / "emuwiz").unlink()
+        (c.bin / "emuwiz").write_bytes(FOREIGN)
+        result = c.run_install()
+        self.assertEqual((c.bin / "emuwiz").read_bytes(), FOREIGN)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("currently running", result.stderr)
+
+    # 12: retry after closing -----------------------------------------------
+
+    def test_retry_after_closing_succeeds_without_replace_foreign(self):
+        c = self.case
+        self.release()
+        gui = self.start("emuwiz")
+        cli = self.start("emuwiz-cli")
+        self.assert_refused_untouched(c.run_install(), "emuwiz-cli")
+        self.close(cli)
+        self.assert_refused_untouched(c.run_install(), "emuwiz")  # GUI still open
+        self.close(gui)
+        result = c.run_install()  # plain retry: no --replace-foreign
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("emuwiz", "emuwiz-cli"):
+            self.assertEqual((c.bin / name).read_bytes(), self.elf + b"\0release-2")
+        self.assertIn(b"record_count 11\n", c.manifest.read_bytes())
+        self.assertEqual(list(c.bin.glob(".emuwiz-foreign-backup.*")), [])
+
+    # A start after the preflight keeps a readable message ------------------
+
+    def test_a_process_started_after_the_preflight_gets_the_same_plain_message(self):
+        c = self.case
+        self.release()
+        pidfile, fifo = c.root / "late.pid", c.root / "late.fifo"
+        os.mkfifo(fifo)
+        c.hook("    asset_record=$(asset_io publish",
+               'if [ "$2" = bin-emuwiz ]; then\n'
+               f"exec 3<>{shlex.quote(str(fifo))}\n"
+               '"$bin_dir/emuwiz" <&3 3<&- >/dev/null 2>&1 7<&- 8<&- 9<&- &\n'
+               f"echo $! > {shlex.quote(str(pidfile))}\n"
+               'until [ "$(readlink /proc/$!/exe 2>/dev/null)" = "$bin_dir/emuwiz" ]; do sleep 0.01; done\n'
+               "fi")
+        try:
+            result = c.run_install()
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), 9)
+                except ProcessLookupError:
+                    pass
+        self.assertNotEqual(result.returncode, 0)
+        for phrase in self.HUMAN:
+            self.assertIn(phrase, result.stderr)
+        self.assertIn("run the installer again", result.stderr)
+        for cryptic in ("Text file busy", "Errno", "/proc/self/fd"):
+            self.assertNotIn(cryptic, result.stderr)
+        self.assertEqual(c.manifest.read_bytes(), self.installed_manifest)
 
 
 if __name__ == "__main__":

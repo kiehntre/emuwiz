@@ -16,7 +16,8 @@
 # filesystem. Missing support fails closed; there is no overwrite fallback.
 # Close native EmuWiz processes before upgrading: owned regular files update
 # through held descriptors, non-atomically, just like the ownership manifest.
-# Running executables (ETXTBSY) and hardlinked files refuse changed-byte updates.
+# Hardlinked files refuse changed-byte updates. A running EmuWiz is detected before
+# anything is published (see preflight_binary_slot) and asks the user to close it.
 #
 # OWNERSHIP TRACKING
 #
@@ -928,6 +929,7 @@ preflight_install_manifest() {
 # Keep the helper embedded so old and current bundle layouts remain self-contained.
 asset_io() {
     python3 - "$@" <<'EMUWIZ_ASSET_PY'
+import errno
 import hashlib
 import os
 import shutil
@@ -967,6 +969,23 @@ def check_parent(parent, location):
         os.close(fd)
 
 
+class Busy(Exception):
+    """The owned inode is being executed, so it cannot accept an in-place update."""
+
+
+def open_for_update(fd, name, location):
+    # Opening the verified inode for write (no O_TRUNC/O_CREAT, no write) is the
+    # exact operation the in-place update needs, and the kernel refuses it with
+    # ETXTBSY precisely while the inode is executing. It changes no byte and no
+    # inode field. The path comes from our own descriptor, never the name.
+    try:
+        return os.open(f"/proc/self/fd/{fd}", os.O_WRONLY)
+    except OSError as error:
+        if error.errno == errno.ETXTBSY:
+            raise Busy(f"{location}/{name} is being executed") from error
+        raise
+
+
 def fingerprint(fd):
     digest = hashlib.sha256()
     with os.fdopen(os.dup(fd), "rb") as stream:
@@ -999,6 +1018,30 @@ def inspect(name, parent, location):
         raise RuntimeError("destination changed during installation")
     check_parent(parent, location)
     print(expected, digest)
+
+
+def preflight(source, name, expected, digest, parent, location):
+    """Fail early if a changed, owned binary cannot be updated in place.
+
+    Binds to the same object publish() will update: the name is opened through
+    the pinned parent with O_NOFOLLOW, then its identity and digest must still
+    match what the gate verified. Identical bytes need no update, so a running
+    binary is fine. Nothing is written.
+    """
+    check_parent(parent, location)
+    with open(source, "rb") as incoming:
+        new_digest = fingerprint(incoming.fileno())
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=7)
+    held = os.fstat(fd)
+    if not stat.S_ISREG(held.st_mode) or identity(held) != expected:
+        raise RuntimeError("destination changed during installation")
+    if fingerprint(fd) != digest:
+        raise RuntimeError("destination changed during installation (content)")
+    if digest != new_digest:
+        os.close(open_for_update(fd, name, location))
+    if snapshot(name) != expected or identity(os.fstat(fd)) != expected:
+        raise RuntimeError("destination changed during installation")
+    check_parent(parent, location)
 
 
 def link_held(fd, name):
@@ -1051,7 +1094,7 @@ def publish(kind, slot, source, name, expected, gate, digest, parent, location):
                 # over a name. Fail closed for hardlinks and running executables.
                 if held.st_nlink != 1:
                     raise RuntimeError("owned destination has hardlinks; refusing an in-place update")
-                output = os.open(f"/proc/self/fd/{fd}", os.O_WRONLY)
+                output = open_for_update(fd, name, location)
                 check_parent(parent, location)
                 if snapshot(name) != expected or identity(os.fstat(fd)) != expected:
                     raise RuntimeError("destination changed during installation")
@@ -1081,6 +1124,8 @@ def main():
         raise RuntimeError("Python descriptor-relative filesystem support is required")
     if sys.argv[1] == "inspect":
         inspect(*sys.argv[2:])
+    elif sys.argv[1] == "preflight":
+        preflight(*sys.argv[2:])
     else:
         publish(*sys.argv[2:])
 
@@ -1088,6 +1133,14 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except Busy as error:
+        # Not an error in the installer: EmuWiz is simply open. The preflight
+        # runs before anything is published, so nothing has changed.
+        where = "before anything was installed" if sys.argv[1] == "preflight" else \
+            "after other files were already published; run the installer again"
+        print("install.sh: EmuWiz is currently running and needs to be closed before it can be "
+              f"updated. Close EmuWiz and try again. ({error}; stopped {where})", file=sys.stderr)
+        sys.exit(1)
     except (OSError, RuntimeError) as error:
         print(f"install.sh: destination changed during installation or safe publication unavailable: {error}; "
               "refusing further publication; assets already published may remain unrecorded", file=sys.stderr)
@@ -1365,6 +1418,27 @@ bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install
 # compared with a prior manifest; no managed file has been touched yet.
 command -v python3 >/dev/null 2>&1 || fail "python3 is required for safe Linux asset publication"
 preflight_install_manifest
+
+# preflight_binary_slot SLOT SRC DEST - refuses, before anything is published,
+# when an EmuWiz-owned binary whose bytes would change cannot be updated in place
+# because it is running. Foreign or absent destinations need no in-place update.
+preflight_binary_slot() {
+    slot=$1
+    src=$2
+    dest=$3
+    assert_manifest_binding
+    prepare_asset "$dest"
+    if [ "$(gate_binary "$slot" "$asset_bound")" = owned ]; then
+        asset_io preflight "$src" "$asset_name" "$asset_state" "$asset_digest" \
+            "$asset_parent" "$asset_location" || exit 1
+    fi
+    exec 7<&-
+}
+
+# Every changed owned binary is checked before the first publication, so a
+# running GUI cannot leave the CLI published but unrecorded.
+preflight_binary_slot bin-emuwiz-cli "$src_cli" "$bin_dir/emuwiz-cli"
+preflight_binary_slot bin-emuwiz "$src_gui" "$bin_dir/emuwiz"
 
 manifest_records_tmp=$(mktemp -- "/proc/self/fd/8/.manifest-records.XXXXXX") ||
     fail "could not create a temporary file for the install manifest"
