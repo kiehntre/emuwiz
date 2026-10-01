@@ -19,7 +19,7 @@ fn isolated_home(name: &str) -> PathBuf {
 }
 
 fn run_cli(home: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_archivefs-cli"))
+    Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
         .args(args)
         .env("HOME", home)
         .env_remove("USERPROFILE")

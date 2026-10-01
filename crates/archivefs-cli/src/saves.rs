@@ -42,6 +42,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut verbose = false;
     let mut emulator = None;
     let mut state_type = None;
+    let mut inspect_id = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => json = true,
@@ -51,9 +52,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             other if other.starts_with("--emulator=") => emulator = Some(other[11..].to_string()),
             other if other.starts_with("--type=") => state_type = Some(other[7..].to_string()),
             other if subcommand == "inspect" && !other.starts_with('-') => {
-                if emulator.is_none() {
-                    emulator = Some(other.to_string());
-                }
+                inspect_id = Some(other.to_string());
             }
             other => return Err(format!("unknown saves argument {other:?}").into()),
         }
@@ -66,7 +65,7 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
     let report = inventory_configured_state();
     let summary = summarize(&report, emulator.as_deref(), state_type.as_deref());
-    let records = report
+    let mut records = report
         .inventory
         .records
         .iter()
@@ -77,6 +76,15 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             record,
         })
         .collect::<Vec<_>>();
+    if subcommand == "inspect" {
+        let id = inspect_id
+            .as_deref()
+            .ok_or("saves inspect requires a record id")?;
+        records.retain(|record| record.id == id);
+        if records.is_empty() {
+            return Err(format!("save/state record {id:?} was not found").into());
+        }
+    }
     if json {
         println!(
             "{}",
@@ -88,17 +96,8 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             })?
         );
     } else if subcommand == "inspect" {
-        let Some(id) = emulator else {
-            return Err("saves inspect requires a record id".into());
-        };
-        let (index, record) = report
-            .inventory
-            .records
-            .iter()
-            .enumerate()
-            .find(|(index, record)| record_id(*index, record) == id)
-            .ok_or_else(|| format!("save/state record {id:?} was not found"))?;
-        print_record(&record_id(index, record), record, true);
+        let item = &records[0];
+        print_record(&item.id, item.record, true);
     } else if subcommand == "summary" {
         print_summary(&summary);
     } else {

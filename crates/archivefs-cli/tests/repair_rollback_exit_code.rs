@@ -15,7 +15,7 @@ const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 const SHA1_XYZ: &str = "66b27417d37e024c46526c2f6d358a754fc552f3";
 
 fn run_cli(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_archivefs-cli"))
+    Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
         .args(args)
         .output()
         .expect("the CLI must run")
