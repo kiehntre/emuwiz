@@ -1,5 +1,7 @@
 # Cheat record provenance and source evidence
 
+> **Consolidated:** this document describes one input to the integrated cheat model. Where it names a type that was later unified (for example `CheatPackApplicability`, `CheatPackRelationship`, `CheatPackAssociation`, `PokeIdentityState`, or the launch stand-in `CheatApplicabilityState`), see [`CHEAT_CONSOLIDATION.md`](CHEAT_CONSOLIDATION.md) for the current canonical type.
+
 This candidate starts at `4c980d184584dd5f1a22b5fbbf67e6c58ff204c1`.
 
 ## Audit

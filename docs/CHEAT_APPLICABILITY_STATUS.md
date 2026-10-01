@@ -1,5 +1,7 @@
 # Cheat applicability and status
 
+> **Consolidated:** the seam described below as needing reconciliation is now reconciled; see [`cheats/CHEAT_CONSOLIDATION.md`](cheats/CHEAT_CONSOLIDATION.md).
+
 Starting commit: `4c980d184584dd5f1a22b5fbbf67e6c58ff204c1`.
 Branch: `feature/cheat-applicability-status`.
 Worktree: `/home/davedap/emuwiz-cheat-applicability-status`.

@@ -1,5 +1,7 @@
 # Classic microcomputer POKE cheat family
 
+> **Consolidated:** `PokeIdentityState` and the static emulator table described below were superseded by `CheatApplicabilityMatch` and the runtime capability model; see [`../cheats/CHEAT_CONSOLIDATION.md`](../cheats/CHEAT_CONSOLIDATION.md).
+
 This feature adds a neutral, read-only normalization model. It does not write
 emulated memory, modify media, execute BASIC, execute trainer scripts, or
 bundle a newly researched database.

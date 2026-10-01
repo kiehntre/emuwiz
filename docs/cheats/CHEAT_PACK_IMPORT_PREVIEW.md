@@ -1,5 +1,7 @@
 # Local cheat-pack preview and dry-run planning (Batch 6)
 
+> **Consolidated:** this document describes one input to the integrated cheat model. Where it names a type that was later unified (for example `CheatPackApplicability`, `CheatPackRelationship`, `CheatPackAssociation`, `PokeIdentityState`, or the launch stand-in `CheatApplicabilityState`), see [`CHEAT_CONSOLIDATION.md`](CHEAT_CONSOLIDATION.md) for the current canonical type.
+
 Base: `a5e604e7456c183c9835ac6a3081a981b91a2c03`, verified equal to
 `origin/main` after fetch. Tracked main was clean; existing untracked research
 files in its worktree were left alone. Branch `feature/cheat-pack-import-preview`,
