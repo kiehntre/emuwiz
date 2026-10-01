@@ -190,17 +190,15 @@ config_file="$config_dir/config.toml"
 # only "does the CURRENT installed content match the LAST thing we
 # ourselves recorded" is the right question.
 #
-# The manifest is rewritten from scratch, in full, only after every asset
-# this run actually installed has succeeded, via the same mktemp-then-mv
-# atomic pattern already used for the desktop entry and icons - and it is
-# written into the SAME directory it replaces, so the rename is a single
-# same-filesystem operation, never a cross-directory or cross-filesystem
-# copy. A run that fails partway through therefore never writes a manifest
-# claiming ownership of anything it did not finish installing; whatever it
-# did manage to write before failing is picked up correctly on the next
-# (successful) run by the very same rules above - including, for a binary
-# that got copied but not recorded, being treated as foreign and requiring
-# --replace-foreign, exactly like any other unrecorded binary.
+# Publication remains nontransactional; no asset rollback is attempted. Each
+# managed publication rechecks the bookkeeping binding. New metadata is linked
+# into an absent name without clobbering; existing metadata is written through
+# its validated descriptor (not a rename over a possibly replaced pathname).
+# Descriptor writes are not atomic: interrupted writes may leave a truncated
+# owned manifest, which fails closed on the next run. An external late change
+# stops further publication; assets already published may remain unrecorded.
+# The directory lock serializes cooperating installers and uninstallers. It
+# does not prohibit another same-user process from editing these writable paths.
 #
 # MANIFEST-DIRECTORY SAFETY: $data_home itself - wherever XDG_DATA_HOME
 # resolves to, symlinked or not - is trusted exactly as much as it already
@@ -218,21 +216,22 @@ config_file="$config_dir/config.toml"
 # trustworthily record ownership of anything this run installs);
 # uninstall, which never creates anything, simply treats it exactly like
 # "no manifest" and never touches that path. Symmetrically, the manifest
-# FILE itself is only ever replaced once it has been validated as belonging
-# to this installation - which in practice means it loaded successfully
-# under load_manifest's own parser rules earlier in the same run, or did
-# not exist at all. A pre-existing path there that did NOT load - a
+# FILE itself is only ever written through its validated descriptor, or
+# created without clobbering if absent. Its identity/content and the bookkeeping
+# directory binding are checked before each managed publication. A pre-existing
+# path there that did NOT load - a
 # symlink, a directory, or simply a regular file whose content is not one
 # of our own manifests - is treated exactly like any other foreign
 # collision in this script: left untouched with a warning by default
-# (asset installs this run still proceed and are simply not recorded until
-# that is resolved), or moved aside into a fresh backup - never silently
+# (the install is refused before any managed asset is published), or moved
+# aside into a fresh backup - never silently
 # written through or over - with --replace-foreign.
 # --------------------------------------------------------------------------
 manifest_schema_version=2
 manifest_dir="$data_home/emuwiz-installer"
 manifest_file="$manifest_dir/manifest"
 manifest_loaded=0
+manifest_input=""
 replace_foreign=0
 
 usage() {
@@ -253,7 +252,8 @@ Options:
                       directory next to it and install in its place. The
                       exact backup location is printed. Without this flag
                       such a path is left untouched and a warning is
-                      printed; the rest of the install still proceeds.
+                      printed; a foreign ownership manifest refuses the
+                      install before any managed file is published.
   --uninstall         Remove EmuWiz binaries, its desktop entry and application
                       icons - but only the ones still provably EmuWiz-owned.
                       A path that was replaced by something else since it was
@@ -329,10 +329,9 @@ manifest_dir_state() {
 }
 manifest_dir_kind=$(manifest_dir_state)
 
-# ensure_manifest_dir - called only from the install path, only after
-# load_manifest has already captured whatever the PRE-run state was. Creates
+# ensure_manifest_dir - called only from install preflight. Creates
 # the bookkeeping directory fresh (mode 0700) if nothing occupies that name
-# yet; tightens permissions on an existing real directory; refuses outright
+# yet; refuses outright
 # (fails the whole install - there is nowhere left it could trustworthily
 # record anything) if something unsafe occupies that name. Deliberately
 # plain mkdir, never mkdir -p: -p treats a name that already resolves to
@@ -341,7 +340,7 @@ manifest_dir_kind=$(manifest_dir_state)
 ensure_manifest_dir() {
     case "$manifest_dir_kind" in
         dir)
-            chmod 0700 -- "$manifest_dir" 2>/dev/null || true
+            : # Tighten permissions only after opening and binding the directory.
             ;;
         absent)
             # $data_home itself is the same pre-existing, already-trusted
@@ -508,6 +507,9 @@ load_manifest() {
     [ "$manifest_dir_kind" = dir ] || return 0
     [ -f "$manifest_file" ] || return 0
     [ ! -L "$manifest_file" ] || return 0
+    # Shell read can discard NUL bytes. Reject them before parsing text records.
+    LC_ALL=C tr -d '\000' <"${manifest_input:-$manifest_file}" \
+        | cmp -s - "${manifest_input:-$manifest_file}" || return 0
 
     manifest_version=""
     manifest_saved_bin_dir=""
@@ -521,7 +523,10 @@ load_manifest() {
     records_seen=0
     parse_ok=1
 
-    while [ "$parse_ok" -eq 1 ] && IFS=' ' read -r key rest; do
+    while [ "$parse_ok" -eq 1 ] && { IFS= read -r manifest_line || [ -n "$manifest_line" ]; }; do
+        IFS=' ' read -r key rest <<EOF
+$manifest_line
+EOF
         # Nothing may follow "end" - not a record, not a header field, and
         # not a comment either. This guard runs before any dispatch at all,
         # so it applies uniformly to every line shape, not just the ones
@@ -555,6 +560,7 @@ load_manifest() {
                 fi
                 ;;
             end)
+                [ -z "$rest" ] || parse_ok=0
                 seen_end=1
                 ;;
             bin-emuwiz-cli|bin-emuwiz|desktop|icon-32|icon-64|icon-128|icon-256|icon-512)
@@ -583,7 +589,7 @@ EOF
                 parse_ok=0
                 ;;
         esac
-    done <"$manifest_file"
+    done <"${manifest_input:-$manifest_file}"
 
     [ "$parse_ok" -eq 1 ] || return 0
     [ "$seen_schema" -eq 1 ] || return 0
@@ -829,6 +835,90 @@ resolve_foreign_collision() {
     return 0
 }
 
+# Linux descriptor paths keep reads/writes on the opened object even if its
+# pathname is replaced. flock serializes cooperating install/uninstall runs;
+# identity + digest checks also detect external replacements and in-place edits.
+lock_manifest_dir() {
+    command -v flock >/dev/null 2>&1 || fail "flock is required for safe installer bookkeeping"
+    exec 8<"$manifest_dir"
+    flock -n 8 || fail "another installer operation holds the bookkeeping lock: $manifest_dir"
+    binding_dir=$(stat -Lc '%d:%i:%f' -- /proc/self/fd/8) || fail "cannot identify bookkeeping directory"
+    binding_parent=$(stat -Lc '%d:%i:%f' -- "$data_home") || fail "cannot identify data directory"
+    binding_location=$(CDPATH= cd -- "$manifest_dir" && pwd -P) || fail "cannot resolve bookkeeping directory"
+    check_manifest_dir_binding
+}
+
+check_manifest_dir_binding() {
+    [ "$(path_kind "$manifest_dir")" = dir ] \
+        && [ "$(stat -c '%d:%i:%f' -- "$manifest_dir" 2>/dev/null)" = "$binding_dir" ] \
+        && [ "$(stat -Lc '%d:%i:%f' -- "$data_home" 2>/dev/null)" = "$binding_parent" ] \
+        && [ "$(CDPATH= cd -- "$manifest_dir" 2>/dev/null && pwd -P)" = "$binding_location" ] \
+        || fail "installer bookkeeping location changed; refusing further publication: $manifest_dir; assets already published may remain unrecorded"
+}
+
+# Include ctime/mtime and size as well as device/inode/type. A digest binds the
+# content used by the parser; the descriptor binds the object used by the writer.
+manifest_object_state() {
+    stat -c '%d:%i:%f:%s:%y:%z' -- "$manifest_file" 2>/dev/null
+}
+manifest_descriptor_state() {
+    stat -Lc '%d:%i:%f:%s:%y:%z' -- /proc/self/fd/9 2>/dev/null
+}
+
+assert_manifest_binding() {
+    check_manifest_dir_binding
+    if [ "$binding_manifest" = absent ]; then
+        [ "$(path_kind "$manifest_file")" = absent ] ||
+            fail "ownership manifest appeared after inspection; refusing further publication: $manifest_file; assets already published may remain unrecorded"
+    else
+        [ "$(manifest_object_state)" = "$binding_manifest" ] ||
+            fail "ownership manifest object changed; refusing further publication: $manifest_file; assets already published may remain unrecorded"
+        if [ -n "$binding_digest" ]; then
+            [ "$(manifest_descriptor_state)" = "$binding_manifest" ] \
+                && [ "$(file_digest /proc/self/fd/9)" = "$binding_digest" ] ||
+                fail "ownership manifest content changed; refusing further publication: $manifest_file; assets already published may remain unrecorded"
+        fi
+    fi
+}
+
+preflight_install_manifest() {
+    # Refresh the early path inspection before using the bookkeeping directory.
+    manifest_dir_kind=$(manifest_dir_state)
+    ensure_manifest_dir
+    lock_manifest_dir
+    chmod 0700 /proc/self/fd/8 2>/dev/null || true
+    binding_dir=$(stat -Lc '%d:%i:%f' -- /proc/self/fd/8) || fail "cannot identify bookkeeping directory"
+    check_manifest_dir_binding
+    binding_manifest=absent
+    binding_digest=""
+    manifest_input=""
+    manifest_loaded=0
+    if [ -e "$manifest_file" ] || [ -L "$manifest_file" ]; then
+        binding_manifest=$(manifest_object_state) || fail "cannot identify ownership manifest"
+        if [ -f "$manifest_file" ] && [ ! -L "$manifest_file" ] && [ -r "$manifest_file" ]; then
+            exec 9<"$manifest_file"
+            [ "$(manifest_descriptor_state)" = "$binding_manifest" ] ||
+                fail "ownership manifest changed while opening it"
+            binding_digest=$(file_digest /proc/self/fd/9) || fail "cannot fingerprint ownership manifest"
+            manifest_input=/proc/self/fd/9
+            load_manifest
+        fi
+        assert_manifest_binding
+        if [ "$manifest_loaded" -ne 1 ]; then
+            if [ "$replace_foreign" -eq 1 ]; then
+                backup_foreign_path "$manifest_file"
+                warn "moved an unrecognised path at the ownership manifest location aside before installing: $manifest_file -> $BACKUP_PATH"
+                exec 9<&-
+                binding_manifest=absent
+                binding_digest=""
+            else
+                fail "ownership manifest exists but is not provably EmuWiz-owned: $manifest_file - refusing to install managed files; re-run with --replace-foreign to move it aside"
+            fi
+        fi
+    fi
+    assert_manifest_binding
+}
+
 # record_slot SLOT KIND PATH - appends a manifest record line for SLOT to
 # $manifest_records_tmp, fingerprinting PATH fresh right now. Only ever
 # called immediately after (re)installing PATH, so the recorded digest
@@ -953,6 +1043,8 @@ if [ "$do_uninstall" -eq 1 ]; then
         bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
     fi
 
+    manifest_dir_kind=$(manifest_dir_state)
+    if [ "$manifest_dir_kind" = dir ]; then lock_manifest_dir; fi
     load_manifest
 
     removed_any=0
@@ -1081,10 +1173,12 @@ done
 mkdir -p -- "$bin_dir"
 bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install prefix: $bin_dir"
 
-load_manifest
+# This must happen before copying or publishing any managed destination.  The
+# prefix directory itself may be created above so its canonical path can be
+# compared with a prior manifest; no managed file has been touched yet.
+preflight_install_manifest
 
-ensure_manifest_dir
-manifest_records_tmp=$(mktemp -- "$manifest_dir/.manifest-records.XXXXXX") ||
+manifest_records_tmp=$(mktemp -- "/proc/self/fd/8/.manifest-records.XXXXXX") ||
     fail "could not create a temporary file for the install manifest"
 
 skipped_any=0
@@ -1096,12 +1190,17 @@ install_binary_slot() {
     slot=$1
     src=$2
     dest=$3
+    assert_manifest_binding
     gate=$(gate_binary "$slot" "$dest")
     if [ "$gate" = foreign ]; then
         resolve_foreign_collision "$dest" || return 0
     fi
-    cp -f -- "$src" "$dest"
-    chmod +x -- "$dest"
+    assert_manifest_binding
+    binary_tmp=$(mktemp -- "$bin_dir/.emuwiz-binary.XXXXXX") || fail "could not stage binary"
+    cp -- "$src" "$binary_tmp"
+    chmod +x -- "$binary_tmp"
+    assert_manifest_binding
+    mv -f -- "$binary_tmp" "$dest"
     record_slot "$slot" file "$dest"
 }
 
@@ -1111,10 +1210,12 @@ install_alias_slot() {
     slot=$1
     target=$2
     dest=$3
+    assert_manifest_binding
     gate=$(gate_alias "$slot" "$dest" "$target")
     if [ "$gate" = foreign ]; then
         resolve_foreign_collision "$dest" || return 0
     fi
+    assert_manifest_binding
     ln -sf -- "$target" "$dest"
     record_slot "$slot" symlink "$dest"
 }
@@ -1179,6 +1280,7 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
     }
 fi
 
+assert_manifest_binding
 desktop_gate=$(gate_content desktop "$desktop_file" "$desktop_tmp" exec)
 desktop_installed=0
 if [ "$desktop_gate" = foreign ]; then
@@ -1189,6 +1291,7 @@ else
     desktop_installed=1
 fi
 if [ "$desktop_installed" -eq 1 ]; then
+    assert_manifest_binding
     mv -f -- "$desktop_tmp" "$desktop_file"
     record_slot desktop file "$desktop_file"
     printf 'Installed the EmuWiz desktop launcher below %s.\n' "$data_home"
@@ -1201,6 +1304,7 @@ for size in 32 64 128 256 512; do
     mkdir -p -- "$icon_dir"
     icon_dest="$icon_dir/$desktop_id.png"
     icon_source="$branding_dir/emuwiz-logo-$size.png"
+    assert_manifest_binding
     icon_gate=$(gate_content "icon-$size" "$icon_dest" "$icon_source" "")
     if [ "$icon_gate" = foreign ]; then
         resolve_foreign_collision "$icon_dest" || continue
@@ -1209,26 +1313,14 @@ for size in 32 64 128 256 512; do
         fail "could not create a temporary file for the $size pixel icon"
     cp -- "$icon_source" "$icon_tmp"
     chmod 0644 "$icon_tmp"
+    assert_manifest_binding
     mv -f -- "$icon_tmp" "$icon_dest"
     record_slot "icon-$size" file "$icon_dest"
 done
 printf 'Installed the EmuWiz application icons below %s.\n' "$data_home"
 
-# Compose the manifest only now that record_count is known, then validate
-# any pre-existing manifest_file before ever touching it: an existing
-# manifest may only be replaced once it has been validated as belonging to
-# THIS installation - which is exactly what load_manifest already
-# established earlier in this run via manifest_loaded. A path that existed
-# before this run but did NOT load successfully - whether it is a symlink,
-# a directory, or simply a regular file whose content never validated as
-# one of our own manifests (an unrelated file, a stale pre-bump schema, a
-# hand-edited one that no longer parses) - is treated exactly like any
-# other foreign collision in this script: left untouched and warned about
-# by default, or backed up (never silently overwritten in place) with
-# --replace-foreign. A manifest that WAS successfully loaded, or no
-# pre-existing path at all, is always safe to replace outright - that is
-# the normal, expected shape of every ordinary reinstall.
-manifest_tmp=$(mktemp -- "$manifest_dir/.manifest.XXXXXX") ||
+# Compose complete metadata in the pinned directory, then recheck the binding.
+manifest_tmp=$(mktemp -- "/proc/self/fd/8/.manifest.XXXXXX") ||
     fail "could not create a temporary file for the install manifest"
 record_count=$(wc -l <"$manifest_records_tmp" | tr -d '[:space:]')
 {
@@ -1243,28 +1335,29 @@ record_count=$(wc -l <"$manifest_records_tmp" | tr -d '[:space:]')
 } >"$manifest_tmp"
 rm -f -- "$manifest_records_tmp"
 chmod 0600 "$manifest_tmp"
+published_manifest_digest=$(file_digest "$manifest_tmp") || fail "cannot fingerprint new manifest"
 
-manifest_write_blocked=0
-manifest_preexisting=0
-if [ -e "$manifest_file" ] || [ -L "$manifest_file" ]; then
-    manifest_preexisting=1
-fi
-if [ "$manifest_preexisting" -eq 1 ] && [ "$manifest_loaded" -ne 1 ]; then
-    if [ "$replace_foreign" -eq 1 ]; then
-        backup_foreign_path "$manifest_file"
-        warn "moved an unrecognised path at the ownership manifest location aside before installing: $manifest_file -> $BACKUP_PATH"
-    else
-        warn "leaving the ownership manifest untouched: $manifest_file exists but does not validate as belonging to this installation (found a $(path_kind "$manifest_file")); this run's installs above are not recorded until that is resolved"
-        warn "  re-run with --replace-foreign to move it aside and record ownership here"
-        manifest_write_blocked=1
-    fi
-fi
-if [ "$manifest_write_blocked" -eq 1 ]; then
-    rm -f -- "$manifest_tmp"
-    skipped_any=1
+# No pathname rename over an existing manifest: write only to the validated
+# open inode. Recheck afterward too, reporting late replacement without touching
+# its object. This write is deliberately non-atomic: interruption may truncate
+# this owned manifest, which the strict parser rejects on the next run.
+assert_manifest_binding
+if [ "$binding_manifest" = absent ]; then
+    # Atomic no-clobber creation also closes the check-to-create window.
+    ln -T -- "$manifest_tmp" /proc/self/fd/8/manifest ||
+        fail "ownership manifest creation collided; published assets may remain unrecorded: $manifest_file"
+    exec 9<"$manifest_tmp"
 else
-    mv -f -- "$manifest_tmp" "$manifest_file"
+    cat -- "$manifest_tmp" > /proc/self/fd/9 ||
+        fail "could not update owned manifest; published assets may remain unrecorded"
+    chmod 0600 /proc/self/fd/9
 fi
+binding_manifest=$(manifest_descriptor_state) || fail "cannot identify updated manifest"
+binding_digest=$published_manifest_digest
+assert_manifest_binding
+rm -f -- "$manifest_tmp"
+exec 9<&-
+exec 8<&-
 
 if [ "$skipped_any" -eq 1 ]; then
     printf '\n' >&2

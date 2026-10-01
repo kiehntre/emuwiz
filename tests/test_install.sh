@@ -979,9 +979,11 @@ manifest=$(manifest_path "$home/.local/share")
 printf 'garbage this is not a valid manifest !!! ***\n\x00\x01binary junk\n' >"$manifest"
 
 warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
-assert_contains "malformed manifest causes binaries to be treated as foreign (fail safe)" \
-    "$warn" "leaving foreign path untouched"
-assert_success "install still completes (does not crash) with a malformed manifest" \
+assert_contains "malformed manifest refuses publication (fail closed)" \
+    "$warn" "refusing to install managed files"
+assert_executable "malformed manifest leaves the existing managed binary untouched" \
+    "$bin_dir/emuwiz-cli"
+assert_success "replace-foreign recovers from a malformed manifest" \
     env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign
 rm -rf -- "$work"
 
@@ -998,8 +1000,10 @@ head -c 25 "$manifest" >"$work/truncated"
 mv -- "$work/truncated" "$manifest"
 
 warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
-assert_contains "truncated manifest causes binaries to be treated as foreign (fail safe)" \
-    "$warn" "leaving foreign path untouched"
+assert_contains "truncated manifest refuses publication (fail closed)" \
+    "$warn" "refusing to install managed files"
+assert_executable "truncated manifest leaves the existing managed binary untouched" \
+    "$bin_dir/emuwiz-cli"
 rm -rf -- "$work"
 
 echo "=== test: an adversarial manifest cannot make uninstall touch an arbitrary path ==="
@@ -1403,11 +1407,11 @@ printf 'this file belongs to something else entirely\n' >"$manifest"
 
 warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns that the manifest itself looks foreign" "$warn" \
-    "leaving the ownership manifest untouched"
+    "refusing to install managed files"
 manifest_content=$(cat "$manifest")
 assert_contains "the foreign manifest file content is preserved exactly" \
     "$manifest_content" "this file belongs to something else entirely"
-assert_executable "the binaries still installed normally around the manifest collision" \
+assert_no_such_path "the foreign-manifest refusal leaves the binary unpublished" \
     "$bin_dir/emuwiz-cli"
 rm -rf -- "$work"
 
@@ -1425,7 +1429,7 @@ ln -s -- "$outside_target" "$manifest"
 
 warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns that the manifest symlink looks foreign" "$warn" \
-    "leaving the ownership manifest untouched"
+    "refusing to install managed files"
 if [ -L "$manifest" ]; then
     ok "the manifest symlink itself is untouched"
 else
@@ -1434,7 +1438,7 @@ fi
 target_content=$(cat "$outside_target")
 assert_contains "whatever the manifest symlink pointed at is untouched" \
     "$target_content" "must never be overwritten via the manifest symlink"
-assert_executable "the binaries still installed normally around the manifest collision" \
+assert_no_such_path "the manifest-symlink refusal leaves the binary unpublished" \
     "$bin_dir/emuwiz-cli"
 rm -rf -- "$work"
 
@@ -1451,7 +1455,7 @@ printf 'must never be touched\n' >"$manifest/some-file-inside"
 
 warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
 assert_contains "install warns that the manifest-shaped directory looks foreign" "$warn" \
-    "leaving the ownership manifest untouched"
+    "refusing to install managed files"
 if [ -d "$manifest" ] && [ ! -L "$manifest" ]; then
     ok "the directory occupying the manifest path is untouched"
 else
@@ -1460,7 +1464,7 @@ fi
 inside_content=$(cat "$manifest/some-file-inside")
 assert_contains "contents inside that directory are untouched" \
     "$inside_content" "must never be touched"
-assert_executable "the binaries still installed normally around the manifest collision" \
+assert_no_such_path "the manifest-directory refusal leaves the binary unpublished" \
     "$bin_dir/emuwiz-cli"
 rm -rf -- "$work"
 
@@ -1549,17 +1553,17 @@ env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" >/dev/null
 manifest=$(manifest_path "$home/.local/share")
 cp -- "$manifest" "$work/pristine-manifest"
 
-# assert_manifest_rejected DESCRIPTION - installs over the mutation staged
-# in $work/mutated-manifest, asserts it was rejected outright (the
-# binaries, which have no fallback recognition rule at all, are the
-# cleanest possible proof: they warn as foreign if and only if the
-# manifest as a whole failed to parse), then reconciles state with
-# --replace-foreign before the next sub-test.
+# assert_manifest_rejected DESCRIPTION - attempts the mutation staged in
+# $work/mutated-manifest, asserts publication is refused before any managed
+# binary is touched, then reconciles state with --replace-foreign before the
+# next sub-test.
 assert_manifest_rejected() {
     description=$1
     cp -- "$work/mutated-manifest" "$manifest"
     warn=$(env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" 2>&1 1>/dev/null) || true
-    assert_contains "$description" "$warn" "leaving foreign path untouched"
+    assert_contains "$description" "$warn" "refusing to install managed files"
+    assert_executable "$description leaves the existing binary in place" \
+        "$bin_dir/emuwiz-cli"
     env HOME="$home" sh "$work/bundle/install.sh" --prefix "$bin_dir" --replace-foreign >/dev/null
 }
 
@@ -1666,3 +1670,6 @@ rm -rf -- "$work"
 echo
 printf 'Results: %s passed, %s failed\n' "$pass_count" "$fail_count"
 [ "$fail_count" -eq 0 ]
+
+# Separate deterministic seams instrument disposable installer copies only.
+python3 -B "$repo_root/tests/test_installer_ownership.py" -v
