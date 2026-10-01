@@ -25,6 +25,11 @@ use eframe::egui;
 #[cfg(test)]
 mod audit;
 mod catalogue;
+mod evidence;
+#[cfg(test)]
+mod evidence_coverage;
+#[cfg(test)]
+mod evidence_tests;
 mod exposure;
 mod model;
 mod script;
