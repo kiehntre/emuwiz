@@ -31,7 +31,7 @@ branches at the time of writing).
 |---|---|---|
 | Available | `CheatCandidate` (+ `CheatVariant`s) | Never enables anything. |
 | Chosen | `CheatLaunchSelection` | The only way in. Carries the explicit variant and a review acknowledgement. |
-| Applicability | `CheatApplicabilityState` | Mirrors the applicability batch's states; `verdict()` = Allowed / ReviewRequired / Blocked. |
+| Applicability | `patch_manager::CheatApplicabilityState` | The one applicability model (consolidated; the earlier stand-in is gone). `applicability_verdict()` maps it to Allowed / ReviewRequired / Blocked. |
 | Capability | `CheatEmulatorCapability`, `CheatLaunchMode` | `PersistentInstallOnly` is never treated as launch-scoped. |
 | Plan | `CheatLaunchPlan` | `NoCheatsSelected` / `Ready` / `Blocked`, with structured `CheatLaunchBlockReason`s. |
 | Derivative | `CheatLaunchDerivative` (patch_manager), `PlannedDerivative` (launch) | Bytes + provenance back to the source. |
@@ -56,8 +56,10 @@ created for launch-scoped material.
   `variant_id` is chosen; only that variant is composed. Two variants of one
   logical cheat are never emitted together (also enforced in the renderer).
 - Blocked outright: wrong region/revision, different game, unsupported format or
-  emulator, malformed. Weak (`PossibleMatch`, `NeedsReview`, `NotEvaluated`)
-  needs an explicit acknowledgement and is recorded as-is, never promoted.
+  emulator, malformed. Only `Ready` / `ExactGameMatch` launch freely. Weak
+  states (`StrongMatch`, `PossibleMatch`, `NeedsReview`, `MissingRequiredEvidence`,
+  `ConflictingVariants`) need an explicit acknowledgement and are recorded
+  as-is, never promoted. A title that merely looks similar is never enough.
 - One blocked selection blocks the whole plan (no silent subset launch).
 - Fail closed with a structured reason; the plan never falls back to persistent
   writes (`persistent_writes` and `global_config_mutations` are empty).
@@ -92,12 +94,14 @@ config, derivative, scratch root (`MustNotExistAfter`).
 
 - **Batch 1 (parser hardening):** `ChtEntry::is_selectable` is the gate; the
   hardened parser feeds `CheatVariant.entry` unchanged.
-- **Batch 2 (conflicts):** replace `CheatCandidate.unresolved_conflict` and the
-  implicit "more than one variant" rule with its typed conflicts; keep the rule
-  "no choice, no composition".
+- **Batch 2 (conflicts):** integrated. `CheatCandidate::requires_choice(group)`
+  derives the conflict flag from the canonical reconciliation group's typed
+  `CheatDuplicateKind`s; the rule "no choice, no composition" is unchanged.
 - **Batch 3 (provenance):** project its record into `CheatSourceReference`.
-- **Batch 4 (applicability):** map its states onto `CheatApplicabilityState`
-  (names deliberately match); `NotEvaluated` disappears once it is always set.
+- **Batch 4 (applicability):** integrated. The launch planner uses
+  `patch_manager::CheatApplicabilityState` directly; `NotEvaluated` and
+  `IdentityVerifiedOnly` no longer exist. A variant must carry the state from
+  `assess_cheat_applicability`.
 - **Capability registry:** `cheat_launch_capability` is a deliberately small
   stand-in for the design's canonical registry.
 - **Batch 6 / GUI:** can read `CheatLaunchPlan.blocked` / `plan_blocks` to explain

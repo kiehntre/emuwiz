@@ -63,7 +63,7 @@ fn facts() -> RetroArchLaunchFacts {
     }
 }
 
-const READY: CheatApplicabilityState = CheatApplicabilityState::ExactMatch;
+const READY: CheatApplicabilityState = CheatApplicabilityState::ExactGameMatch;
 
 fn base_request(selections: Vec<CheatLaunchSelection>) -> CheatLaunchRequest {
     let parsed = entries();
@@ -344,7 +344,13 @@ fn applicability_evidence_blocks_or_requires_review() {
             vec![CheatLaunchBlockReason::Applicability { state }]
         );
     }
-    for state in [S::PossibleMatch, S::NeedsReview, S::NotEvaluated] {
+    for state in [
+        S::StrongMatch,
+        S::PossibleMatch,
+        S::NeedsReview,
+        S::MissingRequiredEvidence,
+        S::ConflictingVariants,
+    ] {
         let mut request = base_request(vec![select("lives")]);
         request.candidates[0].variants[0].applicability = state;
         assert_eq!(
@@ -358,9 +364,13 @@ fn applicability_evidence_blocks_or_requires_review() {
         assert_eq!(plan.selected[0].applicability, state);
         assert!(plan.selected[0].review_acknowledged);
     }
-    assert_eq!(S::from_identity_verified(true), S::IdentityVerifiedOnly);
+    // Only an exact/ready assessment launches without review; similar-looking
+    // titles are never enough on their own.
+    for state in [S::Ready, S::ExactGameMatch] {
+        assert_eq!(applicability_verdict(state), ApplicabilityVerdict::Allowed);
+    }
     assert_eq!(
-        S::from_identity_verified(false).verdict(),
+        applicability_verdict(S::StrongMatch),
         ApplicabilityVerdict::ReviewRequired
     );
 }
@@ -884,4 +894,42 @@ fn persistent_install_stays_distinct_from_launch_scoped_composition() {
         plan.capability.proof,
         PersistenceProof::ProvenByHarness { .. }
     ));
+}
+
+#[test]
+fn canonical_reconciliation_group_decides_whether_a_choice_is_required() {
+    use crate::patch_manager::{
+        CheatDuplicateKind as K, CheatReconciliationGroup, CheatRelationship as R,
+    };
+    let group = |relationship, classifications| CheatReconciliationGroup {
+        relationship,
+        classifications,
+        entry_indices: vec![0, 1],
+        normalized_title: "lives".into(),
+        semantic_fingerprint: None,
+        raw_fingerprint: None,
+        differences: vec![],
+        quality: vec![],
+    };
+    for kinds in [vec![K::ExactDuplicate], vec![K::CorroboratingObservation]] {
+        assert!(!CheatCandidate::requires_choice(&group(
+            R::ExactRawDuplicate,
+            kinds
+        )));
+    }
+    for kind in [
+        K::CodeConflict,
+        K::RegionVariant,
+        K::VersionVariant,
+        K::SourceIndexConflict,
+    ] {
+        assert!(CheatCandidate::requires_choice(&group(
+            R::ExactRawDuplicate,
+            vec![kind]
+        )));
+    }
+    assert!(CheatCandidate::requires_choice(&group(
+        R::SameTitleDifferentCode,
+        vec![]
+    )));
 }

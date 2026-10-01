@@ -198,11 +198,11 @@ pub use cemu_execution::{
     spawn_cemu,
 };
 pub use cheat_launch_plan::{
-    CheatApplicabilityState, CheatCandidate, CheatEmulatorCapability, CheatLaunchBlockReason,
+    ApplicabilityVerdict, CheatCandidate, CheatEmulatorCapability, CheatLaunchBlockReason,
     CheatLaunchCommandError, CheatLaunchFormat, CheatLaunchMode, CheatLaunchPlan,
     CheatLaunchPlanStatus, CheatLaunchRequest, CheatLaunchSelection, CheatLaunchTarget,
     CheatVariant, LaunchStateClass, LaunchStateExpectation, RetroArchLaunchFacts,
-    RetroArchProfileIsolation, capture_baseline, cheat_launch_capability,
+    RetroArchProfileIsolation, applicability_verdict, capture_baseline, cheat_launch_capability,
     command_with_cheat_launch_plan, plan_cheat_launch, verify_expectation,
 };
 pub use desmume_command::{

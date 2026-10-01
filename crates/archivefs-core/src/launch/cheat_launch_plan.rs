@@ -42,9 +42,9 @@ use super::resource_grants::{
 use super::retroarch_command::RetroArchCommand;
 use super::retroarch_resource_projection::approved_retroarch_launch_root;
 use crate::patch_manager::{
-    CheatApplySupport, CheatDerivativeEntryRecord, CheatDerivativeError, CheatDerivativeInput,
-    CheatLaunchDerivativeKind, CheatRouteTarget, CheatSourceReference, ChtEntry,
-    render_retroarch_selected_derivative,
+    CheatApplicabilityState, CheatApplySupport, CheatDerivativeEntryRecord, CheatDerivativeError,
+    CheatDerivativeInput, CheatLaunchDerivativeKind, CheatRouteTarget, CheatSourceReference,
+    ChtEntry, render_retroarch_selected_derivative,
 };
 
 // ---------------------------------------------------------------------
@@ -166,30 +166,12 @@ pub fn cheat_launch_capability(adapter_id: &str) -> CheatEmulatorCapability {
 }
 
 // ---------------------------------------------------------------------
-// Applicability (seam for the applicability batch)
+// Applicability gate
 // ---------------------------------------------------------------------
-
-/// Per-cheat applicability evidence. The states mirror the applicability
-/// batch's vocabulary so its output can be mapped one-to-one at integration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CheatApplicabilityState {
-    Ready,
-    ExactMatch,
-    /// The only evidence current main has: the game identity is verified, but
-    /// cheat-level applicability was not evaluated. Allowed, and recorded as such.
-    IdentityVerifiedOnly,
-    PossibleMatch,
-    NeedsReview,
-    /// No evidence at all; treated like a weak match.
-    NotEvaluated,
-    WrongRegion,
-    WrongRevision,
-    DifferentGame,
-    UnsupportedFormat,
-    UnsupportedEmulator,
-    Malformed,
-}
+//
+// There is exactly one applicability model: `patch_manager::cheat_applicability`.
+// A variant carries the state `assess_cheat_applicability` produced for the
+// selected game; this module only decides what each state means for a launch.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicabilityVerdict {
@@ -199,34 +181,26 @@ pub enum ApplicabilityVerdict {
     Blocked,
 }
 
-impl CheatApplicabilityState {
-    #[must_use]
-    pub fn verdict(self) -> ApplicabilityVerdict {
-        match self {
-            Self::Ready | Self::ExactMatch | Self::IdentityVerifiedOnly => {
-                ApplicabilityVerdict::Allowed
-            }
-            Self::PossibleMatch | Self::NeedsReview | Self::NotEvaluated => {
-                ApplicabilityVerdict::ReviewRequired
-            }
-            Self::WrongRegion
-            | Self::WrongRevision
-            | Self::DifferentGame
-            | Self::UnsupportedFormat
-            | Self::UnsupportedEmulator
-            | Self::Malformed => ApplicabilityVerdict::Blocked,
-        }
-    }
-
-    /// Mapping from the only evidence current main carries
-    /// (`ResolvedCheatPlan::identity_verified`).
-    #[must_use]
-    pub fn from_identity_verified(identity_verified: bool) -> Self {
-        if identity_verified {
-            Self::IdentityVerifiedOnly
-        } else {
-            Self::NeedsReview
-        }
+/// Launch policy over the canonical applicability state. Only an exact game
+/// match (hash/verified identifier) or a fully ready assessment launches
+/// without review. A title that merely looks similar, even with a verified
+/// platform, is never enough on its own.
+#[must_use]
+pub fn applicability_verdict(state: CheatApplicabilityState) -> ApplicabilityVerdict {
+    use CheatApplicabilityState as S;
+    match state {
+        S::Ready | S::ExactGameMatch => ApplicabilityVerdict::Allowed,
+        S::StrongMatch
+        | S::PossibleMatch
+        | S::NeedsReview
+        | S::MissingRequiredEvidence
+        | S::ConflictingVariants => ApplicabilityVerdict::ReviewRequired,
+        S::WrongRegion
+        | S::WrongRevision
+        | S::DifferentGame
+        | S::UnsupportedFormat
+        | S::UnsupportedEmulator
+        | S::Malformed => ApplicabilityVerdict::Blocked,
     }
 }
 
@@ -254,6 +228,26 @@ pub struct CheatCandidate {
     /// Set from reconciliation data that reports unresolved implementations
     /// even when only one variant is listed (Batch 2 seam).
     pub unresolved_conflict: bool,
+}
+
+impl CheatCandidate {
+    /// Typed replacement for the hand-set conflict flag: true when the
+    /// canonical reconciliation group says the implementations differ and a
+    /// deliberate choice is required (any review-requiring duplicate kind, or a
+    /// same-title/different-code or unproven relationship). Identical and
+    /// corroborating duplicates never force a choice.
+    #[must_use]
+    pub fn requires_choice(group: &crate::patch_manager::CheatReconciliationGroup) -> bool {
+        use crate::patch_manager::CheatRelationship as R;
+        group
+            .classifications
+            .iter()
+            .any(|kind| kind.requires_review())
+            || matches!(
+                group.relationship,
+                R::SameTitleDifferentCode | R::RelatedUnproven
+            )
+    }
 }
 
 /// What the user *chose*. The only way a cheat enters a plan.
@@ -703,7 +697,7 @@ fn resolve_selection(
             },
         ));
     };
-    match variant.applicability.verdict() {
+    match applicability_verdict(variant.applicability) {
         ApplicabilityVerdict::Blocked => {
             return Err((
                 id,
