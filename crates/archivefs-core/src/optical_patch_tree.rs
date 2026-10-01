@@ -160,3 +160,33 @@ impl Contents {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::patch_output_recovery::tree::{self, PreparedTreePatch, TreePatchState};
+    #[test]
+    fn both_adapters_return_the_same_durable_tree_contract() {
+        let (_dc_temp, dc, dc_destination) = crate::dreamcast_dcp_apply::tests::fixture();
+        let (_saturn_temp, saturn, saturn_destination) =
+            crate::saturn_patch_apply::tests::fixture();
+        let prepared: [PreparedTreePatch; 2] = [dc.prepare().unwrap(), saturn.prepare().unwrap()];
+        for (receipt, destination) in prepared.iter().zip([dc_destination, saturn_destination]) {
+            assert_eq!(
+                tree::inspect(&receipt.journal_path).unwrap(),
+                TreePatchState::Staged
+            );
+            tree::publish(&receipt.journal_path).unwrap();
+            assert!(destination.is_dir());
+            assert_eq!(
+                tree::inspect(&receipt.journal_path).unwrap(),
+                TreePatchState::Published
+            );
+            tree::undo(&receipt.journal_path).unwrap();
+            assert!(!destination.exists());
+            assert_eq!(
+                tree::inspect(&receipt.journal_path).unwrap(),
+                TreePatchState::Staged
+            );
+        }
+    }
+}
