@@ -126,6 +126,10 @@ pub struct SourceRebindReview {
     pub reason: RebindReason,
     pub archive_count: i64,
     pub last_successful_scan_at: Option<String>,
+    /// The catalogue epoch the review was made at. Confirming re-reads it: any
+    /// authority-relevant write since (a source removed and re-added, a role
+    /// change, another rebind, a scan) means the review is out of date.
+    pub epoch: i64,
 }
 
 /// Prefix of every refusal caused by a source that changed after review.

@@ -104,6 +104,13 @@ fn complete_scan_does_not_call_an_existing_unseen_file_missing() {
         .remove(0);
     db.upsert_archive(source.id, &root, &Archive::from_path(&path).unwrap())
         .unwrap();
+    // A real scan binds a new source before recording coverage under its generation.
+    db.rebind_source_after_review(
+        source.id,
+        0,
+        crate::catalogue_health::SourceRootBinding::inspect(&root).unwrap(),
+    )
+    .unwrap();
     let run = db.start_scan_run("complete", None).unwrap();
     db.record_scan_coverage(
         run,

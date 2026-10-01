@@ -83,7 +83,28 @@ impl F {
             .find(|s| s.path == self.roots[source])
             .unwrap();
         let m = fs::symlink_metadata(&folder.path).unwrap();
-        self.sql().execute("INSERT INTO scan_source_coverage(scan_run_id,source_folder_id,state,excluded_roots_json,root_identity_json) VALUES(?1,?2,?3,'[]',?4)",params![run,folder.id,serde_json::to_string(state).unwrap(),serde_json::to_string(&(m.dev(),m.ino())).unwrap()]).unwrap();
+        // A real scan binds a new source before it records coverage, and records
+        // that coverage under the binding's generation. Model exactly that.
+        if self
+            .sql()
+            .query_row(
+                "SELECT COUNT(*) FROM source_scan_bindings WHERE source_folder_id=?1",
+                [folder.id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 0
+        {
+            self.db
+                .rebind_source_after_review(
+                    folder.id,
+                    0,
+                    archivefs_core::catalogue_health::SourceRootBinding::inspect(&folder.path)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        self.sql().execute("INSERT INTO scan_source_coverage(scan_run_id,source_folder_id,state,excluded_roots_json,root_identity_json,source_generation) VALUES(?1,?2,?3,'[]',?4,(SELECT generation FROM source_scan_bindings WHERE source_folder_id=?2))",params![run,folder.id,serde_json::to_string(state).unwrap(),serde_json::to_string(&(m.dev(),m.ino())).unwrap()]).unwrap();
         run
     }
 }
@@ -207,10 +228,20 @@ fn legitimate_root_replacement_is_reprovable_on_new_scan() {
             .is_err()
     );
     assert_eq!(f.flag(id), None);
+    // A replaced root is never re-trusted by a scan alone: it is reviewed, and
+    // only then can a new complete scan establish the new identity.
+    assert_eq!(
+        f.scan().counts.archives_missing,
+        0,
+        "a scan must not auto-rebind"
+    );
+    assert_eq!(f.flag(id), None);
+    let review = f.db.review_source_rebind(folder).unwrap();
+    f.db.confirm_source_rebind(&review).unwrap();
     assert_eq!(
         f.scan().counts.archives_missing,
         1,
-        "new scan must establish new identity instead of permanent mismatch"
+        "after review, a new scan must establish the new identity instead of a permanent mismatch"
     );
 }
 

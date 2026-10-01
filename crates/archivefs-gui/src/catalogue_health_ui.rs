@@ -1135,6 +1135,7 @@ mod tests {
             reason: RebindReason::NeverBound,
             archive_count: 3,
             last_successful_scan_at: None,
+            epoch: 0,
         }
     }
 
@@ -1205,12 +1206,14 @@ mod tests {
             rows
         };
 
+        // The review is made first and confirmed after the page has reloaded its
+        // snapshot (as the real app does): loading must not invalidate a review.
+        let review = archivefs_core::review_source_rebind_at(&database, &folder).unwrap();
         let blocked = rows_for("legacy");
         let words = wording(blocked[0].health.as_ref());
         assert!(words.needs_review, "a migrated source must offer review");
         assert!(!Overall::from_rows(&blocked).all_clear());
 
-        let review = archivefs_core::review_source_rebind_at(&database, &folder).unwrap();
         archivefs_core::rebind_source_after_review_at(&database, &review).unwrap();
         let after_rebind = rows_for("rebound");
         let health = after_rebind[0].health.as_ref().unwrap();

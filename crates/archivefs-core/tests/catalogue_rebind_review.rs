@@ -568,7 +568,7 @@ fn downgrade_to_21(connection: &Connection) {
     }
     connection
         .execute_batch(
-            "DROP TABLE source_nested_boundaries; DROP TABLE source_scan_bindings; \
+            "DROP TABLE IF EXISTS source_review_required; DROP TABLE source_nested_boundaries; DROP TABLE source_scan_bindings; \
              DROP TABLE catalogue_health_epoch; DELETE FROM schema_migrations WHERE version=23; \
              DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version=22; \
              PRAGMA user_version=21;",
@@ -697,4 +697,750 @@ fn a_failed_migration_leaves_the_copy_at_its_old_version() {
         .is_err(),
         "no half-applied migration 23"
     );
+}
+
+#[test]
+fn independent_old_complete_run_cannot_override_new_partial_attempt() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let old = f.scan().scan_run_id;
+    let latest = f.scan().scan_run_id;
+    f.sql()
+        .execute(
+            "UPDATE scan_source_coverage SET state='\"partial\"' WHERE scan_run_id=?1",
+            [latest],
+        )
+        .unwrap();
+    fs::remove_file(path).unwrap();
+    assert_eq!(f.health(0).state, SourceHealthState::PartialScan);
+    let source = f.source_id(0);
+    let result = f.db.mark_unseen_archives_missing(old, source, &[]);
+    eprintln!(
+        "old complete run result={result:?}, missing={:?}",
+        f.flag(id)
+    );
+    assert!(
+        f.flag(id).is_none(),
+        "non-Healthy source acquired NEW Missing evidence"
+    );
+}
+#[test]
+fn independent_old_rebind_api_cannot_resurrect_old_generation() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let old = f.scan().scan_run_id;
+    f.sql()
+        .execute("DELETE FROM source_scan_bindings", [])
+        .unwrap();
+    let source = f.source_id(0);
+    f.db.rebind_source_after_review(source, 0, SourceRootBinding::inspect(&f.roots[0]).unwrap())
+        .unwrap();
+    fs::remove_file(path).unwrap();
+    let result = f.db.mark_unseen_archives_missing(old, source, &[]);
+    eprintln!(
+        "legacy rebind generation={}, result={result:?}, missing={:?}",
+        f.health(0).generation,
+        f.flag(id)
+    );
+    assert!(
+        f.flag(id).is_none(),
+        "pre-rebind coverage authorized Missing"
+    );
+}
+#[test]
+fn independent_review_refuses_configuration_aba() {
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    f.make_historical();
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    f.db.register_source_folders(&[]).unwrap();
+    f.db.register_source_folders(&f.roots).unwrap();
+    let result = f.db.confirm_source_rebind(&review);
+    eprintln!(
+        "configuration removed/readded: result={result:?}, bindings={}",
+        binding_rows(&f.sql())
+    );
+    assert!(
+        result.is_err(),
+        "review survived source disappearance/reappearance"
+    );
+}
+#[test]
+fn independent_review_refuses_source_role_change() {
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    f.make_historical();
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    f.db.set_source_role(&f.roots[0], archivefs_core::SourceRole::ArcadeRomset)
+        .unwrap();
+    let result = f.db.confirm_source_rebind(&review);
+    eprintln!(
+        "role changed: result={result:?}, bindings={}",
+        binding_rows(&f.sql())
+    );
+    assert!(
+        result.is_err(),
+        "review survived source configuration change"
+    );
+}
+#[test]
+fn independent_migrated_catalogue_without_success_timestamp_needs_review() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, _) = f.add(0, "game.zip");
+    let path = f.db.path().to_path_buf();
+    drop(f.db);
+    downgrade_to_21(&Connection::open(&path).unwrap());
+    f.db = Database::open_or_create(&path).unwrap();
+    f.replace_root(0, "old-storage");
+    let result = f.scan();
+    eprintln!(
+        "migrated historical rows, no successful timestamp: bindings={}, missing={:?}, scan_missing={}",
+        binding_rows(&f.sql()),
+        f.flag(id),
+        result.counts.archives_missing
+    );
+    assert!(
+        f.flag(id).is_none(),
+        "migration with catalogue history silently bound replacement storage and marked Missing"
+    );
+}
+#[test]
+fn independent_targeted_attempt_combinations() {
+    use archivefs_core::{add_source_folder_at, scan_source_folder_at};
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("config.toml");
+    let database = temp.path().join("library.sqlite3");
+    let folders: Vec<PathBuf> = ["A", "B", "C"]
+        .iter()
+        .map(|n| temp.path().join(n))
+        .collect();
+    Database::open_or_create(&database).unwrap();
+    for folder in &folders {
+        fs::create_dir(folder).unwrap();
+        fs::write(folder.join("game.zip"), b"game").unwrap();
+        add_source_folder_at(&config, &database, folder).unwrap();
+        scan_source_folder_at(&config, &database, folder, "initial").unwrap();
+    }
+    let sql = Connection::open(&database).unwrap();
+    sql.execute("UPDATE scan_source_coverage SET state='\"partial\"' WHERE source_folder_id=(SELECT id FROM source_folders WHERE path=?1) AND state='\"complete\"'", [folders[2].as_os_str().as_encoded_bytes()]).unwrap();
+    let mut db = Database::open_or_create(&database).unwrap();
+    let states = |db: &Database| {
+        db.source_health(&folders)
+            .unwrap()
+            .iter()
+            .map(|h| h.state)
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..2 {
+        scan_source_folder_at(&config, &database, &folders[0], "target").unwrap();
+    }
+    assert_eq!(
+        states(&db),
+        vec![
+            SourceHealthState::Healthy,
+            SourceHealthState::Healthy,
+            SourceHealthState::PartialScan
+        ]
+    );
+    fs::rename(&folders[0], temp.path().join("A-away")).unwrap();
+    let _ = scan_source_folder_at(&config, &database, &folders[0], "failed-target");
+    assert_eq!(
+        states(&db)[1..],
+        [SourceHealthState::Healthy, SourceHealthState::PartialScan]
+    );
+    fs::rename(temp.path().join("A-away"), &folders[0]).unwrap();
+    fs::rename(&folders[1], temp.path().join("B-old")).unwrap();
+    fs::create_dir(&folders[1]).unwrap();
+    let b = db
+        .list_source_folders()
+        .unwrap()
+        .iter()
+        .find(|s| s.path == folders[1])
+        .unwrap()
+        .id;
+    let review = db.review_source_rebind(b).unwrap();
+    db.confirm_source_rebind(&review).unwrap();
+    scan_source_folder_at(&config, &database, &folders[0], "target-after-rebind").unwrap();
+    assert_eq!(
+        states(&db)[1..],
+        [SourceHealthState::NeedsScan, SourceHealthState::PartialScan]
+    );
+    let full = Config {
+        source_folders: folders.clone(),
+        mount_root: temp.path().join("mounts"),
+        ratarmount_bin: "ratarmount".into(),
+        master_rom_root: None,
+    };
+    scan_and_persist(&mut db, &full, "full").unwrap();
+    assert_eq!(states(&db), vec![SourceHealthState::Healthy; 3]);
+}
+#[test]
+fn independent_new_confirm_rejects_old_coverage_at_write_boundary() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let old = f.scan().scan_run_id;
+    f.sql()
+        .execute("DELETE FROM source_scan_bindings", [])
+        .unwrap();
+    let source = f.source_id(0);
+    let review = f.db.review_source_rebind(source).unwrap();
+    f.db.confirm_source_rebind(&review).unwrap();
+    fs::remove_file(path).unwrap();
+    assert_eq!(f.health(0).generation, 2);
+    assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+    assert!(f.flag(id).is_none());
+}
+#[test]
+#[ignore = "run alone with the process-local fault shim"]
+fn independent_rebind_postwrite_identity_change_rolls_back() {
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    f.make_historical();
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    let before = everything_but_bindings(&f.sql());
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_PROBE_NUMBER", "2");
+    }
+    let result = f.db.confirm_source_rebind(&review);
+    unsafe {
+        std::env::remove_var("EMUWIZ_FAULT_PATH");
+        std::env::remove_var("EMUWIZ_FAULT_ROOT");
+        std::env::remove_var("EMUWIZ_FAULT_PROBE_NUMBER");
+    }
+    assert_ne!(
+        SourceRootBinding::inspect(&f.roots[0]).as_ref(),
+        Some(&review.current),
+        "fault must fire"
+    );
+    refused(result);
+    assert_eq!(binding_rows(&f.sql()), 0);
+    assert_eq!(everything_but_bindings(&f.sql()), before);
+}
+
+// =====================================================================================
+// Authority repairs: one rule - no new Missing evidence unless the source is presently
+// Healthy for the exact current binding, generation and latest actual scan attempt.
+// =====================================================================================
+
+/// A catalogue migrated from before storage continuity existed: rows, no binding, no
+/// successful-scan timestamp, then reopened so migration 23 runs for real.
+fn migrated(names: &[&str]) -> (Fixture, Vec<(i64, PathBuf)>) {
+    let mut f = Fixture::new(names);
+    let rows: Vec<_> = (0..names.len()).map(|i| f.add(i, "game.zip")).collect();
+    let path = f.db.path().to_path_buf();
+    drop(f.db);
+    downgrade_to_21(&Connection::open(&path).unwrap());
+    f.db = Database::open_or_create(&path).unwrap();
+    (f, rows)
+}
+
+fn review_required_rows(f: &Fixture) -> i64 {
+    f.sql()
+        .query_row("SELECT COUNT(*) FROM source_review_required", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+}
+
+/// A later scan outcome recorded for a source, as a real scan records it.
+fn record_attempt(f: &mut Fixture, index: usize, state: &str) -> i64 {
+    let run = f.db.start_scan_run("later-attempt", None).unwrap();
+    f.sql()
+        .execute(
+            "INSERT INTO scan_source_coverage(scan_run_id,source_folder_id,state,\
+             excluded_roots_json,root_identity_json,source_generation) \
+             VALUES(?1,?2,?3,'[]','null',(SELECT generation FROM source_scan_bindings \
+             WHERE source_folder_id=?2))",
+            rusqlite::params![
+                run,
+                f.source_id(index),
+                serde_json::to_string(state).unwrap()
+            ],
+        )
+        .unwrap();
+    run
+}
+
+// --- Blocker 1: a migrated source is never bound by a first scan ----------------
+
+#[test]
+fn migration_records_which_sources_need_review_and_binds_none() {
+    let (f, _) = migrated(&["games", "other"]);
+    assert_eq!(review_required_rows(&f), 2);
+    assert_eq!(binding_rows(&f.sql()), 0);
+    for index in 0..2 {
+        assert_eq!(f.health(index).state, SourceHealthState::RebindRequired);
+        assert_eq!(f.health(index).rebind, Some(RebindReason::NeverBound));
+    }
+}
+
+#[test]
+fn a_migrated_source_with_rows_and_no_timestamp_never_auto_binds() {
+    // Each variation of "what is at the old path now" must fail closed.
+    type Setup = fn(&Fixture);
+    let scenarios: [(&str, Setup); 5] = [
+        ("different storage", |f| {
+            f.replace_root(0, "old-storage");
+            fs::write(f.roots[0].join("other.zip"), b"different").unwrap();
+        }),
+        ("apparently identical storage", |_| {}),
+        ("empty replacement directory", |f| {
+            f.replace_root(0, "old-storage")
+        }),
+        ("unavailable then available", |f| {
+            let away = f.temp.path().join("away");
+            fs::rename(&f.roots[0], &away).unwrap();
+            fs::rename(&away, &f.roots[0]).unwrap();
+        }),
+        ("scanned twice", |_| {}),
+    ];
+    for (label, setup) in scenarios {
+        let (mut f, rows) = migrated(&["games"]);
+        setup(&f);
+        let (id, path) = &rows[0];
+        let _ = fs::remove_file(path);
+        for _ in 0..2 {
+            let result = f.scan();
+            assert_eq!(result.counts.archives_missing, 0, "{label}");
+        }
+        assert_eq!(
+            binding_rows(&f.sql()),
+            0,
+            "{label}: a scan auto-bound the source"
+        );
+        assert_eq!(f.flag(*id), None, "{label}: Missing evidence was written");
+        assert_eq!(
+            f.health(0).state,
+            SourceHealthState::RebindRequired,
+            "{label}"
+        );
+        assert_eq!(review_required_rows(&f), 1, "{label}");
+    }
+}
+
+#[test]
+fn a_source_unavailable_during_its_first_post_migration_scan_still_needs_review() {
+    let (mut f, rows) = migrated(&["games"]);
+    let away = f.temp.path().join("away");
+    fs::rename(&f.roots[0], &away).unwrap();
+    f.scan();
+    fs::rename(&away, &f.roots[0]).unwrap();
+    fs::remove_file(&rows[0].1).unwrap();
+    assert_eq!(f.scan().counts.archives_missing, 0);
+    assert_eq!(binding_rows(&f.sql()), 0);
+    assert_eq!(f.flag(rows[0].0), None);
+}
+
+#[test]
+fn only_a_reviewed_rebind_makes_a_migrated_source_eligible_and_it_clears_the_requirement() {
+    let (mut f, rows) = migrated(&["games"]);
+    fs::remove_file(&rows[0].1).unwrap();
+    assert_eq!(f.scan().counts.archives_missing, 0);
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    assert_eq!(review.reason, RebindReason::NeverBound);
+    f.db.confirm_source_rebind(&review).unwrap();
+    assert_eq!(review_required_rows(&f), 0);
+    assert_eq!(
+        f.flag(rows[0].0),
+        None,
+        "rebind alone marks nothing missing"
+    );
+    assert_eq!(f.scan().counts.archives_missing, 1);
+    assert!(f.flag(rows[0].0).is_some());
+}
+
+#[test]
+fn a_source_added_after_migration_still_binds_on_its_first_scan() {
+    let (mut f, _) = migrated(&["games"]);
+    let fresh = f.temp.path().join("fresh");
+    fs::create_dir(&fresh).unwrap();
+    fs::write(fresh.join("new.zip"), b"new").unwrap();
+    f.roots.push(fresh);
+    let config = f.config();
+    f.db.register_source_folders(&f.roots).unwrap();
+    scan_and_persist(&mut f.db, &config, "after migration").unwrap();
+    assert_eq!(f.health(1).state, SourceHealthState::Healthy);
+    assert_eq!(f.health(0).state, SourceHealthState::RebindRequired);
+    assert_eq!(binding_rows(&f.sql()), 1);
+}
+
+#[test]
+fn a_fresh_source_whose_first_scan_found_the_drive_offline_binds_on_a_later_scan() {
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    let away = f.temp.path().join("away");
+    fs::rename(&f.roots[0], &away).unwrap();
+    f.scan();
+    assert_eq!(binding_rows(&f.sql()), 0);
+    fs::rename(&away, &f.roots[0]).unwrap();
+    f.scan();
+    assert_eq!(f.health(0).state, SourceHealthState::Healthy);
+}
+
+// --- Blocker 2: superseded coverage has no authority -------------------------------
+
+#[test]
+fn old_complete_coverage_loses_authority_to_any_later_actual_attempt() {
+    for later in ["partial", "failed", "unavailable", "skipped"] {
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "game.zip");
+        let old = f.scan().scan_run_id;
+        record_attempt(&mut f, 0, later);
+        fs::remove_file(path).unwrap();
+        let source = f.source_id(0);
+        let result = f.db.mark_unseen_archives_missing(old, source, &[]);
+        assert!(
+            result.is_err(),
+            "{later}: superseded coverage was accepted: {result:?}"
+        );
+        assert_eq!(f.flag(id), None, "{later}: Missing evidence was written");
+        assert_ne!(f.health(0).state, SourceHealthState::Healthy, "{later}");
+    }
+}
+
+#[test]
+fn a_later_not_attempted_record_does_not_supersede_the_latest_actual_attempt() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let old = f.scan().scan_run_id;
+    record_attempt(&mut f, 0, "not_attempted");
+    record_attempt(&mut f, 0, "removed");
+    fs::remove_file(path).unwrap();
+    assert_eq!(f.health(0).state, SourceHealthState::Healthy);
+    let source = f.source_id(0);
+    assert_eq!(
+        f.db.mark_unseen_archives_missing(old, source, &[]).unwrap(),
+        1
+    );
+    assert!(f.flag(id).is_some());
+}
+
+#[test]
+fn only_the_latest_actual_attempt_may_write_even_when_both_are_complete() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let first = f.scan().scan_run_id;
+    let second = f.scan().scan_run_id;
+    fs::remove_file(path).unwrap();
+    let source = f.source_id(0);
+    assert!(
+        f.db.mark_unseen_archives_missing(first, source, &[])
+            .is_err()
+    );
+    assert_eq!(f.flag(id), None);
+    assert_eq!(
+        f.db.mark_unseen_archives_missing(second, source, &[])
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn missing_evidence_requires_an_accepted_binding_at_the_write_boundary() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let run = f.scan().scan_run_id;
+    f.sql()
+        .execute("DELETE FROM source_scan_bindings", [])
+        .unwrap();
+    fs::remove_file(path).unwrap();
+    let source = f.source_id(0);
+    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert_eq!(f.flag(id), None);
+}
+
+// --- Blocker 3: every rebind allocates a generation above all historical coverage --
+
+/// Both ways of committing a rebind, so neither can diverge from the other.
+fn rebind_every_way(f: &mut Fixture, index: usize, via_review: bool) {
+    let source = f.source_id(index);
+    if via_review {
+        let review = f.db.review_source_rebind(source).unwrap();
+        f.db.confirm_source_rebind(&review).unwrap();
+    } else {
+        let generation: i64 = f
+            .sql()
+            .query_row(
+                "SELECT COALESCE((SELECT generation FROM source_scan_bindings WHERE source_folder_id=?1),0)",
+                [source],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let binding = SourceRootBinding::inspect(&f.roots[index]).unwrap();
+        f.db.rebind_source_after_review(source, generation, binding)
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_rebind_takes_a_generation_above_every_historical_generation_by_either_path() {
+    for via_review in [true, false] {
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "game.zip");
+        let first = f.scan().scan_run_id;
+        let second = f.scan().scan_run_id;
+        // Several historical generations exist in coverage; the binding row is lost.
+        f.sql()
+            .execute(
+                "UPDATE scan_source_coverage SET source_generation=5 WHERE scan_run_id=?1",
+                [first],
+            )
+            .unwrap();
+        f.sql()
+            .execute(
+                "UPDATE scan_source_coverage SET source_generation=7 WHERE scan_run_id=?1",
+                [second],
+            )
+            .unwrap();
+        f.sql()
+            .execute("DELETE FROM source_scan_bindings", [])
+            .unwrap();
+        rebind_every_way(&mut f, 0, via_review);
+        assert_eq!(f.health(0).generation, 8, "via_review={via_review}");
+        assert_eq!(f.health(0).state, SourceHealthState::NeedsScan);
+        fs::remove_file(path).unwrap();
+        let source = f.source_id(0);
+        for old in [first, second] {
+            assert!(
+                f.db.mark_unseen_archives_missing(old, source, &[]).is_err(),
+                "via_review={via_review}: coverage from a historical generation regained authority"
+            );
+        }
+        assert_eq!(f.flag(id), None);
+    }
+}
+
+#[test]
+fn rebinding_an_existing_binding_also_clears_every_historical_generation() {
+    for via_review in [true, false] {
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "game.zip");
+        let old = f.scan().scan_run_id;
+        // Coverage recorded under a generation higher than the binding's own.
+        f.sql()
+            .execute("UPDATE scan_source_coverage SET source_generation=9", [])
+            .unwrap();
+        f.replace_root(0, "preserved");
+        rebind_every_way(&mut f, 0, via_review);
+        assert_eq!(f.health(0).generation, 10, "via_review={via_review}");
+        fs::remove_file(path).ok();
+        let source = f.source_id(0);
+        assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+        assert_eq!(f.flag(id), None);
+    }
+}
+
+#[test]
+fn a_removed_and_readded_source_cannot_reuse_old_coverage_after_rebind() {
+    for via_review in [true, false] {
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "game.zip");
+        let old = f.scan().scan_run_id;
+        f.db.register_source_folders(&[]).unwrap();
+        f.db.register_source_folders(&f.roots).unwrap();
+        f.replace_root(0, "preserved");
+        rebind_every_way(&mut f, 0, via_review);
+        fs::remove_file(path).ok();
+        let source = f.source_id(0);
+        assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+        assert_eq!(f.flag(id), None);
+        assert!(f.health(0).generation > 1);
+    }
+}
+
+#[test]
+fn rebind_after_a_partial_or_complete_old_scan_never_revives_either() {
+    for (later, via_review) in [
+        ("partial", true),
+        ("partial", false),
+        ("complete", true),
+        ("complete", false),
+    ] {
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "game.zip");
+        let complete = f.scan().scan_run_id;
+        let latest = record_attempt(&mut f, 0, later);
+        f.replace_root(0, "preserved");
+        rebind_every_way(&mut f, 0, via_review);
+        fs::remove_file(path).ok();
+        let source = f.source_id(0);
+        for run in [complete, latest] {
+            // Refused outright, or nothing written (a non-complete run never could).
+            let result = f.db.mark_unseen_archives_missing(run, source, &[]);
+            assert!(
+                !matches!(result, Ok(written) if written > 0),
+                "{later}/{via_review}: run {run} kept its authority after the rebind"
+            );
+        }
+        assert_eq!(f.flag(id), None);
+        assert_eq!(f.health(0).state, SourceHealthState::NeedsScan);
+    }
+}
+
+#[test]
+fn generation_allocation_is_checked_and_refuses_instead_of_wrapping() {
+    for via_review in [true, false] {
+        let mut f = Fixture::new(&["games"]);
+        f.add(0, "game.zip");
+        f.scan();
+        f.sql()
+            .execute(
+                "UPDATE scan_source_coverage SET source_generation=?1",
+                [i64::MAX],
+            )
+            .unwrap();
+        f.sql()
+            .execute("DELETE FROM source_scan_bindings", [])
+            .unwrap();
+        let source = f.source_id(0);
+        let result = if via_review {
+            let review = f.db.review_source_rebind(source).unwrap();
+            f.db.confirm_source_rebind(&review)
+        } else {
+            f.db.rebind_source_after_review(
+                source,
+                0,
+                SourceRootBinding::inspect(&f.roots[0]).unwrap(),
+            )
+        };
+        let error = result
+            .expect_err("an exhausted generation space must refuse")
+            .to_string();
+        assert!(error.contains("exhausted"), "{error}");
+        assert_eq!(
+            binding_rows(&f.sql()),
+            0,
+            "nothing may be written on overflow"
+        );
+    }
+}
+
+#[test]
+fn the_legacy_rebind_api_is_not_a_second_authority_path() {
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    f.scan();
+    let source = f.source_id(0);
+    f.replace_root(0, "preserved");
+    let binding = SourceRootBinding::inspect(&f.roots[0]).unwrap();
+    // Wrong generation, wrong storage, and a removed source are all refused.
+    refused(f.db.rebind_source_after_review(source, 99, binding.clone()));
+    let mut other = binding.clone();
+    other.filesystem_id[0] ^= 0xff;
+    refused(f.db.rebind_source_after_review(source, 1, other));
+    assert_eq!(f.health(0).generation, 1, "refused rebinds changed nothing");
+    f.sql()
+        .execute("UPDATE source_folders SET removed_from_config_at='x'", [])
+        .unwrap();
+    refused(f.db.rebind_source_after_review(source, 1, binding));
+    let generation: i64 = f
+        .sql()
+        .query_row("SELECT generation FROM source_scan_bindings", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(generation, 1);
+}
+
+// --- Blocker 4: a review binds the configuration it reviewed ------------------------
+
+#[test]
+fn a_review_is_refused_after_any_authority_relevant_change() {
+    type Change = fn(&mut Fixture);
+    let changes: [(&str, Change); 5] = [
+        ("source removed and re-added", |f| {
+            f.db.register_source_folders(&[]).unwrap();
+            f.db.register_source_folders(&f.roots).unwrap();
+        }),
+        ("role changed", |f| {
+            f.db.set_source_role(&f.roots[0], archivefs_core::SourceRole::ArcadeRomset)
+                .unwrap();
+        }),
+        ("platform assigned", |f| {
+            f.sql()
+                .execute(
+                    "UPDATE source_folders SET assigned_platform='Nintendo Entertainment System'",
+                    [],
+                )
+                .unwrap();
+        }),
+        ("another rebind committed", |f| {
+            let again = f.db.review_source_rebind(f.source_id(0)).unwrap();
+            f.db.confirm_source_rebind(&again).unwrap();
+        }),
+        ("a scan ran", |f| {
+            // A scan of the source is refused (it needs review) but still records an
+            // attempt; any catalogue write moves the epoch.
+            f.scan();
+            f.sql()
+                .execute("UPDATE archives SET updated_at=updated_at", [])
+                .unwrap();
+        }),
+    ];
+    for (label, change) in changes {
+        let mut f = Fixture::new(&["games"]);
+        f.add(0, "game.zip");
+        f.make_historical();
+        let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+        change(&mut f);
+        let before = binding_rows(&f.sql());
+        let result = f.db.confirm_source_rebind(&review);
+        assert!(result.is_err(), "{label}: a stale review was accepted");
+        if label != "another rebind committed" {
+            assert_eq!(binding_rows(&f.sql()), before, "{label}");
+        }
+    }
+}
+
+#[test]
+fn read_only_use_does_not_invalidate_a_review() {
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    f.make_historical();
+    let review = f.db.review_source_rebind(f.source_id(0)).unwrap();
+    // Everything the GUI does while a review is on screen: health, previews, a
+    // snapshot-style reopen, and a fresh review of the same source.
+    f.db.source_health(&f.roots).unwrap();
+    archivefs_core::catalogue_health::preview_catalogue_health(&f.db, &f.roots).unwrap();
+    f.db.load_archives().unwrap();
+    f.db.list_source_folders().unwrap();
+    let path = f.db.path().to_path_buf();
+    drop(f.db);
+    f.db = Database::open_or_create(&path).unwrap();
+    assert_eq!(f.db.review_source_rebind(f.source_id(0)).unwrap(), review);
+    // Display-only state lives in config.toml / GUI state, not in the catalogue, so
+    // it cannot move the epoch. Any catalogue write is treated as authority-relevant
+    // (see `confirm_source_rebind`): reviews are confirmed straight away.
+    f.db.confirm_source_rebind(&review).unwrap();
+}
+
+// --- Self-audit: attacks that must all fail closed ----------------------------------
+
+#[test]
+fn self_audit_every_old_generation_is_dead_after_a_rebind() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let mut runs = vec![f.scan().scan_run_id];
+    for _ in 0..3 {
+        f.replace_root(0, &format!("kept-{}", runs.len()));
+        fs::write(f.roots[0].join("game.zip"), b"fixture bytes").unwrap();
+        rebind_every_way(&mut f, 0, runs.len() % 2 == 0);
+        runs.push(f.scan().scan_run_id);
+    }
+    // Rebind once more; now try every earlier run's coverage.
+    f.replace_root(0, "kept-final");
+    rebind_every_way(&mut f, 0, true);
+    fs::remove_file(f.roots[0].join("game.zip")).ok();
+    fs::remove_file(path).ok();
+    let source = f.source_id(0);
+    for run in runs {
+        assert!(
+            f.db.mark_unseen_archives_missing(run, source, &[]).is_err(),
+            "run {run}"
+        );
+    }
+    assert_eq!(f.flag(id), None);
 }

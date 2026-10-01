@@ -185,28 +185,21 @@ impl Database {
         if let Some((old, _)) = self.source_binding(source)? {
             return Ok(old == json);
         }
-        let historical: bool = self
-            .connection
-            .query_row(
-                "SELECT last_successful_scan_at IS NOT NULL FROM source_folders WHERE id=?1",
-                [source],
-                |r| r.get(0),
-            )
-            .map_err(|e| db_error("check unbound historical source", e))?;
-        if historical {
+        // Only a source the catalogue knows nothing about may bind itself, and only
+        // on its very first scan. Anything with history needs a reviewed rebind:
+        // never trust whatever storage happens to be at the old path.
+        if source_has_catalogue_history(&self.connection, source)? {
             return Ok(false);
         }
-        self.connection
-            .execute(
-                "INSERT INTO source_scan_bindings VALUES (?1,?2,1)",
-                params![source, json],
-            )
-            .map_err(|e| db_error("bind first source scan", e))?;
-        Ok(true)
+        write_rebind(&self.connection, source, &None, &json)
     }
 
-    /// Administrative boundary for a separately reviewed legitimate restore or
-    /// remount. Caller must supply the generation they reviewed. Does not change
+    /// Administrative form of the reviewed rebind, kept for callers that hold a
+    /// generation and a binding but no review token. It is not a second authority
+    /// path: it verifies the same facts (accepted generation, live storage matches
+    /// the reviewed binding, before and after the write) and commits through the
+    /// same single [`write_rebind`], so the new generation is always strictly
+    /// above every generation coverage was ever recorded for. Does not change
     /// catalogue membership or missing evidence; a new scan is still required.
     pub fn rebind_source_after_review(
         &mut self,
@@ -214,35 +207,34 @@ impl Database {
         expected_generation: i64,
         expected_binding: SourceRootBinding,
     ) -> Result<()> {
-        let root: Vec<u8> = self
-            .connection
-            .query_row(
-                "SELECT path FROM source_folders WHERE id=?1 AND removed_from_config_at IS NULL",
-                [source],
-                |r| r.get(0),
-            )
-            .map_err(|e| db_error("review source root", e))?;
-        let root = PathBuf::from(OsString::from_vec(root));
-        if SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding) {
-            return Err(ArchiveFsError::Database(
-                "reviewed source root changed".into(),
-            ));
+        let stale = || ArchiveFsError::Database(REBIND_REVIEW_AGAIN.into());
+        let (root, removed, _) = self
+            .source_review_row(source)?
+            .ok_or_else(|| ArchiveFsError::Database("that source is not configured".into()))?;
+        if removed || SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding) {
+            return Err(stale());
         }
         let tx = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| db_error("begin source rebind", e))?;
+        let existing: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT root_identity_json,generation FROM source_scan_bindings WHERE source_folder_id=?1",
+                [source],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| db_error("recheck source binding", e))?;
+        if existing.as_ref().map_or(0, |(_, g)| *g) != expected_generation {
+            return Err(stale());
+        }
         let json = serde_json::to_string(&expected_binding)
             .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
-        let changed = if expected_generation == 0 {
-            tx.execute("INSERT INTO source_scan_bindings(source_folder_id,root_identity_json,generation) SELECT ?1,?2,1 WHERE NOT EXISTS (SELECT 1 FROM source_scan_bindings WHERE source_folder_id=?1)",params![source,json])
-        } else {
-            tx.execute("UPDATE source_scan_bindings SET root_identity_json=?3,generation=generation+1 WHERE source_folder_id=?1 AND generation=?2",params![source,expected_generation,json])
-        }.map_err(|e|db_error("reviewed source rebind",e))?;
-        if changed != 1 || SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding) {
-            return Err(ArchiveFsError::Database(
-                "source generation changed; review again".into(),
-            ));
+        if !write_rebind(&tx, source, &existing, &json)?
+            || SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding)
+        {
+            return Err(stale());
         }
         tx.commit().map_err(|e| db_error("commit source rebind", e))
     }
@@ -577,6 +569,9 @@ impl Database {
                 "this library database has no source binding to review".into(),
             ));
         }
+        let epoch = self.catalogue_health_epoch()?.ok_or_else(|| {
+            ArchiveFsError::Database("this library database has no source binding to review".into())
+        })?;
         let (root, _, last_success) = self
             .source_review_row(source)?
             .filter(|(_, removed, _)| !removed)
@@ -594,7 +589,9 @@ impl Database {
         })?;
         let bound = self.source_binding(source)?;
         let (generation, recorded, reason) = match bound {
-            None if last_success.is_some() => (0, None, RebindReason::NeverBound),
+            None if source_has_catalogue_history(&self.connection, source)? => {
+                (0, None, RebindReason::NeverBound)
+            }
             None => {
                 return Err(ArchiveFsError::Database(
                     "this source has never been scanned; its first scan records its storage \
@@ -633,6 +630,7 @@ impl Database {
             reason,
             archive_count,
             last_successful_scan_at: last_success,
+            epoch,
         })
     }
 
@@ -666,6 +664,22 @@ impl Database {
         if removed || path != review.path.as_os_str().as_bytes() {
             return Err(stale());
         }
+        // The catalogue epoch is a monotonic counter bumped by triggers on every
+        // mutation of sources, archives, scans, coverage, bindings, identity facts
+        // and platform assignments. A source removed and re-added, a changed role,
+        // another rebind, or any scan all move it, which is the only reliable way to
+        // see a remove/re-add (the row ends up identical). Reviews are meant to be
+        // confirmed straight away, so any intervening write means: review it again.
+        let epoch: i64 = tx
+            .query_row(
+                "SELECT revision FROM catalogue_health_epoch WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| db_error("recheck catalogue epoch", e))?;
+        if epoch != review.epoch {
+            return Err(stale());
+        }
         let existing: Option<(String, i64)> = tx
             .query_row(
                 "SELECT root_identity_json,generation FROM source_scan_bindings WHERE source_folder_id=?1",
@@ -676,36 +690,21 @@ impl Database {
             .map_err(|e| db_error("recheck source binding", e))?;
         let new_json = serde_json::to_string(&review.current)
             .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
-        let changed = match (&existing, review.generation) {
-            // The first generation starts above any generation coverage was ever
-            // recorded for, so a binding that went missing can never make old
-            // coverage look current again. (Normally this is exactly 1.)
-            (None, 0) if review.recorded.is_none() => tx.execute(
-                "INSERT INTO source_scan_bindings(source_folder_id,root_identity_json,generation) \
-                 VALUES(?1,?2,1+COALESCE((SELECT MAX(source_generation) FROM scan_source_coverage \
-                 WHERE source_folder_id=?1),0))",
-                params![review.source_id, new_json],
-            ),
-            (Some((json, generation)), reviewed)
-                if reviewed > 0
-                    && *generation == reviewed
+        let reviewed_state_holds = match &existing {
+            None => review.generation == 0 && review.recorded.is_none(),
+            Some((json, generation)) => {
+                review.generation > 0
+                    && *generation == review.generation
                     && Some(json.clone())
                         == review
                             .recorded
                             .as_ref()
                             .and_then(|r| serde_json::to_string(r).ok())
-                    && *json != new_json =>
-            {
-                tx.execute(
-                    "UPDATE source_scan_bindings SET root_identity_json=?3,generation=generation+1 \
-                     WHERE source_folder_id=?1 AND generation=?2",
-                    params![review.source_id, reviewed, new_json],
-                )
+                    && *json != new_json
             }
-            _ => return Err(stale()),
-        }
-        .map_err(|e| db_error("reviewed source rebind", e))?;
-        if changed != 1
+        };
+        if !reviewed_state_holds
+            || !write_rebind(&tx, review.source_id, &existing, &new_json)?
             || SourceRootBinding::inspect(&review.path).as_ref() != Some(&review.current)
         {
             return Err(stale());
@@ -727,9 +726,8 @@ impl Database {
             {
                 continue;
             }
-            let last_success = self
-                .source_review_row(source.source_id)?
-                .and_then(|(_, _, last_success)| last_success);
+            let historical =
+                schema_23 && source_has_catalogue_history(&self.connection, source.source_id)?;
             let bound = if schema_23 {
                 self.source_binding(source.source_id)?
             } else {
@@ -752,7 +750,7 @@ impl Database {
                 continue;
             };
             match &bound {
-                None if last_success.is_some() => {
+                None if historical => {
                     entry.state = SourceHealthState::RebindRequired;
                     entry.rebind = Some(RebindReason::NeverBound);
                     health.push(entry);
@@ -773,25 +771,10 @@ impl Database {
                 }
                 Some(_) => {}
             }
-            let latest: Option<(String, Option<i64>)> = self
-                .connection
-                .query_row(
-                    // A run that did not attempt this source records NotAttempted for
-                    // it (a targeted scan of another folder does). That is not an
-                    // observation of this source, so the latest *attempt* decides.
-                    "SELECT state, source_generation FROM scan_source_coverage \
-                     WHERE source_folder_id=?1 AND state NOT IN ('\"not_attempted\"','\"removed\"') \
-                     ORDER BY scan_run_id DESC LIMIT 1",
-                    [source.source_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()
-                .map_err(|e| db_error("read latest source coverage", e))?;
-            let covered = latest.as_ref().and_then(|(state, recorded)| {
-                (*recorded == Some(generation))
-                    .then(|| serde_json::from_str::<ScanCoverageState>(state).ok())
-                    .flatten()
-            });
+            // A scan that did not attempt this source (a targeted scan of another
+            // folder) is not an observation of it; the latest real attempt decides.
+            let covered = latest_actual_attempt(&self.connection, source.source_id)?
+                .and_then(|(_, state, recorded)| (recorded == Some(generation)).then_some(state));
             let Some(covered) = covered else {
                 health.push(entry);
                 continue;
@@ -815,6 +798,157 @@ impl Database {
         }
         Ok(health)
     }
+}
+
+// --- The one authority rule -----------------------------------------------------
+//
+// NO new Missing evidence unless the source is presently Healthy for the exact
+// current binding, generation and latest completed scan attempt. Everything below
+// is shared by the binding gate, the reviewed rebind, source health and the Missing
+// write boundary, so there is exactly one definition of each fact.
+
+/// Coverage rows that record a scan *not looking at* a source. A targeted scan of
+/// another folder writes `NotAttempted` for this one; that is not an observation of
+/// it and never supersedes its latest real attempt.
+const NOT_AN_ATTEMPT: &str = "('\"not_attempted\"','\"removed\"')";
+
+/// Whether this source is *historical*: the catalogue already knew it before it
+/// could be bound, so its current storage may not be what that history came from
+/// and it must never be bound automatically. Three independent facts say so:
+/// migration found catalogue rows or a successful scan for it when the schema was
+/// applied (`source_review_required`), it has a successful-scan timestamp, or a
+/// scan attempted it *under an accepted generation* (a first scan that found the
+/// drive offline observed nothing, so it is not history). `last_successful_scan_at` alone is not enough: a
+/// migrated catalogue can have rows and no timestamp, which is exactly why the
+/// migration records the fact. A source added afterwards has none of these, so its
+/// first scan may bind it.
+pub(super) fn source_has_catalogue_history(connection: &Connection, source: i64) -> Result<bool> {
+    connection
+        .query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM source_review_required WHERE source_folder_id=?1) \
+                 OR COALESCE((SELECT last_successful_scan_at IS NOT NULL FROM source_folders WHERE id=?1),0) \
+                 OR EXISTS(SELECT 1 FROM scan_source_coverage WHERE source_folder_id=?1 AND source_generation IS NOT NULL AND state NOT IN {NOT_AN_ATTEMPT})"
+            ),
+            [source],
+            |r| r.get(0),
+        )
+        .map_err(|e| db_error("check source catalogue history", e))
+}
+
+/// The most recent scan that actually attempted this source: `(run, outcome,
+/// generation recorded for it)`. An unreadable outcome counts as `Failed`.
+pub(super) fn latest_actual_attempt(
+    connection: &Connection,
+    source: i64,
+) -> Result<Option<(i64, ScanCoverageState, Option<i64>)>> {
+    let row: Option<(i64, String, Option<i64>)> = connection
+        .query_row(
+            &format!(
+                "SELECT scan_run_id, state, source_generation FROM scan_source_coverage \
+                 WHERE source_folder_id=?1 AND state NOT IN {NOT_AN_ATTEMPT} \
+                 ORDER BY scan_run_id DESC LIMIT 1"
+            ),
+            [source],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| db_error("read latest source attempt", e))?;
+    Ok(row.map(|(run, state, generation)| {
+        let state = serde_json::from_str(&state).unwrap_or(ScanCoverageState::Failed);
+        (run, state, generation)
+    }))
+}
+
+/// The generation a new binding must take: strictly above the one it replaces and
+/// above every generation coverage was ever recorded for, so no historical
+/// coverage can collide with it. Checked: it errors rather than wrapping.
+pub(super) fn next_source_generation(
+    connection: &Connection,
+    source: i64,
+    current: i64,
+) -> Result<i64> {
+    let recorded: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(source_generation),0) FROM scan_source_coverage WHERE source_folder_id=?1",
+            [source],
+            |r| r.get(0),
+        )
+        .map_err(|e| db_error("read historical source generations", e))?;
+    current.max(recorded).checked_add(1).ok_or_else(|| {
+        ArchiveFsError::Database("source generation space is exhausted; nothing was changed".into())
+    })
+}
+
+/// Refuses unless `scan_run_id` is the latest actual attempt for this source, it
+/// completed, and it was recorded for the source's *current* binding generation.
+/// Called at the write boundary itself, so no caller can supply stale coverage.
+pub(super) fn assert_missing_authority(
+    connection: &Connection,
+    source: i64,
+    scan_run_id: i64,
+) -> Result<()> {
+    let binding: Option<i64> = connection
+        .query_row(
+            "SELECT generation FROM source_scan_bindings WHERE source_folder_id=?1",
+            [source],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| db_error("read binding for missing authority", e))?;
+    let Some(generation) = binding else {
+        return Err(ArchiveFsError::Database(
+            "source has no accepted storage binding; reviewed rebind required; no missing evidence written"
+                .into(),
+        ));
+    };
+    match latest_actual_attempt(connection, source)? {
+        Some((run, _, _)) if run != scan_run_id => Err(ArchiveFsError::Database(
+            "coverage superseded by a later scan attempt; no missing evidence written".into(),
+        )),
+        Some((_, ScanCoverageState::Complete, Some(recorded))) if recorded == generation => Ok(()),
+        Some((_, ScanCoverageState::Complete, _)) => Err(ArchiveFsError::Database(
+            "source generation changed; new scan required".into(),
+        )),
+        _ => Err(ArchiveFsError::Database(
+            "latest scan attempt was not complete; no missing evidence written".into(),
+        )),
+    }
+}
+
+/// The only place a source binding is written after first capture. `existing` is
+/// what the caller verified; the write is conditional on it, and the generation is
+/// allocated by [`next_source_generation`].
+fn write_rebind(
+    connection: &Connection,
+    source: i64,
+    existing: &Option<(String, i64)>,
+    new_json: &str,
+) -> Result<bool> {
+    let generation =
+        next_source_generation(connection, source, existing.as_ref().map_or(0, |(_, g)| *g))?;
+    let changed = match existing {
+        None => connection.execute(
+            "INSERT INTO source_scan_bindings(source_folder_id,root_identity_json,generation) \
+             SELECT ?1,?2,?3 WHERE NOT EXISTS (SELECT 1 FROM source_scan_bindings WHERE source_folder_id=?1)",
+            params![source, new_json, generation],
+        ),
+        Some((_, old)) => connection.execute(
+            "UPDATE source_scan_bindings SET root_identity_json=?2,generation=?3 \
+             WHERE source_folder_id=?1 AND generation=?4",
+            params![source, new_json, generation, old],
+        ),
+    }
+    .map_err(|e| db_error("write reviewed source binding", e))?;
+    if changed == 1 {
+        connection
+            .execute(
+                "DELETE FROM source_review_required WHERE source_folder_id=?1",
+                [source],
+            )
+            .map_err(|e| db_error("clear source review requirement", e))?;
+    }
+    Ok(changed == 1)
 }
 
 /// Previously observed nested boundaries that are gone, no longer a mount root

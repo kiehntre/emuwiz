@@ -5951,29 +5951,21 @@ impl Database {
                 "source ownership changed since coverage proof".into(),
             ));
         }
-        if let Some((binding, generation)) = self.source_binding(source_folder_id)? {
-            let recorded:Option<i64> = self.connection.query_row("SELECT source_generation FROM scan_source_coverage WHERE scan_run_id=?1 AND source_folder_id=?2",params![scan_run_id,source_folder_id],|r|r.get(0)).map_err(|e|db_error("read coverage generation",e))?;
-            if recorded != Some(generation)
-                || serde_json::to_string(&source_guard.binding).ok().as_deref()
-                    != Some(binding.as_str())
-            {
-                return Err(ArchiveFsError::Database(
-                    "source generation changed; new scan required".into(),
-                ));
-            }
-        }
-        if self.source_binding(source_folder_id)?.is_none()
-            && self
-                .connection
-                .query_row(
-                    "SELECT last_successful_scan_at IS NOT NULL FROM source_folders WHERE id=?1",
-                    [source_folder_id],
-                    |r| r.get::<_, bool>(0),
-                )
-                .map_err(|e| db_error("verify legacy missing authority", e))?
+        // The write boundary decides authority itself, whatever coverage the caller
+        // holds: a binding must exist, and the supplied run must be the latest actual
+        // attempt for this source, complete, and recorded for the current generation.
+        // (It also pins the live root to the accepted binding.)
+        catalogue_health::assert_missing_authority(
+            &self.connection,
+            source_folder_id,
+            scan_run_id,
+        )?;
+        if let Some((binding, _)) = self.source_binding(source_folder_id)?
+            && serde_json::to_string(&source_guard.binding).ok().as_deref()
+                != Some(binding.as_str())
         {
             return Err(ArchiveFsError::Database(
-                "historical source needs reviewed initial binding".into(),
+                "source generation changed; new scan required".into(),
             ));
         }
         let mut stmt = self
@@ -6054,6 +6046,8 @@ impl Database {
             Ok(())
         };
         ensure_boundaries_hold(&tx)?;
+        // Re-checked inside the write transaction, not just before it.
+        catalogue_health::assert_missing_authority(&tx, source_folder_id, scan_run_id)?;
         for archive_id in &missing {
             let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
             let path = PathBuf::from(OsString::from_vec(bytes));
@@ -6085,6 +6079,7 @@ impl Database {
         }
         // Last authority check: an early return here drops (rolls back) `tx`.
         ensure_boundaries_hold(&tx)?;
+        catalogue_health::assert_missing_authority(&tx, source_folder_id, scan_run_id)?;
         tx.commit()
             .map_err(|error| db_error("failed to commit mark-missing", error))?;
         Ok(missing.len() as i64)
@@ -10613,6 +10608,7 @@ mod tests {
                 "screenscraper_enrichments",
                 "source_folders",
                 "source_nested_boundaries",
+                "source_review_required",
                 "source_scan_bindings",
                 "verified_identity_facts",
             ]

@@ -497,6 +497,84 @@ Still deliberately outside this change: Home, Browse, Game Details, Check Games
 and Problems & Repair do not yet show this projection; there is no command-line
 rebind; relink/removal review flows and archive integrity checks are unchanged.
 
+## Authority repair after the focused safety review
+
+An independent review reproduced four blockers (five failing tests). All five are
+now committed regression tests and fail closed. The repair is one rule, stated
+once and enforced at the lowest layer that can act on it:
+
+> **No new Missing evidence unless the source is presently Healthy for the exact
+> current binding, generation and latest completed scan attempt.** Presentation
+> state is never the authority source, historical coverage never becomes current
+> because generations collide, and migration never grants trust to whatever
+> storage happens to exist at an old path.
+
+**Blocker 1: migration auto-bound replacement storage.** A migrated source with
+catalogue rows and a NULL `last_successful_scan_at` passed the binding gate
+(which asked only about that timestamp), so its first post-migration scan bound
+whatever directory was at the path and then wrote Missing evidence. Older
+databases never recorded the timestamp, so its absence is not evidence of a new
+source. The fix does not infer anything at scan time: migration 23 now records
+*which sources had history when the schema was applied* in a new table,
+`source_review_required` (sources with a successful-scan timestamp or any
+catalogue row). That table binds nothing, changes no historical row and writes no
+Missing evidence; a reviewed rebind deletes the source's row. A source is
+*historical* (never auto-bound) if it is in that table, has a successful-scan
+timestamp, or was attempted by a scan under an accepted generation. A source added
+after migration has none of these, so its first scan may still bind it; a first
+scan that found the drive offline observed nothing and is not history. An
+unbound historical source is refused by the scan (it reports "reviewed rebind
+required") and has no Missing authority until a person reviews it.
+
+**Blocker 2: superseded coverage authorized Missing.** `mark_unseen_archives_missing`
+trusted the run it was given. It now asks the database itself, before reading
+candidates, inside the write savepoint, and again before commit
+(`assert_missing_authority`): a binding exists; the supplied run is the *latest
+actual attempt* for the source; it completed; and it was recorded for the current
+generation. A later partial, failed, unavailable or skipped attempt supersedes an
+older complete one. A `NotAttempted`/`Removed` row is not an attempt (a targeted
+scan of another folder writes it for this source), so it supersedes nothing. Source
+health selects the latest attempt through the same function.
+
+**Blocker 3: the legacy public rebind API reused generation 1.** There is now one
+writer of bindings after first capture, `write_rebind`, and every path goes through
+it: first-scan capture, `rebind_source_after_review` (kept only as an administrative
+form for callers that hold a generation and a binding; it verifies the same facts and
+commits through `write_rebind`) and `confirm_source_rebind`. `write_rebind` allocates
+the new generation with `next_source_generation`: strictly above the binding it
+replaces and above every generation coverage was ever recorded for, using checked
+arithmetic that refuses instead of wrapping. No old coverage can become current.
+
+**Blocker 4: stale configuration reviews were accepted.** A review now carries the
+catalogue epoch it was made at, and confirming re-reads it in the same immediate
+transaction. The epoch is bumped by triggers on every mutation of sources, archives,
+scans, coverage, bindings, identity facts and platform assignments, so a source
+removed and re-added (whose row ends up byte-identical, which no field comparison
+can see), a changed role or platform, another rebind and any scan all refuse with
+"review it again". The reviewed path, source row, removed flag, accepted generation,
+recorded binding and live storage are still checked as well, for specific refusals.
+The cost is deliberate: any catalogue write between review and confirm asks for a new
+review, which is cheap because a review is confirmed straight away. Read-only use
+(source health, previews, loading a snapshot, reopening, a fresh review) does not
+move the epoch and keeps a review valid. Display-only state lives in `config.toml` or
+the GUI, not the catalogue, so it cannot invalidate a review.
+
+**One authority path, audited.** The only SQL that writes `source_scan_bindings` is
+inside `write_rebind`. The only statement that marks an archive missing is inside
+`mark_unseen_archives_missing`, behind the assertion. The only public rebind entry
+points are `review_source_rebind` (read-only), `confirm_source_rebind`, the
+administrative `rebind_source_after_review` and their path wrappers. Production
+callers: binding by the scan (`bind_scan_source`), Missing writes by the full and the
+fingerprint-reused persistence paths (both call the one function), review/confirm by
+the Sources page. `tests/catalogue_authority_paths.rs` fails if a second binding
+writer, an unguarded Missing write or another public rebind path appears.
+
+Migration 21 to 23 is otherwise unchanged: historical tables are preserved row for
+row, nothing is bound, no Missing evidence is generated, integrity and foreign keys
+are clean and a reopen is idempotent. A database already migrated by an earlier,
+unreleased build of this candidate lacks `source_review_required` and must be
+migrated from its pre-23 backup.
+
 ## Deferred GUI work
 
 The Sources-page projection and reviewed rebind above are done. Pass 2 should still project this classification into
