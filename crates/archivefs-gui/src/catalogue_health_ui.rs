@@ -201,6 +201,17 @@ impl Overall {
     }
 }
 
+/// Caveat shown beside the row-level counts. Those counts say where each game's
+/// file is *now*; they are not permission to record anything as missing. For a
+/// folder that still needs review, EmuWiz will not record a game as missing
+/// until the person has reviewed it and a new complete scan has run.
+pub(crate) fn row_counts_caveat(overall: &Overall) -> Option<&'static str> {
+    (overall.review_needed > 0).then_some(
+        "Folders that need review are counted by where their files are now. EmuWiz will not \
+         record any game as missing for them until you review them and scan again.",
+    )
+}
+
 /// One plain sentence for what stops the catalogue being trusted, or `None` when
 /// nothing the backend has answered is blocking. Unknown sources are reported
 /// separately by the caller; they are not a reason in themselves.
@@ -745,6 +756,9 @@ pub(crate) fn show_health_section(
                 for note in &found.notes {
                     ui.weak(note.as_str());
                 }
+                if let Some(caveat) = row_counts_caveat(&overall) {
+                    ui.weak(caveat);
+                }
                 if counts.not_checked > 0 || overall.unknown > 0 {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
@@ -937,6 +951,15 @@ mod tests {
         assert!(text.contains("1 folder cannot be reached"), "{text}");
         assert!(text.contains("1 folder had an incomplete scan"), "{text}");
         assert!(text.contains("1 folder needs a scan"), "{text}");
+    }
+
+    #[test]
+    fn row_counts_carry_a_caveat_only_while_a_folder_needs_review() {
+        let blocked = Overall::from_rows(&[row(Some(SourceHealthState::RebindRequired))]);
+        let caveat = row_counts_caveat(&blocked).unwrap();
+        assert!(caveat.contains("will not record any game as missing"));
+        let clear = Overall::from_rows(&[row(Some(SourceHealthState::Healthy))]);
+        assert_eq!(row_counts_caveat(&clear), None);
     }
 
     #[test]
