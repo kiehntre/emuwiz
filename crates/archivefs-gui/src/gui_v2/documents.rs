@@ -8,16 +8,15 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
     path::{Component, Path, PathBuf},
 };
 
+use archivefs_core::manual_document::{ManualLimits, ManualViewerAction, inspect_manual};
 use serde::{Deserialize, Serialize};
 
 const MAX_ROOTS: usize = 16;
 const MAX_FILES_PER_DIRECTORY: usize = 512;
 const MAX_DOCUMENTS: usize = 256;
-const MAX_CBZ_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum GameDocumentKind {
@@ -263,6 +262,28 @@ pub(crate) enum ViewerCommand {
     ToggleControls,
 }
 
+impl ViewerCommand {
+    /// The canonical viewer action this command drives, where one exists.
+    /// `Open`, the page jumps, `Pan` and the controls toggle have no effect on
+    /// `ManualViewerState` yet, so they return `None` rather than guessing.
+    #[allow(
+        dead_code,
+        reason = "reserved for the embedded viewer surface, which is not routed yet"
+    )]
+    pub(crate) fn viewer_action(self) -> Option<ManualViewerAction> {
+        match self {
+            Self::PreviousPage => Some(ManualViewerAction::PreviousPage),
+            Self::NextPage => Some(ManualViewerAction::NextPage),
+            Self::ZoomIn => Some(ManualViewerAction::ZoomIn),
+            Self::ZoomOut => Some(ManualViewerAction::ZoomOut),
+            Self::Return => Some(ManualViewerAction::Close),
+            Self::Open | Self::PreviousJump | Self::NextJump | Self::Pan | Self::ToggleControls => {
+                None
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn map_viewer_input(input: ViewerInput) -> ViewerCommand {
     match input {
@@ -493,9 +514,15 @@ fn inspect_capability(
     path: &Path,
     format: GameDocumentFormat,
 ) -> (Option<usize>, DocumentOpenCapability) {
+    // One canonical inspector decides what a file is and how many pages it has
+    // (`archivefs_core::manual_document`); discovery only asks it. It is bounded
+    // and read-only, and trusts content signatures over the extension.
     let page_count = match format {
-        GameDocumentFormat::Pdf => pdf_page_count(path),
-        GameDocumentFormat::Cbz => inspect_cbz(path).ok().map(|pages| pages.len()),
+        GameDocumentFormat::Pdf | GameDocumentFormat::Cbz => {
+            inspect_manual(path, &ManualLimits::default())
+                .ok()
+                .and_then(|inspection| inspection.page_count)
+        }
         GameDocumentFormat::Cbr | GameDocumentFormat::Unknown => None,
     };
     (
@@ -561,90 +588,6 @@ fn document_open_capability_with(
             }
         }
     }
-}
-
-fn pdf_page_count(path: &Path) -> Option<usize> {
-    let mut file = fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.by_ref()
-        .take(4 * 1024 * 1024)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let count = bytes
-        .windows(12)
-        .filter(|window| window[..11] == *b"/Type /Page" && window[11] != b's')
-        .count();
-    (count > 0).then_some(count)
-}
-
-pub(crate) fn inspect_cbz(path: &Path) -> Result<Vec<String>, String> {
-    let file = fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|error| format!("malformed CBZ: {error}"))?;
-    if archive.len() > MAX_CBZ_ENTRIES {
-        return Err("CBZ has too many entries".into());
-    }
-    let mut pages = Vec::new();
-    for index in 0..archive.len() {
-        let entry = archive
-            .by_index(index)
-            .map_err(|error| format!("malformed CBZ entry: {error}"))?;
-        let name = entry.name().replace('\\', "/");
-        let path = Path::new(&name);
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(format!("unsafe CBZ entry: {name}"));
-        }
-        if !entry.is_dir()
-            && matches!(
-                path.extension()
-                    .and_then(|v| v.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")
-            )
-        {
-            pages.push(name);
-        }
-    }
-    pages.sort_by_key(|name| natural_sort_key(name));
-    Ok(pages)
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
-enum NaturalPart {
-    Text(String),
-    Number(u64),
-}
-
-fn natural_sort_key(value: &str) -> Vec<NaturalPart> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut numeric = false;
-    for character in value.chars() {
-        let next_numeric = character.is_ascii_digit();
-        if !current.is_empty() && next_numeric != numeric {
-            parts.push(if numeric {
-                NaturalPart::Number(current.parse().unwrap_or(u64::MAX))
-            } else {
-                NaturalPart::Text(current)
-            });
-            current = String::new();
-        }
-        numeric = next_numeric;
-        current.push(character.to_ascii_lowercase());
-    }
-    if !current.is_empty() {
-        parts.push(if numeric {
-            NaturalPart::Number(current.parse().unwrap_or(u64::MAX))
-        } else {
-            NaturalPart::Text(current)
-        });
-    }
-    parts
 }
 
 /// Request to project a RomM-provided manual reference into the local
@@ -787,6 +730,37 @@ mod tests {
         writer.finish().unwrap();
     }
 
+    /// Page names as the canonical inspector reports them.
+    fn inspect_cbz(path: &Path) -> Result<Vec<String>, String> {
+        inspect_manual(path, &ManualLimits::default())
+            .map(|inspection| inspection.pages.into_iter().map(|p| p.name).collect())
+            .map_err(|error| error.to_string())
+    }
+
+    /// A structurally valid one-section PDF with `pages` declared pages.
+    fn minimal_pdf(pages: usize) -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [3 0 R] /Count {pages} >>"),
+            "<< /Type /Page /Parent 2 0 R >>".to_string(),
+        ];
+        let mut out = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(out.len());
+            out.extend(format!("{} 0 obj\n{object}\nendobj\n", index + 1).bytes());
+        }
+        let xref = out.len();
+        out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+        for offset in offsets {
+            out.extend(format!("{offset:010} 00000 n \n").bytes());
+        }
+        out.extend(
+            format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").bytes(),
+        );
+        out
+    }
+
     #[test]
     fn cbz_pages_use_natural_order() {
         let dir = tempdir().unwrap();
@@ -796,6 +770,70 @@ mod tests {
             inspect_cbz(&path).unwrap(),
             ["page1.png", "page2.png", "page10.png"]
         );
+    }
+
+    #[test]
+    fn discovery_page_counts_come_from_the_canonical_inspector() {
+        let dir = tempdir().unwrap();
+        let cbz_path = dir.path().join("guide.cbz");
+        cbz(&cbz_path, &["1.png", "2.png", "3.png"]);
+        let pdf_path = dir.path().join("manual.pdf");
+        fs::write(&pdf_path, minimal_pdf(5)).unwrap();
+        assert_eq!(
+            inspect_capability(&cbz_path, GameDocumentFormat::Cbz).0,
+            Some(3)
+        );
+        assert_eq!(
+            inspect_capability(&pdf_path, GameDocumentFormat::Pdf).0,
+            Some(5)
+        );
+        // A byte-scan lookalike is no longer mistaken for a countable PDF.
+        let fake = dir.path().join("fake.pdf");
+        fs::write(&fake, b"%PDF /Type /Pages /Count 2 /Type /Page\n").unwrap();
+        assert_eq!(inspect_capability(&fake, GameDocumentFormat::Pdf).0, None);
+    }
+
+    #[test]
+    fn viewer_commands_map_onto_the_canonical_actions() {
+        use ViewerCommand as C;
+        assert_eq!(
+            C::NextPage.viewer_action(),
+            Some(ManualViewerAction::NextPage)
+        );
+        assert_eq!(
+            C::PreviousPage.viewer_action(),
+            Some(ManualViewerAction::PreviousPage)
+        );
+        assert_eq!(C::ZoomIn.viewer_action(), Some(ManualViewerAction::ZoomIn));
+        assert_eq!(
+            C::ZoomOut.viewer_action(),
+            Some(ManualViewerAction::ZoomOut)
+        );
+        assert_eq!(C::Return.viewer_action(), Some(ManualViewerAction::Close));
+        for command in [
+            C::Open,
+            C::PreviousJump,
+            C::NextJump,
+            C::Pan,
+            C::ToggleControls,
+        ] {
+            assert_eq!(command.viewer_action(), None, "{command:?}");
+        }
+        // Every generic input reaches a command, and none panics.
+        for input in [
+            ViewerInput::Confirm,
+            ViewerInput::Back,
+            ViewerInput::PreviousPage,
+            ViewerInput::NextPage,
+            ViewerInput::PreviousJump,
+            ViewerInput::NextJump,
+            ViewerInput::Pan,
+            ViewerInput::ZoomIn,
+            ViewerInput::ZoomOut,
+            ViewerInput::Menu,
+        ] {
+            let _ = map_viewer_input(input).viewer_action();
+        }
     }
     #[test]
     fn unsafe_cbz_entries_are_refused() {
@@ -823,8 +861,7 @@ mod tests {
         let game = dir.path().join("game.bin");
         fs::write(&game, b"game").unwrap();
         let manual = dir.path().join("Sonic Manual.pdf");
-        let bytes = b"%PDF /Type /Pages /Count 2 /Type /Page\n/Type /Page\n";
-        fs::write(&manual, bytes).unwrap();
+        fs::write(&manual, minimal_pdf(2)).unwrap();
         let before = fs::read(&manual).unwrap();
         let docs = discover_documents(DocumentDiscoveryRequest {
             game_id: 4,
