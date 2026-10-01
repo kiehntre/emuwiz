@@ -118,6 +118,8 @@ pub mod native_support;
 pub mod np2kai;
 pub mod openmsx_command;
 pub mod openmsx_execution;
+#[cfg(target_os = "linux")]
+pub mod oricutron;
 pub mod pcsx2_command;
 pub mod pcsx2_execution;
 pub mod planning;
