@@ -410,6 +410,7 @@ pub mod saturn_boot_evidence;
 /// Deterministic, read-only Saturn CUE/BIN optical preservation manifests
 /// and byte/topology verifier.
 pub mod saturn_disc_manifest;
+pub mod saturn_patch_apply;
 /// Read-only, fail-closed Saturn patch compatibility and impact preview.
 pub mod saturn_patch_readiness;
 /// Read-only comparison proof for a future deterministic Saturn data-track
