@@ -74,6 +74,8 @@ pub mod atari800;
 pub mod azahar_command;
 pub mod azahar_execution;
 #[cfg(target_os = "linux")]
+pub mod b_em;
+#[cfg(target_os = "linux")]
 pub mod caprice32;
 pub mod cemu_command;
 pub mod cemu_execution;

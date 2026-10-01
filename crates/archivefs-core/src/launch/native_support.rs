@@ -23,10 +23,15 @@ use std::io::{self, Read};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use super::planning::CanonicalIdentityStatus;
 use super::process_spawn::CapturedFileIdentity;
+use super::readiness::LaunchReadiness;
 use super::safe_launch_sandbox::{
-    MAX_CONFIG_BYTES, MediaKind, MediaMember, MediaRole, SourceProvenance,
+    ConfigIsolation, LaunchMediaSafety, LaunchMediaSafetyDeclaration, MAX_CONFIG_BYTES, MediaKind,
+    MediaMember, MediaRole, PersistentStatePolicy, ProfileSeed, SafeLaunchSandboxError,
+    SandboxPlan, SourceProvenance, plan_sandbox,
 };
+use crate::identity_source::model::LocalEvidenceStrength;
 
 const MAX_EXPLICIT: usize = 16;
 const MAX_PATH_ENTRIES: usize = 64;
@@ -205,6 +210,180 @@ pub fn member(path: &Path, role: MediaRole, kind: MediaKind, suffix: &str) -> Me
         kind,
         suffix: suffix.into(),
     }
+}
+
+/// Honest launch status of a native adapter. A `PreviewReadinessOnly` adapter
+/// binds and validates its inputs but offers no `prepare`/`spawn`: some fact
+/// needed to launch it without touching the user's files could not be proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeAdapterClassification {
+    VerifiedLaunchable,
+    BackendReadyRealEmulatorUnverified,
+    PreviewReadinessOnly,
+    Blocked,
+}
+
+#[derive(Debug)]
+pub enum PreviewError {
+    ExecutableMissing,
+    ExecutableUnsafe,
+    IdentityNotVerified,
+    UnsupportedMedia(&'static str),
+    MachineRequired,
+    DisposableSessionRequired,
+    Sandbox(SafeLaunchSandboxError),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for PreviewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecutableMissing => f.write_str("the emulator executable is missing; select a native installation"),
+            Self::ExecutableUnsafe => f.write_str(
+                "the emulator requires an unchanged regular (non-symlink) executable with execute permission",
+            ),
+            Self::IdentityNotVerified => f.write_str(
+                "fresh verified platform evidence and a matching verified source hash are required; extension alone is insufficient",
+            ),
+            Self::UnsupportedMedia(reason) => f.write_str(reason),
+            Self::MachineRequired => f.write_str("select the machine explicitly; none is inferred"),
+            Self::DisposableSessionRequired => {
+                f.write_str("a disposable scratch session must be acknowledged; persistent sessions are not supported")
+            }
+            Self::Sandbox(error) => write!(f, "scratch planning refused: {error}"),
+            Self::Io(error) => write!(f, "input unavailable: {error}"),
+        }
+    }
+}
+impl std::error::Error for PreviewError {}
+impl From<SafeLaunchSandboxError> for PreviewError {
+    fn from(error: SafeLaunchSandboxError) -> Self {
+        Self::Sandbox(error)
+    }
+}
+impl From<io::Error> for PreviewError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+impl From<ExecutableRefusal> for PreviewError {
+    fn from(refusal: ExecutableRefusal) -> Self {
+        match refusal {
+            ExecutableRefusal::Missing => Self::ExecutableMissing,
+            ExecutableRefusal::Unsafe => Self::ExecutableUnsafe,
+        }
+    }
+}
+
+/// What a preview-only adapter validated. Deliberately has no argv, no
+/// `prepare` and no `spawn`: `unproven` lists exactly what stands in the way.
+#[derive(Debug, Clone)]
+pub struct NativePreview {
+    adapter: &'static str,
+    platform_id: &'static str,
+    executable: PathBuf,
+    executable_binding: ExecutableBinding,
+    scratch: SandboxPlan,
+    unproven: &'static [&'static str],
+}
+
+impl NativePreview {
+    pub fn adapter(&self) -> &'static str {
+        self.adapter
+    }
+    pub fn platform_id(&self) -> &'static str {
+        self.platform_id
+    }
+    pub fn classification(&self) -> NativeAdapterClassification {
+        NativeAdapterClassification::PreviewReadinessOnly
+    }
+    /// Never ready: launching is not offered. Inputs are valid, not launchable.
+    pub fn readiness(&self) -> LaunchReadiness {
+        LaunchReadiness::Blocked
+    }
+    pub fn is_launchable(&self) -> bool {
+        false
+    }
+    /// Why launch is not offered, in a person's words.
+    pub fn unproven(&self) -> &'static [&'static str] {
+        self.unproven
+    }
+    /// The hash-bound scratch plan that a future, proven launch would copy.
+    pub fn scratch_plan(&self) -> &SandboxPlan {
+        &self.scratch
+    }
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+    /// True while the executable and every bound source are unchanged.
+    pub fn is_fresh(&self) -> bool {
+        self.executable_binding.is_unchanged(&self.executable)
+            && self.scratch.revalidate_sources().is_ok()
+    }
+}
+
+pub struct PreviewRequest<'a> {
+    pub adapter: &'static str,
+    pub platform_id: &'static str,
+    pub executable: &'a Path,
+    pub media: &'a Path,
+    pub kind: MediaKind,
+    pub suffix: &'static str,
+    /// Canonical identity already resolved upstream, when the platform's
+    /// identity layer provides one.
+    pub identity: Option<&'a CanonicalIdentityStatus>,
+    pub platform_evidence: LocalEvidenceStrength,
+    pub verified_source_sha256: [u8; 32],
+    pub disposable_session_acknowledged: bool,
+    pub unproven: &'static [&'static str],
+}
+
+/// Common preview planning: executable policy, verified evidence bound to the
+/// SAME bytes, bounded media, scratch plan. `validate` is the platform's own
+/// structural check on the bound source.
+pub fn plan_preview(
+    request: PreviewRequest<'_>,
+    validate: impl FnOnce(&SourceProvenance) -> Result<(), PreviewError>,
+) -> Result<NativePreview, PreviewError> {
+    if !request.disposable_session_acknowledged {
+        return Err(PreviewError::DisposableSessionRequired);
+    }
+    let executable_binding = ExecutableBinding::capture(request.executable)?;
+    let identity_ok = request.identity.is_none_or(|identity| {
+        matches!(identity, CanonicalIdentityStatus::Resolved(id)
+            if id.platform_id == request.platform_id && !id.game_key.trim().is_empty())
+    });
+    if request.platform_evidence != LocalEvidenceStrength::Verified || !identity_ok {
+        return Err(PreviewError::IdentityNotVerified);
+    }
+    let scratch = plan_sandbox(
+        LaunchMediaSafetyDeclaration {
+            safety: LaunchMediaSafety::ScratchCopy,
+            // Config isolation is exactly what remains unproven here.
+            config_isolation: ConfigIsolation::None,
+            persistent_state: PersistentStatePolicy::DisposableSession,
+        },
+        &[member(
+            request.media,
+            MediaRole::PrimaryMedia,
+            request.kind,
+            request.suffix,
+        )],
+        ProfileSeed::Empty,
+    )?;
+    let source = scratch.sources().next().expect("one primary member");
+    if source.sha256 != request.verified_source_sha256 {
+        return Err(PreviewError::IdentityNotVerified);
+    }
+    validate(source)?;
+    Ok(NativePreview {
+        adapter: request.adapter,
+        platform_id: request.platform_id,
+        executable: request.executable.to_owned(),
+        executable_binding,
+        scratch,
+        unproven: request.unproven,
+    })
 }
 
 #[cfg(test)]
