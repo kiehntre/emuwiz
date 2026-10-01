@@ -194,49 +194,10 @@ impl Database {
         write_rebind(&self.connection, source, &None, &json)
     }
 
-    /// Administrative form of the reviewed rebind, kept for callers that hold a
-    /// generation and a binding but no review token. It is not a second authority
-    /// path: it verifies the same facts (accepted generation, live storage matches
-    /// the reviewed binding, before and after the write) and commits through the
-    /// same single [`write_rebind`], so the new generation is always strictly
-    /// above every generation coverage was ever recorded for. Does not change
-    /// catalogue membership or missing evidence; a new scan is still required.
-    pub fn rebind_source_after_review(
-        &mut self,
-        source: i64,
-        expected_generation: i64,
-        expected_binding: SourceRootBinding,
-    ) -> Result<()> {
-        let stale = || ArchiveFsError::Database(REBIND_REVIEW_AGAIN.into());
-        let (root, removed, _) = self
-            .source_review_row(source)?
-            .ok_or_else(|| ArchiveFsError::Database("that source is not configured".into()))?;
-        if removed || SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding) {
-            return Err(stale());
-        }
-        let tx = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| db_error("begin source rebind", e))?;
-        let existing: Option<(String, i64)> = tx
-            .query_row(
-                "SELECT root_identity_json,generation FROM source_scan_bindings WHERE source_folder_id=?1",
-                [source],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(|e| db_error("recheck source binding", e))?;
-        if existing.as_ref().map_or(0, |(_, g)| *g) != expected_generation {
-            return Err(stale());
-        }
-        let json = serde_json::to_string(&expected_binding)
-            .map_err(|e| ArchiveFsError::Database(e.to_string()))?;
-        if !write_rebind(&tx, source, &existing, &json)?
-            || SourceRootBinding::inspect(&root).as_ref() != Some(&expected_binding)
-        {
-            return Err(stale());
-        }
-        tx.commit().map_err(|e| db_error("commit source rebind", e))
+    /// Compatibility name for reviewed callers. The opaque review is the
+    /// authority; the implementation is exactly the canonical confirmation.
+    pub fn rebind_source_after_review(&mut self, review: &SourceRebindReview) -> Result<()> {
+        self.confirm_source_rebind(review)
     }
 
     pub(crate) fn catalogue_archive_hashes(&self) -> Result<HashMap<i64, String>> {
@@ -887,21 +848,39 @@ pub(super) fn assert_missing_authority(
     connection: &Connection,
     source: i64,
     scan_run_id: i64,
+    expected_root: &[u8],
+    expected_binding: &SourceRootBinding,
 ) -> Result<()> {
-    let binding: Option<i64> = connection
+    let current: Option<(Vec<u8>, String, i64, String, bool)> = connection
         .query_row(
-            "SELECT generation FROM source_scan_bindings WHERE source_folder_id=?1",
+            "SELECT sf.path,b.root_identity_json,b.generation,sf.source_role, \
+             sf.removed_from_config_at IS NULL \
+             FROM source_folders sf JOIN source_scan_bindings b ON b.source_folder_id=sf.id \
+             WHERE sf.id=?1 AND NOT EXISTS(SELECT 1 FROM source_review_required r WHERE r.source_folder_id=sf.id)",
             [source],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )
         .optional()
         .map_err(|e| db_error("read binding for missing authority", e))?;
-    let Some(generation) = binding else {
+    let Some((path, binding_json, generation, role_json, configured)) = current else {
         return Err(ArchiveFsError::Database(
-            "source has no accepted storage binding; reviewed rebind required; no missing evidence written"
+            "source is removed, unconfigured, or requires reviewed rebind; no missing evidence written"
                 .into(),
         ));
     };
+    let role = crate::database::SourceRole::from_db_str(&role_json);
+    let accepted: SourceRootBinding = serde_json::from_str(&binding_json).map_err(|e| {
+        ArchiveFsError::Database(format!("decode source binding for missing authority: {e}"))
+    })?;
+    if !configured
+        || !role.may_enter_game_scan()
+        || path != expected_root
+        || accepted != *expected_binding
+    {
+        return Err(ArchiveFsError::Database(
+            "source configuration or storage binding changed; no missing evidence written".into(),
+        ));
+    }
     match latest_actual_attempt(connection, source)? {
         Some((run, _, _)) if run != scan_run_id => Err(ArchiveFsError::Database(
             "coverage superseded by a later scan attempt; no missing evidence written".into(),
@@ -914,6 +893,24 @@ pub(super) fn assert_missing_authority(
             "latest scan attempt was not complete; no missing evidence written".into(),
         )),
     }
+}
+
+/// Acquire SQLite's writer reservation inside the Missing savepoint before
+/// authoritative reads. The epoch value is unchanged; config and binding
+/// writers cannot commit until Missing commits or rolls back.
+pub(super) fn lock_missing_authority(connection: &Connection) -> Result<()> {
+    let changed = connection
+        .execute(
+            "UPDATE catalogue_health_epoch SET revision=revision WHERE id=1",
+            [],
+        )
+        .map_err(|e| db_error("lock missing authority", e))?;
+    if changed != 1 {
+        return Err(ArchiveFsError::Database(
+            "catalogue authority state is unavailable; no missing evidence written".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The only place a source binding is written after first capture. `existing` is

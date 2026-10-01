@@ -733,8 +733,8 @@ fn independent_old_rebind_api_cannot_resurrect_old_generation() {
         .execute("DELETE FROM source_scan_bindings", [])
         .unwrap();
     let source = f.source_id(0);
-    f.db.rebind_source_after_review(source, 0, SourceRootBinding::inspect(&f.roots[0]).unwrap())
-        .unwrap();
+    let review = f.db.review_source_rebind(source).unwrap();
+    f.db.rebind_source_after_review(&review).unwrap();
     fs::remove_file(path).unwrap();
     let result = f.db.mark_unseen_archives_missing(old, source, &[]);
     eprintln!(
@@ -915,7 +915,10 @@ fn independent_rebind_postwrite_identity_change_rolls_back() {
         Some(&review.current),
         "fault must fire"
     );
-    refused(result);
+    assert!(
+        result.is_err(),
+        "source removal during preflight did not stale the review"
+    );
     assert_eq!(binding_rows(&f.sql()), 0);
     assert_eq!(everything_but_bindings(&f.sql()), before);
 }
@@ -1152,26 +1155,55 @@ fn missing_evidence_requires_an_accepted_binding_at_the_write_boundary() {
     assert_eq!(f.flag(id), None);
 }
 
+#[test]
+fn missing_write_rechecks_current_source_configuration_and_binding() {
+    type Change = fn(&mut Fixture, i64);
+    let changes: [(&str, Change); 4] = [
+        ("removed from configured roots", |f, _| {
+            f.db.register_source_folders(&[]).unwrap();
+        }),
+        ("disabled for game catalogue", |f, _| {
+            f.db.set_source_role(&f.roots[0], archivefs_core::SourceRole::BiosFirmware)
+                .unwrap();
+        }),
+        ("binding identity changed", |f, source| {
+            f.sql().execute(
+                "UPDATE source_scan_bindings SET root_identity_json='{}' WHERE source_folder_id=?1",
+                [source],
+            ).unwrap();
+        }),
+        ("generation changed", |f, source| {
+            f.sql().execute(
+                "UPDATE source_scan_bindings SET generation=generation+1 WHERE source_folder_id=?1",
+                [source],
+            ).unwrap();
+        }),
+    ];
+    for (label, change) in changes {
+        let mut f = Fixture::new(&["games"]);
+        let (id, path) = f.add(0, "game.zip");
+        let run = f.scan().scan_run_id;
+        fs::remove_file(path).unwrap();
+        let source = f.source_id(0);
+        change(&mut f, source);
+        assert!(
+            f.db.mark_unseen_archives_missing(run, source, &[]).is_err(),
+            "{label} must refuse Missing"
+        );
+        assert_eq!(f.flag(id), None, "{label} wrote Missing evidence");
+    }
+}
+
 // --- Blocker 3: every rebind allocates a generation above all historical coverage --
 
 /// Both ways of committing a rebind, so neither can diverge from the other.
 fn rebind_every_way(f: &mut Fixture, index: usize, via_review: bool) {
     let source = f.source_id(index);
+    let review = f.db.review_source_rebind(source).unwrap();
     if via_review {
-        let review = f.db.review_source_rebind(source).unwrap();
         f.db.confirm_source_rebind(&review).unwrap();
     } else {
-        let generation: i64 = f
-            .sql()
-            .query_row(
-                "SELECT COALESCE((SELECT generation FROM source_scan_bindings WHERE source_folder_id=?1),0)",
-                [source],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let binding = SourceRootBinding::inspect(&f.roots[index]).unwrap();
-        f.db.rebind_source_after_review(source, generation, binding)
-            .unwrap();
+        f.db.rebind_source_after_review(&review).unwrap();
     }
 }
 
@@ -1296,15 +1328,11 @@ fn generation_allocation_is_checked_and_refuses_instead_of_wrapping() {
             .execute("DELETE FROM source_scan_bindings", [])
             .unwrap();
         let source = f.source_id(0);
+        let review = f.db.review_source_rebind(source).unwrap();
         let result = if via_review {
-            let review = f.db.review_source_rebind(source).unwrap();
             f.db.confirm_source_rebind(&review)
         } else {
-            f.db.rebind_source_after_review(
-                source,
-                0,
-                SourceRootBinding::inspect(&f.roots[0]).unwrap(),
-            )
+            f.db.rebind_source_after_review(&review)
         };
         let error = result
             .expect_err("an exhausted generation space must refuse")
@@ -1319,30 +1347,155 @@ fn generation_allocation_is_checked_and_refuses_instead_of_wrapping() {
 }
 
 #[test]
-fn the_legacy_rebind_api_is_not_a_second_authority_path() {
+fn the_legacy_rebind_api_delegates_to_canonical_review_authority() {
+    let mut outcomes = Vec::new();
+    for legacy in [false, true] {
+        let mut f = Fixture::new(&["games"]);
+        f.add(0, "game.zip");
+        f.scan();
+        let source = f.source_id(0);
+        f.replace_root(0, "replacement");
+        let review = f.db.review_source_rebind(source).unwrap();
+        if legacy {
+            f.db.rebind_source_after_review(&review).unwrap();
+        } else {
+            f.db.confirm_source_rebind(&review).unwrap();
+        }
+        outcomes.push((f.health(0).generation, f.health(0).state));
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[0].0, 2);
+}
+
+#[test]
+fn legacy_rebind_refuses_every_stale_review() {
+    type Change = fn(&mut Fixture);
+    let changes: [(&str, Change); 4] = [
+        ("role changed", |f| {
+            f.db.set_source_role(&f.roots[0], archivefs_core::SourceRole::ArcadeRomset)
+                .unwrap();
+        }),
+        ("remove and re-add", |f| {
+            f.db.register_source_folders(&[]).unwrap();
+            f.db.register_source_folders(&f.roots).unwrap();
+        }),
+        ("source removed", |f| {
+            f.db.register_source_folders(&[]).unwrap();
+        }),
+        ("scan epoch changed", |f| {
+            f.scan();
+        }),
+    ];
+    for (label, change) in changes {
+        let mut f = Fixture::new(&["games"]);
+        f.scan();
+        let source = f.source_id(0);
+        f.replace_root(0, "replacement");
+        let review = f.db.review_source_rebind(source).unwrap();
+        change(&mut f);
+        refused(f.db.rebind_source_after_review(&review));
+        let generation: i64 = f
+            .sql()
+            .query_row(
+                "SELECT generation FROM source_scan_bindings WHERE source_folder_id=?1",
+                [source],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 1, "{label}");
+    }
+}
+
+#[test]
+#[ignore = "requires process-local LD_PRELOAD SQL fault shim; run alone"]
+fn legacy_rebind_refuses_source_removed_during_preflight() {
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
     let mut f = Fixture::new(&["games"]);
     f.add(0, "game.zip");
     f.scan();
     let source = f.source_id(0);
     f.replace_root(0, "preserved");
-    let binding = SourceRootBinding::inspect(&f.roots[0]).unwrap();
-    // Wrong generation, wrong storage, and a removed source are all refused.
-    refused(f.db.rebind_source_after_review(source, 99, binding.clone()));
-    let mut other = binding.clone();
-    other.filesystem_id[0] ^= 0xff;
-    refused(f.db.rebind_source_after_review(source, 1, other));
-    assert_eq!(f.health(0).generation, 1, "refused rebinds changed nothing");
-    f.sql()
-        .execute("UPDATE source_folders SET removed_from_config_at='x'", [])
-        .unwrap();
-    refused(f.db.rebind_source_after_review(source, 1, binding));
-    let generation: i64 = f
-        .sql()
-        .query_row("SELECT generation FROM source_scan_bindings", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_eq!(generation, 1);
+    let review = f.db.review_source_rebind(source).unwrap();
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_SQL_DATABASE", f.db.path());
+    }
+    let result = f.db.rebind_source_after_review(&review);
+    for key in [
+        "EMUWIZ_FAULT_PATH",
+        "EMUWIZ_FAULT_ROOT",
+        "EMUWIZ_FAULT_SQL_DATABASE",
+    ] {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+    assert!(
+        result.is_err(),
+        "source removal during legacy preflight did not refuse"
+    );
+    assert!(
+        f.sql()
+            .query_row(
+                "SELECT removed_from_config_at IS NOT NULL FROM source_folders WHERE id=?1",
+                [source],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap(),
+        "fault shim did not remove the source"
+    );
+    assert_eq!(
+        binding_rows(&f.sql()),
+        1,
+        "the original binding remains; stale review wrote no new generation"
+    );
+}
+
+#[test]
+#[ignore = "requires process-local LD_PRELOAD SQL fault shim; run alone"]
+fn missing_write_refuses_source_removed_after_preflight_authority_check() {
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let run = f.scan().scan_run_id;
+    let source = f.source_id(0);
+    fs::remove_file(&path).unwrap();
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &path);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_SQL_DATABASE", f.db.path());
+    }
+    let result = f.db.mark_unseen_archives_missing(run, source, &[]);
+    for key in [
+        "EMUWIZ_FAULT_PATH",
+        "EMUWIZ_FAULT_ROOT",
+        "EMUWIZ_FAULT_SQL_DATABASE",
+    ] {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+    assert!(
+        result.is_err(),
+        "source removal after Missing preflight did not refuse"
+    );
+    assert_eq!(
+        f.flag(id),
+        None,
+        "raced source removal acquired Missing authority"
+    );
+    assert!(
+        f.sql()
+            .query_row(
+                "SELECT removed_from_config_at IS NOT NULL FROM source_folders WHERE id=?1",
+                [source],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap(),
+        "fault shim did not remove the source"
+    );
+    assert_eq!(binding_rows(&f.sql()), 1);
 }
 
 // --- Blocker 4: a review binds the configuration it reviewed ------------------------

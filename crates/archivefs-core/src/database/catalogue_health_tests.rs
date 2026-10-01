@@ -45,6 +45,115 @@ fn targeted_platform_scan_preserves_unattempted_sources() {
 }
 
 #[test]
+fn missing_authority_reservation_serializes_source_removal_until_commit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    fs::create_dir(&root).unwrap();
+    let mut db = Database::open_or_create(temp.path().join("library.sqlite3")).unwrap();
+    let source = db.register_source_folders(&[root]).unwrap().remove(0);
+    let path = db.path().to_path_buf();
+    let tx = db.connection.savepoint().unwrap();
+    catalogue_health::lock_missing_authority(&tx).unwrap();
+
+    let other = Connection::open(path).unwrap();
+    other.busy_timeout(Duration::from_millis(25)).unwrap();
+    let blocked = other.execute(
+        "UPDATE source_folders SET removed_from_config_at='race' WHERE id=?1",
+        [source.id],
+    );
+    assert!(
+        blocked.is_err(),
+        "another connection changed source authority while reserved"
+    );
+    assert_eq!(
+        other
+            .query_row(
+                "SELECT removed_from_config_at IS NOT NULL FROM source_folders WHERE id=?1",
+                [source.id],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap(),
+        false,
+    );
+    tx.commit().unwrap();
+    other
+        .execute(
+            "UPDATE source_folders SET removed_from_config_at='after-commit' WHERE id=?1",
+            [source.id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn missing_authority_is_rechecked_when_source_is_removed_after_preflight() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("games");
+    fs::create_dir(&root).unwrap();
+    let archive_path = root.join("game.zip");
+    fs::write(&archive_path, b"fixture").unwrap();
+    let mut db = Database::open_or_create(temp.path().join("library.sqlite3")).unwrap();
+    let source = db
+        .register_source_folders(std::slice::from_ref(&root))
+        .unwrap()
+        .remove(0);
+    db.upsert_archive(
+        source.id,
+        &root,
+        &Archive::from_path(&archive_path).unwrap(),
+    )
+    .unwrap();
+    let run = scan_and_persist(
+        &mut db,
+        &config(vec![root.clone()], temp.path()),
+        "complete",
+    )
+    .unwrap()
+    .scan_run_id;
+    fs::remove_file(&archive_path).unwrap();
+    let binding = crate::catalogue_health::SourceRootBinding::inspect(&root).unwrap();
+
+    // This is the public path's early authority check, before filesystem
+    // probes. A concurrent configuration write lands before its write boundary.
+    catalogue_health::assert_missing_authority(
+        &db.connection,
+        source.id,
+        run,
+        root.as_os_str().as_bytes(),
+        &binding,
+    )
+    .unwrap();
+    let other = Connection::open(db.path()).unwrap();
+    other
+        .execute(
+            "UPDATE source_folders SET removed_from_config_at='raced' WHERE id=?1",
+            [source.id],
+        )
+        .unwrap();
+
+    let tx = db.connection.savepoint().unwrap();
+    catalogue_health::lock_missing_authority(&tx).unwrap();
+    assert!(
+        catalogue_health::assert_missing_authority(
+            &tx,
+            source.id,
+            run,
+            root.as_os_str().as_bytes(),
+            &binding,
+        )
+        .is_err()
+    );
+    assert_eq!(
+        tx.query_row(
+            "SELECT last_verified_missing_at IS NOT NULL FROM archives WHERE source_folder_id=?1",
+            [source.id],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap(),
+        false,
+    );
+}
+
+#[test]
 fn partial_platform_proof_cannot_authorize_missing() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("games");
@@ -102,15 +211,14 @@ fn complete_scan_does_not_call_an_existing_unseen_file_missing() {
         .register_source_folders(std::slice::from_ref(&root))
         .unwrap()
         .remove(0);
+    let binding = crate::catalogue_health::SourceRootBinding::inspect(&root).unwrap();
+    // Model the normal first-scan capture before catalogue rows establish history.
+    assert!(
+        db.bind_scan_source(source.id, (binding.device, binding.inode))
+            .unwrap()
+    );
     db.upsert_archive(source.id, &root, &Archive::from_path(&path).unwrap())
         .unwrap();
-    // A real scan binds a new source before recording coverage under its generation.
-    db.rebind_source_after_review(
-        source.id,
-        0,
-        crate::catalogue_health::SourceRootBinding::inspect(&root).unwrap(),
-    )
-    .unwrap();
     let run = db.start_scan_run("complete", None).unwrap();
     db.record_scan_coverage(
         run,

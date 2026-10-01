@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 static int replaced=0, enumerated=0, enumeration_failed=0, probed=0;
 static void replace_at_probe_t(const char *path,const char *tag);
@@ -29,6 +30,19 @@ static void replace_at_probe_t(const char *path,const char *tag) {
     const char *phase=getenv("EMUWIZ_FAULT_PROBE_NUMBER");
     if(phase && ++probed<atoi(phase))return;
     replaced=1;
+    const char *database=getenv("EMUWIZ_FAULT_SQL_DATABASE");
+    if(database) {
+        if(strncmp(database,"/tmp/",5))abort();
+        pid_t child=fork(); if(child<0)abort();
+        if(child==0) {
+            execlp("python3","python3","-c",
+                "import os,sqlite3; c=sqlite3.connect(os.environ['EMUWIZ_FAULT_SQL_DATABASE']); c.execute(\"UPDATE source_folders SET removed_from_config_at='changed-during-probe'\"); c.commit()",
+                (char*)NULL);
+            _exit(127);
+        }
+        int status; if(waitpid(child,&status,0)!=child || status)abort();
+        return;
+    }
     const char *parent=getenv("EMUWIZ_FAULT_PARENT_LINK"), *outside=getenv("EMUWIZ_FAULT_LINK_TARGET");
     if(parent && outside){
         size_t n=strlen(root);

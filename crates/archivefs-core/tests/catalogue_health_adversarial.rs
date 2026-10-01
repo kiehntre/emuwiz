@@ -83,27 +83,17 @@ impl F {
             .find(|s| s.path == self.roots[source])
             .unwrap();
         let m = fs::symlink_metadata(&folder.path).unwrap();
-        // A real scan binds a new source before it records coverage, and records
-        // that coverage under the binding's generation. Model exactly that.
-        if self
-            .sql()
-            .query_row(
-                "SELECT COUNT(*) FROM source_scan_bindings WHERE source_folder_id=?1",
-                [folder.id],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap()
-            == 0
-        {
-            self.db
-                .rebind_source_after_review(
-                    folder.id,
-                    0,
-                    archivefs_core::catalogue_health::SourceRootBinding::inspect(&folder.path)
-                        .unwrap(),
+        // The caller performs a real initial scan first so the fixture has the
+        // same first-capture authority as production.
+        assert!(
+            self.sql()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM source_scan_bindings WHERE source_folder_id=?1)",
+                    [folder.id],
+                    |r| r.get::<_, bool>(0)
                 )
-                .unwrap();
-        }
+                .unwrap()
+        );
         self.sql().execute("INSERT INTO scan_source_coverage(scan_run_id,source_folder_id,state,excluded_roots_json,root_identity_json,source_generation) VALUES(?1,?2,?3,'[]',?4,(SELECT generation FROM source_scan_bindings WHERE source_folder_id=?2))",params![run,folder.id,serde_json::to_string(state).unwrap(),serde_json::to_string(&(m.dev(),m.ino())).unwrap()]).unwrap();
         run
     }
@@ -202,6 +192,7 @@ fn coverage_states_fail_closed_except_complete() {
     ] {
         let mut f = F::new(&["games"]);
         let (id, p) = f.add(0, "game.zip");
+        f.scan();
         fs::remove_file(p).unwrap();
         let run = f.proof(state, 0);
         let folder = f.db.list_source_folders().unwrap()[0].id;
@@ -217,6 +208,7 @@ fn coverage_states_fail_closed_except_complete() {
 fn legitimate_root_replacement_is_reprovable_on_new_scan() {
     let mut f = F::new(&["games"]);
     let (id, p) = f.add(0, "game.zip");
+    f.scan();
     fs::remove_file(p).unwrap();
     let old_run = f.proof("complete", 0);
     let folder = f.db.list_source_folders().unwrap()[0].id;
@@ -411,6 +403,8 @@ fn source_disappearing_after_root_preflight_must_preserve_evidence() {
     }
     let mut f = F::new(&["games"]);
     let (id, p) = f.add(0, "game.zip");
+    f.scan();
+    fs::remove_file(&p).unwrap();
     let run = f.proof("complete", 0);
     let folder = f.db.list_source_folders().unwrap()[0].id;
     let original = fs::metadata(&f.roots[0]).unwrap();

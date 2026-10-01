@@ -629,13 +629,8 @@ fn known_root_replacement_requires_reviewed_generation_and_new_scan() {
     let blocked = f.scan();
     assert_eq!(blocked.counts.archives_missing, 0);
     assert_eq!(f.flag(id), None);
-    let identity = SourceRootBinding::inspect(&f.roots[0]).unwrap();
-    assert!(
-        f.db.rebind_source_after_review(source, 99, identity.clone())
-            .is_err()
-    );
-    f.db.rebind_source_after_review(source, 1, identity)
-        .unwrap();
+    let review = f.db.review_source_rebind(source).unwrap();
+    f.db.rebind_source_after_review(&review).unwrap();
     assert!(
         f.db.mark_unseen_archives_missing(scan.scan_run_id, source, &[])
             .is_err()
@@ -759,8 +754,8 @@ fn historical_unbound_source_requires_explicit_initial_review() {
     assert_eq!(blocked.counts.archives_missing, 0);
     assert_eq!(f.db.load_archives().unwrap(), before);
     let source = before[0].source_folder_id;
-    f.db.rebind_source_after_review(source, 0, SourceRootBinding::inspect(&f.roots[0]).unwrap())
-        .unwrap();
+    let review = f.db.review_source_rebind(source).unwrap();
+    f.db.rebind_source_after_review(&review).unwrap();
     assert_eq!(f.scan().counts.archives_missing, 1);
     assert!(f.flag(id).is_some());
 }
@@ -938,7 +933,9 @@ fn filesystem_id_collision_with_same_device_inode_is_not_accepted() {
     );
     assert_eq!(f.scan().counts.archives_missing, 0);
     assert!(f.flag(id).is_some());
-    f.db.rebind_source_after_review(source, 1, current).unwrap();
+    let review = f.db.review_source_rebind(source).unwrap();
+    assert_eq!(review.current, current);
+    f.db.rebind_source_after_review(&review).unwrap();
     assert_eq!(f.scan().counts.archives_restored, 1);
     assert_eq!(f.flag(id), None);
 }

@@ -5959,6 +5959,8 @@ impl Database {
             &self.connection,
             source_folder_id,
             scan_run_id,
+            coverage.root.as_os_str().as_bytes(),
+            &source_guard.binding,
         )?;
         if let Some((binding, _)) = self.source_binding(source_folder_id)?
             && serde_json::to_string(&source_guard.binding).ok().as_deref()
@@ -6030,6 +6032,10 @@ impl Database {
             .connection
             .savepoint()
             .map_err(|error| db_error("failed to start mark-missing transaction", error))?;
+        // SAVEPOINT is deferred. Take SQLite's writer reservation before the
+        // authoritative recheck so source/config/binding changes cannot commit
+        // between validation and the Missing commit.
+        catalogue_health::lock_missing_authority(&tx)?;
         let ensure_boundaries_hold = |connection: &Connection| -> Result<()> {
             if let Some((path, reason)) = catalogue_health::unproven_nested_boundaries_on(
                 connection,
@@ -6047,7 +6053,13 @@ impl Database {
         };
         ensure_boundaries_hold(&tx)?;
         // Re-checked inside the write transaction, not just before it.
-        catalogue_health::assert_missing_authority(&tx, source_folder_id, scan_run_id)?;
+        catalogue_health::assert_missing_authority(
+            &tx,
+            source_folder_id,
+            scan_run_id,
+            coverage.root.as_os_str().as_bytes(),
+            &source_guard.binding,
+        )?;
         for archive_id in &missing {
             let (bytes,kind):(Vec<u8>,String)=tx.query_row("SELECT absolute_path_cached,archive_kind FROM archives WHERE id=?1 AND source_folder_id=?2",params![archive_id,source_folder_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|db_error("revalidate missing row",e))?;
             let path = PathBuf::from(OsString::from_vec(bytes));
@@ -6079,7 +6091,13 @@ impl Database {
         }
         // Last authority check: an early return here drops (rolls back) `tx`.
         ensure_boundaries_hold(&tx)?;
-        catalogue_health::assert_missing_authority(&tx, source_folder_id, scan_run_id)?;
+        catalogue_health::assert_missing_authority(
+            &tx,
+            source_folder_id,
+            scan_run_id,
+            coverage.root.as_os_str().as_bytes(),
+            &source_guard.binding,
+        )?;
         tx.commit()
             .map_err(|error| db_error("failed to commit mark-missing", error))?;
         Ok(missing.len() as i64)
