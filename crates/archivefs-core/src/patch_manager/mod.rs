@@ -34,6 +34,8 @@ mod cheat_cache_maintenance;
 mod cheat_candidates;
 mod cheat_catalogue;
 mod cheat_compatibility;
+#[cfg(test)]
+mod cheat_consolidation_tests;
 mod cheat_conversion;
 mod cheat_coverage;
 mod cheat_history;
