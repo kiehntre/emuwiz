@@ -15,7 +15,15 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-pub const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+/// Logical size of the COMPLETE reviewed extracted tree (every regular file).
+/// A GD-ROM high-density area spans LBA 45000..=549149, i.e. 504,150 sectors of
+/// 2048 bytes = 984.7 MiB, so a genuine extracted tree cannot exceed 1 GiB. The
+/// former 512 MiB bound refused roughly every retail disc that fills more than
+/// half of the area. Sizes are logical (sparse holes count) and hashing streams
+/// with fixed memory.
+pub const MAX_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Source tree plus package: the largest combined input or output tree. Well
+/// under the shared tree helper's `HARD_MAX_TOTAL_BYTES` (8 GiB).
 pub const MAX_STAGING_BYTES: u64 = MAX_SOURCE_BYTES + MAX_DCP_EXPANDED_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
