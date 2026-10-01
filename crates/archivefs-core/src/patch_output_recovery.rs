@@ -7,6 +7,9 @@
 //! patch decoder remains in [`crate::standalone_patch`]; this module owns only
 //! publication, verification, and recovery evidence.
 
+#[cfg(target_os = "linux")]
+pub mod tree;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
