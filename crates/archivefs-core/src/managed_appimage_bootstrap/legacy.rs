@@ -276,7 +276,12 @@ mod tests {
 
     fn script(root: &Path, body: &str) -> PathBuf {
         let path = root.join("fake.AppImage");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // Only fake fixture output is captured; production still discards output.
+        fs::write(
+            &path,
+            format!("#!/bin/sh\nexec >\"$0.stdout\" 2>\"$0.stderr\"\n{body}\n"),
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
@@ -287,7 +292,17 @@ mod tests {
         let installed = root.join("emulators").join(id).join(binary);
         let source = script(root, body);
         fs::create_dir_all(installed.parent().unwrap()).unwrap();
-        fs::copy(source, &installed).unwrap();
+        // Keep writable handles to the executable out of this multithreaded
+        // test process. A sibling fork can inherit fs::copy's handle and make
+        // execve fail with ETXTBSY even after this thread closes it. The copy
+        // child owns that handle, and has exited before initialization starts.
+        let copied = Command::new("cp")
+            .arg("--")
+            .arg(source)
+            .arg(&installed)
+            .output()
+            .unwrap();
+        assert!(copied.status.success(), "fixture copy failed: {copied:?}");
         // The helper writes the provenance marker and validates the AppImage
         // bytes, so use a minimal ELF-shaped fake only for the install marker
         // path in these tests by writing the marker directly below.
@@ -298,6 +313,76 @@ mod tests {
         )
         .unwrap();
         installed
+    }
+
+    fn bootstrap_diagnostic(
+        error: &ManagedAppImageBootstrapError,
+        executable: &Path,
+        config: &RequiredConfig,
+        elapsed: Duration,
+        timeout: Duration,
+    ) -> String {
+        let evidence: Vec<_> = config
+            .evidence
+            .iter()
+            .map(|path| (path, fs::symlink_metadata(path)))
+            .collect();
+        format!(
+            "bootstrap failed: {error:?}; command={executable:?}, args=[]; elapsed={elapsed:?}; \
+             timeout={timeout:?}; expected_config={evidence:?}; \
+             stdout={:?}; stderr={:?}",
+            fs::read_to_string(executable.with_extension("AppImage.stdout")),
+            fs::read_to_string(executable.with_extension("AppImage.stderr")),
+        )
+    }
+
+    fn assert_ppsspp_first_run(root: &Path, before_config: &str) -> PathBuf {
+        let config_root = root.join("config/ppsspp");
+        let evidence = config_root.join("PSP/SYSTEM/ppsspp.ini");
+        let installed = install(
+            root,
+            "ppsspp",
+            "ppsspp.AppImage",
+            &format!(
+                "{before_config}\nmkdir -p '{}' && printf '[General]\\nFirstRun = False\\n' > '{}'",
+                evidence.parent().unwrap().display(),
+                evidence.display()
+            ),
+        );
+        let config = RequiredConfig {
+            root: config_root,
+            evidence: vec![evidence.clone()],
+        };
+        // This tests successful initialization, not a one-second performance SLA.
+        // Use the actual production budget; the timeout test retains its 10ms limit.
+        let started = Instant::now();
+        let receipt = initialize_executable(
+            ManagedAppImageBootstrapKind::Ppsspp,
+            installed.clone(),
+            config.clone(),
+            DEFAULT_BOOTSTRAP_TIMEOUT,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{}",
+                bootstrap_diagnostic(
+                    &error,
+                    &installed,
+                    &config,
+                    started.elapsed(),
+                    DEFAULT_BOOTSTRAP_TIMEOUT,
+                )
+            )
+        });
+        assert_eq!(receipt.kind, ManagedAppImageBootstrapKind::Ppsspp);
+        assert_eq!(receipt.executable, installed);
+        assert_eq!(receipt.config_path, evidence);
+        assert!(safe_regular_file(&evidence));
+        assert_eq!(
+            fs::read_to_string(&evidence).unwrap(),
+            "[General]\nFirstRun = False\n"
+        );
+        evidence
     }
 
     #[test]
@@ -347,7 +432,7 @@ mod tests {
                     root: config_root.clone(),
                     evidence: vec![config_root.join("PSP/SYSTEM/ppsspp.ini")],
                 },
-                Duration::from_secs(1)
+                DEFAULT_BOOTSTRAP_TIMEOUT
             ),
             Err(ManagedAppImageBootstrapError::ConfigStillMissing(_))
         ));
@@ -356,6 +441,37 @@ mod tests {
     #[test]
     fn successful_ppsspp_first_run_proves_its_config() {
         let root = tempfile::tempdir().unwrap();
+        assert_ppsspp_first_run(root.path(), "");
+    }
+
+    #[test]
+    fn successful_ppsspp_bootstrap_can_take_longer_than_one_second() {
+        let root = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        assert_ppsspp_first_run(root.path(), "sleep 1.1");
+        assert!(started.elapsed() >= Duration::from_millis(1100));
+    }
+
+    #[test]
+    fn parallel_ppsspp_first_runs_have_isolated_config_paths() {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                thread::spawn(|| {
+                    let root = tempfile::tempdir().unwrap();
+                    assert_ppsspp_first_run(root.path(), "")
+                })
+            })
+            .collect();
+        let paths: std::collections::BTreeSet<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(paths.len(), 8);
+    }
+
+    #[test]
+    fn config_from_an_unsuccessful_child_is_not_accepted() {
+        let root = tempfile::tempdir().unwrap();
         let config_root = root.path().join("config/ppsspp");
         let evidence = config_root.join("PSP/SYSTEM/ppsspp.ini");
         let installed = install(
@@ -363,22 +479,37 @@ mod tests {
             "ppsspp",
             "ppsspp.AppImage",
             &format!(
-                "mkdir -p '{}' && touch '{}'",
+                "printf 'fake stdout'; printf 'fake stderr' >&2; mkdir -p '{}' && touch '{}'; exit 7",
                 evidence.parent().unwrap().display(),
-                evidence.display()
+                evidence.display(),
             ),
         );
-        let receipt = initialize_executable(
+        let config = RequiredConfig {
+            root: config_root,
+            evidence: vec![evidence.clone()],
+        };
+        let started = Instant::now();
+        let result = initialize_executable(
             ManagedAppImageBootstrapKind::Ppsspp,
-            installed,
-            RequiredConfig {
-                root: config_root,
-                evidence: vec![evidence.clone()],
-            },
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert_eq!(receipt.config_path, evidence);
+            installed.clone(),
+            config.clone(),
+            DEFAULT_BOOTSTRAP_TIMEOUT,
+        );
+        assert_eq!(
+            result,
+            Err(ManagedAppImageBootstrapError::NonZeroExit(Some(7))),
+        );
+        assert!(safe_regular_file(&evidence));
+        let diagnostic = bootstrap_diagnostic(
+            &ManagedAppImageBootstrapError::NonZeroExit(Some(7)),
+            &installed,
+            &config,
+            started.elapsed(),
+            DEFAULT_BOOTSTRAP_TIMEOUT,
+        );
+        for expected in ["NonZeroExit(Some(7))", "fake stdout", "fake stderr"] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
     }
 
     #[test]
@@ -404,7 +535,7 @@ mod tests {
                     root: config_root,
                     evidence: vec![evidence],
                 },
-                Duration::from_secs(1),
+                DEFAULT_BOOTSTRAP_TIMEOUT,
             )
             .is_ok()
         );
@@ -423,7 +554,7 @@ mod tests {
                     root: config_root.clone(),
                     evidence: vec![config_root.join("inis/PCSX2.ini")],
                 },
-                Duration::from_secs(1),
+                DEFAULT_BOOTSTRAP_TIMEOUT,
             ),
             Err(ManagedAppImageBootstrapError::NonZeroExit(Some(7)))
         );
@@ -432,20 +563,42 @@ mod tests {
     #[test]
     fn timeout_kills_the_managed_child() {
         let root = tempfile::tempdir().unwrap();
-        let installed = install(root.path(), "ppsspp", "ppsspp.AppImage", "sleep 2");
+        let installed = install(root.path(), "ppsspp", "ppsspp.AppImage", "exec sleep 2");
         let config_root = root.path().join("config/ppsspp");
-        assert_eq!(
-            initialize_executable(
-                ManagedAppImageBootstrapKind::Ppsspp,
-                installed,
-                RequiredConfig {
-                    root: config_root.clone(),
-                    evidence: vec![config_root.join("PSP/SYSTEM/ppsspp.ini")],
-                },
-                Duration::from_millis(10),
-            ),
-            Err(ManagedAppImageBootstrapError::TimedOut)
+        let config = RequiredConfig {
+            root: config_root.clone(),
+            evidence: vec![config_root.join("PSP/SYSTEM/ppsspp.ini")],
+        };
+        let started = Instant::now();
+        let timeout = Duration::from_millis(10);
+        let result = initialize_executable(
+            ManagedAppImageBootstrapKind::Ppsspp,
+            installed.clone(),
+            config.clone(),
+            timeout,
         );
+        assert_eq!(result, Err(ManagedAppImageBootstrapError::TimedOut));
+        let diagnostic = bootstrap_diagnostic(
+            &ManagedAppImageBootstrapError::TimedOut,
+            &installed,
+            &config,
+            started.elapsed(),
+            timeout,
+        );
+        for expected in [
+            "TimedOut",
+            "command=",
+            "elapsed=",
+            "timeout=10ms",
+            "expected_config=",
+            "stdout=",
+            "stderr=",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+        assert!(diagnostic.contains(installed.to_str().unwrap()));
+        assert!(diagnostic.contains(config.evidence[0].to_str().unwrap()));
+        assert!(!config.evidence[0].exists());
     }
 
     #[test]
@@ -464,7 +617,7 @@ mod tests {
                     root: config_root,
                     evidence: vec![evidence],
                 },
-                Duration::from_secs(1),
+                DEFAULT_BOOTSTRAP_TIMEOUT,
             ),
             Err(ManagedAppImageBootstrapError::ConfigAlreadyPresent)
         );
