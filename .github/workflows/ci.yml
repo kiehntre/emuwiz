@@ -117,6 +117,7 @@ jobs:
       - name: Install desktop-file-utils
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
       - run: bash tests/test_install.sh
+      - run: python3 tests/test_installer_asset_races.py
 
   release-artifact:
     name: Create canonical artifact

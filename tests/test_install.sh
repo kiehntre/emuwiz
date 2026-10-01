@@ -291,7 +291,9 @@ echo "=== test: this suite does not block on stdin when launched from a real con
 if [ "${TEST_INSTALL_TTY_REGRESSION_GUARD:-}" = 1 ]; then
     printf 'SKIP - already running under the controlling-terminal regression re-invocation; not recursing further\n'
 elif command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-    if TEST_INSTALL_TTY_REGRESSION_GUARD=1 timeout 180 script -qec "sh '$repo_root/tests/test_install.sh'" /dev/null >/dev/null 2>&1; then
+    # Descriptor publication adds Python processes; include the ownership suite
+    # in the watchdog budget too. This is a hang bound, not a timing assertion.
+    if TEST_INSTALL_TTY_REGRESSION_GUARD=1 timeout 300 script -qec "sh '$repo_root/tests/test_install.sh'" /dev/null >/dev/null 2>&1; then
         ok "the full suite completes under a real controlling terminal (does not block on /dev/tty)"
     else
         bad "the full suite completes under a real controlling terminal (blocked, or failed - see timeout/exit status)"

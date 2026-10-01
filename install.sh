@@ -11,6 +11,13 @@
 #   - a workspace checkout after `cargo build --workspace --release`
 #     (target/release/emuwiz-cli / target/release/emuwiz)
 #
+# Linux only: safe asset publication requires Python 3, procfs, O_PATH
+# (Linux 2.6.39+), and descriptor-relative hardlink support on the install
+# filesystem. Missing support fails closed; there is no overwrite fallback.
+# Close native EmuWiz processes before upgrading: owned regular files update
+# through held descriptors, non-atomically, just like the ownership manifest.
+# Running executables (ETXTBSY) and hardlinked files refuse changed-byte updates.
+#
 # OWNERSHIP TRACKING
 #
 # Every path this script writes (binaries, legacy aliases, the desktop
@@ -199,6 +206,12 @@ config_file="$config_dir/config.toml"
 # stops further publication; assets already published may remain unrecorded.
 # The directory lock serializes cooperating installers and uninstallers. It
 # does not prohibit another same-user process from editing these writable paths.
+# Assets use the same pinning model: absent names are linked without clobbering
+# from held staged inodes; verified regular files update through held inodes;
+# fixed aliases are validated and retained. Each operation is relative to a
+# pinned parent directory and checks its binding before and after publication.
+# Asset records describe the held published bytes/target, never a fresh read
+# that could adopt a substituted foreign object after publication.
 #
 # MANIFEST-DIRECTORY SAFETY: $data_home itself - wherever XDG_DATA_HOME
 # resolves to, symlinked or not - is trusted exactly as much as it already
@@ -384,15 +397,6 @@ file_digest() {
     [ -n "$line" ] || return 1
     set -- $line
     printf '%s\n' "$1"
-}
-
-# file_size PATH - prints PATH's size in bytes. Tries GNU stat's format
-# first, then the BSD/busybox one. Supplemental metadata only - never
-# consulted by any ownership decision.
-file_size() {
-    stat -c '%s' -- "$1" 2>/dev/null && return 0
-    stat -f '%z' -- "$1" 2>/dev/null && return 0
-    return 1
 }
 
 # validate_file_digest FP - true only for a string of exactly 64 lowercase
@@ -919,29 +923,212 @@ preflight_install_manifest() {
     assert_manifest_binding
 }
 
-# record_slot SLOT KIND PATH - appends a manifest record line for SLOT to
-# $manifest_records_tmp, fingerprinting PATH fresh right now. Only ever
-# called immediately after (re)installing PATH, so the recorded digest
-# always reflects exactly what was just written - never the pre-existing
-# object's digest, and never a digest computed before the write completed.
-record_slot() {
-    slot=$1
-    kind=$2
-    path=$3
-    case "$kind" in
-        file)
-            digest=$(file_digest "$path") || fail "could not fingerprint installed file (SHA-256 unavailable or unreadable): $path"
-            size=$(file_size "$path") || fail "could not determine the size of installed file: $path"
-            printf '%s file %s %s\n' "$slot" "$digest" "$size" >>"$manifest_records_tmp"
-            ;;
-        symlink)
-            target=$(readlink -- "$path") || fail "could not read installed symlink: $path"
-            printf '%s symlink %s\n' "$slot" "$target" >>"$manifest_records_tmp"
-            ;;
-        *)
-            fail "internal error: unknown manifest slot kind: $kind"
-            ;;
-    esac
+# The Python stdlib supplies openat/linkat/symlinkat and O_NOFOLLOW; sh cannot
+# safely open a validated asset without following a substituted symlink.
+# Keep the helper embedded so old and current bundle layouts remain self-contained.
+asset_io() {
+    python3 - "$@" <<'EMUWIZ_ASSET_PY'
+import hashlib
+import os
+import shutil
+import stat
+import sys
+import tempfile
+
+
+def identity(st):
+    return ":".join(str(value) for value in (
+        st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+
+
+def snapshot(name):
+    try:
+        return identity(os.stat(name, dir_fd=7, follow_symlinks=False))
+    except FileNotFoundError:
+        return "absent"
+
+
+def check_parent(parent, location):
+    # Mirror the bookkeeping binding: identity plus physical location. Walk
+    # the canonical components without symlinks; final mutations use fd 7 only.
+    if os.path.realpath(parent) != location or os.readlink("/proc/self/fd/7") != location:
+        raise RuntimeError("destination parent changed during installation")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in location.split("/"):
+            if component:
+                child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+        held, current = os.fstat(7), os.fstat(fd)
+        if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+            raise RuntimeError("destination parent changed during installation")
+    finally:
+        os.close(fd)
+
+
+def fingerprint(fd):
+    digest = hashlib.sha256()
+    with os.fdopen(os.dup(fd), "rb") as stream:
+        stream.seek(0)
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def inspect(name, parent, location):
+    check_parent(parent, location)
+    try:
+        fd = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=7)
+    except FileNotFoundError:
+        print("absent -")
+        return
+    held = os.fstat(fd)
+    expected = identity(held)
+    digest = "-"
+    if stat.S_ISREG(held.st_mode):
+        try:
+            readable = os.open(f"/proc/self/fd/{fd}", os.O_RDONLY)
+        except PermissionError:
+            pass  # The existing gate treats unreadable files as foreign.
+        else:
+            digest = fingerprint(readable)
+            if identity(os.fstat(readable)) != expected:
+                raise RuntimeError("destination changed during installation")
+    if snapshot(name) != expected:
+        raise RuntimeError("destination changed during installation")
+    check_parent(parent, location)
+    print(expected, digest)
+
+
+def link_held(fd, name):
+    # linkat AT_SYMLINK_FOLLOW follows only our proc descriptor to the held
+    # inode (including an O_PATH-held symlink), never the destination name.
+    os.link(f"/proc/self/fd/{fd}", name, dst_dir_fd=7, follow_symlinks=True)
+
+
+def publish(kind, slot, source, name, expected, gate, digest, parent, location):
+    if gate not in ("absent", "owned"):
+        raise RuntimeError("foreign destination was not authorized")
+    check_parent(parent, location)
+    if snapshot(name) != expected:
+        raise RuntimeError("destination changed during installation")
+    if kind == "symlink":
+        if gate == "owned":
+            # Alias targets are fixed across releases. Hold the symlink itself;
+            # never unlink/replace a name on the strength of an earlier check.
+            fd = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=7)
+            if identity(os.fstat(fd)) != expected or os.readlink("", dir_fd=fd) != source:
+                raise RuntimeError("destination changed during installation (alias target)")
+        else:
+            with tempfile.TemporaryDirectory(prefix=".emuwiz-alias.", dir="/proc/self/fd/7") as staging:
+                candidate = staging + "/link"
+                os.symlink(source, candidate)
+                fd = os.open(candidate, os.O_PATH | os.O_NOFOLLOW)
+                if os.readlink("", dir_fd=fd) != source:
+                    raise RuntimeError("staged alias changed during installation")
+                link_held(fd, name)  # EEXIST: never replace a destination
+        published = identity(os.fstat(fd))
+        if snapshot(name) != published or os.readlink("", dir_fd=fd) != source:
+            raise RuntimeError("destination changed during installation")
+        record = f"{slot} symlink {source}"
+    else:
+        staged = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        staged_stat = os.fstat(staged)
+        if not stat.S_ISREG(staged_stat.st_mode):
+            raise RuntimeError("staged asset is not a regular file")
+        new_digest = fingerprint(staged)
+        if gate == "owned":
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=7)
+            held = os.fstat(fd)
+            if not stat.S_ISREG(held.st_mode) or identity(held) != expected:
+                raise RuntimeError("destination changed during installation")
+            old_digest = fingerprint(fd)
+            if old_digest != digest:
+                raise RuntimeError("destination changed during installation (content)")
+            if old_digest != new_digest:
+                # Like the manifest update: write the held inode, never rename
+                # over a name. Fail closed for hardlinks and running executables.
+                if held.st_nlink != 1:
+                    raise RuntimeError("owned destination has hardlinks; refusing an in-place update")
+                output = os.open(f"/proc/self/fd/{fd}", os.O_WRONLY)
+                check_parent(parent, location)
+                if snapshot(name) != expected or identity(os.fstat(fd)) != expected:
+                    raise RuntimeError("destination changed during installation")
+                with os.fdopen(os.dup(staged), "rb") as input_stream, os.fdopen(output, "wb") as stream:
+                    input_stream.seek(0)
+                    shutil.copyfileobj(input_stream, stream)
+                    stream.flush()
+                    os.ftruncate(stream.fileno(), staged_stat.st_size)
+                    os.fchmod(stream.fileno(), stat.S_IMODE(staged_stat.st_mode))
+        else:
+            link_held(staged, name)
+            fd = staged
+        published = os.fstat(fd)
+        current = os.stat(name, dir_fd=7, follow_symlinks=False)
+        if identity(current) != identity(published) or fingerprint(fd) != new_digest:
+            raise RuntimeError("destination changed during installation")
+        record = f"{slot} file {new_digest} {staged_stat.st_size}"
+    check_parent(parent, location)
+    # Record the bytes/target we published, never re-adopt a substituted pathname.
+    print(record)
+
+
+def main():
+    if sys.platform != "linux" or not all(hasattr(os, flag) for flag in ("O_PATH", "O_NOFOLLOW", "O_DIRECTORY")):
+        raise RuntimeError("Linux descriptor publication support is required")
+    if not all(fn in os.supports_dir_fd for fn in (os.open, os.stat, os.readlink, os.symlink, os.link)):
+        raise RuntimeError("Python descriptor-relative filesystem support is required")
+    if sys.argv[1] == "inspect":
+        inspect(*sys.argv[2:])
+    else:
+        publish(*sys.argv[2:])
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError) as error:
+        print(f"install.sh: destination changed during installation or safe publication unavailable: {error}; "
+              "refusing further publication; assets already published may remain unrecorded", file=sys.stderr)
+        sys.exit(1)
+EMUWIZ_ASSET_PY
+}
+
+# Pin the asset's parent before its gate and stage in that same held directory.
+# Symlinked XDG/prefix roots remain supported; retargeting them after this pin
+# cannot redirect publication. fd 7 is separate from bookkeeping fds 8 and 9.
+prepare_asset() {
+    asset_dest=$1
+    asset_parent=$(dirname -- "$asset_dest")
+    asset_name=$(basename -- "$asset_dest")
+    exec 7<"$asset_parent"
+    asset_location=$(CDPATH= cd -- "$asset_parent" && pwd -P) || fail "cannot resolve asset parent"
+    asset_bound="/proc/self/fd/7/$asset_name"
+    asset_inspection=$(asset_io inspect "$asset_name" "$asset_parent" "$asset_location") || exit 1
+    asset_state=${asset_inspection%% *}
+    asset_digest=${asset_inspection#* }
+}
+
+publish_asset() {
+    assert_manifest_binding
+    asset_record=$(asset_io publish "$1" "$2" "$3" "$asset_name" "$asset_state" "$4" \
+        "$asset_digest" "$asset_parent" "$asset_location") || exit 1
+    assert_manifest_binding
+    printf '%s\n' "$asset_record" >>"$manifest_records_tmp"
+}
+
+# --replace-foreign authorizes only the object encountered at the gate. Back
+# it up through the pinned parent; a new collision must still fail closed.
+resolve_asset_collision() {
+    if [ "$replace_foreign" -ne 1 ]; then
+        resolve_foreign_collision "$asset_dest"
+        return 1
+    fi
+    backup_foreign_path "$asset_bound"
+    BACKUP_PATH="$asset_location/${BACKUP_PATH#/proc/self/fd/7/}"
+    warn "moved foreign path aside before installing: $asset_dest -> $BACKUP_PATH"
+    asset_state=absent
 }
 
 # remove_if_owned SLOT KIND PATH [EXPECTED_OR_REFERENCE] [NORMALIZE] -
@@ -1176,6 +1363,7 @@ bin_dir=$(CDPATH= cd -- "$bin_dir" && pwd -P) || fail "could not resolve install
 # This must happen before copying or publishing any managed destination.  The
 # prefix directory itself may be created above so its canonical path can be
 # compared with a prior manifest; no managed file has been touched yet.
+command -v python3 >/dev/null 2>&1 || fail "python3 is required for safe Linux asset publication"
 preflight_install_manifest
 
 manifest_records_tmp=$(mktemp -- "/proc/self/fd/8/.manifest-records.XXXXXX") ||
@@ -1191,17 +1379,19 @@ install_binary_slot() {
     src=$2
     dest=$3
     assert_manifest_binding
-    gate=$(gate_binary "$slot" "$dest")
+    prepare_asset "$dest"
+    gate=$(gate_binary "$slot" "$asset_bound")
     if [ "$gate" = foreign ]; then
-        resolve_foreign_collision "$dest" || return 0
+        resolve_asset_collision || return 0
+        gate=absent
     fi
     assert_manifest_binding
-    binary_tmp=$(mktemp -- "$bin_dir/.emuwiz-binary.XXXXXX") || fail "could not stage binary"
+    binary_tmp=$(mktemp -- "/proc/self/fd/7/.emuwiz-binary.XXXXXX") || fail "could not stage binary"
     cp -- "$src" "$binary_tmp"
     chmod +x -- "$binary_tmp"
-    assert_manifest_binding
-    mv -f -- "$binary_tmp" "$dest"
-    record_slot "$slot" file "$dest"
+    publish_asset file "$slot" "$binary_tmp" "$gate"
+    rm -f -- "$binary_tmp"
+    exec 7<&-
 }
 
 # install_alias_slot SLOT TARGET DEST - creates the symlink DEST -> TARGET,
@@ -1211,13 +1401,14 @@ install_alias_slot() {
     target=$2
     dest=$3
     assert_manifest_binding
-    gate=$(gate_alias "$slot" "$dest" "$target")
+    prepare_asset "$dest"
+    gate=$(gate_alias "$slot" "$asset_bound" "$target")
     if [ "$gate" = foreign ]; then
-        resolve_foreign_collision "$dest" || return 0
+        resolve_asset_collision || return 0
+        gate=absent
     fi
-    assert_manifest_binding
-    ln -sf -- "$target" "$dest"
-    record_slot "$slot" symlink "$dest"
+    publish_asset symlink "$slot" "$target" "$gate"
+    exec 7<&-
 }
 
 install_binary_slot bin-emuwiz-cli "$src_cli" "$bin_dir/emuwiz-cli"
@@ -1259,11 +1450,12 @@ desktop_exec=$(printf '%s' "$bin_dir/emuwiz" | sed \
 desktop_exec="\"$desktop_exec\""
 
 mkdir -p -- "$data_home/applications"
+prepare_asset "$desktop_file"
 # Render the candidate into a temp file first, before any ownership
 # decision, so the "does the existing file match what we'd write" gate and
-# the eventual atomic install always compare against and use the exact
+# the eventual publication always compares against and uses the exact
 # same rendered bytes.
-desktop_tmp=$(mktemp -- "$data_home/applications/.$desktop_id.XXXXXX.desktop") ||
+desktop_tmp=$(mktemp -- "/proc/self/fd/7/.$desktop_id.XXXXXX.desktop") ||
     fail "could not create a temporary file for the desktop entry"
 while IFS= read -r line || [ -n "$line" ]; do
     if [ "$line" = 'Exec=@EMUWIZ_EXEC@' ]; then
@@ -1281,23 +1473,24 @@ if command -v desktop-file-validate >/dev/null 2>&1; then
 fi
 
 assert_manifest_binding
-desktop_gate=$(gate_content desktop "$desktop_file" "$desktop_tmp" exec)
+desktop_gate=$(gate_content desktop "$asset_bound" "$desktop_tmp" exec)
 desktop_installed=0
 if [ "$desktop_gate" = foreign ]; then
-    if resolve_foreign_collision "$desktop_file"; then
+    if resolve_asset_collision; then
+        desktop_gate=absent
         desktop_installed=1
     fi
 else
     desktop_installed=1
 fi
 if [ "$desktop_installed" -eq 1 ]; then
-    assert_manifest_binding
-    mv -f -- "$desktop_tmp" "$desktop_file"
-    record_slot desktop file "$desktop_file"
+    publish_asset file desktop "$desktop_tmp" "$desktop_gate"
+    rm -f -- "$desktop_tmp"
     printf 'Installed the EmuWiz desktop launcher below %s.\n' "$data_home"
 else
     rm -f -- "$desktop_tmp"
 fi
+exec 7<&-
 
 for size in 32 64 128 256 512; do
     icon_dir="$data_home/icons/hicolor/${size}x${size}/apps"
@@ -1305,17 +1498,19 @@ for size in 32 64 128 256 512; do
     icon_dest="$icon_dir/$desktop_id.png"
     icon_source="$branding_dir/emuwiz-logo-$size.png"
     assert_manifest_binding
-    icon_gate=$(gate_content "icon-$size" "$icon_dest" "$icon_source" "")
+    prepare_asset "$icon_dest"
+    icon_gate=$(gate_content "icon-$size" "$asset_bound" "$icon_source" "")
     if [ "$icon_gate" = foreign ]; then
-        resolve_foreign_collision "$icon_dest" || continue
+        resolve_asset_collision || continue
+        icon_gate=absent
     fi
-    icon_tmp=$(mktemp -- "$icon_dir/.$desktop_id.XXXXXX.png") ||
+    icon_tmp=$(mktemp -- "/proc/self/fd/7/.$desktop_id.XXXXXX.png") ||
         fail "could not create a temporary file for the $size pixel icon"
     cp -- "$icon_source" "$icon_tmp"
     chmod 0644 "$icon_tmp"
-    assert_manifest_binding
-    mv -f -- "$icon_tmp" "$icon_dest"
-    record_slot "icon-$size" file "$icon_dest"
+    publish_asset file "icon-$size" "$icon_tmp" "$icon_gate"
+    rm -f -- "$icon_tmp"
+    exec 7<&-
 done
 printf 'Installed the EmuWiz application icons below %s.\n' "$data_home"
 
