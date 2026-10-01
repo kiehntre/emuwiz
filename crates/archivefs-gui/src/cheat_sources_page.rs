@@ -955,7 +955,7 @@ fn show_open_retro_provider_catalogue(ui: &mut egui::Ui) {
     widgets::technical_details(ui, "classic-poke-family", |ui| {
         ui.heading("Classic POKE preview");
         ui.label("Manual entries and approved local imports are normalized without running BASIC, trainer scripts or touching media.");
-        ui.label("Apply requires an exact media hash or verified release identity; a title-only match remains a review warning.");
+        ui.label("Preparing a cheat for an emulator requires an exact media hash or verified release identity; a title-only match stays preview-only.");
         for platform in [
             archivefs_core::patch_manager::PokePlatform::ZxSpectrum,
             archivefs_core::patch_manager::PokePlatform::AmstradCpc,
@@ -986,8 +986,9 @@ fn show_open_retro_provider_catalogue(ui: &mut egui::Ui) {
         ] {
             let capability = archivefs_core::patch_manager::poke_runtime_capability(emulator);
             ui.label(format!(
-                "{emulator:?}: {:?} — {}",
-                capability.support, capability.detail
+                "{emulator:?}: {} — {}",
+                capability.support.plain_label(),
+                capability.detail
             ));
         }
     });

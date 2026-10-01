@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use crate::open_retro_cheat_providers::{ZxPokOperation, ZxPokTrainer};
+use crate::patch_manager::CheatApplicabilityMatch;
 
 pub const POKE_MAX_TITLE_BYTES: usize = 256;
 pub const POKE_MAX_LINES: usize = 4096;
@@ -742,92 +743,62 @@ pub fn find_poke_conflicts(cheats: &[PokeCheat]) -> Vec<PokeConflict> {
     conflicts
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PokeEmulatorProjection {
-    RuntimeMemoryPoke,
-    NativeCheatFile,
-    ManualRuntimeAction,
-    Unsupported,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PokeEmulatorCapability {
-    pub emulator: &'static str,
-    pub platform: PokePlatform,
-    pub projection: PokeEmulatorProjection,
-    pub detail: &'static str,
-}
-
-pub fn poke_emulator_capabilities() -> Vec<PokeEmulatorCapability> {
-    vec![
-        PokeEmulatorCapability {
-            emulator: "Fuse / RetroArch Fuse",
-            platform: PokePlatform::ZxSpectrum,
-            projection: PokeEmulatorProjection::NativeCheatFile,
-            detail: "ZX .pok semantics are available; exact game identity is still required before Apply",
-        },
-        PokeEmulatorCapability {
-            emulator: "Caprice32",
-            platform: PokePlatform::AmstradCpc,
-            projection: PokeEmulatorProjection::RuntimeMemoryPoke,
-            detail: "runtime/manual projection only",
-        },
-        PokeEmulatorCapability {
-            emulator: "VICE",
-            platform: PokePlatform::Commodore64,
-            projection: PokeEmulatorProjection::RuntimeMemoryPoke,
-            detail: "monitor memory writes are runtime actions; bank must be explicit",
-        },
-        PokeEmulatorCapability {
-            emulator: "Hatari",
-            platform: PokePlatform::AtariSt,
-            projection: PokeEmulatorProjection::RuntimeMemoryPoke,
-            detail: "debugger memwrite is a runtime action; no stable native cheat file claimed",
-        },
-        PokeEmulatorCapability {
-            emulator: "openMSX",
-            platform: PokePlatform::Msx,
-            projection: PokeEmulatorProjection::RuntimeMemoryPoke,
-            detail: "poke/poke16 and trainer tooling are runtime-oriented; mapper context is explicit",
-        },
-        PokeEmulatorCapability {
-            emulator: "BeebEm / b-em",
-            platform: PokePlatform::BbcMicro,
-            projection: PokeEmulatorProjection::ManualRuntimeAction,
-            detail: "manual/import preview only in this phase",
-        },
-    ]
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PokeIdentityState {
-    ExactMediaHash,
-    VerifiedRelease,
-    WeakTitleOnly,
-    Missing,
-}
-
+/// Identity strength for a POKE target is the one canonical ladder
+/// ([`CheatApplicabilityMatch`]), not a private one. Callers must pass a hash
+/// only when it was verified against the selected media; a claimed or
+/// filename-derived value must be passed as a title/identity string instead.
 pub fn poke_identity_state(
     media_hash: Option<&str>,
     game_identity: Option<&str>,
     verified: bool,
-) -> PokeIdentityState {
+) -> CheatApplicabilityMatch {
     if media_hash.is_some_and(|value| !value.is_empty()) {
-        PokeIdentityState::ExactMediaHash
+        CheatApplicabilityMatch::ExactHash
     } else if verified && game_identity.is_some_and(|value| !value.is_empty()) {
-        PokeIdentityState::VerifiedRelease
+        CheatApplicabilityMatch::VerifiedIdentifier
     } else if game_identity.is_some_and(|value| !value.is_empty()) {
-        PokeIdentityState::WeakTitleOnly
+        CheatApplicabilityMatch::TitleOnly
     } else {
-        PokeIdentityState::Missing
+        CheatApplicabilityMatch::Unknown
     }
 }
 
-pub fn poke_apply_allowed(state: PokeIdentityState) -> bool {
+/// Only an exact hash or a verified identifier may be prepared for a runtime;
+/// a title-only or missing identity stays preview-only.
+pub fn poke_apply_allowed(state: CheatApplicabilityMatch) -> bool {
     matches!(
         state,
-        PokeIdentityState::ExactMediaHash | PokeIdentityState::VerifiedRelease
+        CheatApplicabilityMatch::ExactHash | CheatApplicabilityMatch::VerifiedIdentifier
     )
+}
+
+impl PokeRuntimeSupport {
+    /// Whether this adapter can generate a real, exact artifact (a Fuse `.pok`
+    /// file or VICE monitor commands) once identity is verified. Preview-only
+    /// and unsupported runtimes never produce one. Generating an artifact is
+    /// not launching an emulator: no launch path consumes it yet.
+    #[must_use]
+    pub const fn can_prepare(self) -> bool {
+        matches!(
+            self,
+            Self::SupportedNativeRuntime
+                | Self::SupportedGeneratedScript
+                | Self::SupportedMonitorCommand
+        )
+    }
+
+    /// Plain wording for normal screens; the enum stays for details.
+    #[must_use]
+    pub const fn plain_label(self) -> &'static str {
+        match self {
+            Self::SupportedNativeRuntime
+            | Self::SupportedGeneratedScript
+            | Self::SupportedMonitorCommand => "Can be prepared once the exact game is confirmed",
+            Self::PreviewOnly => "Preview only",
+            Self::Unsupported => "Not supported",
+            Self::UnknownUnproven => "Not proven",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1104,5 +1075,77 @@ mod tests {
         )
         .unwrap();
         assert_eq!(find_poke_conflicts(&[first, second]).len(), 1);
+    }
+
+    #[test]
+    fn only_fuse_and_vice_can_be_prepared_everything_else_is_preview_only() {
+        use PokeRuntimeEmulator as E;
+        for emulator in [E::Fuse, E::Vice] {
+            assert!(poke_runtime_capability(emulator).support.can_prepare());
+        }
+        for emulator in [E::Hatari, E::Caprice32, E::OpenMsx, E::BeebEm, E::BEm] {
+            let capability = poke_runtime_capability(emulator);
+            assert!(!capability.support.can_prepare(), "{emulator:?}");
+            assert_eq!(capability.support.plain_label(), "Preview only");
+            // Even with a verified identity a preview-only runtime refuses.
+            let cheat = manual_poke(
+                capability.platform,
+                "Lives",
+                0x8000,
+                255,
+                None,
+                PokeBank::Unspecified,
+                None,
+                Some("exact-game".into()),
+                true,
+            )
+            .unwrap();
+            let projection = project_poke_runtime(&cheat, emulator);
+            assert_eq!(
+                projection.refusal,
+                Some(PokeProjectionRefusal::UnsupportedRuntime),
+                "{emulator:?}"
+            );
+            assert!(projection.commands_or_files.is_empty());
+        }
+    }
+
+    #[test]
+    fn identity_ladder_is_the_canonical_applicability_match() {
+        use CheatApplicabilityMatch as M;
+        assert_eq!(poke_identity_state(Some("h"), None, false), M::ExactHash);
+        assert_eq!(
+            poke_identity_state(None, Some("id"), true),
+            M::VerifiedIdentifier
+        );
+        assert_eq!(
+            poke_identity_state(None, Some("title"), false),
+            M::TitleOnly
+        );
+        assert_eq!(poke_identity_state(None, None, false), M::Unknown);
+        assert!(poke_apply_allowed(M::ExactHash) && poke_apply_allowed(M::VerifiedIdentifier));
+        assert!(!poke_apply_allowed(M::TitleOnly) && !poke_apply_allowed(M::Strong));
+    }
+
+    #[test]
+    fn unverified_target_blocks_even_a_supported_runtime() {
+        let cheat = manual_poke(
+            PokePlatform::ZxSpectrum,
+            "Lives",
+            0x8000,
+            255,
+            None,
+            PokeBank::Unspecified,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(!cheat.target_verified);
+        let projection = project_poke_runtime(&cheat, PokeRuntimeEmulator::Fuse);
+        assert_eq!(
+            projection.refusal,
+            Some(PokeProjectionRefusal::IdentityNotEligible)
+        );
     }
 }
