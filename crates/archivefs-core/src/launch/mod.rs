@@ -73,6 +73,8 @@ pub mod amiga_whdload_execution;
 pub mod atari800;
 pub mod azahar_command;
 pub mod azahar_execution;
+#[cfg(target_os = "linux")]
+pub mod caprice32;
 pub mod cemu_command;
 pub mod cemu_execution;
 pub mod desmume_command;
