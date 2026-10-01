@@ -5,8 +5,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::cheat_ir::{
-    CheatConversionPreview, CheatDocument, CheatPlatform, CheatReconciliationResult,
-    CheatRelationship, CheatSourceFormat, CheatTargetFormat, convert_cheat_document,
+    CheatConversionPreview, CheatDocument, CheatPlatform, CheatReconciliationEntry,
+    CheatReconciliationResult, CheatRelationship, CheatSourceFormat, CheatTargetFormat,
+    convert_cheat_document,
 };
 use super::cheat_route::{
     CheatApplySupport, CheatRoute, CheatRouteTarget, canonical_cheat_platform,
@@ -106,6 +107,66 @@ pub struct CheatGameAssociation {
     pub revision: Option<String>,
     pub identities: Vec<CheatIdentityRequirement>,
     pub manually_associated: bool,
+}
+
+impl CheatGameAssociation {
+    /// The one bridge from the canonical entry model to this assessment.
+    ///
+    /// Layers, not parallel models: an entry's [`CheatApplicability`] holds what
+    /// the *source claims* (region/revision/binary), its provenance holds *how
+    /// strongly and from where* (`CheatApplicabilityEvidence`), and this
+    /// association is the expectation handed to [`assess_cheat_applicability`].
+    /// Everything here is a source declaration, never verification of the
+    /// selected game. Only unambiguous claims are mapped: serial-style evidence
+    /// is platform-specific and stays in provenance. A 64-hex binary/content
+    /// claim becomes a required content hash; nothing else is guessed.
+    pub fn from_entry(entry: &CheatReconciliationEntry) -> Self {
+        use super::cheat_provenance::CheatApplicabilityKind as Kind;
+        let claims = &entry.applicability;
+        let mut association = Self {
+            region: claims.region.clone(),
+            revision: claims.revision.clone(),
+            ..Self::default()
+        };
+        let is_sha256 =
+            |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+        let mut hashes = Vec::new();
+        if let Some(binary) = &claims.verified_binary_identity {
+            if is_sha256(binary) {
+                hashes.push(binary.to_ascii_lowercase());
+            }
+        }
+        for evidence in entry.audit_evidence() {
+            for claim in &evidence.applicability {
+                let value = claim.value.clone();
+                match claim.kind {
+                    Kind::Region => association.region.get_or_insert(value),
+                    Kind::Revision => association.revision.get_or_insert(value),
+                    Kind::TitleMatch => association.title.get_or_insert(value),
+                    Kind::FilenameAssociation => association.filename.get_or_insert(value),
+                    Kind::ManualAssociation => {
+                        association.manually_associated = true;
+                        continue;
+                    }
+                    Kind::ContentHashMatch if is_sha256(&claim.value) => {
+                        hashes.push(claim.value.to_ascii_lowercase());
+                        continue;
+                    }
+                    _ => continue,
+                };
+            }
+        }
+        hashes.sort();
+        hashes.dedup();
+        association.identities = hashes
+            .into_iter()
+            .map(|value| CheatIdentityRequirement {
+                kind: IdentityKind::LooseRomSha256,
+                value,
+            })
+            .collect();
+        association
+    }
 }
 
 /// Parser evidence is independent of IR semantics: opaque native codes may

@@ -56,6 +56,7 @@ fn fixture() -> CheatApplicabilityInput {
             manually_associated: false,
         },
         document: CheatDocument {
+            source_evidence: Vec::new(),
             title: "Infinite lives".into(),
             platform: CheatPlatform::GameCube,
             source_format: CheatSourceFormat::Gecko,
@@ -269,6 +270,10 @@ fn entry(input: &CheatApplicabilityInput, source: &str) -> CheatReconciliationEn
     CheatReconciliationEntry {
         game_identity: "GEXE01".into(),
         identity_verified: true,
+        applicability: Default::default(),
+        source_path: None,
+        source_index: None,
+        source_fields: vec![],
         title: input.document.title.clone(),
         source: source.into(),
         source_format: input.document.source_format.clone(),
@@ -715,4 +720,45 @@ fn title_with_matching_region_and_revision_never_claims_exact_game() {
     let report = assess_cheat_applicability(&input);
     assert_eq!(report.state, CheatApplicabilityState::StrongMatch);
     assert_eq!(report.identity_match, CheatApplicabilityMatch::Strong);
+}
+
+#[test]
+fn entry_claims_bridge_to_association_without_becoming_verification() {
+    use crate::patch_manager::cheat_provenance::{
+        CheatApplicabilityEvidence, CheatApplicabilityKind as Kind, CheatRecordProvenance,
+    };
+    use crate::platform_evidence_fusion::evidence_lineage::ClaimStrength;
+    let input = fixture();
+    let mut e = entry(&input, "local");
+    e.applicability.region = Some("NTSC-U".into());
+    e.applicability.revision = Some("1.0".into());
+    e.applicability.verified_binary_identity = Some("A".repeat(64));
+    let mut evidence = CheatRecordProvenance::original(Some("Lives".into()), None);
+    evidence.applicability = vec![
+        CheatApplicabilityEvidence {
+            kind: Kind::ManualAssociation,
+            value: "Game".into(),
+            strength: ClaimStrength::Weak,
+        },
+        CheatApplicabilityEvidence {
+            kind: Kind::SerialMatch,
+            value: "SLUS-00001".into(),
+            strength: ClaimStrength::Weak,
+        },
+    ];
+    e.document.source_evidence = vec![evidence];
+    let a = CheatGameAssociation::from_entry(&e);
+    assert_eq!(a.region.as_deref(), Some("NTSC-U"));
+    assert_eq!(a.revision.as_deref(), Some("1.0"));
+    assert!(a.manually_associated);
+    // A claimed hash is a *requirement*, normalised to lowercase; the platform
+    // specific serial is not guessed into an identity kind.
+    assert_eq!(a.identities.len(), 1);
+    assert_eq!(a.identities[0].value, "a".repeat(64));
+    // Claims alone never make an unrelated selected game "ready".
+    let mut assessed = fixture();
+    assessed.association = a;
+    assessed.game = CheatSelectedGame::default();
+    let report = assess_cheat_applicability(&assessed);
+    assert_ne!(report.state, CheatApplicabilityState::Ready);
 }
