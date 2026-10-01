@@ -1,7 +1,8 @@
 # Safe Launch Sandbox + Scratch-Media Primitive (V1 Design)
 
-**Status: design only. No production code lands in this pass — see "Implementation decision"
-below for why, and what would unblock implementation.**
+**Status: implemented** in `launch/safe_launch_sandbox` (see
+`NATIVE_ADAPTERS_FIVE_PLATFORM_RESCUE.md`). The text below is the original V1 design,
+retained for its threat model; its "design only" decision no longer applies.
 
 ## Threat model
 

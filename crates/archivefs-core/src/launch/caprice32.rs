@@ -47,6 +47,8 @@ use super::safe_launch_sandbox::{
 
 pub const ADAPTER_ID: &str = "caprice32";
 pub const DISPLAY_NAME: &str = "Caprice32";
+pub const CLASSIFICATION: super::native_support::NativeAdapterClassification =
+    super::native_support::NativeAdapterClassification::VerifiedLaunchable;
 pub const PLATFORM_ID: &str = "Amstrad CPC";
 pub const DISPOSABLE_SESSION_WARNING: &str = "Temporary Caprice32 session: disk and tape changes are discarded; persistent-save sessions are not supported.";
 

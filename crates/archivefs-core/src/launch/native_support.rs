@@ -386,6 +386,87 @@ pub fn plan_preview(
     })
 }
 
+/// What a person or a router can be told about one native adapter without
+/// running anything. Read-only: nothing here changes how any other launch is
+/// planned or routed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeAdapterInfo {
+    pub adapter_id: &'static str,
+    pub display_name: &'static str,
+    pub platform_id: &'static str,
+    pub classification: NativeAdapterClassification,
+    /// Media formats the adapter accepts (launch or, for preview-only adapters,
+    /// validation).
+    pub supported_media: &'static [&'static str],
+    /// Formats it refuses by name.
+    pub refused_media: &'static [&'static str],
+    /// Why launch is not offered; empty for a verified-launchable adapter.
+    pub unproven: &'static [&'static str],
+}
+
+/// The five native adapters, in alphabetical order of adapter id.
+pub const NATIVE_ADAPTERS: &[NativeAdapterInfo] = &[
+    NativeAdapterInfo {
+        adapter_id: super::atari800::ADAPTER_ID,
+        display_name: super::atari800::DISPLAY_NAME,
+        platform_id: super::atari800::PLATFORM_ID,
+        classification: super::atari800::CLASSIFICATION,
+        supported_media: &["ATR", "XFD"],
+        refused_media: &["ATX", "tape", "program", "cartridge", "HDD", "manifest"],
+        unproven: &[],
+    },
+    NativeAdapterInfo {
+        adapter_id: super::b_em::ADAPTER_ID,
+        display_name: "b-em",
+        platform_id: super::b_em::PLATFORM_ID,
+        classification: super::b_em::CLASSIFICATION,
+        supported_media: &["SSD", "DSD", "UEF"],
+        refused_media: &["CSW", "ADF", "snapshot"],
+        unproven: super::b_em::UNPROVEN,
+    },
+    NativeAdapterInfo {
+        adapter_id: super::caprice32::ADAPTER_ID,
+        display_name: super::caprice32::DISPLAY_NAME,
+        platform_id: super::caprice32::PLATFORM_ID,
+        classification: super::caprice32::CLASSIFICATION,
+        supported_media: &["DSK", "CDT"],
+        refused_media: &["IPF", "CPR", "SNA"],
+        unproven: &[],
+    },
+    NativeAdapterInfo {
+        adapter_id: super::np2kai::ADAPTER_ID,
+        display_name: "NP2kai",
+        platform_id: super::np2kai::PLATFORM_ID,
+        classification: super::np2kai::CLASSIFICATION,
+        supported_media: &["D88"],
+        refused_media: &["HDI", "HDD", "NHD"],
+        unproven: super::np2kai::UNPROVEN,
+    },
+    NativeAdapterInfo {
+        adapter_id: super::oricutron::ADAPTER_ID,
+        display_name: "Oricutron",
+        platform_id: super::oricutron::PLATFORM_ID,
+        classification: super::oricutron::CLASSIFICATION,
+        supported_media: &["TAP", "DSK (MFM_DISK)"],
+        refused_media: &["Telestrat", "unverified media"],
+        unproven: super::oricutron::UNPROVEN,
+    },
+];
+
+pub fn native_adapter_info(adapter_id: &str) -> Option<&'static NativeAdapterInfo> {
+    NATIVE_ADAPTERS
+        .iter()
+        .find(|info| info.adapter_id == adapter_id)
+}
+
+pub fn native_adapters_for_platform(
+    platform_id: &str,
+) -> impl Iterator<Item = &'static NativeAdapterInfo> {
+    NATIVE_ADAPTERS
+        .iter()
+        .filter(move |info| info.platform_id == platform_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +475,38 @@ mod tests {
     fn make_executable(path: &Path) {
         fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn the_registry_is_consistent_and_only_proven_adapters_are_launchable() {
+        let ids: Vec<_> = NATIVE_ADAPTERS.iter().map(|i| i.adapter_id).collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids, sorted, "alphabetical and unique");
+        let launchable: Vec<_> = NATIVE_ADAPTERS
+            .iter()
+            .filter(|i| i.classification == NativeAdapterClassification::VerifiedLaunchable)
+            .map(|i| i.adapter_id)
+            .collect();
+        assert_eq!(launchable, ["atari800", "caprice32"]);
+        for info in NATIVE_ADAPTERS {
+            assert!(!info.supported_media.is_empty() && !info.refused_media.is_empty());
+            // Not launchable <=> a reason is given; launchable <=> none is.
+            assert_eq!(
+                info.unproven.is_empty(),
+                info.classification == NativeAdapterClassification::VerifiedLaunchable,
+                "{}",
+                info.adapter_id
+            );
+        }
+        assert_eq!(
+            native_adapter_info("oricutron").unwrap().platform_id,
+            "Oric"
+        );
+        assert!(native_adapter_info("nonexistent").is_none());
+        assert_eq!(native_adapters_for_platform("PC-98").count(), 1);
+        assert_eq!(native_adapters_for_platform("Nowhere").count(), 0);
     }
 
     #[test]

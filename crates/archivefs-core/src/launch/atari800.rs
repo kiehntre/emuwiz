@@ -29,6 +29,8 @@ use super::safe_launch_sandbox::{
 
 pub const ADAPTER_ID: &str = "atari800";
 pub const DISPLAY_NAME: &str = "Atari800";
+pub const CLASSIFICATION: super::native_support::NativeAdapterClassification =
+    super::native_support::NativeAdapterClassification::VerifiedLaunchable;
 pub const PLATFORM_ID: &str = "Atari 8-bit";
 pub const DISPOSABLE_SESSION_WARNING: &str = "Temporary Atari800 session: disk changes and new saves are discarded. Existing saves are not imported. Persistent-save sessions are not supported.";
 
