@@ -33,6 +33,8 @@ pub enum CheatReviewChoice {
 pub struct ResolvedCheatEntry {
     pub canonical_entry_index: usize,
     pub duplicate_entry_indices: Vec<usize>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub title: String,
     pub platform: CheatPlatform,
     pub source_format: super::cheat_ir::CheatSourceFormat,
@@ -46,6 +48,8 @@ pub struct ResolvedCheatDiagnostic {
     pub entry_indices: Vec<usize>,
     pub title: String,
     pub reason: String,
+    #[serde(default)]
+    pub classifications: Vec<super::cheat_ir::CheatDuplicateKind>,
     pub provenance: Vec<String>,
 }
 
@@ -117,51 +121,101 @@ impl ResolvedCheatPlan {
         let mut unsupported = Vec::new();
         let mut consumed = BTreeSet::new();
         let mut warnings = Vec::new();
+        // A filtered or stale projection must not turn omitted conflicts
+        // into automatically selected fallback entries.
+        let current = super::cheat_ir::reconcile_cheats_for_game(report.entries.clone());
+        let current_groups = match &current {
+            super::cheat_ir::CheatReconciliationOutcome::Ready(current) => {
+                current.groups.as_slice()
+            }
+            _ => &[],
+        };
+        let needs_review = |group: &CheatReconciliationGroup| {
+            matches!(
+                group.relationship,
+                CheatRelationship::SameTitleDifferentCode | CheatRelationship::RelatedUnproven
+            )
+        };
+        let review_by_entry: BTreeMap<_, _> = current_groups
+            .iter()
+            .filter(|group| needs_review(group))
+            .flat_map(|group| group.entry_indices.iter().map(move |index| (*index, group)))
+            .collect();
 
         for (group_index, group) in report.groups.iter().enumerate() {
             let indices = valid_indices(report, group);
             if indices.is_empty() {
                 continue;
             }
+            if indices.iter().any(|index| consumed.contains(index)) {
+                continue;
+            }
+            if let Some(conflict) = indices
+                .iter()
+                .filter_map(|index| review_by_entry.get(index))
+                .find(|current| {
+                    !needs_review(group)
+                        || current
+                            .entry_indices
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                            != indices.iter().copied().collect()
+                })
+            {
+                consumed.extend(conflict.entry_indices.iter().copied());
+                let mut item = diagnostic(
+                    report,
+                    &conflict.entry_indices,
+                    "source evidence contains a conflict absent from this group projection",
+                );
+                item.classifications = conflict.classifications.clone();
+                unresolved.push(item);
+                continue;
+            }
             consumed.extend(indices.iter().copied());
             let choice = choices.get(&group_index).copied();
             let selected_indices: Vec<usize> = match group.relationship {
-                CheatRelationship::SameTitleDifferentCode => match choice {
-                    Some(CheatReviewChoice::KeepA) => {
-                        indices.first().copied().into_iter().collect()
+                CheatRelationship::SameTitleDifferentCode | CheatRelationship::RelatedUnproven => {
+                    match choice {
+                        Some(CheatReviewChoice::KeepA) if indices.len() == 2 => {
+                            indices.first().copied().into_iter().collect()
+                        }
+                        Some(CheatReviewChoice::KeepB) if indices.len() == 2 => {
+                            indices.get(1).copied().into_iter().collect()
+                        }
+                        Some(CheatReviewChoice::KeepBoth) => indices.clone(),
+                        Some(CheatReviewChoice::Skip) => {
+                            skipped.push(diagnostic(
+                                report,
+                                &indices,
+                                "excluded by the saved Skip review choice",
+                            ));
+                            Vec::new()
+                        }
+                        Some(CheatReviewChoice::IgnoreConflict) => {
+                            ignored.push(diagnostic(
+                                report,
+                                &indices,
+                                "left unresolved by the saved Ignore review choice",
+                            ));
+                            Vec::new()
+                        }
+                        None | Some(CheatReviewChoice::KeepA | CheatReviewChoice::KeepB) => {
+                            unresolved.push(diagnostic(
+                                report,
+                                &indices,
+                                "conflicting entries have no saved review choice",
+                            ));
+                            Vec::new()
+                        }
                     }
-                    Some(CheatReviewChoice::KeepB) => indices.get(1).copied().into_iter().collect(),
-                    Some(CheatReviewChoice::KeepBoth) => indices.clone(),
-                    Some(CheatReviewChoice::Skip) => {
-                        skipped.push(diagnostic(
-                            report,
-                            &indices,
-                            "excluded by the saved Skip review choice",
-                        ));
-                        Vec::new()
-                    }
-                    Some(CheatReviewChoice::IgnoreConflict) => {
-                        ignored.push(diagnostic(
-                            report,
-                            &indices,
-                            "left unresolved by the saved Ignore review choice",
-                        ));
-                        Vec::new()
-                    }
-                    None => {
-                        unresolved.push(diagnostic(
-                            report,
-                            &indices,
-                            "conflicting entries have no saved review choice",
-                        ));
-                        Vec::new()
-                    }
-                },
+                }
                 CheatRelationship::ExactSemanticDuplicate
                 | CheatRelationship::ExactRawDuplicate => {
                     indices.first().copied().into_iter().collect()
                 }
-                CheatRelationship::Unique | CheatRelationship::RelatedUnproven => indices.clone(),
+                CheatRelationship::Unique => indices.clone(),
             };
             for index in selected_indices {
                 if let Some(entry) = report.entries.get(index) {
@@ -186,6 +240,19 @@ impl ResolvedCheatPlan {
 
         for index in 0..report.entries.len() {
             if !consumed.contains(&index) {
+                if let Some(conflict) = review_by_entry.get(&index) {
+                    let unseen: Vec<_> = conflict
+                        .entry_indices
+                        .iter()
+                        .copied()
+                        .filter(|index| !consumed.contains(index))
+                        .collect();
+                    consumed.extend(unseen.iter().copied());
+                    let mut item = diagnostic(report, &unseen, "omitted conflict requires review");
+                    item.classifications = conflict.classifications.clone();
+                    unresolved.push(item);
+                    continue;
+                }
                 let entry = &report.entries[index];
                 if let Some(reason) = unsafe_reason(entry) {
                     let item = diagnostic(report, &[index], reason);
@@ -199,7 +266,39 @@ impl ResolvedCheatPlan {
                 }
             }
         }
-        selected.sort_by_key(|entry| entry.canonical_entry_index);
+        // Review state must not hide the malformed/unsupported evidence of
+        // a source entry, including entries omitted from a filtered report.
+        let mut diagnosed: BTreeSet<_> = malformed
+            .iter()
+            .chain(unsupported.iter())
+            .flat_map(|item| item.entry_indices.iter().copied())
+            .collect();
+        for (index, entry) in report.entries.iter().enumerate() {
+            if !diagnosed.contains(&index) {
+                if let Some(reason) = unsafe_reason(entry) {
+                    let item = diagnostic(report, &[index], reason);
+                    if is_malformed(entry) {
+                        malformed.push(item);
+                    } else {
+                        unsupported.push(item);
+                    }
+                    diagnosed.insert(index);
+                }
+            }
+        }
+        selected.sort_by_cached_key(|entry| {
+            (
+                entry
+                    .title
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase(),
+                entry.provenance.clone(),
+                serde_json::to_string(&entry.document)
+                    .expect("resolved cheat document is serializable"),
+            )
+        });
         warnings.extend(
             malformed
                 .iter()
@@ -217,6 +316,16 @@ impl ResolvedCheatPlan {
         }
 
         let mut blocked = Vec::new();
+        if matches!(
+            current,
+            super::cheat_ir::CheatReconciliationOutcome::Unavailable { .. }
+        ) || report.entries.iter().any(|entry| {
+            entry.game_identity != report.game_identity
+                || entry.document.platform != report.platform
+        }) {
+            blocked.push("entries do not share the reported verified game identity".into());
+            selected.clear();
+        }
         if report.auto_winner.is_some() {
             blocked.push("reconciliation report supplied an automatic winner".into());
         }
@@ -349,6 +458,17 @@ fn resolved_entry(
     let mut provenance = Vec::new();
     for source_index in duplicate_indices {
         if let Some(source) = report.entries.get(*source_index) {
+            provenance.push(source.source.clone());
+            if let Some(path) = &source.source_path {
+                provenance.push(format!("{}: {path}", source.source));
+            }
+            provenance.extend(
+                source
+                    .document
+                    .provenance
+                    .iter()
+                    .map(|value| format!("{}: {value}", source.source)),
+            );
             provenance.extend(
                 source
                     .provenance
@@ -362,6 +482,12 @@ fn resolved_entry(
     ResolvedCheatEntry {
         canonical_entry_index: index,
         duplicate_entry_indices: duplicate_indices.to_vec(),
+        aliases: duplicate_indices
+            .iter()
+            .filter_map(|index| report.entries.get(*index).map(|entry| entry.title.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         title: entry.title.clone(),
         platform: entry.document.platform.clone(),
         source_format: entry.source_format.clone(),
@@ -384,6 +510,14 @@ fn diagnostic(
         .unwrap_or_default();
     for index in indices {
         if let Some(entry) = report.entries.get(*index) {
+            provenance.push(entry.source.clone());
+            provenance.extend(
+                entry
+                    .document
+                    .provenance
+                    .iter()
+                    .map(|value| format!("{}: {value}", entry.source)),
+            );
             provenance.extend(
                 entry
                     .provenance
@@ -398,6 +532,19 @@ fn diagnostic(
         entry_indices: indices.to_vec(),
         title,
         reason: reason.into(),
+        classifications: report
+            .groups
+            .iter()
+            .filter(|group| {
+                group
+                    .entry_indices
+                    .iter()
+                    .any(|index| indices.contains(index))
+            })
+            .flat_map(|group| group.classifications.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         provenance,
     }
 }

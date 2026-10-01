@@ -302,7 +302,24 @@ impl CheatSelection {
     #[must_use]
     pub fn from_document(document: &ChtDocument) -> Self {
         Self {
-            entries: document.entries.iter().map(entry_row).collect(),
+            entries: {
+                let conflicts = document.conflicting_entry_indices();
+                document
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let mut row = entry_row(entry);
+                        if conflicts.contains(&entry.index) {
+                            row.enabled = false;
+                            row.warnings.push(
+                                "conflicting cheat implementations require review before enabling"
+                                    .into(),
+                            );
+                        }
+                        row
+                    })
+                    .collect()
+            },
         }
     }
 
@@ -403,6 +420,23 @@ impl CheatSelection {
                 )
             })?;
             resolved.push(install);
+        }
+        let enabled_indices: std::collections::BTreeSet<_> = self
+            .entries
+            .iter()
+            .filter(|row| row.selected && row.enabled)
+            .map(|row| row.source_index)
+            .collect();
+        let mut enabled_document = document.clone();
+        enabled_document
+            .entries
+            .retain(|entry| enabled_indices.contains(&entry.index));
+        if !enabled_document.conflicting_entry_indices().is_empty() {
+            return Err(error(
+                CheatInstallPlanErrorKind::SelectionInvalid,
+                None,
+                "conflicting implementations cannot be enabled together; select one for review",
+            ));
         }
         if resolved.is_empty() {
             return Err(error(

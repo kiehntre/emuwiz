@@ -23,6 +23,10 @@
 
 use std::fmt;
 
+use super::cheat_ir::{
+    CheatApplicability, CheatDocument, CheatIssue, CheatOperation, CheatPlatform,
+    CheatReconciliationEntry, CheatSourceFieldEvidence, CheatSourceFormat,
+};
 use serde::Serialize;
 
 /// Mirrors `cheat_catalogue::MAX_CHEATS_PER_GAME` and
@@ -46,6 +50,10 @@ pub const MAX_CHT_GLOBAL_FIELDS: usize = 64;
 pub const MAX_CHT_PRESERVED_COMMENTS: usize = 32;
 /// Preserved `cheatN_<field>` keys other than `desc`/`code`/`enable`.
 pub const MAX_CHT_EXTRA_FIELDS_PER_ENTRY: usize = 32;
+/// Original assignments retained per entry as review evidence (repeats included).
+pub const MAX_CHT_SOURCE_FIELDS_PER_ENTRY: usize = 64;
+/// Original file-wide assignments retained as review evidence.
+pub const MAX_CHT_GLOBAL_SOURCE_FIELDS: usize = 128;
 /// Bounded document-level warning list.
 pub const MAX_CHT_DOCUMENT_WARNINGS: usize = 256;
 
@@ -252,6 +260,9 @@ pub struct ChtEntry {
     /// first-seen order, with `<field>` (not the full key) as the name.
     pub extra_fields: Vec<(String, String)>,
     pub warnings: Vec<ChtEntryWarning>,
+    /// Every original `cheatN_*` assignment in source order (bounded), so a
+    /// conflicting or repeated value is reviewable, never silently dropped.
+    pub source_fields: Vec<CheatSourceFieldEvidence>,
 }
 
 impl ChtEntry {
@@ -296,6 +307,8 @@ pub struct ChtDocument {
     pub preserved_comments: Vec<String>,
     /// Non-`cheatN_*`, non-`cheats` keys, in first-seen order.
     pub global_fields: Vec<(String, String)>,
+    /// Original file-wide assignments, including repeated count/engine keys.
+    pub source_fields: Vec<CheatSourceFieldEvidence>,
     pub warnings: Vec<ChtDocumentWarning>,
 }
 
@@ -311,6 +324,154 @@ impl ChtDocument {
     #[must_use]
     pub fn has_warnings(&self) -> bool {
         !self.warnings.is_empty() || self.entries.iter().any(|entry| !entry.warnings.is_empty())
+    }
+
+    /// Projects entries into the shared reconciliation model. A projection
+    /// only: original values, flags and source lines stay in this document.
+    /// Callers supply already-verified identity evidence explicitly.
+    pub fn reconciliation_entries(
+        &self,
+        game_identity: &str,
+        identity_verified: bool,
+        platform: CheatPlatform,
+        source: &str,
+        source_path: &str,
+    ) -> Vec<CheatReconciliationEntry> {
+        let global_conflict = self
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::ConflictingDuplicate);
+        let global_truncated = self
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == ChtDocumentWarningKind::LimitReached);
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(position, entry)| {
+                let title = entry.effective_description();
+                let provenance = vec![format!("{source_path}:cheat{}", entry.index)];
+                let mut issues: Vec<CheatIssue> = entry
+                    .blocking_warnings()
+                    .map(|warning| {
+                        if warning.kind == ChtEntryWarningKind::ConflictingDuplicate {
+                            CheatIssue::SourceIndexConflict
+                        } else {
+                            CheatIssue::UnsupportedOperation(warning.detail.clone())
+                        }
+                    })
+                    .collect();
+                if global_conflict {
+                    issues.push(CheatIssue::SourceMetadataConflict);
+                }
+                if global_truncated {
+                    issues.push(CheatIssue::UnsupportedOperation(
+                        "file-wide metadata exceeds the retained bound; review the document evidence"
+                            .into(),
+                    ));
+                }
+                CheatReconciliationEntry {
+                    game_identity: game_identity.into(),
+                    identity_verified,
+                    title: title.clone(),
+                    source: source.into(),
+                    source_format: CheatSourceFormat::RetroArch,
+                    document: CheatDocument {
+                        title,
+                        platform: platform.clone(),
+                        source_format: CheatSourceFormat::RetroArch,
+                        operations: entry
+                            .code
+                            .iter()
+                            .map(|raw| CheatOperation::UnsupportedRaw {
+                                source_format: CheatSourceFormat::RetroArch,
+                                raw: raw.clone(),
+                                reason: "RetroArch engine-specific code retained without decoding"
+                                    .into(),
+                            })
+                            .collect(),
+                        issues,
+                        provenance: provenance.clone(),
+                    },
+                    raw_code: entry.code.clone(),
+                    provenance,
+                    applicability: CheatApplicability {
+                        metadata: entry
+                            .extra_fields
+                            .iter()
+                            .map(|(key, value)| (format!("entry:{key}"), value.clone()))
+                            .chain(
+                                self.global_fields
+                                    .iter()
+                                    .map(|(key, value)| (format!("global:{key}"), value.clone())),
+                            )
+                            .collect(),
+                        ..Default::default()
+                    },
+                    source_path: Some(source_path.into()),
+                    source_index: Some(entry.index),
+                    // File-wide assignments are carried once, not copied per entry.
+                    source_fields: self
+                        .source_fields
+                        .iter()
+                        .filter(|_| position == 0)
+                        .chain(entry.source_fields.iter())
+                        .cloned()
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Indices needing a deliberate choice before default activation: the same
+    /// name with a different body/metadata, or the same body with different
+    /// engine metadata. Descriptions and codes are never rewritten.
+    pub fn conflicting_entry_indices(&self) -> std::collections::BTreeSet<u32> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut names = BTreeMap::<String, Vec<&ChtEntry>>::new();
+        let mut codes = BTreeMap::<String, Vec<&ChtEntry>>::new();
+        for entry in &self.entries {
+            if let Some(name) = &entry.description {
+                let name = name
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_ascii_lowercase();
+                if !name.is_empty() {
+                    names.entry(name).or_default().push(entry);
+                }
+            }
+            if let Some(code) = &entry.code {
+                if !code.trim().is_empty() {
+                    codes.entry(code.trim().into()).or_default().push(entry);
+                }
+            }
+        }
+        let metadata = |entry: &ChtEntry| {
+            entry
+                .extra_fields
+                .iter()
+                .cloned()
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut conflicts = BTreeSet::new();
+        for group in names.values() {
+            let first = group[0];
+            if group.iter().any(|entry| {
+                entry.code.as_deref() != first.code.as_deref() || metadata(entry) != metadata(first)
+            }) {
+                conflicts.extend(group.iter().map(|entry| entry.index));
+            }
+        }
+        for group in codes.values() {
+            if group
+                .iter()
+                .any(|entry| metadata(entry) != metadata(group[0]) || entry.code != group[0].code)
+            {
+                conflicts.extend(group.iter().map(|entry| entry.index));
+            }
+        }
+        conflicts
     }
 
     #[must_use]
@@ -357,8 +518,10 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         enable: Option<String>,
         extra_fields: Vec<(String, String)>,
         warnings: Vec<ChtEntryWarning>,
+        source_fields: Vec<CheatSourceFieldEvidence>,
     }
 
+    let mut source_fields: Vec<CheatSourceFieldEvidence> = Vec::new();
     let mut declared_count: Option<u32> = None;
     let mut declared_value: Option<String> = None;
     let mut drafts: BTreeMap<u32, Draft> = BTreeMap::new();
@@ -367,6 +530,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
     let mut warnings: Vec<ChtDocumentWarning> = Vec::new();
     let mut seen_any_body_line = false;
     let mut limit_reported = false;
+    let mut source_fields_limit_reported = false;
 
     let push_warning = |warnings: &mut Vec<ChtDocumentWarning>,
                         kind: ChtDocumentWarningKind,
@@ -438,6 +602,28 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 bounded_line,
                 "source line exceeds the line bound".to_string(),
             ));
+        }
+
+        let is_entry_assignment = key
+            .strip_prefix("cheat")
+            .is_some_and(|rest| rest.bytes().next().is_some_and(|b| b.is_ascii_digit()));
+        if !is_entry_assignment && !key.is_empty() {
+            if source_fields.len() < MAX_CHT_GLOBAL_SOURCE_FIELDS {
+                source_fields.push(CheatSourceFieldEvidence {
+                    field: if key.eq_ignore_ascii_case("cheats") { "cheats".into() } else { key.into() },
+                    value: value.clone(),
+                    line: line_number,
+                    raw_source: bounded_line.to_string(),
+                });
+            } else if !source_fields_limit_reported {
+                source_fields_limit_reported = true;
+                push_warning(
+                    &mut warnings,
+                    ChtDocumentWarningKind::LimitReached,
+                    Some(line_number),
+                    format!("more than {MAX_CHT_GLOBAL_SOURCE_FIELDS} file-wide assignments; later evidence omitted"),
+                );
+            }
         }
 
         if key.eq_ignore_ascii_case("cheats") {
@@ -577,10 +763,63 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             enable: None,
             extra_fields: Vec::new(),
             warnings: Vec::new(),
+            source_fields: Vec::new(),
         });
+        if draft.source_fields.len() < MAX_CHT_SOURCE_FIELDS_PER_ENTRY {
+            draft.source_fields.push(CheatSourceFieldEvidence {
+                field: field.to_string(),
+                value: value.clone(),
+                line: line_number,
+                raw_source: bounded_line.to_string(),
+            });
+        } else if !draft
+            .warnings
+            .iter()
+            .any(|w| w.kind == ChtEntryWarningKind::LimitReached)
+        {
+            draft.warnings.push(entry_warning(
+                ChtEntryWarningKind::LimitReached,
+                line_number,
+                bounded_line,
+                format!("more than {MAX_CHT_SOURCE_FIELDS_PER_ENTRY} assignments for one entry; later evidence omitted"),
+            ));
+        }
         for warning in &mut value_warnings {
             warning.line = Some(line_number);
             warning.raw_source = Some(bounded_line.to_string());
+        }
+        // A bounded prefix can make two different over-long values look equal.
+        // Compare the retained original right-hand sides so that difference
+        // stays a blocking, observable conflict.
+        let truncated_now = value_warnings
+            .iter()
+            .any(|warning| warning.kind == ChtEntryWarningKind::OversizedField);
+        if let Some(previous) = draft
+            .source_fields
+            .iter()
+            .rev()
+            .skip(1)
+            .find(|item| item.field == field)
+        {
+            let rhs = |line: &str| line.split_once('=').map(|(_, value)| value.trim().to_string());
+            let previous_truncated = draft.warnings.iter().any(|warning| {
+                warning.kind == ChtEntryWarningKind::OversizedField
+                    && warning.line == Some(previous.line)
+            });
+            if (truncated_now || previous_truncated)
+                && field_values_equivalent(field, &previous.value, &value)
+                && rhs(&previous.raw_source) != rhs(bounded_line)
+            {
+                draft.warnings.push(entry_warning(
+                    ChtEntryWarningKind::ConflictingDuplicate,
+                    line_number,
+                    bounded_line,
+                    format!(
+                        "cheat{entry_index}_{field} differs from line {} beyond the retained value bound; review required",
+                        previous.line
+                    ),
+                ));
+            }
         }
         draft.warnings.extend(value_warnings);
 
@@ -731,6 +970,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                 .is_some_and(|value| value.eq_ignore_ascii_case("true")),
             extra_fields: draft.extra_fields,
             warnings: entry_warnings,
+            source_fields: draft.source_fields,
         });
     }
 
@@ -774,6 +1014,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         entries,
         preserved_comments,
         global_fields,
+        source_fields,
         warnings,
     })
 }
@@ -789,7 +1030,7 @@ fn set_once(
 ) {
     if let Some(first) = slot {
         warnings.push(ChtEntryWarning {
-            kind: if first == &value { ChtEntryWarningKind::DuplicateField }
+            kind: if field_values_equivalent(field, first, &value) { ChtEntryWarningKind::DuplicateField }
                 else { ChtEntryWarningKind::ConflictingDuplicate },
             line: Some(line),
             raw_source: Some(raw_source.to_string()),
@@ -800,6 +1041,23 @@ fn set_once(
         return;
     }
     *slot = Some(value);
+}
+
+/// Only normalization justified by a field's grammar: descriptions compare
+/// case- and whitespace-insensitively, `enable` compares case-insensitively.
+/// Codes and every other field are literal. Originals are never rewritten.
+pub(super) fn field_values_equivalent(field: &str, left: &str, right: &str) -> bool {
+    let fold = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+    };
+    match field {
+        "desc" => fold(left) == fold(right),
+        "enable" => left.eq_ignore_ascii_case(right),
+        _ => left == right,
+    }
 }
 
 fn check_file_size(size: usize) -> Result<(), ChtParseError> {

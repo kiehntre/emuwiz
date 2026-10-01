@@ -305,9 +305,10 @@ pub use cheat_installer::{
     CheatInstallRunOutcome, execute_cheat_install_run,
 };
 pub use cheat_ir::{
-    CheatConversionPreview, CheatDocument, CheatEvidenceQuality, CheatIssue, CheatOperation,
-    CheatPlatform, CheatReconciliationEntry, CheatReconciliationGroup, CheatReconciliationOutcome,
-    CheatReconciliationResult, CheatRelationship, CheatSourceFormat, CheatTargetFormat,
+    CheatApplicability, CheatConversionPreview, CheatDocument, CheatDuplicateKind,
+    CheatEvidenceQuality, CheatIssue, CheatOperation, CheatPlatform, CheatReconciliationEntry,
+    CheatReconciliationGroup, CheatReconciliationOutcome, CheatReconciliationResult,
+    CheatRelationship, CheatSourceFieldEvidence, CheatSourceFormat, CheatTargetFormat,
     ConversionCapability, DsActionReplayClassification, DsActionReplayUnsupported,
     DsActionReplayUnsupportedKind, OperationConversionStatus, TargetCapability,
     assess_document_conversion, convert_cheat_document, dolphin_line_to_ir,

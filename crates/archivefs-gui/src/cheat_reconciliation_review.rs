@@ -429,6 +429,7 @@ impl CheatReconciliationReviewState {
         widgets::card(ui, |ui| {
             ui.strong(title);
             ui.label(heading);
+            ui.weak(format!("Evidence: {:?}", group.classifications));
             for difference in &group.differences {
                 ui.weak(format!("Difference: {difference}"));
             }
@@ -456,7 +457,7 @@ impl CheatReconciliationReviewState {
             }
             if matches!(
                 group.relationship,
-                CheatRelationship::SameTitleDifferentCode
+                CheatRelationship::SameTitleDifferentCode | CheatRelationship::RelatedUnproven
             ) {
                 ui.horizontal_wrapped(|ui| {
                     self.choice_button(ui, result, group_index, ReviewChoice::KeepA, "Keep A");
@@ -592,7 +593,10 @@ fn choice_allowed(report: &CheatReconciliationResult, index: usize, choice: Revi
     let Some(group) = report.groups.get(index) else {
         return false;
     };
-    if group.relationship != CheatRelationship::SameTitleDifferentCode {
+    if !matches!(
+        group.relationship,
+        CheatRelationship::SameTitleDifferentCode | CheatRelationship::RelatedUnproven
+    ) {
         return false;
     }
     if matches!(choice, ReviewChoice::Skip | ReviewChoice::IgnoreConflict) {

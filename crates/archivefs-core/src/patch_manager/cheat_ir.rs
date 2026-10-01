@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+mod duplicates;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CheatPlatform {
@@ -80,6 +80,8 @@ pub enum CheatIssue {
     LossyMapping(String),
     UnknownWidth,
     RawPreserved,
+    SourceIndexConflict,
+    SourceMetadataConflict,
     MissingTargetEncoder,
     DsActionReplayUnsupported(DsActionReplayUnsupportedKind),
 }
@@ -130,12 +132,65 @@ pub struct CheatDocument {
 pub struct CheatReconciliationEntry {
     pub game_identity: String,
     pub identity_verified: bool,
+    #[serde(default)]
+    pub applicability: CheatApplicability,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub source_index: Option<u32>,
+    #[serde(default)]
+    pub source_fields: Vec<CheatSourceFieldEvidence>,
     pub title: String,
     pub source: String,
     pub source_format: CheatSourceFormat,
     pub document: CheatDocument,
     pub raw_code: Option<String>,
     pub provenance: Vec<String>,
+}
+
+/// Verified applicability supplied by an existing identity/provider adapter.
+/// None is unknown, never a wildcard. No filename inference is performed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheatApplicability {
+    pub region: Option<String>,
+    pub revision: Option<String>,
+    pub verified_binary_identity: Option<String>,
+    pub engine: Option<String>,
+    pub metadata: std::collections::BTreeMap<String, String>,
+}
+
+/// Original assignments, including repeated values and their source lines.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheatSourceFieldEvidence {
+    pub field: String,
+    pub value: String,
+    pub line: u32,
+    pub raw_source: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum CheatDuplicateKind {
+    Unique,
+    ExactDuplicate,
+    EquivalentDuplicate,
+    NameConflict,
+    CodeConflict,
+    SourceIndexConflict,
+    SourceMetadataConflict,
+    VersionVariant,
+    RegionVariant,
+    SyntaxVariant,
+    AmbiguousPossibleDuplicate,
+}
+
+impl CheatDuplicateKind {
+    pub fn requires_review(self) -> bool {
+        !matches!(
+            self,
+            Self::Unique | Self::ExactDuplicate | Self::EquivalentDuplicate
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +213,8 @@ pub struct CheatEvidenceQuality {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheatReconciliationGroup {
     pub relationship: CheatRelationship,
+    #[serde(default)]
+    pub classifications: Vec<CheatDuplicateKind>,
     pub entry_indices: Vec<usize>,
     pub normalized_title: String,
     pub semantic_fingerprint: Option<String>,
@@ -846,8 +903,16 @@ fn operation_semantics_known(document: &CheatDocument) -> bool {
             .all(|operation| !matches!(operation, CheatOperation::UnsupportedRaw { .. }))
 }
 
-fn raw_fingerprint(entry: &CheatReconciliationEntry) -> Option<String> {
-    let raw = entry.raw_code.clone().or_else(|| {
+fn raw_evidence(entry: &CheatReconciliationEntry) -> Option<String> {
+    entry.raw_code.clone().or_else(|| {
+        if entry
+            .document
+            .operations
+            .iter()
+            .any(|operation| !matches!(operation, CheatOperation::UnsupportedRaw { .. }))
+        {
+            return None;
+        }
         let lines = entry.document.operations.iter().filter_map(|operation| {
             if let CheatOperation::UnsupportedRaw { raw, .. } = operation {
                 Some(raw.as_str())
@@ -857,16 +922,64 @@ fn raw_fingerprint(entry: &CheatReconciliationEntry) -> Option<String> {
         });
         let joined = lines.collect::<Vec<_>>().join("\n");
         (!joined.is_empty()).then_some(joined)
-    })?;
-    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
-    let normalized = normalized
+    })
+}
+
+fn word_code_whitespace_safe(format: &CheatSourceFormat) -> bool {
+    matches!(
+        format,
+        CheatSourceFormat::DolphinActionReplay
+            | CheatSourceFormat::Gecko
+            | CheatSourceFormat::DolphinOnFrame
+            | CheatSourceFormat::Pnach
+            | CheatSourceFormat::ActionReplayDs
+            | CheatSourceFormat::GameSharkPs2
+            | CheatSourceFormat::CodeBreakerPs2
+            | CheatSourceFormat::N64GameShark
+    )
+}
+
+fn trimmed_code_lines(raw: &str) -> String {
+    raw.replace("\r\n", "\n")
+        .replace('\r', "\n")
         .lines()
         .map(str::trim)
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+fn raw_fingerprint(entry: &CheatReconciliationEntry) -> Option<String> {
+    let raw = raw_evidence(entry)?;
+    let safe = word_code_whitespace_safe(&entry.source_format)
+        && entry.document.operations.iter().all(|operation| {
+            if let CheatOperation::UnsupportedRaw { source_format, .. } = operation {
+                word_code_whitespace_safe(source_format)
+            } else {
+                true
+            }
+        });
+    // RetroArch may carry Game Genie strings or other core-specific syntax.
+    // Their padding and separators are literal evidence, not proven equivalent.
+    let normalized = if safe { trimmed_code_lines(&raw) } else { raw };
+    if normalized.trim().is_empty() {
+        return None;
+    }
     let mut hash = Sha256::new();
-    hash.update(b"cheat-raw-v1\0");
+    hash.update(b"cheat-raw-v2\0");
     hash.update(normalized.as_bytes());
+    Some(hex_digest(hash.finalize()))
+}
+
+/// Resemblance only. This fingerprint never proves code identity or selects
+/// a winner; unknown formatting matches must remain reviewable evidence.
+fn possible_raw_fingerprint(entry: &CheatReconciliationEntry) -> Option<String> {
+    let raw = trimmed_code_lines(&raw_evidence(entry)?);
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"cheat-possible-raw-v1\0");
+    hash.update(raw.as_bytes());
     Some(hex_digest(hash.finalize()))
 }
 
@@ -979,163 +1092,7 @@ fn difference_summary(left: &CheatDocument, right: &CheatDocument) -> Vec<String
 pub fn reconcile_cheats_for_game(
     entries: Vec<CheatReconciliationEntry>,
 ) -> CheatReconciliationOutcome {
-    let Some(first) = entries.first() else {
-        return CheatReconciliationOutcome::Unavailable {
-            reason: "no cheat entries were supplied".into(),
-        };
-    };
-    if !first.identity_verified || first.game_identity.trim().is_empty() {
-        return CheatReconciliationOutcome::Unavailable {
-            reason: "game identity is not verified".into(),
-        };
-    }
-    if entries.iter().any(|entry| {
-        !entry.identity_verified
-            || entry.game_identity != first.game_identity
-            || entry.document.platform != first.document.platform
-    }) {
-        return CheatReconciliationOutcome::Unavailable {
-            reason: "entries do not share one verified game and platform identity".into(),
-        };
-    }
-
-    let semantics = entries
-        .iter()
-        .map(|entry| semantic_fingerprint(&entry.document))
-        .collect::<Vec<_>>();
-    let raws = entries.iter().map(raw_fingerprint).collect::<Vec<_>>();
-    let titles = entries
-        .iter()
-        .map(|entry| reconciliation_title(&entry.title))
-        .collect::<Vec<_>>();
-    let mut groups = Vec::new();
-    let mut assigned = vec![false; entries.len()];
-
-    let mut semantic_groups = BTreeMap::<String, Vec<usize>>::new();
-    for (index, fingerprint) in semantics.iter().enumerate() {
-        if let Some(fingerprint) = fingerprint {
-            semantic_groups
-                .entry(fingerprint.clone())
-                .or_default()
-                .push(index);
-        }
-    }
-    for (fingerprint, indexes) in semantic_groups {
-        if indexes.len() < 2 {
-            continue;
-        }
-        for index in &indexes {
-            assigned[*index] = true;
-        }
-        groups.push(CheatReconciliationGroup {
-            relationship: CheatRelationship::ExactSemanticDuplicate,
-            normalized_title: titles[indexes[0]].clone(),
-            entry_indices: indexes.to_vec(),
-            semantic_fingerprint: Some(fingerprint),
-            raw_fingerprint: None,
-            differences: Vec::new(),
-            quality: indexes
-                .iter()
-                .map(|index| entry_quality(&entries[*index]))
-                .collect(),
-        });
-    }
-
-    let mut raw_groups = BTreeMap::<String, Vec<usize>>::new();
-    for (index, fingerprint) in raws.iter().enumerate() {
-        if !assigned[index]
-            && let Some(fingerprint) = fingerprint
-        {
-            raw_groups
-                .entry(fingerprint.clone())
-                .or_default()
-                .push(index);
-        }
-    }
-    for (fingerprint, indexes) in raw_groups {
-        if indexes.len() < 2 {
-            continue;
-        }
-        for index in &indexes {
-            assigned[*index] = true;
-        }
-        groups.push(CheatReconciliationGroup {
-            relationship: CheatRelationship::ExactRawDuplicate,
-            normalized_title: titles[indexes[0]].clone(),
-            entry_indices: indexes.to_vec(),
-            semantic_fingerprint: None,
-            raw_fingerprint: Some(fingerprint),
-            differences: Vec::new(),
-            quality: indexes
-                .iter()
-                .map(|index| entry_quality(&entries[*index]))
-                .collect(),
-        });
-    }
-
-    let mut title_groups = BTreeMap::<String, Vec<usize>>::new();
-    for (index, title) in titles.iter().enumerate() {
-        if !assigned[index] {
-            title_groups.entry(title.clone()).or_default().push(index);
-        }
-    }
-    for (title, indexes) in title_groups {
-        if indexes.len() < 2 {
-            continue;
-        }
-        for index in &indexes {
-            assigned[*index] = true;
-        }
-        let comparable = indexes
-            .iter()
-            .all(|index| semantics[*index].is_some() || raws[*index].is_some());
-        let relationship = if comparable {
-            CheatRelationship::SameTitleDifferentCode
-        } else {
-            CheatRelationship::RelatedUnproven
-        };
-        let mut differences = Vec::new();
-        for pair in indexes.windows(2) {
-            differences.extend(difference_summary(
-                &entries[pair[0]].document,
-                &entries[pair[1]].document,
-            ));
-        }
-        groups.push(CheatReconciliationGroup {
-            relationship,
-            normalized_title: title,
-            entry_indices: indexes.to_vec(),
-            semantic_fingerprint: None,
-            raw_fingerprint: None,
-            differences,
-            quality: indexes
-                .iter()
-                .map(|index| entry_quality(&entries[*index]))
-                .collect(),
-        });
-    }
-
-    for index in 0..entries.len() {
-        if !assigned[index] {
-            groups.push(CheatReconciliationGroup {
-                relationship: CheatRelationship::Unique,
-                entry_indices: vec![index],
-                normalized_title: titles[index].clone(),
-                semantic_fingerprint: semantics[index].clone(),
-                raw_fingerprint: raws[index].clone(),
-                differences: Vec::new(),
-                quality: vec![entry_quality(&entries[index])],
-            });
-        }
-    }
-    groups.sort_by_key(|group| group.entry_indices[0]);
-    CheatReconciliationOutcome::Ready(CheatReconciliationResult {
-        game_identity: first.game_identity.clone(),
-        platform: first.document.platform.clone(),
-        groups,
-        entries,
-        auto_winner: None,
-    })
+    duplicates::reconcile(entries)
 }
 
 #[cfg(test)]
@@ -1150,6 +1107,10 @@ mod tests {
         CheatReconciliationEntry {
             game_identity: "GAFE01-r1".into(),
             identity_verified: true,
+            applicability: Default::default(),
+            source_path: None,
+            source_index: None,
+            source_fields: Vec::new(),
             title: title.into(),
             source: source.into(),
             source_format: CheatSourceFormat::Gecko,

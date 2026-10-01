@@ -24,6 +24,10 @@ fn report() -> CheatReconciliationResult {
         .map(|value| CheatReconciliationEntry {
             game_identity: "GAFE01-r1".into(),
             identity_verified: true,
+            applicability: Default::default(),
+            source_path: None,
+            source_index: None,
+            source_fields: Vec::new(),
             title: "Lives".into(),
             source: format!("Local source {value}"),
             source_format: CheatSourceFormat::Gecko,

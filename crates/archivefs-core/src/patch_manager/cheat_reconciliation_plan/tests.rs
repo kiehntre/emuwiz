@@ -14,6 +14,10 @@ fn entry(
     CheatReconciliationEntry {
         game_identity: "dolphin:GALE01".into(),
         identity_verified: verified,
+        applicability: Default::default(),
+        source_path: None,
+        source_index: None,
+        source_fields: Vec::new(),
         title: title.into(),
         source: source.into(),
         source_format: CheatSourceFormat::Gecko,
@@ -49,6 +53,7 @@ fn report(
 fn group(relationship: CheatRelationship, indices: Vec<usize>) -> CheatReconciliationGroup {
     CheatReconciliationGroup {
         relationship,
+        classifications: Vec::new(),
         entry_indices: indices,
         normalized_title: "test".into(),
         semantic_fingerprint: None,
@@ -116,14 +121,25 @@ fn duplicate_group_collapses_but_retains_all_provenance() {
     let report = report(
         vec![
             entry(0, "a", "Same", 1, true),
-            entry(1, "b", "Same", 1, true),
+            entry(0, "b", "Same", 1, true),
         ],
         vec![group(CheatRelationship::ExactSemanticDuplicate, vec![0, 1])],
     );
     let plan = resolve_reviewed_cheat_plan(&report, &BTreeMap::new(), &request());
     assert_eq!(plan.selected_entries.len(), 1);
     assert_eq!(plan.selected_entries[0].duplicate_entry_indices, vec![0, 1]);
-    assert_eq!(plan.selected_entries[0].provenance.len(), 2);
+    assert!(
+        plan.selected_entries[0]
+            .provenance
+            .iter()
+            .any(|value| value.contains("provider-a"))
+    );
+    assert!(
+        plan.selected_entries[0]
+            .provenance
+            .iter()
+            .any(|value| value.contains("provider-b"))
+    );
 }
 
 #[test]
