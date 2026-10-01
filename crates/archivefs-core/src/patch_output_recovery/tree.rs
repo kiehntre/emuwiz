@@ -374,7 +374,20 @@ fn load(path: &Path) -> io::Result<(File, Receipt)> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    file.try_lock().map_err(io::Error::other)?;
+    // Another thread's fork can briefly hold an inherited copy of this
+    // descriptor (until its exec closes it), and flock then reports contention
+    // although no tree operation holds the receipt. Retry briefly; a genuine
+    // concurrent publish/undo still refuses once the wait expires.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        }
+    }
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.nlink() != 1 || metadata.len() > MAX_JOURNAL_BYTES {
         return Err(refuse("unsafe journal"));
