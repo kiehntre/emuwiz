@@ -31,7 +31,7 @@ branches at the time of writing).
 |---|---|---|
 | Available | `CheatCandidate` (+ `CheatVariant`s) | Never enables anything. |
 | Chosen | `CheatLaunchSelection` | The only way in. Carries the explicit variant and a review acknowledgement. |
-| Applicability | `patch_manager::CheatApplicabilityState` | The one applicability model (consolidated; the earlier stand-in is gone). `applicability_verdict()` maps it to Allowed / ReviewRequired / Blocked. |
+| Applicability | `patch_manager::CheatApplicabilityReport` | Complete canonical findings, not only the display state. `applicability_verdict(&report)` checks every hard refusal before applying review/acknowledgement policy. |
 | Capability | `CheatEmulatorCapability`, `CheatLaunchMode` | `PersistentInstallOnly` is never treated as launch-scoped. |
 | Plan | `CheatLaunchPlan` | `NoCheatsSelected` / `Ready` / `Blocked`, with structured `CheatLaunchBlockReason`s. |
 | Derivative | `CheatLaunchDerivative` (patch_manager), `PlannedDerivative` (launch) | Bytes + provenance back to the source. |

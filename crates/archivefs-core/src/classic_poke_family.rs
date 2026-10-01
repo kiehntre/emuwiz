@@ -536,7 +536,12 @@ pub fn project_poke_runtime(
     emulator: PokeRuntimeEmulator,
 ) -> PokeRuntimeProjection {
     let capability = poke_runtime_capability(emulator);
-    if !cheat.target_verified {
+    if !cheat.target_verified
+        || cheat
+            .target_identity
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+    {
         return PokeRuntimeProjection {
             capability,
             commands_or_files: Vec::new(),
@@ -1147,5 +1152,57 @@ mod tests {
             projection.refusal,
             Some(PokeProjectionRefusal::IdentityNotEligible)
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_gate_regressions {
+    use super::*;
+    #[test]
+    fn fuse_and_vice_require_both_verification_and_a_concrete_identity() {
+        for (platform, emulator, bank, original) in [
+            (
+                PokePlatform::ZxSpectrum,
+                PokeRuntimeEmulator::Fuse,
+                PokeBank::Number(5),
+                Some(3),
+            ),
+            (
+                PokePlatform::Commodore64,
+                PokeRuntimeEmulator::Vice,
+                PokeBank::Unspecified,
+                None,
+            ),
+        ] {
+            for verified in [false, true] {
+                for identity in [
+                    None,
+                    Some(""),
+                    Some("  "),
+                    Some("sha256:exact-reviewed-game"),
+                ] {
+                    let cheat = manual_poke(
+                        platform,
+                        "Lives",
+                        32768,
+                        255,
+                        original,
+                        bank.clone(),
+                        None,
+                        identity.map(str::to_owned),
+                        verified,
+                    )
+                    .unwrap();
+                    let projection = project_poke_runtime(&cheat, emulator);
+                    let allowed = verified && identity.is_some_and(|s| !s.trim().is_empty());
+                    assert_eq!(
+                        projection.refusal.is_none(),
+                        allowed,
+                        "{emulator:?}: {identity:?}, {verified}"
+                    );
+                    assert_eq!(!projection.commands_or_files.is_empty(), allowed);
+                }
+            }
+        }
     }
 }

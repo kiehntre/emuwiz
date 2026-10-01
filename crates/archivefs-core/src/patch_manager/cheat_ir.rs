@@ -165,6 +165,10 @@ pub struct CheatApplicability {
 /// Original assignments, including repeated values and their source lines.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheatSourceFieldEvidence {
+    /// Complete decoded source value digest before display truncation. Legacy
+    /// persisted evidence has no digest; it must not prove truncated equality.
+    #[serde(default)]
+    pub full_value_sha256: Option<[u8; 32]>,
     pub field: String,
     pub value: String,
     pub line: u32,
@@ -1132,6 +1136,13 @@ fn difference_summary(left: &CheatDocument, right: &CheatDocument) -> Vec<String
 /// Reconciles entries only when every item is tied to the same verified game
 /// identity and platform. It never mutates, installs, deletes, or selects a
 /// winner.
+pub(crate) fn group_cheat_observations(
+    entries: Vec<CheatReconciliationEntry>,
+) -> CheatReconciliationResult {
+    // Callers partition nonempty observations by the same game/platform key.
+    duplicates::group(entries)
+}
+
 pub fn reconcile_cheats_for_game(
     entries: Vec<CheatReconciliationEntry>,
 ) -> CheatReconciliationOutcome {

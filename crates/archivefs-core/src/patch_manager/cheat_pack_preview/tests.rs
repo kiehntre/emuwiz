@@ -1,5 +1,6 @@
 use super::*;
 use crate::game_identity::{IdentityConfidence, IdentityProvenance};
+use crate::patch_manager::CheatReconciliationOutcome;
 use std::fs;
 use tempfile::{TempDir, tempdir};
 
@@ -190,7 +191,7 @@ fn filename_only_association_is_weak() {
     let r = tempdir().unwrap();
     write(r.path(), "Example.cht", &cht("A"));
     let p = run(r.path(), None, &[game("g", "Example")]);
-    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Possible);
+    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Unmatched);
     assert!(p.files[0].association.title.is_none());
     assert_eq!(p.files[0].association.filename.as_deref(), Some("Example"));
 }
@@ -237,7 +238,16 @@ fn conflicting_verified_requirements_do_not_fall_back_to_title() {
         value: "SLUS-12345".into(),
     });
     let p = run(r.path(), Some(a), &[game("g", "Example")]);
-    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Unmatched);
+    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Exact);
+    assert_eq!(p.totals.would_add, 0);
+    assert!(
+        p.observations[0]
+            .assessment
+            .as_ref()
+            .unwrap()
+            .blockers
+            .contains(&CheatApplicabilityIssue::RequiredIdentityUnknown)
+    );
 }
 #[test]
 fn contradictory_catalogue_facts_cannot_supply_exact_match() {
@@ -247,7 +257,7 @@ fn contradictory_catalogue_facts_cannot_supply_exact_match() {
     g.facts
         .push(fact(IdentityKind::LooseRomSha256, &"b".repeat(64)));
     let p = run(r.path(), Some(association()), &[g]);
-    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Unmatched);
+    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Ambiguous);
 }
 #[test]
 fn exact_duplicate_is_one_logical_cheat_and_known_copy_not_independent_source() {
@@ -276,7 +286,7 @@ fn understood_equivalent_code_reuses_main_semantic_key() {
     g.game.platform = a.platform.clone();
     let p = run(r.path(), Some(a), &[g]);
     assert_eq!(p.totals.logical_cheats, 1);
-    assert_eq!(p.totals.equivalent_duplicates, 1);
+    assert_eq!(p.totals.exact_duplicates, 1);
     assert_eq!(p.totals.would_corroborate, 1);
 }
 #[test]
@@ -326,7 +336,7 @@ fn conflicting_duplicate_index_field_remains_visible_and_review_only() {
             .contains(&CheatDuplicateKind::SourceIndexConflict)
     );
     assert_eq!(p.observations[0].raw_code, "A");
-    assert_eq!(p.totals.would_review, 1);
+    assert_eq!(p.totals.would_reject, 1);
 }
 #[test]
 fn region_variant_is_not_collapsed() {
@@ -736,7 +746,7 @@ fn code_conflict_between_interpretations_is_not_an_equivalent_duplicate() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatDuplicateKind::CodeConflict)
+            .contains(&CheatDuplicateKind::AmbiguousPossibleDuplicate)
     );
     assert_eq!(p.totals.would_review, 2);
 }
@@ -758,7 +768,15 @@ fn syntax_engine_variant_requires_review() {
 #[test]
 fn unsupported_target_seam_rejects_without_apply() {
     let (_r, mut p) = ready();
-    p.observations[0].applicability = CheatApplicabilityState::UnsupportedEmulator;
+    use crate::patch_manager::{CheatApplySupport, CheatRoute, CheatRouteBasis, CheatRouteTarget};
+    p.observations[0].assessment.as_mut().unwrap().support.route = Some(CheatRoute {
+        platform_id: "NES".into(),
+        target: CheatRouteTarget::standalone("unsupported"),
+        basis: CheatRouteBasis::ExplicitSelection,
+        apply_support: CheatApplySupport::Unsupported,
+        native_format: "unsupported",
+        alternatives: vec![],
+    });
     let p = replan(p);
     assert_eq!(p.totals.unsupported_targets, 1);
     assert_eq!(p.totals.would_reject, 1);
@@ -880,7 +898,7 @@ fn recognized_pnach_crc_requires_verified_fact_and_is_exact() {
         fact(IdentityKind::Pcsx2ExecutableCrc, "A1B2C3D4"),
     ];
     let p = run(r.path(), None, &[g]);
-    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Exact);
+    assert_eq!(p.files[0].match_strength, CheatPackMatchStrength::Strong);
 }
 #[test]
 fn pnach_execution_mode_is_part_of_logical_identity() {
@@ -925,7 +943,7 @@ fn source_comments_globals_and_entry_extra_fields_are_retained() {
     let p = run(r.path(), Some(association()), &[game("g", "Example")]);
     assert_eq!(p.files[0].source_comments, vec!["provenance comment"]);
     assert_eq!(p.files[0].source_metadata["cheat_delay"], "5");
-    assert_eq!(p.observations[0].execution_fields["handler"], "0");
+    assert_eq!(p.observations[0].execution_fields["entry:handler"], "0");
 }
 #[test]
 fn root_file_and_directory_preview_share_same_logical_identity() {
@@ -1009,6 +1027,7 @@ fn oversized_native_code_retains_explicit_sample_and_digest_only() {
 fn missing_variant_constraint_is_an_ambiguous_possible_duplicate() {
     let (_r, mut p) = ready();
     let mut o = p.observations[0].clone();
+    o.source_index = None;
     o.engine = Some("known".into());
     p.observations.push(o);
     let p = replan(p);
@@ -1050,4 +1069,97 @@ fn unverified_game_association_does_not_prove_logical_duplicates() {
             .contains(&CheatDuplicateKind::AmbiguousPossibleDuplicate)
     );
     assert_eq!(p.totals.would_review, 2);
+}
+
+#[test]
+fn pack_applicability_is_a_projection_of_the_canonical_assessor() {
+    for case in [
+        "exact",
+        "ambiguous",
+        "conflicting",
+        "candidate",
+        "region",
+        "revision",
+        "duplicate",
+        "variant",
+    ] {
+        let temp = tempdir().unwrap();
+        write(temp.path(), "a.cht", &cht("A"));
+        if matches!(case, "duplicate" | "variant") {
+            write(
+                temp.path(),
+                "b.cht",
+                &cht(if case == "variant" { "B" } else { "A" }),
+            );
+        }
+        let mut game = game("g", "Example");
+        let mut association = association();
+        match case {
+            "ambiguous" | "conflicting" => {
+                let mut other = fact(IdentityKind::LooseRomSha256, &"b".repeat(64));
+                if case == "ambiguous" {
+                    other.status = IdentityStatus::Ambiguous;
+                }
+                game.facts.push(other);
+            }
+            "candidate" => game.facts[0].status = IdentityStatus::Candidate,
+            "region" => {
+                association.region = Some("Europe".into());
+                game.facts.push(fact(IdentityKind::DolphinRegion, "USA"));
+            }
+            "revision" => {
+                association.revision = Some("1".into());
+                game.facts.push(fact(IdentityKind::DolphinRevision, "2"));
+            }
+            _ => {}
+        }
+        let preview = run(temp.path(), Some(association.clone()), &[game.clone()]);
+        assert!(!preview.can_apply());
+        for o in &preview.observations {
+            let group = preview
+                .logical_cheats
+                .iter()
+                .find(|g| {
+                    g.observation_indices
+                        .iter()
+                        .any(|&i| std::ptr::eq(&preview.observations[i], o))
+                })
+                .unwrap();
+            let canonical = assess_cheat_applicability(&CheatApplicabilityInput {
+                game: selected_game(&game),
+                association: association.clone(),
+                document: o.document.clone(),
+                parsing: CheatParseEvidence::Valid,
+                native_cht: o.native_cht.clone(),
+                route: None,
+                reconciliation: group.reconciliation.clone(),
+            });
+            let actual = o.assessment.as_ref().unwrap();
+            assert_eq!(o.applicability, canonical.state, "{case}");
+            assert_eq!(actual.identity_match, canonical.identity_match, "{case}");
+            assert_eq!(actual.blockers, canonical.blockers, "{case}");
+            if matches!(case, "ambiguous" | "conflicting" | "region" | "revision") {
+                assert!(
+                    actual.blockers.iter().any(|b| b.is_hard_refusal()),
+                    "{case}"
+                );
+                assert!(!matches!(
+                    o.action,
+                    CheatPackAction::WouldAdd | CheatPackAction::WouldCorroborate
+                ));
+            }
+            if matches!(case, "duplicate" | "variant") {
+                let report = group.reconciliation.as_ref().unwrap();
+                let CheatReconciliationOutcome::Ready(expected) =
+                    cheat_ir::reconcile_cheats_for_game(report.entries.clone())
+                else {
+                    panic!("{case}")
+                };
+                assert_eq!(
+                    group.relationships,
+                    expected.groups[0].classifications.iter().copied().collect()
+                );
+            }
+        }
+    }
 }

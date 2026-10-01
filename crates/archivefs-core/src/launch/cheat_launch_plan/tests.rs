@@ -35,7 +35,7 @@ fn variant(
         variant_id: id.into(),
         source: source(src),
         format: CheatLaunchFormat::RetroArchCht,
-        applicability: state,
+        applicability: assessment(state),
         entry,
     }
 }
@@ -335,7 +335,7 @@ fn applicability_evidence_blocks_or_requires_review() {
         S::Malformed,
     ] {
         let mut request = base_request(vec![select("lives")]);
-        request.candidates[0].variants[0].applicability = state;
+        request.candidates[0].variants[0].applicability = assessment(state);
         // Even an acknowledgement cannot unblock wrong/unsafe evidence.
         request.selections[0].review_acknowledged = true;
         let plan = plan_cheat_launch(&request);
@@ -352,7 +352,7 @@ fn applicability_evidence_blocks_or_requires_review() {
         S::ConflictingVariants,
     ] {
         let mut request = base_request(vec![select("lives")]);
-        request.candidates[0].variants[0].applicability = state;
+        request.candidates[0].variants[0].applicability = assessment(state);
         assert_eq!(
             blocked_reason(&plan_cheat_launch(&request)),
             vec![CheatLaunchBlockReason::ReviewRequired { state }]
@@ -367,10 +367,13 @@ fn applicability_evidence_blocks_or_requires_review() {
     // Only an exact/ready assessment launches without review; similar-looking
     // titles are never enough on their own.
     for state in [S::Ready, S::ExactGameMatch] {
-        assert_eq!(applicability_verdict(state), ApplicabilityVerdict::Allowed);
+        assert_eq!(
+            applicability_verdict(&assessment(state)),
+            ApplicabilityVerdict::Allowed
+        );
     }
     assert_eq!(
-        applicability_verdict(S::StrongMatch),
+        applicability_verdict(&assessment(S::StrongMatch)),
         ApplicabilityVerdict::ReviewRequired
     );
 }
@@ -932,4 +935,111 @@ fn canonical_reconciliation_group_decides_whether_a_choice_is_required() {
         R::SameTitleDifferentCode,
         vec![]
     )));
+}
+
+fn assessment(state: CheatApplicabilityState) -> CheatApplicabilityReport {
+    use crate::patch_manager::*;
+    let parsed = parse_cht_text("cheat0_desc=Lives\ncheat0_code=A\n").unwrap();
+    let mut report = assess_cheat_applicability(&CheatApplicabilityInput {
+        game: Default::default(),
+        association: Default::default(),
+        document: parsed.reconciliation_entries(
+            "game",
+            true,
+            CheatPlatform::GameCube,
+            "local",
+            "a.cht",
+        )[0]
+        .document
+        .clone(),
+        parsing: CheatParseEvidence::Valid,
+        native_cht: Some(parsed.entries[0].clone()),
+        route: None,
+        reconciliation: None,
+    });
+    // Unit fixtures for presentation-state policy; end-to-end tests below
+    // retain all assessed findings without changing the report.
+    report.state = state;
+    report.blockers.clear();
+    report
+}
+
+#[test]
+fn assessed_hard_findings_survive_variant_choice_and_acknowledgement() {
+    use crate::game_identity::IdentityStatus;
+    use crate::patch_manager::*;
+    for mismatch in ["region", "revision", "identity", "none"] {
+        let parsed = parse_cht_text("cheat0_desc=Lives\ncheat0_code=A\n").unwrap();
+        let mut entries =
+            parsed.reconciliation_entries("game", true, CheatPlatform::GameCube, "local", "a.cht");
+        entries[0].applicability.region = Some("Europe".into());
+        entries[0].applicability.revision = Some("1".into());
+        let association = CheatGameAssociation::from_entry(&entries[0]);
+        let document = entries[0].document.clone();
+        let mut second = entries[0].clone();
+        second.raw_code = Some("B".into());
+        second.document.operations = vec![CheatOperation::UnsupportedRaw {
+            source_format: CheatSourceFormat::RetroArch,
+            raw: "B".into(),
+            reason: "opaque".into(),
+        }];
+        second.source_path = Some("b.cht".into());
+        entries.push(second);
+        let CheatReconciliationOutcome::Ready(reconciliation) = reconcile_cheats_for_game(entries)
+        else {
+            panic!()
+        };
+        let report = assess_cheat_applicability(&CheatApplicabilityInput {
+            game: CheatSelectedGame {
+                region: Some(CheatReleaseEvidence {
+                    value: if mismatch == "region" {
+                        "USA"
+                    } else {
+                        "Europe"
+                    }
+                    .into(),
+                    status: if mismatch == "identity" {
+                        IdentityStatus::Ambiguous
+                    } else {
+                        IdentityStatus::Verified
+                    },
+                }),
+                revision: Some(CheatReleaseEvidence {
+                    value: if mismatch == "revision" { "2" } else { "1" }.into(),
+                    status: IdentityStatus::Verified,
+                }),
+                ..Default::default()
+            },
+            association,
+            document,
+            parsing: CheatParseEvidence::Valid,
+            native_cht: Some(parsed.entries[0].clone()),
+            route: None,
+            reconciliation: Some(reconciliation),
+        });
+        assert_eq!(report.state, CheatApplicabilityState::ConflictingVariants);
+        let expected = match mismatch {
+            "region" => Some(CheatApplicabilityIssue::WrongRegion),
+            "revision" => Some(CheatApplicabilityIssue::WrongRevision),
+            "identity" => Some(CheatApplicabilityIssue::ConflictingIdentity),
+            _ => None,
+        };
+        if let Some(issue) = expected {
+            assert!(report.blockers.contains(&issue));
+        }
+        for acknowledge in [false, true] {
+            for choose in [false, true] {
+                let mut request = base_request(vec![select("lives")]);
+                request.candidates[0].unresolved_conflict = true;
+                request.candidates[0].variants[0].applicability = report.clone();
+                request.selections[0].variant_id = choose.then(|| "v1".into());
+                request.selections[0].review_acknowledged = acknowledge;
+                assert_eq!(
+                    plan_cheat_launch(&request).is_ready(),
+                    mismatch == "none" && acknowledge && choose,
+                    "{mismatch}, acknowledged={acknowledge}, chosen={choose}"
+                );
+            }
+        }
+    }
 }

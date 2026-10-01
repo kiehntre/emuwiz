@@ -127,6 +127,13 @@ pub(super) fn reconcile(entries: Vec<CheatReconciliationEntry>) -> CheatReconcil
             reason: "entries do not share one verified game and platform identity".into(),
         };
     }
+    CheatReconciliationOutcome::Ready(group(entries))
+}
+
+/// Shared read-only grouping also accepts uncertain observations. It never
+/// grants them verified identity or an automatic duplicate/merge decision.
+pub(super) fn group(entries: Vec<CheatReconciliationEntry>) -> CheatReconciliationResult {
+    let first = &entries[0];
     let semantics: Vec<_> = entries
         .iter()
         .map(|entry| {
@@ -197,13 +204,17 @@ pub(super) fn reconcile(entries: Vec<CheatReconciliationEntry>) -> CheatReconcil
             let left = root(&mut parents, a);
             let right = root(&mut parents, b);
             parents[right] = left;
-            let kinds = classify(
-                &entries[a],
-                &entries[b],
-                titles[a] == titles[b],
-                semantics[a].is_some() && semantics[a] == semantics[b],
-                raws[a].is_some() && raws[a] == raws[b],
-            );
+            let kinds = if !entries[a].identity_verified || !entries[b].identity_verified {
+                BTreeSet::from([CheatDuplicateKind::AmbiguousPossibleDuplicate])
+            } else {
+                classify(
+                    &entries[a],
+                    &entries[b],
+                    titles[a] == titles[b],
+                    semantics[a].is_some() && semantics[a] == semantics[b],
+                    raws[a].is_some() && raws[a] == raws[b],
+                )
+            };
             evidence[a].extend(kinds.iter().copied());
             evidence[b].extend(kinds);
         }
@@ -296,13 +307,13 @@ pub(super) fn reconcile(entries: Vec<CheatReconciliationEntry>) -> CheatReconcil
         });
     }
     groups.sort_by(|a, b| stable_keys[a.entry_indices[0]].cmp(&stable_keys[b.entry_indices[0]]));
-    CheatReconciliationOutcome::Ready(CheatReconciliationResult {
+    CheatReconciliationResult {
         game_identity: first.game_identity.clone(),
         platform: first.document.platform.clone(),
         groups,
         entries,
         auto_winner: None,
-    })
+    }
 }
 
 #[cfg(test)]

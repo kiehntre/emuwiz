@@ -21,6 +21,7 @@
 //!   sanitizes manually-constructed entries, but parser output can never
 //!   reach that path with an altered value.
 
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 use super::cheat_ir::{
@@ -602,6 +603,16 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         seen_any_body_line = true;
         let key = raw_key.trim();
         let (value, mut value_warnings) = decode_value(raw_value.trim());
+        // The input file is bounded. Hash a borrowed complete value, never an
+        // allocated full line or just its display prefix. No escape decoding.
+        let full_value = raw_line
+            .trim()
+            .split_once('=')
+            .map_or("", |(_, v)| v.trim());
+        let full_value = full_value
+            .strip_prefix('"')
+            .map_or(full_value, |v| v.strip_suffix('"').unwrap_or(v));
+        let full_value_sha256 = Some(Sha256::digest(full_value.as_bytes()).into());
         if missing_separator {
             value_warnings.push(entry_warning(
                 ChtEntryWarningKind::InvalidFieldValue,
@@ -625,6 +636,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         if !is_entry_assignment && !key.is_empty() {
             if source_fields.len() < MAX_CHT_GLOBAL_SOURCE_FIELDS {
                 source_fields.push(CheatSourceFieldEvidence {
+                    full_value_sha256,
                     field: if key.eq_ignore_ascii_case("cheats") {
                         "cheats".into()
                     } else {
@@ -651,7 +663,12 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             if let Some(first) = &declared_value {
                 push_warning(
                     &mut warnings,
-                    if first == &value {
+                    if first == &value
+                        && source_fields
+                            .iter()
+                            .find(|f| f.field == "cheats")
+                            .is_some_and(|f| f.full_value_sha256 == full_value_sha256)
+                    {
                         ChtDocumentWarningKind::DuplicateField
                     } else {
                         ChtDocumentWarningKind::ConflictingDuplicate
@@ -721,7 +738,12 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             if let Some((_, first)) = global_fields.iter().find(|(name, _)| name == key) {
                 push_warning(
                     &mut warnings,
-                    if first == &value {
+                    if first == &value
+                        && source_fields
+                            .iter()
+                            .find(|f| f.field == key)
+                            .is_some_and(|f| f.full_value_sha256 == full_value_sha256)
+                    {
                         ChtDocumentWarningKind::DuplicateField
                     } else {
                         ChtDocumentWarningKind::ConflictingDuplicate
@@ -790,6 +812,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
         });
         if draft.source_fields.len() < MAX_CHT_SOURCE_FIELDS_PER_ENTRY {
             draft.source_fields.push(CheatSourceFieldEvidence {
+                full_value_sha256,
                 field: field.to_string(),
                 value: value.clone(),
                 line: line_number,
@@ -812,7 +835,7 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             warning.raw_source = Some(bounded_line.to_string());
         }
         // A bounded prefix can make two different over-long values look equal.
-        // Compare the retained original right-hand sides so that difference
+        // Compare complete value digests so that difference
         // stays a blocking, observable conflict.
         let truncated_now = value_warnings
             .iter()
@@ -824,17 +847,13 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
             .skip(1)
             .find(|item| item.field == field)
         {
-            let rhs = |line: &str| {
-                line.split_once('=')
-                    .map(|(_, value)| value.trim().to_string())
-            };
             let previous_truncated = draft.warnings.iter().any(|warning| {
                 warning.kind == ChtEntryWarningKind::OversizedField
                     && warning.line == Some(previous.line)
             });
             if (truncated_now || previous_truncated)
                 && field_values_equivalent(field, &previous.value, &value)
-                && rhs(&previous.raw_source) != rhs(bounded_line)
+                && previous.full_value_sha256 != full_value_sha256
             {
                 draft.warnings.push(entry_warning(
                     ChtEntryWarningKind::ConflictingDuplicate,
@@ -949,6 +968,13 @@ pub fn parse_cht_text(text: &str) -> Result<ChtDocument, ChtParseError> {
                     draft.extra_fields.push((other.to_string(), value));
                 }
             }
+        }
+        if draft.warnings.iter().any(|w| {
+            w.line == Some(line_number) && w.kind == ChtEntryWarningKind::ConflictingDuplicate
+        }) {
+            draft.warnings.retain(|w| {
+                w.line != Some(line_number) || w.kind != ChtEntryWarningKind::DuplicateField
+            });
         }
         bound_entry_warnings(&mut draft.warnings);
     }

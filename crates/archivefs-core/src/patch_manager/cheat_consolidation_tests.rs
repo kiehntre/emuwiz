@@ -186,7 +186,7 @@ fn hostile_input_is_bounded_and_never_panics() {
 fn applicability(
     game: CheatSelectedGame,
     association: CheatGameAssociation,
-) -> CheatApplicabilityState {
+) -> CheatApplicabilityReport {
     let parsed = parse_cht_text(CHT_A).unwrap();
     let entry = parsed.entries[0].clone();
     let projected = project("a.cht", CHT_A).remove(0);
@@ -199,7 +199,7 @@ fn applicability(
         route: None,
         reconciliation: None,
     };
-    assess_cheat_applicability(&input).state
+    assess_cheat_applicability(&input)
 }
 
 #[test]
@@ -210,7 +210,7 @@ fn similar_titles_or_bare_claims_never_make_a_cheat_launchable() {
     // Nothing is known about the selected game.
     let unknown = applicability(CheatSelectedGame::default(), association.clone());
     assert_ne!(
-        applicability_verdict(unknown),
+        applicability_verdict(&unknown),
         ApplicabilityVerdict::Allowed,
         "{unknown:?}"
     );
@@ -224,7 +224,7 @@ fn similar_titles_or_bare_claims_never_make_a_cheat_launchable() {
     claimed.title = Some("Infinite Lives Adventure".into());
     let state = applicability(titled, claimed);
     assert_ne!(
-        applicability_verdict(state),
+        applicability_verdict(&state),
         ApplicabilityVerdict::Allowed,
         "{state:?}"
     );

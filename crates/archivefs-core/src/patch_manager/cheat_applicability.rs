@@ -37,9 +37,22 @@ impl CheatSelectedGame {
     /// Keep every observation, including contradictory and candidate facts.
     /// Do not convert a report's platform guess into a verified fact.
     pub fn from_identity_report(report: &GameIdentityReport) -> Self {
+        let mut selected = Self::from_evidence(&report.evidence);
+        selected.title = report
+            .verified_value(IdentityKind::LooseRomTitle)
+            .map(str::to_owned);
+        selected.filename = report
+            .archive_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned);
+        selected
+    }
+
+    /// Canonical release projection for catalogue and inspector observations.
+    pub fn from_evidence(facts: &[IdentityEvidence]) -> Self {
         let release = |kind| {
-            let mut values: Vec<_> = report
-                .evidence
+            let mut values: Vec<_> = facts
                 .iter()
                 .filter(|fact| fact.kind == kind && fact.status == IdentityStatus::Verified)
                 .filter_map(|fact| fact.value.as_deref())
@@ -74,18 +87,12 @@ impl CheatSelectedGame {
             }
         });
         Self {
-            title: report
-                .verified_value(IdentityKind::LooseRomTitle)
-                .map(str::to_owned),
-            filename: report
-                .archive_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_owned),
+            title: None,
+            filename: None,
             platform: release(IdentityKind::Platform),
-            region,
+            region: region.or_else(|| release(IdentityKind::DolphinRegion)),
             revision: release(IdentityKind::DolphinRevision),
-            facts: report.evidence.clone(),
+            facts: facts.to_vec(),
         }
     }
 }
@@ -258,6 +265,23 @@ pub enum CheatApplicabilityIssue {
     RegionUnknown,
     RevisionUnknown,
     UnverifiedAssociation,
+}
+
+impl CheatApplicabilityIssue {
+    /// Authorization severity is independent of the display summary priority.
+    pub fn is_hard_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::Malformed
+                | Self::MissingCode
+                | Self::ConflictingIdentity
+                | Self::DifferentGame
+                | Self::WrongRegion
+                | Self::WrongRevision
+                | Self::UnsupportedEmulator
+                | Self::UnsupportedFormat
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -501,6 +525,15 @@ fn assess_support(input: &CheatApplicabilityInput) -> CheatApplicabilitySupport 
 
 /// Deterministic evaluation; every blocker survives priority selection.
 pub fn assess_cheat_applicability(input: &CheatApplicabilityInput) -> CheatApplicabilityReport {
+    assess_cheat_applicability_with_reconciliation(input, input.reconciliation.as_ref())
+}
+
+/// Pack rows borrow their shared group evidence instead of cloning an entire
+/// group into every observation. The pack retains the complete group once.
+pub(super) fn assess_cheat_applicability_with_reconciliation(
+    input: &CheatApplicabilityInput,
+    reconciliation: Option<&CheatReconciliationResult>,
+) -> CheatApplicabilityReport {
     let mut evidence = Vec::new();
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
@@ -715,7 +748,7 @@ pub fn assess_cheat_applicability(input: &CheatApplicabilityInput) -> CheatAppli
     if identity_match < CheatApplicabilityMatch::VerifiedIdentifier {
         warnings.push(CheatApplicabilityIssue::UnverifiedAssociation);
     }
-    if let Some(result) = &input.reconciliation {
+    if let Some(result) = reconciliation {
         for group in &result.groups {
             match group.relationship {
                 CheatRelationship::SameTitleDifferentCode | CheatRelationship::RelatedUnproven => {

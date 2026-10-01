@@ -44,60 +44,7 @@ fn bounded<T>(mut rows: Vec<T>, limit: usize) -> (Vec<T>, bool) {
     rows.truncate(limit);
     (rows, truncated)
 }
-fn release_value(game: &CheatPackCatalogueGame, kind: IdentityKind) -> Option<&str> {
-    let values: BTreeSet<_> = game
-        .facts
-        .iter()
-        .filter(|f| f.kind == kind && f.status == IdentityStatus::Verified)
-        .filter_map(|f| f.value.as_deref())
-        .collect();
-    if values.len() == 1 {
-        values.first().copied()
-    } else {
-        None
-    }
-}
-fn applicability(f: &CheatPackFile, catalogue: &CatalogueIndex<'_>) -> CheatApplicabilityState {
-    match f.match_strength {
-        CheatPackMatchStrength::Unmatched => CheatApplicabilityState::MissingRequiredEvidence,
-        CheatPackMatchStrength::Ambiguous => CheatApplicabilityState::NeedsReview,
-        CheatPackMatchStrength::Possible => CheatApplicabilityState::PossibleMatch,
-        _ => {
-            if f.association.region.is_none() && f.association.revision.is_none() {
-                return CheatApplicabilityState::Ready;
-            }
-            let game = f.matches.first().and_then(|m| {
-                catalogue
-                    .by_key
-                    .get(&m.identity_key)
-                    .map(|&i| &catalogue.games[i])
-            });
-            if let Some(game) = game {
-                if let Some(region) = &f.association.region {
-                    // Region strings in optional index metadata are not proof.
-                    if let Some(actual) = release_value(game, IdentityKind::DolphinRegion) {
-                        if actual != region {
-                            return CheatApplicabilityState::WrongRegion;
-                        }
-                    } else {
-                        return CheatApplicabilityState::NeedsReview;
-                    }
-                }
-                if let Some(revision) = &f.association.revision {
-                    if let Some(actual) = release_value(game, IdentityKind::DolphinRevision) {
-                        if actual != revision {
-                            return CheatApplicabilityState::WrongRevision;
-                        }
-                    } else {
-                        return CheatApplicabilityState::NeedsReview;
-                    }
-                }
-            }
-            CheatApplicabilityState::Ready
-        }
-    }
-}
-fn platform(a: &CheatPackAssociation) -> CheatPlatform {
+pub(super) fn platform(a: &CheatPackAssociation) -> CheatPlatform {
     match a
         .platform
         .as_deref()
@@ -160,6 +107,8 @@ fn observation(
         engine: None,
         source_enabled_by_default: false,
         applicability: CheatApplicabilityState::NeedsReview,
+        assessment: None,
+        native_cht: None,
         diagnostics: Vec::new(),
         diagnostics_truncated: false,
         logical_key: String::new(),
@@ -204,6 +153,13 @@ fn adapt(
                     return result;
                 }
             };
+            let projected = doc.reconciliation_entries(
+                "unassigned",
+                false,
+                platform(&file.association),
+                "local",
+                &file.path.display().to_string(),
+            );
             file.source_metadata = doc.global_fields.into_iter().collect();
             file.source_comments = doc.preserved_comments;
             file.diagnostics.extend(
@@ -236,10 +192,21 @@ fn adapt(
                 o.source_index_conflict = e.warnings.iter().any(|w| {
                     w.kind == super::super::cht_document::ChtEntryWarningKind::ConflictingDuplicate
                 });
+                if let Some(entry) = projected
+                    .iter()
+                    .find(|entry| entry.source_index == Some(e.index))
+                {
+                    o.document = entry.document.clone();
+                    o.execution_fields = entry.applicability.metadata.clone();
+                }
+                o.native_cht = Some(e.clone());
                 o.source_index = Some(e.index);
                 o.source_enabled_by_default = e.enabled_by_default;
-                o.execution_fields = e.extra_fields.iter().cloned().collect();
-                o.engine = o.execution_fields.get("handler").cloned();
+                o.engine = e
+                    .extra_fields
+                    .iter()
+                    .find(|(key, _)| key == "handler")
+                    .map(|(_, value)| value.clone());
                 // An entry blocked *only* by a conflicting repeat parses fine but is
                 // ambiguous: review-only, not malformed. Anything else blocking is.
                 let only_conflict = e.code.as_deref().is_some_and(|code| !code.is_empty())
@@ -686,7 +653,7 @@ pub(super) fn preview(
                                 p.complete = false;
                                 f.diagnostics.push(CheatPackDiagnostic::Limit{detail:"catalogue candidate retention bound reached; association remains ambiguous".into()});
                             }
-                            let effective = applicability(&f, &index);
+
                             let mut rows = adapt(&mut f, &bytes, p.files.len(), limits);
                             if rows.len() > limits.source.max_cheats_per_file
                                 || p.observations.len() + rows.len() > limits.max_observations
@@ -720,13 +687,18 @@ pub(super) fn preview(
                                     o.diagnostics.push(CheatPackDiagnostic::Limit {
                                         detail: format!("code length/line count bound exceeded ({full_bytes} original bytes); only a code sample retained; operations withheld"),
                                     });
-                                } else if o.applicability != CheatApplicabilityState::Malformed {
-                                    if effective == CheatApplicabilityState::MissingRequiredEvidence
-                                        || o.applicability == CheatApplicabilityState::Ready
-                                    {
-                                        o.applicability = effective;
-                                    }
                                 }
+                                let game = f
+                                    .matches
+                                    .first()
+                                    .and_then(|m| {
+                                        catalogue.iter().find(|g| g.game.game_id == m.game_id)
+                                    })
+                                    .map(selected_game)
+                                    .unwrap_or_default();
+                                let report = assess_observation(&o, game, None);
+                                o.applicability = report.state;
+                                o.assessment = Some(report);
                                 (o.diagnostics, o.diagnostics_truncated) =
                                     bounded(o.diagnostics, limits.source.max_warnings);
                                 p.complete &= !o.diagnostics_truncated;

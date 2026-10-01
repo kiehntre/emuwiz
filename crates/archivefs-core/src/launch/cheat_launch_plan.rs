@@ -42,9 +42,10 @@ use super::resource_grants::{
 use super::retroarch_command::RetroArchCommand;
 use super::retroarch_resource_projection::approved_retroarch_launch_root;
 use crate::patch_manager::{
-    CheatApplicabilityState, CheatApplySupport, CheatDerivativeEntryRecord, CheatDerivativeError,
-    CheatDerivativeInput, CheatLaunchDerivativeKind, CheatRouteTarget, CheatSourceReference,
-    ChtEntry, render_retroarch_selected_derivative,
+    CheatApplicabilityReport, CheatApplicabilityState, CheatApplySupport,
+    CheatDerivativeEntryRecord, CheatDerivativeError, CheatDerivativeInput,
+    CheatLaunchDerivativeKind, CheatRouteTarget, CheatSourceReference, ChtEntry,
+    render_retroarch_selected_derivative,
 };
 
 // ---------------------------------------------------------------------
@@ -181,12 +182,22 @@ pub enum ApplicabilityVerdict {
     Blocked,
 }
 
-/// Launch policy over the canonical applicability state. Only an exact game
+/// Launch policy over all canonical applicability findings, then the summary.
+/// Hard refusals cannot be acknowledged away. Only an exact game
 /// match (hash/verified identifier) or a fully ready assessment launches
 /// without review. A title that merely looks similar, even with a verified
 /// platform, is never enough on its own.
 #[must_use]
-pub fn applicability_verdict(state: CheatApplicabilityState) -> ApplicabilityVerdict {
+pub fn applicability_verdict(report: &CheatApplicabilityReport) -> ApplicabilityVerdict {
+    if report
+        .blockers
+        .iter()
+        .chain(&report.warnings)
+        .any(|issue| issue.is_hard_refusal())
+    {
+        return ApplicabilityVerdict::Blocked;
+    }
+    let state = report.state;
     use CheatApplicabilityState as S;
     match state {
         S::Ready | S::ExactGameMatch => ApplicabilityVerdict::Allowed,
@@ -214,7 +225,7 @@ pub struct CheatVariant {
     pub variant_id: String,
     pub source: CheatSourceReference,
     pub format: CheatLaunchFormat,
-    pub applicability: CheatApplicabilityState,
+    pub applicability: CheatApplicabilityReport,
     /// Parsed entry for RetroArch `.cht` variants. `None` is malformed.
     pub entry: Option<ChtEntry>,
 }
@@ -697,12 +708,12 @@ fn resolve_selection(
             },
         ));
     };
-    match applicability_verdict(variant.applicability) {
+    match applicability_verdict(&variant.applicability) {
         ApplicabilityVerdict::Blocked => {
             return Err((
                 id,
                 CheatLaunchBlockReason::Applicability {
-                    state: variant.applicability,
+                    state: variant.applicability.state,
                 },
             ));
         }
@@ -710,7 +721,7 @@ fn resolve_selection(
             return Err((
                 id,
                 CheatLaunchBlockReason::ReviewRequired {
-                    state: variant.applicability,
+                    state: variant.applicability.state,
                 },
             ));
         }
@@ -723,7 +734,7 @@ fn resolve_selection(
             title: candidate.title.clone(),
             source: variant.source.clone(),
             format: variant.format.clone(),
-            applicability: variant.applicability,
+            applicability: variant.applicability.state,
             review_acknowledged: selection.review_acknowledged,
         },
         entry.clone(),

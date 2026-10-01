@@ -47,7 +47,7 @@ Cheats & Mods surfaces.
 | Variants / conflicts | `CheatDuplicateKind` (+ `CorroboratingObservation`) | `CheatPackRelationship` |
 | Same-title expectation | `CheatGameAssociation` / `CheatIdentityRequirement` | `CheatPackAssociation`, `CheatPackIdentityRequirement` (now aliases) |
 | Selected review decision | `CheatReviewChoice` (existing, persisted) | — |
-| Launch compatibility | `applicability_verdict(state)` + `CheatLaunchPlan` | — |
+| Launch compatibility | `applicability_verdict(&report)` + `CheatLaunchPlan` | — |
 
 The layers are *claims -> evidence -> assessment*, not parallel models:
 `CheatGameAssociation::from_entry` turns an entry's claims and provenance
@@ -145,3 +145,79 @@ capability. The existing WHDLoad trainer workflow is untouched.
 5. **Fuse/VICE preparation has no launch integration.**
 6. `CheatGameAssociation::from_entry` maps only unambiguous claims; serial-style
    evidence is platform specific and stays in provenance.
+
+
+## Four-finding review repair
+
+Recreated the consolidation on authoritative `1a24276a` after verifying fetched
+main/origin parity. The shared tree publication/recovery commits (`626afa87`,
+`e306d7c2`) and subsequent CLI inspection work are retained unchanged. Launch variants now carry the whole
+canonical applicability report. Hard findings (wrong game/region/revision,
+conflicting identity, unsupported format/emulator, malformed or missing code)
+refuse regardless of summary precedence, acknowledgement, or variant choice.
+Purely reviewable conflicts still require explicit choice and acknowledgement.
+
+Pack preview constructs native entries with the canonical parser projection,
+uses the canonical assessor, and borrows the canonical grouping implementation.
+Its catalogue indexes retrieve candidates only; they do not confer applicability.
+Rows retain the assessed state and findings. `WouldAdd` is a read-only import
+suggestion for verified identity without applicable blockers, never runtime
+readiness: absent runtime-route capabilities remain visible in the report.
+Declared but unverified region/revision constraints still require review.
+Canonical classifications replace the old parallel labels (including CRC as a
+verified identifier, and unproven mixed interpretations as ambiguous).
+
+Repeated .cht fields retain a 32-byte SHA-256 of the complete decoded value in
+addition to their bounded display prefix. The input file remains bounded and
+hashing borrows its bytes; no full-value copy is retained. Legacy persisted
+field evidence defaults the missing digest to unknown. Values differing only
+beyond the retained prefix remain conflicting; identical huge values remain
+observable duplicates and remain unselectable because of the existing bounds.
+
+Fuse/VICE preparation requires both verified state and a concrete nonempty
+identity. Other classic families remain preview-only. No launch executor,
+RetroArch runtime isolation, ADF trainer, or broad GUI applicability wiring is
+added by this repair.
+
+### Repair validation
+
+Authoritative base: `1a24276a1270114193490201eb4e542f7ef93f08` (clean,
+fetched local main/origin parity). All 16 consolidation commits were replayed
+unchanged before the focused repair; range-diff confirmed equivalence. The
+external CLI promotion changed no core or GUI source.
+
+| Validation | Result |
+|---|---|
+| Applicability | 40 passed |
+| Launch cheat planning | 22 passed |
+| Pack preview and canonical parity | 62 passed |
+| CHT parsing/conflict evidence | 48 passed |
+| Classic POKE | 15 passed |
+| Core reconciliation | 10 passed |
+| GUI persisted review | 27 passed |
+| Full core library | 10,353 passed, 0 failed, 3 ignored |
+| Core integration tests (19 harnesses) | 147 passed, 0 failed |
+| Workspace excluding GUI/CLI, including doctests | 10,500 passed, 0 failed, 3 ignored |
+| Full GUI library, two test threads | 3,160 passed, 2 failed, 3 ignored |
+| Offline locked workspace check | Passed |
+| Release workspace build | Passed |
+| Workspace formatting check / diff check / scope guard | Passed |
+
+The two GUI failures were rerun individually on both the repaired candidate
+and a pristine detached worktree at the authoritative base. Their assertions
+match:
+
+- `convert_discs_home_card_lands_on_the_first_class_disc_conversion_page`:
+  missing rendered `Source folder:` text.
+- `adapter_routing_is_platform_authoritative`: actual `Unsupported`, expected
+  `RetroArch`.
+
+No unrelated GUI fixes were made. Complete validation output is retained in
+`/tmp/emuwiz-cheat-four-logs`; build artifacts use isolated target directories.
+
+Five GUI compiler warnings remain unchanged (one unused import and four
+unused helpers/variants). No launch execution or production runtime isolation
+is introduced. The repair is ready for focused re-review, with the two
+confirmed baseline GUI failures explicitly retained. Authoritative main and
+the original candidate worktree were not modified by this task; nothing was
+pushed or promoted.

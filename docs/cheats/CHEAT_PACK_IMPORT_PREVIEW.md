@@ -160,7 +160,7 @@ Files partition into accepted, malformed and rejected rows. Malformed entry
 counts refer to observation rows, while whole-file failures have file-level
 counts and diagnostics. Duplicate/conflict totals count logical groups;
 release mismatches and action totals count observations. `usable_cheats`
-counts Ready logical groups with no unsafe sibling/conflict, not each source
+counts canonically assessed logical groups eligible for a read-only import suggestion, with no unsafe sibling/conflict, not each source
 observation. Games are grouped separately from source files.
 
 ## Bounds and filesystem policy

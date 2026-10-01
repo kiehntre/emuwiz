@@ -939,3 +939,67 @@ fn padding_and_invalid_global_values_cannot_hide_duplicate_evidence() {
     );
     assert_eq!(document.selectable_count(), 1);
 }
+
+#[test]
+fn complete_value_digests_distinguish_huge_duplicates_from_prefix_collisions() {
+    let prefix = "界".repeat(30_000);
+    for identical in [false, true] {
+        let last = if identical { "X" } else { "Y" };
+        let text = format!(
+            "cheat0_desc=Lives\ncheat0_code=\"{prefix}X\"\ncheat0_code=\"{prefix}{last}\"\n"
+        );
+        let doc = parse_cht_text(&text).unwrap();
+        assert_eq!(doc, parse_cht_text(&text).unwrap());
+        let entry = &doc.entries[0];
+        assert!(!entry.is_selectable());
+        assert!(entry.code.as_ref().unwrap().len() <= MAX_CHT_FIELD_BYTES);
+        assert!(
+            entry
+                .source_fields
+                .iter()
+                .all(|f| f.raw_source.len() <= MAX_CHT_LINE_BYTES
+                    && f.value.len() <= MAX_CHT_FIELD_BYTES)
+        );
+        assert_eq!(
+            entry
+                .warnings
+                .iter()
+                .any(|w| w.kind == ChtEntryWarningKind::ConflictingDuplicate),
+            !identical
+        );
+        assert_eq!(
+            entry
+                .warnings
+                .iter()
+                .any(|w| w.kind == ChtEntryWarningKind::DuplicateField),
+            identical
+        );
+        let codes: Vec<_> = entry
+            .source_fields
+            .iter()
+            .filter(|f| f.field == "code")
+            .collect();
+        assert_eq!(
+            codes[0].full_value_sha256 == codes[1].full_value_sha256,
+            identical
+        );
+    }
+}
+
+#[test]
+fn huge_global_values_also_keep_complete_conflict_evidence() {
+    let prefix = "A".repeat(64 * 1024);
+    for identical in [false, true] {
+        let last = if identical { "X" } else { "Y" };
+        let doc = parse_cht_text(&format!(
+            "author={prefix}X\nauthor={prefix}{last}\ncheat0_code=A\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            doc.warnings
+                .iter()
+                .any(|w| w.kind == ChtDocumentWarningKind::ConflictingDuplicate),
+            !identical
+        );
+    }
+}
