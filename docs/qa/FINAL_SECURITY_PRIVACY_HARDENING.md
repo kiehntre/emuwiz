@@ -163,6 +163,12 @@ binary `strings` scan found no home or maintainer path.
   over HTTPS to a fixed public host, so a user-configured proxy is an
   ordinary network choice there, not a credential leak. It was left
   unchanged.
+  - **Superseded.** EmuWiz's network policy later changed: it no longer
+    honours proxy settings inherited from the process environment. The
+    ScreenScraper and Hasheous transports now explicitly ignore
+    `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (either case) and `NO_PROXY`.
+    This entry is kept unchanged as the record of the decision made at the
+    time. See "Provider network routing" in `docs/security.md`.
 - **DNS rebinding for RomM.** Already documented: the validated address is
   not pinned into the socket.
 - **`RommToken::persist_to` / `RommToken::load_from`** are public but have no

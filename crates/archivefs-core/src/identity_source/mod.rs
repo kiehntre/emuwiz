@@ -66,6 +66,8 @@ pub mod verification;
 pub mod whdload;
 
 #[cfg(test)]
+mod provider_proxy_tests;
+#[cfg(test)]
 mod stage1b_tests;
 #[cfg(test)]
 mod tests;

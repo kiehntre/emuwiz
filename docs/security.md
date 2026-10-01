@@ -235,6 +235,30 @@ No provider network access or emulator-profile write happens automatically on
 startup, on a background timer, or as a side effect of mounting or
 cataloguing archives.
 
+#### Provider network routing
+
+EmuWiz does not implicitly honour proxy settings inherited from the process
+environment. Every in-process HTTP client (`ureq` agent) in the workspace is
+built with `.proxy(None)`, so `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (either
+case) and `NO_PROXY` have no effect on it. In particular, ScreenScraper,
+Hasheous and RomM connect directly to their approved endpoints: ScreenScraper
+requests carry the user's ScreenScraper credentials in the query string,
+Hasheous lookups carry the hashes of the user's files, and RomM requests carry
+a bearer token, and none of that traffic is routed to a proxy because of an
+environment variable the user may not know is set. The policy is held by
+`identity_source/provider_proxy_tests.rs` (ScreenScraper and Hasheous) and
+`identity_source/romm/tests.rs` (RomM), which run each variable on its own in
+a child process with an otherwise empty environment.
+
+This covers HTTP requests EmuWiz makes itself. It does not describe programs
+EmuWiz launches or external tools it hands work to, which have their own
+network behaviour.
+
+If proxy support is ever added it must be explicit: configured by the user
+inside EmuWiz, scoped to named transports, off by default, and documented with
+what a proxy operator would be able to see (destination and timing for HTTPS,
+the full request for plain HTTP). It must not be read from the environment.
+
 ## Path Safety
 
 EmuWiz must not allow archive names or internal archive paths to escape the configured mount area.

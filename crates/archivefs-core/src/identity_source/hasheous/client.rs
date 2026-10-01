@@ -173,6 +173,10 @@ impl UreqTransport {
             .timeout_connect(Some(CONNECT_TIMEOUT))
             .timeout_global(Some(timeout))
             .max_redirects(0)
+            // No environment proxy: lookups carry the hashes of the user's
+            // files, and EmuWiz never routes provider traffic through a proxy
+            // it was not explicitly configured to use.
+            .proxy(None)
             .build();
         Self {
             agent: config.into(),
