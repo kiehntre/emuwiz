@@ -1,5 +1,7 @@
 # Manual and Strategy Guide Viewer Foundation
 
+> **Superseded in part:** PDF page counting and CBZ inspection described below now go through the canonical, bounded `archivefs_core::manual_document` inspector. See [`MANUAL_DOCUMENT_VIEWER_FOUNDATION.md`](MANUAL_DOCUMENT_VIEWER_FOUNDATION.md). The "bounded header/body scan" and the GUI-private CBZ inspector no longer exist.
+
 ## Relevant existing support
 
 GUI v2 already has a selected-game detail route, persisted GUI-v2
