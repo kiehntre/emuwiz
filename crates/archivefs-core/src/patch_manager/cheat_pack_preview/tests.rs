@@ -323,7 +323,7 @@ fn conflicting_duplicate_index_field_remains_visible_and_review_only() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatPackRelationship::SourceIndexConflict)
+            .contains(&CheatDuplicateKind::SourceIndexConflict)
     );
     assert_eq!(p.observations[0].raw_code, "A");
     assert_eq!(p.totals.would_review, 1);
@@ -339,7 +339,7 @@ fn region_variant_is_not_collapsed() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatPackRelationship::RegionVariant)
+            .contains(&CheatDuplicateKind::RegionVariant)
     );
     assert_eq!(p.totals.would_review, 2);
 }
@@ -354,7 +354,7 @@ fn revision_variant_is_not_collapsed() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatPackRelationship::RevisionVariant)
+            .contains(&CheatDuplicateKind::VersionVariant)
     );
     assert_eq!(p.totals.would_review, 2);
 }
@@ -736,7 +736,7 @@ fn code_conflict_between_interpretations_is_not_an_equivalent_duplicate() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatPackRelationship::CodeConflict)
+            .contains(&CheatDuplicateKind::CodeConflict)
     );
     assert_eq!(p.totals.would_review, 2);
 }
@@ -751,14 +751,14 @@ fn syntax_engine_variant_requires_review() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatPackRelationship::SyntaxVariant)
+            .contains(&CheatDuplicateKind::SyntaxVariant)
     );
     assert_eq!(p.totals.would_review, 2);
 }
 #[test]
 fn unsupported_target_seam_rejects_without_apply() {
     let (_r, mut p) = ready();
-    p.observations[0].applicability = CheatPackApplicability::UnsupportedTarget;
+    p.observations[0].applicability = CheatApplicabilityState::UnsupportedEmulator;
     let p = replan(p);
     assert_eq!(p.totals.unsupported_targets, 1);
     assert_eq!(p.totals.would_reject, 1);
@@ -1015,7 +1015,7 @@ fn missing_variant_constraint_is_an_ambiguous_possible_duplicate() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatPackRelationship::AmbiguousPossibleDuplicate)
+            .contains(&CheatDuplicateKind::AmbiguousPossibleDuplicate)
     );
     assert_eq!(p.totals.would_review, 2);
     assert_eq!(p.totals.would_add, 0);
@@ -1047,7 +1047,7 @@ fn unverified_game_association_does_not_prove_logical_duplicates() {
     assert!(
         p.logical_cheats[0]
             .relationships
-            .contains(&CheatPackRelationship::AmbiguousPossibleDuplicate)
+            .contains(&CheatDuplicateKind::AmbiguousPossibleDuplicate)
     );
     assert_eq!(p.totals.would_review, 2);
 }

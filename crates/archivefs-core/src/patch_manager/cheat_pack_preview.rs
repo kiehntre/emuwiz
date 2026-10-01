@@ -9,9 +9,12 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use super::cheat_applicability::{
+    CheatApplicabilityState, CheatGameAssociation, CheatIdentityRequirement,
+};
 use super::cheat_ir::{
-    self, CheatDocument, CheatPlatform, CheatReconciliationEntry, CheatReconciliationOutcome,
-    CheatReconciliationResult, CheatSourceFormat,
+    self, CheatDocument, CheatDuplicateKind, CheatPlatform, CheatReconciliationEntry,
+    CheatReconciliationOutcome, CheatReconciliationResult, CheatSourceFormat,
 };
 use super::cht_document::{ChtDocumentWarning, ChtEntryWarning};
 use super::user_cheat_import::{
@@ -57,23 +60,12 @@ impl Default for CheatPackLimits {
     }
 }
 
-/// Expectations from source data or an explicitly supplied local manifest.
-/// A requirement is not proof of the ROM's identity. No manifest format is
-/// invented: callers may adapt their existing evidence to this in-memory seam.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct CheatPackAssociation {
-    pub title: Option<String>,
-    pub filename: Option<String>,
-    pub platform: Option<String>,
-    pub region: Option<String>,
-    pub revision: Option<String>,
-    pub identities: Vec<CheatPackIdentityRequirement>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CheatPackIdentityRequirement {
-    pub kind: IdentityKind,
-    pub value: String,
-}
+/// Expectations from source data or an explicitly supplied local manifest are
+/// the canonical [`CheatGameAssociation`]: a requirement is not proof of the
+/// ROM's identity. No manifest format is invented; callers adapt existing
+/// evidence to this in-memory seam.
+pub type CheatPackAssociation = CheatGameAssociation;
+pub type CheatPackIdentityRequirement = CheatIdentityRequirement;
 /// Verified facts use EmuWiz's existing IdentityEvidence, never optional string
 /// fields in UserCheatLibraryGame as an implicit verification flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -98,19 +90,6 @@ pub struct CheatPackGameMatch {
     pub evidence: Vec<CheatPackIdentityRequirement>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub enum CheatPackApplicability {
-    Ready,
-    PossibleMatch,
-    NeedsReview,
-    WrongRegion,
-    WrongRevision,
-    UnsupportedFormat,
-    UnsupportedTarget,
-    Malformed,
-    Unmatched,
-    Ambiguous,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum CheatPackAction {
     WouldAdd,
     WouldCorroborate,
@@ -120,19 +99,6 @@ pub enum CheatPackAction {
     WouldRejectUnsupported,
     WouldRemainUnmatched,
     WouldRemainAmbiguous,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub enum CheatPackRelationship {
-    ExactDuplicate,
-    EquivalentDuplicate,
-    CorroboratingObservation,
-    NameConflict,
-    CodeConflict,
-    SourceIndexConflict,
-    RegionVariant,
-    RevisionVariant,
-    SyntaxVariant,
-    AmbiguousPossibleDuplicate,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CheatPackFileState {
@@ -189,7 +155,7 @@ pub struct CheatPackObservation {
     pub execution_fields: BTreeMap<String, String>,
     pub engine: Option<String>,
     pub source_enabled_by_default: bool,
-    pub applicability: CheatPackApplicability,
+    pub applicability: CheatApplicabilityState,
     pub diagnostics: Vec<CheatPackDiagnostic>,
     pub diagnostics_truncated: bool,
     pub logical_key: String,
@@ -200,7 +166,7 @@ pub struct CheatPackLogicalCheat {
     pub key: String,
     pub game_key: String,
     pub observation_indices: Vec<usize>,
-    pub relationships: BTreeSet<CheatPackRelationship>,
+    pub relationships: BTreeSet<CheatDuplicateKind>,
     pub distinct_source_contents: usize,
     pub independent_source_groups: usize,
     pub known_mirrors: usize,
@@ -629,13 +595,34 @@ fn entry_for(
     game_key: &str,
     verified: bool,
 ) -> CheatReconciliationEntry {
+    // One provenance model: the observation's local artifact becomes the
+    // canonical typed record (hash, path, original text), never ad hoc strings.
+    let mut record = super::cheat_provenance::CheatRecordProvenance::local_with_sha256(
+        &observation.provenance.original_path,
+        &observation.provenance.source_sha256,
+        &format!("{:?}", observation.document.source_format),
+    );
+    record.record_index = observation.source_index;
+    record.original_description = Some(observation.document.title.clone());
+    record.original_code = Some(observation.raw_code.clone());
+    let mut document = observation.document.clone();
+    document.source_evidence = vec![record];
     CheatReconciliationEntry {
         game_identity: game_key.into(),
         identity_verified: verified,
+        applicability: cheat_ir::CheatApplicability {
+            region: observation.association.region.clone(),
+            revision: observation.association.revision.clone(),
+            engine: observation.engine.clone(),
+            ..Default::default()
+        },
+        source_path: Some(observation.provenance.original_path.display().to_string()),
+        source_index: observation.source_index,
+        source_fields: Vec::new(),
         title: observation.document.title.clone(),
         source: observation.provenance.source_sha256.clone(),
         source_format: observation.document.source_format.clone(),
-        document: observation.document.clone(),
+        document,
         raw_code: Some(observation.raw_code.clone()),
         provenance: vec![
             observation.provenance.original_path.display().to_string(),
@@ -736,7 +723,7 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
         let first = &preview.observations[indices[0]];
         let all_ready = indices
             .iter()
-            .all(|&i| preview.observations[i].applicability == CheatPackApplicability::Ready);
+            .all(|&i| preview.observations[i].applicability == CheatApplicabilityState::Ready);
         let game_key = preview.files[first.file_index].game_key.clone();
         let mut relations = BTreeSet::new();
         let mut by_name = BTreeMap::<String, BTreeSet<String>>::new();
@@ -755,7 +742,7 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
             let o = &preview.observations[i];
             let content = content_key(o);
             if o.source_index_conflict {
-                relations.insert(CheatPackRelationship::SourceIndexConflict);
+                relations.insert(CheatDuplicateKind::SourceIndexConflict);
             }
             by_name
                 .entry(cheat_ir::reconciliation_title(&o.document.title))
@@ -818,7 +805,7 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
                 .len()
                 > 1;
         if ambiguous_information {
-            relations.insert(CheatPackRelationship::AmbiguousPossibleDuplicate);
+            relations.insert(CheatDuplicateKind::AmbiguousPossibleDuplicate);
         }
         if !ambiguous_information
             && raw_semantics.values().any(|v| v.len() > 1)
@@ -826,30 +813,30 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
             && revisions.len() < 2
             && engines.len() < 2
         {
-            relations.insert(CheatPackRelationship::CodeConflict);
+            relations.insert(CheatDuplicateKind::CodeConflict);
         }
         if regions.len() > 1 {
-            relations.insert(CheatPackRelationship::RegionVariant);
+            relations.insert(CheatDuplicateKind::RegionVariant);
         }
         if revisions.len() > 1 {
-            relations.insert(CheatPackRelationship::RevisionVariant);
+            relations.insert(CheatDuplicateKind::VersionVariant);
         }
         if engines.len() > 1 || formats.len() > 1 {
-            relations.insert(CheatPackRelationship::SyntaxVariant);
+            relations.insert(CheatDuplicateKind::SyntaxVariant);
         }
         if by_index.values().any(|v| v.len() > 1) {
-            relations.insert(CheatPackRelationship::SourceIndexConflict);
+            relations.insert(CheatDuplicateKind::SourceIndexConflict);
         }
         let variant = relations.iter().any(|r| {
             matches!(
                 r,
-                CheatPackRelationship::RegionVariant
-                    | CheatPackRelationship::RevisionVariant
-                    | CheatPackRelationship::SyntaxVariant
+                CheatDuplicateKind::RegionVariant
+                    | CheatDuplicateKind::VersionVariant
+                    | CheatDuplicateKind::SyntaxVariant
             )
         });
         if !variant && !ambiguous_information && by_name.values().any(|v| v.len() > 1) {
-            relations.insert(CheatPackRelationship::NameConflict);
+            relations.insert(CheatDuplicateKind::NameConflict);
         }
         for duplicate in contents.values().filter(|v| v.len() > 1) {
             let titles: BTreeSet<_> = duplicate
@@ -861,9 +848,9 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
                 .map(|&i| &preview.observations[i].raw_code)
                 .collect();
             relations.insert(if titles.len() == 1 && raw.len() == 1 {
-                CheatPackRelationship::ExactDuplicate
+                CheatDuplicateKind::ExactDuplicate
             } else {
-                CheatPackRelationship::EquivalentDuplicate
+                CheatDuplicateKind::EquivalentDuplicate
             });
             if duplicate
                 .iter()
@@ -872,19 +859,19 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
                 .len()
                 > 1
             {
-                relations.insert(CheatPackRelationship::CorroboratingObservation);
+                relations.insert(CheatDuplicateKind::CorroboratingObservation);
             }
         }
         let conflict = relations.iter().any(|r| {
             matches!(
                 r,
-                CheatPackRelationship::NameConflict
-                    | CheatPackRelationship::CodeConflict
-                    | CheatPackRelationship::SourceIndexConflict
-                    | CheatPackRelationship::RegionVariant
-                    | CheatPackRelationship::RevisionVariant
-                    | CheatPackRelationship::SyntaxVariant
-                    | CheatPackRelationship::AmbiguousPossibleDuplicate
+                CheatDuplicateKind::NameConflict
+                    | CheatDuplicateKind::CodeConflict
+                    | CheatDuplicateKind::SourceIndexConflict
+                    | CheatDuplicateKind::RegionVariant
+                    | CheatDuplicateKind::VersionVariant
+                    | CheatDuplicateKind::SyntaxVariant
+                    | CheatDuplicateKind::AmbiguousPossibleDuplicate
             )
         });
         let verified = indices.iter().all(|&i| {
@@ -894,10 +881,10 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
             )
         });
         if !verified && indices.len() > 1 {
-            relations.remove(&CheatPackRelationship::ExactDuplicate);
-            relations.remove(&CheatPackRelationship::EquivalentDuplicate);
-            relations.remove(&CheatPackRelationship::CorroboratingObservation);
-            relations.insert(CheatPackRelationship::AmbiguousPossibleDuplicate);
+            relations.remove(&CheatDuplicateKind::ExactDuplicate);
+            relations.remove(&CheatDuplicateKind::EquivalentDuplicate);
+            relations.remove(&CheatDuplicateKind::CorroboratingObservation);
+            relations.insert(CheatDuplicateKind::AmbiguousPossibleDuplicate);
         }
         let conflict = conflict || (!verified && indices.len() > 1);
         let mut reconciliation = if verified {
@@ -931,14 +918,24 @@ fn plan(preview: &mut CheatPackPreview, existing: &BTreeSet<String>) {
             let o = &mut preview.observations[i];
             o.logical_key = keys[i].clone();
             o.action = match o.applicability {
-                CheatPackApplicability::Malformed => CheatPackAction::WouldRejectMalformed,
-                CheatPackApplicability::UnsupportedFormat
-                | CheatPackApplicability::UnsupportedTarget => {
+                CheatApplicabilityState::Malformed => CheatPackAction::WouldRejectMalformed,
+                CheatApplicabilityState::UnsupportedFormat
+                | CheatApplicabilityState::UnsupportedEmulator => {
                     CheatPackAction::WouldRejectUnsupported
                 }
-                CheatPackApplicability::Unmatched => CheatPackAction::WouldRemainUnmatched,
-                CheatPackApplicability::Ambiguous => CheatPackAction::WouldRemainAmbiguous,
-                CheatPackApplicability::Ready if !conflict => {
+                // No catalogue game matched: identity evidence is insufficient.
+                CheatApplicabilityState::MissingRequiredEvidence => {
+                    CheatPackAction::WouldRemainUnmatched
+                }
+                // Several games matched equally well; the file's match strength
+                // (not a second applicability model) records the ambiguity.
+                CheatApplicabilityState::NeedsReview
+                    if preview.files[o.file_index].match_strength
+                        == CheatPackMatchStrength::Ambiguous =>
+                {
+                    CheatPackAction::WouldRemainAmbiguous
+                }
+                CheatApplicabilityState::Ready if !conflict => {
                     if existing.contains(&o.logical_key) {
                         CheatPackAction::WouldRetainExisting
                     } else if added.insert(o.logical_key.clone()) {
@@ -1023,22 +1020,22 @@ fn rebuild_totals(p: &mut CheatPackPreview) {
         t.usable_cheats += usize::from(g.usable);
         t.exact_duplicates += usize::from(
             g.relationships
-                .contains(&CheatPackRelationship::ExactDuplicate),
+                .contains(&CheatDuplicateKind::ExactDuplicate),
         );
         t.equivalent_duplicates += usize::from(
             g.relationships
-                .contains(&CheatPackRelationship::EquivalentDuplicate),
+                .contains(&CheatDuplicateKind::EquivalentDuplicate),
         );
         t.corroborating_sources += usize::from(
             g.relationships
-                .contains(&CheatPackRelationship::CorroboratingObservation),
+                .contains(&CheatDuplicateKind::CorroboratingObservation),
         );
         t.conflicts += usize::from(g.relationships.iter().any(|r| {
             matches!(
                 r,
-                CheatPackRelationship::NameConflict
-                    | CheatPackRelationship::CodeConflict
-                    | CheatPackRelationship::SourceIndexConflict
+                CheatDuplicateKind::NameConflict
+                    | CheatDuplicateKind::CodeConflict
+                    | CheatDuplicateKind::SourceIndexConflict
             )
         }));
     }
@@ -1054,10 +1051,10 @@ fn rebuild_totals(p: &mut CheatPackPreview) {
     }
     for o in &p.observations {
         match o.applicability {
-            CheatPackApplicability::Malformed => t.malformed_cheats += 1,
-            CheatPackApplicability::WrongRegion => t.region_mismatches += 1,
-            CheatPackApplicability::WrongRevision => t.revision_mismatches += 1,
-            CheatPackApplicability::UnsupportedTarget => t.unsupported_targets += 1,
+            CheatApplicabilityState::Malformed => t.malformed_cheats += 1,
+            CheatApplicabilityState::WrongRegion => t.region_mismatches += 1,
+            CheatApplicabilityState::WrongRevision => t.revision_mismatches += 1,
+            CheatApplicabilityState::UnsupportedEmulator => t.unsupported_targets += 1,
             _ => {}
         }
         match o.action {

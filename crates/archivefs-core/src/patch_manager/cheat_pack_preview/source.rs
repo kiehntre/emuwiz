@@ -57,14 +57,14 @@ fn release_value(game: &CheatPackCatalogueGame, kind: IdentityKind) -> Option<&s
         None
     }
 }
-fn applicability(f: &CheatPackFile, catalogue: &CatalogueIndex<'_>) -> CheatPackApplicability {
+fn applicability(f: &CheatPackFile, catalogue: &CatalogueIndex<'_>) -> CheatApplicabilityState {
     match f.match_strength {
-        CheatPackMatchStrength::Unmatched => CheatPackApplicability::Unmatched,
-        CheatPackMatchStrength::Ambiguous => CheatPackApplicability::Ambiguous,
-        CheatPackMatchStrength::Possible => CheatPackApplicability::PossibleMatch,
+        CheatPackMatchStrength::Unmatched => CheatApplicabilityState::MissingRequiredEvidence,
+        CheatPackMatchStrength::Ambiguous => CheatApplicabilityState::NeedsReview,
+        CheatPackMatchStrength::Possible => CheatApplicabilityState::PossibleMatch,
         _ => {
             if f.association.region.is_none() && f.association.revision.is_none() {
-                return CheatPackApplicability::Ready;
+                return CheatApplicabilityState::Ready;
             }
             let game = f.matches.first().and_then(|m| {
                 catalogue
@@ -77,23 +77,23 @@ fn applicability(f: &CheatPackFile, catalogue: &CatalogueIndex<'_>) -> CheatPack
                     // Region strings in optional index metadata are not proof.
                     if let Some(actual) = release_value(game, IdentityKind::DolphinRegion) {
                         if actual != region {
-                            return CheatPackApplicability::WrongRegion;
+                            return CheatApplicabilityState::WrongRegion;
                         }
                     } else {
-                        return CheatPackApplicability::NeedsReview;
+                        return CheatApplicabilityState::NeedsReview;
                     }
                 }
                 if let Some(revision) = &f.association.revision {
                     if let Some(actual) = release_value(game, IdentityKind::DolphinRevision) {
                         if actual != revision {
-                            return CheatPackApplicability::WrongRevision;
+                            return CheatApplicabilityState::WrongRevision;
                         }
                     } else {
-                        return CheatPackApplicability::NeedsReview;
+                        return CheatApplicabilityState::NeedsReview;
                     }
                 }
             }
-            CheatPackApplicability::Ready
+            CheatApplicabilityState::Ready
         }
     }
 }
@@ -145,6 +145,7 @@ fn observation(
         mirror_of: None,
         association: file.association.clone(),
         document: CheatDocument {
+            source_evidence: Vec::new(),
             title,
             platform: platform(&file.association),
             source_format: format,
@@ -158,7 +159,7 @@ fn observation(
         execution_fields: BTreeMap::new(),
         engine: None,
         source_enabled_by_default: false,
-        applicability: CheatPackApplicability::NeedsReview,
+        applicability: CheatApplicabilityState::NeedsReview,
         diagnostics: Vec::new(),
         diagnostics_truncated: false,
         logical_key: String::new(),
@@ -230,51 +231,27 @@ fn adapt(
                     CheatSourceFormat::RetroArch,
                     vec![op],
                 );
-                o.source_index_conflict = e
-                    .warnings
-                    .iter()
-                    .filter(|w| {
-                        w.kind == super::super::cht_document::ChtEntryWarningKind::DuplicateField
-                    })
-                    .filter_map(|w| w.raw_source.as_deref())
-                    .any(|line| {
-                        let Some((key, value)) = line.split_once('=') else {
-                            return true;
-                        };
-                        let value = value.trim().trim_matches('"');
-                        let field = key
-                            .trim()
-                            .split_once('_')
-                            .map(|(_, f)| f)
-                            .unwrap_or_default();
-                        match field {
-                            "desc" => e.description.as_deref() != Some(value),
-                            "code" => e.code.as_deref() != Some(value),
-                            "enable" => {
-                                value
-                                    != if e.enabled_by_default {
-                                        "true"
-                                    } else {
-                                        "false"
-                                    }
-                            }
-                            _ => e
-                                .extra_fields
-                                .iter()
-                                .find(|(k, _)| k == field)
-                                .is_none_or(|(_, v)| v != value),
-                        }
-                    });
+                // The shared hardened parser already classifies a repeated field with
+                // a different value; an identical repeat is a benign duplicate.
+                o.source_index_conflict = e.warnings.iter().any(|w| {
+                    w.kind == super::super::cht_document::ChtEntryWarningKind::ConflictingDuplicate
+                });
                 o.source_index = Some(e.index);
                 o.source_enabled_by_default = e.enabled_by_default;
                 o.execution_fields = e.extra_fields.iter().cloned().collect();
                 o.engine = o.execution_fields.get("handler").cloned();
-                o.applicability = if !e.is_selectable() {
-                    CheatPackApplicability::Malformed
+                // An entry blocked *only* by a conflicting repeat parses fine but is
+                // ambiguous: review-only, not malformed. Anything else blocking is.
+                let only_conflict = e.code.as_deref().is_some_and(|code| !code.is_empty())
+                    && e.blocking_warnings().all(|w| {
+                        w.kind == super::super::cht_document::ChtEntryWarningKind::ConflictingDuplicate
+                    });
+                o.applicability = if !e.is_selectable() && !only_conflict {
+                    CheatApplicabilityState::Malformed
                 } else if e.warnings.is_empty() {
-                    CheatPackApplicability::Ready
+                    CheatApplicabilityState::Ready
                 } else {
-                    CheatPackApplicability::NeedsReview
+                    CheatApplicabilityState::NeedsReview
                 };
                 o.diagnostics = e
                     .warnings
@@ -320,9 +297,9 @@ fn adapt(
                 // Execution mode and CPU remain in raw code if IR cannot prove
                 // them. No line from a different section is silently enabled.
                 o.applicability = if malformed.is_empty() {
-                    CheatPackApplicability::Ready
+                    CheatApplicabilityState::Ready
                 } else {
-                    CheatPackApplicability::NeedsReview
+                    CheatApplicabilityState::NeedsReview
                 };
                 let execution: Vec<_> = raw
                     .iter()
@@ -378,9 +355,9 @@ fn adapt(
                     o.source_index = e.source_line;
                     o.source_enabled_by_default = e.enabled_by_default;
                     o.applicability = if e.is_selectable() {
-                        CheatPackApplicability::Ready
+                        CheatApplicabilityState::Ready
                     } else {
-                        CheatPackApplicability::Malformed
+                        CheatApplicabilityState::Malformed
                     };
                     o.diagnostics = e
                         .warnings
@@ -433,9 +410,9 @@ fn adapt(
                 o.document.provenance.push(format!("author: {}", e.author));
                 o.applicability = if e.is_selectable() {
                     // Current main catalogue facts cannot prove Xenia module hash binding.
-                    CheatPackApplicability::NeedsReview
+                    CheatApplicabilityState::NeedsReview
                 } else {
-                    CheatPackApplicability::Malformed
+                    CheatApplicabilityState::Malformed
                 };
                 o.diagnostics = e
                     .warnings
@@ -727,7 +704,7 @@ pub(super) fn preview(
                                     > super::super::cht_document::MAX_CHT_FIELD_BYTES
                                     || o.raw_code.lines().count() > limits.max_code_lines
                                 {
-                                    o.applicability = CheatPackApplicability::Malformed;
+                                    o.applicability = CheatApplicabilityState::Malformed;
                                     let full_bytes = o.raw_code.len();
                                     o.full_code_digest =
                                         Some(digest("full-source-code", &o.raw_code));
@@ -743,12 +720,9 @@ pub(super) fn preview(
                                     o.diagnostics.push(CheatPackDiagnostic::Limit {
                                         detail: format!("code length/line count bound exceeded ({full_bytes} original bytes); only a code sample retained; operations withheld"),
                                     });
-                                } else if o.applicability != CheatPackApplicability::Malformed {
-                                    if matches!(
-                                        effective,
-                                        CheatPackApplicability::Unmatched
-                                            | CheatPackApplicability::Ambiguous
-                                    ) || o.applicability == CheatPackApplicability::Ready
+                                } else if o.applicability != CheatApplicabilityState::Malformed {
+                                    if effective == CheatApplicabilityState::MissingRequiredEvidence
+                                        || o.applicability == CheatApplicabilityState::Ready
                                     {
                                         o.applicability = effective;
                                     }

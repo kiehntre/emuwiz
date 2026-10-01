@@ -184,13 +184,19 @@ pub enum CheatDuplicateKind {
     RegionVariant,
     SyntaxVariant,
     AmbiguousPossibleDuplicate,
+    /// Independent upstream sources agree on the same cheat. Emitted by pack
+    /// preview from provenance independence; it never selects or enables.
+    CorroboratingObservation,
 }
 
 impl CheatDuplicateKind {
     pub fn requires_review(self) -> bool {
         !matches!(
             self,
-            Self::Unique | Self::ExactDuplicate | Self::EquivalentDuplicate
+            Self::Unique
+                | Self::ExactDuplicate
+                | Self::EquivalentDuplicate
+                | Self::CorroboratingObservation
         )
     }
 }

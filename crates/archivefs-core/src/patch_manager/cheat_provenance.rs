@@ -130,6 +130,16 @@ impl CheatRecordProvenance {
 
     /// Selected local input is known locally, but is not thereby user-authored.
     pub fn local(path: &Path, bytes: &[u8], format: &str) -> Self {
+        let sha256: String = Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        Self::local_with_sha256(path, &sha256, format)
+    }
+
+    /// As [`Self::local`] for callers that already hold the artifact digest
+    /// (for example a pack preview that hashed the file while inspecting it).
+    pub fn local_with_sha256(path: &Path, sha256: &str, format: &str) -> Self {
         Self {
             source_kind: CheatSourceKind::LocalFile,
             source_quality: CheatSourceQuality::LocalKnown,
@@ -138,12 +148,7 @@ impl CheatRecordProvenance {
             artifact: Some(SourceArtifactIdentity {
                 source_family: SourceFamily::Unknown,
                 upstream_version: None,
-                artifact_sha256: Some(
-                    Sha256::digest(bytes)
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect(),
-                ),
+                artifact_sha256: (!sha256.is_empty()).then(|| sha256.to_string()),
                 artifact_name: path.file_name().and_then(|s| s.to_str()).map(str::to_owned),
             }),
             ..Self::default()
