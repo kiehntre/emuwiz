@@ -554,6 +554,38 @@ fn count_line(ui: &mut egui::Ui, label: &str, value: usize, note: &str) {
     ui.end_row();
 }
 
+/// A compact, one-line-per-folder notice for folders that need review, meant for
+/// the top of a page whose layout has no room for the full health section. It
+/// draws nothing at all when no folder needs review.
+pub(crate) fn show_review_banner(
+    ui: &mut egui::Ui,
+    rows: &[SourceHealthRow],
+    busy: bool,
+) -> Option<HealthAction> {
+    let mut action = None;
+    for row in rows {
+        let words = wording(row.health.as_ref());
+        if !words.needs_review {
+            continue;
+        }
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_strip(ui, &[(words.headline, words.tone)]);
+            ui.label(row.path.display().to_string());
+            if widgets::action_button(
+                ui,
+                "Review and rebind source",
+                widgets::ActionStyle::Primary,
+                !busy,
+            )
+            .clicked()
+            {
+                action = Some(HealthAction::Review(row.path.clone()));
+            }
+        });
+    }
+    action
+}
+
 pub(crate) fn show_health_section(
     ui: &mut egui::Ui,
     rows: &[SourceHealthRow],

@@ -4506,12 +4506,12 @@ fn sources_page_projects_backend_health_and_offers_reviewed_rebind_only_when_req
         generation: 0,
         detail: None,
     };
-    let render = |entries: Vec<SourceHealth>| {
+    let render_at = |size: [f32; 2], entries: Vec<SourceHealth>| {
         let context = egui::Context::default();
         let mut app = fixture(&context);
         app.artwork.index = Some(Arc::new(MediaIndex::default()));
         app.router.current = Route::Section(Section::Sources);
-        frame(&context, &mut app, [1280.0, 820.0]);
+        frame(&context, &mut app, size);
         let mut snapshot = crate::tests::cached_snapshot(Vec::new());
         snapshot.source_views = vec![view()];
         snapshot.source_health = entries;
@@ -4519,10 +4519,11 @@ fn sources_page_projects_backend_health_and_offers_reviewed_rebind_only_when_req
             snapshot: Box::new(snapshot),
             last_scan_summary: None,
         };
-        frame(&context, &mut app, [1280.0, 820.0]);
-        let output = frame(&context, &mut app, [1280.0, 820.0]);
-        text(&output)
+        frame(&context, &mut app, size);
+        frame(&context, &mut app, size)
     };
+    // Tall enough that the whole page is painted.
+    let render = |entries: Vec<SourceHealth>| text(&render_at([1280.0, 2600.0], entries));
     // Status badges carry a tone glyph ("× Review needed"), so match the label.
     let has = |texts: &[String], needle: &str| {
         texts
@@ -4535,6 +4536,17 @@ fn sources_page_projects_backend_health_and_offers_reviewed_rebind_only_when_req
         Some(RebindReason::NeverBound),
     )]);
     assert!(has(&legacy, "Review and rebind source"), "{legacy:?}");
+    // The review is reachable at the ordinary viewport without scrolling, even
+    // with the full provider setup block on the same page.
+    let ordinary = render_at(
+        [1280.0, 820.0],
+        vec![health(
+            SourceHealthState::RebindRequired,
+            Some(RebindReason::NeverBound),
+        )],
+    );
+    assert!(clip_visible(&ordinary, "Review and rebind source"));
+    assert!(clip_visible(&ordinary, "Artwork and metadata providers"));
     assert!(has(&legacy, "Review needed"));
     assert!(!has(&legacy, "Up to date"));
 

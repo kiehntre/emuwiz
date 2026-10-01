@@ -727,20 +727,13 @@ impl NativeWorkflows {
             }
         });
 
-        // Catalogue health comes first: a folder that needs review blocks
-        // scanning and every Missing report, so it must not be buried below
-        // provider setup. Hidden in Discovery, and while there are no folders.
-        if !self.sources_discovery && !source_state.sources.is_empty() {
-            ui.separator();
-            let row_view = self
-                .app
-                .sources_ui
-                .catalogue_row_check
-                .view(self.app.database_generation.0);
-            health_action = crate::catalogue_health_ui::show_health_section(
+        // A folder that needs review blocks scanning and every Missing report,
+        // so say so right here, in one line, without pushing provider setup down.
+        // Nothing is drawn unless a folder actually needs review.
+        if !self.sources_discovery {
+            health_action = crate::catalogue_health_ui::show_review_banner(
                 ui,
                 &health_rows,
-                &row_view,
                 busy || self.app.database_state.is_loading(),
             );
         }
@@ -762,6 +755,21 @@ impl NativeWorkflows {
             egui::ScrollArea::vertical()
                 .id_salt("v2_native_sources")
                 .show(ui, |ui| {
+                    {
+                        let row_view = self
+                            .app
+                            .sources_ui
+                            .catalogue_row_check
+                            .view(self.app.database_generation.0);
+                        let full = crate::catalogue_health_ui::show_health_section(
+                            ui,
+                            &health_rows,
+                            &row_view,
+                            busy || self.app.database_state.is_loading(),
+                        );
+                        health_action = full.or(health_action.take());
+                    }
+                    ui.add_space(8.0);
                     for source in &source_state.sources {
                         ui.push_id(&source.path, |ui| {
                             self.show_native_source_card(ui, source, &archives, busy, &mut action);
