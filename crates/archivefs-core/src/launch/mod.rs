@@ -114,6 +114,8 @@ pub mod mgba_command;
 pub mod mgba_execution;
 #[cfg(target_os = "linux")]
 pub mod native_support;
+#[cfg(target_os = "linux")]
+pub mod np2kai;
 pub mod openmsx_command;
 pub mod openmsx_execution;
 pub mod pcsx2_command;
