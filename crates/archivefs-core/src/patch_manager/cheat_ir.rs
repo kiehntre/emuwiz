@@ -190,6 +190,26 @@ pub enum CheatDuplicateKind {
 }
 
 impl CheatDuplicateKind {
+    /// The one plain-English wording for normal screens. Technical names stay
+    /// available for the Details view.
+    #[must_use]
+    pub const fn plain_label(self) -> &'static str {
+        match self {
+            Self::Unique => "Only one version",
+            Self::ExactDuplicate => "The same cheat from more than one place",
+            Self::EquivalentDuplicate => "The same cheat, written slightly differently",
+            Self::NameConflict => "The same code has different names",
+            Self::CodeConflict => "Different codes share one name",
+            Self::SourceIndexConflict => "One file lists this cheat twice with different codes",
+            Self::SourceMetadataConflict => "The file's own settings disagree",
+            Self::VersionVariant => "Made for different versions of the game",
+            Self::RegionVariant => "Made for different regions",
+            Self::SyntaxVariant => "Written for different cheat engines",
+            Self::AmbiguousPossibleDuplicate => "EmuWiz cannot tell whether these are the same",
+            Self::CorroboratingObservation => "Confirmed by independent sources",
+        }
+    }
+
     pub fn requires_review(self) -> bool {
         !matches!(
             self,

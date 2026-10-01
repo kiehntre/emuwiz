@@ -5,6 +5,7 @@
 //! separate, explicit step that hands it to the existing per-emulator local
 //! install bridge (preview, confirm, apply, undo); the index never writes.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -15,27 +16,27 @@ use archivefs_core::patch_manager::{
     CheatCandidateOptions, CheatCodeDecodeResult, CheatDestinationRequest, CheatDocument,
     CheatIssue, CheatJourneyApplyApproval, CheatJourneyApplyOptions, CheatJourneyGameIdentity,
     CheatJourneyPreview, CheatJourneyPreviewAction, CheatJourneyUndoConfirmation,
-    CheatJourneyUndoOptions, CheatJourneyUndoPreview, CheatOperation, CheatPlatform,
-    CheatSourceFormat, CheatTargetFormat, CheatTargetPlatform, ConversionCapability,
-    DolphinCandidate, DolphinInstallPreview, DolphinInstallPreviewRequest,
-    LocalDolphinInstallState, LocalPcsx2InstallState, LocalXeniaInstallState, Pcsx2GameIdentity,
-    Pcsx2InstallPreview, Pcsx2InstallPreviewRequest, Pcsx2Profile, PreviewProposedAction,
-    SharedApplyConfirmation, SharedApplyOptions, SharedApplyStatus, SharedRollbackConfirmation,
-    SharedRollbackOptions, SharedRollbackPreview, UserCheatCandidate, UserCheatDiagnostic,
-    UserCheatFormat, UserCheatImportError, UserCheatImportReport, UserCheatLibraryGame,
-    UserCheatMatchState, XeniaInstallPreview, XeniaInstallPreviewRequest, XeniaProfile,
-    apply_cheat_journey, build_dolphin_install_preview, build_pcsx2_install_preview,
-    build_shared_transaction_plan, build_xenia_install_preview, check_local_dolphin_install_state,
-    check_local_pcsx2_install_state, check_local_xenia_install_state, convert_cheat_document,
-    decode_action_replay, default_shared_backup_root, default_shared_history_root,
-    detect_action_replay_format, discover_local_dolphin_cheat_file,
-    discover_local_pcsx2_pnach_file, discover_local_retroarch_cheat_file,
-    discover_local_xenia_patch_file, execute_shared_apply, execute_shared_rollback,
-    generate_shared_operation_id, load_dolphin_destination, load_local_xenia_destination,
-    preview_cheat_journey, preview_cheat_journey_undo, preview_shared_rollback,
-    scan_user_cheat_directory, scan_user_cheat_file, select_cheat_journey_candidate,
-    stage_local_dolphin_codes, stage_local_xenia_patch_file, stage_pcsx2_pnach,
-    supported_targets_for, undo_cheat_journey,
+    CheatJourneyUndoOptions, CheatJourneyUndoPreview, CheatOperation, CheatPackCatalogueGame,
+    CheatPackLimits, CheatPackPreview, CheatPlatform, CheatSourceFormat, CheatTargetFormat,
+    CheatTargetPlatform, ConversionCapability, DolphinCandidate, DolphinInstallPreview,
+    DolphinInstallPreviewRequest, LocalDolphinInstallState, LocalPcsx2InstallState,
+    LocalXeniaInstallState, Pcsx2GameIdentity, Pcsx2InstallPreview, Pcsx2InstallPreviewRequest,
+    Pcsx2Profile, PreviewProposedAction, SharedApplyConfirmation, SharedApplyOptions,
+    SharedApplyStatus, SharedRollbackConfirmation, SharedRollbackOptions, SharedRollbackPreview,
+    UserCheatCandidate, UserCheatDiagnostic, UserCheatFormat, UserCheatImportError,
+    UserCheatImportReport, UserCheatLibraryGame, UserCheatMatchState, XeniaInstallPreview,
+    XeniaInstallPreviewRequest, XeniaProfile, apply_cheat_journey, build_dolphin_install_preview,
+    build_pcsx2_install_preview, build_shared_transaction_plan, build_xenia_install_preview,
+    check_local_dolphin_install_state, check_local_pcsx2_install_state,
+    check_local_xenia_install_state, convert_cheat_document, decode_action_replay,
+    default_shared_backup_root, default_shared_history_root, detect_action_replay_format,
+    discover_local_dolphin_cheat_file, discover_local_pcsx2_pnach_file,
+    discover_local_retroarch_cheat_file, discover_local_xenia_patch_file, execute_shared_apply,
+    execute_shared_rollback, generate_shared_operation_id, load_dolphin_destination,
+    load_local_xenia_destination, preview_cheat_journey, preview_cheat_journey_undo,
+    preview_cheat_pack, preview_shared_rollback, scan_user_cheat_directory, scan_user_cheat_file,
+    select_cheat_journey_candidate, stage_local_dolphin_codes, stage_local_xenia_patch_file,
+    stage_pcsx2_pnach, supported_targets_for, undo_cheat_journey,
 };
 use eframe::egui;
 
@@ -229,7 +230,12 @@ enum LocalDolphinInstallStage {
 
 #[derive(Debug)]
 enum TaskResult {
-    Scanned(Result<UserCheatImportReport, UserCheatImportError>),
+    /// The scan report, plus (for a folder) the bounded read-only pack preview
+    /// computed in the same background pass.
+    Scanned(
+        Result<UserCheatImportReport, UserCheatImportError>,
+        Option<Result<Box<CheatPackPreview>, String>>,
+    ),
 }
 
 #[derive(Debug, Default)]
@@ -253,6 +259,8 @@ enum ImportState {
 pub(crate) struct UserCheatImportPageState {
     state: ImportState,
     task: Option<(u64, Receiver<TaskResult>)>,
+    /// What EmuWiz found in the last scanned folder, if it was a folder.
+    pack_preview: Option<Result<Box<CheatPackPreview>, String>>,
     generation: u64,
     context_key: Option<String>,
     report_context_key: Option<String>,
@@ -281,16 +289,19 @@ impl UserCheatImportPageState {
             return;
         };
         let generation = *generation;
-        let result = match receiver.try_recv() {
-            Ok(TaskResult::Scanned(result)) => result,
+        let (result, pack) = match receiver.try_recv() {
+            Ok(TaskResult::Scanned(result, pack)) => (result, pack),
             Err(TryRecvError::Empty) => {
                 context.request_repaint_after(std::time::Duration::from_millis(100));
                 return;
             }
-            Err(TryRecvError::Disconnected) => Err(UserCheatImportError::Io {
-                path: PathBuf::new(),
-                message: "The cheat import worker stopped unexpectedly.".to_string(),
-            }),
+            Err(TryRecvError::Disconnected) => (
+                Err(UserCheatImportError::Io {
+                    path: PathBuf::new(),
+                    message: "The cheat import worker stopped unexpectedly.".to_string(),
+                }),
+                None,
+            ),
         };
         self.task = None;
         if generation != self.generation {
@@ -304,9 +315,11 @@ impl UserCheatImportPageState {
             Ok(report) => {
                 self.report_context_key = self.context_key.clone();
                 self.selected_candidate = None;
+                self.pack_preview = pack;
                 self.state = ImportState::Ready { report };
             }
             Err(error) => {
+                self.pack_preview = None;
                 self.state = ImportState::Failed {
                     source,
                     message: error.to_string(),
@@ -332,13 +345,35 @@ impl UserCheatImportPageState {
             source: source.clone(),
         };
         let context = context.clone();
+        self.pack_preview = None;
         thread::spawn(move || {
             let result = if is_directory {
                 scan_user_cheat_directory(&source, &library)
             } else {
                 scan_user_cheat_file(&source, &library)
             };
-            let _ = sender.send(TaskResult::Scanned(result));
+            // Bounded, read-only, nothing is enabled. No verified identity
+            // facts are supplied here, so matches stay title-level at best.
+            let pack = is_directory.then(|| {
+                let catalogue: Vec<CheatPackCatalogueGame> = library
+                    .iter()
+                    .map(|game| CheatPackCatalogueGame {
+                        game: game.clone(),
+                        facts: Vec::new(),
+                        revision: None,
+                    })
+                    .collect();
+                preview_cheat_pack(
+                    &source,
+                    &catalogue,
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    &CheatPackLimits::default(),
+                )
+                .map(Box::new)
+                .map_err(|error| error.to_string())
+            });
+            let _ = sender.send(TaskResult::Scanned(result, pack));
             context.request_repaint();
         });
     }
@@ -445,6 +480,7 @@ impl UserCheatImportPageState {
                     self.generation = self.generation.wrapping_add(1);
                     self.task = None;
                     self.state = ImportState::Idle;
+                    self.pack_preview = None;
                     self.report_context_key = None;
                     self.selected_candidate = None;
                 }
@@ -473,6 +509,7 @@ impl UserCheatImportPageState {
                     );
                 }
                 ImportState::Ready { .. } => {
+                    self.show_pack_preview(ui);
                     if let Some(report) = report.as_ref() {
                         self.show_report(
                             ui,
@@ -494,6 +531,30 @@ impl UserCheatImportPageState {
         self.show_local_xenia_install_picker(ui, local_xenia_install_context);
         self.show_local_xenia_install_panel(ui);
         self.show_action_replay_decoder_panel(ui);
+    }
+
+    /// "What EmuWiz found in this folder": a plain summary of the bounded
+    /// pack preview. It never enables, installs or selects anything.
+    fn show_pack_preview(&self, ui: &mut egui::Ui) {
+        match &self.pack_preview {
+            None => {}
+            Some(Err(message)) => widgets::banner(
+                ui,
+                "Could not look through this folder",
+                message,
+                widgets::StatusTone::Warning,
+            ),
+            Some(Ok(preview)) => widgets::card(ui, |ui| {
+                ui.strong("What EmuWiz found in this folder");
+                for (line, warn) in pack_summary_lines(preview) {
+                    if warn {
+                        ui.colored_label(crate::ui::theme::WARNING, line);
+                    } else {
+                        ui.label(line);
+                    }
+                }
+            }),
+        }
     }
 
     fn show_action_replay_decoder_panel(&mut self, ui: &mut egui::Ui) {
@@ -2996,6 +3057,90 @@ impl UserCheatImportPageState {
     }
 }
 
+/// Plain-language summary of a pack preview: `(text, needs_attention)` pairs.
+/// Zero counts are omitted. Wording avoids internal terms and always ends by
+/// saying nothing is enabled or installed.
+fn pack_summary_lines(preview: &CheatPackPreview) -> Vec<(String, bool)> {
+    let t = &preview.totals;
+    let plural = |n: usize, one: &str, many: &str| {
+        if n == 1 {
+            one.to_string()
+        } else {
+            many.to_string()
+        }
+    };
+    let mut lines = vec![(
+        format!(
+            "EmuWiz looked through {} {} and found {} {}.",
+            t.files_discovered,
+            plural(t.files_discovered, "file", "files"),
+            t.logical_cheats,
+            plural(t.logical_cheats, "cheat", "cheats"),
+        ),
+        false,
+    )];
+    if !preview.complete {
+        lines.push((
+            "This folder is larger than EmuWiz looks through at once, so these results are partial.".into(),
+            true,
+        ));
+    }
+    let mut add = |n: usize, text: String, warn: bool| {
+        if n > 0 {
+            lines.push((text, warn));
+        }
+    };
+    add(
+        t.usable_cheats,
+        format!("{} can be reviewed for your games.", t.usable_cheats),
+        false,
+    );
+    let mismatched = t.region_mismatches + t.revision_mismatches;
+    add(
+        mismatched,
+        format!("{mismatched} may not match this region or revision."),
+        true,
+    );
+    add(
+        t.conflicts,
+        format!(
+            "{} have different versions - you will choose which to use.",
+            t.conflicts
+        ),
+        true,
+    );
+    let unsupported = t.unsupported_formats + t.unsupported_targets;
+    add(
+        unsupported,
+        format!("{unsupported} are in a format EmuWiz cannot use here."),
+        true,
+    );
+    let unreadable = t.malformed_cheats + t.files_malformed;
+    add(unreadable, format!("{unreadable} could not be read."), true);
+    let unmatched = t.would_remain_unmatched;
+    add(
+        unmatched,
+        format!("{unmatched} do not match a game in your library yet."),
+        false,
+    );
+    add(
+        t.would_remain_ambiguous,
+        format!("{} match more than one game.", t.would_remain_ambiguous),
+        true,
+    );
+    let copies = t.exact_duplicates + t.equivalent_duplicates;
+    add(
+        copies,
+        format!("{copies} appear more than once or are copies of cheats you already have."),
+        false,
+    );
+    lines.push((
+        "Nothing is enabled or installed by this preview.".into(),
+        false,
+    ));
+    lines
+}
+
 fn now_unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3133,5 +3278,76 @@ mod tests {
             "RetroArch .cht"
         );
         assert_eq!(format_label(UserCheatFormat::Pcsx2Pnach), "PCSX2 .pnach");
+    }
+
+    fn preview_of(files: &[(&str, &str)]) -> CheatPackPreview {
+        let root = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            std::fs::write(root.path().join(name), body).unwrap();
+        }
+        let library = vec![CheatPackCatalogueGame {
+            game: UserCheatLibraryGame {
+                game_id: "g".into(),
+                title: "Example".into(),
+                ..Default::default()
+            },
+            facts: Vec::new(),
+            revision: None,
+        }];
+        preview_cheat_pack(
+            root.path(),
+            &library,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &CheatPackLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pack_summary_reports_conflicts_and_unreadable_files_in_plain_words() {
+        let preview = preview_of(&[
+            (
+                "Example.cht",
+                "cheats = 1\ncheat0_desc = \"Lives\"\ncheat0_code = \"A\"\ncheat0_code = \"B\"\n",
+            ),
+            ("Broken.cht", "\u{0}\u{1}not a cheat file"),
+        ]);
+        let lines = pack_summary_lines(&preview);
+        let text: Vec<&str> = lines.iter().map(|(line, _)| line.as_str()).collect();
+        assert!(
+            text[0].starts_with("EmuWiz looked through 2 files"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("different versions")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|l| l.contains("could not be read")),
+            "{text:?}"
+        );
+        assert_eq!(
+            *text.last().unwrap(),
+            "Nothing is enabled or installed by this preview."
+        );
+        // Nothing in normal wording leaks internal names, and a preview can
+        // never be applied.
+        for line in &text {
+            assert!(
+                !line.contains("CheatPack") && !line.contains("Variant") && !line.contains("::"),
+                "{line}"
+            );
+        }
+        assert!(!preview.can_apply());
+    }
+
+    #[test]
+    fn pack_summary_for_an_empty_folder_is_calm_and_complete() {
+        let preview = preview_of(&[]);
+        let lines = pack_summary_lines(&preview);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].0.contains("0 files") && lines[0].0.contains("0 cheats"));
+        assert!(lines.iter().all(|(_, attention)| !attention));
     }
 }

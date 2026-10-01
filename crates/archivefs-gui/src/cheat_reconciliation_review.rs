@@ -8,10 +8,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use archivefs_core::patch_manager::{
-    CheatCompatibilityEntry, CheatConflictSeverity, CheatOperation, CheatReconciliationGroup,
-    CheatReconciliationResult, CheatRelationship, CheatReviewChoice, CheatRevisionEvidence,
-    ResolvedCheatApplyEligibility, ResolvedCheatPlan, ResolvedCheatPlanRequest,
-    analyze_cheat_stack, resolve_reviewed_cheat_plan,
+    CheatCompatibilityEntry, CheatConflictSeverity, CheatIssue, CheatOperation,
+    CheatReconciliationEntry, CheatReconciliationGroup, CheatReconciliationResult,
+    CheatRelationship, CheatReviewChoice, CheatRevisionEvidence, ResolvedCheatApplyEligibility,
+    ResolvedCheatPlan, ResolvedCheatPlanRequest, analyze_cheat_stack, resolve_reviewed_cheat_plan,
 };
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -429,26 +429,48 @@ impl CheatReconciliationReviewState {
         widgets::card(ui, |ui| {
             ui.strong(title);
             ui.label(heading);
-            ui.weak(format!("Evidence: {:?}", group.classifications));
-            for difference in &group.differences {
-                ui.weak(format!("Difference: {difference}"));
+            for reason in plain_group_reasons(group) {
+                ui.label(reason);
             }
+            if matches!(
+                group.relationship,
+                CheatRelationship::SameTitleDifferentCode | CheatRelationship::RelatedUnproven
+            ) {
+                ui.label("Choose which version to use. Nothing is chosen for you.");
+            }
+            widgets::technical_details(ui, ("cheat_group_evidence", group_index), |ui| {
+                ui.weak(format!("Evidence: {:?}", group.classifications));
+                for difference in &group.differences {
+                    ui.weak(format!("Difference: {difference}"));
+                }
+            });
             for (position, index) in group.entry_indices.iter().enumerate() {
                 let Some(entry) = result.entries.get(*index) else {
                     continue;
                 };
                 ui.separator();
-                ui.label(format!("Source {}: {}", position + 1, entry.source));
                 ui.label(format!(
-                    "Game: {} · Format: {:?}",
-                    entry.title, entry.source_format
+                    "Version {}: {}",
+                    position + 1,
+                    plain_source_line(entry)
                 ));
-                for provenance in &entry.provenance {
-                    ui.weak(format!("Provenance: {provenance}"));
-                }
+                ui.label(format!("Game: {}", entry.title));
                 for issue in &entry.document.issues {
-                    ui.colored_label(theme::WARNING, format!("Issue: {issue:?}"));
+                    ui.colored_label(theme::WARNING, plain_issue(issue));
                 }
+                widgets::technical_details(ui, ("cheat_entry_provenance", *index), |ui| {
+                    ui.weak(format!("Source: {}", entry.source));
+                    ui.weak(format!("Format: {:?}", entry.source_format));
+                    for provenance in &entry.provenance {
+                        ui.weak(format!("Provenance: {provenance}"));
+                    }
+                    for record in entry.audit_evidence() {
+                        ui.weak(format!("Record: {record:?}"));
+                    }
+                    for issue in &entry.document.issues {
+                        ui.weak(format!("Issue: {issue:?}"));
+                    }
+                });
                 for operation in &entry.document.operations {
                     if let CheatOperation::UnsupportedRaw { reason, .. } = operation {
                         ui.colored_label(theme::WARNING, format!("Unsupported: {reason}"));
@@ -516,6 +538,67 @@ impl CheatReconciliationReviewState {
                         .any(|operation| matches!(operation, CheatOperation::UnsupportedRaw { .. }))
             })
         })
+    }
+}
+
+/// Plain-English reasons a group needs a choice, from the canonical duplicate
+/// kinds. Stable order, no repeats, nothing for "unique".
+fn plain_group_reasons(group: &CheatReconciliationGroup) -> Vec<&'static str> {
+    let mut reasons: Vec<&'static str> = group
+        .classifications
+        .iter()
+        .filter(|kind| {
+            !matches!(
+                kind,
+                archivefs_core::patch_manager::CheatDuplicateKind::Unique
+            )
+        })
+        .map(|kind| kind.plain_label())
+        .collect();
+    reasons.dedup();
+    reasons
+}
+
+/// One readable line about where a version came from: the source's own kind
+/// and the file name only. Full paths and hashes stay under Details.
+fn plain_source_line(entry: &CheatReconciliationEntry) -> String {
+    let evidence = entry.audit_evidence();
+    let first = evidence.first();
+    let origin = first
+        .map(|record| record.source_kind.plain_label())
+        .unwrap_or("Unknown source");
+    let quality = first.map(|record| record.source_quality.plain_label());
+    let file = first.and_then(|record| record.display_filename());
+    let mut line = entry.source.clone();
+    if let Some(file) = file {
+        line = file.to_string();
+    }
+    match quality {
+        Some(quality) => format!("{line} - {origin} ({quality})"),
+        None => format!("{line} - {origin}"),
+    }
+}
+
+fn plain_issue(issue: &CheatIssue) -> String {
+    match issue {
+        CheatIssue::UnsupportedOperation(_) => "EmuWiz cannot use part of this cheat.".into(),
+        CheatIssue::AmbiguousOperation(_) => "Part of this cheat is ambiguous.".into(),
+        CheatIssue::EncryptedVariant => "This cheat is encrypted, so EmuWiz cannot read it.".into(),
+        CheatIssue::MasterCodeRequired => "This cheat needs a master code.".into(),
+        CheatIssue::PlatformMismatch => "This cheat was made for a different system.".into(),
+        CheatIssue::LossyMapping(_) => "Converting it would lose detail.".into(),
+        CheatIssue::UnknownWidth => "The size of the change is not known.".into(),
+        CheatIssue::RawPreserved => "Kept exactly as written; EmuWiz does not decode it.".into(),
+        CheatIssue::SourceIndexConflict => {
+            "The same file lists this cheat twice with different codes.".into()
+        }
+        CheatIssue::SourceMetadataConflict => "The file's own settings disagree.".into(),
+        CheatIssue::MissingTargetEncoder => {
+            "EmuWiz cannot write this for the chosen emulator yet.".into()
+        }
+        CheatIssue::DsActionReplayUnsupported(_) => {
+            "This Action Replay feature is not supported.".into()
+        }
     }
 }
 
@@ -628,5 +711,71 @@ mod tests {
         assert!(state.report.is_none());
         assert!(state.choices.is_empty());
         assert!(!state.show_all);
+    }
+}
+
+#[cfg(test)]
+mod plain_language_tests {
+    use super::*;
+    use archivefs_core::patch_manager::CheatDuplicateKind as K;
+
+    fn group(kinds: Vec<K>) -> CheatReconciliationGroup {
+        CheatReconciliationGroup {
+            relationship: CheatRelationship::SameTitleDifferentCode,
+            classifications: kinds,
+            entry_indices: vec![0, 1],
+            normalized_title: "lives".into(),
+            semantic_fingerprint: None,
+            raw_fingerprint: None,
+            differences: vec![],
+            quality: vec![],
+        }
+    }
+
+    #[test]
+    fn reasons_are_plain_ordered_and_skip_unique() {
+        let reasons =
+            plain_group_reasons(&group(vec![K::Unique, K::RegionVariant, K::VersionVariant]));
+        assert_eq!(
+            reasons,
+            vec![
+                "Made for different regions",
+                "Made for different versions of the game"
+            ]
+        );
+    }
+
+    #[test]
+    fn normal_wording_never_leaks_internal_type_names() {
+        for kind in [
+            K::NameConflict,
+            K::CodeConflict,
+            K::SourceIndexConflict,
+            K::SourceMetadataConflict,
+            K::VersionVariant,
+            K::RegionVariant,
+            K::SyntaxVariant,
+            K::AmbiguousPossibleDuplicate,
+            K::CorroboratingObservation,
+        ] {
+            let text = kind.plain_label();
+            assert!(
+                !text.contains("::") && !text.contains("Variant") && !text.contains("Index"),
+                "{text}"
+            );
+        }
+        for issue in [
+            CheatIssue::RawPreserved,
+            CheatIssue::SourceIndexConflict,
+            CheatIssue::UnknownWidth,
+            CheatIssue::MissingTargetEncoder,
+            CheatIssue::UnsupportedOperation("x".into()),
+        ] {
+            let text = plain_issue(&issue);
+            assert!(
+                !text.contains("Issue") && !text.contains("::") && text.ends_with('.'),
+                "{text}"
+            );
+        }
     }
 }
