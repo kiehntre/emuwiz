@@ -49,6 +49,8 @@
 
 use std::path::Path;
 
+pub mod nkit;
+
 use nod::{Disc, OpenOptions, PartitionKind};
 
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
