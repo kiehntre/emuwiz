@@ -123,6 +123,27 @@ impl Section {
         }
     }
 
+    /// The sidebar label. The twelve feature-family overviews share their title
+    /// with a task page of the same name (Saves & States, Organisation, Problems &
+    /// Repair), so they read "… overview" to stay distinguishable at a glance.
+    pub fn sidebar_title(self) -> &'static str {
+        match self {
+            Self::DatVerification => "DATs & Verification overview",
+            Self::CheatsMods => "Cheats & Mods overview",
+            Self::SavesStates => "Saves & States overview",
+            Self::EmulatorsFamily => "Emulators overview",
+            Self::Mame => "MAME overview",
+            Self::ArtworkExtras => "Artwork & Extras overview",
+            Self::Conversion => "Conversion overview",
+            Self::OrganisationFamily => "Organisation overview",
+            Self::ProblemsRepair => "Problems & Repair overview",
+            Self::SourcesProviders => "Sources & Providers overview",
+            Self::HistoryUndo => "History & Undo overview",
+            Self::AdvancedDiagnostics => "Advanced / Diagnostics overview",
+            other => other.title(),
+        }
+    }
+
     pub fn purpose(self) -> &'static str {
         match self {
             Self::Home => "Your games, and the things you can do with them.",

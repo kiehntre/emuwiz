@@ -407,7 +407,7 @@ impl App {
                                 if ui
                                     .add_sized(
                                         [ui.available_width(), 40.0],
-                                        egui::Button::new(section.title())
+                                        egui::Button::new(section.sidebar_title())
                                             .selected(selected)
                                             .wrap(),
                                     )
@@ -1493,7 +1493,7 @@ impl App {
                         &mut self.imagery,
                         EmptyArt::Mascot,
                         "Nothing has been compared yet",
-                        "Wizzy compares file evidence and verified hashes, not filenames alone. Finding duplicates never deletes anything; results are reviewed before any recoverable quarantine.",
+                        "Mr Wiz compares file evidence and verified hashes, not filenames alone. Finding duplicates never deletes anything; results are reviewed before any recoverable quarantine.",
                         Some("Find duplicates"),
                     )
                 };
@@ -1645,7 +1645,7 @@ impl App {
                     ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(58.0, 58.0)));
                 }
                 ui.heading("Nothing has been compared yet");
-                ui.label("Wizzy compares verified file evidence, not filenames alone.");
+                ui.label("Mr Wiz compares verified file evidence, not filenames alone.");
                 ui.label("Finding duplicates never deletes anything; review comes first.");
                 clicked = primary(ui, "Find duplicates");
             });

@@ -830,11 +830,89 @@ fn gui_v2_saves_populated_state_keeps_save_types_and_game_identity_scanable() {
         "SLUS-20312",
         "Read-only inspection",
         "Open PS1/PS2 Save Vault",
+        // The disabled Restore buttons are explained, not left to imply a feature.
+        "Restore is not available on this page",
     ] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
             "missing {expected}"
         );
+    }
+}
+
+#[test]
+fn gui_v2_sidebar_labels_are_unique_and_routes_are_unchanged() {
+    let mut labels = std::collections::HashSet::new();
+    for section in routes::SECTIONS {
+        assert!(
+            labels.insert(section.sidebar_title()),
+            "duplicate sidebar label: {}",
+            section.sidebar_title()
+        );
+    }
+    // Same destinations as before: only the family overview labels differ.
+    assert_eq!(Section::Saves.sidebar_title(), "Saves & States");
+    assert_eq!(
+        Section::SavesStates.sidebar_title(),
+        "Saves & States overview"
+    );
+    assert_eq!(Section::Build.sidebar_title(), "Organisation");
+    assert_eq!(
+        Section::OrganisationFamily.sidebar_title(),
+        "Organisation overview"
+    );
+    assert_eq!(Section::Problems.sidebar_title(), "Problems & Repair");
+    assert_eq!(
+        Section::ProblemsRepair.sidebar_title(),
+        "Problems & Repair overview"
+    );
+    assert_eq!(Section::OrganisationFamily.title(), "Organisation");
+}
+
+#[test]
+fn gui_v2_sidebar_shows_the_distinct_labels() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    // Tall enough that the whole sidebar list is laid out.
+    frame(&context, &mut app, [1280.0, 4000.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+    for label in [
+        "Saves & States overview",
+        "Organisation overview",
+        "Problems & Repair overview",
+    ] {
+        assert_eq!(
+            strings.iter().filter(|value| *value == label).count(),
+            1,
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn gui_v2_sources_do_not_use_the_retired_wizzy_name() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui_v2");
+    let mut stack = vec![dir];
+    while let Some(path) = stack.pop() {
+        for entry in fs::read_dir(&path).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            // The guidance tests quote the retired name as a banned word.
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !matches!(path.file_name().and_then(|n| n.to_str()), Some("tests.rs"))
+            {
+                let source = fs::read_to_string(&path).unwrap();
+                if path.ends_with("guidance/tests.rs") {
+                    continue;
+                }
+                assert!(
+                    !source.to_lowercase().contains("wizzy"),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
     }
 }
 
@@ -4813,11 +4891,11 @@ fn sidebar_shows_each_group_heading_once_before_its_entries() {
     // Every family entry still appears, after the single heading.
     let heading = strings.iter().position(|v| v == "FAMILIES").unwrap();
     for family in [
-        "DATs & Verification",
-        "Cheats & Mods",
-        "Saves & States",
-        "Emulators",
-        "MAME",
+        "DATs & Verification overview",
+        "Cheats & Mods overview",
+        "Saves & States overview",
+        "Emulators overview",
+        "MAME overview",
     ] {
         assert!(
             strings.iter().skip(heading).any(|v| v == family),
@@ -4827,7 +4905,7 @@ fn sidebar_shows_each_group_heading_once_before_its_entries() {
     // Every section is still reachable from the sidebar exactly once.
     for section in super::routes::SECTIONS.iter().copied() {
         assert!(
-            strings.iter().any(|v| v == section.title()),
+            strings.iter().any(|v| v == section.sidebar_title()),
             "{section:?} missing"
         );
     }

@@ -512,11 +512,13 @@ fn record_card(
         } else if matches!(record.portability_class, PortabilityClass::VersionBound | PortabilityClass::EmulatorBound) {
             ui.label("Check the emulator, version and profile before considering restore.");
         }
+        // This list only shows where saves are; the buttons are never enabled here.
+        ui.weak("Restore is not available on this page. It only shows where your saves are and never changes them.");
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled(false, egui::Button::new("Preview Restore"))
-                .on_hover_text("Restore preview is not wired into this read-only inventory projection yet.");
+                .on_hover_text("Not available here: this page is a read-only list of saves.");
             ui.add_enabled(false, egui::Button::new("Restore"))
-                .on_hover_text("Restore is not available from this read-only inventory projection; no safety bypass is offered.");
+                .on_hover_text("Not available here: this page is a read-only list of saves. Nothing is restored or changed.");
         });
         ui.collapsing("Advanced details", |ui| {
             ui.label(format!("Path: {}", record.path.display()));
