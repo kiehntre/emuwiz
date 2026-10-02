@@ -396,6 +396,7 @@ impl App {
             ),
             egui::StrokeKind::Inside,
         );
+        theme::paint_focus_ring(ui, &response, rect, 16.0);
         let mut x = rect.left() + 12.0;
         if let Some(platform) = icon_for {
             let icon_rect = egui::Rect::from_min_size(
@@ -521,7 +522,8 @@ impl App {
         ui.add_space(theme::SPACE_XS);
     }
 
-    fn card_background(ui: &egui::Ui, rect: egui::Rect, selected: bool, hovered: bool) {
+    fn card_background(ui: &egui::Ui, rect: egui::Rect, selected: bool, response: &egui::Response) {
+        let hovered = response.hovered();
         let fill = if selected || hovered {
             theme::RAISED_SURFACE
         } else {
@@ -537,6 +539,7 @@ impl App {
         };
         ui.painter()
             .rect_stroke(rect, 10.0, stroke, egui::StrokeKind::Inside);
+        theme::paint_focus_ring(ui, response, rect, 10.0);
     }
 
     fn note_cover_problem(&self, game: &Game, note: &mut Option<String>) {
@@ -564,7 +567,7 @@ impl App {
             if !ui.is_rect_visible(rect) {
                 return;
             }
-            Self::card_background(ui, rect, selected, response.hovered());
+            Self::card_background(ui, rect, selected, &response);
             let inner = rect.shrink(CARD_PAD);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()
@@ -609,7 +612,7 @@ impl App {
             if !ui.is_rect_visible(rect) {
                 return;
             }
-            Self::card_background(ui, rect, selected, response.hovered());
+            Self::card_background(ui, rect, selected, &response);
             let inner = rect.shrink(CARD_PAD);
             let mut child = ui.new_child(
                 egui::UiBuilder::new()

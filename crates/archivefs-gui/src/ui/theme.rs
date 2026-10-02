@@ -158,3 +158,21 @@ mod tests {
         );
     }
 }
+
+/// Keyboard-focus ring for custom-painted cards and chips (egui draws one
+/// only for its own widgets). Mouse appearance is untouched.
+pub(crate) fn paint_focus_ring(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    rect: egui::Rect,
+    radius: f32,
+) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(2.5_f32, TEAL),
+            egui::StrokeKind::Inside,
+        );
+    }
+}

@@ -64,6 +64,7 @@ fn fixture(context: &egui::Context) -> App {
         notice: None,
         handoff_status: None,
         confirm_scan: false,
+        text_was_focused: false,
         screenshots: false,
         check_platform: None,
         verification: None,
@@ -5712,4 +5713,265 @@ fn gui_v2_setup_portability_is_visible_in_settings() {
             "missing setup portability content: {expected}"
         );
     }
+}
+
+fn key_event(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
+fn frame_with(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            events,
+            ..Default::default()
+        },
+        |context| app.show(context),
+    )
+}
+
+fn text_pos(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn find(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == needle => Some(text.pos),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, needle)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|clipped| find(&clipped.shape, needle))
+}
+
+fn open_jump_to(context: &egui::Context, app: &mut App, size: [f32; 2]) {
+    let output = frame(context, app, size);
+    let at = text_pos(&output, "Jump to…").expect("Jump to… button") + egui::vec2(8.0, 8.0);
+    for pressed in [true, false] {
+        frame_with(
+            context,
+            app,
+            size,
+            vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+    }
+    for _ in 0..3 {
+        frame(context, app, size);
+    }
+}
+
+#[test]
+fn escape_policy_prefers_modal_then_popup_then_text_then_back() {
+    use super::pages::{EscapeAction::*, escape_action};
+    assert_eq!(escape_action(true, true, true, true), CloseModal);
+    assert_eq!(escape_action(false, true, true, true), PopupHandles);
+    assert_eq!(escape_action(false, false, true, true), KeepDialogOpen);
+    assert_eq!(escape_action(false, false, false, true), LeaveFocus);
+    assert_eq!(escape_action(false, false, false, false), Back);
+}
+
+#[test]
+fn gui_v2_escape_on_an_ordinary_page_goes_back() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Games));
+    app.go(Route::Section(Section::Problems));
+    frame(&context, &mut app, [1024.0, 700.0]);
+    frame_with(
+        &context,
+        &mut app,
+        [1024.0, 700.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Games));
+}
+
+#[test]
+fn gui_v2_escape_in_a_focused_search_box_stays_on_the_page() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Home));
+    app.go(Route::Section(Section::Games));
+    frame(&context, &mut app, [1280.0, 820.0]);
+    for _ in 0..200 {
+        if context.text_edit_focused() {
+            break;
+        }
+        frame_with(
+            &context,
+            &mut app,
+            [1280.0, 820.0],
+            vec![key_event(egui::Key::Tab)],
+        );
+    }
+    assert!(
+        context.text_edit_focused(),
+        "Tab never reached a text field"
+    );
+    frame_with(
+        &context,
+        &mut app,
+        [1280.0, 820.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Games));
+    frame(&context, &mut app, [1280.0, 820.0]);
+    assert!(
+        !context.text_edit_focused(),
+        "Escape should release the field"
+    );
+    assert!(!app.text_was_focused);
+    // With nothing left to consume it, the next Escape is an ordinary Back.
+    frame_with(
+        &context,
+        &mut app,
+        [1280.0, 820.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Home));
+}
+
+#[test]
+fn gui_v2_escape_closes_jump_to_without_going_back() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Games));
+    app.go(Route::Section(Section::Problems));
+    open_jump_to(&context, &mut app, [1280.0, 820.0]);
+    assert!(egui::Popup::is_any_open(&context), "Jump to… did not open");
+    frame_with(
+        &context,
+        &mut app,
+        [1280.0, 820.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    frame(&context, &mut app, [1280.0, 820.0]);
+    assert!(!egui::Popup::is_any_open(&context));
+    assert_eq!(app.router.current, Route::Section(Section::Problems));
+    frame_with(
+        &context,
+        &mut app,
+        [1280.0, 820.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Games));
+}
+
+#[test]
+fn gui_v2_escape_closes_a_confirmation_without_navigating_underneath() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Games));
+    app.go(Route::Section(Section::Sources));
+    app.confirm_scan = true;
+    frame_with(
+        &context,
+        &mut app,
+        [1024.0, 700.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert!(!app.confirm_scan);
+    assert_eq!(app.router.current, Route::Section(Section::Sources));
+    frame_with(
+        &context,
+        &mut app,
+        [1024.0, 700.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Games));
+}
+
+#[test]
+fn gui_v2_jump_to_stays_inside_small_windows() {
+    for size in [
+        [1280.0, 820.0],
+        [1024.0, 768.0],
+        [800.0, 560.0],
+        [620.0, 480.0],
+    ] {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        open_jump_to(&context, &mut app, size);
+        let output = frame(&context, &mut app, size);
+        let clipped = output
+            .shapes
+            .iter()
+            .filter(|clipped| {
+                fn has(shape: &egui::Shape) -> bool {
+                    match shape {
+                        egui::Shape::Text(text) => text.galley.text() == "Cheats & Mods",
+                        egui::Shape::Vec(shapes) => shapes.iter().any(has),
+                        _ => false,
+                    }
+                }
+                has(&clipped.shape)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !clipped.is_empty(),
+            "popup list missing at {size:?}: {:?}",
+            text(&output).iter().rev().take(20).collect::<Vec<_>>()
+        );
+        for shape in clipped {
+            assert!(
+                shape.clip_rect.max.y <= size[1],
+                "popup clipped at {size:?}"
+            );
+            assert!(
+                shape.clip_rect.max.x <= size[0],
+                "popup clipped sideways at {size:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gui_v2_escape_does_not_navigate_under_a_dialog_it_does_not_own() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Games));
+    app.go(Route::Section(Section::Sources));
+    let show = |context: &egui::Context, app: &mut App, events: Vec<egui::Event>| {
+        context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |context| {
+                app.show(context);
+                egui::Window::new("Remove this source from EmuWiz?").show(context, |ui| {
+                    ui.label("classic dialog");
+                });
+            },
+        )
+    };
+    show(&context, &mut app, vec![]);
+    show(&context, &mut app, vec![key_event(egui::Key::Escape)]);
+    assert_eq!(app.router.current, Route::Section(Section::Sources));
 }

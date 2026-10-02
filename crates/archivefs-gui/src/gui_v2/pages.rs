@@ -296,10 +296,43 @@ impl App {
         }
     }
     pub(super) fn show(&mut self, context: &egui::Context) {
-        if context.input(|input| {
-            input.key_pressed(egui::Key::Escape)
-                || (input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft))
-        }) {
+        let modal_open = self.confirm_scan || self.repair_confirm || self.undo_confirm.is_some();
+        let (escape, alt_back) = context.input(|input| {
+            (
+                input.key_pressed(egui::Key::Escape),
+                input.modifiers.alt && input.key_pressed(egui::Key::ArrowLeft),
+            )
+        });
+        if escape {
+            // Any other open dialog (the classic Sources dialogs are hosted here too)
+            // is not ours to cancel, but Back must not run underneath it.
+            let other_window_open = context.memory(|memory| {
+                memory
+                    .areas()
+                    .visible_layer_ids()
+                    .iter()
+                    .any(|layer| layer.order == egui::Order::Middle)
+            });
+            match escape_action(
+                modal_open,
+                egui::Popup::is_any_open(context),
+                other_window_open,
+                self.text_was_focused,
+            ) {
+                EscapeAction::CloseModal => {
+                    // Every v2 confirmation is a preview-only step, so closing is always safe.
+                    self.confirm_scan = false;
+                    self.repair_confirm = false;
+                    self.undo_confirm = None;
+                }
+                // egui has already released the field's focus on this key press.
+                EscapeAction::LeaveFocus => {}
+                // egui closes an open popup on this same key press.
+                EscapeAction::PopupHandles => {}
+                EscapeAction::KeepDialogOpen => {}
+                EscapeAction::Back => self.back(),
+            }
+        } else if alt_back && !modal_open {
             self.back();
         }
         if context.input(|input| input.modifiers.alt && input.key_pressed(egui::Key::Home)) {
@@ -566,6 +599,7 @@ impl App {
                 if ui.button("Cancel — keep browsing").clicked() { self.confirm_scan = false; }
             });
         }
+        self.text_was_focused = context.text_edit_focused();
     }
 
     fn guidance_context(&self, route: &Route) -> Option<super::guidance::GuidanceContext> {
@@ -695,28 +729,36 @@ impl App {
                     });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Keep the popup inside the window; the list scrolls when it cannot fit.
+                    let popup_height = (ui.ctx().content_rect().height() - 90.0).max(120.0);
                     ui.menu_button("Jump to…", |ui| {
+                        // egui caps a menu at about half the window; lift that cap, then scroll if needed.
+                        ui.set_max_height(popup_height);
                         ui.label("Feature families");
                         ui.separator();
-                        for family in [
-                            FeatureFamily::DatsVerification,
-                            FeatureFamily::CheatsMods,
-                            FeatureFamily::SavesStates,
-                            FeatureFamily::Emulators,
-                            FeatureFamily::Mame,
-                            FeatureFamily::ArtworkExtras,
-                            FeatureFamily::Conversion,
-                            FeatureFamily::Organisation,
-                            FeatureFamily::ProblemsRepair,
-                            FeatureFamily::SourcesProviders,
-                            FeatureFamily::HistoryUndo,
-                            FeatureFamily::AdvancedDiagnostics,
-                        ] {
-                            if ui.button(family.label()).clicked() {
-                                self.go(family_home(family));
-                                ui.close();
-                            }
-                        }
+                        egui::ScrollArea::vertical()
+                            .max_height(popup_height)
+                            .show(ui, |ui| {
+                                for family in [
+                                    FeatureFamily::DatsVerification,
+                                    FeatureFamily::CheatsMods,
+                                    FeatureFamily::SavesStates,
+                                    FeatureFamily::Emulators,
+                                    FeatureFamily::Mame,
+                                    FeatureFamily::ArtworkExtras,
+                                    FeatureFamily::Conversion,
+                                    FeatureFamily::Organisation,
+                                    FeatureFamily::ProblemsRepair,
+                                    FeatureFamily::SourcesProviders,
+                                    FeatureFamily::HistoryUndo,
+                                    FeatureFamily::AdvancedDiagnostics,
+                                ] {
+                                    if ui.button(family.label()).clicked() {
+                                        self.go(family_home(family));
+                                        ui.close();
+                                    }
+                                }
+                            });
                     });
                 });
             });
@@ -3239,5 +3281,35 @@ mod disambiguation_tests {
         assert_eq!(first.as_deref(), Some("Source: games/roms"));
         assert_eq!(second.as_deref(), Some("Source: usbdrive/games"));
         assert_ne!(first, second);
+    }
+}
+
+/// What one Escape press means, most specific first: an open confirmation,
+/// then an open menu, then a focused text field, and only then Back.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum EscapeAction {
+    CloseModal,
+    PopupHandles,
+    KeepDialogOpen,
+    LeaveFocus,
+    Back,
+}
+
+pub(super) fn escape_action(
+    modal_open: bool,
+    popup_open: bool,
+    other_window_open: bool,
+    typing: bool,
+) -> EscapeAction {
+    if modal_open {
+        EscapeAction::CloseModal
+    } else if popup_open {
+        EscapeAction::PopupHandles
+    } else if other_window_open {
+        EscapeAction::KeepDialogOpen
+    } else if typing {
+        EscapeAction::LeaveFocus
+    } else {
+        EscapeAction::Back
     }
 }

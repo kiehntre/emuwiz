@@ -149,7 +149,7 @@ impl App {
                         format!("{platform}, {count} games"),
                     )
                 });
-                let hovered = response.hovered() || response.has_focus();
+                let hovered = response.hovered();
                 ui.painter().rect_filled(rect, 10.0, theme::CARD_SURFACE);
                 ui.painter().rect_stroke(
                     rect,
@@ -161,6 +161,7 @@ impl App {
                     },
                     egui::StrokeKind::Inside,
                 );
+                theme::paint_focus_ring(ui, &response, rect, 10.0);
                 let plate = egui::Rect::from_min_size(
                     rect.min + egui::vec2(6.0, 6.0),
                     egui::vec2(rect.width() - 12.0, 96.0),

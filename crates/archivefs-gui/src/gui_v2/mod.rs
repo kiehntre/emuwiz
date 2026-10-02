@@ -255,6 +255,8 @@ pub(super) struct App {
     /// navigation or dismissal.
     handoff_status: Option<String>,
     confirm_scan: bool,
+    /// egui drops focus on Escape before `show` runs, so remember last frame's.
+    text_was_focused: bool,
     screenshots: bool,
     check_platform: Option<String>,
     verification: Option<VerificationResult>,
@@ -334,6 +336,7 @@ impl App {
             notice: None,
             handoff_status: None,
             confirm_scan: false,
+            text_was_focused: false,
             screenshots: false,
             check_platform: None,
             verification: None,
