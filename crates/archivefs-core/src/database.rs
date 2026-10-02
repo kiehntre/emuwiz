@@ -9775,7 +9775,7 @@ mod tests {
         upgraded.close().unwrap();
 
         let reopened = Database::open_read_only(&database_path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 23);
+        assert_eq!(reopened.schema_version().unwrap(), 24);
         reopened.close().unwrap();
         let _ = fs::remove_dir_all(root);
     }
