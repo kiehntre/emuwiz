@@ -1478,7 +1478,7 @@ fn a_non_utf8_path_is_flagged_lossy_rather_than_silently_mangled() {
 /// (the string scan below, over Doctor's own source files only).
 #[test]
 fn stage_1a_introduces_no_database_migration() {
-    const EXPECTED: [&str; 23] = [
+    const EXPECTED: [&str; 24] = [
         include_str!("../migrations/0001_initial.sql"),
         include_str!("../migrations/0002_platform_aliases.sql"),
         include_str!("../migrations/0003_source_folder_scan_status.sql"),
@@ -1502,6 +1502,7 @@ fn stage_1a_introduces_no_database_migration() {
         include_str!("../migrations/0021_mame_member_evidence.sql"),
         include_str!("../migrations/0022_scan_source_coverage.sql"),
         include_str!("../migrations/0023_catalogue_safety_bindings.sql"),
+        include_str!("../migrations/0024_source_enablement.sql"),
     ];
     assert_eq!(
         crate::latest_schema_version(),

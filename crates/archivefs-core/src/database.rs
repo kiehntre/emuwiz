@@ -9729,7 +9729,7 @@ mod tests {
         );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 23);
+        assert_eq!(upgraded.schema_version().unwrap(), 24);
         let source = upgraded.list_source_folders().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].role, SourceRole::Games);
@@ -9756,8 +9756,8 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 20);
-        assert_eq!(report.to_version, 23);
-        assert_eq!(report.applied_versions, vec![21, 22, 23]);
+        assert_eq!(report.to_version, 24);
+        assert_eq!(report.applied_versions, vec![21, 22, 23, 24]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
         assert_eq!(upgraded.schema_version().unwrap(), 23);
@@ -10632,6 +10632,7 @@ mod tests {
                 "scan_source_coverage",
                 "schema_migrations",
                 "screenscraper_enrichments",
+                "source_enablement",
                 "source_folders",
                 "source_nested_boundaries",
                 "source_review_required",
@@ -19053,7 +19054,7 @@ mod tests {
 
         #[test]
         fn migrations_0011_and_0012_are_registered() {
-            assert_eq!(latest_known_version(MIGRATIONS), 23);
+            assert_eq!(latest_known_version(MIGRATIONS), 24);
             assert!(MIGRATIONS.iter().any(|migration| {
                 migration.version == 11
                     && migration.sql.contains("CREATE TABLE dat_expected_entries")

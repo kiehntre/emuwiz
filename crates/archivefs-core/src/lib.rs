@@ -3441,7 +3441,6 @@ pub fn assign_source_platform_at(
             target.display()
         )));
     }
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
     register_configured_sources(&mut database, &sources)?;
     database.set_source_platform_assignment(target, Some(canonical))?;
@@ -3507,7 +3506,6 @@ pub fn add_source_folder_at(
         config.master_rom_root.as_deref(),
     )?;
 
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
     register_configured_sources(&mut database, &sources)?;
 
@@ -3581,7 +3579,6 @@ pub fn set_source_folder_enabled_at(
         config.master_rom_root.as_deref(),
     )?;
 
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
     let registered = register_configured_sources(&mut database, &sources)?;
 
@@ -3760,7 +3757,6 @@ pub fn scan_source_folder_at(
         )));
     }
 
-    let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
     let registered = register_configured_sources(&mut database, &sources)?;
     let folder = registered
