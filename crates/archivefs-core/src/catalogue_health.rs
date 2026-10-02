@@ -6,6 +6,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 mod path_probe;
+pub use crate::database::forget_missing::{
+    FORGET_PLAN_STALE, ForgetEvidence, ForgetMissingCounts, ForgetMissingEntry, ForgetMissingPlan,
+    ForgetMissingResult, MissingClassification, RelatedRows,
+};
 pub(crate) use path_probe::{BoundRoot, NestedState, directory_mount};
 
 use serde::{Deserialize, Serialize};

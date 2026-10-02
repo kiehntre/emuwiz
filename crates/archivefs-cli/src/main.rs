@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
 
+use archivefs_core::catalogue_health::{FORGET_PLAN_STALE, MissingClassification};
 use archivefs_core::diagnostics::environment::{
     FreeSpacePolicy, assess_storage, mount_table, storage_resources,
 };
@@ -1340,6 +1341,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 print!("{}", format_missing_removal(&result));
+            }
+        }
+        "library-forget-missing" => {
+            let mut input_args: Vec<String> = args.collect();
+            let json = extract_flag(&mut input_args, "--json");
+            let forget = extract_flag(&mut input_args, "--forget-confirmed");
+            let token = extract_named_string_flag(&mut input_args, "--plan")?;
+            let undo = extract_named_string_flag(&mut input_args, "--undo")?;
+            if !input_args.is_empty() {
+                return Err("library-forget-missing accepts only --json, --forget-confirmed --plan <token>, or --undo <receipt>".into());
+            }
+            let database_path = default_database_path()?;
+            if let Some(receipt) = undo {
+                let restored = run_library_forget_undo(&database_path, Path::new(&receipt))?;
+                println!(
+                    "EmuWiz Library Forget Missing\nRestored: {restored} catalogue entr{}.",
+                    if restored == 1 { "y" } else { "ies" }
+                );
+            } else {
+                let roots: Vec<PathBuf> = load_source_folder_configs_default()?
+                    .into_iter()
+                    .map(|s| s.path)
+                    .collect();
+                let output = run_library_forget_missing(
+                    &database_path,
+                    &roots,
+                    forget,
+                    token.as_deref(),
+                    json,
+                )?;
+                print!("{output}");
             }
         }
         "platform-alias-list" => {
@@ -4597,6 +4629,92 @@ fn run_library_remove_missing(
     Ok(database.remove_missing_archives(&target_ids)?)
 }
 
+/// `library-forget-missing`: read-only preview by default. With `forget` it
+/// re-previews and applies only if the fresh plan matches the reviewed `token`.
+/// Catalogue rows only; never accesses an archive file.
+fn run_library_forget_missing(
+    database_path: &Path,
+    roots: &[PathBuf],
+    forget: bool,
+    token: Option<&str>,
+    json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !database_path.exists() {
+        return Err(format!(
+            "No library database found at {}. Run: emuwiz-cli library-scan",
+            database_path.display()
+        )
+        .into());
+    }
+    if forget {
+        let token = token.ok_or("--forget-confirmed requires --plan <token> from a preview")?;
+        let mut database = Database::open_or_create(database_path)?;
+        let plan = database.preview_forget_confirmed_missing(roots)?;
+        if plan.token() != token {
+            return Err(format!("{FORGET_PLAN_STALE}: the library changed since the preview; preview again; nothing was removed").into());
+        }
+        let result = database.apply_forget_confirmed_missing(&plan)?;
+        return Ok(match &result.receipt_path {
+            Some(receipt) => format!(
+                "EmuWiz Library Forget Missing\nForgotten: {} catalogue entr{}.\nNo archive files were deleted.\nUndo receipt: {}\n",
+                result.forgotten,
+                if result.forgotten == 1 { "y" } else { "ies" },
+                receipt.display()
+            ),
+            None => "EmuWiz Library Forget Missing\nNothing to forget.\n".to_string(),
+        });
+    }
+    if token.is_some() {
+        return Err("--plan only applies together with --forget-confirmed".into());
+    }
+    let database = Database::open_catalogue_health_read_only(database_path)?;
+    let plan = database.preview_forget_confirmed_missing(roots)?;
+    if json {
+        return Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "counts": plan.counts,
+            "plan": plan.token(),
+            "entries": plan.entries,
+        }))? + "\n");
+    }
+    let c = &plan.counts;
+    let mut out = format!(
+        "EmuWiz Library Missing Entries (preview, nothing changed)\n{} confirmed missing (eligible)\n{} possibly moved\n{} source unavailable\n{} scan incomplete\n{} review required\n",
+        c.confirmed_missing,
+        c.possibly_moved,
+        c.source_unavailable,
+        c.scan_incomplete,
+        c.review_required
+    );
+    for e in plan
+        .entries
+        .iter()
+        .filter(|e| e.classification == MissingClassification::ConfirmedMissing)
+    {
+        out.push_str(&format!(
+            "  [{}] {} - {}\n",
+            e.archive_id,
+            e.absolute_path.display(),
+            e.reason
+        ));
+    }
+    if c.confirmed_missing > 0 {
+        out.push_str(&format!(
+            "To forget the {} confirmed entries (files are never deleted):\n  emuwiz-cli library-forget-missing --forget-confirmed --plan {}\n",
+            c.confirmed_missing,
+            plan.token()
+        ));
+    }
+    Ok(out)
+}
+
+fn run_library_forget_undo(
+    database_path: &Path,
+    receipt: &Path,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut database = Database::open_or_create(database_path)?;
+    Ok(database.undo_forget_missing(receipt)?)
+}
+
 fn format_missing_removal(result: &MissingArchiveRemovalResult) -> String {
     format!(
         "EmuWiz Library Remove Missing\nRemoved: {} missing catalogue entr{}.\nNo archive files or mounted contents were deleted.\n",
@@ -5791,6 +5909,9 @@ fn print_help() {
     );
     println!(
         "  library-remove-missing Remove missing catalogue entries by exact id/path (never deletes files)"
+    );
+    println!(
+        "  library-forget-missing Preview (default) or forget confirmed-missing catalogue entries (never deletes files)"
     );
     println!("  platform-alias-list    List persistent custom folder-name platform aliases");
     println!(
@@ -7196,6 +7317,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn forget_missing_defaults_to_read_only_and_apply_needs_the_reviewed_plan() {
+        let root = temp_dir("cli-forget-missing");
+        let database_path = root.join("library.sqlite3");
+        Database::open_or_create(&database_path).unwrap();
+        let before = std::fs::read(&database_path).unwrap();
+        let out = run_library_forget_missing(&database_path, &[], false, None, false).unwrap();
+        assert!(out.contains("nothing changed"), "{out}");
+        assert_eq!(std::fs::read(&database_path).unwrap(), before);
+        assert!(run_library_forget_missing(&database_path, &[], true, None, false).is_err());
+        let err = run_library_forget_missing(&database_path, &[], true, Some("bogus"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("STALE PLAN"), "{err}");
+        assert!(run_library_forget_missing(&database_path, &[], false, Some("x"), false).is_err());
     }
 
     fn write_archive_file(dir: &Path, relative_path: &str, content: &[u8]) -> PathBuf {
