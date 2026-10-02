@@ -3353,8 +3353,7 @@ pub fn set_source_role_at(
         )));
     }
     let mut database = Database::open_or_create(database_path)?;
-    let paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
-    database.register_source_folders(&paths)?;
+    register_configured_sources(&mut database, &sources)?;
     database.set_source_role(target, role)
 }
 
@@ -3444,7 +3443,7 @@ pub fn assign_source_platform_at(
     }
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    database.register_source_folders(&all_paths)?;
+    register_configured_sources(&mut database, &sources)?;
     database.set_source_platform_assignment(target, Some(canonical))?;
     drop(database);
     scan_source_folder_at(config_path, database_path, target, triggered_by)
@@ -3510,7 +3509,7 @@ pub fn add_source_folder_at(
 
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    database.register_source_folders(&all_paths)?;
+    register_configured_sources(&mut database, &sources)?;
 
     Ok(new_source)
 }
@@ -3584,7 +3583,7 @@ pub fn set_source_folder_enabled_at(
 
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    let registered = database.register_source_folders(&all_paths)?;
+    let registered = register_configured_sources(&mut database, &sources)?;
 
     let scan = if enabled {
         let folder = registered
@@ -3711,6 +3710,22 @@ pub fn remove_source_folder_at(
     })
 }
 
+/// Registers the configured sources and records their enabled state in the same
+/// step, so the database's Missing authority never relies on config it cannot read.
+fn register_configured_sources(
+    database: &mut Database,
+    sources: &[SourceFolderConfig],
+) -> Result<Vec<RegisteredSourceFolder>> {
+    let paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
+    let registered = database.register_source_folders(&paths)?;
+    let states: Vec<(PathBuf, bool)> = sources
+        .iter()
+        .map(|source| (source.path.clone(), source.enabled))
+        .collect();
+    database.sync_source_enablement(&states)?;
+    Ok(registered)
+}
+
 /// Scans exactly one configured source folder, enabled or disabled - an
 /// explicit, targeted action, so unlike [`scan_all_enabled_sources_at`]
 /// this does not check `enabled` at all (a user directly clicking "Scan"
@@ -3747,7 +3762,7 @@ pub fn scan_source_folder_at(
 
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     let mut database = Database::open_or_create(database_path)?;
-    let registered = database.register_source_folders(&all_paths)?;
+    let registered = register_configured_sources(&mut database, &sources)?;
     let folder = registered
         .into_iter()
         .find(|folder| folder.path == target)
@@ -3787,7 +3802,7 @@ pub fn scan_all_enabled_sources_at(
     let all_paths: Vec<PathBuf> = sources.iter().map(|source| source.path.clone()).collect();
     validate_configured_source_roots(&all_paths)?;
     let mut database = Database::open_or_create(database_path)?;
-    let registered = database.register_source_folders(&all_paths)?;
+    let registered = register_configured_sources(&mut database, &sources)?;
 
     let enabled_paths: HashSet<&PathBuf> = sources
         .iter()
@@ -14902,6 +14917,56 @@ mod tests {
             disabled_view.last_archive_count,
             Some(1),
             "disabling must preserve the last known archive count, not reset it"
+        );
+    }
+
+    #[test]
+    fn disabling_through_the_api_removes_missing_authority_until_a_fresh_scan() {
+        let root = test_root("disable_source_missing_authority");
+        let config_path = root.join("config.toml");
+        let database_path = root.join("library.sqlite3");
+        write_starter_config(&config_path, &root.join("mounts"));
+        let source = root.join("source-a");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("a.zip"), b"a").unwrap();
+        fs::write(source.join("b.zip"), b"b").unwrap();
+        add_source_folder_at(&config_path, &database_path, &source).unwrap();
+        scan_all_enabled_sources_at(&config_path, &database_path, "test").unwrap();
+        let enabled_flag = || -> Option<i64> {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .query_row("SELECT enabled FROM source_enablement", [], |r| r.get(0))
+                .ok()
+        };
+        let missing_rows = || -> i64 {
+            rusqlite::Connection::open(&database_path)
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM archives WHERE last_verified_missing_at IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        set_source_folder_enabled_at(&config_path, &database_path, &source, false).unwrap();
+        assert_eq!(enabled_flag(), Some(0));
+        fs::remove_file(source.join("a.zip")).unwrap();
+        // An explicit scan of a disabled source must never write Missing.
+        let _ = scan_source_folder_at(&config_path, &database_path, &source, "test");
+        assert_eq!(
+            missing_rows(),
+            0,
+            "a disabled source must not gain Missing evidence"
+        );
+
+        // Re-enabling scans straight away, which is the fresh authority.
+        set_source_folder_enabled_at(&config_path, &database_path, &source, true).unwrap();
+        assert_eq!(enabled_flag(), Some(1));
+        assert_eq!(
+            missing_rows(),
+            1,
+            "the fresh scan after re-enable reconciles the deletion"
         );
     }
 

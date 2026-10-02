@@ -235,6 +235,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "catalogue_safety_bindings",
         sql: include_str!("migrations/0023_catalogue_safety_bindings.sql"),
     },
+    Migration {
+        version: 24,
+        description: "record source enablement for Missing authority",
+        sql: include_str!("migrations/0024_source_enablement.sql"),
+    },
 ];
 
 fn latest_known_version(migrations: &[Migration]) -> i64 {
@@ -9717,8 +9722,11 @@ mod tests {
 
         let report = upgrade_library_database(&database_path).unwrap();
         assert_eq!(report.from_version, 16);
-        assert_eq!(report.to_version, 23);
-        assert_eq!(report.applied_versions, vec![17, 18, 19, 20, 21, 22, 23]);
+        assert_eq!(report.to_version, 24);
+        assert_eq!(
+            report.applied_versions,
+            vec![17, 18, 19, 20, 21, 22, 23, 24]
+        );
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
         assert_eq!(upgraded.schema_version().unwrap(), 23);

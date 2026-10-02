@@ -570,6 +570,7 @@ fn downgrade_to_21(connection: &Connection) {
         .execute_batch(
             "DROP TABLE IF EXISTS source_review_required; DROP TABLE source_nested_boundaries; DROP TABLE source_scan_bindings; \
              DROP TABLE catalogue_health_epoch; DELETE FROM schema_migrations WHERE version=23; \
+             DROP TABLE IF EXISTS source_enablement; DELETE FROM schema_migrations WHERE version=24; \
              DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version=22; \
              PRAGMA user_version=21;",
         )
@@ -587,14 +588,14 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
     let history = everything_but_bindings(&Connection::open(&path).unwrap());
 
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 23);
+    assert_eq!(db.schema_version().unwrap(), 24);
     let sql = Connection::open(&path).unwrap();
     // Historical tables are preserved row for row; the new ones start empty.
     let after = everything_but_bindings(&sql);
     for (table, rows) in history.iter().filter(|(t, _)| *t != "schema_migrations") {
         assert_eq!(after.get(table), Some(rows), "table {table} changed");
     }
-    // The migration ledger only gains exactly versions 22 and 23.
+    // The migration ledger only gains exactly versions 22, 23 and 24.
     let versions = |connection: &Connection| -> Vec<i64> {
         connection
             .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -604,7 +605,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
             .collect::<Result<_, _>>()
             .unwrap()
     };
-    assert_eq!(versions(&sql), (1..=23).collect::<Vec<_>>());
+    assert_eq!(versions(&sql), (1..=24).collect::<Vec<_>>());
     assert_eq!(binding_rows(&sql), 0, "migration must not bind any source");
     assert_eq!(
         sql.query_row("SELECT COUNT(*) FROM source_nested_boundaries", [], |r| r
@@ -658,7 +659,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
     drop(db);
     let reopened = everything_but_bindings(&Connection::open(&path).unwrap());
     let db = Database::open_or_create(&path).unwrap();
-    assert_eq!(db.schema_version().unwrap(), 23);
+    assert_eq!(db.schema_version().unwrap(), 24);
     assert_eq!(
         everything_but_bindings(&Connection::open(&path).unwrap()),
         reopened
@@ -1192,6 +1193,160 @@ fn missing_write_rechecks_current_source_configuration_and_binding() {
         );
         assert_eq!(f.flag(id), None, "{label} wrote Missing evidence");
     }
+}
+
+// --- Disabled sources never gain Missing authority ----------------------------------
+
+fn set_enabled(f: &mut Fixture, index: usize, enabled: bool) {
+    let root = f.roots[index].clone();
+    f.db.sync_source_enablement(&[(root, enabled)]).unwrap();
+}
+
+#[test]
+fn enabled_source_with_current_authority_still_writes_missing() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    set_enabled(&mut f, 0, true);
+    let run = f.scan().scan_run_id;
+    fs::remove_file(path).unwrap();
+    let source = f.source_id(0);
+    assert_eq!(
+        f.db.mark_unseen_archives_missing(run, source, &[]).unwrap(),
+        1
+    );
+    assert!(f.flag(id).is_some());
+}
+
+#[test]
+fn disabled_source_cannot_write_missing() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let run = f.scan().scan_run_id;
+    set_enabled(&mut f, 0, false);
+    fs::remove_file(path).unwrap();
+    let source = f.source_id(0);
+    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert_eq!(f.flag(id), None);
+}
+
+#[test]
+fn enabled_complete_scan_then_disable_refuses_missing() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    set_enabled(&mut f, 0, true);
+    let run = f.scan().scan_run_id;
+    set_enabled(&mut f, 0, false);
+    fs::remove_file(path).unwrap();
+    let source = f.source_id(0);
+    assert!(f.db.mark_unseen_archives_missing(run, source, &[]).is_err());
+    assert_eq!(f.flag(id), None);
+}
+
+#[test]
+fn reenabling_needs_a_fresh_scan_before_missing_is_allowed_again() {
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let old = f.scan().scan_run_id;
+    set_enabled(&mut f, 0, false);
+    set_enabled(&mut f, 0, true);
+    fs::remove_file(&path).unwrap();
+    let source = f.source_id(0);
+    // The old complete attempt is still the latest actual attempt, but it began
+    // before the disable, so re-enabling must not revive its authority.
+    assert!(f.db.mark_unseen_archives_missing(old, source, &[]).is_err());
+    assert_eq!(f.flag(id), None);
+    // A new complete scan after re-enable is a fresh authority and is honoured by
+    // the ordinary scan path (the missing file is reconciled by that scan itself).
+    let fresh = f.scan().scan_run_id;
+    assert!(fresh > old);
+    assert!(
+        f.flag(id).is_some(),
+        "a fresh scan after re-enable writes Missing"
+    );
+}
+
+#[test]
+fn syncing_enablement_is_idempotent_and_ignores_unregistered_paths() {
+    let mut f = Fixture::new(&["games"]);
+    f.add(0, "game.zip");
+    f.scan();
+    set_enabled(&mut f, 0, false);
+    let first: i64 = f
+        .sql()
+        .query_row(
+            "SELECT barred_through_run FROM source_enablement",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    f.scan();
+    set_enabled(&mut f, 0, false); // already disabled: must not move the bar
+    let again: i64 = f
+        .sql()
+        .query_row(
+            "SELECT barred_through_run FROM source_enablement",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(first, again);
+    f.db.sync_source_enablement(&[(PathBuf::from("/not/registered"), false)])
+        .unwrap();
+    let rows: i64 = f
+        .sql()
+        .query_row("SELECT count(*) FROM source_enablement", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+#[ignore = "requires process-local LD_PRELOAD SQL fault shim; run alone"]
+fn source_disabled_during_missing_write_refuses() {
+    assert_eq!(std::env::var("EMUWIZ_INJECT_FAULTS").as_deref(), Ok("1"));
+    let mut f = Fixture::new(&["games"]);
+    let (id, path) = f.add(0, "game.zip");
+    let run = f.scan().scan_run_id;
+    let source = f.source_id(0);
+    fs::remove_file(&path).unwrap();
+    let statement = format!(
+        "INSERT INTO source_enablement(source_folder_id,enabled,barred_through_run) \
+         VALUES({source},0,(SELECT MAX(id) FROM scan_runs)) \
+         ON CONFLICT(source_folder_id) DO UPDATE SET enabled=0"
+    );
+    unsafe {
+        std::env::set_var("EMUWIZ_FAULT_PATH", &path);
+        std::env::set_var("EMUWIZ_FAULT_ROOT", &f.roots[0]);
+        std::env::set_var("EMUWIZ_FAULT_SQL_DATABASE", f.db.path());
+        std::env::set_var("EMUWIZ_FAULT_SQL_STATEMENT", &statement);
+    }
+    let result = f.db.mark_unseen_archives_missing(run, source, &[]);
+    for key in [
+        "EMUWIZ_FAULT_PATH",
+        "EMUWIZ_FAULT_ROOT",
+        "EMUWIZ_FAULT_SQL_DATABASE",
+        "EMUWIZ_FAULT_SQL_STATEMENT",
+    ] {
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+    assert!(
+        result.is_err(),
+        "disable during the Missing write did not refuse"
+    );
+    assert_eq!(
+        f.sql()
+            .query_row("SELECT enabled FROM source_enablement", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0,
+        "fault shim did not disable the source"
+    );
+    assert_eq!(
+        f.flag(id),
+        None,
+        "Missing was committed for a disabled source"
+    );
 }
 
 // --- Blocker 3: every rebind allocates a generation above all historical coverage --

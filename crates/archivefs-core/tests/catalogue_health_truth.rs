@@ -488,7 +488,7 @@ fn preceding_schema_preview_does_not_migrate_or_write() {
         sql.execute_batch(&format!("DROP TRIGGER {trigger}"))
             .unwrap();
     }
-    sql.execute_batch("DROP TABLE source_scan_bindings; DROP TABLE catalogue_health_epoch; DELETE FROM schema_migrations WHERE version=23; DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version=22; PRAGMA user_version=21;").unwrap();
+    sql.execute_batch("DROP TABLE source_scan_bindings; DROP TABLE catalogue_health_epoch; DELETE FROM schema_migrations WHERE version=23; DROP TABLE IF EXISTS source_enablement; DELETE FROM schema_migrations WHERE version=24; DROP TABLE scan_source_coverage; DELETE FROM schema_migrations WHERE version=22; PRAGMA user_version=21;").unwrap();
     let before = fs::read(f.db.path()).unwrap();
     let read_only = Database::open_catalogue_health_read_only(f.db.path()).unwrap();
     assert_eq!(

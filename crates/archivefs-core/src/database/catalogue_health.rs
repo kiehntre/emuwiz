@@ -194,6 +194,57 @@ impl Database {
         write_rebind(&self.connection, source, &None, &json)
     }
 
+    /// Records which registered sources are enabled so Missing authority can be
+    /// decided inside the database. Disabling bars every scan run that exists at
+    /// that moment from ever writing Missing; re-enabling lifts only the
+    /// "disabled" refusal, so the source needs a fresh scan to regain authority.
+    /// Idempotent: unchanged state writes nothing. Unregistered paths are ignored.
+    pub fn sync_source_enablement(&mut self, states: &[(PathBuf, bool)]) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| db_error("begin source enablement sync", e))?;
+        for (path, want_enabled) in states {
+            let id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM source_folders WHERE path=?1",
+                    [path.as_os_str().as_bytes()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| db_error("look up source for enablement", e))?;
+            let Some(id) = id else { continue };
+            let current: Option<bool> = tx
+                .query_row(
+                    "SELECT enabled FROM source_enablement WHERE source_folder_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| db_error("read source enablement", e))?;
+            if current.unwrap_or(true) == *want_enabled {
+                continue;
+            }
+            if *want_enabled {
+                tx.execute(
+                    "UPDATE source_enablement SET enabled=1 WHERE source_folder_id=?1",
+                    [id],
+                )
+            } else {
+                tx.execute(
+                    "INSERT INTO source_enablement(source_folder_id,enabled,barred_through_run) \
+                     VALUES(?1,0,(SELECT COALESCE(MAX(id),0) FROM scan_runs)) \
+                     ON CONFLICT(source_folder_id) DO UPDATE SET enabled=0, \
+                     barred_through_run=MAX(barred_through_run,excluded.barred_through_run)",
+                    [id],
+                )
+            }
+            .map_err(|e| db_error("write source enablement", e))?;
+        }
+        tx.commit()
+            .map_err(|e| db_error("commit source enablement", e))
+    }
+
     /// Compatibility name for reviewed callers. The opaque review is the
     /// authority; the implementation is exactly the canonical confirmation.
     pub fn rebind_source_after_review(&mut self, review: &SourceRebindReview) -> Result<()> {
@@ -880,6 +931,29 @@ pub(super) fn assert_missing_authority(
         return Err(ArchiveFsError::Database(
             "source configuration or storage binding changed; no missing evidence written".into(),
         ));
+    }
+    // Enablement is persisted so the write boundary can see it (config is not
+    // readable here). Absent row = enabled and nothing barred.
+    let enablement: Option<(bool, i64)> = connection
+        .query_row(
+            "SELECT enabled,barred_through_run FROM source_enablement WHERE source_folder_id=?1",
+            [source],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| db_error("read source enablement for missing authority", e))?;
+    if let Some((enabled, barred_through)) = enablement {
+        if !enabled {
+            return Err(ArchiveFsError::Database(
+                "source is disabled; no missing evidence written".into(),
+            ));
+        }
+        if scan_run_id <= barred_through {
+            return Err(ArchiveFsError::Database(
+                "source was disabled after this scan began; a fresh scan is required; no missing evidence written"
+                    .into(),
+            ));
+        }
     }
     match latest_actual_attempt(connection, source)? {
         Some((run, _, _)) if run != scan_run_id => Err(ArchiveFsError::Database(

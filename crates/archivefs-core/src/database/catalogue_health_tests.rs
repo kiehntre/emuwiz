@@ -403,7 +403,7 @@ fn migration_safety_bookkeeping_is_additive_idempotent_and_atomic() {
             connection
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            23
+            24
         );
         assert_eq!(
             connection

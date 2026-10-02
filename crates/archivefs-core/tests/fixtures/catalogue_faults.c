@@ -36,7 +36,7 @@ static void replace_at_probe_t(const char *path,const char *tag) {
         pid_t child=fork(); if(child<0)abort();
         if(child==0) {
             execlp("python3","python3","-c",
-                "import os,sqlite3; c=sqlite3.connect(os.environ['EMUWIZ_FAULT_SQL_DATABASE']); c.execute(\"UPDATE source_folders SET removed_from_config_at='changed-during-probe'\"); c.commit()",
+                "import os,sqlite3; c=sqlite3.connect(os.environ['EMUWIZ_FAULT_SQL_DATABASE']); c.execute(os.environ.get('EMUWIZ_FAULT_SQL_STATEMENT') or \"UPDATE source_folders SET removed_from_config_at='changed-during-probe'\"); c.commit()",
                 (char*)NULL);
             _exit(127);
         }
