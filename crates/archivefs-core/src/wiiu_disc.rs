@@ -19,7 +19,7 @@ const DISC_MAGIC: u32 = 0xcc54_9eb9;
 const CONTENTS_MAGIC: u32 = 0xcca6_e67b;
 const MAGIC1: u32 = 0x1099_d02e;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUPartitionEvidence {
     /// Region exists; absence of plaintext magic does not prove encryption.
     EncryptedOrOpaque,
@@ -28,12 +28,12 @@ pub enum WiiUPartitionEvidence {
         partitions: Vec<WiiUPartitionFact>,
     },
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUPartitionFact {
     pub volume_id: Option<String>,
     pub volume_offsets: Vec<u64>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUHeaderEvidence {
     /// Printable manufacturer WUP identifier, never a decrypted title ID.
     pub manufacturer_disc_id: Option<String>,
@@ -46,7 +46,7 @@ pub struct WiiUHeaderEvidence {
 }
 /// Bounded preview binding; the digest covers inspected header/table evidence,
 /// not the entire container. Apply separately captures full-file SHA-256.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUDiscEvidence {
     pub size_bytes: u64,
     pub modified: SystemTime,
@@ -81,14 +81,14 @@ impl WiiUDiscEvidence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUDiscFormat {
     Wud,
     Wux,
     Wua,
     Unknown,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUDiscKeyState {
     NotRequiredForContainerInspection,
     RequiredForDeeperInspection,
@@ -97,7 +97,7 @@ pub enum WiiUDiscKeyState {
     Invalid,
     Unknown,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUDiscReadiness {
     ReadyForContainerInspection,
     StructurallyComplete,
@@ -105,7 +105,7 @@ pub enum WiiUDiscReadiness {
     RequiresKeysForDeeperInspection,
     UnsupportedRepresentation,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUDiscIssue {
     EmptyInput,
     TruncatedHeader,
@@ -131,14 +131,14 @@ pub enum WiiUDiscIssue {
     Io(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUDiscPart {
     pub path: PathBuf,
     pub index: Option<u32>,
     pub size_bytes: u64,
     pub required: bool,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUDiscStructure {
     pub detected_format: WiiUDiscFormat,
     pub total_size_bytes: u64,
@@ -156,7 +156,7 @@ pub struct WiiUDiscStructure {
     pub flags: Option<u32>,
     pub parts: Vec<WiiUDiscPart>,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUDiscInspection {
     pub source: PathBuf,
     pub format: WiiUDiscFormat,

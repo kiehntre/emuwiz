@@ -1,8 +1,11 @@
-//! Generic, mutation-free conversion queue planning.
+//! Conversion queue planning and durable, serial execution.
 //!
 //! Converter-specific inspection, readiness and execution remain in their
 //! existing backends; this module owns only queue vocabulary and conservative
-//! space arithmetic.
+//! space arithmetic. [`durable`] adds persisted reviewed jobs and restart
+//! recovery while reusing converter execution and Repair publication journals.
+
+pub mod durable;
 
 use std::fs;
 use std::path::{Path, PathBuf};

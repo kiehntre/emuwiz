@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::wiiu_disc::{WiiUDiscFormat, WiiUDiscInspection, WiiUDiscIssue};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUConversionDirection {
     WudToWux,
     WuxToWud,
@@ -28,7 +28,7 @@ impl WiiUConversionDirection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUConversionReadiness {
     ReadyToPreview,
     ReadyIfToolAvailable,
@@ -38,7 +38,7 @@ pub enum WiiUConversionReadiness {
     Ambiguous,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUConversionToolStatus {
     Missing,
     VersionUnknown,
@@ -46,7 +46,7 @@ pub enum WiiUConversionToolStatus {
     Supported,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionToolCapability {
     pub name: String,
     pub path: Option<PathBuf>,
@@ -65,7 +65,7 @@ impl WiiUConversionToolCapability {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionToolInventory {
     pub tools: Vec<WiiUConversionToolCapability>,
 }
@@ -76,14 +76,14 @@ pub fn probe_wiiu_conversion_tools() -> WiiUConversionToolInventory {
     WiiUConversionToolInventory::default()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUConversionIdentity {
     HashAvailable { algorithm: String, value: String },
     HashMissing,
     HashStale,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionSpaceEstimate {
     pub source_bytes: u64,
     pub destination_exact_bytes: Option<u64>,
@@ -95,7 +95,7 @@ pub struct WiiUConversionSpaceEstimate {
     pub safety_margin_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionVerificationPlan {
     pub required: bool,
     pub exact_identity_provable: bool,
@@ -103,7 +103,7 @@ pub struct WiiUConversionVerificationPlan {
     pub source_identity: WiiUConversionIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUConversionRefusal {
     WrongSourceFormat {
         expected: WiiUDiscFormat,
@@ -130,7 +130,7 @@ pub enum WiiUConversionRefusal {
     InvalidSourceIdentity,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionPlan {
     pub source: PathBuf,
     pub source_parts: Vec<PathBuf>,
@@ -376,14 +376,14 @@ impl From<std::io::Error> for WiiUConversionError {
         Self::Io(e)
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionProgress {
     pub written_bytes: u64,
     pub expected_bytes: u64,
     pub completed_blocks: u64,
     pub total_blocks: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionRecord {
     pub source: PathBuf,
     pub destination: PathBuf,
@@ -403,7 +403,7 @@ fn check_cancel(cancel: &std::sync::atomic::AtomicBool) -> Result<(), WiiUConver
         Ok(())
     }
 }
-fn revalidate(
+pub(crate) fn revalidate(
     plan: &WiiUConversionPlan,
     staging_needed: bool,
 ) -> Result<WiiUDiscInspection, WiiUConversionError> {
@@ -464,6 +464,24 @@ pub fn execute_wiiu_conversion(
     ),
     WiiUConversionError,
 > {
+    execute_wiiu_conversion_in_stage(plan, options, cancel, progress, None)
+}
+
+/// Queue attempts provide a persisted, same-filesystem staging parent. The
+/// ordinary executor retains its existing destination-adjacent staging policy.
+pub(crate) fn execute_wiiu_conversion_in_stage(
+    plan: &WiiUConversionPlan,
+    options: &crate::repair::execute::RepairExecutionOptions,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mut dyn FnMut(WiiUConversionProgress),
+    staging_parent: Option<&Path>,
+) -> Result<
+    (
+        WiiUConversionRecord,
+        crate::repair::execute::RepairTransactionResult,
+    ),
+    WiiUConversionError,
+> {
     use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
     use crate::repair::execute::{
         RepairApplyExecution, RepairReverifyOutcome, apply_repair_transaction,
@@ -516,7 +534,7 @@ pub fn execute_wiiu_conversion(
         .ok_or(WiiUConversionError::StalePlan)?;
     let stage = tempfile::Builder::new()
         .prefix(".emuwiz-wiiu-")
-        .tempdir_in(parent)?;
+        .tempdir_in(staging_parent.unwrap_or(parent))?;
     let staged = stage.path().join("output.wud");
     let mut output = fs::OpenOptions::new()
         .write(true)
