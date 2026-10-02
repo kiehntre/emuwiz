@@ -1,8 +1,8 @@
-//! Read-only planning for verified Wii U WUD/WUX representation conversion.
+//! Bounded preview and verified native WUX → WUD conversion.
+//! Publication reuses the journaled Repair transaction engine.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::wiiu_disc::{WiiUDiscFormat, WiiUDiscInspection, WiiUDiscIssue};
 
@@ -60,20 +60,6 @@ pub struct WiiUConversionToolCapability {
 }
 
 impl WiiUConversionToolCapability {
-    fn missing(name: &str) -> Self {
-        Self {
-            name: name.into(),
-            path: None,
-            version: None,
-            status: WiiUConversionToolStatus::Missing,
-            directions: Vec::new(),
-            source: "bounded PATH lookup; no executable found".into(),
-            modifies_source_in_place: false,
-            output_naming: "Not established".into(),
-            license_provenance: "Not established".into(),
-        }
-    }
-
     pub fn supports(&self, direction: WiiUConversionDirection) -> bool {
         self.status == WiiUConversionToolStatus::Supported && self.directions.contains(&direction)
     }
@@ -84,57 +70,10 @@ pub struct WiiUConversionToolInventory {
     pub tools: Vec<WiiUConversionToolCapability>,
 }
 
-fn path_in_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH")?
-        .to_string_lossy()
-        .split(':')
-        .map(PathBuf::from)
-        .map(|directory| directory.join(name))
-        .find(|path| path.is_file())
-}
-
-fn discover(name: &str) -> WiiUConversionToolCapability {
-    let Some(path) = path_in_path(name) else {
-        return WiiUConversionToolCapability::missing(name);
-    };
-    let probe = Command::new("timeout")
-        .args(["2", path.to_string_lossy().as_ref(), "--version"])
-        .output();
-    let text = probe.ok().map(|output| {
-        format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    let version = text.as_deref().and_then(|value| {
-        value
-            .lines()
-            .find(|line| {
-                line.to_ascii_lowercase()
-                    .contains(&name.to_ascii_lowercase())
-            })
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-    });
-    WiiUConversionToolCapability {
-        name: name.into(),
-        path: Some(path),
-        version,
-        status: WiiUConversionToolStatus::VersionUnknown,
-        directions: Vec::new(),
-        source: "bounded --version probe; capability not inferred from filename".into(),
-        modifies_source_in_place: false,
-        output_naming: "Not established".into(),
-        license_provenance: "Not established".into(),
-    }
-}
-
+/// Compatibility entry point for existing preview callers. Native conversion
+/// does not discover or execute external tools.
 pub fn probe_wiiu_conversion_tools() -> WiiUConversionToolInventory {
-    WiiUConversionToolInventory {
-        tools: vec![discover("JWUDTool"), discover("WudCompress")],
-    }
+    WiiUConversionToolInventory::default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +126,8 @@ pub enum WiiUConversionRefusal {
     OutputSizeUnknown,
     UnsupportedFormat(WiiUDiscFormat),
     AmbiguousSplit,
+    DeferredDirection,
+    InvalidSourceIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +149,15 @@ pub struct WiiUConversionPlan {
     pub source_immutable: bool,
     pub keys_required: bool,
     pub provenance: String,
+    pub estimated_blocks: Option<u64>,
+    pub no_clobber: bool,
+    pub post_write_verification_available: bool,
+    binding: Option<(
+        PathBuf,
+        PathBuf,
+        crate::wiiu_disc::WiiUDiscEvidence,
+        WiiUConversionIdentity,
+    )>,
 }
 
 #[derive(Debug, Clone)]
@@ -220,149 +170,113 @@ pub struct WiiUConversionRequest {
     pub tools: WiiUConversionToolInventory,
 }
 
-fn existing_parent(path: &Path) -> Option<PathBuf> {
-    let mut current = path.to_path_buf();
-    loop {
-        if current.is_dir() {
-            return Some(current);
+fn safe_parent(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut current = PathBuf::new();
+    for c in path.components() {
+        if !matches!(
+            c,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        ) {
+            return false;
         }
-        if !current.pop() {
-            return None;
+        current.push(c.as_os_str());
+        if !fs::symlink_metadata(&current).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        {
+            return false;
         }
     }
+    true
 }
-
-fn safe_regular_source(path: &Path) -> bool {
-    fs::symlink_metadata(path)
-        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        .unwrap_or(false)
+fn safe_destination(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(crate::dat::rename_apply::preflight::is_safe_basename)
+        && path.parent().is_some_and(safe_parent)
 }
-
 fn source_parts(report: &WiiUDiscInspection) -> Vec<PathBuf> {
     report
         .structure
         .as_ref()
-        .map(|structure| {
-            structure
-                .parts
-                .iter()
-                .map(|part| part.path.clone())
-                .collect()
-        })
+        .map(|s| s.parts.iter().map(|p| p.path.clone()).collect())
         .unwrap_or_default()
 }
-
-fn space_for(
-    report: &WiiUDiscInspection,
-    direction: WiiUConversionDirection,
-    available: Option<u64>,
-) -> WiiUConversionSpaceEstimate {
-    let source = report
-        .structure
-        .as_ref()
-        .map(|structure| structure.physical_container_size_bytes)
-        .unwrap_or(0);
-    let exact = match direction {
-        WiiUConversionDirection::WuxToWud => report
-            .structure
-            .as_ref()
-            .and_then(|structure| structure.logical_disc_size_bytes),
-        WiiUConversionDirection::WudToWux => None,
-    };
-    let description = exact
-        .map(|bytes| format!("exact logical WUD size: {bytes} bytes"))
-        .unwrap_or_else(|| "WUX output size is unknown until compression is measured".into());
-    let temporary = exact.map(|bytes| bytes.saturating_add(source));
-    let duplicate = exact.map(|bytes| bytes.saturating_add(source));
-    let sufficient = match (available, duplicate) {
-        (Some(available), Some(required)) => Some(available >= required),
-        _ => None,
-    };
-    WiiUConversionSpaceEstimate {
-        source_bytes: source,
-        destination_exact_bytes: exact,
-        destination_description: description,
-        temporary_bytes: temporary,
-        atomic_duplicate_bytes: duplicate,
-        available_bytes: available,
-        sufficient,
-        safety_margin_bytes: source,
-    }
+pub(crate) fn digest_hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+fn valid_sha256(algorithm: &str, value: &str) -> bool {
+    algorithm.eq_ignore_ascii_case("sha256")
+        && value.len() == 64
+        && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Read-only: hashes only bounded structural evidence, never creates a stage or
+/// journal. HashAvailable is an optional SHA-256 of the physical SOURCE file,
+/// not a purported hash of the uncompressed original disc.
 pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPlan {
     let report = crate::wiiu_disc::inspect_wii_u_disc(&request.source);
+    let native = request.direction == WiiUConversionDirection::WuxToWud;
     let mut refusals = Vec::new();
-    let mut warnings = Vec::new();
-    let expected = request.direction.source_format();
-    if report.format != expected {
-        refusals.push(match report.format {
-            WiiUDiscFormat::Wua => WiiUConversionRefusal::UnsupportedFormat(report.format),
-            actual => WiiUConversionRefusal::WrongSourceFormat { expected, actual },
+    if report.format != request.direction.source_format() {
+        refusals.push(WiiUConversionRefusal::WrongSourceFormat {
+            expected: request.direction.source_format(),
+            actual: report.format,
         });
-    }
-    if !safe_regular_source(&request.source) {
-        refusals.push(WiiUConversionRefusal::SourcePathUnsafe);
     }
     if !report.structural_complete {
         refusals.push(WiiUConversionRefusal::IncompleteSource(
             report.issues.clone(),
         ));
     }
+    if report.source_evidence.is_none() {
+        refusals.push(WiiUConversionRefusal::SourcePathUnsafe);
+    }
+    if !safe_destination(&request.destination) {
+        refusals.push(WiiUConversionRefusal::DestinationPathUnsafe);
+    }
     if request.destination == request.source {
         refusals.push(WiiUConversionRefusal::DestinationIsSource);
     }
-    if request.destination.exists() {
-        refusals.push(WiiUConversionRefusal::DestinationExists);
+    // Includes dangling symlinks, unlike Path::exists().
+    match fs::symlink_metadata(&request.destination) {
+        Ok(_) => refusals.push(WiiUConversionRefusal::DestinationExists),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => refusals.push(WiiUConversionRefusal::DestinationPathUnsafe),
     }
-    if request
-        .destination
-        .parent()
-        .is_some_and(|parent| parent.is_symlink())
-    {
-        refusals.push(WiiUConversionRefusal::DestinationPathUnsafe);
-    }
-    let source_identity = request.source_identity.clone();
-    match source_identity {
+    match &request.source_identity {
         WiiUConversionIdentity::HashStale => refusals.push(WiiUConversionRefusal::HashStale),
-        WiiUConversionIdentity::HashMissing => {
-            refusals.push(WiiUConversionRefusal::HashMissingForVerification)
+        WiiUConversionIdentity::HashAvailable { algorithm, value }
+            if !valid_sha256(algorithm, value) =>
+        {
+            refusals.push(WiiUConversionRefusal::InvalidSourceIdentity)
         }
-        WiiUConversionIdentity::HashAvailable { .. } => {}
+        _ => {}
     }
-    let tool = request
-        .tools
-        .tools
-        .iter()
-        .find(|tool| tool.supports(request.direction))
-        .cloned();
-    let any_tool = request
-        .tools
-        .tools
-        .iter()
-        .find(|tool| tool.path.is_some() && tool.status != WiiUConversionToolStatus::Missing);
-    let any_supported_tool = request
-        .tools
-        .tools
-        .iter()
-        .any(|tool| tool.status == WiiUConversionToolStatus::Supported);
-    if tool.is_none() {
-        if any_supported_tool {
-            refusals.push(WiiUConversionRefusal::ToolDoesNotSupportDirection);
-        } else if any_tool.is_some() {
-            refusals.push(WiiUConversionRefusal::ToolCapabilityUnproven);
-        } else {
-            refusals.push(WiiUConversionRefusal::ToolUnavailable);
-        }
+    if !native {
+        refusals.push(WiiUConversionRefusal::DeferredDirection);
     }
-    let available = request.available_free_space.or_else(|| {
-        existing_parent(&request.destination).and_then(|parent| {
-            crate::diagnostics::environment::filesystem_stat(&parent)
-                .map(|stat| stat.available_bytes)
+    let source = report
+        .structure
+        .as_ref()
+        .map_or(0, |s| s.physical_container_size_bytes);
+    let exact = native
+        .then(|| {
+            report
+                .structure
+                .as_ref()
+                .and_then(|s| s.logical_disc_size_bytes)
         })
+        .flatten();
+    let available = request.available_free_space.or_else(|| {
+        request
+            .destination
+            .parent()
+            .and_then(crate::diagnostics::environment::filesystem_stat)
+            .map(|s| s.available_bytes)
     });
-    let space = space_for(&report, request.direction, available);
-    if let (Some(required), Some(available)) = (space.atomic_duplicate_bytes, space.available_bytes)
+    if let (Some(required), Some(available)) = (exact, available)
         && available < required
     {
         refusals.push(WiiUConversionRefusal::InsufficientDestinationSpace {
@@ -370,61 +284,36 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
             available,
         });
     }
-    if space.destination_exact_bytes.is_none() {
-        warnings
-            .push("WUX output size is a range/unknown; no compression ratio is invented".into());
-        if request.available_free_space.is_some() {
-            refusals.push(WiiUConversionRefusal::OutputSizeUnknown);
-        }
-    }
-    let identity_available = matches!(
-        request.source_identity,
-        WiiUConversionIdentity::HashAvailable { .. }
-    );
-    let verification = WiiUConversionVerificationPlan {
-        required: true,
-        exact_identity_provable: identity_available,
-        steps: match request.direction {
-            WiiUConversionDirection::WudToWux => vec![
-                "convert to a separate WUX destination".into(),
-                "reconstruct the logical WUD stream from WUX".into(),
-                "compare the reconstructed stream with the source WUD identity".into(),
-            ],
-            WiiUConversionDirection::WuxToWud => vec![
-                "convert to a separate WUD destination".into(),
-                "hash the reconstructed WUD".into(),
-                "compare with the pre-conversion WUD identity".into(),
-            ],
-        },
-        source_identity: request.source_identity.clone(),
+    let space = WiiUConversionSpaceEstimate {
+        source_bytes: source,
+        destination_exact_bytes: exact,
+        destination_description: exact
+            .map(|n| format!("exact logical WUD size: {n} bytes"))
+            .unwrap_or_else(|| "WUD → WUX generation is deferred".into()),
+        // Same-filesystem staging becomes the destination by atomic rename.
+        temporary_bytes: exact,
+        atomic_duplicate_bytes: Some(0),
+        available_bytes: available,
+        sufficient: exact.zip(available).map(|(n, a)| a >= n),
+        safety_margin_bytes: 0,
     };
-    let readiness = if report.format == WiiUDiscFormat::Wua {
+    let readiness = if !native || report.format == WiiUDiscFormat::Wua {
         WiiUConversionReadiness::Unsupported
-    } else if refusals.iter().any(|refusal| {
-        matches!(
-            refusal,
-            WiiUConversionRefusal::SourcePathUnsafe
-                | WiiUConversionRefusal::DestinationPathUnsafe
-                | WiiUConversionRefusal::DestinationIsSource
-                | WiiUConversionRefusal::DestinationExists
-                | WiiUConversionRefusal::HashStale
-                | WiiUConversionRefusal::IncompleteSource(_)
-                | WiiUConversionRefusal::WrongSourceFormat { .. }
-                | WiiUConversionRefusal::UnsupportedFormat(_)
-                | WiiUConversionRefusal::InsufficientDestinationSpace { .. }
-                | WiiUConversionRefusal::AmbiguousSplit
-        )
-    }) {
-        WiiUConversionReadiness::NotReady
-    } else if matches!(request.source_identity, WiiUConversionIdentity::HashMissing) {
-        WiiUConversionReadiness::VerificationRequired
-    } else if matches!(request.source_identity, WiiUConversionIdentity::HashStale) {
-        WiiUConversionReadiness::NotReady
-    } else if tool.is_some() && space.destination_exact_bytes.is_some() {
+    } else if refusals.is_empty() {
         WiiUConversionReadiness::ReadyToPreview
     } else {
-        WiiUConversionReadiness::ReadyIfToolAvailable
+        WiiUConversionReadiness::NotReady
     };
+    let binding = report.source_evidence.clone().map(|e| {
+        (
+            request.source.clone(),
+            request.destination.clone(),
+            e,
+            request.source_identity.clone(),
+        )
+    });
+    let estimated_blocks = report.structure.as_ref().and_then(|s| s.block_count);
+    let warnings = report.issues.iter().map(|i| format!("{i:?}")).collect();
     WiiUConversionPlan {
         source: request.source.clone(),
         source_parts: source_parts(&report),
@@ -433,184 +322,372 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
         source_format: report.format,
         target_format: request.direction.target_format(),
         source_inspection: report,
-        source_identity,
-        tool,
+        source_identity: request.source_identity.clone(),
+        tool: None,
         readiness,
         refusals,
         warnings,
         space,
-        verification,
+        verification: WiiUConversionVerificationPlan {
+            required: true,
+            exact_identity_provable: native,
+            steps: vec![
+                "revalidate bounded source binding before writes".into(),
+                "stream sectors in logical WUD order and hash reconstructed bytes".into(),
+                "inspect staged WUD and compare complete header evidence".into(),
+                "verify exact output size and independent full-file SHA-256".into(),
+                "revalidate full source hash; publish with journaled no-clobber move".into(),
+            ],
+            source_identity: request.source_identity.clone(),
+        },
         source_immutable: true,
         keys_required: false,
-        provenance: "native Wii U structural inspection plus explicit conversion-plan evidence"
-            .into(),
+        provenance: "native-wux-to-wud-v1".into(),
+        estimated_blocks,
+        no_clobber: true,
+        post_write_verification_available: native,
+        binding,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Debug)]
+pub enum WiiUConversionError {
+    Refused(Vec<WiiUConversionRefusal>),
+    StalePlan,
+    Cancelled,
+    InvalidSource(WiiUDiscIssue),
+    VerificationFailed(String),
+    Io(std::io::Error),
+    /// Recovery must retain this directory because the transaction may have
+    /// reached publication before an I/O/journal failure was reported.
+    Transaction {
+        detail: String,
+        recovery_directory: PathBuf,
+    },
+}
+impl std::fmt::Display for WiiUConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for WiiUConversionError {}
+impl From<std::io::Error> for WiiUConversionError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WiiUConversionProgress {
+    pub written_bytes: u64,
+    pub expected_bytes: u64,
+    pub completed_blocks: u64,
+    pub total_blocks: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WiiUConversionRecord {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub output_bytes: u64,
+    pub source_container_sha256: String,
+    pub reconstructed_wud_sha256: String,
+    pub output_sha256: String,
+    pub header_sha256: String,
+    pub source_header: crate::wiiu_disc::WiiUHeaderEvidence,
+    pub policy: String,
+    pub transaction_id: String,
+}
+fn check_cancel(cancel: &std::sync::atomic::AtomicBool) -> Result<(), WiiUConversionError> {
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        Err(WiiUConversionError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+fn revalidate(
+    plan: &WiiUConversionPlan,
+    staging_needed: bool,
+) -> Result<WiiUDiscInspection, WiiUConversionError> {
+    let Some((source, destination, evidence, identity)) = &plan.binding else {
+        return Err(WiiUConversionError::StalePlan);
+    };
+    if source != &plan.source
+        || destination != &plan.destination
+        || identity != &plan.source_identity
+        || plan.direction != WiiUConversionDirection::WuxToWud
+        || plan.source_format != WiiUDiscFormat::Wux
+        || plan.target_format != WiiUDiscFormat::Wud
+    {
+        return Err(WiiUConversionError::StalePlan);
+    }
+    let fresh = plan_wiiu_conversion(&WiiUConversionRequest {
+        source: source.clone(),
+        destination: destination.clone(),
+        direction: plan.direction,
+        source_identity: identity.clone(),
+        // Once the stage exists, that output space is already occupied; do not
+        // demand another full image's free space during publication checks.
+        available_free_space: if staging_needed { None } else { Some(u64::MAX) },
+        tools: WiiUConversionToolInventory::default(),
+    });
+    let report = fresh.source_inspection;
+    if !report.structural_complete
+        || report.source_evidence.as_ref() != Some(evidence)
+        || report != plan.source_inspection
+        || report
+            .structure
+            .as_ref()
+            .and_then(|s| s.logical_disc_size_bytes)
+            != plan.space.destination_exact_bytes
+    {
+        return Err(WiiUConversionError::StalePlan);
+    }
+    if !fresh.refusals.is_empty() {
+        return Err(WiiUConversionError::Refused(fresh.refusals));
+    }
+    Ok(report)
+}
+
+pub const WIIU_CONVERSION_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Native streaming decode, explicitly invoked after preview approval.
+/// Full identity capture and Repair's hash checks use existing fixed buffers;
+/// cancellation is checked per decode chunk and at phase boundaries.
+pub fn execute_wiiu_conversion(
+    plan: &WiiUConversionPlan,
+    options: &crate::repair::execute::RepairExecutionOptions,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mut dyn FnMut(WiiUConversionProgress),
+) -> Result<
+    (
+        WiiUConversionRecord,
+        crate::repair::execute::RepairTransactionResult,
+    ),
+    WiiUConversionError,
+> {
+    use crate::dat::rename_apply::identity::{capture_identity, identity_matches};
+    use crate::repair::execute::{
+        RepairApplyExecution, RepairReverifyOutcome, apply_repair_transaction,
+        build_repair_transaction,
+    };
+    use crate::repair::plan::{RepairPlanId, build_repair_plan};
+    use crate::repair::proposal::{
+        RepairAction, RepairEvidence, RepairEvidenceKind, RepairProposal, RepairProposalId,
+        SafetyState,
+    };
+    use sha2::{Digest, Sha256};
     use std::io::Write;
-    use tempfile::tempdir;
 
-    fn make_wux(path: &Path) {
-        let mut file = fs::File::create(path).unwrap();
-        let mut header = [0_u8; 32];
-        header[..4].copy_from_slice(b"WUX0");
-        header[4..8].copy_from_slice(&0x1099_d02e_u32.to_le_bytes());
-        header[8..12].copy_from_slice(&0x100_u32.to_le_bytes());
-        header[16..24].copy_from_slice(&0x100_u64.to_le_bytes());
-        file.write_all(&header).unwrap();
-        file.write_all(&[0_u8; 252]).unwrap();
-        file.write_all(&[0_u8; 256]).unwrap();
+    check_cancel(cancel)?;
+    if !plan.refusals.is_empty() {
+        return Err(WiiUConversionError::Refused(plan.refusals.clone()));
     }
-
-    fn tool(direction: WiiUConversionDirection) -> WiiUConversionToolInventory {
-        WiiUConversionToolInventory {
-            tools: vec![WiiUConversionToolCapability {
-                name: "synthetic-converter".into(),
-                path: Some("/synthetic/converter".into()),
-                version: Some("1.0".into()),
-                status: WiiUConversionToolStatus::Supported,
-                directions: vec![direction],
-                source: "synthetic capability fixture".into(),
-                modifies_source_in_place: false,
-                output_naming: "explicit destination".into(),
-                license_provenance: "synthetic fixture".into(),
-            }],
-        }
+    let report = revalidate(plan, true)?;
+    let source_identity = capture_identity(&plan.source)?;
+    let source_sha = digest_hex(
+        source_identity
+            .freshness
+            .as_ref()
+            .ok_or(WiiUConversionError::StalePlan)?
+            .sha256,
+    );
+    if let WiiUConversionIdentity::HashAvailable { value, .. } = &plan.source_identity
+        && !value.eq_ignore_ascii_case(&source_sha)
+    {
+        return Err(WiiUConversionError::StalePlan);
     }
-
-    fn request(source: PathBuf, direction: WiiUConversionDirection) -> WiiUConversionRequest {
-        let destination = source.parent().unwrap().join(format!(
-            "converted.{}",
-            match direction {
-                WiiUConversionDirection::WudToWux => "wux",
-                WiiUConversionDirection::WuxToWud => "wud",
-            }
-        ));
-        WiiUConversionRequest {
-            destination,
-            source,
-            direction,
-            source_identity: WiiUConversionIdentity::HashAvailable {
-                algorithm: "sha256".into(),
-                value: "synthetic".into(),
+    revalidate(plan, true)?;
+    let mut source =
+        crate::safe_read::open_bounded_read(&plan.source, &crate::safe_read::TrustedRoots::none())
+            .map_err(|e| WiiUConversionError::VerificationFailed(format!("{e:?}")))?
+            .into_file();
+    let evidence = report.source_evidence.as_ref().unwrap();
+    if !evidence.matches_metadata(&source.metadata()?) {
+        return Err(WiiUConversionError::StalePlan);
+    }
+    let layout = crate::wiiu_disc::load_wux(&mut source, evidence.size_bytes)
+        .map_err(WiiUConversionError::InvalidSource)?;
+    if !evidence.matches_metadata(&source.metadata()?) {
+        return Err(WiiUConversionError::StalePlan);
+    }
+    let logical = layout.logical;
+    let parent = plan
+        .destination
+        .parent()
+        .ok_or(WiiUConversionError::StalePlan)?;
+    let stage = tempfile::Builder::new()
+        .prefix(".emuwiz-wiiu-")
+        .tempdir_in(parent)?;
+    let staged = stage.path().join("output.wud");
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+    let mut buffer = [0_u8; WIIU_CONVERSION_CHUNK_BYTES];
+    let mut digest = Sha256::new();
+    let mut written = 0_u64;
+    while written < layout.logical {
+        check_cancel(cancel)?;
+        let length = (layout.logical - written).min(buffer.len() as u64) as usize;
+        crate::wiiu_disc::read_wux_at(&mut source, &layout, written, &mut buffer[..length])
+            .map_err(WiiUConversionError::InvalidSource)?;
+        output.write_all(&buffer[..length])?;
+        digest.update(&buffer[..length]);
+        written = written
+            .checked_add(length as u64)
+            .ok_or(WiiUConversionError::InvalidSource(
+                WiiUDiscIssue::LogicalSizeOverflow,
+            ))?;
+        progress(WiiUConversionProgress {
+            written_bytes: written,
+            expected_bytes: layout.logical,
+            completed_blocks: if written == layout.logical {
+                layout.table.len() as u64
+            } else {
+                written / u64::from(layout.sector)
             },
-            available_free_space: None,
-            tools: tool(direction),
-        }
-    }
-
-    #[test]
-    fn plans_both_directions_without_mutating_sources() {
-        let directory = tempdir().unwrap();
-        let wud = directory.path().join("game.wud");
-        fs::write(&wud, [7_u8; 1024]).unwrap();
-        let before = fs::read(&wud).unwrap();
-        let wud_plan =
-            plan_wiiu_conversion(&request(wud.clone(), WiiUConversionDirection::WudToWux));
-        assert_eq!(
-            wud_plan.readiness,
-            WiiUConversionReadiness::ReadyIfToolAvailable
-        );
-        assert!(wud_plan.verification.exact_identity_provable);
-
-        let wux = directory.path().join("game.wux");
-        make_wux(&wux);
-        let wux_plan =
-            plan_wiiu_conversion(&request(wux.clone(), WiiUConversionDirection::WuxToWud));
-        assert_eq!(wux_plan.readiness, WiiUConversionReadiness::ReadyToPreview);
-        assert_eq!(wux_plan.space.destination_exact_bytes, Some(256));
-        assert_eq!(fs::read(&wud).unwrap(), before);
-        assert_eq!(fs::read(&wux).unwrap().len(), 540);
-    }
-
-    #[test]
-    fn missing_identity_requires_verification_and_stale_identity_refuses() {
-        let directory = tempdir().unwrap();
-        let source = directory.path().join("game.wux");
-        make_wux(&source);
-        let mut missing = request(source.clone(), WiiUConversionDirection::WuxToWud);
-        missing.source_identity = WiiUConversionIdentity::HashMissing;
-        assert_eq!(
-            plan_wiiu_conversion(&missing).readiness,
-            WiiUConversionReadiness::VerificationRequired
-        );
-        let mut stale = missing;
-        stale.source_identity = WiiUConversionIdentity::HashStale;
-        assert_eq!(
-            plan_wiiu_conversion(&stale).readiness,
-            WiiUConversionReadiness::NotReady
-        );
-    }
-
-    #[test]
-    fn malformed_split_space_and_tool_cases_fail_closed() {
-        let directory = tempdir().unwrap();
-        let malformed = directory.path().join("bad.wux");
-        fs::write(&malformed, b"bad").unwrap();
-        let mut bad = request(malformed, WiiUConversionDirection::WuxToWud);
-        bad.tools = WiiUConversionToolInventory::default();
-        let bad_plan = plan_wiiu_conversion(&bad);
-        assert_eq!(bad_plan.readiness, WiiUConversionReadiness::NotReady);
-        assert!(
-            bad_plan
-                .refusals
-                .iter()
-                .any(|refusal| matches!(refusal, WiiUConversionRefusal::IncompleteSource(_)))
-        );
-
-        let split = directory.path().join("title_part1.wud");
-        fs::write(&split, [0_u8; 16]).unwrap();
-        fs::write(directory.path().join("title_part3.wud"), [0_u8; 16]).unwrap();
-        let split_plan = plan_wiiu_conversion(&request(split, WiiUConversionDirection::WudToWux));
-        assert!(
-            split_plan
-                .refusals
-                .iter()
-                .any(|refusal| matches!(refusal, WiiUConversionRefusal::IncompleteSource(_)))
-        );
-
-        let wux = directory.path().join("space.wux");
-        make_wux(&wux);
-        let mut space = request(wux, WiiUConversionDirection::WuxToWud);
-        space.available_free_space = Some(1);
-        assert!(
-            space
-                .tools
-                .tools
-                .first()
-                .unwrap()
-                .supports(WiiUConversionDirection::WuxToWud)
-        );
-        assert!(
-            plan_wiiu_conversion(&space)
-                .refusals
-                .iter()
-                .any(|refusal| matches!(
-                    refusal,
-                    WiiUConversionRefusal::InsufficientDestinationSpace { .. }
-                ))
-        );
-
-        let unsupported = directory.path().join("unsupported.wud");
-        fs::write(&unsupported, [0_u8; 32]).unwrap();
-        let unsupported_plan = plan_wiiu_conversion(&WiiUConversionRequest {
-            source: unsupported,
-            destination: directory.path().join("unsupported.wux"),
-            direction: WiiUConversionDirection::WudToWux,
-            source_identity: WiiUConversionIdentity::HashAvailable {
-                algorithm: "sha256".into(),
-                value: "synthetic".into(),
-            },
-            available_free_space: None,
-            tools: tool(WiiUConversionDirection::WuxToWud),
+            total_blocks: layout.table.len() as u64,
         });
-        assert!(
-            unsupported_plan
-                .refusals
-                .contains(&WiiUConversionRefusal::ToolDoesNotSupportDirection)
-        );
     }
+    check_cancel(cancel)?;
+    // Release the bounded table before later source inspection allocates one.
+    drop(layout);
+    output.sync_all()?;
+    if output.metadata()?.len() != logical {
+        return Err(WiiUConversionError::VerificationFailed(
+            "output size differs".into(),
+        ));
+    }
+    drop(output);
+    let reconstructed_sha = digest_hex(digest.finalize());
+    let inspected_output = crate::wiiu_disc::inspect_wii_u_disc(&staged);
+    let source_header = report
+        .structure
+        .as_ref()
+        .and_then(|s| s.wud_header.as_ref())
+        .unwrap();
+    if !inspected_output.structural_complete
+        || inspected_output.format != WiiUDiscFormat::Wud
+        || inspected_output
+            .structure
+            .as_ref()
+            .and_then(|s| s.wud_header.as_ref())
+            != Some(source_header)
+    {
+        return Err(WiiUConversionError::VerificationFailed(
+            "WUD structural evidence differs from WUX projection".into(),
+        ));
+    }
+    let output_identity = capture_identity(&staged)?;
+    let output_sha = digest_hex(output_identity.freshness.as_ref().unwrap().sha256);
+    if output_identity.size_bytes != logical || output_sha != reconstructed_sha {
+        return Err(WiiUConversionError::VerificationFailed(
+            "independent output hash/size differs".into(),
+        ));
+    }
+    if !identity_matches(&source_identity, &capture_identity(&plan.source)?)
+        || !evidence.matches_metadata(&source.metadata()?)
+    {
+        return Err(WiiUConversionError::StalePlan);
+    }
+    revalidate(plan, false)?;
+    check_cancel(cancel)?;
+    let proposal = RepairProposal {
+        id: RepairProposalId::new("wiiu-output").unwrap(),
+        action: RepairAction::MovePath {
+            destination: plan.destination.clone(),
+        },
+        source_path: staged.clone(),
+        reason: "publish independently verified native WUX → WUD output".into(),
+        evidence: vec![RepairEvidence::new(
+            RepairEvidenceKind::UserRequestedOrganisation,
+            "exact size, SHA-256 and WUD header evidence verified",
+        )],
+        expected_source_identity: Some(output_identity),
+        originating_audit: None,
+        safety: SafetyState::Safe,
+        blockers: vec![],
+        warnings: vec![],
+        dat_source_id: None,
+        dat_source_display: None,
+        game_name: None,
+        rom_name: None,
+        verdict_label: Some("Verified WUD output".into()),
+        match_confident: true,
+        is_outer_archive: false,
+        is_outer_archive_verified: false,
+        survivor_path: None,
+    };
+    let publication = build_repair_plan(
+        RepairPlanId::new("wiiu-output-v1").unwrap(),
+        0,
+        crate::dat::sources::now_unix(),
+        Some("native-wux-to-wud-v1".into()),
+        vec![proposal],
+    );
+    let mut transaction = build_repair_transaction(&publication)
+        .map_err(|e| WiiUConversionError::VerificationFailed(e.to_string()))?;
+    let record = WiiUConversionRecord {
+        source: plan.source.clone(),
+        destination: plan.destination.clone(),
+        output_bytes: logical,
+        source_container_sha256: source_sha,
+        reconstructed_wud_sha256: reconstructed_sha,
+        output_sha256: output_sha,
+        header_sha256: digest_hex(source_header.header_sha256),
+        source_header: source_header.clone(),
+        policy: "native-wux-to-wud-v1".into(),
+        transaction_id: transaction.transaction_id.clone(),
+    };
+    transaction.unknown.insert(
+        "wiiu_conversion".into(),
+        serde_json::json!({
+            "policy": record.policy, "source": record.source, "destination": record.destination,
+            "source_container_sha256": record.source_container_sha256,
+            "reconstructed_wud_sha256": record.reconstructed_wud_sha256,
+            "output_sha256": record.output_sha256, "header_sha256": record.header_sha256,
+            "output_bytes": record.output_bytes, "keys_required": false, "source_retained": true,
+        }),
+    );
+    revalidate(plan, false)?;
+    check_cancel(cancel)?;
+    fs::create_dir_all(&options.journal_dir)?;
+    // From this point the journal owns the stage path, including an ambiguous
+    // publication failure. Retain it for existing rollback/recovery rules.
+    let recovery_directory = stage.keep();
+    let publication_result = apply_repair_transaction(&mut RepairApplyExecution {
+        transaction: &mut transaction,
+        current_generation: 0,
+        options,
+        cancel,
+    });
+    let applied = match publication_result {
+        Ok(applied)
+            if applied.summary.applied == 1
+                && applied.summary.failed == 0
+                && applied.transaction.state
+                    == crate::dat::rename_apply::model::TransactionState::Applied
+                && applied.reverify.len() == 1
+                && applied.reverify[0].outcome == RepairReverifyOutcome::Verified =>
+        {
+            applied
+        }
+        outcome => {
+            let detail = match outcome {
+                Err(e) => e.to_string(),
+                Ok(_) => "publication was not confirmed".into(),
+            };
+            // Failure cleanup must not be cancelled by the forward operation's
+            // flag. The reused rollback still requires identity/no-clobber proof.
+            let rollback = crate::repair::execute::rollback_repair_transaction(
+                &mut transaction,
+                &options.journal_dir,
+                &std::sync::atomic::AtomicBool::new(false),
+            );
+            return Err(WiiUConversionError::Transaction {
+                detail: format!("{detail}; rollback: {rollback:?}"),
+                recovery_directory,
+            });
+        }
+    };
+    Ok((record, applied))
 }
