@@ -8,6 +8,7 @@ mod browse_play;
 mod documents;
 mod dreamcast_ipbin;
 mod environment;
+mod equivalent_duplicates;
 mod guidance;
 mod hackhash;
 mod imagery;
@@ -306,6 +307,7 @@ pub(super) struct App {
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     setup_portability: setup_portability::SetupPortabilityState,
     missing: missing_review::MissingReviewState,
+    equiv: equivalent_duplicates::EquivalentState,
 }
 
 impl App {
@@ -386,6 +388,7 @@ impl App {
             document_cache: None,
             setup_portability: setup_portability::SetupPortabilityState::default(),
             missing: Default::default(),
+            equiv: Default::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1473,6 +1476,10 @@ impl App {
                                     self.canonical_organisation_history = organisations;
                                     self.organisation.mame_history = mame_reconstructions;
                                 }
+                                Payload::EquivalentScan(scan) => self.equivalent_scan_done(*scan),
+                                Payload::EquivalentApplied(record) => {
+                                    self.equivalent_applied(*record)
+                                }
                                 Payload::MissingPreview(plan) => {
                                     self.missing.job = None;
                                     self.missing.plan = Some(plan);
@@ -1575,6 +1582,9 @@ impl App {
                             }
                             if self.missing.job == Some(id) {
                                 self.missing_failed(&error);
+                            }
+                            if self.equiv.job == Some(id) {
+                                self.equivalent_failed(&error);
                             }
                             self.settle_romm_library_load(id, Err(error.clone()));
                             if self

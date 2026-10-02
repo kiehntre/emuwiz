@@ -101,6 +101,13 @@ pub(super) enum Command {
         cancel: Arc<AtomicBool>,
     },
     LoadRepairHistory,
+    EquivalentScan {
+        kind: super::equivalent_duplicates::EquivalentKind,
+        cancel: Arc<AtomicBool>,
+    },
+    EquivalentApply {
+        group: Box<super::equivalent_duplicates::EquivalentGroup>,
+    },
     MissingPreview,
     MissingApply {
         token: String,
@@ -165,6 +172,8 @@ pub(super) enum Payload {
         organisations: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
         mame_reconstructions: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     },
+    EquivalentScan(Box<super::equivalent_duplicates::EquivalentScan>),
+    EquivalentApplied(Box<DuplicateRepairRecord>),
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
     MissingUndone(usize),
@@ -270,6 +279,12 @@ impl Backend {
 
 fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload, String> {
     match command {
+        Command::EquivalentScan { kind, cancel } => Ok(Payload::EquivalentScan(Box::new(
+            super::equivalent_duplicates::scan(kind, &cancel)?,
+        ))),
+        Command::EquivalentApply { group } => Ok(Payload::EquivalentApplied(Box::new(
+            super::equivalent_duplicates::apply(&group)?,
+        ))),
         Command::MissingPreview => Ok(Payload::MissingPreview(Box::new(
             super::missing_review::preview()?,
         ))),
@@ -722,7 +737,7 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
     }
 }
 
-fn trusted_root_for(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
+pub(super) fn trusted_root_for(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, String> {
     roots
         .iter()
         .filter(|root| path.starts_with(root))

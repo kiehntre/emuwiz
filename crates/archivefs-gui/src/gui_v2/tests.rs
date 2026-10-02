@@ -112,6 +112,7 @@ fn fixture(context: &egui::Context) -> App {
         document_cache: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
         missing: Default::default(),
+        equiv: Default::default(),
     }
 }
 
@@ -5976,4 +5977,38 @@ fn gui_v2_escape_does_not_navigate_under_a_dialog_it_does_not_own() {
     show(&context, &mut app, vec![]);
     show(&context, &mut app, vec![key_event(egui::Key::Escape)]);
     assert_eq!(app.router.current, Route::Section(Section::Sources));
+}
+
+#[test]
+fn gui_v2_equivalent_duplicates_card_shows_and_escape_closes_its_confirmation() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Games));
+    app.go(Route::Section(Section::Duplicates));
+    let strings = text(&frame(&context, &mut app, [1024.0, 700.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("Same game, different format"))
+    );
+    assert!(strings.iter().any(|s| s.contains("Check discs")));
+    // No scan has run: no results, no action buttons.
+    assert!(!strings.iter().any(|s| s.contains("Move to quarantine")));
+    app.equiv.optical = Some(Default::default());
+    let strings = text(&frame(&context, &mut app, [1024.0, 700.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("No equivalent copies found"))
+    );
+    app.equiv.selected = Some((super::equivalent_duplicates::EquivalentKind::Optical, 0));
+    app.equiv.confirm = true;
+    frame_with(
+        &context,
+        &mut app,
+        [1024.0, 700.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert!(!app.equiv.confirm);
+    assert_eq!(app.router.current, Route::Section(Section::Duplicates));
 }

@@ -299,7 +299,8 @@ impl App {
         let modal_open = self.confirm_scan
             || self.repair_confirm
             || self.undo_confirm.is_some()
-            || self.missing.confirm;
+            || self.missing.confirm
+            || self.equiv.confirm;
         let (escape, alt_back) = context.input(|input| {
             (
                 input.key_pressed(egui::Key::Escape),
@@ -328,6 +329,7 @@ impl App {
                     self.repair_confirm = false;
                     self.undo_confirm = None;
                     self.missing.confirm = false;
+                    self.equiv.confirm = false;
                 }
                 // egui has already released the field's focus on this key press.
                 EscapeAction::LeaveFocus => {}
@@ -1529,6 +1531,7 @@ impl App {
 
     fn duplicates_content(&mut self, ui: &mut egui::Ui) {
         self.duplicates_hero(ui);
+        self.equivalent_duplicates_section(ui);
         ui.label("Only byte-identical files are called exact duplicates. Different regions, revisions and titles remain separate unless their contents are proven identical.");
         if self.duplicate_report.is_none() {
             if self.duplicate_job.is_some() {
