@@ -386,7 +386,7 @@ fn preview_is_read_only_native_and_no_clobber() {
     assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
 }
 #[test]
-fn preview_refuses_space_stale_hash_unsafe_path_and_writer() {
+fn preview_refuses_space_stale_hash_unsafe_path_and_wrong_direction() {
     let d = tempdir().unwrap();
     let p = d.path().join("disc.wux");
     fixture(&p, 8);
@@ -416,11 +416,12 @@ fn preview_refuses_space_stale_hash_unsafe_path_and_writer() {
     assert!(
         plan_wiiu_conversion(&req)
             .refusals
-            .contains(&WiiUConversionRefusal::DeferredDirection)
+            .iter()
+            .any(|r| matches!(r, WiiUConversionRefusal::WrongSourceFormat { .. }))
     );
     assert_eq!(
         plan_wiiu_conversion(&req).readiness,
-        WiiUConversionReadiness::Unsupported
+        WiiUConversionReadiness::NotReady
     );
 }
 #[test]
@@ -914,4 +915,705 @@ fn unavailable_journal_prevents_publication_and_cleans_stage() {
     assert!(!dest.exists());
     assert!(stages(d.path()).is_empty());
     assert_eq!(std::fs::read(&opts.journal_dir).unwrap(), b"unavailable");
+}
+
+fn encoding_request(source: &Path, destination: &Path) -> WiiUConversionRequest {
+    let mut req = request(source, destination);
+    req.direction = WiiUConversionDirection::WudToWux;
+    req
+}
+fn encoding_fixture(path: &Path, tail: &[u8]) -> Vec<u8> {
+    let mut bytes = wud_header();
+    for value in tail {
+        bytes.extend(vec![*value; WUD_SECTOR_SIZE as usize]);
+    }
+    std::fs::write(path, &bytes).unwrap();
+    bytes
+}
+fn encode_fixture(source: &Path, destination: &Path) -> WiiUConversionRecord {
+    execute_wiiu_conversion(
+        &plan_wiiu_conversion(&encoding_request(source, destination)),
+        &options(destination.parent().unwrap()),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .unwrap()
+    .0
+}
+
+#[test]
+fn wud_to_wux_preview_is_bounded_read_only_and_binds_canonical_geometry() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.data");
+    let destination = d.path().join("disc.wux");
+    let before = encoding_fixture(&source, &[0, 0x5a]);
+    let plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+    assert_eq!(
+        plan.readiness,
+        WiiUConversionReadiness::ReadyToPreview,
+        "{plan:?}"
+    );
+    assert!(plan.refusals.is_empty());
+    assert!(plan.no_clobber && plan.source_immutable && plan.post_write_verification_available);
+    assert!(plan.tool.is_none());
+    assert!(plan.verification.required && plan.verification.exact_identity_provable);
+    let layout = plan.wux_creation.unwrap();
+    assert_eq!(layout.block_size_bytes, 0x8000);
+    assert_eq!(layout.logical_size_bytes, before.len() as u64);
+    assert_eq!(layout.logical_block_count, 6);
+    assert_eq!(layout.lookup_table_bytes, 24);
+    assert_eq!(layout.payload_offset, 0x8000);
+    assert_eq!(layout.maximum_output_bytes, before.len() as u64 + 0x8000);
+    assert_eq!(plan.space.source_bytes, before.len() as u64);
+    assert_eq!(plan.space.destination_exact_bytes, None);
+    assert_eq!(
+        plan.space.destination_maximum_bytes,
+        Some(layout.maximum_output_bytes)
+    );
+    assert_eq!(
+        plan.space.temporary_bytes,
+        Some(layout.maximum_output_bytes)
+    );
+    assert_eq!(plan.space.atomic_duplicate_bytes, Some(0));
+    assert_eq!(
+        plan.source_inspection
+            .source_evidence
+            .as_ref()
+            .unwrap()
+            .size_bytes,
+        before.len() as u64
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), before);
+    assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn wud_to_wux_tiny_header_has_independently_specified_canonical_bytes() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("tiny.wud");
+    let destination = d.path().join("tiny.wux");
+    let original = encoding_fixture(&source, &[]);
+    let record = encode_fixture(&source, &destination);
+    let mut expected = vec![0; 0x8000];
+    expected[..8].copy_from_slice(&[b'W', b'U', b'X', b'0', 0x2e, 0xd0, 0x99, 0x10]);
+    expected[8..12].copy_from_slice(&0x8000u32.to_le_bytes());
+    expected[16..24].copy_from_slice(&0x20000u64.to_le_bytes());
+    expected[32..48].copy_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+    expected.extend(&original);
+    assert_eq!(std::fs::read(&destination).unwrap(), expected);
+    let inspected = inspect_wii_u_disc(&destination);
+    assert!(inspected.structural_complete, "{inspected:?}");
+    assert_eq!(inspected.format, WiiUDiscFormat::Wux);
+    assert_eq!(record.wux_creation.unwrap().stored_blocks, 4);
+    assert_eq!(
+        record.reconstructed_wud_sha256,
+        digest_hex(Sha256::digest(&original))
+    );
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn wud_to_wux_mixed_zero_nonzero_and_repeated_bytes_have_exact_mappings() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("mixed.wud");
+    let destination = d.path().join("mixed.wux");
+    let original = encoding_fixture(&source, &[0, 0x5a, 0, 0x5a, 0xff]);
+    let record = encode_fixture(&source, &destination);
+    let mut file = File::open(&destination).unwrap();
+    let layout = load_wux(&mut file, record.output_bytes).unwrap();
+    assert_eq!(layout.table, [0, 1, 2, 3, 1, 4, 1, 5, 6]);
+    assert_eq!(layout.unique, 7);
+    assert_eq!(
+        record.wux_creation,
+        Some(WiiUWuxCreationStatistics {
+            zero_blocks: 3,
+            reused_zero_blocks: 2,
+            stored_blocks: 7,
+        })
+    );
+    let mut restored = vec![0; original.len()];
+    read_wux_at(&mut file, &layout, 0, &mut restored).unwrap();
+    assert_eq!(restored, original);
+    for offset in [0x7ff0, 0xfff9, 0x1fff1, 0x27ffb] {
+        let mut cross_boundary = [0; 51];
+        read_wux_at(&mut file, &layout, offset, &mut cross_boundary).unwrap();
+        assert_eq!(
+            &cross_boundary,
+            &original[offset as usize..offset as usize + 51]
+        );
+    }
+}
+
+#[test]
+fn wud_to_wux_entirely_nonzero_blocks_are_all_stored() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("nonzero.wud");
+    let destination = d.path().join("nonzero.wux");
+    let mut original = encoding_fixture(&source, &[0xff, 0xff, 1]);
+    original[0x8000..0x10000].fill(0xff);
+    std::fs::write(&source, &original).unwrap();
+    let record = encode_fixture(&source, &destination);
+    let stats = record.wux_creation.unwrap();
+    assert_eq!(stats.zero_blocks, 0);
+    assert_eq!(stats.reused_zero_blocks, 0);
+    assert_eq!(stats.stored_blocks, 7);
+    let layout = load_wux(&mut File::open(&destination).unwrap(), record.output_bytes).unwrap();
+    assert_eq!(layout.table, [0, 1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn wud_to_wux_near_zero_block_is_not_shared_as_zero() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("nearzero.wud");
+    let destination = d.path().join("nearzero.wux");
+    let mut original = encoding_fixture(&source, &[0, 0, 0]);
+    *original.last_mut().unwrap() = 1;
+    std::fs::write(&source, &original).unwrap();
+    let record = encode_fixture(&source, &destination);
+    assert_eq!(record.wux_creation.unwrap().stored_blocks, 5);
+    let mut file = File::open(&destination).unwrap();
+    let layout = load_wux(&mut file, record.output_bytes).unwrap();
+    assert_eq!(layout.table, [0, 1, 2, 3, 1, 1, 4]);
+    let mut last = [0; 1];
+    read_wux_at(&mut file, &layout, layout.logical - 1, &mut last).unwrap();
+    assert_eq!(last, [1]);
+}
+
+#[test]
+fn wud_to_wux_then_existing_wud_decoder_is_byte_exact_and_hash_exact() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    let restored = d.path().join("restored.wud");
+    let original = encoding_fixture(&source, &[0, 0x77, 0, 0xff]);
+    let encoded = encode_fixture(&source, &destination);
+    let (decoded, result) = execute_wiiu_conversion(
+        &plan_wiiu_conversion(&request(&destination, &restored)),
+        &options(d.path()),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&restored).unwrap(), original);
+    let hash = digest_hex(Sha256::digest(&original));
+    assert_eq!(encoded.source_container_sha256, hash);
+    assert_eq!(encoded.reconstructed_wud_sha256, hash);
+    assert_eq!(decoded.output_sha256, hash);
+    assert_eq!(encoded.output_sha256, decoded.source_container_sha256);
+    assert_eq!(encoded.source_header, decoded.source_header);
+    assert_eq!(result.summary.applied, 1);
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn wud_to_wux_is_deterministic_across_two_transactions() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let first = d.path().join("first.wux");
+    let second = d.path().join("second.wux");
+    encoding_fixture(&source, &[0, 0x5a, 0x5a, 0, 0, 0xff]);
+    let a = encode_fixture(&source, &first);
+    let b = encode_fixture(&source, &second);
+    assert_ne!(a.transaction_id, b.transaction_id);
+    assert_eq!(a.output_sha256, b.output_sha256);
+    assert_eq!(a.wux_creation, b.wux_creation);
+    assert_eq!(
+        std::fs::read(first).unwrap(),
+        std::fs::read(second).unwrap()
+    );
+}
+
+#[test]
+fn wud_to_wux_partial_sector_and_malformed_wud_are_refused_before_staging() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    for size in [
+        4,
+        0x10003,
+        WUD_HEADER_SIZE - 1,
+        WUD_HEADER_SIZE + 1,
+        MAX_LOGICAL_SIZE + WUD_SECTOR_SIZE as u64,
+    ] {
+        raw(&source, size);
+        let plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+        assert!(!plan.refusals.is_empty(), "accepted {size}");
+        assert!(plan.wux_creation.is_none());
+        assert!(
+            execute_wiiu_conversion(
+                &plan,
+                &options(d.path()),
+                &AtomicBool::new(false),
+                &mut |_| {}
+            )
+            .is_err()
+        );
+        assert!(!destination.exists());
+        assert!(stages(d.path()).is_empty());
+    }
+    raw(&source, WUD_HEADER_SIZE);
+    edit(&source, 0x10000, &[0; 4]);
+    assert!(
+        !plan_wiiu_conversion(&encoding_request(&source, &destination))
+            .refusals
+            .is_empty()
+    );
+}
+
+#[test]
+fn wud_to_wux_geometry_limits_overflow_and_table_alignment_are_checked() {
+    for size in [
+        0,
+        1,
+        WUD_HEADER_SIZE - 1,
+        WUD_HEADER_SIZE + 1,
+        MAX_LOGICAL_SIZE + 0x8000,
+        u64::MAX,
+    ] {
+        assert!(WiiUWuxCreationLayout::for_size(size).is_err());
+    }
+    let largest = WiiUWuxCreationLayout::for_size(MAX_LOGICAL_SIZE).unwrap();
+    assert_eq!(largest.logical_block_count, 2_097_152);
+    assert_eq!(largest.lookup_table_bytes, 8_388_608);
+    assert!(largest.lookup_table_bytes <= MAX_WUX_TABLE_BYTES);
+    assert_eq!(largest.payload_offset, 8_421_376);
+    assert_eq!(
+        largest.maximum_output_bytes,
+        MAX_LOGICAL_SIZE + largest.payload_offset
+    );
+    for (blocks, offset) in [
+        (8184, 0x8000),
+        (8185, 0x10000),
+        (16376, 0x10000),
+        (16377, 0x18000),
+    ] {
+        let layout = WiiUWuxCreationLayout::for_size(blocks * 0x8000).unwrap();
+        assert_eq!(layout.payload_offset, offset);
+        assert!(layout.lookup_table_bytes + 32 <= offset);
+    }
+}
+
+#[test]
+fn wud_to_wux_stale_header_body_size_and_replaced_source_never_stage() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    for change in 0..4 {
+        let bytes = encoding_fixture(&source, &[0x5a, 0]);
+        let plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+        match change {
+            0 => edit(&source, 0x10020, b"changed"),
+            1 => edit(&source, WUD_HEADER_SIZE + 19, &[0x99]),
+            2 => File::options()
+                .write(true)
+                .open(&source)
+                .unwrap()
+                .set_len(WUD_HEADER_SIZE)
+                .unwrap(),
+            _ => {
+                std::fs::rename(&source, d.path().join("retained.wud")).unwrap();
+                std::fs::write(&source, bytes).unwrap();
+            }
+        }
+        assert!(matches!(
+            execute_wiiu_conversion(
+                &plan,
+                &options(d.path()),
+                &AtomicBool::new(false),
+                &mut |_| {}
+            ),
+            Err(WiiUConversionError::StalePlan)
+        ));
+        assert!(!destination.exists());
+        assert!(stages(d.path()).is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn wud_to_wux_restored_mtime_cannot_hide_a_body_edit() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    encoding_fixture(&source, &[0x5a]);
+    let plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+    edit(&source, WUD_HEADER_SIZE + 7, &[0x42]);
+    File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new().set_modified(
+                plan.source_inspection
+                    .source_evidence
+                    .as_ref()
+                    .unwrap()
+                    .modified,
+            ),
+        )
+        .unwrap();
+    assert!(matches!(
+        execute_wiiu_conversion(
+            &plan,
+            &options(d.path()),
+            &AtomicBool::new(false),
+            &mut |_| {}
+        ),
+        Err(WiiUConversionError::StalePlan)
+    ));
+    assert!(stages(d.path()).is_empty());
+}
+
+#[test]
+fn wud_to_wux_existing_and_late_destinations_are_never_replaced() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    encoding_fixture(&source, &[0]);
+    for late in [false, true] {
+        let destination = d.path().join(format!("{late}.wux"));
+        let plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+        if !late {
+            std::fs::write(&destination, b"kept").unwrap();
+        }
+        let result = execute_wiiu_conversion(
+            &plan,
+            &options(d.path()),
+            &AtomicBool::new(false),
+            &mut |p| {
+                if late && p.written_bytes == p.expected_bytes {
+                    std::fs::write(&destination, b"kept").unwrap();
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"kept");
+        assert!(
+            plan_wiiu_conversion(&encoding_request(&source, &destination))
+                .refusals
+                .contains(&WiiUConversionRefusal::DestinationExists)
+        );
+        assert!(stages(d.path()).is_empty());
+    }
+}
+
+#[test]
+fn wud_to_wux_source_alias_and_hard_link_are_refused() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let original = encoding_fixture(&source, &[0x5a]);
+    let alias = d.path().join("alias.wux");
+    std::fs::hard_link(&source, &alias).unwrap();
+    for destination in [&source, &alias] {
+        let plan = plan_wiiu_conversion(&encoding_request(&source, destination));
+        assert!(!plan.refusals.is_empty());
+        assert!(
+            execute_wiiu_conversion(
+                &plan,
+                &options(d.path()),
+                &AtomicBool::new(false),
+                &mut |_| {}
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(std::fs::read(source).unwrap(), original);
+    assert_eq!(std::fs::read(alias).unwrap(), original);
+    assert!(stages(d.path()).is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn wud_to_wux_symlinks_and_special_sources_fail_closed() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    encoding_fixture(&source, &[]);
+    let alias = d.path().join("alias.wud");
+    std::os::unix::fs::symlink(&source, &alias).unwrap();
+    for unsafe_source in [&alias, d.path()] {
+        let plan = plan_wiiu_conversion(&encoding_request(unsafe_source, &destination));
+        assert!(!plan.refusals.is_empty());
+        assert!(
+            execute_wiiu_conversion(
+                &plan,
+                &options(d.path()),
+                &AtomicBool::new(false),
+                &mut |_| {}
+            )
+            .is_err()
+        );
+    }
+    std::os::unix::fs::symlink(d.path().join("absent"), &destination).unwrap();
+    assert!(
+        plan_wiiu_conversion(&encoding_request(&source, &destination))
+            .refusals
+            .contains(&WiiUConversionRefusal::DestinationExists)
+    );
+    let parent = d.path().join("linked-parent");
+    std::os::unix::fs::symlink(d.path(), &parent).unwrap();
+    assert!(
+        plan_wiiu_conversion(&encoding_request(&source, &parent.join("out.wux")))
+            .refusals
+            .contains(&WiiUConversionRefusal::DestinationPathUnsafe)
+    );
+}
+
+#[test]
+fn wud_to_wux_cancelled_write_removes_stage_and_preserves_source() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    let original = encoding_fixture(&source, &[0, 0x5a, 0]);
+    let cancel = AtomicBool::new(false);
+    let mut callbacks = 0;
+    let result = execute_wiiu_conversion(
+        &plan_wiiu_conversion(&encoding_request(&source, &destination)),
+        &options(d.path()),
+        &cancel,
+        &mut |_| {
+            callbacks += 1;
+            cancel.store(true, Ordering::Relaxed);
+        },
+    );
+    assert!(matches!(result, Err(WiiUConversionError::Cancelled)));
+    assert_eq!(callbacks, 1);
+    assert!(!destination.exists());
+    assert!(!d.path().join("journal").exists());
+    assert!(stages(d.path()).is_empty());
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn wud_to_wux_source_changes_during_encoding_never_publish() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    for change in 0..3 {
+        encoding_fixture(&source, &[0x5a, 0]);
+        let mut once = false;
+        let result = execute_wiiu_conversion(
+            &plan_wiiu_conversion(&encoding_request(&source, &destination)),
+            &options(d.path()),
+            &AtomicBool::new(false),
+            &mut |_| {
+                if !once {
+                    once = true;
+                    match change {
+                        0 => File::options()
+                            .write(true)
+                            .open(&source)
+                            .unwrap()
+                            .set_len(32)
+                            .unwrap(),
+                        1 => edit(&source, WUD_HEADER_SIZE + 17, &[0x99]),
+                        _ => edit(&source, 17, &[0x99]),
+                    }
+                }
+            },
+        );
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        assert!(stages(d.path()).is_empty());
+    }
+}
+
+#[test]
+fn wud_to_wux_corrupted_stage_header_table_payload_and_extent_never_publish() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    let original = encoding_fixture(&source, &[0x5a, 0]);
+    for corrupt in 0..4 {
+        let result = execute_wiiu_conversion(
+            &plan_wiiu_conversion(&encoding_request(&source, &destination)),
+            &options(d.path()),
+            &AtomicBool::new(false),
+            &mut |p| {
+                if p.written_bytes == p.expected_bytes {
+                    let staged = stages(d.path())[0].join("output.wux");
+                    match corrupt {
+                        0 => edit(&staged, 0, b"NOPE"),
+                        1 => edit(&staged, 32 + 4 * 4, &u32::MAX.to_le_bytes()),
+                        // Structure still parses: only full logical hashing catches this.
+                        2 => edit(&staged, 0x8000 + 4 * 0x8000 + 19, &[0x99]),
+                        _ => File::options()
+                            .write(true)
+                            .open(staged)
+                            .unwrap()
+                            .set_len(32)
+                            .unwrap(),
+                    }
+                }
+            },
+        );
+        assert!(
+            matches!(result, Err(WiiUConversionError::VerificationFailed(_))),
+            "{result:?}"
+        );
+        assert!(!destination.exists());
+        assert!(stages(d.path()).is_empty());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+}
+
+#[test]
+fn wud_to_wux_tampered_plan_geometry_and_direction_are_stale() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    encoding_fixture(&source, &[0]);
+    for change in 0..5 {
+        let mut plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+        match change {
+            0 => plan.wux_creation.as_mut().unwrap().block_size_bytes = 0x10000,
+            1 => plan.wux_creation.as_mut().unwrap().lookup_table_bytes = u64::MAX,
+            2 => plan.space.destination_maximum_bytes = Some(1),
+            3 => plan.direction = WiiUConversionDirection::WuxToWud,
+            _ => plan.wux_creation = None,
+        }
+        assert!(matches!(
+            execute_wiiu_conversion(
+                &plan,
+                &options(d.path()),
+                &AtomicBool::new(false),
+                &mut |_| {}
+            ),
+            Err(WiiUConversionError::StalePlan)
+        ));
+        assert!(!destination.exists());
+        assert!(stages(d.path()).is_empty());
+    }
+}
+
+#[test]
+fn wud_to_wux_hash_evidence_and_maximum_staging_space_are_required() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    let original = encoding_fixture(&source, &[0]);
+    let mut req = encoding_request(&source, &destination);
+    req.available_free_space = Some(original.len() as u64);
+    assert!(plan_wiiu_conversion(&req).refusals.iter().any(|r| matches!(
+        r,
+        WiiUConversionRefusal::InsufficientDestinationSpace { .. }
+    )));
+    req.available_free_space = None;
+    req.source_identity = WiiUConversionIdentity::HashAvailable {
+        algorithm: "sha256".into(),
+        value: "0".repeat(64),
+    };
+    assert!(matches!(
+        execute_wiiu_conversion(
+            &plan_wiiu_conversion(&req),
+            &options(d.path()),
+            &AtomicBool::new(false),
+            &mut |_| {}
+        ),
+        Err(WiiUConversionError::StalePlan)
+    ));
+    req.source_identity = WiiUConversionIdentity::HashAvailable {
+        algorithm: "SHA256".into(),
+        value: digest_hex(Sha256::digest(&original)),
+    };
+    assert!(
+        execute_wiiu_conversion(
+            &plan_wiiu_conversion(&req),
+            &options(d.path()),
+            &AtomicBool::new(false),
+            &mut |_| {}
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn wud_to_wux_journal_records_round_trip_and_existing_rollback_works() {
+    let d = tempdir().unwrap();
+    let source = d.path().join("disc.wud");
+    let destination = d.path().join("disc.wux");
+    let original = encoding_fixture(&source, &[0x5a, 0]);
+    let (record, mut result) = execute_wiiu_conversion(
+        &plan_wiiu_conversion(&encoding_request(&source, &destination)),
+        &options(d.path()),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .unwrap();
+    let encoded = std::fs::read(&destination).unwrap();
+    let evidence = &result.transaction.unknown["wiiu_conversion"];
+    assert_eq!(evidence["policy"], "native-wud-to-wux-zero-sharing-v1");
+    assert_eq!(evidence["source_retained"], true);
+    assert_eq!(
+        evidence["reconstructed_wud_sha256"],
+        record.source_container_sha256
+    );
+    assert_eq!(evidence["logical_wud_bytes"], original.len() as u64);
+    assert_eq!(evidence["wux_creation"]["reused_zero_blocks"], 1);
+    let staged = result.transaction.entries[0].source_path.clone();
+    let rollback = crate::repair::execute::rollback_repair_transaction(
+        &mut result.transaction,
+        &d.path().join("journal"),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(
+        rollback,
+        crate::dat::rename_apply::model::RollbackResult::FullyRolledBack
+    );
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(staged).unwrap(), encoded);
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn wud_to_wux_large_streaming_and_measurement() {
+    let bytes = std::env::var("EMUWIZ_WUD_WUX_PERF_BYTES")
+        .map(|v| v.parse::<u64>().unwrap())
+        .unwrap_or(128 * 1024 * 1024);
+    let d = tempdir().unwrap();
+    let source = d.path().join("large.wud");
+    let destination = d.path().join("large.wux");
+    raw(&source, bytes);
+    let start = std::time::Instant::now();
+    let original = crate::dat::rename_apply::identity::capture_identity(&source).unwrap();
+    let plan = plan_wiiu_conversion(&encoding_request(&source, &destination));
+    let mut previous = 0;
+    let mut callbacks = 0;
+    let (record, _) = execute_wiiu_conversion(
+        &plan,
+        &options(d.path()),
+        &AtomicBool::new(false),
+        &mut |p| {
+            assert_eq!(
+                p.written_bytes - previous,
+                WIIU_WUX_CANONICAL_BLOCK_BYTES as u64
+            );
+            assert_eq!(p.completed_blocks, p.written_bytes / 0x8000);
+            previous = p.written_bytes;
+            callbacks += 1;
+        },
+    )
+    .unwrap();
+    let stats = record.wux_creation.unwrap();
+    assert_eq!(previous, bytes);
+    assert_eq!(callbacks, bytes / 0x8000);
+    assert_eq!(stats.stored_blocks, 4);
+    assert_eq!(stats.zero_blocks, bytes / 0x8000 - 3);
+    assert_eq!(stats.reused_zero_blocks, stats.zero_blocks - 1);
+    assert_eq!(
+        record.reconstructed_wud_sha256,
+        record.source_container_sha256
+    );
+    assert!(crate::dat::rename_apply::identity::identity_matches(
+        &original,
+        &crate::dat::rename_apply::identity::capture_identity(&source).unwrap()
+    ));
+    println!(
+        "WUD_WUX_PERF input_bytes={bytes} output_bytes={} zero_blocks={} reused_zero_blocks={} stored_blocks={} callbacks={callbacks} elapsed_seconds={:.3}",
+        record.output_bytes,
+        stats.zero_blocks,
+        stats.reused_zero_blocks,
+        stats.stored_blocks,
+        start.elapsed().as_secs_f64()
+    );
 }

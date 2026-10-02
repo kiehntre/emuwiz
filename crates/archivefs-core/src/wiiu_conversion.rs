@@ -1,4 +1,4 @@
-//! Bounded preview and verified native WUX → WUD conversion.
+//! Bounded preview and verified native WUD ↔ WUX conversion.
 //! Publication reuses the journaled Repair transaction engine.
 
 use std::fs;
@@ -87,6 +87,7 @@ pub enum WiiUConversionIdentity {
 pub struct WiiUConversionSpaceEstimate {
     pub source_bytes: u64,
     pub destination_exact_bytes: Option<u64>,
+    pub destination_maximum_bytes: Option<u64>,
     pub destination_description: String,
     pub temporary_bytes: Option<u64>,
     pub atomic_duplicate_bytes: Option<u64>,
@@ -128,6 +129,59 @@ pub enum WiiUConversionRefusal {
     AmbiguousSplit,
     DeferredDirection,
     InvalidSourceIdentity,
+    InvalidWriterLayout(WiiUDiscIssue),
+}
+
+/// One interoperable, deterministic encoding, not a tunable block-size range.
+pub const WIIU_WUX_CANONICAL_BLOCK_BYTES: u32 = crate::wiiu_disc::WUD_SECTOR_SIZE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WiiUWuxCreationLayout {
+    pub block_size_bytes: u32,
+    pub logical_size_bytes: u64,
+    pub logical_block_count: u64,
+    pub lookup_table_bytes: u64,
+    pub payload_offset: u64,
+    pub maximum_output_bytes: u64,
+}
+impl WiiUWuxCreationLayout {
+    pub(crate) fn for_size(logical: u64) -> Result<Self, WiiUDiscIssue> {
+        crate::wiiu_disc::validate_logical_size(logical)?;
+        let overflow = || WiiUDiscIssue::LogicalSizeOverflow;
+        let block = u64::from(WIIU_WUX_CANONICAL_BLOCK_BYTES);
+        let count = logical.checked_div(block).ok_or_else(overflow)?;
+        let table = count.checked_mul(4).ok_or_else(overflow)?;
+        if table > crate::wiiu_disc::MAX_WUX_TABLE_BYTES
+            || usize::try_from(count).is_err()
+            || u32::try_from(count).is_err()
+        {
+            return Err(WiiUDiscIssue::AbsurdBlockCount(count));
+        }
+        let payload_offset = crate::wiiu_disc::checked_align(
+            crate::wiiu_disc::WUX_HEADER
+                .checked_add(table)
+                .ok_or_else(overflow)?,
+            block,
+        )
+        .ok_or_else(overflow)?;
+        Ok(Self {
+            block_size_bytes: WIIU_WUX_CANONICAL_BLOCK_BYTES,
+            logical_size_bytes: logical,
+            logical_block_count: count,
+            lookup_table_bytes: table,
+            payload_offset,
+            maximum_output_bytes: payload_offset.checked_add(logical).ok_or_else(overflow)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WiiUWuxCreationStatistics {
+    /// All logical zero blocks, including the first physically stored one.
+    pub zero_blocks: u64,
+    pub reused_zero_blocks: u64,
+    /// Includes the shared zero block if present. Non-zero duplicates stay stored.
+    pub stored_blocks: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -152,12 +206,16 @@ pub struct WiiUConversionPlan {
     pub estimated_blocks: Option<u64>,
     pub no_clobber: bool,
     pub post_write_verification_available: bool,
+    pub wux_creation: Option<WiiUWuxCreationLayout>,
     binding: Option<(
         PathBuf,
         PathBuf,
         crate::wiiu_disc::WiiUDiscEvidence,
         WiiUConversionIdentity,
     )>,
+    // Queues saved before encoding support have the four-part binding above.
+    // Their only executable direction was WUX -> WUD; retain that binding.
+    binding_direction: Option<WiiUConversionDirection>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,7 +275,7 @@ fn valid_sha256(algorithm: &str, value: &str) -> bool {
 /// not a purported hash of the uncompressed original disc.
 pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPlan {
     let report = crate::wiiu_disc::inspect_wii_u_disc(&request.source);
-    let native = request.direction == WiiUConversionDirection::WuxToWud;
+    let creating_wux = request.direction == WiiUConversionDirection::WudToWux;
     let mut refusals = Vec::new();
     if report.format != request.direction.source_format() {
         refusals.push(WiiUConversionRefusal::WrongSourceFormat {
@@ -254,14 +312,11 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
         }
         _ => {}
     }
-    if !native {
-        refusals.push(WiiUConversionRefusal::DeferredDirection);
-    }
     let source = report
         .structure
         .as_ref()
         .map_or(0, |s| s.physical_container_size_bytes);
-    let exact = native
+    let exact = (!creating_wux)
         .then(|| {
             report
                 .structure
@@ -269,6 +324,18 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
                 .and_then(|s| s.logical_disc_size_bytes)
         })
         .flatten();
+    let wux_creation = if creating_wux && report.structural_complete {
+        match WiiUWuxCreationLayout::for_size(source) {
+            Ok(layout) => Some(layout),
+            Err(issue) => {
+                refusals.push(WiiUConversionRefusal::InvalidWriterLayout(issue));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let maximum = wux_creation.map(|l| l.maximum_output_bytes).or(exact);
     let available = request.available_free_space.or_else(|| {
         request
             .destination
@@ -276,7 +343,7 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
             .and_then(crate::diagnostics::environment::filesystem_stat)
             .map(|s| s.available_bytes)
     });
-    if let (Some(required), Some(available)) = (exact, available)
+    if let (Some(required), Some(available)) = (maximum, available)
         && available < required
     {
         refusals.push(WiiUConversionRefusal::InsufficientDestinationSpace {
@@ -287,17 +354,25 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
     let space = WiiUConversionSpaceEstimate {
         source_bytes: source,
         destination_exact_bytes: exact,
+        destination_maximum_bytes: maximum,
         destination_description: exact
             .map(|n| format!("exact logical WUD size: {n} bytes"))
-            .unwrap_or_else(|| "WUD → WUX generation is deferred".into()),
+            .or_else(|| {
+                maximum.map(|n| {
+                    format!(
+                        "canonical WUX upper bound: {n} bytes; zero sharing determines actual size"
+                    )
+                })
+            })
+            .unwrap_or_else(|| "valid output geometry unavailable".into()),
         // Same-filesystem staging becomes the destination by atomic rename.
-        temporary_bytes: exact,
+        temporary_bytes: maximum,
         atomic_duplicate_bytes: Some(0),
         available_bytes: available,
-        sufficient: exact.zip(available).map(|(n, a)| a >= n),
+        sufficient: maximum.zip(available).map(|(n, a)| a >= n),
         safety_margin_bytes: 0,
     };
-    let readiness = if !native || report.format == WiiUDiscFormat::Wua {
+    let readiness = if report.format == WiiUDiscFormat::Wua {
         WiiUConversionReadiness::Unsupported
     } else if refusals.is_empty() {
         WiiUConversionReadiness::ReadyToPreview
@@ -312,7 +387,9 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
             request.source_identity.clone(),
         )
     });
-    let estimated_blocks = report.structure.as_ref().and_then(|s| s.block_count);
+    let estimated_blocks = wux_creation
+        .map(|l| l.logical_block_count)
+        .or_else(|| report.structure.as_ref().and_then(|s| s.block_count));
     let warnings = report.issues.iter().map(|i| format!("{i:?}")).collect();
     WiiUConversionPlan {
         source: request.source.clone(),
@@ -330,23 +407,39 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
         space,
         verification: WiiUConversionVerificationPlan {
             required: true,
-            exact_identity_provable: native,
+            exact_identity_provable: true,
             steps: vec![
                 "revalidate bounded source binding before writes".into(),
-                "stream sectors in logical WUD order and hash reconstructed bytes".into(),
-                "inspect staged WUD and compare complete header evidence".into(),
-                "verify exact output size and independent full-file SHA-256".into(),
+                if creating_wux {
+                    "encode sequential 32 KiB blocks; share only exactly zero blocks".into()
+                } else {
+                    "stream sectors in logical WUD order and hash reconstructed bytes".into()
+                },
+                "inspect staged output; compare logical size and complete WUD header evidence"
+                    .into(),
+                if creating_wux {
+                    "stream staged WUX through the existing logical reader; compare full SHA-256 with source WUD".into()
+                } else {
+                    "verify exact output size and independent full-file SHA-256".into()
+                },
                 "revalidate full source hash; publish with journaled no-clobber move".into(),
             ],
             source_identity: request.source_identity.clone(),
         },
         source_immutable: true,
         keys_required: false,
-        provenance: "native-wux-to-wud-v1".into(),
+        provenance: if creating_wux {
+            "native-wud-to-wux-zero-sharing-v1"
+        } else {
+            "native-wux-to-wud-v1"
+        }
+        .into(),
         estimated_blocks,
         no_clobber: true,
-        post_write_verification_available: native,
+        post_write_verification_available: true,
+        wux_creation,
         binding,
+        binding_direction: Some(request.direction),
     }
 }
 
@@ -378,6 +471,7 @@ impl From<std::io::Error> for WiiUConversionError {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WiiUConversionProgress {
+    /// Logical bytes processed, also for WUX creation (not physical WUX bytes).
     pub written_bytes: u64,
     pub expected_bytes: u64,
     pub completed_blocks: u64,
@@ -393,6 +487,7 @@ pub struct WiiUConversionRecord {
     pub output_sha256: String,
     pub header_sha256: String,
     pub source_header: crate::wiiu_disc::WiiUHeaderEvidence,
+    pub wux_creation: Option<WiiUWuxCreationStatistics>,
     pub policy: String,
     pub transaction_id: String,
 }
@@ -410,12 +505,15 @@ pub(crate) fn revalidate(
     let Some((source, destination, evidence, identity)) = &plan.binding else {
         return Err(WiiUConversionError::StalePlan);
     };
+    let direction = plan
+        .binding_direction
+        .unwrap_or(WiiUConversionDirection::WuxToWud);
     if source != &plan.source
         || destination != &plan.destination
         || identity != &plan.source_identity
-        || plan.direction != WiiUConversionDirection::WuxToWud
-        || plan.source_format != WiiUDiscFormat::Wux
-        || plan.target_format != WiiUDiscFormat::Wud
+        || direction != plan.direction
+        || plan.source_format != direction.source_format()
+        || plan.target_format != direction.target_format()
     {
         return Err(WiiUConversionError::StalePlan);
     }
@@ -433,11 +531,10 @@ pub(crate) fn revalidate(
     if !report.structural_complete
         || report.source_evidence.as_ref() != Some(evidence)
         || report != plan.source_inspection
-        || report
-            .structure
-            .as_ref()
-            .and_then(|s| s.logical_disc_size_bytes)
-            != plan.space.destination_exact_bytes
+        || fresh.space.destination_exact_bytes != plan.space.destination_exact_bytes
+        || fresh.space.destination_maximum_bytes != plan.space.destination_maximum_bytes
+        || fresh.space.temporary_bytes != plan.space.temporary_bytes
+        || fresh.wux_creation != plan.wux_creation
     {
         return Err(WiiUConversionError::StalePlan);
     }
@@ -449,7 +546,160 @@ pub(crate) fn revalidate(
 
 pub const WIIU_CONVERSION_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Native streaming decode, explicitly invoked after preview approval.
+/// The format has stored-sector references, not sparse sentinels. Store the
+/// first zero block and share it; store every non-zero block in encounter order.
+fn encode_wud(
+    source: &mut fs::File,
+    output: &mut fs::File,
+    layout: WiiUWuxCreationLayout,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mut dyn FnMut(WiiUConversionProgress),
+) -> Result<(String, WiiUWuxCreationStatistics), WiiUConversionError> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    if WiiUWuxCreationLayout::for_size(source.metadata()?.len())
+        .map_err(WiiUConversionError::InvalidSource)?
+        != layout
+    {
+        return Err(WiiUConversionError::StalePlan);
+    }
+    let overflow = || WiiUConversionError::InvalidSource(WiiUDiscIssue::LogicalSizeOverflow);
+    let mut table = Vec::<u32>::new();
+    // Geometry and the allocation cap are proven before allocating metadata.
+    table
+        .try_reserve_exact(usize::try_from(layout.logical_block_count).map_err(|_| overflow())?)
+        .map_err(|e| std::io::Error::other(format!("WUX table allocation failed: {e}")))?;
+    let mut header = [0_u8; crate::wiiu_disc::WUX_HEADER as usize];
+    header[..4].copy_from_slice(b"WUX0");
+    header[4..8].copy_from_slice(&crate::wiiu_disc::MAGIC1.to_le_bytes());
+    header[8..12].copy_from_slice(&layout.block_size_bytes.to_le_bytes());
+    header[16..24].copy_from_slice(&layout.logical_size_bytes.to_le_bytes());
+    output.write_all(&header)?;
+    let zeros = [0_u8; WIIU_WUX_CANONICAL_BLOCK_BYTES as usize];
+    let mut padding = layout
+        .payload_offset
+        .checked_sub(crate::wiiu_disc::WUX_HEADER)
+        .ok_or_else(overflow)?;
+    while padding > 0 {
+        check_cancel(cancel)?;
+        let length = padding.min(zeros.len() as u64) as usize;
+        output.write_all(&zeros[..length])?;
+        padding = padding.checked_sub(length as u64).ok_or_else(overflow)?;
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let mut buffer = [0_u8; WIIU_WUX_CANONICAL_BLOCK_BYTES as usize];
+    let mut digest = Sha256::new();
+    let mut zero_index = None;
+    let mut stored = 0_u32;
+    let mut zero_blocks = 0_u64;
+    let mut processed = 0_u64;
+    for completed in 0..layout.logical_block_count {
+        check_cancel(cancel)?;
+        source.read_exact(&mut buffer)?;
+        digest.update(buffer);
+        let is_zero = buffer == zeros;
+        if is_zero {
+            zero_blocks = zero_blocks.checked_add(1).ok_or_else(overflow)?;
+        }
+        let index = if is_zero && let Some(index) = zero_index {
+            index
+        } else {
+            let index = stored;
+            output.write_all(&buffer)?;
+            stored = stored.checked_add(1).ok_or_else(overflow)?;
+            if is_zero {
+                zero_index = Some(index);
+            }
+            index
+        };
+        table.push(index);
+        processed = processed
+            .checked_add(u64::from(layout.block_size_bytes))
+            .ok_or_else(overflow)?;
+        if processed < layout.logical_size_bytes {
+            progress(WiiUConversionProgress {
+                written_bytes: processed,
+                expected_bytes: layout.logical_size_bytes,
+                completed_blocks: completed.checked_add(1).ok_or_else(overflow)?,
+                total_blocks: layout.logical_block_count,
+            });
+        }
+    }
+    check_cancel(cancel)?;
+    output.seek(SeekFrom::Start(crate::wiiu_disc::WUX_HEADER))?;
+    let mut entries = std::io::BufWriter::new(output);
+    for (i, index) in table.iter().enumerate() {
+        if i.is_multiple_of(2048) {
+            check_cancel(cancel)?;
+        }
+        entries.write_all(&index.to_le_bytes())?;
+    }
+    entries.flush()?;
+    progress(WiiUConversionProgress {
+        written_bytes: processed,
+        expected_bytes: layout.logical_size_bytes,
+        completed_blocks: layout.logical_block_count,
+        total_blocks: layout.logical_block_count,
+    });
+    Ok((
+        digest_hex(digest.finalize()),
+        WiiUWuxCreationStatistics {
+            zero_blocks,
+            reused_zero_blocks: zero_blocks.checked_sub(1).unwrap_or(0),
+            stored_blocks: u64::from(stored),
+        },
+    ))
+}
+
+/// Reconstruct through the existing reader into a hash, without a second WUD.
+fn hash_staged_wux(
+    path: &Path,
+    inspection: &WiiUDiscInspection,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<String, WiiUConversionError> {
+    use sha2::{Digest, Sha256};
+    let evidence = inspection
+        .source_evidence
+        .as_ref()
+        .ok_or_else(|| WiiUConversionError::VerificationFailed("missing staged evidence".into()))?;
+    let mut file =
+        crate::safe_read::open_bounded_read(path, &crate::safe_read::TrustedRoots::none())
+            .map_err(|e| WiiUConversionError::VerificationFailed(format!("{e:?}")))?
+            .into_file();
+    if !evidence.matches_metadata(&file.metadata()?) {
+        return Err(WiiUConversionError::VerificationFailed(
+            "staged WUX changed".into(),
+        ));
+    }
+    let layout = crate::wiiu_disc::load_wux(&mut file, evidence.size_bytes)
+        .map_err(WiiUConversionError::InvalidSource)?;
+    let mut buffer = [0_u8; WIIU_CONVERSION_CHUNK_BYTES];
+    let mut digest = Sha256::new();
+    let mut offset = 0_u64;
+    while offset < layout.logical {
+        check_cancel(cancel)?;
+        let length = (layout.logical - offset).min(buffer.len() as u64) as usize;
+        crate::wiiu_disc::read_wux_at(&mut file, &layout, offset, &mut buffer[..length])
+            .map_err(WiiUConversionError::InvalidSource)?;
+        digest.update(&buffer[..length]);
+        offset = offset
+            .checked_add(length as u64)
+            .ok_or(WiiUConversionError::InvalidSource(
+                WiiUDiscIssue::LogicalSizeOverflow,
+            ))?;
+    }
+    if !evidence.matches_metadata(&file.metadata()?)
+        || !evidence.matches_metadata(&fs::symlink_metadata(path)?)
+    {
+        return Err(WiiUConversionError::VerificationFailed(
+            "staged WUX changed".into(),
+        ));
+    }
+    Ok(digest_hex(digest.finalize()))
+}
+
+/// Native streaming conversion, explicitly invoked after preview approval.
 /// Full identity capture and Repair's hash checks use existing fixed buffers;
 /// cancellation is checked per decode chunk and at phase boundaries.
 pub fn execute_wiiu_conversion(
@@ -522,12 +772,13 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
     if !evidence.matches_metadata(&source.metadata()?) {
         return Err(WiiUConversionError::StalePlan);
     }
-    let layout = crate::wiiu_disc::load_wux(&mut source, evidence.size_bytes)
-        .map_err(WiiUConversionError::InvalidSource)?;
-    if !evidence.matches_metadata(&source.metadata()?) {
-        return Err(WiiUConversionError::StalePlan);
-    }
-    let logical = layout.logical;
+    let logical = report
+        .structure
+        .as_ref()
+        .unwrap()
+        .logical_disc_size_bytes
+        .unwrap();
+    let creating_wux = plan.direction == WiiUConversionDirection::WudToWux;
     let parent = plan
         .destination
         .parent()
@@ -535,48 +786,77 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
     let stage = tempfile::Builder::new()
         .prefix(".emuwiz-wiiu-")
         .tempdir_in(staging_parent.unwrap_or(parent))?;
-    let staged = stage.path().join("output.wud");
+    let staged = stage.path().join(if creating_wux {
+        "output.wux"
+    } else {
+        "output.wud"
+    });
     let mut output = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&staged)?;
-    let mut buffer = [0_u8; WIIU_CONVERSION_CHUNK_BYTES];
-    let mut digest = Sha256::new();
-    let mut written = 0_u64;
-    while written < layout.logical {
-        check_cancel(cancel)?;
-        let length = (layout.logical - written).min(buffer.len() as u64) as usize;
-        crate::wiiu_disc::read_wux_at(&mut source, &layout, written, &mut buffer[..length])
-            .map_err(WiiUConversionError::InvalidSource)?;
-        output.write_all(&buffer[..length])?;
-        digest.update(&buffer[..length]);
-        written = written
-            .checked_add(length as u64)
-            .ok_or(WiiUConversionError::InvalidSource(
-                WiiUDiscIssue::LogicalSizeOverflow,
-            ))?;
-        progress(WiiUConversionProgress {
-            written_bytes: written,
-            expected_bytes: layout.logical,
-            completed_blocks: if written == layout.logical {
-                layout.table.len() as u64
-            } else {
-                written / u64::from(layout.sector)
-            },
-            total_blocks: layout.table.len() as u64,
-        });
-    }
+    let (reconstructed_sha, creation_statistics) =
+        if let Some(layout) = plan.wux_creation {
+            let (streamed_source_sha, statistics) =
+                encode_wud(&mut source, &mut output, layout, cancel, progress)?;
+            if streamed_source_sha != source_sha {
+                return Err(WiiUConversionError::StalePlan);
+            }
+            (streamed_source_sha, Some(statistics))
+        } else {
+            let layout = crate::wiiu_disc::load_wux(&mut source, evidence.size_bytes)
+                .map_err(WiiUConversionError::InvalidSource)?;
+            if !evidence.matches_metadata(&source.metadata()?) {
+                return Err(WiiUConversionError::StalePlan);
+            }
+            let mut buffer = [0_u8; WIIU_CONVERSION_CHUNK_BYTES];
+            let mut digest = Sha256::new();
+            let mut written = 0_u64;
+            while written < layout.logical {
+                check_cancel(cancel)?;
+                let length = (layout.logical - written).min(buffer.len() as u64) as usize;
+                crate::wiiu_disc::read_wux_at(&mut source, &layout, written, &mut buffer[..length])
+                    .map_err(WiiUConversionError::InvalidSource)?;
+                output.write_all(&buffer[..length])?;
+                digest.update(&buffer[..length]);
+                written = written.checked_add(length as u64).ok_or(
+                    WiiUConversionError::InvalidSource(WiiUDiscIssue::LogicalSizeOverflow),
+                )?;
+                progress(WiiUConversionProgress {
+                    written_bytes: written,
+                    expected_bytes: layout.logical,
+                    completed_blocks: if written == layout.logical {
+                        layout.table.len() as u64
+                    } else {
+                        written / u64::from(layout.sector)
+                    },
+                    total_blocks: layout.table.len() as u64,
+                });
+            }
+            // Release the bounded table before later source inspection allocates one.
+            (digest_hex(digest.finalize()), None)
+        };
     check_cancel(cancel)?;
-    // Release the bounded table before later source inspection allocates one.
-    drop(layout);
     output.sync_all()?;
-    if output.metadata()?.len() != logical {
+    let output_bytes = output.metadata()?.len();
+    let expected_output_bytes =
+        if let (Some(layout), Some(stats)) = (plan.wux_creation, creation_statistics) {
+            stats
+                .stored_blocks
+                .checked_mul(u64::from(layout.block_size_bytes))
+                .and_then(|n| layout.payload_offset.checked_add(n))
+                .ok_or(WiiUConversionError::InvalidSource(
+                    WiiUDiscIssue::LogicalSizeOverflow,
+                ))?
+        } else {
+            logical
+        };
+    if output_bytes != expected_output_bytes {
         return Err(WiiUConversionError::VerificationFailed(
             "output size differs".into(),
         ));
     }
     drop(output);
-    let reconstructed_sha = digest_hex(digest.finalize());
     let inspected_output = crate::wiiu_disc::inspect_wii_u_disc(&staged);
     let source_header = report
         .structure
@@ -584,7 +864,12 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
         .and_then(|s| s.wud_header.as_ref())
         .unwrap();
     if !inspected_output.structural_complete
-        || inspected_output.format != WiiUDiscFormat::Wud
+        || inspected_output.format != plan.target_format
+        || inspected_output
+            .structure
+            .as_ref()
+            .and_then(|s| s.logical_disc_size_bytes)
+            != Some(logical)
         || inspected_output
             .structure
             .as_ref()
@@ -592,12 +877,31 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
             != Some(source_header)
     {
         return Err(WiiUConversionError::VerificationFailed(
-            "WUD structural evidence differs from WUX projection".into(),
+            "staged logical size/header evidence differs from source".into(),
         ));
+    }
+    if let Some(stats) = creation_statistics {
+        let structure = inspected_output.structure.as_ref().unwrap();
+        if structure.sector_size_bytes != Some(WIIU_WUX_CANONICAL_BLOCK_BYTES)
+            || structure.referenced_block_count != Some(stats.stored_blocks)
+            || structure.repeated_block_count != Some(stats.reused_zero_blocks)
+            || hash_staged_wux(&staged, &inspected_output, cancel)? != reconstructed_sha
+        {
+            return Err(WiiUConversionError::VerificationFailed(
+                "WUX round-trip SHA-256 or canonical mapping differs".into(),
+            ));
+        }
     }
     let output_identity = capture_identity(&staged)?;
     let output_sha = digest_hex(output_identity.freshness.as_ref().unwrap().sha256);
-    if output_identity.size_bytes != logical || output_sha != reconstructed_sha {
+    if output_identity.size_bytes != expected_output_bytes
+        || (!creating_wux && output_sha != reconstructed_sha)
+        || !inspected_output
+            .source_evidence
+            .as_ref()
+            .unwrap()
+            .matches_metadata(&fs::symlink_metadata(&staged)?)
+    {
         return Err(WiiUConversionError::VerificationFailed(
             "independent output hash/size differs".into(),
         ));
@@ -609,13 +913,18 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
     }
     revalidate(plan, false)?;
     check_cancel(cancel)?;
+    let policy = if creating_wux {
+        "native-wud-to-wux-zero-sharing-v1"
+    } else {
+        "native-wux-to-wud-v1"
+    };
     let proposal = RepairProposal {
         id: RepairProposalId::new("wiiu-output").unwrap(),
         action: RepairAction::MovePath {
             destination: plan.destination.clone(),
         },
         source_path: staged.clone(),
-        reason: "publish independently verified native WUX → WUD output".into(),
+        reason: "publish independently verified native Wii U conversion output".into(),
         evidence: vec![RepairEvidence::new(
             RepairEvidenceKind::UserRequestedOrganisation,
             "exact size, SHA-256 and WUD header evidence verified",
@@ -629,7 +938,7 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
         dat_source_display: None,
         game_name: None,
         rom_name: None,
-        verdict_label: Some("Verified WUD output".into()),
+        verdict_label: Some(format!("Verified {:?} output", plan.target_format)),
         match_confident: true,
         is_outer_archive: false,
         is_outer_archive_verified: false,
@@ -639,7 +948,7 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
         RepairPlanId::new("wiiu-output-v1").unwrap(),
         0,
         crate::dat::sources::now_unix(),
-        Some("native-wux-to-wud-v1".into()),
+        Some(policy.into()),
         vec![proposal],
     );
     let mut transaction = build_repair_transaction(&publication)
@@ -647,13 +956,14 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
     let record = WiiUConversionRecord {
         source: plan.source.clone(),
         destination: plan.destination.clone(),
-        output_bytes: logical,
+        output_bytes,
         source_container_sha256: source_sha,
         reconstructed_wud_sha256: reconstructed_sha,
         output_sha256: output_sha,
         header_sha256: digest_hex(source_header.header_sha256),
         source_header: source_header.clone(),
-        policy: "native-wux-to-wud-v1".into(),
+        wux_creation: creation_statistics,
+        policy: policy.into(),
         transaction_id: transaction.transaction_id.clone(),
     };
     transaction.unknown.insert(
@@ -664,6 +974,12 @@ pub(crate) fn execute_wiiu_conversion_in_stage(
             "reconstructed_wud_sha256": record.reconstructed_wud_sha256,
             "output_sha256": record.output_sha256, "header_sha256": record.header_sha256,
             "output_bytes": record.output_bytes, "keys_required": false, "source_retained": true,
+            "logical_wud_bytes": logical,
+            "wux_creation": record.wux_creation.map(|s| serde_json::json!({
+                "block_size_bytes": WIIU_WUX_CANONICAL_BLOCK_BYTES,
+                "stored_blocks": s.stored_blocks, "zero_blocks": s.zero_blocks,
+                "reused_zero_blocks": s.reused_zero_blocks,
+            })),
         }),
     );
     revalidate(plan, false)?;

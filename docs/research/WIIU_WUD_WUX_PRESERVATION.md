@@ -5,6 +5,10 @@ Final validation base: `d34cb3393b58a31114e45319f53cccf5479f4f20` (independent
 main promotions during this task; the backend candidate is rebased onto them).
 Backend only; this document supersedes the earlier preview-only Wii U design.
 
+WUD → WUX creation extension starts at main
+`fc8bda7be687e626d708a4633f73840bcbf15c32`. It extends the same native
+planner/executor and journaled publication path; there is no second converter.
+
 ## Architecture inventory and reuse
 
 Current main already exports `wiiu_disc` and `wiiu_conversion`. This change
@@ -92,11 +96,73 @@ No complete image is read into a Vec or `read_to_end`.
 [WUDD's interoperable writer](https://github.com/wiiu-env/wudd/blob/04872a3e83293cab668c64d67a4f396ae3b1c2f6/source/fs/WUXFileWriter.cpp)
 corroborates header padding, flags, alignment and stored-sector deduplication.
 
+## Canonical WUD → WUX writer
+
+Writing rules were checked before implementation against the original
+[WudCompress v1 format notes and writer](https://github.com/cemu-project/WudCompress/blob/b0ab5f6b6a46a1972dbbd802b6d04d46de003aab/WudCompress/main.cpp),
+its [header definition](https://github.com/cemu-project/WudCompress/blob/b0ab5f6b6a46a1972dbbd802b6d04d46de003aab/WudCompress/wud.h),
+the pinned WUDD writer above, and
+[Cemu's independent reader](https://github.com/cemu-project/Cemu/blob/e20bfd00ecfc4376e39048942c15a55463f065d0/src/Cafe/Filesystem/WUD/wud.cpp).
+Only format facts were used; no upstream implementation was copied into EmuWiz.
+
+The original format comment lists member types without ABI padding. The actual
+header definition and interoperable readers/writer establish this 32-byte
+layout; the table does **not** start after a packed 24-byte header.
+
+| Offset | Width | Canonical bytes / meaning |
+| --- | --- | --- |
+| `0x00` | 4 | ASCII `WUX0` |
+| `0x04` | 4 | little-endian `u32` `0x1099D02E` |
+| `0x08` | 4 | little-endian `u32` block size `0x8000` |
+| `0x0C` | 4 | zero ABI padding |
+| `0x10` | 8 | little-endian `u64` exact source WUD byte size |
+| `0x18` | 4 | little-endian `u32` flags 0 |
+| `0x1C` | 4 | zero trailing header padding |
+| `0x20` | `4 * logical_blocks` | little-endian `u32` physical block indices in logical order |
+| table end | to next `0x8000` boundary | zero padding |
+| aligned payload start | `stored_blocks * 0x8000` | consecutive complete physical blocks |
+
+The source must meet the existing complete-header and whole-32-KiB-sector WUD
+policy (128 KiB–64 GiB). WUX readers support a final partial logical block for
+some other block sizes; this writer accepts only `0x8000`, so partial WUD
+sectors refuse. No block-size tuning option is exposed. Raw WUD has no declared
+extent, so an aligned shortened opaque dump still cannot be authenticated as
+a historically complete disc.
+
+WUX permits different valid physical encodings. EmuWiz chooses one reproducible
+policy: walk logical blocks sequentially; store every non-zero block in encounter
+order, store the first all-zero block at its ordinary next physical index, and
+reference that index for later exactly zero blocks. There is no implicit hole,
+special index, omitted first zero block, generic compression or special treatment
+of `0xFF`/other repeated bytes. Non-zero duplicates remain separately stored.
+Upstream writers deduplicate more broadly; neither their map order nor their
+hash shortcut is part of this policy. It need not produce their same bytes.
+The original comment calls the sector array unique, but its stated array size
+uses logical sector count; repeated-index writer behaviour and reader addressing
+prove the actual payload size is determined by physically stored slots. These
+editorial ambiguities do not require private flags or change lookup semantics.
+
+`WiiUWuxCreationLayout` proves every size/offset with checked arithmetic before
+allocation. Worst-case WUX size is aligned payload start plus source size. At
+64 GiB the lookup has 2,097,152 entries (8 MiB), below the existing 16 MiB reader
+limit. Encoding keeps that bounded `u32` table, one 32 KiB input buffer, a fixed
+zero buffer and fixed hashing/I/O state. No payload or per-block hash map is
+retained. The creation table is dropped before re-inspection/reconstruction
+allocates a reader table. There is no image-sized allocation.
+
+All header/table/alignment padding is explicitly zero. No timestamp, transaction
+ID, path or machine data enters WUX bytes. Identical source bytes produce
+byte-identical WUX; random staging and journal IDs are outside the container.
+
 ## Preview, apply and verification
 
 `plan_wiiu_conversion` performs zero writes. It exposes source/destination,
 formats, physical/expected logical bytes, staged space, no-clobber status,
-header evidence, block count and verification availability. One output extent
+header evidence, block count and verification availability. WUD → WUX additionally
+projects fixed block size, exact logical size, lookup size/alignment and maximum
+output bytes. It does not scan all payload blocks to guess the final sharing
+ratio. Creation reserves worst-case output space; decoding reserves exact WUD
+space. One output extent
 is required on the destination filesystem; atomic rename needs no second copy.
 Free space excludes the source, which already exists. Metadata/journal space
 is not estimated; any ENOSPC during writes fails safely. Optional caller
@@ -121,6 +187,20 @@ with the hash accumulated over reconstruction. WUX contains no payload checksum:
 this proves faithful reconstruction, not authenticity against a historical
 original or DAT. Source bytes are never rewritten, renamed or deleted.
 
+For WUD → WUX, the same executor captures a stable full source SHA-256, streams
+the source read-only into a private stage, and compares its streaming source
+digest with that captured proof. It backfills the little-endian table, syncs,
+re-inspects WUX, and compares exact logical size and complete WUD header evidence.
+Stored/repeated block counts must match the encoder's receipt. It then reconstructs
+**every logical byte** through the existing `read_wux_at` in 64 KiB buffers directly
+into SHA-256. Equality with the complete original WUD digest is mandatory;
+structural parsing alone cannot authorize publication. No second physical WUD
+is materialised. Staged metadata must remain unchanged across reconstruction
+and the stable full physical WUX hash capture. Source identity/hash/evidence are
+rechecked before publication. The journal records physical WUX hash separately
+from reconstructed/source WUD hash, exact logical/physical sizes, the writer
+policy and stored/zero/reused-zero block counts. No verification-skip option exists.
+
 Verified output enters a single existing journaled Repair `MovePath`.
 Linux `renameat2(RENAME_NOREPLACE)` publishes atomically; existing destinations
 and platforms without the verified primitive refuse. Success requires the
@@ -128,22 +208,23 @@ transaction to confirm one applied output and matching destination identity.
 The journal's extension map records policy, source/container hash, reconstructed
 WUD hash, output hash, header hash, exact size and source retention.
 
-Decode/verification failures and cancellation remove the temporary directory.
+Encode/decode/verification failures and cancellation remove the temporary directory.
 Once publication is handed to Repair, its stage directory is retained for
 journal rollback/recovery. Unconfirmed publication attempts the existing
 identity-checked rollback; an I/O failure that also prevents rollback is
 reported with its recovery directory and never as success. A process
 crash before handoff can leave a hidden `.emuwiz-wiiu-*` stage for manual cleanup;
 it cannot expose a partial final destination. Cancellation is checked each
-64 KiB chunk and at phase boundaries; existing full-hash/Repair phases do not
+32 KiB encode block, 64 KiB reconstruction chunk, bounded table batch and phase
+boundary; existing full-hash/Repair phases do not
 provide chunk-level cancellation. No unattended conversion/resume is added.
 
 ## Unsupported cases and NKit boundary
 
-WUD → WUX is **DEFERRED**. Upstream writers document deduplication, but this
-foundation does not establish a tested deterministic encoder policy and
-independent writer interoperability corpus. The planner refuses that direction
-even if supplied an external-tool capability; no pseudo-WUX writer is added.
+WUD → WUX now uses the canonical native representation above. Arbitrary writer
+block sizes, non-zero deduplication tuning, non-zero flags and partial optical
+sectors are unsupported. The reader retains its wider validated block-size
+support; writing does not infer rules from permissive parsing alone.
 Split media remains bounded diagnostic inventory (64 part indices/4,096 directory
 entries), never silently assembled or marked structurally complete. WUA,
 extraction, key access and filesystem/title authentication remain unsupported.
@@ -161,7 +242,9 @@ No NKit converter, embedded keys, key downloader or emulator dependency exists.
 
 Existing inspection and plan objects retain their API shape with additional
 header/source evidence, repeat counts, retail-size flag, work estimate and
-verification availability. Future GUI work can show opaque metadata and
+verification availability. The request shape is unchanged. Creation adds typed
+geometry/maximum-size and receipt block-count projections; progress counts
+logical bytes processed rather than physical WUX bytes written. Future GUI work can show opaque metadata and
 non-retail warnings, request explicit apply, connect progress/cancellation and
 surface the existing Repair transaction receipt/recovery path. No GUI edits
 or automatic real-image conversion are part of this foundation.
@@ -172,3 +255,14 @@ byte-exact output, stale evidence, source preservation, collision refusal,
 cancellation, premature EOF, staged corruption and journal provenance. A 64 MiB
 logical fixture verifies 1,024 bounded decode chunks and every trailing zero;
 a sparse retail-size raw fixture validates bounded inspection of large extents.
+
+The creation extension adds 21 synthetic tests (49 total Wii U foundation
+tests). They cover an independently specified tiny canonical byte vector,
+zero/mixed/non-zero/near-zero blocks, cross-block reads, exact size and full
+SHA-256 round trips through the existing decoder, two-run determinism, partial
+sector refusal, overflow/allocation/alignment limits, stale source bindings,
+alias/symlink/special-file refusals, destination races, cancellation and
+premature EOF, malformed staged output and payload corruption that still parses,
+source immutability, journal evidence and existing rollback. The streaming test
+normally uses a 128 MiB sparse synthetic WUD; `EMUWIZ_WUD_WUX_PERF_BYTES`
+selects a larger **test fixture**, not a production conversion option.

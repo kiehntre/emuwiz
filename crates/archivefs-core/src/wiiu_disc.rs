@@ -17,7 +17,7 @@ pub const MAX_LOGICAL_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 pub const MAX_WUX_TABLE_BYTES: u64 = 16 * 1024 * 1024;
 const DISC_MAGIC: u32 = 0xcc54_9eb9;
 const CONTENTS_MAGIC: u32 = 0xcca6_e67b;
-const MAGIC1: u32 = 0x1099_d02e;
+pub(crate) const MAGIC1: u32 = 0x1099_d02e;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WiiUPartitionEvidence {
@@ -325,7 +325,7 @@ fn inspect_into(path: &Path, report: &mut WiiUDiscInspection) -> Result<(), WiiU
     report.readiness = WiiUDiscReadiness::RequiresKeysForDeeperInspection;
     Ok(())
 }
-fn validate_logical_size(size: u64) -> Result<(), WiiUDiscIssue> {
+pub(crate) fn validate_logical_size(size: u64) -> Result<(), WiiUDiscIssue> {
     if size < WUD_HEADER_SIZE {
         return Err(WiiUDiscIssue::TruncatedBody {
             minimum: WUD_HEADER_SIZE,
