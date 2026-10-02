@@ -40,6 +40,7 @@ pub mod arcade;
 pub mod container;
 pub mod content_registry;
 pub mod cue_bin;
+pub mod cue_timeline;
 pub mod discovery;
 pub mod gdi;
 pub mod structural_probe;

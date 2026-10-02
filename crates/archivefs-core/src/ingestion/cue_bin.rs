@@ -25,6 +25,16 @@ pub struct CueTimestamp {
 
 impl CueTimestamp {
     pub fn parse(raw: &str) -> Result<Self, CueError> {
+        // MM:SS:FF is plain decimal digits; reject signs and blanks that
+        // `u64::from_str` would otherwise accept ("+1", "").
+        if raw
+            .split(':')
+            .any(|field| field.is_empty() || !field.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err(CueError::Malformed(
+                "timestamp is not MM:SS:FF digits".into(),
+            ));
+        }
         let mut fields = raw.split(':');
         let minutes = fields
             .next()
@@ -131,6 +141,13 @@ pub struct CueTrack {
     pub index_01: Option<CueTimestamp>,
     pub pregap: Option<CueTimestamp>,
     pub postgap: Option<CueTimestamp>,
+    /// Zero-based ordinal of the `FILE` line this track belongs to. INDEX
+    /// timestamps are relative to that file, never to the whole disc.
+    pub file_ordinal: u32,
+    /// The `FILE` type word (`BINARY`, `WAVE`, ...), upper-cased.
+    pub file_type: String,
+    /// `INDEX 02..=99` in declaration order. `INDEX 00`/`01` live above.
+    pub extra_indexes: Vec<(u8, CueTimestamp)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +242,9 @@ pub(crate) fn resolve_cue_layout_text(
     let canonical_base =
         std::fs::canonicalize(base).map_err(|error| CueError::Io(error.to_string()))?;
     let mut current_file: Option<PathBuf> = None;
+    let mut file_ordinal: Option<u32> = None;
+    let mut file_type = String::new();
+    let mut current_extras: Vec<(u8, CueTimestamp)> = Vec::new();
     let mut current_track: Option<(
         u32,
         CueTrackMode,
@@ -236,6 +256,9 @@ pub(crate) fn resolve_cue_layout_text(
     let mut tracks = Vec::new();
 
     let finish = |current_file: &mut Option<PathBuf>,
+                  file_ordinal: u32,
+                  file_type: &str,
+                  extras: &mut Vec<(u8, CueTimestamp)>,
                   current_track: &mut Option<(
         u32,
         CueTrackMode,
@@ -267,6 +290,9 @@ pub(crate) fn resolve_cue_layout_text(
                 index_01,
                 pregap,
                 postgap,
+                file_ordinal,
+                file_type: file_type.to_owned(),
+                extra_indexes: std::mem::take(extras),
             });
         }
         Ok(())
@@ -278,17 +304,34 @@ pub(crate) fn resolve_cue_layout_text(
             continue;
         }
         if line.len() >= 4 && line[..4].eq_ignore_ascii_case("FILE") {
-            finish(&mut current_file, &mut current_track, &mut tracks)?;
+            finish(
+                &mut current_file,
+                file_ordinal.unwrap_or(0),
+                &file_type,
+                &mut current_extras,
+                &mut current_track,
+                &mut tracks,
+            )?;
             let rest = line[4..].trim_start();
             let quoted = rest
                 .strip_prefix('"')
                 .and_then(|value| value.find('"').map(|end| &value[..end]))
                 .ok_or_else(|| CueError::Malformed("FILE line has no quoted filename".into()))?;
             current_file = Some(resolve_safe_reference(quoted, base, &canonical_base)?);
+            file_ordinal = Some(file_ordinal.map_or(0, |ordinal| ordinal + 1));
+            let after = &rest[1 + quoted.len() + 1..];
+            file_type = after.trim().to_ascii_uppercase();
             continue;
         }
         if line.len() >= 5 && line[..5].eq_ignore_ascii_case("TRACK") {
-            finish(&mut current_file, &mut current_track, &mut tracks)?;
+            finish(
+                &mut current_file,
+                file_ordinal.unwrap_or(0),
+                &file_type,
+                &mut current_extras,
+                &mut current_track,
+                &mut tracks,
+            )?;
             let mut fields = line.split_whitespace();
             let _ = fields.next();
             let number = fields
@@ -353,12 +396,29 @@ pub(crate) fn resolve_cue_layout_text(
                         return Err(CueError::Malformed("TRACK has duplicate INDEX 01".into()));
                     }
                 }
-                Ok(_) => {}
-                Err(_) => return Err(CueError::Malformed("INDEX number is malformed".into())),
+                Ok(number @ 2..=99) => {
+                    if current_extras
+                        .iter()
+                        .any(|(existing, _)| *existing == number)
+                    {
+                        return Err(CueError::Malformed("TRACK has duplicate INDEX".into()));
+                    }
+                    current_extras.push((number, timestamp));
+                }
+                Ok(_) | Err(_) => {
+                    return Err(CueError::Malformed("INDEX number is malformed".into()));
+                }
             }
         }
     }
-    finish(&mut current_file, &mut current_track, &mut tracks)?;
+    finish(
+        &mut current_file,
+        file_ordinal.unwrap_or(0),
+        &file_type,
+        &mut current_extras,
+        &mut current_track,
+        &mut tracks,
+    )?;
     if tracks.is_empty() {
         return Err(CueError::NoFileReferences);
     }
