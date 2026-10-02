@@ -337,6 +337,13 @@ const SCOPE_CATALOG: &[ScopeEntry] = &[
         value: "UMD_DATA.BIN",
         scope: EvidenceScope::PlatformSpecific("PSP"),
     },
+    // ps4_layout_evidence.rs: emitted only for a validated sce_sys/param.sfo
+    // layout with a CUSA-family TITLE_ID; the CUSA family is PS4-exclusive.
+    ScopeEntry {
+        kind: BootStructure,
+        value: crate::ps4_layout_evidence::PS4_LAYOUT_EVIDENCE_MARKER,
+        scope: EvidenceScope::PlatformSpecific("PS4"),
+    },
     ScopeEntry {
         kind: BootStructure,
         value: "GameCube",

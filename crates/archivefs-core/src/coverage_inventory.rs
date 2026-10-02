@@ -212,6 +212,15 @@ pub const COVERAGE: &[PlatformEvidenceCoverage] = &[
         dat_validation: None,
     },
     PlatformEvidenceCoverage {
+        canonical_id: "PS4",
+        detector_modules: &["ps4_layout_evidence"],
+        normalization: false,
+        real_validation: ValidationStatus::SyntheticValidated,
+        notes: "Extracted-folder evidence only: sce_sys/param.sfo layout plus a CUSA-family TITLE_ID, synthetic fixtures. No retail PKG inspection, no disc-image identity, no real PS4 specimen",
+        real_validation_provenance: None,
+        dat_validation: None,
+    },
+    PlatformEvidenceCoverage {
         canonical_id: "Xbox",
         detector_modules: &["xbox_boot_evidence", "executable_signatures"],
         normalization: false,

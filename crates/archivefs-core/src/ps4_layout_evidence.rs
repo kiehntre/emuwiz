@@ -279,13 +279,24 @@ pub fn title_id_agreement(
 ///   title ID.
 ///
 /// Returns an empty vec for anything that is not a valid PS4 layout, so a
-/// PS3 or Vita `param.sfo` produces no PS4 evidence here.
+/// PS3 or Vita `param.sfo` produces no PS4 evidence here. A `TITLE_ID` that
+/// disagrees with its own `CONTENT_ID` also yields nothing.
 pub fn observe_ps4_evidence(observation: &Ps4LayoutObservation) -> Vec<ContentEvidence> {
     let mut evidence = Vec::new();
     let Some(title_id) = observation.ps4_title_id() else {
         return evidence;
     };
     if !(observation.sce_sys_dir_present && observation.param_sfo_present) {
+        return evidence;
+    }
+    // A TITLE_ID that disagrees with the title component of its own
+    // CONTENT_ID is an internally inconsistent PARAM.SFO. Neither side is
+    // preferred, so no PS4 evidence is emitted at all (fail closed); the
+    // identity report keeps reporting the same case as `Ambiguous`.
+    if matches!(
+        title_id_agreement(&title_id, observation.ps4_content_id().as_ref()),
+        Ps4TitleIdAgreement::Disagrees { .. }
+    ) {
         return evidence;
     }
     evidence.push(ContentEvidence::new(
@@ -310,6 +321,43 @@ pub fn observe_ps4_evidence(observation: &Ps4LayoutObservation) -> Vec<ContentEv
         ));
     }
     evidence
+}
+
+/// Bounded, read-only observation of a candidate extracted PS4 game
+/// directory at `root`: the `sce_sys/` + `sce_sys/param.sfo` layout facts
+/// and the parsed (size-bounded) PARAM.SFO, nothing else. Uses the same
+/// symlink-safe, absolute-path-only layout check as
+/// [`crate::game_identity`]'s PS4 folder inspection, so the identity report
+/// and the fusion evidence can never disagree about what counts as the
+/// layout. Anything that fails a check yields the all-absent observation -
+/// "no evidence", never an error and never a partial guess.
+pub fn observe_ps4_directory(root: &std::path::Path) -> Ps4LayoutObservation {
+    use std::io::Read;
+    let mut observation = Ps4LayoutObservation::default();
+    if !crate::game_identity::ps4_directory_paths_are_regular(root) {
+        return observation;
+    }
+    observation.sce_sys_dir_present = true;
+    observation.param_sfo_present = true;
+    let sfo_path = root.join(PS4_PARAM_SFO_RELATIVE_PATH);
+    let limit = crate::param_sfo::MAX_SFO_BYTES as u64;
+    if let Ok(file) = std::fs::File::open(&sfo_path) {
+        // Read one byte past the ceiling so an oversize file is rejected
+        // even if it grew after the layout check.
+        let mut bytes = Vec::new();
+        if file.take(limit + 1).read_to_end(&mut bytes).is_ok() && bytes.len() as u64 <= limit {
+            observation.param_sfo = crate::param_sfo::parse_param_sfo(&bytes);
+        }
+    }
+    observation
+}
+
+/// Neutral evidence for an extracted PS4 directory: the bounded observation
+/// above fed through [`observe_ps4_evidence`]. This is the collector the
+/// platform-evidence fusion consumes (see the `ps4_extracted_layout_cusa`
+/// rule in [`crate::platform_evidence_fusion::RULES`]).
+pub fn observe_ps4_directory_evidence(root: &std::path::Path) -> Vec<ContentEvidence> {
+    observe_ps4_evidence(&observe_ps4_directory(root))
 }
 
 #[cfg(test)]
@@ -476,5 +524,320 @@ mod tests {
             .collect();
         assert!(product_codes.contains(&"CUSA00001"));
         assert!(product_codes.contains(&"UP0001-CUSA00001_00-LABEL00000000000"));
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    //! The extracted-folder -> neutral evidence -> `platform_evidence_fusion`
+    //! route, on synthetic bounded PARAM.SFO fixtures only.
+    use super::*;
+    use crate::platform_evidence_fusion::identity_orchestrator::{
+        IdentityInspectionInput, inspect_identity,
+    };
+    use crate::platform_evidence_fusion::{FusionOutcome, RULES, fuse_platform_evidence};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    fn sfo_bytes(pairs: &[(&str, &str)]) -> Vec<u8> {
+        const HEADER: usize = 20;
+        const ENTRY: usize = 16;
+        let key_table_start = HEADER + pairs.len() * ENTRY;
+        let mut key_table = Vec::new();
+        let mut key_offsets = Vec::new();
+        for (key, _) in pairs {
+            key_offsets.push(key_table.len() as u16);
+            key_table.extend_from_slice(key.as_bytes());
+            key_table.push(0);
+        }
+        while key_table.len() % 4 != 0 {
+            key_table.push(0);
+        }
+        let data_table_start = key_table_start + key_table.len();
+        let (mut data, mut offsets, mut lens) = (Vec::new(), Vec::new(), Vec::new());
+        for (_, value) in pairs {
+            offsets.push(data.len() as u32);
+            let mut raw = value.as_bytes().to_vec();
+            raw.push(0);
+            lens.push(raw.len() as u32);
+            data.extend_from_slice(&raw);
+        }
+        let mut out = vec![0u8; HEADER];
+        out[0..4].copy_from_slice(&[0x00, b'P', b'S', b'F']);
+        out[4..8].copy_from_slice(&0x0101_u32.to_le_bytes());
+        out[8..12].copy_from_slice(&(key_table_start as u32).to_le_bytes());
+        out[12..16].copy_from_slice(&(data_table_start as u32).to_le_bytes());
+        out[16..20].copy_from_slice(&(pairs.len() as u32).to_le_bytes());
+        for i in 0..pairs.len() {
+            let mut entry = [0u8; ENTRY];
+            entry[0..2].copy_from_slice(&key_offsets[i].to_le_bytes());
+            entry[2..4].copy_from_slice(&0x0204_u16.to_le_bytes());
+            entry[4..8].copy_from_slice(&lens[i].to_le_bytes());
+            entry[8..12].copy_from_slice(&lens[i].to_le_bytes());
+            entry[12..16].copy_from_slice(&offsets[i].to_le_bytes());
+            out.extend_from_slice(&entry);
+        }
+        out.extend_from_slice(&key_table);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    fn write(root: &Path, relative: &str, bytes: &[u8]) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn fuse_dir(root: &Path) -> crate::platform_evidence_fusion::ResolutionExplanation {
+        fuse_platform_evidence(observe_ps4_directory_evidence(root))
+    }
+
+    fn ps4_dir(pairs: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "sce_sys/param.sfo", &sfo_bytes(pairs));
+        dir
+    }
+
+    #[test]
+    fn valid_extracted_folder_reaches_fusion_and_resolves_ps4() {
+        let dir = ps4_dir(&[
+            ("TITLE_ID", "CUSA00001"),
+            ("CONTENT_ID", "UP0001-CUSA00001_00-LABEL00000000000"),
+        ]);
+        let evidence = observe_ps4_directory_evidence(dir.path());
+        assert!(
+            evidence
+                .iter()
+                .any(|e| e.value == PS4_LAYOUT_EVIDENCE_MARKER)
+        );
+        let explanation = fuse_dir(dir.path());
+        assert_eq!(explanation.outcome, FusionOutcome::Resolved);
+        assert_eq!(explanation.resolved_platform, Some("PS4"));
+        assert!(
+            explanation
+                .fired_candidates
+                .iter()
+                .any(|c| c.rule_id == "ps4_extracted_layout_cusa")
+        );
+    }
+
+    #[test]
+    fn it_flows_through_the_identity_orchestrator_like_any_other_platform() {
+        let dir = ps4_dir(&[("TITLE_ID", "CUSA12345")]);
+        let result = inspect_identity(IdentityInspectionInput {
+            content_evidence: observe_ps4_directory_evidence(dir.path()),
+            ..Default::default()
+        });
+        assert_eq!(result.content.resolved_platform, Some("PS4"));
+        assert!(!result.has_conflict());
+    }
+
+    #[test]
+    fn resolving_ps4_never_claims_exact_release_identity() {
+        let dir = ps4_dir(&[("TITLE_ID", "CUSA00001"), ("TITLE", "Example")]);
+        let explanation = fuse_dir(dir.path());
+        // Platform only: nothing here is a hash, DAT or release/region fact.
+        for fact in &explanation.input_evidence {
+            assert!(
+                matches!(
+                    fact.kind,
+                    ContentEvidenceKind::BootStructure | ContentEvidenceKind::ProductCode
+                ),
+                "unexpected evidence kind {:?}",
+                fact.kind
+            );
+        }
+        // The descriptive TITLE never becomes evidence.
+        assert!(
+            explanation
+                .input_evidence
+                .iter()
+                .all(|f| f.value != "Example")
+        );
+    }
+
+    #[test]
+    fn ps3_param_sfo_never_becomes_ps4() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "PS3_GAME/PARAM.SFO",
+            &sfo_bytes(&[("TITLE_ID", "BLUS30000")]),
+        );
+        assert!(observe_ps4_directory_evidence(dir.path()).is_empty());
+        // Even a CUSA id in the PS3 location is not the PS4 layout.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "PS3_GAME/PARAM.SFO",
+            &sfo_bytes(&[("TITLE_ID", "CUSA00001")]),
+        );
+        assert_ne!(fuse_dir(dir.path()).resolved_platform, Some("PS4"));
+    }
+
+    #[test]
+    fn vita_style_sfo_under_sce_sys_never_becomes_ps4() {
+        let dir = ps4_dir(&[("TITLE_ID", "PCSE00001")]);
+        assert!(observe_ps4_directory_evidence(dir.path()).is_empty());
+        assert_ne!(fuse_dir(dir.path()).resolved_platform, Some("PS4"));
+    }
+
+    #[test]
+    fn loose_param_sfo_without_sce_sys_never_becomes_ps4() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "param.sfo",
+            &sfo_bytes(&[("TITLE_ID", "CUSA00001")]),
+        );
+        assert!(observe_ps4_directory_evidence(dir.path()).is_empty());
+        // Pointing at the file itself is not a directory layout either.
+        assert!(observe_ps4_directory_evidence(&dir.path().join("param.sfo")).is_empty());
+    }
+
+    #[test]
+    fn pkg_eboot_and_cusa_names_alone_never_become_ps4() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path().join("ps4").join("CUSA00001");
+        write(&game, "game.pkg", b"\x7fPKG");
+        write(&game, "eboot.bin", b"not parsed");
+        fs::create_dir_all(game.join("sce_sys")).unwrap(); // sce_sys without param.sfo
+        assert!(observe_ps4_directory_evidence(&game).is_empty());
+        assert_eq!(fuse_dir(&game).resolved_platform, None);
+        assert!(observe_ps4_directory_evidence(&game.join("game.pkg")).is_empty());
+    }
+
+    #[test]
+    fn missing_or_malformed_title_id_fails_closed() {
+        for pairs in [
+            vec![("TITLE", "No id")],
+            vec![("TITLE_ID", "CUSA1234")],   // too short
+            vec![("TITLE_ID", "CUSA123456")], // too long
+            vec![("TITLE_ID", "NPUB30000")],  // other family
+            vec![("TITLE_ID", "")],
+        ] {
+            let dir = ps4_dir(&pairs);
+            assert!(
+                observe_ps4_directory_evidence(dir.path()).is_empty(),
+                "{pairs:?}"
+            );
+            assert_ne!(fuse_dir(dir.path()).resolved_platform, Some("PS4"));
+        }
+        // Unparseable SFO bytes fail closed too.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "sce_sys/param.sfo",
+            b"garbage that is not a PSF",
+        );
+        assert!(observe_ps4_directory_evidence(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn title_id_content_id_disagreement_is_not_resolved_either_way() {
+        let dir = ps4_dir(&[
+            ("TITLE_ID", "CUSA00001"),
+            ("CONTENT_ID", "UP0001-CUSA99999_00-LABEL00000000000"),
+        ]);
+        assert!(observe_ps4_directory_evidence(dir.path()).is_empty());
+        let explanation = fuse_dir(dir.path());
+        assert_eq!(explanation.resolved_platform, None);
+        assert_ne!(explanation.outcome, FusionOutcome::Resolved);
+        // The identity report keeps calling the same case Ambiguous.
+        let report = crate::game_identity::inspect_game_identity(dir.path(), Some("PS4"));
+        assert_eq!(report.verified_ps4_title_id(), None);
+    }
+
+    #[test]
+    fn ps4_evidence_conflicting_with_other_strong_evidence_fails_closed() {
+        let dir = ps4_dir(&[("TITLE_ID", "CUSA00001")]);
+        let mut evidence = observe_ps4_directory_evidence(dir.path());
+        evidence.push(ContentEvidence::new(
+            ContentEvidenceKind::BootStructure,
+            "SEGA SEGASATURN",
+            ContentEvidenceConfidence::Strong,
+            "synthetic conflicting Saturn header",
+        ));
+        let explanation = fuse_platform_evidence(evidence);
+        assert_eq!(explanation.outcome, FusionOutcome::Conflict);
+        assert_eq!(explanation.resolved_platform, None);
+        assert!(explanation.conflicting_platforms.contains(&"PS4"));
+    }
+
+    #[test]
+    fn symlinked_layout_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        write(
+            &real,
+            "sce_sys/param.sfo",
+            &sfo_bytes(&[("TITLE_ID", "CUSA00001")]),
+        );
+        // sce_sys is a symlink.
+        let linked = dir.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        symlink(real.join("sce_sys"), linked.join("sce_sys")).unwrap();
+        assert!(observe_ps4_directory_evidence(&linked).is_empty());
+        // The root itself is a symlink.
+        let root_link = dir.path().join("root_link");
+        symlink(&real, &root_link).unwrap();
+        assert!(observe_ps4_directory_evidence(&root_link).is_empty());
+        // param.sfo is a symlink.
+        let file_linked = dir.path().join("file_linked");
+        fs::create_dir_all(file_linked.join("sce_sys")).unwrap();
+        symlink(
+            real.join("sce_sys/param.sfo"),
+            file_linked.join("sce_sys/param.sfo"),
+        )
+        .unwrap();
+        assert!(observe_ps4_directory_evidence(&file_linked).is_empty());
+    }
+
+    #[test]
+    fn oversize_param_sfo_is_not_read_into_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = sfo_bytes(&[("TITLE_ID", "CUSA00001")]);
+        bytes.resize(crate::param_sfo::MAX_SFO_BYTES + 1, 0);
+        write(dir.path(), "sce_sys/param.sfo", &bytes);
+        assert!(observe_ps4_directory_evidence(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn rule_scope_and_coverage_tables_agree_about_ps4() {
+        use crate::content_evidence_scope::{EvidenceScope, scope_of};
+        assert_eq!(
+            scope_of(
+                ContentEvidenceKind::BootStructure,
+                PS4_LAYOUT_EVIDENCE_MARKER
+            ),
+            EvidenceScope::PlatformSpecific("PS4")
+        );
+        let rules: Vec<_> = RULES.iter().filter(|r| r.platform == "PS4").collect();
+        assert_eq!(
+            rules.len(),
+            1,
+            "exactly one PS4 rule, extracted-folder only"
+        );
+        assert!(rules[0].has_strong_leg());
+        let coverage = crate::coverage_inventory::COVERAGE
+            .iter()
+            .find(|c| c.canonical_id == "PS4")
+            .expect("PS4 coverage row");
+        assert_eq!(
+            coverage.real_validation,
+            crate::coverage_inventory::ValidationStatus::SyntheticValidated
+        );
+    }
+
+    #[test]
+    fn a_bare_product_code_or_scope_family_never_resolves_ps4() {
+        let explanation = fuse_platform_evidence([ContentEvidence::new(
+            ContentEvidenceKind::ProductCode,
+            "CUSA00001",
+            ContentEvidenceConfidence::Corroborated,
+            "a title id alone, without the layout marker",
+        )]);
+        assert_eq!(explanation.resolved_platform, None);
     }
 }

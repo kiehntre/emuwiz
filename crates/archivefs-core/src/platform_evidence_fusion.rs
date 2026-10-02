@@ -694,6 +694,24 @@ pub const RULES: &[FusionRule] = &[
         ],
         explanation: "PS3_GAME layout, a PARAM.SFO-derived TITLE_ID, and PS3 SELF executable magic together",
     },
+    // -- PS4 (extracted game folder only): the marker is emitted by
+    //    ps4_layout_evidence::observe_ps4_evidence solely when the
+    //    sce_sys/param.sfo layout AND a CUSA-family TITLE_ID are both
+    //    present (and TITLE_ID agrees with any CONTENT_ID), so the single
+    //    leg already encodes the two-signal test. It proves the PS4
+    //    application/platform only - never release, region, revision,
+    //    hashes or launchability. No rule keys off .pkg, eboot.bin, a bare
+    //    sce_sys directory, a loose param.sfo or a CUSA-looking name.
+    FusionRule {
+        id: "ps4_extracted_layout_cusa",
+        platform: "PS4",
+        legs: &[Exact {
+            kind: BootStructure,
+            value: crate::ps4_layout_evidence::PS4_LAYOUT_EVIDENCE_MARKER,
+            min_confidence: STRONG,
+        }],
+        explanation: "an extracted PS4 game folder with sce_sys/param.sfo and a CUSA-family TITLE_ID proves PlayStation 4 application identity only; exact release/region/revision stays DAT/hash-led (see crate::ps4_layout_evidence)",
+    },
     // -- DOS boot media: a documented system-file pair in a FAT12/FAT16
     //    root directory. FAT geometry, OEM string, volume label and the
     //    image's extension prove nothing on their own (see

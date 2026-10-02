@@ -3492,7 +3492,7 @@ fn ps3_directory_paths_are_regular(root: &Path) -> bool {
 /// no symlink anywhere on the path from `root` down. Mirrors
 /// [`ps3_directory_paths_are_regular`]; it never crawls the rest of the
 /// directory.
-fn ps4_directory_paths_are_regular(root: &Path) -> bool {
+pub(crate) fn ps4_directory_paths_are_regular(root: &Path) -> bool {
     if !root.is_absolute()
         || root.components().any(|component| {
             matches!(
