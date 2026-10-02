@@ -9736,7 +9736,7 @@ mod tests {
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         assert_eq!(
             pending_schema_migration_versions(19).unwrap(),
-            vec![20, 21, 22, 23]
+            vec![20, 21, 22, 23, 24]
         );
 
         let quick_check: String = upgraded
@@ -9760,7 +9760,7 @@ mod tests {
         assert_eq!(report.applied_versions, vec![21, 22, 23, 24]);
 
         let upgraded = Database::open_or_create(&database_path).unwrap();
-        assert_eq!(upgraded.schema_version().unwrap(), 23);
+        assert_eq!(upgraded.schema_version().unwrap(), 24);
         assert_eq!(upgraded.list_source_folders().unwrap().len(), 1);
         assert_eq!(upgraded.load_archives().unwrap().len(), 1);
         let table_count: i64 = upgraded
