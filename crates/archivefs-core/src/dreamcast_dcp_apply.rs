@@ -2,6 +2,10 @@
 //! No image reconstruction or launch. Callers must supply an independently
 //! reviewed package/source binding: DCP itself has no cryptographic base claim.
 //! A returned shared receipt is staged, not published; use tree::{publish,inspect,undo}.
+use crate::dreamcast_boot_evidence::ip_bin::{
+    IpBinBootTargetStatus, IpBinFileInspection, IpBinPreview, check_boot_target,
+    inspect_ip_bin_file,
+};
 use crate::dreamcast_boot_evidence::{
     DreamcastIpBinValidationStatus, IP_BIN_META_BYTES, inspect_ip_bin_meta,
 };
@@ -54,6 +58,110 @@ pub struct DreamcastDcpPlan {
 /// Read-only review evidence, never an inferred package/source association.
 pub fn source_tree_sha256(source: &Path) -> io::Result<String> {
     Contents::read(source, MAX_SOURCE_BYTES)?.fingerprint()
+}
+
+/// Full IP.BIN facts from the existing extracted-tree convention. Root members
+/// are only listed/stat'ed for this check; no image mounting or executable run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractedDreamcastIpBinInspection {
+    pub ip_bin: IpBinFileInspection,
+    pub boot_target: IpBinBootTargetStatus,
+}
+pub fn inspect_extracted_dreamcast_ip_bin(
+    source: &Path,
+) -> io::Result<ExtractedDreamcastIpBinInspection> {
+    let ip_bin = inspect_ip_bin_file(&source.join("bootsector/IP.BIN"))?;
+    let boot_target = match &ip_bin.inspection.ip_bin {
+        Some(ip) => check_boot_target(source, &ip.metadata.boot_filename.value)?,
+        None => IpBinBootTargetStatus::NotChecked,
+    };
+    Ok(ExtractedDreamcastIpBinInspection {
+        ip_bin,
+        boot_target,
+    })
+}
+
+/// Explicit IP.BIN-only edits to an extracted tree use the same staging,
+/// immutable receipts, revalidation, publication and undo as DCP replacements.
+#[derive(Clone, Debug)]
+pub struct DreamcastIpBinTreePlan {
+    tree: TreePatchPlan,
+    source: PathBuf,
+    original: Contents,
+    expected: Contents,
+    preview: IpBinPreview,
+}
+pub fn review_extracted_dreamcast_ip_bin(
+    source: &Path,
+    destination: &Path,
+    preview: &IpBinPreview,
+) -> io::Result<DreamcastIpBinTreePlan> {
+    if preview.source().path != source.join("bootsector/IP.BIN") {
+        return Err(refuse(
+            "IP.BIN preview belongs to a different extracted tree",
+        ));
+    }
+    preview.verify_source()?;
+    let original = Contents::read(source, MAX_SOURCE_BYTES)?;
+    let mut expected = original.clone();
+    expected.0.insert(
+        PathBuf::from("bootsector/IP.BIN"),
+        Some(Content::bytes(preview.expected_bytes())),
+    );
+    let ip = preview.expected().ip_bin.as_ref().unwrap();
+    let original_boot = inspect_extracted_dreamcast_ip_bin(source)?
+        .ip_bin
+        .inspection
+        .ip_bin
+        .unwrap()
+        .metadata
+        .boot_filename
+        .value;
+    if original_boot != ip.metadata.boot_filename.value
+        && !matches!(
+            check_boot_target(source, &ip.metadata.boot_filename.value)?,
+            IpBinBootTargetStatus::Present(_)
+        )
+    {
+        return Err(refuse(
+            "edited boot filename needs an exact, unambiguous regular tree member",
+        ));
+    }
+    let tree = TreePatchPlan::review_with_max_total_bytes(
+        &[source.to_owned()],
+        destination,
+        MAX_SOURCE_BYTES,
+    )?;
+    original.verify(source, MAX_SOURCE_BYTES)?;
+    preview.verify_source()?;
+    Ok(DreamcastIpBinTreePlan {
+        tree,
+        source: source.to_owned(),
+        original,
+        expected,
+        preview: preview.clone(),
+    })
+}
+impl DreamcastIpBinTreePlan {
+    pub fn prepare(&self) -> io::Result<PreparedTreePatch> {
+        self.preview.verify_source()?;
+        tree::prepare(
+            &self.tree,
+            |staging| {
+                self.original.verify(&self.source, MAX_SOURCE_BYTES)?;
+                self.original.copy(&self.source, staging)?;
+                fs::write(
+                    staging.join("bootsector/IP.BIN"),
+                    self.preview.expected_bytes(),
+                )
+            },
+            |staging| {
+                self.expected.verify(staging, MAX_SOURCE_BYTES)?;
+                self.preview
+                    .verify_output(&staging.join("bootsector/IP.BIN"))
+            },
+        )
+    }
 }
 fn verify_ip(root: &Path, identity: &DreamcastIdentity) -> io::Result<String> {
     let mut bytes = [0u8; IP_BIN_META_BYTES];

@@ -66,6 +66,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Complete, lossless IP.BIN inspection and explicit staged field edits.
+pub mod ip_bin;
+
 use crate::content_detector::{ContentDetectionOutcome, ContentDetector};
 use crate::content_evidence::{ContentEvidence, ContentEvidenceConfidence, ContentEvidenceKind};
 
@@ -121,6 +124,10 @@ pub enum DreamcastVgaCompatibility {
 pub enum IpBinChecksumStatus {
     NotProven,
     NotPresentInInspectedMetadata,
+    ProductCrcMatched,
+    ProductCrcPlaceholderZero,
+    ProductCrcMismatch,
+    MalformedProductCrc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -509,7 +516,7 @@ fn validate_area_symbols(value: &str) -> (IpBinFieldValidity, Vec<String>) {
     let mut warnings = Vec::new();
     let unknown: String = value
         .chars()
-        .filter(|character| !matches!(character, 'J' | 'U' | 'E' | 'A' | 'K'))
+        .filter(|character| !matches!(character, 'J' | 'U' | 'E' | ' '))
         .collect();
     if !unknown.is_empty() {
         warnings.push(format!("unknown IP.BIN area symbols: {unknown}"));
@@ -547,16 +554,17 @@ fn validate_peripherals(
             DreamcastVgaCompatibility::Unknown,
         );
     };
-    let unknown = bits & !((1_u32 << 21) - 1);
+    let unknown = bits & !ip_bin::KNOWN_PERIPHERAL_MASK;
     let mut warnings = Vec::new();
     if unknown != 0 {
         warnings.push(format!(
             "IP.BIN contains unknown peripheral bits 0x{unknown:08X}"
         ));
     }
-    // The independent bodgit/dreamcast model assigns bit 1 to VGA. We expose
-    // only that corroborated meaning and keep all other bits unnamed here.
-    let vga = if bits & (1 << 1) != 0 {
+    // Comstedt's IP0000.BIN documentation and the makeip README agree on
+    // bit 4 for VGA; bit 1 is reserved. These are declarations, not proof
+    // that the program actually implements the advertised capability.
+    let vga = if bits & (1 << 4) != 0 {
         DreamcastVgaCompatibility::Declared
     } else {
         DreamcastVgaCompatibility::NotDeclared
@@ -930,7 +938,7 @@ mod tests {
     #[test]
     fn inspection_handles_vga_and_unknown_peripheral_bits_conservatively() {
         let mut data = synthetic_ip_bin();
-        put(&mut data, PERIPHERALS, b"00200002");
+        put(&mut data, PERIPHERALS, b"00000012");
         let inspection = inspect_ip_bin_meta(&data).unwrap();
         assert_eq!(
             inspection.vga_compatibility,
