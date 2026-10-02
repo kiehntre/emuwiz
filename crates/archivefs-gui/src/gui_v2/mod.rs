@@ -30,6 +30,7 @@ mod saturn_manifest;
 mod saves_states;
 mod setup_portability;
 mod sources_providers;
+mod storage_review;
 #[cfg(test)]
 mod tape_tests;
 #[cfg(test)]
@@ -308,6 +309,7 @@ pub(super) struct App {
     setup_portability: setup_portability::SetupPortabilityState,
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
+    storage: storage_review::StorageState,
 }
 
 impl App {
@@ -389,6 +391,7 @@ impl App {
             setup_portability: setup_portability::SetupPortabilityState::default(),
             missing: Default::default(),
             equiv: Default::default(),
+            storage: Default::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1480,6 +1483,7 @@ impl App {
                                 Payload::EquivalentApplied(record) => {
                                     self.equivalent_applied(*record)
                                 }
+                                Payload::StorageReview(review) => self.storage_review_done(*review),
                                 Payload::MissingPreview(plan) => {
                                     self.missing.job = None;
                                     self.missing.plan = Some(plan);
@@ -1585,6 +1589,9 @@ impl App {
                             }
                             if self.equiv.job == Some(id) {
                                 self.equivalent_failed(&error);
+                            }
+                            if self.storage.job == Some(id) {
+                                self.storage_review_failed();
                             }
                             self.settle_romm_library_load(id, Err(error.clone()));
                             if self

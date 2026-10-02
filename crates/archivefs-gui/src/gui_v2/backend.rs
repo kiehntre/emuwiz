@@ -108,6 +108,9 @@ pub(super) enum Command {
     EquivalentApply {
         group: Box<super::equivalent_duplicates::EquivalentGroup>,
     },
+    StorageReview {
+        library: SharedLibrary,
+    },
     MissingPreview,
     MissingApply {
         token: String,
@@ -174,6 +177,7 @@ pub(super) enum Payload {
     },
     EquivalentScan(Box<super::equivalent_duplicates::EquivalentScan>),
     EquivalentApplied(Box<DuplicateRepairRecord>),
+    StorageReview(Box<super::storage_review::StorageReview>),
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
     MissingUndone(usize),
@@ -284,6 +288,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         ))),
         Command::EquivalentApply { group } => Ok(Payload::EquivalentApplied(Box::new(
             super::equivalent_duplicates::apply(&group)?,
+        ))),
+        Command::StorageReview { library } => Ok(Payload::StorageReview(Box::new(
+            super::storage_review::analyse(&library),
         ))),
         Command::MissingPreview => Ok(Payload::MissingPreview(Box::new(
             super::missing_review::preview()?,

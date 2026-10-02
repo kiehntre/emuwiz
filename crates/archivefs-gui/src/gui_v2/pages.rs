@@ -529,6 +529,7 @@ impl App {
                         Route::Section(Section::Check) => self.check_games(ui, None),
                         Route::QuickRename => self.quick_rename(ui),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
+                        Route::Section(Section::Storage) => self.storage_page(ui),
                         Route::Section(Section::Problems) => self.problems(ui, None),
                         Route::Section(Section::Build) => self.organisation_page(ui),
                         Route::Section(Section::Converter) => self.converter(ui),

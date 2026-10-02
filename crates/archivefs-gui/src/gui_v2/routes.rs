@@ -9,6 +9,7 @@ pub(super) enum Section {
     Games,
     Saves,
     Duplicates,
+    Storage,
     Platforms,
     Check,
     Problems,
@@ -48,6 +49,7 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::Games,
     Section::Saves,
     Section::Duplicates,
+    Section::Storage,
     Section::Platforms,
     Section::Check,
     Section::Problems,
@@ -89,6 +91,7 @@ impl Section {
             Self::Games => "Games",
             Self::Saves => "Saves & States",
             Self::Duplicates => "Duplicates",
+            Self::Storage => "Storage",
             Self::Platforms => "Platforms",
             Self::Check => "Check Games",
             Self::Problems => "Problems & Repair",
@@ -153,6 +156,7 @@ impl Section {
             Self::Duplicates => {
                 "Review exact copies without silently collapsing different releases."
             }
+            Self::Storage => "See how much space your library uses and what could safely shrink.",
             Self::Platforms => "Choose a system to explore its games.",
             Self::Check => "Find missing, unknown, damaged or mismatched games.",
             Self::Problems => "Review problems and preview a fix before changing anything.",
@@ -204,6 +208,7 @@ impl Section {
             Self::Check => "Check my games",
             Self::Setup => "Check my setup",
             Self::Duplicates => "Review duplicates",
+            Self::Storage => "Check my storage",
             Self::Problems => "Review problems",
             Self::Build => "Choose an organisation method",
             Self::Converter => "Open Converter",
@@ -241,7 +246,7 @@ impl Section {
             Self::Duplicates => Some("LIBRARY"),
             Self::Launch => Some("PLAY"),
             Self::Mods => Some("TOOLS"),
-            Self::Converter | Self::Tape | Self::Museum => Some("TOOLS"),
+            Self::Converter | Self::Storage | Self::Tape | Self::Museum => Some("TOOLS"),
             Self::Romm => Some("LIBRARY"),
             Self::DatVerification
             | Self::CheatsMods
@@ -366,7 +371,7 @@ pub(super) fn family_for_route(route: &Route) -> Option<FeatureFamily> {
         }
         Section::Mame => FeatureFamily::Mame,
         Section::Artwork | Section::ArtworkExtras | Section::Museum => FeatureFamily::ArtworkExtras,
-        Section::Converter | Section::Conversion => FeatureFamily::Conversion,
+        Section::Converter | Section::Storage | Section::Conversion => FeatureFamily::Conversion,
         Section::Build | Section::OrganisationFamily | Section::Games | Section::Launch => {
             FeatureFamily::Organisation
         }

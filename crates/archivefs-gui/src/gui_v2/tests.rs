@@ -113,6 +113,7 @@ fn fixture(context: &egui::Context) -> App {
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
         missing: Default::default(),
         equiv: Default::default(),
+        storage: Default::default(),
     }
 }
 
@@ -6011,4 +6012,74 @@ fn gui_v2_equivalent_duplicates_card_shows_and_escape_closes_its_confirmation() 
     );
     assert!(!app.equiv.confirm);
     assert_eq!(app.router.current, Route::Section(Section::Duplicates));
+}
+
+#[test]
+fn gui_v2_storage_page_handles_empty_library_and_a_synthetic_review() {
+    use super::storage_review::{Group, GroupTotals, ItemView, StorageReview};
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Games));
+    app.go(Route::Section(Section::Storage));
+    let strings = text(&frame(&context, &mut app, [1024.0, 700.0]));
+    assert!(strings.iter().any(|s| s.contains("nothing to measure")));
+
+    app.library = Arc::new(Library::new(vec![archive(1, "Disc", Some("PlayStation"))]));
+    let mut review = StorageReview {
+        total_logical: 5 * 1024 * 1024,
+        ..Default::default()
+    };
+    review.items.push(ItemView {
+        path: "/fixture/Disc.cue".into(),
+        platform: "PlayStation".into(),
+        format: "BIN/CUE".into(),
+        logical: Some(5 * 1024 * 1024),
+        allocated: None,
+        group: Group::CanShrink,
+        savings: Some((1024 * 1024, 2 * 1024 * 1024)),
+        estimate: "estimated range",
+        why: vec!["Round trip: content-equivalent".into()],
+    });
+    review.totals.insert(
+        Group::CanShrink,
+        GroupTotals {
+            items: 1,
+            logical: 5 * 1024 * 1024,
+            savings: (1024 * 1024, 2 * 1024 * 1024),
+            measured: 1,
+            ..Default::default()
+        },
+    );
+    app.storage.review = Some(Arc::new(review));
+    app.storage.for_library = Arc::as_ptr(&app.library) as usize;
+    for size in [[1024.0, 700.0], [700.0, 520.0]] {
+        let strings = text(&frame(&context, &mut app, size));
+        assert!(
+            strings
+                .iter()
+                .any(|s| s.contains("Where is my space going?"))
+        );
+        assert!(
+            strings
+                .iter()
+                .any(|s| s.contains("About 1.0 MB–2.0 MB could be freed"))
+        );
+        assert!(strings.iter().any(|s| s.contains("Can shrink safely")));
+        // In the small window the action may sit below the fold; it must exist at full size.
+        if size[0] > 900.0 {
+            assert!(strings.iter().any(|s| s.contains("Open Converter")));
+        }
+    }
+    // A review for an older library is recomputed rather than trusted.
+    app.storage.for_library = 0;
+    frame(&context, &mut app, [1024.0, 700.0]);
+    assert!(app.storage.job.is_some());
+    // Escape leaves the page.
+    frame_with(
+        &context,
+        &mut app,
+        [1024.0, 700.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Games));
 }
