@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::mame_normalizer::{
-    MameCollectionMode, MameNormalisationPlan, detect_mame_collection_mode,
-    plan_mame_normalisation, plan_mame_normalisation_from_verified_joins,
+    MameCollectionMode, detect_mame_collection_mode, mame_clone_component, plan_mame_normalisation,
+    plan_mame_normalisation_from_verified_joins_for_set, restrict_plan_to_set,
 };
 use archivefs_core::dat::parsers::parse_dat_file;
 use archivefs_core::{Database, default_database_path};
@@ -57,40 +57,27 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    let mut plan = if let Ok(database_path) = default_database_path()
+    let set_name = &args[4];
+    let plan = if let Ok(database_path) = default_database_path()
         && let Ok(database) = Database::open_read_only(&database_path)
-        && let Ok(joins) = database.mame_arcade_join_paths_for_dat(&dat_sha256)
-        && !joins.is_empty()
+        && database
+            .mame_arcade_join_exists_for_dat(&dat_sha256)
+            .unwrap_or(false)
     {
-        plan_mame_normalisation_from_verified_joins(&root, &dat.dat, &joins, mode)?
+        // Audited collection: plan only the requested set's clone component. The
+        // result for those sets equals the whole-collection plan's, without
+        // listing, stat-ing and re-hashing every other set in the folder.
+        let component = mame_clone_component(&dat.dat, set_name)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let joins = database.mame_arcade_join_paths_for_dat_sets(&dat_sha256, Some(&component))?;
+        plan_mame_normalisation_from_verified_joins_for_set(
+            &root, &dat.dat, &joins, mode, set_name,
+        )?
     } else {
         plan_mame_normalisation(&root, &dat.dat, mode)?
     };
-    let set_name = &args[4];
-    let paths = plan
-        .split_rebuilds
-        .iter()
-        .filter(|rebuild| {
-            rebuild
-                .parent_path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy() == set_name.as_str())
-                || rebuild
-                    .clone_path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy() == set_name.as_str())
-                || rebuild
-                    .parent_target
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy() == set_name.as_str())
-                || rebuild
-                    .clone_target
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy() == set_name.as_str())
-        })
-        .flat_map(|rebuild| [rebuild.parent_path.clone(), rebuild.clone_path.clone()])
-        .collect::<std::collections::BTreeSet<_>>();
-    plan = restrict_to_paths(plan, &paths);
+    let plan = restrict_plan_to_set(plan, set_name);
     if command == "preview" {
         println!("{}", serde_json::to_string_pretty(&plan)?);
     } else if command == "apply" {
@@ -110,22 +97,4 @@ pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         println!("Verified {count} published Split members.");
     }
     Ok(())
-}
-
-fn restrict_to_paths(
-    mut plan: MameNormalisationPlan,
-    paths: &std::collections::BTreeSet<PathBuf>,
-) -> MameNormalisationPlan {
-    plan.split_rebuilds.retain(|rebuild| {
-        paths.contains(&rebuild.parent_path) && paths.contains(&rebuild.clone_path)
-    });
-    plan.sets.retain(|set| paths.contains(&set.current_path));
-    plan.summary.total_sets = plan.sets.len();
-    plan.summary.split_rebuilds = plan.split_rebuilds.len();
-    plan.summary.moved_members = plan
-        .split_rebuilds
-        .iter()
-        .map(|rebuild| rebuild.moved_members)
-        .sum();
-    plan
 }

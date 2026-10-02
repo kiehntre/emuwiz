@@ -70,6 +70,100 @@ pub use restore::{
     prepare_database_restore, restore_database, rollback_database_restore,
 };
 
+/// The join evidence for `logical_set_name` with its member observations replaced
+/// by `rows`, encoded exactly as it is stored.
+fn mame_join_with_member_evidence(
+    encoded: &[u8],
+    logical_set_name: &str,
+    rows: &[crate::dat::mame_arcade_join::MamePhysicalMemberEvidence],
+) -> Result<Vec<u8>> {
+    let mut evidence: crate::dat::mame_arcade_join::ArcadeJoinEvidence =
+        serde_json::from_slice(encoded).map_err(|error| {
+            ArchiveFsError::Database(format!(
+                "stored MAME join evidence is malformed for {logical_set_name}: {error}"
+            ))
+        })?;
+    for member in &mut evidence.members {
+        let matches = rows
+            .iter()
+            .filter(|row| {
+                row.actionable
+                    && row.target_set_name.as_deref() == Some(logical_set_name)
+                    && row.target_member_name.as_deref() == Some(member.name.as_str())
+            })
+            .collect::<Vec<_>>();
+        if matches.len() == 1 {
+            let row = matches[0];
+            member.kind = crate::dat::mame_arcade_join::MemberEvidenceKind::Present;
+            member.current_name = Some(row.current_name.clone());
+            member.observed_sha1 = row.sha1.clone();
+            member.observed_crc32 = row.crc32.clone();
+        } else {
+            member.current_name = None;
+            member.observed_sha1 = None;
+            member.observed_crc32 = None;
+        }
+    }
+    let encoded = serde_json::to_vec(&evidence).map_err(|error| {
+        ArchiveFsError::Database(format!(
+            "failed to encode MAME join evidence for {logical_set_name}: {error}"
+        ))
+    })?;
+    Ok(encoded)
+}
+
+/// Whether the rows stored for `logical_set_name` are exactly `rows` (every
+/// column, including `observed_at`), in any order.
+fn mame_member_evidence_rows_equal(
+    tx: &rusqlite::Transaction<'_>,
+    dat_source_id: &str,
+    logical_set_name: &str,
+    rows: &[crate::dat::mame_arcade_join::MamePhysicalMemberEvidence],
+) -> Result<bool> {
+    let mut statement = tx
+        .prepare(
+            "SELECT logical_set_name, source_path, current_name, file_size,
+                    modified_time_ns, sha1, crc32, target_set_name,
+                    target_member_name, actionable, failure_reason,
+                    evidence_version, observed_at
+             FROM mame_member_evidence
+             WHERE dat_source_id = ?1 AND logical_set_name = ?2",
+        )
+        .map_err(|error| db_error("failed to prepare MAME member evidence comparison", error))?;
+    let stored = statement
+        .query_map(params![dat_source_id, logical_set_name], |row| {
+            Ok(crate::dat::mame_arcade_join::MamePhysicalMemberEvidence {
+                logical_set_name: row.get(0)?,
+                source_path: PathBuf::from(OsString::from_vec(row.get::<_, Vec<u8>>(1)?)),
+                current_name: row.get(2)?,
+                file_size: u64::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                modified_time_ns: row.get(4)?,
+                sha1: row.get(5)?,
+                crc32: row.get(6)?,
+                target_set_name: row.get(7)?,
+                target_member_name: row.get(8)?,
+                actionable: row.get::<_, i64>(9)? != 0,
+                failure_reason: row.get(10)?,
+                evidence_version: row.get(11)?,
+                observed_at: row.get(12)?,
+            })
+        })
+        .map_err(|error| db_error("failed to read MAME member evidence for comparison", error))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| db_error("failed to read MAME member evidence for comparison", error))?;
+    if stored.len() != rows.len() {
+        return Ok(false);
+    }
+    let key = |row: &crate::dat::mame_arcade_join::MamePhysicalMemberEvidence| {
+        (row.source_path.clone(), row.current_name.clone())
+    };
+    let mut stored = stored;
+    stored.sort_by_key(key);
+    let mut wanted = rows.to_vec();
+    wanted.sort_by_key(key);
+    Ok(stored == wanted)
+}
+
 /// Resolves the default library database path: `library.sqlite3` under the
 /// effective data directory (EmuWiz's `~/.local/share/emuwiz`, or the legacy
 /// `~/.local/share/archivefs` when that is where the user's data lives), next
@@ -532,6 +626,32 @@ impl Database {
             .connection
             .transaction()
             .map_err(|error| db_error("failed to start MAME member evidence transaction", error))?;
+        let metadata = tx
+            .query_row(
+                "SELECT metadata_json FROM dat_expected_entries
+                 WHERE dat_source_id = ?1 AND canonical_identity = ?2",
+                params![dat_source_id, logical_set_name],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()
+            .map_err(|error| db_error("failed to read MAME join for member evidence", error))?;
+        let merged_metadata = match &metadata {
+            Some(Some(encoded)) => Some(mame_join_with_member_evidence(
+                encoded,
+                logical_set_name,
+                rows,
+            )?),
+            _ => None,
+        };
+        // A republish that would leave every stored byte as it is writes nothing:
+        // the rows and the join evidence derived from them are already exactly
+        // these. Anything different, including a join that was rewritten without
+        // its member evidence, still takes the full replace below.
+        if merged_metadata.as_deref() == metadata.as_ref().and_then(|m| m.as_deref())
+            && mame_member_evidence_rows_equal(&tx, dat_source_id, logical_set_name, rows)?
+        {
+            return Ok(rows.len());
+        }
         tx.execute(
             "DELETE FROM mame_member_evidence
              WHERE dat_source_id = ?1 AND logical_set_name = ?2",
@@ -566,48 +686,7 @@ impl Database {
             .map_err(|error| db_error("failed to persist MAME member evidence", error))?;
         }
 
-        let metadata = tx
-            .query_row(
-                "SELECT metadata_json FROM dat_expected_entries
-                 WHERE dat_source_id = ?1 AND canonical_identity = ?2",
-                params![dat_source_id, logical_set_name],
-                |row| row.get::<_, Option<Vec<u8>>>(0),
-            )
-            .optional()
-            .map_err(|error| db_error("failed to read MAME join for member evidence", error))?;
-        if let Some(Some(encoded)) = metadata {
-            let mut evidence: crate::dat::mame_arcade_join::ArcadeJoinEvidence =
-                serde_json::from_slice(&encoded).map_err(|error| {
-                    ArchiveFsError::Database(format!(
-                        "stored MAME join evidence is malformed for {logical_set_name}: {error}"
-                    ))
-                })?;
-            for member in &mut evidence.members {
-                let matches = rows
-                    .iter()
-                    .filter(|row| {
-                        row.actionable
-                            && row.target_set_name.as_deref() == Some(logical_set_name)
-                            && row.target_member_name.as_deref() == Some(member.name.as_str())
-                    })
-                    .collect::<Vec<_>>();
-                if matches.len() == 1 {
-                    let row = matches[0];
-                    member.kind = crate::dat::mame_arcade_join::MemberEvidenceKind::Present;
-                    member.current_name = Some(row.current_name.clone());
-                    member.observed_sha1 = row.sha1.clone();
-                    member.observed_crc32 = row.crc32.clone();
-                } else {
-                    member.current_name = None;
-                    member.observed_sha1 = None;
-                    member.observed_crc32 = None;
-                }
-            }
-            let encoded = serde_json::to_vec(&evidence).map_err(|error| {
-                ArchiveFsError::Database(format!(
-                    "failed to encode MAME join evidence for {logical_set_name}: {error}"
-                ))
-            })?;
+        if let Some(encoded) = merged_metadata {
             tx.execute(
                 "UPDATE dat_expected_entries SET metadata_json = ?3, updated_at = ?4
                  WHERE dat_source_id = ?1 AND canonical_identity = ?2",
@@ -926,21 +1005,67 @@ impl Database {
         &self,
         dat_sha256: &str,
     ) -> Result<Vec<(PathBuf, crate::dat::mame_arcade_join::ArcadeJoinEvidence)>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT audit.archive_path, expected.metadata_json
+        self.mame_arcade_join_paths_for_dat_sets(dat_sha256, None)
+    }
+
+    /// Whether [`Self::mame_arcade_join_paths_for_dat`] would return any row:
+    /// the same digest and currency filters, without decoding any evidence.
+    pub fn mame_arcade_join_exists_for_dat(&self, dat_sha256: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM dat_set_audit_results AS audit
+                     JOIN dat_expected_entries AS expected
+                       ON expected.dat_source_id = audit.source_id
+                      AND expected.canonical_identity = audit.game_name
+                     WHERE audit.source_id LIKE ?2 AND audit.dat_revision = ?1
+                       AND audit.stale = 0)",
+                params![dat_sha256, "mame-arcade:%"],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| db_error("failed to check MAME join evidence", error))
+    }
+
+    /// The same rows as [`Self::mame_arcade_join_paths_for_dat`] (same trust
+    /// filters: this DAT digest, current rows only, same order), restricted to
+    /// the audited sets named in `set_names` when given. It is a pure restriction
+    /// of the full result, so a caller that already ignores other sets gets an
+    /// identical answer without decoding the whole collection's evidence.
+    pub fn mame_arcade_join_paths_for_dat_sets(
+        &self,
+        dat_sha256: &str,
+        set_names: Option<&[String]>,
+    ) -> Result<Vec<(PathBuf, crate::dat::mame_arcade_join::ArcadeJoinEvidence)>> {
+        let mut values = vec![dat_sha256.to_string(), "mame-arcade:%".to_string()];
+        let scope_sql = match set_names {
+            Some([]) => return Ok(Vec::new()),
+            Some(names) => {
+                values.extend(names.iter().cloned());
+                let placeholders = (0..names.len())
+                    .map(|index| format!("?{}", index + 3))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(" AND audit.game_name IN ({placeholders})")
+            }
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT audit.archive_path, expected.metadata_json
              FROM dat_set_audit_results AS audit
              JOIN dat_expected_entries AS expected
                ON expected.dat_source_id = audit.source_id
               AND expected.canonical_identity = audit.game_name
-             WHERE audit.source_id LIKE ?1 AND audit.dat_revision = ?2
-               AND audit.stale = 0
-             ORDER BY audit.archive_path, audit.game_name",
-            )
+             WHERE audit.source_id LIKE ?2 AND audit.dat_revision = ?1
+               AND audit.stale = 0{scope_sql}
+             ORDER BY audit.archive_path, audit.game_name"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
             .map_err(|error| db_error("failed to prepare MAME join path query", error))?;
         let rows = statement
-            .query_map(params!["mame-arcade:%", dat_sha256], |row| {
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
                 Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<Vec<u8>>>(1)?))
             })
             .map_err(|error| db_error("failed to query MAME join paths", error))?;

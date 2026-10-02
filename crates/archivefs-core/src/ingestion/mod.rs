@@ -50,7 +50,7 @@ mod tests;
 pub(crate) use arcade::discover_extracted_sets_excluding;
 pub use arcade::{
     ArcadeIngestionDiagnostics, ArcadeSetDirectory, ArcadeSetDiscovery, SupportMaterialKind,
-    discover_extracted_sets, support_material_kind,
+    discover_extracted_sets, discover_extracted_sets_scoped, support_material_kind,
 };
 pub use container::{ArchiveFormat, ContainerKind, FolderRole};
 pub use content_registry::ContentKind;

@@ -356,6 +356,99 @@ pub fn plan_mame_normalisation_from_verified_joins(
     joins: &[(PathBuf, ArcadeJoinEvidence)],
     mode: MameCollectionMode,
 ) -> Result<MameNormalisationPlan, String> {
+    plan_from_verified_joins(root, dat, joins, mode, None)
+}
+
+/// The clone-of component of `set_name`: the set, its parent and clones, and the
+/// parents and clones of those, transitively. Two components share no set name,
+/// and so (a path carries exactly one audited name) no path.
+pub fn mame_clone_component(dat: &ParsedDat, set_name: &str) -> BTreeSet<String> {
+    let mut component = BTreeSet::from([set_name.to_string()]);
+    loop {
+        let before = component.len();
+        for game in &dat.games {
+            let Some(parent) = game.clone_of.as_deref() else {
+                continue;
+            };
+            if component.contains(&game.name) || component.contains(parent) {
+                component.insert(game.name.clone());
+                component.insert(parent.to_string());
+            }
+        }
+        if component.len() == before {
+            return component;
+        }
+    }
+}
+
+/// [`plan_mame_normalisation_from_verified_joins`] for one set's component only.
+///
+/// For every set in the component the plan equals the full-collection plan:
+/// the DAT (and so its checksum-uniqueness index) is the whole DAT, clones are
+/// visited in DAT order, and no other component can touch a path this one uses.
+/// What it skips is everything else: the other components' sets are neither
+/// listed, stat-ed, nor opened and hashed for a rebuild. `joins` need only hold
+/// the component's audited sets. The summary describes the planned sets.
+pub fn plan_mame_normalisation_from_verified_joins_for_set(
+    root: &Path,
+    dat: &ParsedDat,
+    joins: &[(PathBuf, ArcadeJoinEvidence)],
+    mode: MameCollectionMode,
+    requested_set: &str,
+) -> Result<MameNormalisationPlan, String> {
+    let component = mame_clone_component(dat, requested_set);
+    plan_from_verified_joins(root, dat, joins, mode, Some(&component))
+}
+
+/// The part of a full-collection plan that concerns one set: the Split rebuilds
+/// naming it (as a current path or a target) and the sets those rebuilds touch.
+/// This is what `mame-normalise <preview|apply|verify>` acts on.
+pub fn restrict_plan_to_set(
+    mut plan: MameNormalisationPlan,
+    set_name: &str,
+) -> MameNormalisationPlan {
+    let named = |path: &Path| {
+        let matches = |name: Option<&std::ffi::OsStr>| {
+            name.is_some_and(|name| name.to_string_lossy() == set_name)
+        };
+        matches(path.file_name())
+            || (path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+                && matches(path.file_stem()))
+    };
+    let paths = plan
+        .split_rebuilds
+        .iter()
+        .filter(|rebuild| {
+            named(&rebuild.parent_path)
+                || named(&rebuild.clone_path)
+                || named(&rebuild.parent_target)
+                || named(&rebuild.clone_target)
+        })
+        .flat_map(|rebuild| [rebuild.parent_path.clone(), rebuild.clone_path.clone()])
+        .collect::<BTreeSet<_>>();
+    plan.split_rebuilds.retain(|rebuild| {
+        paths.contains(&rebuild.parent_path) && paths.contains(&rebuild.clone_path)
+    });
+    plan.sets.retain(|set| paths.contains(&set.current_path));
+    plan.summary.total_sets = plan.sets.len();
+    plan.summary.split_rebuilds = plan.split_rebuilds.len();
+    plan.summary.moved_members = plan
+        .split_rebuilds
+        .iter()
+        .map(|rebuild| rebuild.moved_members)
+        .sum();
+    plan
+}
+
+fn plan_from_verified_joins(
+    root: &Path,
+    dat: &ParsedDat,
+    joins: &[(PathBuf, ArcadeJoinEvidence)],
+    mode: MameCollectionMode,
+    component: Option<&BTreeSet<String>>,
+) -> Result<MameNormalisationPlan, String> {
     if mode == MameCollectionMode::NotSure {
         return Err("choose or confirm a MAME collection layout before previewing".into());
     }
@@ -367,18 +460,35 @@ pub fn plan_mame_normalisation_from_verified_joins(
     }
     let mut by_path = BTreeMap::new();
     for (path, evidence) in joins {
-        if path.starts_with(root) {
+        if path.starts_with(root)
+            && component.is_none_or(|names| {
+                evidence
+                    .dat_set_name
+                    .as_ref()
+                    .is_some_and(|name| names.contains(name))
+            })
+        {
             by_path.insert(path.clone(), evidence);
         }
     }
     let mut planned = Vec::new();
-    let mut children = fs::read_dir(root)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    children.sort_by_key(|entry| entry.file_name());
-    for entry in children {
-        let path = entry.path();
+    let children: Vec<PathBuf> = if component.is_some() {
+        // Only the component's audited sets that are direct entries of the
+        // folder, in the same name order as the listing below.
+        by_path
+            .keys()
+            .filter(|path| path.parent() == Some(root) && fs::symlink_metadata(path).is_ok())
+            .cloned()
+            .collect()
+    } else {
+        let mut children = fs::read_dir(root)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        children.sort_by_key(|entry| entry.file_name());
+        children.into_iter().map(|entry| entry.path()).collect()
+    };
+    for path in children {
         let Some(evidence) = by_path.get(&path) else {
             planned.push(PlannedSet {
                 fix: unresolved(
@@ -453,7 +563,7 @@ pub fn plan_mame_normalisation_from_verified_joins(
     }
     apply_layout_completeness(dat, mode, &mut planned);
     let split_rebuilds = if mode == MameCollectionMode::Split {
-        plan_split_rebuilds_from_verified_joins(dat, &by_path, &mut planned)
+        plan_split_rebuilds_from_verified_joins(dat, &by_path, &mut planned, component)
     } else {
         Vec::new()
     };
@@ -503,11 +613,14 @@ fn plan_split_rebuilds_from_verified_joins(
     dat: &ParsedDat,
     joins: &BTreeMap<PathBuf, &ArcadeJoinEvidence>,
     planned: &mut [PlannedSet],
+    component: Option<&BTreeSet<String>>,
 ) -> Vec<MameSplitRebuild> {
     let index = DatIndex::build(dat);
     let mut rebuilds = Vec::new();
     let mut used_archives = BTreeSet::new();
-    for clone in dat.games.iter().filter(|game| game.clone_of.is_some()) {
+    for clone in dat.games.iter().filter(|game| {
+        game.clone_of.is_some() && component.is_none_or(|names| names.contains(&game.name))
+    }) {
         let Some(parent_name) = clone.clone_of.as_deref() else {
             continue;
         };
@@ -2302,6 +2415,237 @@ mod tests {
                 .iter()
                 .any(|member| member.correct == "clone.bin")
         );
+    }
+
+    fn dat_game(name: &str, clone_of: Option<&str>, roms: &[(&str, &[u8])]) -> DatGameEntry {
+        DatGameEntry {
+            name: name.into(),
+            clone_of: clone_of.map(str::to_owned),
+            rom_of: clone_of.map(str::to_owned),
+            roms: roms
+                .iter()
+                .map(|(name, bytes)| {
+                    let digest = hashes(bytes);
+                    DatRomEntry {
+                        name: (*name).into(),
+                        crc32: Some(digest.crc),
+                        md5: Some(digest.md5),
+                        sha1: Some(digest.sha1),
+                        sha256: Some(digest.sha256),
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A folder of several unrelated families, built so that the whole-collection
+    /// plan has rebuilds, a refused rebuild (a checksum shared across families under
+    /// two ROM names), a second clone competing for one parent, a clone-of chain, a
+    /// duplicate audited path, a join below the folder, and an unaudited archive.
+    fn collection_fixture(root: &Path) -> (ParsedDat, Vec<(PathBuf, ArcadeJoinEvidence)>) {
+        let mut games = Vec::new();
+        let mut joins = Vec::new();
+        let mut put = |file: &str, name: &str, clone_of: Option<&str>, member: (&str, &[u8])| {
+            let path = root.join(file);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            write_fixture_zip(&path, &[member]);
+            joins.push((path, persisted_join(name, clone_of, &[member])));
+        };
+        for (family, shared) in [("a", &b"a shared"[..]), ("b", b"b shared")] {
+            let (p, c) = (format!("{family}p"), format!("{family}c"));
+            games.push(dat_game(&p, None, &[("shared.bin", shared)]));
+            games.push(dat_game(
+                &c,
+                Some(&p),
+                &[("shared.bin", shared), ("cown.bin", b"c")],
+            ));
+            put(&format!("{p}.zip"), &p, None, ("w1.bin", b"c"));
+            put(&format!("{c}.zip"), &c, Some(&p), ("w2.bin", shared));
+        }
+        // A second clone of `ap`: the parent is already spoken for by `ac`.
+        games.push(dat_game(
+            "ac2",
+            Some("ap"),
+            &[("shared.bin", b"a shared"), ("x.bin", b"x2")],
+        ));
+        put("ac2.zip", "ac2", Some("ap"), ("w3.bin", b"a shared"));
+        // The same bytes as `ap`'s shared.bin under another ROM name, in another family:
+        // across the whole DAT that checksum is no longer unique, so `a` is refused.
+        games.push(dat_game("hp", None, &[("alias.bin", b"a shared")]));
+        games.push(dat_game(
+            "hc",
+            Some("hp"),
+            &[("alias.bin", b"a shared"), ("hc.bin", b"hc")],
+        ));
+        put("hp.zip", "hp", None, ("w1.bin", b"hc"));
+        put("hc.zip", "hc", Some("hp"), ("w2.bin", b"a shared"));
+        // A clone-of chain.
+        games.push(dat_game("dp", None, &[("s.bin", b"d shared")]));
+        games.push(dat_game(
+            "dc",
+            Some("dp"),
+            &[("s.bin", b"d shared"), ("c.bin", b"dc")],
+        ));
+        games.push(dat_game(
+            "de",
+            Some("dc"),
+            &[("s.bin", b"d shared"), ("e.bin", b"de")],
+        ));
+        put("dp.zip", "dp", None, ("w1.bin", b"dc"));
+        put("dc.zip", "dc", Some("dp"), ("w2.bin", b"d shared"));
+        put("de.zip", "de", Some("dc"), ("w3.bin", b"d shared"));
+        // A duplicate audited archive for `bp`, a join below the folder that sorts
+        // first for `de`, and an archive with no audit at all.
+        put("bp_copy.zip", "bp", None, ("w1.bin", b"c"));
+        put("0nested/de.zip", "de", Some("dc"), ("w3.bin", b"d shared"));
+        write_fixture_zip(&root.join("stray.zip"), &[("z.bin", b"stray")]);
+        let mut parsed = parent_clone_dat();
+        parsed.games = games;
+        (parsed, joins)
+    }
+
+    fn set_names(dat: &ParsedDat) -> Vec<String> {
+        dat.games.iter().map(|game| game.name.clone()).collect()
+    }
+
+    #[test]
+    fn a_set_scoped_plan_equals_the_whole_collection_plan_for_that_set() {
+        let directory = tempdir().expect("fixture directory");
+        let root = directory.path();
+        let (dat, joins) = collection_fixture(root);
+        let full = plan_mame_normalisation_from_verified_joins(
+            root,
+            &dat,
+            &joins,
+            MameCollectionMode::Split,
+        )
+        .expect("whole-collection plan");
+
+        let mut with_rebuild = BTreeSet::new();
+        for name in set_names(&dat) {
+            let expected = restrict_plan_to_set(full.clone(), &name);
+            let component = mame_clone_component(&dat, &name);
+            let only_component: Vec<_> = joins
+                .iter()
+                .filter(|(_, e)| {
+                    e.dat_set_name
+                        .as_ref()
+                        .is_some_and(|set| component.contains(set))
+                })
+                .cloned()
+                .collect();
+            // Whether the caller hands over every join or only the component's,
+            // the answer for the set is the same.
+            for given in [&joins, &only_component] {
+                let scoped = restrict_plan_to_set(
+                    plan_mame_normalisation_from_verified_joins_for_set(
+                        root,
+                        &dat,
+                        given,
+                        MameCollectionMode::Split,
+                        &name,
+                    )
+                    .expect("scoped plan"),
+                    &name,
+                );
+                assert_eq!(scoped.sets, expected.sets, "{name}");
+                assert_eq!(scoped.split_rebuilds, expected.split_rebuilds, "{name}");
+                assert_eq!(
+                    scoped.summary.total_sets, expected.summary.total_sets,
+                    "{name}"
+                );
+                assert_eq!(
+                    scoped.summary.moved_members, expected.summary.moved_members,
+                    "{name}"
+                );
+            }
+            if !expected.split_rebuilds.is_empty() {
+                with_rebuild.insert(name);
+            }
+        }
+        // Not vacuous: real rebuilds were compared, and the refused ones stay refused.
+        assert!(
+            ["bp", "bc", "dp", "dc"]
+                .iter()
+                .all(|name| with_rebuild.contains(*name)),
+            "{with_rebuild:?}"
+        );
+        assert!(
+            !with_rebuild.contains("ap"),
+            "shared checksum must refuse family a"
+        );
+        assert!(!with_rebuild.contains("hp") && !with_rebuild.contains("hc"));
+        assert!(!with_rebuild.contains("ac2"), "the parent is already used");
+    }
+
+    #[test]
+    fn a_scoped_plan_lists_only_its_own_component() {
+        let directory = tempdir().expect("fixture directory");
+        let root = directory.path();
+        let (dat, joins) = collection_fixture(root);
+        let plan = plan_mame_normalisation_from_verified_joins_for_set(
+            root,
+            &dat,
+            &joins,
+            MameCollectionMode::Split,
+            "dc",
+        )
+        .expect("scoped plan");
+        let component = mame_clone_component(&dat, "dc");
+        assert_eq!(
+            component,
+            BTreeSet::from(["dp".to_string(), "dc".to_string(), "de".to_string()])
+        );
+        assert!(plan.sets.iter().all(|set| {
+            set.set_name
+                .as_ref()
+                .is_some_and(|name| component.contains(name))
+        }));
+        assert!(
+            plan.sets
+                .iter()
+                .all(|set| set.current_path != root.join("stray.zip"))
+        );
+        assert_eq!(plan.sets.len(), 3);
+    }
+
+    /// The reason the DAT is not narrowed to the family: a ROM checksum's uniqueness
+    /// is a property of the whole DAT, so a family-only DAT would accept a rebuild the
+    /// whole collection correctly refuses.
+    #[test]
+    fn narrowing_the_dat_to_the_family_would_change_the_answer() {
+        let directory = tempdir().expect("fixture directory");
+        let root = directory.path();
+        let (dat, joins) = collection_fixture(root);
+        let family = mame_clone_component(&dat, "ap");
+        let narrowed = ParsedDat {
+            source: dat.source.clone(),
+            games: dat
+                .games
+                .iter()
+                .filter(|game| family.contains(&game.name))
+                .cloned()
+                .collect(),
+        };
+        let plan = |dat: &ParsedDat| {
+            restrict_plan_to_set(
+                plan_mame_normalisation_from_verified_joins_for_set(
+                    root,
+                    dat,
+                    &joins,
+                    MameCollectionMode::Split,
+                    "ap",
+                )
+                .expect("plan"),
+                "ap",
+            )
+        };
+        assert!(plan(&dat).split_rebuilds.is_empty());
+        assert!(!plan(&narrowed).split_rebuilds.is_empty());
     }
 
     #[test]

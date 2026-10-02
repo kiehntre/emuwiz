@@ -21,7 +21,7 @@ use archivefs_core::dat::mame_arcade_join::{
 };
 use archivefs_core::dat::mame_merged_reconstruction::{
     MAME_RECONSTRUCTION_WORKFLOW, MameMergedReconstructionPlan, apply_staged_reconstruction_output,
-    build_merged_reconstruction_plan, discover_packed_zip_sources,
+    build_merged_reconstruction_plan, discover_packed_zip_sources, reconstruction_family_names,
 };
 use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionState};
 use archivefs_core::dat::rename_apply::{
@@ -30,7 +30,6 @@ use archivefs_core::dat::rename_apply::{
 use archivefs_core::dat::rom_organisation::OrganisationMode;
 use archivefs_core::safe_read::TrustedRoots;
 use archivefs_core::{Database, default_database_path};
-use sha2::{Digest, Sha256};
 use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -569,15 +568,14 @@ fn current_mame_reconstruction_plan(
         return Err("Enter a parent or clone set name before previewing.".into());
     }
     let dat = load_verified_mame_0174(dat_path)?;
-    let digest = Sha256::digest(std::fs::read(dat_path).map_err(|e| e.to_string())?);
-    let dat_sha256 = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    // The loader has already hashed the DAT it parsed; do not read it again.
+    let dat_sha256 = dat.sha256.clone();
+    let family = reconstruction_family_names(&dat.parsed, requested_set)?;
     let database_path = default_database_path().map_err(|e| e.to_string())?;
     let database = Database::open_read_only(&database_path).map_err(|e| e.to_string())?;
+    // Only this family's persisted joins: the plan ignores every other set's.
     let mut joins = database
-        .mame_arcade_join_paths_for_dat(&dat_sha256)
+        .mame_arcade_join_paths_for_dat_sets(&dat_sha256, Some(&family))
         .map_err(|e| e.to_string())?;
     joins.extend(discover_packed_zip_sources(
         root,

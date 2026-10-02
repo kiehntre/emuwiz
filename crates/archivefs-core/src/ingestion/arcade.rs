@@ -81,6 +81,10 @@ pub struct ArcadeSetDirectory {
 pub struct ArcadeSetDiscovery {
     /// Read errors or enumeration bounds mean this is not a complete walk.
     pub scan_errors_total: usize,
+    /// The walk was restricted to requested set names, so it never opened the
+    /// other sets. Such a result proves nothing about what is absent and must
+    /// not feed presence, coverage or Missing decisions.
+    pub scoped: bool,
     pub sets: Vec<ArcadeSetDirectory>,
     pub diagnostics: ArcadeIngestionDiagnostics,
 }
@@ -161,11 +165,35 @@ pub fn discover_extracted_sets(root: &Path) -> std::io::Result<ArcadeSetDiscover
     discover_extracted_sets_excluding(root, &[])
 }
 
+/// Like [`discover_extracted_sets`], but opens only the sets whose normalised
+/// name is in `requested_names`. The root listing, the directory bound and the
+/// per-set rules are unchanged, so each returned set is exactly the one the full
+/// walk returns for that name, in the same order. The result is marked
+/// [`ArcadeSetDiscovery::scoped`]: it is for reading evidence about a known
+/// family, never for deciding what is absent.
+pub fn discover_extracted_sets_scoped(
+    root: &Path,
+    requested_names: &std::collections::BTreeSet<String>,
+) -> std::io::Result<ArcadeSetDiscovery> {
+    discover_extracted_sets_inner(root, &[], Some(requested_names))
+}
+
 pub(crate) fn discover_extracted_sets_excluding(
     root: &Path,
     excluded: &[std::path::PathBuf],
 ) -> std::io::Result<ArcadeSetDiscovery> {
-    let mut result = ArcadeSetDiscovery::default();
+    discover_extracted_sets_inner(root, excluded, None)
+}
+
+fn discover_extracted_sets_inner(
+    root: &Path,
+    excluded: &[std::path::PathBuf],
+    requested_names: Option<&std::collections::BTreeSet<String>>,
+) -> std::io::Result<ArcadeSetDiscovery> {
+    let mut result = ArcadeSetDiscovery {
+        scoped: requested_names.is_some(),
+        ..Default::default()
+    };
     let mut directories = Vec::new();
     let mut direct_members = Vec::new();
     let mut root_malformed = false;
@@ -181,20 +209,27 @@ pub(crate) fn discover_extracted_sets_excluding(
         if excluded.iter().any(|owned| path.starts_with(owned)) {
             continue;
         }
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+        // Neither form follows symlinks. A scoped walk takes the type from the
+        // directory listing instead of stat-ing every entry of a large folder.
+        let file_type = if requested_names.is_some() {
+            entry.file_type()
+        } else {
+            std::fs::symlink_metadata(&path).map(|metadata| metadata.file_type())
+        };
+        let file_type = match file_type {
+            Ok(file_type) => file_type,
             Err(_) => {
                 result.scan_errors_total += 1;
                 continue;
             }
         };
-        if metadata.file_type().is_symlink() {
+        if file_type.is_symlink() {
             root_malformed = true;
             continue;
         }
-        if metadata.is_dir() {
+        if file_type.is_dir() {
             directories.push(path);
-        } else if metadata.is_file() {
+        } else if file_type.is_file() {
             result.diagnostics.raw_files_considered += 1;
             direct_members.push(path);
         } else {
@@ -222,6 +257,7 @@ pub(crate) fn discover_extracted_sets_excluding(
             })
         })
         && let Some(set_name) = safe_set_name(root)
+        && requested_names.is_none_or(|names| names.contains(&set_name))
     {
         direct_members.sort();
         result.diagnostics.logical_sets_aggregated += 1;
@@ -249,6 +285,9 @@ pub(crate) fn discover_extracted_sets_excluding(
             result.diagnostics.unresolved_items += 1;
             continue;
         };
+        if requested_names.is_some_and(|names| !names.contains(&set_name)) {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&path) else {
             result.scan_errors_total += 1;
             result.diagnostics.unresolved_items += 1;
@@ -313,6 +352,7 @@ fn safe_set_name(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::fs;
     use tempfile::tempdir;
 
@@ -357,6 +397,96 @@ mod tests {
         assert_eq!(report.sets[0].set_name, "pacman");
         assert_eq!(report.sets[0].members.len(), 2);
         assert_eq!(report.diagnostics.logical_sets_aggregated, 1);
+    }
+
+    fn make_set(root: &Path, name: &str) {
+        let set = root.join(name);
+        fs::create_dir(&set).unwrap();
+        fs::write(set.join("one.bin"), b"one").unwrap();
+        fs::write(set.join("two.bin"), b"two").unwrap();
+    }
+
+    fn names(report: &ArcadeSetDiscovery) -> Vec<&str> {
+        report.sets.iter().map(|s| s.set_name.as_str()).collect()
+    }
+
+    #[test]
+    fn scoped_discovery_is_the_full_walk_restricted_to_the_requested_names() {
+        let dir = tempdir().unwrap();
+        for name in ["alpha", "beta", "gamma", "delta"] {
+            make_set(dir.path(), name);
+        }
+        fs::write(dir.path().join("loose.zip"), b"zip").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("alpha"), dir.path().join("link")).unwrap();
+
+        let full = discover_extracted_sets(dir.path()).unwrap();
+        assert!(!full.scoped);
+        for subset in [
+            vec!["beta", "alpha"],
+            vec!["delta"],
+            vec!["nothing"],
+            vec!["alpha", "beta", "gamma", "delta"],
+        ] {
+            let wanted: BTreeSet<String> = subset.iter().map(|s| s.to_string()).collect();
+            let scoped = discover_extracted_sets_scoped(dir.path(), &wanted).unwrap();
+            assert!(scoped.scoped);
+            let expected: Vec<_> = full
+                .sets
+                .iter()
+                .filter(|set| wanted.contains(&set.set_name))
+                .cloned()
+                .collect();
+            assert_eq!(scoped.sets, expected, "{subset:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scoped_discovery_never_opens_an_unrequested_set() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        make_set(dir.path(), "wanted");
+        make_set(dir.path(), "locked");
+        let locked = dir.path().join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can read anything; the property is only observable without that.
+        let can_still_read = fs::read_dir(&locked).is_ok();
+
+        let requested = BTreeSet::from(["wanted".to_string()]);
+        let scoped = discover_extracted_sets_scoped(dir.path(), &requested).unwrap();
+        let full = discover_extracted_sets(dir.path()).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(names(&scoped), vec!["wanted"]);
+        assert_eq!(scoped.scan_errors_total, 0);
+        if !can_still_read {
+            assert_eq!(full.scan_errors_total, 1, "the full walk does open it");
+        }
+    }
+
+    #[test]
+    fn scoped_discovery_keeps_the_root_as_a_set_rule() {
+        let dir = tempdir().unwrap();
+        let set = dir.path().join("arcade").join("wanted");
+        fs::create_dir_all(&set).unwrap();
+        fs::write(set.join("one.bin"), b"one").unwrap();
+        fs::write(set.join("two.bin"), b"two").unwrap();
+
+        let full = discover_extracted_sets(&set).unwrap();
+        assert_eq!(names(&full), vec!["wanted"]);
+        let yes = BTreeSet::from(["wanted".to_string()]);
+        assert_eq!(
+            discover_extracted_sets_scoped(&set, &yes).unwrap().sets,
+            full.sets
+        );
+        let no = BTreeSet::from(["other".to_string()]);
+        assert!(
+            discover_extracted_sets_scoped(&set, &no)
+                .unwrap()
+                .sets
+                .is_empty()
+        );
     }
 
     #[test]

@@ -65,6 +65,32 @@ impl MameMergedReconstructionPlan {
     }
 }
 
+/// The parent and clone set names [`build_merged_reconstruction_plan`] plans
+/// for `requested_set`. A caller can restrict the persisted joins it loads to
+/// these names: the plan ignores every other set's join anyway.
+pub fn reconstruction_family_names(
+    dat: &ParsedDat,
+    requested_set: &str,
+) -> Result<Vec<String>, String> {
+    let selected = dat
+        .games
+        .iter()
+        .find(|game| game.name == requested_set)
+        .ok_or_else(|| {
+            format!("MAME set is absent from the selected catalogue: {requested_set}")
+        })?;
+    let parent = selected
+        .clone_of
+        .as_deref()
+        .unwrap_or(selected.name.as_str());
+    Ok(dat
+        .games
+        .iter()
+        .filter(|game| game.name == parent || game.clone_of.as_deref() == Some(parent))
+        .map(|game| game.name.clone())
+        .collect())
+}
+
 /// Build a deterministic plan from the current parsed MAME catalogue and
 /// persisted join evidence. `joins` must contain the exact archive path paired
 /// with each SHA-bound join. Directory names and member filenames are never
@@ -288,17 +314,19 @@ pub fn discover_packed_zip_sources(
         .map_err(|error| format!("scan packed MAME sources: {error}"))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
+        // Name filters first: `is_file` is a stat, and it only matters for the few
+        // entries that could be this family's archives. Same result, one stat per
+        // candidate instead of one per entry in the folder.
         .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+            path.extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
         })
         .filter(|path| {
             path.file_stem()
                 .map(|stem| family.contains(&stem.to_string_lossy().to_ascii_lowercase()))
                 .unwrap_or(false)
         })
+        .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     paths.sort();
 
@@ -772,6 +800,71 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+    #[test]
+    fn a_plan_from_only_the_family_joins_equals_the_plan_from_every_join() {
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a"), ("b", "b")]),
+            game("clone", Some("parent"), &[("c", "c")]),
+            game("stranger", None, &[("a", "a"), ("z", "z")]),
+        ]);
+        let family = reconstruction_family_names(&parsed, "clone").unwrap();
+        assert_eq!(family, vec!["parent".to_string(), "clone".to_string()]);
+        assert_eq!(
+            reconstruction_family_names(&parsed, "parent").unwrap(),
+            family
+        );
+        assert!(reconstruction_family_names(&parsed, "absent").is_err());
+
+        let every = vec![
+            (
+                PathBuf::from("/s/parent"),
+                join("parent", "digest", &[("a", "a"), ("b", "b")]),
+            ),
+            (
+                PathBuf::from("/s/clone"),
+                join("clone", "digest", &[("c", "c")]),
+            ),
+            // An unrelated set with the same bytes must not become a duplicate source.
+            (
+                PathBuf::from("/s/stranger"),
+                join("stranger", "digest", &[("a", "a"), ("z", "z")]),
+            ),
+        ];
+        let only_family: Vec<_> = every
+            .iter()
+            .filter(|(_, e)| family.contains(&e.logical_set_name))
+            .cloned()
+            .collect();
+        let root = Path::new("/output");
+        let from_every =
+            build_merged_reconstruction_plan(root, &parsed, &every, "clone", "digest").unwrap();
+        let from_family =
+            build_merged_reconstruction_plan(root, &parsed, &only_family, "clone", "digest")
+                .unwrap();
+        assert_eq!(from_every, from_family);
+        assert!(from_every.duplicate_candidates.is_empty());
+    }
+
+    #[test]
+    fn packed_source_discovery_only_considers_family_zip_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a")]),
+            game("clone", Some("parent"), &[("c", "c")]),
+        ]);
+        // A directory that merely has a family archive's name is not an archive,
+        // and a file for another set is never opened (it is not a valid zip).
+        std::fs::create_dir(root.join("parent.zip")).unwrap();
+        std::fs::write(root.join("stranger.zip"), b"not a zip").unwrap();
+        std::fs::write(root.join("parent.txt"), b"x").unwrap();
+        assert!(
+            discover_packed_zip_sources(root, &parsed, "parent", "digest")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn duplicate_and_missing_members_block() {
         let parsed = dat(vec![

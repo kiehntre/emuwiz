@@ -23,7 +23,9 @@ use crate::game_identity::{
     GameIdentityReport, IdentityConfidence, IdentityEvidence, IdentityImageFormat, IdentityKind,
     IdentityPlatform, IdentityProvenance, IdentityStatus,
 };
-use crate::ingestion::arcade::{ArcadeSetDirectory, discover_extracted_sets};
+use crate::ingestion::arcade::{
+    ArcadeSetDirectory, discover_extracted_sets, discover_extracted_sets_scoped,
+};
 
 pub const MAME_0174_SHA256: &str =
     "df9938254e6299a9dc0499ac4d30ef562730d5e1e1d0f8f887402948980fae27";
@@ -185,8 +187,6 @@ pub fn refresh_mame_member_evidence(
     root: &Path,
     requested_set: Option<&str>,
 ) -> Result<MameEvidenceRefreshReport, String> {
-    let discovered = discover_extracted_sets(root)
-        .map_err(|error| format!("discover MAME extracted sets: {error}"))?;
     let selected = requested_set.map(|name| {
         let family_parent = dat
             .parsed
@@ -204,6 +204,14 @@ pub fn refresh_mame_member_evidence(
             .map(|game| game.name.clone())
             .collect::<BTreeSet<_>>()
     });
+    // A family refresh opens only that family's directories; the full walk is
+    // kept for a whole-folder refresh. The discovery rules are identical, so the
+    // sets considered and their members do not change.
+    let discovered = match selected.as_ref() {
+        Some(names) => discover_extracted_sets_scoped(root, names),
+        None => discover_extracted_sets(root),
+    }
+    .map_err(|error| format!("discover MAME extracted sets: {error}"))?;
     let dat_source_id = format!("mame-arcade:{}:{}", dat.version, dat.sha256);
     let mut report = MameEvidenceRefreshReport {
         root: root.to_path_buf(),
@@ -1241,6 +1249,141 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn rom(name: &str, path: &Path) -> DatRomEntry {
+        let (sha1, crc32) = hash_member(path).unwrap();
+        DatRomEntry {
+            name: name.into(),
+            sha1: Some(sha1),
+            crc32: Some(crc32),
+            ..Default::default()
+        }
+    }
+
+    /// parent `puck` and clone `pacm` (one family) beside an unrelated `other`;
+    /// every member is stored under a wrong name so rows are actionable renames.
+    fn family_fixture(root: &Path) -> VerifiedMameDat {
+        let mut games = Vec::new();
+        for (name, clone_of) in [("puck", None), ("pacm", Some("puck")), ("other", None)] {
+            let files = set(
+                root,
+                name,
+                &[&format!("{name}-a.bin"), &format!("{name}-b.bin")],
+            );
+            for (index, path) in files.members.iter().enumerate() {
+                fs::write(path, format!("{name} member {index}")).unwrap();
+            }
+            let mut entry = game(name);
+            entry.clone_of = clone_of.map(str::to_string);
+            entry.roms = files
+                .members
+                .iter()
+                .enumerate()
+                .map(|(index, path)| rom(&format!("target{index}.bin"), path))
+                .collect();
+            games.push(entry);
+        }
+        dat(games)
+    }
+
+    fn evidence_rows(
+        database: &crate::Database,
+        root: &Path,
+        set: &str,
+    ) -> Vec<Option<MamePhysicalMemberEvidence>> {
+        let source = format!("mame-arcade:{MAME_0174_VERSION}:{MAME_0174_SHA256}");
+        ["a", "b"]
+            .iter()
+            .map(|which| {
+                let name = format!("{set}-{which}.bin");
+                let path = root.join(set).join(&name);
+                let metadata = fs::metadata(&path).unwrap();
+                database
+                    .cached_mame_member_evidence(
+                        &source,
+                        &path,
+                        &name,
+                        metadata.len(),
+                        metadata
+                            .mtime()
+                            .saturating_mul(1_000_000_000)
+                            .saturating_add(metadata.mtime_nsec()),
+                    )
+                    .unwrap()
+                    .map(|mut row| {
+                        row.observed_at.clear();
+                        row
+                    })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_family_refresh_stores_exactly_what_the_full_refresh_stores_for_that_family() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("arcade");
+        fs::create_dir(&root).unwrap();
+        let dat = family_fixture(&root);
+        let mut scoped =
+            crate::Database::open_or_create(directory.path().join("s.sqlite3")).unwrap();
+        let mut full = crate::Database::open_or_create(directory.path().join("f.sqlite3")).unwrap();
+
+        let family = refresh_mame_member_evidence(&mut scoped, &dat, &root, Some("pacm")).unwrap();
+        let everything = refresh_mame_member_evidence(&mut full, &dat, &root, None).unwrap();
+
+        assert_eq!((family.sets_considered, family.members_seen), (2, 4));
+        assert_eq!(
+            (everything.sets_considered, everything.members_seen),
+            (3, 6)
+        );
+        for set in ["puck", "pacm"] {
+            let rows = evidence_rows(&scoped, &root, set);
+            assert!(
+                rows.iter()
+                    .all(|row| row.as_ref().is_some_and(|r| r.actionable))
+            );
+            assert_eq!(rows, evidence_rows(&full, &root, set), "{set}");
+        }
+        // The family refresh never touched the unrelated set; the full one did.
+        assert!(
+            evidence_rows(&scoped, &root, "other")
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(
+            evidence_rows(&full, &root, "other")
+                .iter()
+                .all(Option::is_some)
+        );
+
+        // What a refresh stores is reused by the next one (nothing re-hashed).
+        assert_eq!(family.members_rehashed, 4);
+        let again = refresh_mame_member_evidence(&mut scoped, &dat, &root, Some("pacm")).unwrap();
+        assert_eq!((again.members_reused, again.members_rehashed), (4, 0));
+    }
+
+    #[test]
+    fn a_changed_member_is_rehashed_and_stored_by_the_next_family_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("arcade");
+        fs::create_dir(&root).unwrap();
+        let dat = family_fixture(&root);
+        let mut database =
+            crate::Database::open_or_create(directory.path().join("d.sqlite3")).unwrap();
+        refresh_mame_member_evidence(&mut database, &dat, &root, Some("puck")).unwrap();
+
+        fs::write(
+            root.join("pacm").join("pacm-a.bin"),
+            b"changed bytes of a different size",
+        )
+        .unwrap();
+        let report =
+            refresh_mame_member_evidence(&mut database, &dat, &root, Some("puck")).unwrap();
+        assert_eq!((report.members_rehashed, report.members_reused), (1, 3));
+        let stored = evidence_rows(&database, &root, "pacm");
+        assert!(stored[0].as_ref().is_some_and(|row| !row.actionable));
+        assert!(stored[1].as_ref().is_some_and(|row| row.actionable));
     }
 
     fn set(root: &Path, name: &str, members: &[&str]) -> ArcadeSetDirectory {
