@@ -1293,7 +1293,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         category: C::Explain,
         pages: &[P::Organisation],
         mascot: M::Helpful,
-        quick: "Organisation starts with a preview. Originals stay protected until you explicitly confirm a reviewed transaction.",
+        quick: "Organisation starts with a preview. Originals stay protected until you explicitly confirm the previewed changes.",
         replaced_by: &["playing_library.plan_ready", "mame.missing_members"],
         ..BASE
     },
@@ -1461,7 +1461,7 @@ pub(crate) static CATALOGUE: &[GuidanceScript] = &[
         category: C::Explain,
         pages: &[P::Saves],
         mascot: M::Neutral,
-        quick: "Save data, save states and memory cards are kept separate. A restore always shows a preview first.",
+        quick: "Saves, save states and memory cards are kept separate. This page only lists them and never changes them.",
         ..BASE
     },
     GuidanceScript {

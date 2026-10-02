@@ -829,7 +829,7 @@ fn gui_v2_saves_populated_state_keeps_save_types_and_game_identity_scanable() {
         "Game identity",
         "SLUS-20312",
         "Read-only inspection",
-        "Open PS1/PS2 Save Vault",
+        "Open Emulator Setup",
         // The disabled Restore buttons are explained, not left to imply a feature.
         "Restore is not available on this page",
     ] {

@@ -645,7 +645,7 @@ pub(super) fn family_children(family: FeatureFamily) -> Vec<FamilyAction> {
             action(
                 "repair",
                 "Repair",
-                "Preview safe repair paths without changing the backend model.",
+                "Preview safe repair paths before anything changes.",
                 Route::Section(Section::Problems),
                 Normal,
             ),
@@ -807,6 +807,9 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
         }
         return labels;
     }
+    if matches!(route, Route::Section(Section::Games)) {
+        return vec!["Games".into()];
+    }
     let section = route.section();
     let mut labels = family_for_route(route)
         .map(|family| vec![family.label().to_string()])
@@ -839,6 +842,10 @@ mod tests {
     #[test]
     fn breadcrumbs_follow_route_and_selected_game_context() {
         assert_eq!(breadcrumb_labels(&Route::Home, None), ["Home"]);
+        assert_eq!(
+            breadcrumb_labels(&Route::Section(Section::Games), None),
+            ["Games"]
+        );
         assert_eq!(
             breadcrumb_labels(&Route::Section(Section::Check), None),
             ["DATs & Verification", "Check Games"]

@@ -348,7 +348,7 @@ impl App {
             .resizable(false)
             .show(context, |ui| {
                 ui.heading("EmuWiz");
-                ui.label("GUI v2 · live review");
+                ui.label("Your game library");
                 ui.push_id("v2_sidebar_browse_play", |ui| {
                     if ui
                         .add_sized(
@@ -973,7 +973,11 @@ impl App {
                 } else {
                     "No games match these choices"
                 },
-                "Try another system or clear the search. If a game folder is missing, add it through Sources.",
+                if self.library.games.is_empty() {
+                    "Add a folder of games and EmuWiz will list them here. Nothing is moved or changed."
+                } else {
+                    "Try another system or clear the search. If a game folder is missing, add it through Sources."
+                },
                 Some(if self.library.games.is_empty() {
                     "Add my games"
                 } else {
@@ -1479,7 +1483,7 @@ impl App {
 
     fn duplicates_content(&mut self, ui: &mut egui::Ui) {
         self.duplicates_hero(ui);
-        ui.label("Only byte-identical files are called exact duplicates. Different regions, revisions and titles remain separate unless the backend proves identical content.");
+        ui.label("Only byte-identical files are called exact duplicates. Different regions, revisions and titles remain separate unless their contents are proven identical.");
         if self.duplicate_report.is_none() {
             if self.duplicate_job.is_some() {
                 ui.spinner();
@@ -1714,7 +1718,7 @@ impl App {
             page_hero(
                 ui,
                 move |ui, size| {
-                    let rect = ui.min_rect().shrink(5.0);
+                    let rect = ui.max_rect().shrink(5.0);
                     ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
                     ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.65)), egui::StrokeKind::Inside);
                     ui.painter().rect_stroke(rect.shrink(10.0), 3.0, egui::Stroke::new(1.0_f32, theme::PRIMARY_ACTION.gamma_multiply(0.65)), egui::StrokeKind::Inside);
@@ -1727,22 +1731,23 @@ impl App {
                 Some((if summary.is_none() { "Checking saved evidence" } else if attention > 0 { "Needs attention" } else { "Ready for review" }, if summary.is_none() { StatusTone::Active } else if attention > 0 { StatusTone::Warning } else { StatusTone::Success })),
                 Some("Read-only first. Preview any supported repair before it changes a file."),
                 |ui| {
-                    ui.label("CRT STATUS");
-                    ui.monospace(if summary.is_none() { "CHECKING..." } else { "SIGNAL STABLE" });
-                    if let Some(summary) = summary.as_ref() {
-                        ui.label(format!(
-                            "{} actionable · {} warnings · {} total",
-                            summary.actionable_count(),
-                            warnings,
-                            summary.problems.len()
-                        ));
-                    } else {
-                        ui.label(format!("{attention} attention · {warnings} review"));
-                    }
+                    let lines = match summary.as_ref() {
+                        Some(summary) => vec![
+                            "PROBLEM INBOX".to_string(),
+                            format!("ACTIONABLE {:>3}", summary.actionable_count()),
+                            format!("WARNINGS   {warnings:>3}"),
+                            format!("TOTAL      {:>3}", summary.problems.len()),
+                        ],
+                        None => vec!["PROBLEM INBOX".to_string(), "CHECKING...".to_string()],
+                    };
+                    crate::ui::components::signal_panel(ui, egui::vec2(180.0, 86.0), &lines, |_, _| {});
                 },
                 |ui| {
                     if let Some(summary) = summary.as_ref() {
-                        if primary(ui, "Review problems") && self.problem_selected.is_none() {
+                        if !summary.problems.is_empty()
+                            && primary(ui, "Review problems")
+                            && self.problem_selected.is_none()
+                        {
                             self.problem_selected = summary
                                 .problems
                                 .first()

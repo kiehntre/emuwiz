@@ -213,7 +213,13 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
             {
                 refresh = true;
             }
-            if ui.button("Open PS1/PS2 Save Vault").clicked() {
+            if ui
+                .button("Open Emulator Setup")
+                .on_hover_text(
+                    "Opens Emulator Setup. Restoring saves is not available on this page.",
+                )
+                .clicked()
+            {
                 app.go(Route::Section(Section::Emulators));
             }
         },
@@ -507,9 +513,7 @@ fn record_card(
             PersistentStateType::NativeSave if record.provenance.contains("PS2 card save directory") => "Card save set: this is a directory/set and must be handled as one unit.".to_string(),
             _ => format!("Restore status: {restore_state}"),
         });
-        if matches!(record.portability_class, PortabilityClass::SafeToCopy | PortabilityClass::CopyWithMetadata) {
-            ui.label("Preview restore in the established Save Vault before applying any change.");
-        } else if matches!(record.portability_class, PortabilityClass::VersionBound | PortabilityClass::EmulatorBound) {
+        if matches!(record.portability_class, PortabilityClass::VersionBound | PortabilityClass::EmulatorBound) {
             ui.label("Check the emulator, version and profile before considering restore.");
         }
         // This list only shows where saves are; the buttons are never enabled here.
@@ -522,8 +526,8 @@ fn record_card(
         });
         ui.collapsing("Advanced details", |ui| {
             ui.label(format!("Path: {}", record.path.display()));
-            ui.label(format!("State type: {:?}", record.state_type));
-            ui.label(format!("Portability: {:?}", record.portability_class));
+            ui.label(format!("State type: {}", state_type_label(record.state_type)));
+            ui.label(format!("Portability: {}", portability_label(record.portability_class)));
             ui.label(format!("Size: {} bytes", record.size_bytes));
             ui.label(&record.provenance);
             for warning in &record.warnings { ui.label(warning); }
