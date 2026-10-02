@@ -16,6 +16,7 @@ mod legacy;
 pub(crate) mod library;
 mod mame_collection_health;
 mod media_sources;
+mod missing_review;
 mod mods;
 mod native_workflows;
 mod onboarding;
@@ -304,6 +305,7 @@ pub(super) struct App {
     document_preferences: documents::DocumentPreferences,
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     setup_portability: setup_portability::SetupPortabilityState,
+    missing: missing_review::MissingReviewState,
 }
 
 impl App {
@@ -383,6 +385,7 @@ impl App {
             document_preferences: documents::DocumentPreferences::default(),
             document_cache: None,
             setup_portability: setup_portability::SetupPortabilityState::default(),
+            missing: Default::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1391,6 +1394,7 @@ impl App {
                                     }
                                     self.library = library;
                                     self.problem_summary = None;
+                                    self.missing.plan = None;
                                     self.loaded = true;
                                     self.indices.clear();
                                     self.change_filter();
@@ -1468,6 +1472,14 @@ impl App {
                                     self.playing_library_history = playing_libraries;
                                     self.canonical_organisation_history = organisations;
                                     self.organisation.mame_history = mame_reconstructions;
+                                }
+                                Payload::MissingPreview(plan) => {
+                                    self.missing.job = None;
+                                    self.missing.plan = Some(plan);
+                                }
+                                Payload::MissingApplied(result) => self.missing_apply_done(*result),
+                                Payload::MissingUndone(restored) => {
+                                    self.missing_undo_done(restored)
                                 }
                                 Payload::Preferences(preferences) => {
                                     self.welcome_dismissed = preferences.welcome_dismissed;
@@ -1560,6 +1572,9 @@ impl App {
                             }
                             if self.undo_job == Some(id) {
                                 self.undo_job = None;
+                            }
+                            if self.missing.job == Some(id) {
+                                self.missing_failed(&error);
                             }
                             self.settle_romm_library_load(id, Err(error.clone()));
                             if self

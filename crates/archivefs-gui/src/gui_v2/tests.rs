@@ -111,6 +111,7 @@ fn fixture(context: &egui::Context) -> App {
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
+        missing: Default::default(),
     }
 }
 
@@ -3508,6 +3509,7 @@ fn gui_v2_accidental_exploration_never_runs_scan_or_legacy() {
             || job.title == "Checking emulator readiness"
             || job.title == "Checking save locations"
             || job.title == "Checking saved problem evidence"
+            || job.title == "Checking which games are really missing"
     }));
     assert!(app.load_job.is_none());
     assert!(!app.confirm_scan);

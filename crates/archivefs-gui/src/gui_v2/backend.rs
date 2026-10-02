@@ -101,6 +101,13 @@ pub(super) enum Command {
         cancel: Arc<AtomicBool>,
     },
     LoadRepairHistory,
+    MissingPreview,
+    MissingApply {
+        token: String,
+    },
+    MissingUndo {
+        receipt: PathBuf,
+    },
     OpenFolder(PathBuf),
     OpenDocument(PathBuf),
     Save(Preferences),
@@ -158,6 +165,9 @@ pub(super) enum Payload {
         organisations: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
         mame_reconstructions: Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
     },
+    MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
+    MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
+    MissingUndone(usize),
     Preferences(Preferences),
     Done,
     PlayingLibraryPreview {
@@ -260,6 +270,15 @@ impl Backend {
 
 fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload, String> {
     match command {
+        Command::MissingPreview => Ok(Payload::MissingPreview(Box::new(
+            super::missing_review::preview()?,
+        ))),
+        Command::MissingApply { token } => Ok(Payload::MissingApplied(Box::new(
+            super::missing_review::apply(&token)?,
+        ))),
+        Command::MissingUndo { receipt } => Ok(Payload::MissingUndone(
+            super::missing_review::undo(&receipt)?,
+        )),
         Command::EnvironmentCheck => Ok(Payload::Environment(crate::gui_v2::environment::gather())),
         Command::LoadRommLibrary => Ok(Payload::RommLibrary(
             crate::gui_v2::romm_library::load_snapshot()?,

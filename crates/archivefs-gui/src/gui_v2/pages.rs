@@ -296,7 +296,10 @@ impl App {
         }
     }
     pub(super) fn show(&mut self, context: &egui::Context) {
-        let modal_open = self.confirm_scan || self.repair_confirm || self.undo_confirm.is_some();
+        let modal_open = self.confirm_scan
+            || self.repair_confirm
+            || self.undo_confirm.is_some()
+            || self.missing.confirm;
         let (escape, alt_back) = context.input(|input| {
             (
                 input.key_pressed(egui::Key::Escape),
@@ -324,6 +327,7 @@ impl App {
                     self.confirm_scan = false;
                     self.repair_confirm = false;
                     self.undo_confirm = None;
+                    self.missing.confirm = false;
                 }
                 // egui has already released the field's focus on this key press.
                 EscapeAction::LeaveFocus => {}
@@ -1809,6 +1813,9 @@ impl App {
             }
             if let Some(preview) = self.repair_preview.clone() {
                 self.duplicate_preview(ui, &preview);
+            }
+            if game_id.is_none() {
+                self.missing_review_panel(ui);
             }
             let Some(summary) = summary else {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
