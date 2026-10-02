@@ -53,6 +53,25 @@ fn setup() -> (TempDir, DurableConversionQueue, u64) {
     (dir, queue, id)
 }
 
+fn setup_encode() -> (TempDir, DurableConversionQueue, u64) {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("in.wud");
+    fs::write(&source, fixture(&dir.path().join("reference.wux"))).unwrap();
+    let plan = plan_wiiu_conversion(&WiiUConversionRequest {
+        source,
+        destination: dir.path().join("out.wux"),
+        direction: WiiUConversionDirection::WudToWux,
+        source_identity: WiiUConversionIdentity::HashMissing,
+        available_free_space: Some(u64::MAX),
+        tools: WiiUConversionToolInventory::default(),
+    });
+    let mut queue = DurableConversionQueue::open(&dir.path().join("queue")).unwrap();
+    let id = queue
+        .enqueue(ReviewedConversion::WudToWux(Box::new(plan)))
+        .unwrap();
+    (dir, queue, id)
+}
+
 fn run(queue: &mut DurableConversionQueue) -> ConversionJob {
     queue
         .run_next(&AtomicBool::new(false), &mut |_| {})
@@ -221,9 +240,13 @@ fn fail_verification(queue: &mut DurableConversionQueue) -> ConversionJob {
                     .unwrap()
                     .unwrap()
                     .path();
+                let name = match snapshot.jobs[0].reviewed {
+                    ReviewedConversion::WuxToWud(_) => "output.wud",
+                    ReviewedConversion::WudToWux(_) => "output.wux",
+                };
                 let mut output = fs::OpenOptions::new()
                     .write(true)
-                    .open(child.join("output.wud"))
+                    .open(child.join(name))
                     .unwrap();
                 output.seek(SeekFrom::Start(0)).unwrap();
                 output.write_all(b"damage").unwrap();
@@ -528,9 +551,23 @@ fn crash_child() {
 
 #[test]
 fn actual_process_exit_releases_lock_preserves_partial_stage_and_restarts_from_zero() {
-    let (dir, queue, id) = setup();
+    assert_process_exit_restart(setup());
+}
+
+#[test]
+fn queued_wud_to_wux_process_exit_restarts_from_zero() {
+    assert_process_exit_restart(setup_encode());
+}
+
+fn assert_process_exit_restart((_dir, queue, id): (TempDir, DurableConversionQueue, u64)) {
     let root = queue.root.clone();
-    let source = fs::read(dir.path().join("in.wux")).unwrap();
+    let source_path = queue.snapshot.jobs[0].reviewed.source().to_owned();
+    let destination = queue.snapshot.jobs[0].reviewed.destination().to_owned();
+    let first_chunk = match queue.snapshot.jobs[0].reviewed {
+        ReviewedConversion::WuxToWud(_) => 64 * 1024,
+        ReviewedConversion::WudToWux(_) => 32 * 1024,
+    };
+    let source = fs::read(&source_path).unwrap();
     drop(queue);
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -546,17 +583,25 @@ fn actual_process_exit_releases_lock_preserves_partial_stage_and_restarts_from_z
         DurableConversionQueue::inspect(&root).unwrap().jobs[0].state,
         JobState::Running
     );
-    assert!(!dir.path().join("out.wud").exists());
+    assert!(!destination.exists());
     let mut queue = DurableConversionQueue::open(&root).unwrap();
     assert_eq!(queue.snapshot.jobs[0].state, JobState::Interrupted);
     let abandoned = queue.snapshot.jobs[0].attempts[0].staging_root.clone();
     assert_eq!(fs::read_dir(&abandoned).unwrap().count(), 1);
     assert_eq!(queue.retry(id).unwrap(), JobState::Queued);
-    let completed = run(&mut queue);
+    assert!(queue.snapshot.jobs[0].progress.is_none());
+    let mut first = None;
+    let completed = queue
+        .run_next(&AtomicBool::new(false), &mut |p| {
+            first.get_or_insert(p.bytes_processed.unwrap());
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(first, Some(first_chunk));
     assert_eq!(completed.state, JobState::Completed);
     assert_ne!(completed.attempts[1].staging_root, abandoned);
     assert!(abandoned.exists());
-    assert_eq!(fs::read(dir.path().join("in.wux")).unwrap(), source);
+    assert_eq!(fs::read(source_path).unwrap(), source);
 }
 
 #[test]
@@ -718,4 +763,232 @@ fn progress_checkpoint_failure_stops_before_publication_and_requires_recovery() 
     assert!(cancel.load(Ordering::Relaxed));
     assert_eq!(fs::read(snapshot).unwrap(), b"corrupt");
     assert!(!dir.path().join("out.wud").exists());
+}
+
+#[test]
+fn queued_wud_to_wux_persists_plan_and_verified_result_across_restarts() {
+    let (dir, queue, id) = setup_encode();
+    let source = capture_identity(&dir.path().join("in.wud")).unwrap();
+    let snapshot = queue.snapshot.clone();
+    drop(queue);
+    let mut queue = DurableConversionQueue::open(&dir.path().join("queue")).unwrap();
+    assert_eq!(queue.snapshot, snapshot);
+    let job = run(&mut queue);
+    assert_eq!((job.id, job.state), (id, JobState::Completed));
+    let record = job.result.as_ref().unwrap();
+    assert_eq!(
+        record.source_container_sha256,
+        record.reconstructed_wud_sha256
+    );
+    assert_eq!(record.wux_creation.as_ref().unwrap().stored_blocks, 4);
+    let output = inspect_wii_u_disc(&record.destination);
+    assert!(output.structural_complete);
+    assert_eq!(
+        output.structure.unwrap().logical_disc_size_bytes,
+        Some(source.size_bytes)
+    );
+    assert!(identity_matches(
+        &source,
+        &capture_identity(&record.source).unwrap()
+    ));
+    let (journals, problems) =
+        crate::dat::rename_apply::journal::list_journals(&job.attempts[0].journal_dir);
+    assert!(problems.is_empty());
+    assert_eq!(journals[0].transaction_id, record.transaction_id);
+    assert_eq!(journals[0].state, TransactionState::Applied);
+    drop(queue);
+    assert_eq!(
+        DurableConversionQueue::open(&dir.path().join("queue"))
+            .unwrap()
+            .snapshot
+            .jobs[0],
+        job
+    );
+}
+
+#[test]
+fn queued_wud_to_wux_revalidates_source_and_destination() {
+    for change in 0..3 {
+        let (dir, mut queue, _) = setup_encode();
+        let source = dir.path().join("in.wud");
+        let destination = dir.path().join("out.wux");
+        match change {
+            0 => {
+                let mut f = fs::OpenOptions::new().write(true).open(&source).unwrap();
+                f.seek(SeekFrom::End(-1)).unwrap();
+                f.write_all(&[1]).unwrap();
+            }
+            1 => fs::remove_file(&source).unwrap(),
+            _ => fs::write(&destination, b"existing").unwrap(),
+        }
+        let state = if change == 1 {
+            JobState::BlockedInputMissing
+        } else {
+            JobState::BlockedStale
+        };
+        assert_eq!(run(&mut queue).state, state);
+        if change == 2 {
+            assert_eq!(fs::read(destination).unwrap(), b"existing");
+        } else {
+            assert!(!destination.exists());
+        }
+    }
+}
+
+#[test]
+fn queued_wud_to_wux_reserves_destination_across_conversion_types() {
+    let (dir, mut queue, _) = setup_encode();
+    let encode = queue.snapshot.jobs[0].reviewed.clone();
+    assert!(queue.enqueue(encode).is_err());
+    assert!(
+        queue
+            .enqueue(reviewed(dir.path(), "reference.wux", "out.wux"))
+            .is_err()
+    );
+    assert_eq!(queue.snapshot.jobs.len(), 1);
+}
+
+#[test]
+fn queued_wud_to_wux_cancellation_preserves_source_and_never_publishes() {
+    for before_start in [true, false] {
+        let (dir, mut queue, id) = setup_encode();
+        let before = capture_identity(&dir.path().join("in.wud")).unwrap();
+        if before_start {
+            queue.cancel_queued(id).unwrap();
+        } else {
+            let cancel = AtomicBool::new(false);
+            let mut callbacks = 0;
+            let job = queue
+                .run_next(&cancel, &mut |p| {
+                    assert_eq!(p.bytes_processed, Some(32 * 1024));
+                    callbacks += 1;
+                    cancel.store(true, Ordering::Relaxed);
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(callbacks, 1);
+            assert_eq!(job.state, JobState::Cancelled);
+            assert_eq!(
+                fs::read_dir(&job.attempts[0].staging_root).unwrap().count(),
+                0
+            );
+        }
+        assert_eq!(
+            DurableConversionQueue::inspect(&queue.root).unwrap().jobs[0].state,
+            JobState::Cancelled
+        );
+        assert!(!dir.path().join("out.wux").exists());
+        assert!(identity_matches(
+            &before,
+            &capture_identity(&dir.path().join("in.wud")).unwrap()
+        ));
+    }
+}
+
+#[test]
+fn queued_wud_to_wux_failed_verification_never_publishes_and_can_retry() {
+    let (dir, mut queue, id) = setup_encode();
+    let source = capture_identity(&dir.path().join("in.wud")).unwrap();
+    assert_eq!(fail_verification(&mut queue).state, JobState::Failed);
+    assert!(!dir.path().join("out.wux").exists());
+    drop(queue);
+    let mut queue = DurableConversionQueue::open(&dir.path().join("queue")).unwrap();
+    assert_eq!(queue.snapshot.jobs[0].state, JobState::Failed);
+    let second = queue
+        .enqueue(reviewed(dir.path(), "reference.wux", "second.wud"))
+        .unwrap();
+    assert_eq!(queue.retry(id).unwrap(), JobState::Queued);
+    assert_eq!(run(&mut queue).id, second);
+    let job = run(&mut queue);
+    assert_eq!(
+        (job.id, job.state, job.attempts.len()),
+        (id, JobState::Completed, 2)
+    );
+    assert!(identity_matches(
+        &source,
+        &capture_identity(&dir.path().join("in.wud")).unwrap()
+    ));
+}
+
+#[test]
+fn queued_wud_to_wux_interrupted_retry_revalidates_original_plan() {
+    for change_source in [true, false] {
+        let (dir, mut queue, id) = setup_encode();
+        mark_running(&mut queue);
+        drop(queue);
+        let mut queue = DurableConversionQueue::open(&dir.path().join("queue")).unwrap();
+        assert_eq!(queue.snapshot.jobs[0].state, JobState::Interrupted);
+        if change_source {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.path().join("in.wud"))
+                .unwrap();
+            f.seek(SeekFrom::End(-1)).unwrap();
+            f.write_all(&[1]).unwrap();
+            assert_eq!(queue.retry(id).unwrap(), JobState::BlockedStale);
+        } else {
+            fs::write(dir.path().join("out.wux"), b"existing").unwrap();
+            assert!(queue.retry(id).is_err());
+            assert_eq!(fs::read(dir.path().join("out.wux")).unwrap(), b"existing");
+        }
+    }
+}
+
+#[test]
+fn conversion_tag_must_match_reviewed_direction() {
+    let (_dir, mut queue, _) = setup_encode();
+    let ReviewedConversion::WudToWux(plan) = queue.snapshot.jobs[0].reviewed.clone() else {
+        unreachable!()
+    };
+    let wrong = ReviewedConversion::WuxToWud(plan);
+    assert!(matches!(
+        wrong.revalidate(),
+        Err(WiiUConversionError::StalePlan)
+    ));
+    queue.snapshot.jobs[0].reviewed = wrong;
+    // Persist tampered input so the normal worker revalidation handles it.
+    fs::write(
+        queue.root.join(SNAPSHOT_FILE),
+        serde_json::to_vec(&queue.snapshot).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(run(&mut queue).state, JobState::BlockedStale);
+}
+
+#[test]
+fn queue_saved_before_encoder_support_remains_readable_and_executable() {
+    let (dir, queue, _) = setup();
+    let mut old = serde_json::to_value(&queue.snapshot).unwrap();
+    let plan = old["jobs"][0]["reviewed"]["plan"].as_object_mut().unwrap();
+    plan.remove("binding_direction");
+    plan.remove("wux_creation");
+    plan.get_mut("space")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .remove("destination_maximum_bytes");
+    assert_eq!(plan["binding"].as_array().unwrap().len(), 4);
+    let path = queue.root.join(SNAPSHOT_FILE);
+    drop(queue);
+    fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let mut queue = DurableConversionQueue::open(&dir.path().join("queue")).unwrap();
+    assert_eq!(run(&mut queue).state, JobState::Completed);
+    let mut old_completed = serde_json::to_value(&queue.snapshot).unwrap();
+    old_completed["jobs"][0]["reviewed"] = old["jobs"][0]["reviewed"].clone();
+    old_completed["jobs"][0]["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("wux_creation");
+    drop(queue);
+    fs::write(path, serde_json::to_vec(&old_completed).unwrap()).unwrap();
+    let queue = DurableConversionQueue::open(&dir.path().join("queue")).unwrap();
+    assert_eq!(queue.snapshot.jobs[0].state, JobState::Completed);
+    assert!(
+        queue.snapshot.jobs[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .wux_creation
+            .is_none()
+    );
 }

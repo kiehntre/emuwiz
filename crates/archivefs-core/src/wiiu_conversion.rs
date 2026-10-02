@@ -532,7 +532,9 @@ pub(crate) fn revalidate(
         || report.source_evidence.as_ref() != Some(evidence)
         || report != plan.source_inspection
         || fresh.space.destination_exact_bytes != plan.space.destination_exact_bytes
-        || fresh.space.destination_maximum_bytes != plan.space.destination_maximum_bytes
+        // Pre-encoder queue plans bind the exact decode size, without a maximum.
+        || fresh.space.destination_maximum_bytes
+            != plan.space.destination_maximum_bytes.or(plan.space.destination_exact_bytes)
         || fresh.space.temporary_bytes != plan.space.temporary_bytes
         || fresh.wux_creation != plan.wux_creation
     {

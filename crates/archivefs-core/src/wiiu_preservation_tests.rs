@@ -1594,6 +1594,7 @@ fn wud_to_wux_large_streaming_and_measurement() {
         },
     )
     .unwrap();
+    let conversion_seconds = start.elapsed().as_secs_f64();
     let stats = record.wux_creation.unwrap();
     assert_eq!(previous, bytes);
     assert_eq!(callbacks, bytes / 0x8000);
@@ -1604,16 +1605,52 @@ fn wud_to_wux_large_streaming_and_measurement() {
         record.reconstructed_wud_sha256,
         record.source_container_sha256
     );
+    let inspection = inspect_wii_u_disc(&destination);
+    assert!(inspection.structural_complete);
+    assert_eq!(
+        inspection.structure.unwrap().logical_disc_size_bytes,
+        Some(bytes)
+    );
+    // Independently exercise the existing logical reader without a restored WUD
+    // allocation or file. This also checks the full logical extent, not parsing alone.
+    let mut output = File::open(&destination).unwrap();
+    let layout = load_wux(&mut output, record.output_bytes).unwrap();
+    assert_eq!(layout.logical, bytes);
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; WIIU_CONVERSION_CHUNK_BYTES];
+    let mut offset = 0;
+    while offset < bytes {
+        let length = (bytes - offset).min(buffer.len() as u64) as usize;
+        read_wux_at(&mut output, &layout, offset, &mut buffer[..length]).unwrap();
+        digest.update(&buffer[..length]);
+        offset += length as u64;
+    }
+    assert_eq!(
+        digest_hex(digest.finalize()),
+        record.source_container_sha256
+    );
+    assert_eq!(
+        record.source_container_sha256,
+        digest_hex(original.freshness.as_ref().unwrap().sha256)
+    );
+    drop(layout);
+    let second = encode_fixture(&source, &d.path().join("second.wux"));
+    assert_eq!(record.output_bytes, second.output_bytes);
+    assert_eq!(record.output_sha256, second.output_sha256);
+    assert_eq!(record.wux_creation, second.wux_creation);
     assert!(crate::dat::rename_apply::identity::identity_matches(
         &original,
         &crate::dat::rename_apply::identity::capture_identity(&source).unwrap()
     ));
     println!(
-        "WUD_WUX_PERF input_bytes={bytes} output_bytes={} zero_blocks={} reused_zero_blocks={} stored_blocks={} callbacks={callbacks} elapsed_seconds={:.3}",
+        "WUD_WUX_PERF input_bytes={bytes} output_bytes={} zero_blocks={} reused_zero_blocks={} stored_blocks={} callbacks={callbacks} conversion_seconds={conversion_seconds:.3} elapsed_seconds={:.3} source_sha256={} logical_sha256={} output_sha256={} deterministic=true",
         record.output_bytes,
         stats.zero_blocks,
         stats.reused_zero_blocks,
         stats.stored_blocks,
-        start.elapsed().as_secs_f64()
+        start.elapsed().as_secs_f64(),
+        record.source_container_sha256,
+        record.reconstructed_wud_sha256,
+        record.output_sha256,
     );
 }

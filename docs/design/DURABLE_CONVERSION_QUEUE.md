@@ -2,10 +2,9 @@
 
 Backend implementation: `archivefs_core::conversion_queue::durable`.
 Original base: `fc8bda7be687e626d708a4633f73840bcbf15c32`.
-Main inspected during this task: `4124825fc6664bee6686fd649277a9c53ff405b4`,
-which adds unrelated Dreamcast IP.BIN tooling and GUI missing-game review.
-Those commits are not included. Rebase onto current main and full revalidation
-are required before promotion.
+The queue landed at `d7b8b2560df83b1bf54c531767fb9fbdc0de413b`, including
+Dreamcast IP.BIN tooling and GUI missing-game review. WUD → WUX support extends
+that main without changing the queue state machine or persistence limits.
 
 ## Existing architecture and integration boundary
 
@@ -28,7 +27,10 @@ are required before promotion.
 
 Converter changes serialize the existing typed evidence and expose internal
 revalidation and staging-parent entry points. Ordinary callers retain their current
-execution behavior. WUD → WUX checkpoint `60e640b0` is not incorporated.
+execution behavior. WUD → WUX checkpoint `60e640b0` is now reconciled with these
+entry points. `ReviewedConversion::WudToWux` uses the same native executor,
+independent streaming round-trip verification and Repair publication. Its tag
+must match the original plan direction; admission and execution check both.
 
 ## Persistence and ownership
 
@@ -38,6 +40,14 @@ Callers can pass another absolute directory for isolated tests/profiles.
 original typed plans/options, full source identities, stable numeric job IDs,
 timestamps, FIFO order, attempt states/paths, progress, diagnostics and results.
 Job IDs are unique within the queue and never recycled by pruning.
+
+Pre-encoder version-1 WUX → WUD plans/results remain readable and executable.
+Their original four-part evidence binding is retained; an absent direction binding
+means the only previously executable direction, WUX → WUD. Their exact output
+size supplies the newly added maximum-size projection. No reviewed evidence is
+regenerated or replaced. WUD → WUX plans bind direction explicitly and include
+canonical writer geometry. No database migration or snapshot version bump is needed;
+older binaries refuse the new conversion tag instead of running an unknown job.
 
 `open()` holds an exclusive OS directory lock for its lifetime. Process exit or
 crash releases the lock; another live owner refuses immediately. All queue
@@ -113,7 +123,7 @@ job and run it from byte zero. No CHD or WUX byte-offset continuation is claimed
 
 ## Progress, cancellation and retention
 
-The live callback reports WUX decoder byte counts and phase. Before byte progress
+The live callback reports logical WUD bytes processed for either direction and phase. Before byte progress
 is available, the persisted snapshot is indeterminate. Progress persistence is
 throttled to at most once per second, in addition to required state transitions.
 Reaching the byte total is not success: verification/publication must finish.
@@ -121,8 +131,8 @@ Startup labels old progress historical; retry clears it. A progress checkpoint
 failure requests cooperative cancellation before further conversion phases.
 
 A shared `AtomicBool` cancels the running converter at its supported boundaries:
-64 KiB decode chunks and phase boundaries. Existing full-source hashing, output
-verification and Repair steps can delay response. No arbitrary process killing
+32 KiB encode blocks, bounded table batches, 64 KiB decode/round-trip chunks and
+phase boundaries. Existing full-source hashing and Repair steps can delay response. No arbitrary process killing
 is added. Before publication, cancellation removes the converter's temporary
 output and persists `Cancelled`; the queue's empty attempt parent is retained.
 Publication errors retain journals/staging and require existing verified rollback
@@ -163,3 +173,9 @@ Build artifacts use the isolated `/tmp/emuwiz-durable-queue-target` directory.
 `cargo check --offline --locked --workspace`, `cargo fmt --all -- --check`,
 and `git diff --check` also pass; the workspace check reports four existing
 warnings in untouched GUI code.
+
+Encoder integration tests additionally cover persisted WUD → WUX plans/results,
+real process exit with partial WUX staging and restart from byte zero, source and
+destination revalidation, shared destination reservations, cancellation, failed
+verification, FIFO retry and source preservation. A compatibility regression
+loads pre-encoder queued/completed snapshots and executes the original decode plan.

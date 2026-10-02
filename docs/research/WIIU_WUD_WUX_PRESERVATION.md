@@ -8,6 +8,10 @@ Backend only; this document supersedes the earlier preview-only Wii U design.
 WUD → WUX creation extension starts at main
 `fc8bda7be687e626d708a4633f73840bcbf15c32`. It extends the same native
 planner/executor and journaled publication path; there is no second converter.
+Checkpoint `60e640b0ec797bffbc28a3abddcdf661dbff69d6` was resumed and rebased
+onto queue-aware main `d7b8b2560df83b1bf54c531767fb9fbdc0de413b`. Reconciliation
+retains the encoder while preserving queue-owned staging, serialization and old
+queued decode-plan compatibility.
 
 ## Architecture inventory and reuse
 
@@ -217,7 +221,12 @@ crash before handoff can leave a hidden `.emuwiz-wiiu-*` stage for manual cleanu
 it cannot expose a partial final destination. Cancellation is checked each
 32 KiB encode block, 64 KiB reconstruction chunk, bounded table batch and phase
 boundary; existing full-hash/Repair phases do not
-provide chunk-level cancellation. No unattended conversion/resume is added.
+provide chunk-level cancellation. Both directions can now run through the existing
+[durable queue](../design/DURABLE_CONVERSION_QUEUE.md). Queue admission saves the
+reviewed plan and full source identity; execution/retry revalidate it. Abandoned
+running jobs become interrupted with staging/journals retained. Retry uses a new
+stage, starts from byte zero and moves to the FIFO tail. Ambiguous publication
+requires review. No mid-file resume is supported.
 
 ## Unsupported cases and NKit boundary
 
@@ -266,3 +275,56 @@ premature EOF, malformed staged output and payload corruption that still parses,
 source immutability, journal evidence and existing rollback. The streaming test
 normally uses a 128 MiB sparse synthetic WUD; `EMUWIZ_WUD_WUX_PERF_BYTES`
 selects a larger **test fixture**, not a production conversion option.
+
+## Queue-aware candidate measurements
+
+Measured on Linux with the unoptimized test build, isolated
+`CARGO_TARGET_DIR=/tmp/emuwiz-wud-wux-target`. Each row is a separate process
+running `wiiu_disc::tests::wud_to_wux_large_streaming_and_measurement` with
+`--exact --nocapture --test-threads=1`, timed by `/usr/bin/time` (maximum RSS in
+KiB). `EMUWIZ_WUD_WUX_PERF_BYTES` selects the input size. Compilation is excluded.
+These are sparse synthetic fixtures with three nonzero header blocks; no retail
+image or key is used. The encoder still reads/hashes every logical source byte.
+
+| Logical WUD bytes | WUX bytes | Zero blocks | Reused zero blocks | Stored blocks | First conversion (s) | Total wall (s) | Peak RSS (KiB) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 134,217,728 (128 MiB) | 163,840 | 4,093 | 4,092 | 4 | 21.365 | 48.05 | 43,336 |
+| 1,073,741,824 (1 GiB) | 294,912 | 32,765 | 32,764 | 4 | 195.692 | 412.82 | 43,532 |
+
+Stored counts include one shared zero block. First-conversion time includes the
+fixture's initial full source-identity capture. Total time includes two complete
+verified/published encodes, an additional independent logical-reader SHA-256
+pass and source-immutability checks. It is not an optimized throughput benchmark.
+The eightfold larger logical image increased measured peak RSS by 196 KiB
+(0.45%), not proportionally to image size. The bounded lookup table grows from
+16 KiB to 128 KiB; fixed I/O/hash buffers remain unchanged. The table's existing
+format/allocation limits still apply to larger supported images.
+
+Both runs pass structural inspection, exact logical-size checks and source/hash
+preservation. Two independently staged encode transactions produce identical
+physical WUX SHA-256 and sizes; small fixtures additionally compare every output
+byte. The large test independently hashes the entire reconstructed WUD through
+`load_wux`/`read_wux_at` using a fixed 64 KiB buffer, without creating a second WUD
+or reading the source/output into an image-sized `Vec`.
+
+For the 1 GiB fixture, original and reconstructed WUD SHA-256 are both
+`af009ae903659199bf5b9b9ce44b493d6b935ed0ab5800e0436db91fc3601e77`.
+Both encoded WUX files have SHA-256
+`d7d42579fdb1f10d3f5db7f61959c80b434ffdce22ff0b00b333cf3f801ffd02`.
+
+Validation on queue-aware main: 49 Wii U tests, 28 tests selected by
+`wud_to_wux` (including queued encoder tests), 49 queue tests and 18 optical
+conversion tests pass. These filter totals overlap. The full core library suite
+passes 10,756 tests, with 3 existing ignored tests. It runs outside the sandbox
+because existing proxy tests require loopback sockets. The candidate keeps the
+checkpoint encoder and staged logical-stream verifier unchanged; the rebase's
+single textual staging conflict was resolved by retaining the queue-owned parent
+and the direction-specific output filename. No GUI, NKit, dependency or database
+migration work is included.
+`cargo check --offline --locked --workspace`, `cargo fmt --all -- --check`, and
+`git diff --check` pass. Workspace checking reports four existing warnings in
+untouched GUI code.
+
+During final validation, main advanced to `34478400a98363c09535ac75e1203fb35f11de87`
+(GUI v2 equivalent-duplicate review only). The completed candidate is rebased
+onto it; the entire core tree and measured encoder remain identical.

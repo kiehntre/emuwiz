@@ -57,25 +57,32 @@ pub enum RetryDisposition {
 #[serde(tag = "conversion", content = "plan", rename_all = "snake_case")]
 pub enum ReviewedConversion {
     WuxToWud(Box<WiiUConversionPlan>),
+    WudToWux(Box<WiiUConversionPlan>),
 }
 
 impl ReviewedConversion {
     pub fn source(&self) -> &Path {
         match self {
-            Self::WuxToWud(plan) => &plan.source,
+            Self::WuxToWud(plan) | Self::WudToWux(plan) => &plan.source,
         }
     }
 
     pub fn destination(&self) -> &Path {
         match self {
-            Self::WuxToWud(plan) => &plan.destination,
+            Self::WuxToWud(plan) | Self::WudToWux(plan) => &plan.destination,
         }
     }
 
     fn revalidate(&self) -> std::result::Result<(), WiiUConversionError> {
-        match self {
-            Self::WuxToWud(plan) => wiiu_conversion::revalidate(plan, true).map(|_| ()),
+        use wiiu_conversion::WiiUConversionDirection;
+        let (plan, direction) = match self {
+            Self::WuxToWud(plan) => (plan, WiiUConversionDirection::WuxToWud),
+            Self::WudToWux(plan) => (plan, WiiUConversionDirection::WudToWux),
+        };
+        if plan.direction != direction {
+            return Err(WiiUConversionError::StalePlan);
         }
+        wiiu_conversion::revalidate(plan, true).map(|_| ())
     }
 }
 
@@ -344,7 +351,8 @@ impl DurableConversionQueue {
     }
 
     /// Runs at most one FIFO job synchronously. Pass an AtomicBool shared with
-    /// the caller for cooperative cancellation. Decode checks each 64 KiB;
+    /// the caller for cooperative cancellation. Encode checks each 32 KiB,
+    /// decode each 64 KiB;
     /// hashing/verification stops at the next converter cancellation boundary.
     pub fn run_next(
         &mut self,
@@ -475,7 +483,7 @@ impl DurableConversionQueue {
         let mut last_checkpoint = None::<Instant>;
         let mut checkpoint_error = None;
         let outcome = match &reviewed {
-            ReviewedConversion::WuxToWud(plan) => {
+            ReviewedConversion::WuxToWud(plan) | ReviewedConversion::WudToWux(plan) => {
                 wiiu_conversion::execute_wiiu_conversion_in_stage(
                     plan,
                     &options,
