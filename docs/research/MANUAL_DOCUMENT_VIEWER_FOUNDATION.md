@@ -50,6 +50,54 @@ KiB); the extension is only recorded and a mismatch is reported as a warning.
 
 Callers can only tighten limits, never exceed them.
 
+## Verified PDF page index (backend only)
+
+`ManualDocument::pdf_page_index()` adds an on-demand structural page index to
+the existing reader. It returns `ManualPdfPageIndex { id, pages }`; each entry
+is a `ManualPdfObjectRef { object_number, generation }`. Vector position is
+the zero-based navigation index. Its length is the verified leaf count.
+The lightweight `inspect_manual` API retains its declared count and
+`PageCountIsDeclared` warning. PDF readiness remains `InspectOnly`.
+
+The same catalog, cross-reference and object-stream reader serves both APIs.
+The index walks `/Kids` in order, checks each `/Pages` count against its
+descendant `/Page` leaves, verifies parent references, and rejects missing or
+free objects, stale generations, cycles, repeated children, wrong node types,
+direct children, and empty trees. Indirect count and child-array values work.
+Both classic and stream cross-reference entries retain generations; resolved
+object headers must agree. Incremental updates use the newest definition.
+
+The format basis is ISO 32000-1:2008, clauses 7.3.10, 7.5.4, 7.5.7 and 7.7.3,
+[Adobe's reference](https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf),
+and the [PDF Association's approved page-tree clarifications](https://pdf-issues.pdfa.org/32000-2-2020/clause07.html#7732-page-tree-nodes).
+Children are indirect references to pages or page-tree nodes; parents are
+required except at the root, where they are prohibited. Counts describe
+descendant leaves. The PDF 2.0 clarification explicitly excludes empty child
+arrays and zero counts; the index conservatively applies that rule to every
+PDF version. Adobe's full reference URL returned 404 during this task;
+indexed clause text and the Association's published clarification were
+available. No third-party implementation was copied.
+
+Traversal uses existing clamp-only limits: at most 10,000 output pages,
+500,000 referenced objects, and 32 tree levels (root at level one). Existing
+array, object-window, token and stream bounds still apply. State is bounded
+by those limits, with one visited-reference set and one page vector; no page
+content streams are decoded. Oversized or malformed trees return an error
+without a partial index. No files are written or subprocesses launched.
+
+The existing source identity (path, length, mtime, device/inode where available)
+is checked before traversal and against both the open file and path afterwards.
+Changed evidence is refused. This is the existing document-reader evidence,
+not a cryptographic snapshot or protection against an adversary restoring
+metadata during concurrent edits. No index is persistently cached.
+
+A future controller can open a document, request this index on demand, and
+use `pages.len()` for verified navigation. It must retain the accompanying
+source identity and handle refusal. The index proves page-tree membership,
+order and counts only: rendering, inherited geometry, page labels, content
+validity, and per-page active-content inventory remain outside this API.
+No GUI, persistence, migration, dependency or alternate PDF parser was added.
+
 ## Safety rules (CBZ)
 
 Refused: `..` traversal (including backslash forms), absolute and drive/UNC
@@ -117,7 +165,8 @@ validated with synthetic fixtures only. No personal document is a fixture.
 1. No embedded viewer screen (collision above).
 2. No PDF page rendering (no renderer dependency).
 3. No CBR reading (no RAR decompressor / supervised tool).
-4. PDF page count is the page-tree root's declared `/Count`, not a walk of the tree.
+4. Lightweight PDF inspection reports declared `/Count`; callers can now opt
+   into `pdf_page_index()` for verified membership, order and counts.
 5. Damaged PDF cross-reference data is refused, not reconstructed.
 6. Encrypted PDFs are not decrypted (including empty-password ones).
 7. No reading-position persistence beyond the existing `DocumentReadingState`.

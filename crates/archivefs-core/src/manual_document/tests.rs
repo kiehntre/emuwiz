@@ -133,15 +133,27 @@ fn zlib(data: &[u8]) -> Vec<u8> {
 fn object_stream_pdf(pages: i64, with_encrypt: bool) -> Vec<u8> {
     let catalog = "<< /Type /Catalog /Pages 2 0 R >>";
     let page_tree = format!("<< /Type /Pages /Kids [] /Count {pages} >>");
-    let header = format!("1 0 2 {} ", catalog.len() + 1);
-    let stm_data = format!("{header}{catalog} {page_tree}");
+    object_stream_pdf_nodes(&[catalog, &page_tree], with_encrypt)
+}
+
+fn object_stream_pdf_nodes(objects: &[&str], with_encrypt: bool) -> Vec<u8> {
+    assert!(objects.len() <= 4);
+    let mut header = String::new();
+    let mut data = String::new();
+    for (index, object) in objects.iter().enumerate() {
+        header.push_str(&format!("{} {} ", index + 1, data.len()));
+        data.push_str(object);
+        data.push(' ');
+    }
+    let stm_data = format!("{header}{data}");
     let compressed = zlib(stm_data.as_bytes());
 
     let mut out = b"%PDF-1.5\n".to_vec();
     let stm_offset = out.len();
     out.extend_from_slice(
         format!(
-            "5 0 obj\n<< /Type /ObjStm /N 2 /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
+            "5 0 obj\n<< /Type /ObjStm /N {} /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
+            objects.len(),
             header.len(),
             compressed.len()
         )
@@ -152,7 +164,7 @@ fn object_stream_pdf(pages: i64, with_encrypt: bool) -> Vec<u8> {
 
     let xref_offset = out.len();
     // W [1 2 1]: type, field2, field3. Objects 0..=6.
-    let rows: [[u8; 4]; 7] = [
+    let mut rows: [[u8; 4]; 7] = [
         [0, 0, 0, 0],
         [2, 0, 5, 0],
         [2, 0, 5, 1],
@@ -161,6 +173,9 @@ fn object_stream_pdf(pages: i64, with_encrypt: bool) -> Vec<u8> {
         [1, (stm_offset >> 8) as u8, stm_offset as u8, 0],
         [1, (xref_offset >> 8) as u8, xref_offset as u8, 0],
     ];
+    for (index, _) in objects.iter().enumerate() {
+        rows[index + 1] = [2, 0, 5, index as u8];
+    }
     // PNG "Up" predictor over the raw rows.
     let mut predicted = Vec::new();
     let mut previous = [0u8; 4];
@@ -185,6 +200,430 @@ fn object_stream_pdf(pages: i64, with_encrypt: bool) -> Vec<u8> {
         format!("\nendstream\nendobj\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
     );
     out
+}
+
+// ------------------------------------------------------- PDF page index ----
+
+/// Small classic-xref fixtures with controllable object generations.
+fn page_index_pdf(objects: &[(u16, &str)]) -> Vec<u8> {
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, (generation, body)) in objects.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(
+            format!("{} {generation} obj\n{body}\nendobj\n", index + 1).as_bytes(),
+        );
+    }
+    let xref = out.len();
+    out.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for (offset, (generation, _)) in offsets.iter().zip(objects) {
+        out.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+const INDEX_CATALOG: &str = "<< /Type /Catalog /Pages 2 0 R >>";
+const INDEX_ROOT: &str = "<< /Type /Pages /Count 1 /Kids [3 0 R] >>";
+const INDEX_PAGE: &str = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> >>";
+
+fn page_index_from_bytes(
+    bytes: &[u8],
+    limits: &ManualLimits,
+) -> Result<ManualPdfPageIndex, ManualViewerError> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "guide.pdf", bytes);
+    ManualDocument::open(&path, limits)?.pdf_page_index()
+}
+
+#[test]
+fn pdf_page_index_walks_nested_kids_in_reading_order_without_writes() {
+    let bytes = page_index_pdf(&[
+        (0, INDEX_CATALOG),
+        (0, "<< /Type /Pages /Count 3 /Kids [5 0 R 6 0 R] >>"),
+        (7, "<< /Type /Page /Parent 5 0 R >>"),
+        (0, "<< /Type /Page /Parent 5 0 R >>"),
+        (
+            0,
+            "<< /Type /Pages /Parent 2 0 R /Count 2 /Kids [4 0 R 3 7 R] >>",
+        ),
+        (0, INDEX_PAGE),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "manual.cbz", &bytes);
+    let document = ManualDocument::open(&path, &ManualLimits::default()).unwrap();
+    let index = document.pdf_page_index().unwrap();
+    assert_eq!(index.id, *document.id());
+    assert_eq!(
+        index.pages,
+        vec![
+            ManualPdfObjectRef {
+                object_number: 4,
+                generation: 0
+            },
+            ManualPdfObjectRef {
+                object_number: 3,
+                generation: 7
+            },
+            ManualPdfObjectRef {
+                object_number: 6,
+                generation: 0
+            },
+        ]
+    );
+    assert_eq!(document.pdf_page_index().unwrap(), index);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert!(!document.inspection().readiness.can_view());
+}
+
+#[test]
+fn pdf_page_index_does_not_trust_declared_counts() {
+    let bytes = PdfBuilder::new(37).build();
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "lying.pdf", &bytes);
+    let document = ManualDocument::open(&path, &ManualLimits::default()).unwrap();
+    assert_eq!(document.inspection().page_count, Some(37));
+    assert!(
+        document
+            .inspection()
+            .warnings
+            .contains(&ManualWarning::PageCountIsDeclared)
+    );
+    assert!(matches!(
+        document.pdf_page_index(),
+        Err(ManualViewerError::Malformed(_))
+    ));
+
+    // Correct root count cannot hide an incorrect count in an intermediate node.
+    let bytes = page_index_pdf(&[
+        (0, INDEX_CATALOG),
+        (0, "<< /Type /Pages /Count 2 /Kids [3 0 R] >>"),
+        (
+            0,
+            "<< /Type /Pages /Parent 2 0 R /Count 1 /Kids [4 0 R 5 0 R] >>",
+        ),
+        (0, "<< /Type /Page /Parent 3 0 R >>"),
+        (0, "<< /Type /Page /Parent 3 0 R >>"),
+    ]);
+    assert!(matches!(
+        page_index_from_bytes(&bytes, &ManualLimits::default()),
+        Err(ManualViewerError::Malformed(_))
+    ));
+}
+
+#[test]
+fn pdf_page_index_refuses_malformed_graphs() {
+    let cases = [
+        (
+            "cycle",
+            "<< /Type /Pages /Count 1 /Kids [2 0 R] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "repeated child",
+            "<< /Type /Pages /Count 2 /Kids [3 0 R 3 0 R] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "missing child",
+            "<< /Type /Pages /Count 1 /Kids [99 0 R] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "null child",
+            "<< /Type /Pages /Count 1 /Kids [null] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "direct child",
+            "<< /Type /Pages /Count 1 /Kids [<< /Type /Page /Parent 2 0 R >>] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "root parent",
+            "<< /Type /Pages /Parent 1 0 R /Count 1 /Kids [3 0 R] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "wrong parent",
+            INDEX_ROOT,
+            "<< /Type /Page /Parent 99 0 R >>",
+        ),
+        ("missing parent", INDEX_ROOT, "<< /Type /Page >>"),
+        (
+            "wrong node type",
+            INDEX_ROOT,
+            "<< /Type /Other /Parent 2 0 R >>",
+        ),
+        (
+            "root is a page",
+            "<< /Type /Page /Count 1 /Kids [3 0 R] >>",
+            INDEX_PAGE,
+        ),
+        ("missing kids", "<< /Type /Pages /Count 1 >>", INDEX_PAGE),
+        (
+            "empty kids",
+            "<< /Type /Pages /Count 1 /Kids [] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "zero count",
+            "<< /Type /Pages /Count 0 /Kids [] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "negative count",
+            "<< /Type /Pages /Count -1 /Kids [3 0 R] >>",
+            INDEX_PAGE,
+        ),
+        (
+            "real count",
+            "<< /Type /Pages /Count 1.0 /Kids [3 0 R] >>",
+            INDEX_PAGE,
+        ),
+    ];
+    for (name, root, page) in cases {
+        let bytes = page_index_pdf(&[(0, INDEX_CATALOG), (0, root), (0, page)]);
+        assert!(
+            matches!(
+                page_index_from_bytes(&bytes, &ManualLimits::default()),
+                Err(ManualViewerError::Malformed(_))
+            ),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn pdf_page_index_preserves_and_checks_reference_generations() {
+    let valid = page_index_pdf(&[
+        (0, INDEX_CATALOG),
+        (0, "<< /Type /Pages /Count 1 /Kids [3 4 R] >>"),
+        (4, INDEX_PAGE),
+    ]);
+    let index = page_index_from_bytes(&valid, &ManualLimits::default()).unwrap();
+    assert_eq!(index.pages[0].generation, 4);
+    for (old, new) in [
+        ("3 4 R", "3 0 R"),
+        ("3 4 obj", "3 0 obj"),
+        ("00004 n", "00000 n"),
+    ] {
+        let bytes = String::from_utf8(valid.clone())
+            .unwrap()
+            .replacen(old, new, 1)
+            .into_bytes();
+        assert!(
+            matches!(
+                page_index_from_bytes(&bytes, &ManualLimits::default()),
+                Err(ManualViewerError::Malformed(_))
+            ),
+            "{old}"
+        );
+    }
+}
+
+#[test]
+fn pdf_page_index_uses_existing_compressed_xref_and_object_stream_reader() {
+    let bytes = object_stream_pdf_nodes(&[INDEX_CATALOG, INDEX_ROOT, INDEX_PAGE], false);
+    let index = page_index_from_bytes(&bytes, &ManualLimits::default()).unwrap();
+    assert_eq!(
+        index.pages,
+        vec![ManualPdfObjectRef {
+            object_number: 3,
+            generation: 0
+        }]
+    );
+    let invalid = object_stream_pdf_nodes(
+        &[
+            INDEX_CATALOG,
+            "<< /Type /Pages /Count 1 /Kids [3 1 R] >>",
+            INDEX_PAGE,
+        ],
+        false,
+    );
+    assert!(matches!(
+        page_index_from_bytes(&invalid, &ManualLimits::default()),
+        Err(ManualViewerError::Malformed(_))
+    ));
+}
+
+#[test]
+fn pdf_page_index_allows_indirect_kids_and_counts() {
+    let bytes = page_index_pdf(&[
+        (0, INDEX_CATALOG),
+        (0, "<< /Type /Pages /Count 5 0 R /Kids 4 0 R >>"),
+        (0, INDEX_PAGE),
+        (0, "[3 0 R]"),
+        (0, "1"),
+    ]);
+    assert_eq!(
+        page_index_from_bytes(&bytes, &ManualLimits::default())
+            .unwrap()
+            .pages
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn pdf_page_index_bounds_depth_declared_and_actual_pages() {
+    let bytes = page_index_pdf(&[
+        (0, INDEX_CATALOG),
+        (0, INDEX_ROOT),
+        (0, "<< /Type /Pages /Parent 2 0 R /Count 1 /Kids [4 0 R] >>"),
+        (0, "<< /Type /Page /Parent 3 0 R >>"),
+    ]);
+    assert!(page_index_from_bytes(&bytes, &ManualLimits::default()).is_ok());
+    assert!(matches!(
+        page_index_from_bytes(&bytes, &tight(|l| l.pdf_max_nesting = 2)),
+        Err(ManualViewerError::Malformed(_))
+    ));
+    assert!(matches!(
+        page_index_from_bytes(&bytes, &tight(|l| l.pdf_max_objects = 3)),
+        Err(ManualViewerError::Malformed(_))
+    ));
+    for count in [1, 3] {
+        let root = format!("<< /Type /Pages /Count {count} /Kids [3 0 R 4 0 R 5 0 R] >>");
+        let bytes = page_index_pdf(&[
+            (0, INDEX_CATALOG),
+            (0, &root),
+            (0, INDEX_PAGE),
+            (0, INDEX_PAGE),
+            (0, INDEX_PAGE),
+        ]);
+        assert_eq!(
+            page_index_from_bytes(&bytes, &tight(|l| l.max_pages = 2)),
+            Err(ManualViewerError::TooManyPages { count: 3, max: 2 })
+        );
+    }
+}
+
+#[test]
+fn pdf_page_index_refuses_a_changed_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), "manual.pdf", &PdfBuilder::new(1).build());
+    let document = ManualDocument::open(&path, &ManualLimits::default()).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"\n")
+        .unwrap();
+    assert_eq!(
+        document.pdf_page_index(),
+        Err(ManualViewerError::SourceChanged)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pdf_page_index_refuses_source_replacement_and_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = PdfBuilder::new(1).build();
+    let path = write(dir.path(), "manual.pdf", &bytes);
+    let document = ManualDocument::open(&path, &ManualLimits::default()).unwrap();
+    let other = write(dir.path(), "replacement.pdf", &bytes);
+    fs::rename(other, &path).unwrap();
+    assert_eq!(
+        document.pdf_page_index(),
+        Err(ManualViewerError::SourceChanged)
+    );
+    fs::remove_file(&path).unwrap();
+    let other = write(dir.path(), "target.pdf", &bytes);
+    std::os::unix::fs::symlink(other, path).unwrap();
+    assert_eq!(
+        document.pdf_page_index(),
+        Err(ManualViewerError::NotARegularFile)
+    );
+}
+
+#[test]
+fn pdf_page_index_uses_the_newest_incremental_tree() {
+    let mut bytes = page_index_pdf(&[
+        (0, INDEX_CATALOG),
+        (0, "<< /Type /Pages /Count 2 /Kids [3 0 R 4 0 R] >>"),
+        (0, INDEX_PAGE),
+        (0, INDEX_PAGE),
+    ]);
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let previous = text
+        .rsplit_once("startxref\n")
+        .unwrap()
+        .1
+        .lines()
+        .next()
+        .unwrap();
+    let previous: usize = previous.parse().unwrap();
+    let object = bytes.len();
+    bytes.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Count 2 /Kids [4 0 R 3 0 R] >>\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n2 1\n{object:010} 00000 n \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {previous} >>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+    let index = page_index_from_bytes(&bytes, &ManualLimits::default()).unwrap();
+    assert_eq!(
+        index
+            .pages
+            .iter()
+            .map(|r| r.object_number)
+            .collect::<Vec<_>>(),
+        [4, 3]
+    );
+    let freed_xref = bytes.len();
+    bytes.extend_from_slice(format!("xref\n3 1\n0000000000 00001 f \ntrailer\n<< /Size 5 /Root 1 0 R /Prev {xref} >>\nstartxref\n{freed_xref}\n%%EOF\n").as_bytes());
+    assert!(matches!(
+        page_index_from_bytes(&bytes, &ManualLimits::default()),
+        Err(ManualViewerError::Malformed(_))
+    ));
+}
+
+#[test]
+fn pdf_page_index_does_not_decode_page_content_or_actions() {
+    let bytes = page_index_pdf(&[
+        (0, INDEX_CATALOG),
+        (0, INDEX_ROOT),
+        (
+            0,
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /AA 5 0 R >>",
+        ),
+        (
+            0,
+            "<< /Length 999999999 /Filter /FlateDecode >>\nstream\ninvalid compressed content\nendstream",
+        ),
+        (0, "<< /O << /S /JavaScript /JS (throw an error) >> >>"),
+    ]);
+    assert_eq!(
+        page_index_from_bytes(&bytes, &ManualLimits::default())
+            .unwrap()
+            .pages
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn pdf_page_index_keeps_non_pdf_and_encrypted_files_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = cbz(dir.path(), "manual.pdf", &[("1.png", &png(2, 2))]);
+    let document = ManualDocument::open(&path, &ManualLimits::default()).unwrap();
+    assert_eq!(
+        document.pdf_page_index(),
+        Err(ManualViewerError::UnrecognisedFormat)
+    );
+    assert_eq!(
+        page_index_from_bytes(
+            &object_stream_pdf_nodes(&[INDEX_CATALOG, INDEX_ROOT, INDEX_PAGE], true),
+            &ManualLimits::default()
+        ),
+        Err(ManualViewerError::Encrypted)
+    );
 }
 
 // ------------------------------------------------------------ detection ----

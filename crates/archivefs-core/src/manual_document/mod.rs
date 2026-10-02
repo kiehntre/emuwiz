@@ -414,6 +414,22 @@ pub struct ManualPage {
     pub group: PageGroup,
 }
 
+/// An indirect PDF page reference, meaningful only within its source document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ManualPdfObjectRef {
+    pub object_number: u32,
+    pub generation: u16,
+}
+
+/// Verified page-tree membership in reading order. This does not validate
+/// page contents or imply that a PDF renderer is available.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManualPdfPageIndex {
+    pub id: ManualDocumentId,
+    /// Zero-based navigation index is the position in this vector.
+    pub pages: Vec<ManualPdfObjectRef>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ManualMetadata {
     pub title: Option<String>,
@@ -552,6 +568,38 @@ impl ManualDocument {
     #[must_use]
     pub fn id(&self) -> &ManualDocumentId {
         &self.inspection.id
+    }
+
+    /// Walk a PDF's page tree on demand, checking every subtree's declared
+    /// count, parent links and unique membership. CBZ/CBR return
+    /// `UnrecognisedFormat`; use their existing inspection instead.
+    ///
+    /// Reuses the document's bounds and checks its path/size/mtime/file identity
+    /// before and after reading. No content stream or action is executed.
+    pub fn pdf_page_index(&self) -> Result<ManualPdfPageIndex, ManualViewerError> {
+        if self.inspection.kind != ManualDocumentKind::Pdf {
+            return Err(ManualViewerError::UnrecognisedFormat);
+        }
+        let (mut file, metadata) = open_regular(&self.id().path)?;
+        if !self.id().still_matches(&metadata) {
+            return Err(ManualViewerError::SourceChanged);
+        }
+        let pages = pdf::page_index(&mut file, self.id().len, &self.limits)?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| ManualViewerError::Io(e.to_string()))?;
+        let path_metadata = fs::symlink_metadata(&self.id().path)
+            .map_err(|e| ManualViewerError::Io(e.to_string()))?;
+        if !path_metadata.is_file()
+            || !self.id().still_matches(&metadata)
+            || !self.id().still_matches(&path_metadata)
+        {
+            return Err(ManualViewerError::SourceChanged);
+        }
+        Ok(ManualPdfPageIndex {
+            id: self.id().clone(),
+            pages,
+        })
     }
 
     /// Raw bytes of one page image, bounded and size-checked.

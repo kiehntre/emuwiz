@@ -19,8 +19,8 @@ use std::io::{Read, Seek, SeekFrom};
 use super::detect::ManualFormatEvidence;
 use super::{
     ManualActiveContent, ManualCapabilityGap, ManualDocumentId, ManualDocumentKind,
-    ManualInspection, ManualLimits, ManualMetadata, ManualReadiness, ManualViewerError,
-    ManualWarning,
+    ManualInspection, ManualLimits, ManualMetadata, ManualPdfObjectRef, ManualReadiness,
+    ManualViewerError, ManualWarning,
 };
 
 const PDF_HEADER_SCAN: usize = 1024;
@@ -47,7 +47,7 @@ enum Obj {
     Str(Vec<u8>),
     Array(Vec<Obj>),
     Dict(Dict),
-    Ref(u32),
+    Ref(ManualPdfObjectRef),
 }
 
 impl Obj {
@@ -382,7 +382,14 @@ impl<'a> Lexer<'a> {
                     self.skip_ws();
                     let r = self.word();
                     if r == b"R" {
-                        return Ok(Obj::Ref(int as u32));
+                        let generation = std::str::from_utf8(gen_word)
+                            .ok()
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .ok_or(PErr::Bad("bad reference generation"))?;
+                        return Ok(Obj::Ref(ManualPdfObjectRef {
+                            object_number: int as u32,
+                            generation,
+                        }));
                     }
                 }
                 self.pos = save;
@@ -406,7 +413,7 @@ fn push_capped(out: &mut Vec<u8>, b: u8) {
 
 #[derive(Clone, Copy, Debug)]
 enum XEntry {
-    Offset(u64),
+    Offset { abs: u64, generation: u16 },
     InStream { stm: u32, index: u32 },
     Free,
 }
@@ -415,7 +422,7 @@ struct StreamLoc {
     /// Absolute file offset of the first data byte.
     data_offset: u64,
     length: Option<i64>,
-    length_ref: Option<u32>,
+    length_ref: Option<ManualPdfObjectRef>,
 }
 
 struct ObjStm {
@@ -456,7 +463,7 @@ impl<'f> Reader<'f> {
     fn load_at(
         &mut self,
         abs: u64,
-        expect: Option<u32>,
+        expect: Option<ManualPdfObjectRef>,
     ) -> Result<(Obj, Option<StreamLoc>), ManualViewerError> {
         for window in [FIRST_WINDOW, self.limits.pdf_max_object_window] {
             let buf = self.read_at(abs, window)?;
@@ -471,21 +478,26 @@ impl<'f> Reader<'f> {
         Err(malformed("object is too large"))
     }
 
-    fn resolve(&mut self, num: u32) -> Result<Obj, ManualViewerError> {
+    fn resolve(&mut self, reference: ManualPdfObjectRef) -> Result<Obj, ManualViewerError> {
         if self.depth >= MAX_RESOLVE_DEPTH {
             return Err(malformed("reference chain too deep"));
         }
         self.depth += 1;
-        let result = self.resolve_inner(num);
+        let result = self.resolve_inner(reference);
         self.depth -= 1;
         result
     }
 
-    fn resolve_inner(&mut self, num: u32) -> Result<Obj, ManualViewerError> {
-        match self.xref.get(&num).copied() {
-            Some(XEntry::Offset(abs)) => Ok(self.load_at(abs, Some(num))?.0),
-            Some(XEntry::InStream { stm, index }) => self.load_from_object_stream(stm, index, num),
-            Some(XEntry::Free) | None => Ok(Obj::Null),
+    fn resolve_inner(&mut self, reference: ManualPdfObjectRef) -> Result<Obj, ManualViewerError> {
+        match self.xref.get(&reference.object_number).copied() {
+            Some(XEntry::Offset { abs, generation }) if generation == reference.generation => {
+                Ok(self.load_at(abs, Some(reference))?.0)
+            }
+            Some(XEntry::InStream { stm, index }) if reference.generation == 0 => {
+                self.load_from_object_stream(stm, index, reference.object_number)
+            }
+            // Undefined references, including stale generations, denote null.
+            _ => Ok(Obj::Null),
         }
     }
 
@@ -555,10 +567,16 @@ impl<'f> Reader<'f> {
         num: u32,
     ) -> Result<Obj, ManualViewerError> {
         if !self.objstm.contains_key(&stm) {
-            let Some(XEntry::Offset(abs)) = self.xref.get(&stm).copied() else {
+            let Some(XEntry::Offset { abs, generation }) = self.xref.get(&stm).copied() else {
                 return Err(malformed("object stream is not directly addressable"));
             };
-            let (obj, loc) = self.load_at(abs, Some(stm))?;
+            let (obj, loc) = self.load_at(
+                abs,
+                Some(ManualPdfObjectRef {
+                    object_number: stm,
+                    generation,
+                }),
+            )?;
             let dict = obj
                 .as_dict()
                 .ok_or_else(|| malformed("bad object stream"))?
@@ -631,17 +649,18 @@ fn parse_indirect(
     buf: &[u8],
     abs: u64,
     max_depth: usize,
-    expect: Option<u32>,
+    expect: Option<ManualPdfObjectRef>,
 ) -> Result<(Obj, Option<StreamLoc>), PErr> {
     let mut lexer = Lexer::new(buf, 0, max_depth);
     let number = lexer.unsigned()?;
-    let _generation = lexer.unsigned()?;
+    let generation = lexer.unsigned()?;
     lexer.keyword(b"obj")?;
     if let Some(expected) = expect
-        && u64::from(expected) != number
+        && (u64::from(expected.object_number) != number
+            || u64::from(expected.generation) != generation)
     {
         return Err(PErr::Bad(
-            "object number does not match the cross-reference",
+            "object number or generation does not match the cross-reference",
         ));
     }
     let obj = lexer.object(0)?;
@@ -879,7 +898,8 @@ impl Reader<'_> {
             }
             for i in 0..count {
                 let offset = number(&mut lexer, "bad cross-reference entry")?;
-                let _generation = number(&mut lexer, "bad cross-reference entry")?;
+                let generation = u16::try_from(number(&mut lexer, "bad cross-reference entry")?)
+                    .map_err(|_| bad("bad cross-reference generation"))?;
                 lexer.skip_ws();
                 if lexer.pos >= buf.len() {
                     return Err(TableErr::NeedMore);
@@ -897,7 +917,7 @@ impl Reader<'_> {
                         .checked_add(offset)
                         .filter(|o| *o < self.file_len)
                     {
-                        Some(abs) if offset > 0 => XEntry::Offset(abs),
+                        Some(abs) if offset > 0 => XEntry::Offset { abs, generation },
                         _ => return Err(bad("live cross-reference offset outside file")),
                     },
                     b"f" => XEntry::Free,
@@ -999,7 +1019,14 @@ impl Reader<'_> {
                         .checked_add(second)
                         .filter(|o| *o < self.file_len)
                     {
-                        Some(abs) if second > 0 => self.merge(number, XEntry::Offset(abs))?,
+                        Some(abs) if second > 0 => self.merge(
+                            number,
+                            XEntry::Offset {
+                                abs,
+                                generation: u16::try_from(third)
+                                    .map_err(|_| malformed("bad cross-reference generation"))?,
+                            },
+                        )?,
                         _ => return Err(malformed("live cross-reference offset outside file")),
                     },
                     2 => self.merge(
@@ -1024,13 +1051,103 @@ impl Reader<'_> {
 
 // ------------------------------------------------------------- top level ----
 
-pub(super) fn inspect(
+pub(super) fn page_index(
     file: &mut File,
-    id: ManualDocumentId,
-    evidence: ManualFormatEvidence,
+    file_len: u64,
     limits: &ManualLimits,
-) -> Result<ManualInspection, ManualViewerError> {
-    let file_len = id.len;
+) -> Result<Vec<ManualPdfObjectRef>, ManualViewerError> {
+    let (mut reader, catalog, _) = open_catalog(file, file_len, limits)?;
+    if !matches!(catalog.get("Type"), Some(Obj::Name(name)) if name == "Catalog") {
+        return Err(malformed("bad catalog type"));
+    }
+    let Some(Obj::Ref(root)) = catalog.get("Pages") else {
+        return Err(malformed("page tree root must be an indirect reference"));
+    };
+    let mut pages = Vec::new();
+    reader.walk_pages(*root, None, 0, &mut HashSet::new(), &mut pages)?;
+    Ok(pages)
+}
+
+impl Reader<'_> {
+    fn walk_pages(
+        &mut self,
+        reference: ManualPdfObjectRef,
+        parent: Option<ManualPdfObjectRef>,
+        depth: usize,
+        visited: &mut HashSet<ManualPdfObjectRef>,
+        pages: &mut Vec<ManualPdfObjectRef>,
+    ) -> Result<(), ManualViewerError> {
+        if depth >= self.limits.pdf_max_nesting {
+            return Err(malformed("page tree exceeds nesting bound"));
+        }
+        if visited.len() >= self.limits.pdf_max_objects {
+            return Err(malformed("page tree exceeds object bound"));
+        }
+        if !visited.insert(reference) {
+            return Err(malformed("page tree contains a cycle or repeated child"));
+        }
+        let obj = self.resolve(reference)?;
+        let node = obj
+            .as_dict()
+            .ok_or_else(|| malformed("bad page tree node"))?;
+        match (parent, node.get("Parent")) {
+            (None, None) => {}
+            (Some(expected), Some(Obj::Ref(actual))) if expected == *actual => {}
+            _ => return Err(malformed("page tree parent does not match its position")),
+        }
+        match node.get("Type") {
+            Some(Obj::Name(name)) if name == "Pages" => {
+                let count = self
+                    .deref(node.get("Count").unwrap_or(&Obj::Null))?
+                    .as_int()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| malformed("bad page tree count"))?;
+                if count > self.limits.max_pages {
+                    return Err(ManualViewerError::TooManyPages {
+                        count,
+                        max: self.limits.max_pages,
+                    });
+                }
+                let Obj::Array(kids) = self.deref(node.get("Kids").unwrap_or(&Obj::Null))? else {
+                    return Err(malformed("page tree has no child array"));
+                };
+                if kids.is_empty() {
+                    return Err(malformed("page tree has no children"));
+                }
+                let start = pages.len();
+                for child in kids {
+                    let Obj::Ref(child) = child else {
+                        return Err(malformed("page tree children must be indirect references"));
+                    };
+                    self.walk_pages(child, Some(reference), depth + 1, visited, pages)?;
+                }
+                if pages.len() - start != count {
+                    return Err(malformed(
+                        "page tree count differs from actual descendant pages",
+                    ));
+                }
+            }
+            Some(Obj::Name(name)) if name == "Page" && parent.is_some() => {
+                if pages.len() >= self.limits.max_pages {
+                    return Err(ManualViewerError::TooManyPages {
+                        count: pages.len() + 1,
+                        max: self.limits.max_pages,
+                    });
+                }
+                pages.push(reference);
+            }
+            _ => return Err(malformed("bad page tree node type")),
+        }
+        Ok(())
+    }
+}
+
+fn open_catalog<'a>(
+    file: &'a mut File,
+    file_len: u64,
+    limits: &'a ManualLimits,
+) -> Result<(Reader<'a>, Dict, Option<Obj>), ManualViewerError> {
     let mut head = Vec::new();
     file.seek(SeekFrom::Start(0))
         .map_err(|e| ManualViewerError::Io(e.to_string()))?;
@@ -1124,6 +1241,16 @@ pub(super) fn inspect(
         .as_dict()
         .ok_or_else(|| malformed("bad document catalog"))?
         .clone();
+    Ok((reader, catalog, info))
+}
+
+pub(super) fn inspect(
+    file: &mut File,
+    id: ManualDocumentId,
+    evidence: ManualFormatEvidence,
+    limits: &ManualLimits,
+) -> Result<ManualInspection, ManualViewerError> {
+    let (mut reader, catalog, info) = open_catalog(file, id.len, limits)?;
     let pages_ref = catalog
         .get("Pages")
         .cloned()
