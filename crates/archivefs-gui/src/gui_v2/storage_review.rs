@@ -291,8 +291,21 @@ pub(super) fn analyse(library: &SharedLibrary) -> StorageReview {
 pub(super) struct StorageState {
     pub review: Option<Arc<StorageReview>>,
     pub job: Option<u64>,
+    pub failed: bool,
     /// Identity of the library the review was computed for.
     pub for_library: usize,
+}
+
+impl StorageState {
+    fn should_start(&self, stale: bool) -> bool {
+        (self.review.is_none() || stale) && self.job.is_none() && !self.failed
+    }
+    fn accept(&mut self, current_library: usize, review: StorageReview) {
+        self.job = None;
+        if self.for_library == current_library {
+            self.review = Some(Arc::new(review));
+        }
+    }
 }
 
 const SHOWN_PER_GROUP: usize = 25;
@@ -306,6 +319,8 @@ impl App {
         if self.storage.job.is_some() {
             return;
         }
+        self.storage.failed = false;
+        self.storage.review = None;
         let id = self.activity.queue(
             "Measuring your library",
             Route::Section(Section::Storage),
@@ -322,12 +337,12 @@ impl App {
     }
 
     pub(super) fn storage_review_done(&mut self, review: StorageReview) {
-        self.storage.job = None;
-        self.storage.review = Some(Arc::new(review));
+        self.storage.accept(self.library_key(), review);
     }
 
     pub(super) fn storage_review_failed(&mut self) {
         self.storage.job = None;
+        self.storage.failed = true;
     }
 
     pub(super) fn storage_page(&mut self, ui: &mut egui::Ui) {
@@ -340,17 +355,29 @@ impl App {
             return;
         }
         let stale = self.storage.review.is_some() && self.storage.for_library != self.library_key();
-        if (self.storage.review.is_none() || stale) && self.storage.job.is_none() {
+        if self.storage.should_start(stale) {
             self.start_storage_review();
         }
         ui.heading("Where is my space going?");
-        ui.label("EmuWiz measured your catalogue and checked which files could be stored more compactly. This page only looks; nothing is changed, converted or deleted here.");
+        if self.storage.failed {
+            ui.colored_label(theme::WARNING, "Storage review could not finish. Check the drive and try Check again. No files were changed; Activity has the error details.");
+            if ui.button("Open Activity details").clicked() {
+                self.go(Route::Section(Section::Activity));
+            }
+        }
+        if stale {
+            ui.label(
+                "The library changed. Wait for the new check before relying on space estimates.",
+            );
+        }
+        ui.label("This review measures your catalogue and checks which files could be stored more compactly. Nothing is changed, converted or deleted here.");
         ui.horizontal_wrapped(|ui| {
             if self.storage.job.is_some() {
                 ui.spinner();
                 ui.label("Measuring your library… you can keep browsing.");
             } else if ui.button("Check again").clicked() {
                 self.storage.review = None;
+                self.start_storage_review();
             }
         });
         let Some(review) = self.storage.review.clone() else {
@@ -552,6 +579,31 @@ mod tests {
             );
         }
         map
+    }
+
+    #[test]
+    fn failed_storage_review_requires_explicit_retry() {
+        let mut state = StorageState::default();
+        assert!(state.should_start(false));
+        state.failed = true;
+        assert!(!state.should_start(false));
+        assert!(!state.should_start(true));
+        state.failed = false;
+        state.job = Some(1);
+        assert!(!state.should_start(false));
+    }
+    #[test]
+    fn storage_result_from_old_library_is_not_published() {
+        let mut state = StorageState {
+            for_library: 1,
+            job: Some(1),
+            ..Default::default()
+        };
+        state.accept(2, StorageReview::default());
+        assert!(state.review.is_none());
+        assert!(state.job.is_none());
+        state.accept(1, StorageReview::default());
+        assert!(state.review.is_some());
     }
 
     #[test]

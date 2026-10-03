@@ -434,9 +434,16 @@ pub(super) enum Chip {
 pub(super) struct MultiDiscState {
     pub review: Option<Arc<MediaSetReview>>,
     pub job: Option<u64>,
+    pub failed: bool,
     pub chip: Chip,
     pub query: String,
     pub show_all: BTreeSet<Bucket>,
+}
+
+impl MultiDiscState {
+    fn should_start(&self, stale: bool) -> bool {
+        (self.review.is_none() || stale) && self.job.is_none() && !self.failed
+    }
 }
 
 const SHOWN_PER_GROUP: usize = 50;
@@ -450,6 +457,7 @@ impl App {
         if self.multi.job.is_some() {
             return;
         }
+        self.multi.failed = false;
         let id = self.activity.queue(
             "Looking for multi-disc games",
             Route::Section(Section::MultiDisc),
@@ -476,6 +484,7 @@ impl App {
 
     pub(super) fn media_sets_failed(&mut self) {
         self.multi.job = None;
+        self.multi.failed = true;
     }
 
     pub(super) fn multi_disc_page(&mut self, ui: &mut egui::Ui) {
@@ -487,12 +496,23 @@ impl App {
             }
             return;
         }
+        if self.multi.failed {
+            ui.colored_label(theme::WARNING, "The multi-disc check could not finish. Nothing was changed. Retry the check, or open Activity for details.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Retry multi-disc check").clicked() {
+                    self.start_media_sets_review();
+                }
+                if ui.button("Open Activity details").clicked() {
+                    self.go(Route::Section(Section::Activity));
+                }
+            });
+        }
         let stale = self
             .multi
             .review
             .as_ref()
             .is_some_and(|r| r.key != self.media_sets_key());
-        if (self.multi.review.is_none() || stale) && self.multi.job.is_none() {
+        if self.multi.should_start(stale) {
             self.start_media_sets_review();
         }
         ui.label("Read from your catalogue; no files were opened or changed. EmuWiz does not swap discs, build playlists or launch games from this page.");
@@ -502,11 +522,15 @@ impl App {
                 ui.label("Looking for multi-disc games… you can keep browsing.");
             } else if ui.button("Check again").clicked() {
                 self.multi.review = None;
+                self.start_media_sets_review();
             }
         });
         let Some(review) = self.multi.review.clone() else {
             return;
         };
+        if stale {
+            ui.colored_label(theme::WARNING, "These are results from an earlier library view. Wait for the new check before relying on them.");
+        }
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new(headline(&review)).strong());
             ui.small(format!(
@@ -676,5 +700,21 @@ mod tests {
             assert_ne!(label, format!("{kind:?}"));
             assert!(label.contains(' '), "{kind:?} label should be a sentence");
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn failed_multi_disc_check_waits_for_an_explicit_retry() {
+        let mut state = MultiDiscState::default();
+        assert!(state.should_start(false));
+        state.failed = true;
+        assert!(!state.should_start(false));
+        assert!(!state.should_start(true));
+        state.failed = false;
+        state.job = Some(1);
+        assert!(!state.should_start(true));
     }
 }

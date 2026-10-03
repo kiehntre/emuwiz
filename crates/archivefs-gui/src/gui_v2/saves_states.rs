@@ -43,6 +43,16 @@ pub(super) struct SavesStatesState {
     pub(super) error: Option<String>,
 }
 
+impl SavesStatesState {
+    fn filters_active(&self) -> bool {
+        self.filter != Filter::All || !self.search.trim().is_empty()
+    }
+    fn clear_filters(&mut self) {
+        self.filter = Filter::All;
+        self.search.clear();
+    }
+}
+
 pub(super) fn configured_roots() -> Vec<PersistentStateRoot> {
     // GUI rendering tests must never inherit the developer's remembered
     // emulator roots. Production still uses the exact remembered/configured
@@ -200,7 +210,8 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         },
         |ui| {
             if ui
-                .add(
+                .add_enabled(
+                    !loading,
                     egui::Button::new(if has_inventory {
                         "Refresh save locations"
                     } else {
@@ -228,8 +239,15 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         app.start_saves_inventory();
     }
 
+    if loading {
+        ui.spinner();
+        ui.label("Checking save locations in the background. You can keep browsing; another check can start when this one finishes.");
+    }
     if let Some(error) = &app.saves_states.error {
-        ui.colored_label(egui::Color32::YELLOW, error);
+        ui.colored_label(theme::WARNING, "Save locations could not be checked. Reconnect the drive or review Emulator Setup, then refresh. Your saves were not changed.");
+        ui.collapsing("Save inspection details", |ui| {
+            ui.label(error);
+        });
     }
 
     if let Some(game) = &selected_game {
@@ -304,7 +322,13 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
         })
         .collect();
     if records.is_empty() {
-        let (title, detail) = if selected_game.is_some() {
+        let filtered = app.saves_states.filters_active();
+        let (title, detail) = if filtered {
+            (
+                "No saves match these filters",
+                "This does not mean your saves are missing. Clear the search and filters to see all records in this view.",
+            )
+        } else if selected_game.is_some() {
             (
                 "No saves found for this game",
                 "No save or state record has explicit identity evidence for the selected game. Review unassigned records from the full inventory if needed.",
@@ -325,14 +349,25 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 "Your configured save location is unavailable or needs review.",
             )
         };
-        empty_state(
+        if empty_state(
             ui,
             &mut app.imagery,
             EmptyArt::Glyph("cartridge"),
             title,
             detail,
-            None,
-        );
+            filtered.then_some("Clear search and filters"),
+        ) {
+            app.saves_states.clear_filters();
+            return;
+        }
+        if selected_game.is_some()
+            && ui
+                .button("Review all saves, including unassigned")
+                .clicked()
+        {
+            app.go(Route::Section(Section::Saves));
+            return;
+        }
     }
     egui::ScrollArea::vertical()
         .id_salt(("v2_saves_states_records", game_id))
@@ -343,8 +378,13 @@ pub(super) fn show(app: &mut App, ui: &mut egui::Ui, game_id: Option<i64>) {
                 });
             }
         });
-    for warning in &inventory.warnings {
-        ui.collapsing("Advanced inventory details", |ui| ui.label(warning));
+    if !inventory.warnings.is_empty() {
+        ui.colored_label(theme::WARNING, "Some save locations could not be fully checked. This list may be incomplete; review Emulator Setup and refresh after correcting the locations.");
+        ui.collapsing("Advanced inventory details", |ui| {
+            for warning in &inventory.warnings {
+                ui.label(warning);
+            }
+        });
     }
 }
 
@@ -650,6 +690,21 @@ mod tests {
     /// card's "Advanced details" header resolves to the *same* persisted
     /// open/closed id and one record's toggle bleeds into every other
     /// record's card, appearing as a flash when the list repaints.
+    #[test]
+    fn clearing_save_filters_keeps_inspection_and_selection_evidence() {
+        let mut state = SavesStatesState {
+            filter: Filter::SaveStates,
+            search: "no match".into(),
+            generation: 7,
+            ..Default::default()
+        };
+        assert!(state.filters_active());
+        state.clear_filters();
+        assert!(!state.filters_active());
+        assert_eq!(state.generation, 7);
+        assert!(state.job.is_none());
+    }
+
     #[test]
     fn advanced_details_id_is_isolated_per_record() {
         let context = egui::Context::default();

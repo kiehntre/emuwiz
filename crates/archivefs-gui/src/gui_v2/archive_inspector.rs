@@ -68,8 +68,8 @@ struct Failure {
 impl From<String> for Failure {
     fn from(message: String) -> Self {
         Self {
-            technical: message.clone(),
-            message,
+            technical: message,
+            message: "EmuWiz could not inspect this archive. Check that its drive is connected and the file is accessible, then try again.".into(),
         }
     }
 }
@@ -503,6 +503,7 @@ pub(crate) fn show(
                 );
                 ui.label(&failure.message);
                 ui.small("Nothing was changed: this page only reads archive metadata.");
+                ui.label("Check the source file or its drive before trying again.");
                 retry = ui.button("Try again").clicked();
                 ui.collapsing("Technical details", |ui| ui.monospace(&failure.technical));
             }
@@ -521,6 +522,7 @@ pub(crate) fn show(
 
 fn show_report(ui: &mut egui::Ui, inspection: &ArchiveInspection) {
     let report = &inspection.report;
+    ui.label("Listing succeeded. Names and sizes do not prove that the contents are complete or undamaged; use Check Games for verification.");
     let likely = report
         .entries
         .iter()
@@ -590,6 +592,81 @@ fn show_report(ui: &mut egui::Ui, inspection: &ArchiveInspection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_selection_discards_old_worker_results() {
+        let ctx = egui::Context::default();
+        let (sender, receiver) = mpsc::channel();
+        let mut state = ArchiveInspectorPageState::default();
+        state.status = Status::Loading {
+            target: ArchiveInspectorTarget {
+                game_id: Some(1),
+                title: "QA".into(),
+                path: "/synthetic.zip".into(),
+                media: "zip".into(),
+                platform: "QA".into(),
+            },
+            receiver,
+        };
+        state.set_target(None, &ctx);
+        assert!(
+            sender
+                .send(Err(Failure::from("late result".to_string())))
+                .is_err()
+        );
+        state.poll(&ctx);
+        assert!(matches!(state.status, Status::Idle));
+    }
+
+    #[test]
+    fn error_details_are_closed_and_retry_visible_at_both_window_sizes() {
+        fn text(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => out.push_str(t.galley.text()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        text(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for size in [[1280.0, 800.0], [700.0, 520.0]] {
+            let ctx = egui::Context::default();
+            let target = ArchiveInspectorTarget {
+                game_id: Some(1),
+                title: "QA archive".into(),
+                path: "/synthetic.zip".into(),
+                media: "zip".into(),
+                platform: "QA".into(),
+            };
+            let mut state = ArchiveInspectorPageState::default();
+            state.status = Status::Error {
+                target: target.clone(),
+                failure: Failure {
+                    message: "Could not inspect the archive".into(),
+                    technical: "PRIVATE_RAW_ERROR".into(),
+                },
+            };
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size.into())),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| show(ui, &mut state, Some(target.clone())));
+                },
+            );
+            let mut rendered = String::new();
+            for s in output.shapes {
+                text(&s.shape, &mut rendered);
+            }
+            assert!(rendered.contains("Try again"));
+            assert!(rendered.contains("Nothing was extracted or changed"));
+            assert!(!rendered.contains("PRIVATE_RAW_ERROR"));
+        }
+    }
 
     #[test]
     fn supported_archive_formats_are_explicit() {

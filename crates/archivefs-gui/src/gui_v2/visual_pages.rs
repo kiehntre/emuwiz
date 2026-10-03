@@ -94,6 +94,12 @@ impl App {
                             self.library.platforms.len(),
                             self.library.attention
                         ));
+                        if self.library.games.is_empty() {
+                            ui.label("Start by adding a folder you already keep games in. EmuWiz lists the files; it does not move them.");
+                            if ui.button("Add my game folders").clicked() { self.go(Route::Section(Section::Sources)); }
+                        } else if self.library.attention > 0 {
+                            if ui.button("Understand what needs attention").clicked() { self.go(Route::Section(Section::Problems)); }
+                        }
                     } else {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -325,7 +331,7 @@ impl App {
         width: f32,
     ) -> Option<bool> {
         let mut choice = None;
-        let ready = platform.eq_ignore_ascii_case("Arcade") || count > 0;
+
         egui::Frame::new()
             .fill(theme::CARD_SURFACE)
             .stroke(theme::border(ui))
@@ -335,7 +341,11 @@ impl App {
                 ui.set_width(width - 22.0);
                 ui.set_height(PLATFORM_CARD_HEIGHT - 22.0);
                 ui.horizontal_top(|ui| {
-                    let side = PLATFORM_CARD_HEIGHT - 22.0;
+                    let side = if width < 420.0 {
+                        76.0
+                    } else {
+                        PLATFORM_CARD_HEIGHT - 22.0
+                    };
                     let (plate, _) =
                         ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
                     ui.painter().rect_filled(plate, 8.0, theme::DEEP_BACKGROUND);
@@ -361,12 +371,7 @@ impl App {
                         );
                         ui.add(
                             egui::Label::new(
-                                RichText::new(if ready {
-                                    "Verification data ready · game folder configured"
-                                } else {
-                                    "Needs setup"
-                                })
-                                .color(theme::muted(ui)),
+                                RichText::new(platform_verification_note()).color(theme::muted(ui)),
                             )
                             .truncate(),
                         );
@@ -385,14 +390,12 @@ impl App {
                             }
                             if ui
                                 .add(
-                                    egui::Button::new(if ready { "Check" } else { "Set up" })
+                                    egui::Button::new("Review checks")
                                         .min_size(egui::vec2(80.0, 38.0)),
                                 )
-                                .on_hover_text(if ready {
-                                    format!("Check {platform}")
-                                } else {
-                                    format!("Set up {platform}")
-                                })
+                                .on_hover_text(format!(
+                                    "Review {platform} verification data and checks before starting"
+                                ))
                                 .clicked()
                             {
                                 choice = Some(false);
@@ -405,9 +408,19 @@ impl App {
     }
 }
 
+fn platform_verification_note() -> &'static str {
+    "Listed in your library · verification setup not checked here"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_counts_never_claim_verification_or_launch_readiness() {
+        assert!(platform_verification_note().contains("not checked"));
+        assert!(!platform_verification_note().contains("ready"));
+    }
 
     #[test]
     fn tiles_fit_the_available_width_and_never_drop_to_zero() {
