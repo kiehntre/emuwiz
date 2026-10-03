@@ -112,30 +112,16 @@ pub(super) fn show_mods_page(
     egui::ScrollArea::vertical()
         .id_salt("v2_mods_native")
         .show(ui, |ui| {
-            widgets::workshop_light_header(
+            widgets::workflow_header(
                 ui,
                 "Cheats & Mods workshop",
-                "Tinker, customise and experiment safely — every change is reviewed before it is applied.",
-                |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        widgets::status_badge(
-                            ui,
-                            "Original game stays untouched until you confirm",
-                            widgets::StatusTone::Success,
-                        );
-                        widgets::status_badge(
-                            ui,
-                            "Reviewable change history",
-                            widgets::StatusTone::Info,
-                        );
-                    });
-                },
+                "Choose a game and inspect compatibility before reviewing a change. Browsing this workshop does not change game or emulator files.",
             );
 
             let tabs = [
                 (Tab::Installed, "Installed"),
                 (Tab::Add, "Available packages"),
-                (Tab::Stack, "Recorded changes"),
+                (Tab::Stack, "Active stack"),
                 (Tab::Conflicts, "Conflicts"),
                 (Tab::Cheats, "Cheats"),
             ];
@@ -147,7 +133,7 @@ pub(super) fn show_mods_page(
                 }
             });
             ui.separator();
-            if state.history_worker.is_some() {
+            if state.history_worker.is_some() && !(state.tab == Tab::Cheats && selected_game.is_none()) {
                 ui.spinner();
                 ui.label("Reading change history in the background. You can keep browsing; previous results may be out of date.");
             }
@@ -169,7 +155,7 @@ pub(super) fn show_mods_page(
                 }
                 if ui.button("Open History & Undo").clicked() { destination = Some(Route::Section(Section::History)); }
             });
-            if state.tab == Tab::Cheats {
+            if state.tab == Tab::Cheats && selected_game.is_some() {
                 ui.label("Recognised code syntax does not prove a cheat works in-game. Check the game version, region and emulator before previewing any supported change; installing a file is not proof that a cheat is active.");
             }
             if state.tab == Tab::Cheats && selected_game.is_none() {

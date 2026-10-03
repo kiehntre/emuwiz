@@ -220,9 +220,13 @@ impl App {
                 }
             });
         }
-        if self.missing.job.is_some() {
-            ui.spinner();
-            ui.label("Checking or updating the missing-game list. Please wait before starting another operation; game files are not deleted by this workflow.");
+        if self.missing.job.is_some()
+            && (self.missing.receipt.is_some() || self.missing.plan.is_some())
+        {
+            ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.small("Checking or updating the game list… No game files are deleted.");
+            });
         }
         // The review appears once its evidence is available.
         let Some(plan) = self.missing.plan.clone() else {
