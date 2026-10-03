@@ -375,6 +375,359 @@ fn legacy_retroarch_install_is_only_a_hashed_migration_preview() {
     assert!(!preview.new_path.exists(), "preview must not migrate");
 }
 
+mod migration_apply {
+    use super::*;
+    use crate::patch_manager::shared_transaction::*;
+
+    const LEGACY: &str = "# retained verbatim\ncheats = 1\ncheat0_desc = \"Test\"\ncheat0_code = \"NNVOSPVG\"\ncheat0_enable = false\n";
+
+    fn setup() -> (
+        Fixture,
+        CheatDestinationRequest,
+        PreviewIdentity,
+        RetroArchCheatMigrationPreview,
+    ) {
+        let fixture = Fixture::new("migration-apply");
+        let mut request = destination_request(&fixture.dir("cheats"));
+        request.retroarch_core = Some("Nestopia".into());
+        request.retroarch_core_required = true;
+        let identity = PreviewIdentity {
+            kind: PreviewIdentityKind::RetroArchCatalogueMatch,
+            state: PreviewIdentityState::Verified,
+            value: Some("synthetic-verified-catalogue-binding".into()),
+            archive_path: fixture.write("roms/Chrono Quest (USA).nes", "synthetic ROM"),
+            revision: None,
+        };
+        fixture.write("cheats/NES/Chrono Quest (USA).cht", LEGACY);
+        let preview = preview_retroarch_cheat_migration(
+            &request.profile_cheat_root,
+            "NES",
+            "Nestopia",
+            "Chrono Quest (USA)",
+            None,
+        )
+        .unwrap();
+        (fixture, request, identity, preview)
+    }
+
+    fn options(fixture: &Fixture, plan: &SharedTransactionPlan) -> SharedApplyOptions {
+        SharedApplyOptions {
+            dry_run: false,
+            confirmation: Some(SharedApplyConfirmation {
+                plan_id: plan.plan_id.clone(),
+                general_approved: true,
+                replacement_approved: false,
+            }),
+            operation_id: "migration".into(),
+            timestamp_unix_seconds: 100,
+            current_context: plan.context.clone(),
+            history_root: fixture.path("history"),
+            backup_root: fixture.path("backups"),
+        }
+    }
+
+    #[test]
+    fn reviewed_migration_applies_verbatim_with_durable_undo_and_legacy_retained() {
+        let (fixture, request, identity, preview) = setup();
+        let plan = preview
+            .build_transaction_plan(&request, &identity, "profile-1")
+            .unwrap();
+        assert!(!preview.new_path.exists());
+        assert!(!fixture.path("history").exists());
+        assert!(!fixture.path("backups").exists());
+        let result = execute_shared_apply(&plan, &options(&fixture, &plan));
+        assert_eq!(
+            result.journal.status,
+            SharedApplyStatus::Success,
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&preview.old_path).unwrap(), LEGACY.as_bytes());
+        assert_eq!(fs::read(&preview.new_path).unwrap(), LEGACY.as_bytes());
+        assert_eq!(fs::read(&identity.archive_path).unwrap(), b"synthetic ROM");
+        let journal = result.journal_path.unwrap();
+        assert!(journal.exists());
+        assert_eq!(
+            discover_shared_apply_history(&fixture.path("history"))
+                .journals
+                .len(),
+            1
+        );
+        let undo = preview_shared_rollback(
+            &journal,
+            &request.profile_cheat_root,
+            &fixture.path("backups"),
+        );
+        assert!(undo.available);
+        let result = execute_shared_rollback(
+            &undo,
+            &SharedRollbackOptions {
+                confirmation: SharedRollbackConfirmation {
+                    preview_id: undo.preview_id.clone(),
+                    approved: true,
+                },
+                rollback_operation_id: "migration-undo".into(),
+                timestamp_unix_seconds: 101,
+                history_root: fixture.path("history"),
+                backup_root: fixture.path("backups"),
+            },
+        );
+        assert_eq!(result.status, SharedApplyStatus::Success);
+        assert!(!preview.new_path.exists());
+        assert_eq!(fs::read(&preview.old_path).unwrap(), LEGACY.as_bytes());
+        assert!(
+            !preview_shared_rollback(
+                &journal,
+                &request.profile_cheat_root,
+                &fixture.path("backups")
+            )
+            .available
+        );
+    }
+
+    #[test]
+    fn explicit_confirmation_and_exact_plan_id_are_required() {
+        for case in 0..3 {
+            let (fixture, request, identity, preview) = setup();
+            let plan = preview
+                .build_transaction_plan(&request, &identity, "profile-1")
+                .unwrap();
+            let mut options = options(&fixture, &plan);
+            match case {
+                0 => options.confirmation = None,
+                1 => options.dry_run = true,
+                _ => options.confirmation.as_mut().unwrap().plan_id = "wrong-plan".into(),
+            }
+            execute_shared_apply(&plan, &options);
+            assert!(!preview.new_path.exists());
+            assert!(!fixture.path("history").exists());
+            assert!(!fixture.path("backups").exists());
+        }
+    }
+
+    #[test]
+    fn source_changed_between_preview_and_bridge_is_refused() {
+        let (_fixture, request, identity, preview) = setup();
+        fs::write(&preview.old_path, b"changed since review").unwrap();
+        assert!(
+            preview
+                .build_transaction_plan(&request, &identity, "profile-1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_sources_and_targets_after_plan_never_publish() {
+        for source_changes in [true, false] {
+            let (fixture, request, identity, preview) = setup();
+            let plan = preview
+                .build_transaction_plan(&request, &identity, "profile-1")
+                .unwrap();
+            if source_changes {
+                fs::write(&preview.old_path, b"changed").unwrap();
+            } else {
+                fs::create_dir_all(preview.new_path.parent().unwrap()).unwrap();
+                fs::write(&preview.new_path, b"new live cheats").unwrap();
+            }
+            let result = execute_shared_apply(&plan, &options(&fixture, &plan));
+            assert_ne!(result.journal.status, SharedApplyStatus::Success);
+            if source_changes {
+                assert!(!preview.new_path.exists());
+            } else {
+                assert_eq!(fs::read(&preview.new_path).unwrap(), b"new live cheats");
+            }
+        }
+    }
+
+    #[test]
+    fn conflicting_target_refused_and_matching_target_is_a_noop() {
+        for matches in [true, false] {
+            let (fixture, request, identity, _) = setup();
+            fixture.write(
+                "cheats/Nestopia/Chrono Quest (USA).cht",
+                if matches { LEGACY } else { "different" },
+            );
+            let preview = preview_retroarch_cheat_migration(
+                &request.profile_cheat_root,
+                "NES",
+                "Nestopia",
+                "Chrono Quest (USA)",
+                None,
+            )
+            .unwrap();
+            let plan = preview.build_transaction_plan(&request, &identity, "profile-1");
+            if matches {
+                let plan = plan.unwrap();
+                assert_eq!(
+                    plan.entries[0].proposed_action,
+                    crate::patch_manager::shared_preview::PreviewProposedAction::Skip
+                );
+                execute_shared_apply(&plan, &options(&fixture, &plan));
+                assert_eq!(fs::read(&preview.new_path).unwrap(), LEGACY.as_bytes());
+            } else {
+                assert!(plan.is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_missing_stale_ambiguous_and_wrong_kind_identity_are_refused() {
+        let (_fixture, request, identity, preview) = setup();
+        for state in [
+            PreviewIdentityState::Candidate,
+            PreviewIdentityState::Missing,
+            PreviewIdentityState::Stale,
+            PreviewIdentityState::Ambiguous,
+        ] {
+            let mut identity = identity.clone();
+            identity.state = state;
+            assert!(
+                preview
+                    .build_transaction_plan(&request, &identity, "profile-1")
+                    .is_err()
+            );
+        }
+        let mut identity = identity;
+        identity.kind = PreviewIdentityKind::DuckStationSerial;
+        assert!(
+            preview
+                .build_transaction_plan(&request, &identity, "profile-1")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn profile_core_content_platform_and_root_cannot_be_guessed_or_switched() {
+        let (_fixture, request, identity, preview) = setup();
+        assert!(
+            preview
+                .build_transaction_plan(&request, &identity, "")
+                .is_err()
+        );
+        for case in 0..8 {
+            let mut request = request.clone();
+            match case {
+                0 => request.retroarch_core = None,
+                1 => request.retroarch_core = Some("OtherCore".into()),
+                2 => request.content_basename = None,
+                3 => request.content_basename = Some("Other Game".into()),
+                4 => request.retroarch_core_required = false,
+                5 => request.platform = Some("PSX".into()),
+                6 => request.profile_cheat_root = request.profile_cheat_root.join("other-profile"),
+                _ => request.retroarch_core = Some(" Nestopia ".into()),
+            }
+            assert!(
+                preview
+                    .build_transaction_plan(&request, &identity, "profile-1")
+                    .is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_or_malformed_legacy_document_is_not_migrated() {
+        for bytes in [
+            "not cheats",
+            "cheats = 1\ncheat0_desc = \"missing code\"\n",
+            "cheats = 999999\n",
+        ] {
+            let (_fixture, request, identity, preview) = setup();
+            fs::write(&preview.old_path, bytes).unwrap();
+            let preview = preview_retroarch_cheat_migration(
+                &request.profile_cheat_root,
+                "NES",
+                "Nestopia",
+                "Chrono Quest (USA)",
+                None,
+            )
+            .unwrap();
+            assert!(
+                preview
+                    .build_transaction_plan(&request, &identity, "profile-1")
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_source_or_destination_is_refused_by_bounded_preview() {
+        for source in [true, false] {
+            let (_fixture, request, _, preview) = setup();
+            let path = if source {
+                &preview.old_path
+            } else {
+                &preview.new_path
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(path)
+                .unwrap()
+                .set_len(MAX_CANDIDATE_FILE_BYTES + 1)
+                .unwrap();
+            assert!(
+                preview_retroarch_cheat_migration(
+                    &request.profile_cheat_root,
+                    "NES",
+                    "Nestopia",
+                    "Chrono Quest (USA)",
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn symlinked_source_or_destination_refuses_without_following_it() {
+        for source in [true, false] {
+            let (fixture, request, _, preview) = setup();
+            let path = if source {
+                fs::remove_file(&preview.old_path).unwrap();
+                &preview.old_path
+            } else {
+                &preview.new_path
+            };
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let other = fixture.write("other.cht", LEGACY);
+            std::os::unix::fs::symlink(&other, path).unwrap();
+            assert!(
+                preview_retroarch_cheat_migration(
+                    &request.profile_cheat_root,
+                    "NES",
+                    "Nestopia",
+                    "Chrono Quest (USA)",
+                    None
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(other).unwrap(), LEGACY.as_bytes());
+        }
+    }
+
+    #[test]
+    fn switched_profile_context_and_user_changed_output_are_protected() {
+        let (fixture, request, identity, preview) = setup();
+        let plan = preview
+            .build_transaction_plan(&request, &identity, "profile-1")
+            .unwrap();
+        let mut wrong = options(&fixture, &plan);
+        wrong.current_context.profile_id = "profile-2".into();
+        execute_shared_apply(&plan, &wrong);
+        assert!(!preview.new_path.exists());
+        let result = execute_shared_apply(&plan, &options(&fixture, &plan));
+        let journal = result.journal_path.unwrap();
+        fs::write(&preview.new_path, b"user edits").unwrap();
+        assert!(
+            !preview_shared_rollback(
+                &journal,
+                &request.profile_cheat_root,
+                &fixture.path("backups")
+            )
+            .available
+        );
+        assert_eq!(fs::read(&preview.new_path).unwrap(), b"user edits");
+    }
+}
+
 #[test]
 fn the_name_falls_back_through_playlist_then_catalogue_identity() {
     let fixture = Fixture::new("names");

@@ -557,9 +557,9 @@ pub struct ResolvedCheatDestination {
     pub replaces_existing: bool,
 }
 
-/// A read-only description of moving an older EmuWiz platform-folder cheat
-/// into RetroArch's core/content folder. This deliberately has no apply
-/// method: an old install is never silently migrated by a normal install.
+/// A read-only description of copying an older EmuWiz platform-folder cheat
+/// into RetroArch's core/content folder. Normal installation never silently
+/// migrates old files; explicit review can build a shared apply transaction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetroArchCheatMigrationStatus {
@@ -578,6 +578,153 @@ pub struct RetroArchCheatMigrationPreview {
     pub destination_sha256: Option<String>,
     pub status: RetroArchCheatMigrationStatus,
     pub detail: String,
+}
+
+impl RetroArchCheatMigrationPreview {
+    /// Bridge an explicitly selected legacy install into the canonical apply/
+    /// rollback engine. This method writes nothing. The caller must review and
+    /// confirm the returned plan ID through `execute_shared_apply` as usual.
+    /// The legacy file is retained; conflicting destinations are never replaced.
+    /// Verified identity and exact core/content/profile evidence must come from
+    /// the existing caller workflow, not be inferred from the legacy filename.
+    pub fn build_transaction_plan(
+        &self,
+        request: &CheatDestinationRequest,
+        identity: &PreviewIdentity,
+        profile_id: &str,
+    ) -> Result<super::shared_transaction::SharedTransactionPlan, CheatInstallPlanError> {
+        let refuse = || {
+            error(
+                CheatInstallPlanErrorKind::PreviewFailed,
+                Some(&self.old_path),
+                "migration requires unchanged reviewed files and verified core/content/profile identity",
+            )
+        };
+        if !matches!(
+            self.status,
+            RetroArchCheatMigrationStatus::ReadyForExplicitReview
+                | RetroArchCheatMigrationStatus::DestinationAlreadyMatches
+        ) || self.source_sha256.is_none()
+            || identity.kind != PreviewIdentityKind::RetroArchCatalogueMatch
+            || identity.state != PreviewIdentityState::Verified
+            || identity.value.as_ref().is_none_or(|v| v.trim().is_empty())
+            || !identity.archive_path.is_absolute()
+            || profile_id.trim().is_empty()
+            || !request.retroarch_core_required
+        {
+            return Err(refuse());
+        }
+        let core = request.retroarch_core.as_deref().ok_or_else(refuse)?;
+        let content = request.content_basename.as_deref().ok_or_else(refuse)?;
+        // Do not silently trim, rename or fall back to a catalogue title.
+        if safe_file_stem(core).as_deref() != Some(core)
+            || safe_file_stem(content).as_deref() != Some(content)
+        {
+            return Err(refuse());
+        }
+        let old_relative = self
+            .old_path
+            .strip_prefix(&request.profile_cheat_root)
+            .map_err(|_| refuse())?;
+        let parts: Vec<_> = old_relative.components().collect();
+        if parts.len() != 2
+            || !parts
+                .iter()
+                .all(|p| matches!(p, std::path::Component::Normal(_)))
+        {
+            return Err(refuse());
+        }
+        let old_platform = parts[0].as_os_str().to_str().ok_or_else(refuse)?;
+        let platform = request
+            .platform
+            .as_deref()
+            .and_then(canonical_platform_for_alias)
+            .ok_or_else(refuse)?;
+        if canonical_platform_for_alias(old_platform) != Some(platform) {
+            return Err(refuse());
+        }
+        let destination = resolve_cheat_destination(request)?;
+        let current = preview_retroarch_cheat_migration(
+            &request.profile_cheat_root,
+            old_platform,
+            core,
+            content,
+            self.source_sha256.as_deref(),
+        )?;
+        if &current != self || destination.path != self.new_path || self.old_path == self.new_path {
+            return Err(refuse());
+        }
+        let bytes = read_migration_file(&self.old_path)?.ok_or_else(refuse)?;
+        if self.source_sha256.as_deref() != Some(hex_sha256(&bytes).as_str()) {
+            return Err(refuse());
+        }
+        let document = parse_cht_bytes(&bytes).map_err(|failure| {
+            error(
+                CheatInstallPlanErrorKind::CandidateMalformed,
+                Some(&self.old_path),
+                failure.to_string(),
+            )
+        })?;
+        if document.entries.is_empty()
+            || document.entries.iter().any(|entry| !entry.is_selectable())
+            || !document.warnings.is_empty()
+        {
+            return Err(error(
+                CheatInstallPlanErrorKind::CandidateMalformed,
+                Some(&self.old_path),
+                "legacy cheat document has unsafe or unresolved entries; review it separately",
+            ));
+        }
+        let report = build_shared_preview(&SharedPreviewRequest {
+            adapter: PreviewAdapter::RetroArch,
+            selected_archive: identity.archive_path.clone(),
+            platform: request.platform.clone(),
+            identity: identity.clone(),
+            destination_root: request.profile_cheat_root.clone(),
+            source_items: vec![PreviewSourceItem {
+                adapter: PreviewAdapter::RetroArch,
+                source_path: self.old_path.clone(),
+                expected_source_digest: self.source_sha256.clone(),
+                destination_relative_paths: vec![PathBuf::from(core).join(&destination.file_name)],
+                match_strength: PreviewMatchStrength::Strong,
+            }],
+        })
+        .map_err(|failure| preview_error(&failure))?;
+        // Bind to the reviewed destination even if it changed during this read-only bridge.
+        if report.entries.len() != 1
+            || report.entries[0].existing_destination_digest != self.destination_sha256
+        {
+            return Err(refuse());
+        }
+        super::shared_transaction::build_shared_transaction_plan(
+            &report,
+            profile_id,
+            "retroarch_legacy_path_migration",
+            &request.profile_cheat_root,
+        )
+        .map_err(|failure| {
+            error(
+                CheatInstallPlanErrorKind::PreviewFailed,
+                Some(&self.old_path),
+                failure.detail,
+            )
+        })
+    }
+}
+
+fn read_migration_file(path: &Path) -> Result<Option<Vec<u8>>, CheatInstallPlanError> {
+    use crate::emulator_environment::{
+        BoundedReadResult, HostReadOnlyFilesystem, ReadOnlyHostFilesystem,
+    };
+    match HostReadOnlyFilesystem.read_bounded(path, MAX_CANDIDATE_FILE_BYTES as usize) {
+        BoundedReadResult::Ok(bytes) => Ok(Some(bytes)),
+        BoundedReadResult::NotFound => Ok(None),
+        failure => Err(error(
+            CheatInstallPlanErrorKind::CandidateUnreadable,
+            Some(path),
+            format!("bounded legacy cheat read refused: {failure:?}"),
+        )),
+    }
 }
 
 /// Previews an explicit migration from the old platform-folder layout to the
@@ -624,9 +771,9 @@ pub fn preview_retroarch_cheat_migration(
     .map_err(|failure| destination_error(&failure))?;
     let old_path = old.proposed_destination.path().to_path_buf();
     let new_path = new.proposed_destination.path().to_path_buf();
-    let source_bytes = match fs::read(&old_path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
+    let source_bytes = match read_migration_file(&old_path)? {
+        Some(bytes) => bytes,
+        None => {
             return Ok(RetroArchCheatMigrationPreview {
                 old_path,
                 new_path,
@@ -648,7 +795,7 @@ pub fn preview_retroarch_cheat_migration(
             detail: "the legacy cheat file no longer matches the reviewed bytes".to_string(),
         });
     }
-    let destination_sha256 = fs::read(&new_path).ok().map(|bytes| hex_sha256(&bytes));
+    let destination_sha256 = read_migration_file(&new_path)?.map(|bytes| hex_sha256(&bytes));
     let (status, detail) = match destination_sha256.as_deref() {
         Some(hash) if hash == source_sha256 => (
             RetroArchCheatMigrationStatus::DestinationAlreadyMatches,
