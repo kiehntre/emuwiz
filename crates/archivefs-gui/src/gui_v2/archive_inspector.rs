@@ -68,7 +68,18 @@ struct Failure {
 impl From<String> for Failure {
     fn from(message: String) -> Self {
         Self {
-            technical: message,
+            technical: message.clone(),
+            message,
+        }
+    }
+}
+
+impl Failure {
+    /// A raw lower-level error (for example the ZIP reader's) kept out of the
+    /// primary text: plain advice up front, the raw text under Technical details.
+    fn unreadable(raw: String) -> Self {
+        Self {
+            technical: raw,
             message: "EmuWiz could not inspect this archive. Check that its drive is connected and the file is accessible, then try again.".into(),
         }
     }
@@ -357,7 +368,7 @@ fn inspect_path(path: &Path) -> Result<ArchiveInspection, Failure> {
     match format {
         ArchiveFormat::Zip => inspect_archive(path)
             .map(|report| inspection(format, report))
-            .map_err(|error| Failure::from(error.to_string())),
+            .map_err(|error| Failure::unreadable(error.to_string())),
         ArchiveFormat::SevenZip => inspect_sevenz(path, format),
         ArchiveFormat::Rar => inspect_rar(path, format),
         ArchiveFormat::Tar => unreachable!("TAR is not exposed by archive_format"),
@@ -663,7 +674,9 @@ mod tests {
                 text(&s.shape, &mut rendered);
             }
             assert!(rendered.contains("Try again"));
-            assert!(rendered.contains("Nothing was extracted or changed"));
+            assert!(
+                rendered.contains("Nothing was changed: this page only reads archive metadata.")
+            );
             assert!(!rendered.contains("PRIVATE_RAW_ERROR"));
         }
     }
