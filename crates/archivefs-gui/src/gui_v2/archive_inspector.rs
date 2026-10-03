@@ -92,23 +92,41 @@ fn sevenz_failure(error: &ArchiveMemberSourceError) -> Failure {
 
 fn rar_failure(error: &RarError) -> Failure {
     use RarError::*;
-    let message = match error {
+    let message: String = match error {
         BackendNotFound | BackendUnavailable { .. } => {
-            "RAR support isn't available on this computer, so this archive can't be listed."
+            "RAR support isn't available on this computer, so this archive can't be listed.".into()
         }
-        Timeout => "Reading this RAR archive took too long.",
+        Timeout => "Reading this RAR archive took too long.".into(),
         EncryptedArchive => {
-            "This RAR archive is password-protected, so its contents can't be listed."
+            "This RAR archive is password-protected, so its contents can't be listed.".into()
         }
-        InvalidSignature | CorruptArchive { .. } => "This RAR archive looks damaged or incomplete.",
-        UnsupportedArchive { .. } => "This RAR archive uses a feature EmuWiz can't read.",
+        InvalidSignature | CorruptArchive { .. } => {
+            "This RAR archive looks damaged or incomplete.".into()
+        }
+        UnsupportedArchive { .. } => "This RAR archive uses a feature EmuWiz can't read.".into(),
         ProcessOutputLimit { .. } | OutputLimitExceeded { .. } | MemberTooLarge { .. } => {
-            "This RAR archive is too large or complex to inspect safely."
+            "This RAR archive is too large or complex to inspect safely.".into()
         }
-        _ => "This RAR archive could not be read.",
+        // The external RAR-capable tool reported a failure. The exit code
+        // (when the tool provides one) is useful on its own; no Debug form.
+        BackendFailure { status, .. } => format!(
+            "The RAR-capable tool on this system reported a failure{}.",
+            status.map_or_else(String::new, |code| format!(" (exit code {code})"))
+        ),
+        // EmuWiz could not prove what this archive actually contains, so it
+        // refused rather than guess - a deliberate safety behaviour, not a
+        // parsing bug.
+        AmbiguousListing { .. } => {
+            "EmuWiz could not safely determine this archive's contents, so it refused to guess."
+                .into()
+        }
+        DuplicatePath { path } => format!(
+            "This RAR archive lists \"{path}\" more than once, so it was refused for safety."
+        ),
+        _ => "This RAR archive could not be read.".into(),
     };
     Failure {
-        message: message.into(),
+        message,
         technical: format!("RAR inspection refused this archive: {error:?}"),
     }
 }
@@ -484,6 +502,7 @@ pub(crate) fn show(
                     "Archive inspection unavailable",
                 );
                 ui.label(&failure.message);
+                ui.small("Nothing was changed: this page only reads archive metadata.");
                 retry = ui.button("Try again").clicked();
                 ui.collapsing("Technical details", |ui| ui.monospace(&failure.technical));
             }
@@ -686,5 +705,75 @@ mod tests {
         let mut state = ArchiveInspectorPageState::default();
         state.retry(&ctx);
         assert!(matches!(state.status, Status::Idle));
+    }
+
+    #[test]
+    fn rar_backend_failure_names_the_exit_code_without_raw_debug() {
+        let error = RarError::BackendFailure {
+            status: Some(2),
+            detail: "7zz exited with an error".into(),
+        };
+        let failure = rar_failure(&error);
+        assert_ne!(failure.message, format!("{error:?}"));
+        assert!(failure.message.contains("exit code 2"));
+        assert!(!failure.message.contains("BackendFailure"));
+        assert!(failure.technical.contains("BackendFailure"));
+    }
+
+    #[test]
+    fn rar_ambiguous_listing_explains_a_safe_refusal_not_a_bug() {
+        let error = RarError::AmbiguousListing {
+            detail: "duplicate header offsets".into(),
+        };
+        let failure = rar_failure(&error);
+        assert_ne!(failure.message, format!("{error:?}"));
+        assert!(failure.message.contains("refused"));
+        assert!(!failure.message.contains("AmbiguousListing"));
+        assert!(failure.technical.contains("AmbiguousListing"));
+    }
+
+    #[test]
+    fn rar_duplicate_path_names_the_duplicated_path() {
+        let error = RarError::DuplicatePath {
+            path: "disc/game.bin".into(),
+        };
+        let failure = rar_failure(&error);
+        assert_ne!(failure.message, format!("{error:?}"));
+        assert!(failure.message.contains("disc/game.bin"));
+        assert!(!failure.message.contains("DuplicatePath"));
+        assert!(failure.technical.contains("DuplicatePath"));
+    }
+
+    #[test]
+    fn error_state_says_inspection_changed_nothing() {
+        let mut state = ArchiveInspectorPageState {
+            status: Status::Error {
+                target: target(),
+                failure: Failure::from("boom".to_string()),
+            },
+            rows: None,
+        };
+        let context = egui::Context::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run(raw_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, &mut state, Some(target())));
+        });
+        let found = output.shapes.iter().any(|clipped| {
+            fn has(shape: &egui::Shape, needle: &str) -> bool {
+                match shape {
+                    egui::Shape::Text(text) => text.galley.text().contains(needle),
+                    egui::Shape::Vec(nested) => nested.iter().any(|s| has(s, needle)),
+                    _ => false,
+                }
+            }
+            has(&clipped.shape, "Nothing was changed")
+        });
+        assert!(found, "the error state must reassure that nothing changed");
     }
 }

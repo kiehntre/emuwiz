@@ -300,32 +300,7 @@ impl ApplyOutcome {
         let technical = format!("{:?}; history journal: {journal}", result.journal.status);
         // Undo is only real when a history journal was persisted for a run
         // that actually wrote something.
-        let (tone, headline, detail, wrote) = match result.journal.status {
-            SharedApplyStatus::Success => (
-                StatusTone::Success,
-                "Bezel applied",
-                "The bezel configuration was written.",
-                true,
-            ),
-            SharedApplyStatus::PartialFailure => (
-                StatusTone::Warning,
-                "Bezel only partly applied",
-                "Some changes were made and some were not. Review the history before retrying.",
-                true,
-            ),
-            SharedApplyStatus::Failed => (
-                StatusTone::Blocked,
-                "Apply failed",
-                "The bezel could not be applied.",
-                false,
-            ),
-            SharedApplyStatus::DryRun => (
-                StatusTone::Info,
-                "Dry run only",
-                "Nothing has changed.",
-                false,
-            ),
-        };
+        let (tone, headline, detail, wrote) = apply_status_text(result.journal.status);
         Self {
             tone,
             headline,
@@ -333,6 +308,40 @@ impl ApplyOutcome {
             undo_available: wrote && result.journal_path.is_some(),
             technical,
         }
+    }
+}
+
+/// Plain-language apply outcome for a finished shared-transaction journal:
+/// tone, headline, detail, and whether anything was actually written.
+/// `derive_status` only returns `Failed` when zero entries reached
+/// `InstalledNew`/`ReplacedExisting`/`AlreadyInstalled`, so the `Failed`
+/// detail states that provable fact rather than a general backup promise.
+fn apply_status_text(status: SharedApplyStatus) -> (StatusTone, &'static str, &'static str, bool) {
+    match status {
+        SharedApplyStatus::Success => (
+            StatusTone::Success,
+            "Bezel applied",
+            "The bezel configuration was written.",
+            true,
+        ),
+        SharedApplyStatus::PartialFailure => (
+            StatusTone::Warning,
+            "Bezel only partly applied",
+            "Some changes were made and some were not. Review the history before retrying.",
+            true,
+        ),
+        SharedApplyStatus::Failed => (
+            StatusTone::Blocked,
+            "Apply failed",
+            "The bezel could not be applied. Nothing was written, so your previous configuration was not changed.",
+            false,
+        ),
+        SharedApplyStatus::DryRun => (
+            StatusTone::Info,
+            "Dry run only",
+            "Nothing has changed.",
+            false,
+        ),
     }
 }
 
@@ -545,7 +554,15 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
             {
                 state.apply();
             }
-            ui.small(format!("Undo/history: {}", plan.rollback.reason));
+            ui.label(format!(
+                "Undo: {}",
+                if plan.rollback.supported {
+                    "Available"
+                } else {
+                    "Not available"
+                }
+            ));
+            ui.small(&plan.rollback.reason);
         });
     }
     if let Some(result) = &state.apply_result {
@@ -792,5 +809,184 @@ mod tests {
             StatusTone::Blocked,
             "failure must never use the success tone"
         );
+    }
+
+    /// A state with a selected, resolved asset and a stubbed preview texture
+    /// (so `ensure_preview`'s "unavailable" fallback - which claims unbounded
+    /// remaining height via `centered_and_justified` - never runs and pushes
+    /// the rest of the page outside this frame's rendered bounds).
+    fn state_with_selected_asset_and_plan(plan: BezelApplyPlan) -> BezelPanelState {
+        let candidate = asset("game", DecorationScope::Game);
+        BezelPanelState {
+            selected_game: Some("Game".into()),
+            selected_platform: Some("SNES".into()),
+            target: DecorationTarget {
+                emulator: "retroarch".into(),
+                core: None,
+            },
+            candidates: vec![candidate.clone()],
+            resolution: resolve_decoration(
+                vec![candidate.clone()],
+                DecorationTarget {
+                    emulator: "retroarch".into(),
+                    core: None,
+                },
+            ),
+            config: LocalBezelConfig::default().bounded(),
+            catalogue: LocalBezelCatalogue {
+                assets: vec![candidate],
+                ..LocalBezelCatalogue::default()
+            },
+            apply_plan: Some(plan),
+            preview_id: Some("game".to_string()),
+            ..BezelPanelState::default()
+        }
+    }
+
+    fn plan_with_rollback(supported: bool, reason: &str) -> BezelApplyPlan {
+        BezelApplyPlan {
+            schema_version: 1,
+            plan_id: "test-plan".into(),
+            status: BezelApplyStatus::Ready,
+            source: archivefs_core::bezel_apply::BezelPlanSource {
+                path: "game.png".into(),
+                sha256: "0".repeat(64),
+                size_bytes: 1,
+                provenance: archivefs_core::bezel_decorations::DecorationProvenance {
+                    provider: "local-test".into(),
+                    reference: "game".into(),
+                    retrieved_at_unix_seconds: None,
+                },
+            },
+            transfer_strategy:
+                archivefs_core::bezel_apply::BezelAssetTransferStrategy::CopyReadOnlySource,
+            target: archivefs_core::bezel_apply::BezelPlanTarget {
+                emulator: "retroarch".into(),
+                core: None,
+                resolved_identity: "game".into(),
+                platform: "SNES".into(),
+                config_path: None,
+                destination_root: None,
+            },
+            viewport: None,
+            files: Vec::new(),
+            config_entries: Vec::new(),
+            conflicts: Vec::new(),
+            warnings: Vec::new(),
+            refusals: Vec::new(),
+            rollback: archivefs_core::bezel_apply::BezelRollbackInfo {
+                supported,
+                backup_paths: Vec::new(),
+                exact_restore: supported,
+                reason: reason.to_string(),
+            },
+        }
+    }
+
+    fn text_bounds(output: &egui::FullOutput, wanted: &str) -> Vec<egui::Rect> {
+        fn gather(shape: &egui::Shape, wanted: &str, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == wanted => {
+                    out.push(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                }
+                egui::Shape::Vec(nested) => {
+                    for shape in nested {
+                        gather(shape, wanted, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            gather(&clipped.shape, wanted, &mut out);
+        }
+        out
+    }
+
+    /// "Planned changes" is an `egui::CollapsingHeader`, closed by default,
+    /// so its body (including the Undo line) never renders until clicked
+    /// open - this simulates exactly that click, the same way the project's
+    /// own `gui_v2::tests::click_label` helper does.
+    fn render_planned_changes(plan: BezelApplyPlan) -> String {
+        let mut state = state_with_selected_asset_and_plan(plan);
+        let context = egui::Context::default();
+        context.style_mut(|style| style.animation_time = 0.0);
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 4000.0),
+            )),
+            ..Default::default()
+        };
+        let mut texture = None;
+        let _ = context.run(raw_input.clone(), |ctx| {
+            texture = Some(ctx.load_texture(
+                "bezel-test-stub",
+                egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+                egui::TextureOptions::LINEAR,
+            ));
+        });
+        state.preview_texture = texture;
+        let layout = context.run(raw_input.clone(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+        });
+        let point = text_bounds(&layout, "Planned changes")
+            .into_iter()
+            .next()
+            .expect("\"Planned changes\" header must be on screen")
+            .center();
+        for pressed in [true, false] {
+            let mut input = raw_input.clone();
+            input.events = vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = context.run(input, |context| {
+                egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+            });
+        }
+        let _ = context.run(raw_input.clone(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+        });
+        let output = context.run(raw_input, |context| {
+            egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+        });
+        texts(&output)
+    }
+
+    #[test]
+    fn planned_changes_explicitly_states_undo_available() {
+        let rendered =
+            render_planned_changes(plan_with_rollback(true, "An exact backup was recorded."));
+        assert!(rendered.contains("Undo: Available"));
+        assert!(!rendered.contains("Undo: Not available"));
+        assert!(rendered.contains("An exact backup was recorded."));
+    }
+
+    #[test]
+    fn planned_changes_explicitly_states_undo_not_available() {
+        let rendered =
+            render_planned_changes(plan_with_rollback(false, "No backup root was configured."));
+        assert!(rendered.contains("Undo: Not available"));
+        assert!(!rendered.contains("Undo: Available"));
+        assert!(rendered.contains("No backup root was configured."));
+    }
+
+    /// `derive_status` only returns `Failed` when zero entries reached
+    /// InstalledNew/ReplacedExisting/AlreadyInstalled, so this reassurance
+    /// must describe that provable fact, not a general backup promise.
+    #[test]
+    fn failed_apply_reassurance_matches_the_derive_status_guarantee() {
+        let (tone, headline, detail, wrote) = apply_status_text(SharedApplyStatus::Failed);
+        assert_eq!(tone, StatusTone::Blocked);
+        assert_eq!(headline, "Apply failed");
+        assert!(detail.contains("Nothing was written"));
+        assert!(!wrote, "Failed must never claim anything was written");
     }
 }
