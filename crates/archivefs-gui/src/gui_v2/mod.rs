@@ -15,6 +15,7 @@ mod imagery;
 mod launch_readiness_summary;
 mod legacy;
 pub(crate) mod library;
+mod library_failure;
 mod mame_collection_health;
 mod media_sets;
 mod media_sources;
@@ -254,6 +255,8 @@ pub(super) struct App {
     preferences_dirty: Option<Instant>,
     interacted: bool,
     loaded: bool,
+    /// Why the library could not load; `None` once a load succeeds.
+    library_failure: Option<library_failure::LibraryLoadFailure>,
     notice: Option<Notice>,
     /// Non-alarming confirmation that a separate window was opened; cleared on
     /// navigation or dismissal.
@@ -341,6 +344,7 @@ impl App {
             preferences_dirty: None,
             interacted: false,
             loaded: false,
+            library_failure: None,
             notice: None,
             handoff_status: None,
             confirm_scan: false,
@@ -1340,7 +1344,8 @@ impl App {
                     }
                 }
                 Event::Finished { id, outcome } => {
-                    if self.load_job == Some(id) {
+                    let was_load_job = self.load_job == Some(id);
+                    if was_load_job {
                         self.load_job = None;
                     }
                     if self.problem_summary_job == Some(id) {
@@ -1402,6 +1407,7 @@ impl App {
                                         });
                                     }
                                     self.library = library;
+                                    self.library_failure = None;
                                     self.problem_summary = None;
                                     self.missing.plan = None;
                                     self.loaded = true;
@@ -1561,6 +1567,9 @@ impl App {
                             );
                         }
                         Err(error) => {
+                            if was_load_job {
+                                self.library_load_failed(&error);
+                            }
                             if self
                                 .playing_library_job
                                 .as_ref()

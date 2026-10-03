@@ -22,7 +22,7 @@ use crate::ui::{
 use archivefs_core::dat::rename_apply::model::TransactionState;
 use eframe::egui::{self, Color32, RichText};
 
-fn primary(ui: &mut egui::Ui, text: &str) -> bool {
+pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(text).strong())
             .fill(theme::PRIMARY_ACTION)
@@ -500,6 +500,11 @@ impl App {
             {
                 super::guidance::show(ui, &mut self.guidance, guidance);
                 ui.add_space(theme::SPACE_SM);
+            }
+            // A failed library load is shown as a failure, never as a loading
+            // spinner or an empty catalogue.
+            if super::library_failure::needs_library(&route) && self.show_library_failure(ui) {
+                return;
             }
             // Browse & Play is an application layout: the shelf scrolls, the page
             // does not, so the selected game and its Play button stay in view.

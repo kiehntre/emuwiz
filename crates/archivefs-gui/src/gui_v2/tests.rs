@@ -61,6 +61,7 @@ fn fixture(context: &egui::Context) -> App {
         preferences_dirty: None,
         interacted: false,
         loaded: true,
+        library_failure: None,
         notice: None,
         handoff_status: None,
         confirm_scan: false,
@@ -6217,4 +6218,156 @@ fn multidisc_page_renders_navigates_and_discards_stale_results() {
         vec![key_event(egui::Key::Escape)],
     );
     assert_eq!(app.router.current, Route::Section(Section::Games));
+}
+
+const SCHEMA_ERROR: &str = "database error: library database schema version 21 is not the required current version 24; refusing to migrate or repair it during a read-only operation";
+
+fn failed_load_app(context: &egui::Context, error: &str) -> App {
+    let mut app = fixture(context);
+    app.loaded = false;
+    app.library_load_failed(error);
+    app
+}
+
+fn page_text(context: &egui::Context, app: &mut App, route: Route) -> Vec<String> {
+    app.router.current = route;
+    text(&frame(context, app, [1280.0, 720.0]))
+}
+
+fn has(strings: &[String], needle: &str) -> bool {
+    strings.iter().any(|value| value.contains(needle))
+}
+
+#[test]
+fn library_load_failure_is_classified_from_the_schema_error() {
+    use super::library_failure::{LibraryLoadFailure, LibraryLoadFailureKind};
+    assert_eq!(
+        LibraryLoadFailure::from_error(SCHEMA_ERROR).kind,
+        LibraryLoadFailureKind::UpgradeRequired {
+            found: 21,
+            required: 24
+        }
+    );
+    assert!(matches!(
+        LibraryLoadFailure::from_error("schema version 30 is not the required current version 24")
+            .kind,
+        LibraryLoadFailureKind::NewerThanThisBuild { .. }
+    ));
+    let other = LibraryLoadFailure::from_error("disk I/O error");
+    assert_eq!(other.kind, LibraryLoadFailureKind::Other);
+    assert_eq!(other.technical, "disk I/O error");
+}
+
+#[test]
+fn failed_initial_load_shows_no_spinner_and_no_authoritative_zero_games() {
+    for route in [
+        Route::BrowsePlay,
+        Route::Section(Section::Platforms),
+        Route::Section(Section::Museum),
+        Route::Section(Section::MultiDisc),
+    ] {
+        let context = egui::Context::default();
+        let mut app = failed_load_app(&context, "disk I/O error");
+        let strings = page_text(&context, &mut app, route.clone());
+        assert!(
+            has(&strings, "Your game library could not be loaded"),
+            "{route:?}"
+        );
+        assert!(
+            has(&strings, "does not mean you have no games"),
+            "{route:?}"
+        );
+        assert!(!has(&strings, "Loading your game list"), "{route:?}");
+        assert!(!has(&strings, "No games have been added yet"), "{route:?}");
+        assert!(!has(&strings, "Your games can go here"), "{route:?}");
+        assert!(!has(&strings, "0 games"), "{route:?}");
+        assert!(!has(&strings, "no games in the catalogue"), "{route:?}");
+        assert!(has(&strings, "Retry"), "{route:?}");
+        assert!(has(&strings, "Technical details"), "{route:?}");
+        assert!(!has(&strings, "Open upgrade tools"), "{route:?}");
+    }
+}
+
+#[test]
+fn schema_mismatch_says_the_library_needs_an_upgrade_and_offers_the_tools() {
+    for route in [
+        Route::BrowsePlay,
+        Route::Section(Section::Platforms),
+        Route::Section(Section::Museum),
+        Route::Section(Section::MultiDisc),
+    ] {
+        let context = egui::Context::default();
+        let mut app = failed_load_app(&context, SCHEMA_ERROR);
+        let strings = page_text(&context, &mut app, route.clone());
+        assert!(has(&strings, "Your library needs an upgrade"), "{route:?}");
+        assert!(has(&strings, "Open upgrade tools"), "{route:?}");
+        assert!(has(
+            &strings,
+            "cannot open it until its database format is upgraded"
+        ));
+        assert!(has(&strings, "Library format: 21"), "{route:?}");
+        assert!(!has(&strings, "Loading your game list"), "{route:?}");
+        // The main action is the upgrade, not an endless retry.
+        assert!(!strings.iter().any(|value| value == "Retry"), "{route:?}");
+    }
+}
+
+#[test]
+fn library_load_failure_never_queues_a_load_or_migrates_by_itself() {
+    let context = egui::Context::default();
+    let mut app = failed_load_app(&context, SCHEMA_ERROR);
+    let jobs = app.activity.jobs.len();
+    let _ = page_text(&context, &mut app, Route::BrowsePlay);
+    let _ = page_text(&context, &mut app, Route::BrowsePlay);
+    assert!(app.load_job.is_none());
+    assert_eq!(app.activity.jobs.len(), jobs);
+    assert!(!app.loaded);
+    for source in [
+        include_str!("library_failure.rs"),
+        include_str!("backend.rs"),
+    ] {
+        assert!(!source.contains("upgrade_library_database"));
+        assert!(!source.contains("open_or_create"));
+    }
+}
+
+#[test]
+fn retry_uses_the_canonical_load_and_never_duplicates_a_running_load() {
+    let context = egui::Context::default();
+    let mut app = failed_load_app(&context, "disk I/O error");
+    app.retry_library_load();
+    let first = app.load_job.expect("retry queues the canonical load");
+    let jobs = app.activity.jobs.len();
+    app.retry_library_load();
+    assert_eq!(app.load_job, Some(first));
+    assert_eq!(app.activity.jobs.len(), jobs);
+}
+
+#[test]
+fn successful_load_clears_the_failure_and_the_loading_state() {
+    let context = egui::Context::default();
+    let mut app = failed_load_app(&context, "disk I/O error");
+    app.library = Arc::new(Library::new(vec![archive(1, "Sonic", Some("Genesis"))]));
+    app.loaded = true;
+    app.library_failure = None;
+    app.router.current = Route::BrowsePlay;
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(!has(&strings, "could not be loaded"));
+    assert!(!has(&strings, "Loading your game list"));
+}
+
+#[test]
+fn a_later_failed_refresh_keeps_the_last_good_library_and_says_so() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(Library::new(vec![archive(1, "Sonic", Some("Genesis"))]));
+    app.loaded = true;
+    app.library_load_failed("disk I/O error");
+    assert_eq!(app.library.games.len(), 1);
+    assert!(app.loaded);
+    app.router.current = Route::BrowsePlay;
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(has(&strings, "The game list could not be refreshed"));
+    assert!(has(&strings, "last game list that loaded"));
+    assert!(has(&strings, "Sonic"));
 }
