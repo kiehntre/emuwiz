@@ -351,7 +351,7 @@ fn oversized_input_and_links_are_refused_before_reading() {
     // A sparse file one byte over the limit: refused from its length alone.
     let big = dir.path().join("huge.xml");
     let file = fs::File::create(&big).unwrap();
-    file.set_len(MAX_SNAPSHOT_BYTES + 1).unwrap();
+    file.set_len(MAX_LISTXML_BYTES + 1).unwrap();
     let error = snapshot_from_mame_listxml(&big).unwrap_err();
     assert!(error.contains("import limit"), "{error}");
     // A directory or symlink is not a listxml file.
@@ -380,4 +380,145 @@ fn scummvm_cannot_be_imported_or_version_pinned_through_the_mame_paths() {
         )
         .is_err()
     );
+}
+
+/// A stand-in MAME whose `-listxml` is larger than the old 256 MiB bound,
+/// produced on the fly so nothing large is stored in the repository.
+fn fake_huge_mame(dir: &Path, machines: u64) -> PathBuf {
+    let script = dir.join("fake-huge-mame");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '<?xml version=\"1.0\"?>\\n<mame build=\"0.999 (fake)\">\\n'\n\
+             yes '<machine name=\"m\"><description>padding padding padding</description></machine>' | head -n {machines}\n\
+             printf '</mame>\\n'\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+#[test]
+fn capture_larger_than_the_old_cap_is_spooled_to_disk_and_still_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    // ~300 MB of listxml: above the former 256 MiB in-memory limit.
+    let script = fake_huge_mame(dir.path(), 4_000_000);
+    let snapshot = capture_retrying(&script).unwrap();
+    let ProviderRecords::DatLike {
+        listxml,
+        machine_count,
+        catalogue,
+    } = &snapshot.records
+    else {
+        panic!("MAME evidence is listxml");
+    };
+    assert!(
+        listxml.len() as u64 > MAX_SNAPSHOT_BYTES,
+        "{}",
+        listxml.len()
+    );
+    assert_eq!(*machine_count, 4_000_000);
+    assert_eq!(snapshot.record_count(), 4_000_000);
+    // No per-machine records are retained beside the XML itself.
+    assert!(catalogue.games.is_empty());
+    assert_eq!(snapshot.version, "0.999 (fake)");
+    assert_eq!(snapshot.source_sha256, sha256(listxml.as_bytes()));
+}
+
+#[test]
+fn capture_beyond_the_listxml_ceiling_is_refused_not_truncated() {
+    let dir = tempfile::tempdir().unwrap();
+    // A tool that never stops talking must be stopped at the ceiling.
+    let script = dir.path().join("endless-mame");
+    fs::write(&script, "#!/bin/sh\nexec yes '<machine name=\"m\"/>'\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    let error = capture_retrying(&script).unwrap_err();
+    assert!(
+        error.to_ascii_lowercase().contains("limit") || error.contains("MiB"),
+        "{error}"
+    );
+}
+
+#[test]
+fn capture_that_stops_midway_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("cut-mame");
+    fs::write(
+        &script,
+        "#!/bin/sh\nprintf '<?xml version=\"1.0\"?><mame build=\"0.264\"><machine name=\"a\">'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(capture_retrying(&script).is_err());
+}
+
+/// Real-world checks against an installed MAME; run explicitly:
+/// `EMUWIZ_REAL_MAME=/usr/games/mame cargo test ... real_installed_mame -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn real_installed_mame_full_capture_stage_and_verify() {
+    let mame = PathBuf::from(std::env::var("EMUWIZ_REAL_MAME").unwrap());
+    let started = std::time::Instant::now();
+    let snapshot = capture(&mame).unwrap();
+    let ProviderRecords::DatLike {
+        listxml,
+        machine_count,
+        ..
+    } = &snapshot.records
+    else {
+        panic!()
+    };
+    eprintln!(
+        "REAL version={} xml_bytes={} machines={} capture={:?} above_old_cap={}",
+        snapshot.version,
+        listxml.len(),
+        machine_count,
+        started.elapsed(),
+        listxml.len() as u64 > MAX_SNAPSHOT_BYTES
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        ManagedProviderStore::new(dir.path().join("store"), IdentityProvider::Mame, &mame).unwrap();
+    let t = std::time::Instant::now();
+    let candidate = store.stage_snapshot(&snapshot).unwrap();
+    store.activate_snapshot(&candidate, None).unwrap();
+    eprintln!("REAL stage+activate={:?}", t.elapsed());
+    let active = store.active_snapshot().unwrap().unwrap();
+    assert_eq!(active.version, snapshot.version);
+    // Verify a disposable folder: one real ROM-less file only; the collection is synthetic.
+    let root = dir.path().join("arcade");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("unrelated.bin"), b"not a rom").unwrap();
+    let t = std::time::Instant::now();
+    let result = verify(&active, &root).unwrap();
+    eprintln!("REAL verify={:?} status={:?}", t.elapsed(), result.status);
+}
+
+/// A disposable collection with every interesting state. Nothing outside the
+/// temp directory is touched, and nothing inside it changes.
+#[test]
+fn directory_verify_over_a_realistic_collection_is_read_only_and_contained() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("alpha.rom"), ALPHA).unwrap(); // must never be reached via a link
+    let root = dir.path().join("collection");
+    fs::create_dir_all(root.join("nested/deeper")).unwrap();
+    fs::write(root.join("alpha.rom"), ALPHA).unwrap(); // valid member
+    fs::write(root.join("nested/beta.rom"), b"WRONG HASH CONTENT").unwrap(); // wrong hash
+    fs::write(root.join("nested/deeper/readme.txt"), b"unrelated extra").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap(); // link out of the root
+    let snapshot = import(dir.path(), "0.174");
+    let before = tree_state(dir.path());
+    let result = verify(&snapshot, &root).unwrap();
+    assert_eq!(
+        tree_state(dir.path()),
+        before,
+        "verification must not change anything"
+    );
+    let text = format!("{result:?}");
+    assert!(text.contains("alpha"), "{text}");
+    // Only a valid-alpha exact match; the wrong-hash and unrelated files never become exact.
+    assert!(!matches!(result.status, MatchStatus::NoMatch), "{text}");
 }

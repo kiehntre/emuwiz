@@ -18,6 +18,11 @@ use std::path::{Path, PathBuf};
 pub type ProviderResult<T> = Result<T, String>;
 pub const PARSER_VERSION: u32 = 1;
 pub const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest MAME `-listxml` accepted (captured or imported). Real MAME 0.264 is
+/// ~268 MiB, so this leaves roughly 2.7x headroom for growth.
+pub const MAX_LISTXML_BYTES: u64 = 768 * 1024 * 1024;
+/// Ceiling for a stored MAME snapshot: the listxml plus JSON escaping.
+pub const MAX_MAME_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 /// Prefix of `ProviderSnapshot::source_identifier` for evidence the user
 /// imported from a local file rather than captured from an installed tool.
 pub const LOCAL_IMPORT_PREFIX: &str = "local-import:";
@@ -48,7 +53,11 @@ impl ManagedProviderStore {
             source_kind: ManagedSourceKind::Local,
             source: ManagedSourceReference::LocalPath(executable.to_path_buf()),
             expected_media_type: "application/vnd.emuwiz.identity-provider+json".into(),
-            maximum_size_bytes: MAX_SNAPSHOT_BYTES,
+            maximum_size_bytes: if provider == IdentityProvider::Mame {
+                MAX_MAME_SNAPSHOT_BYTES
+            } else {
+                MAX_SNAPSHOT_BYTES
+            },
             attribution_url: None,
             parser_schema_version: PARSER_VERSION.to_string(),
             trust: ManagedSourceTrust::Official,
@@ -80,7 +89,7 @@ impl ManagedProviderStore {
                 "{LOCAL_IMPORT_PREFIX}mame-listxml"
             ))),
             expected_media_type: "application/vnd.emuwiz.identity-provider+json".into(),
-            maximum_size_bytes: MAX_SNAPSHOT_BYTES,
+            maximum_size_bytes: MAX_MAME_SNAPSHOT_BYTES,
             attribution_url: None,
             parser_schema_version: PARSER_VERSION.to_string(),
             trust: ManagedSourceTrust::UserProvided,
@@ -194,7 +203,12 @@ impl ManagedProviderStore {
 #[allow(clippy::large_enum_variant)]
 pub enum ProviderRecords {
     DatLike {
+        /// Header-only for new snapshots (no per-machine records are retained:
+        /// the catalogue is the `listxml`); older snapshots may carry games.
         catalogue: ParsedDat,
+        /// Machines in `listxml`; 0 on older snapshots, which count `catalogue`.
+        #[serde(default)]
+        machine_count: usize,
         listxml: String,
     },
     NativeDetection(Vec<scummvm::DetectionRecord>),
@@ -228,7 +242,11 @@ impl ProviderSnapshot {
     }
     pub fn record_count(&self) -> usize {
         match &self.records {
-            ProviderRecords::DatLike { catalogue, .. } => catalogue.games.len(),
+            ProviderRecords::DatLike {
+                catalogue,
+                machine_count,
+                ..
+            } => (*machine_count).max(catalogue.games.len()),
             ProviderRecords::NativeDetection(records) => records.len(),
         }
     }
@@ -553,6 +571,7 @@ mod tests {
                         ..DatGameEntry::default()
                     }],
                 },
+                machine_count: 0,
                 listxml: "<mame build=\"0.264\"><machine name=\"puckman\"/></mame>".into(),
             },
             warnings: Vec::new(),

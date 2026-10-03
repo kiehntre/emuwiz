@@ -35,6 +35,47 @@ pub fn run(
     scummvm: bool,
     limit: u64,
 ) -> ProviderResult<(Vec<u8>, String)> {
+    let mut output = Vec::new();
+    let stderr = run_streaming(
+        executable,
+        args,
+        scummvm,
+        limit.min(MAX_SNAPSHOT_BYTES),
+        |chunk| {
+            output.extend_from_slice(chunk);
+            Ok(())
+        },
+    )?;
+    Ok((output, stderr))
+}
+
+/// Runs the tool with stdout streamed straight into `out` (never held in
+/// memory), hashing it on the way. Returns `(sha256 of stdout, bytes written,
+/// stderr)`. The supervisor refuses output beyond `limit`.
+pub fn run_to_writer(
+    executable: &Path,
+    args: &[OsString],
+    limit: u64,
+    out: &mut impl std::io::Write,
+) -> ProviderResult<(String, u64, String)> {
+    let mut hash = Sha256::new();
+    let mut written = 0_u64;
+    let stderr = run_streaming(executable, args, false, limit, |chunk| {
+        hash.update(chunk);
+        written += chunk.len() as u64;
+        out.write_all(chunk).map_err(|e| e.to_string())
+    })?;
+    let digest = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    Ok((digest, written, stderr))
+}
+
+fn run_streaming(
+    executable: &Path,
+    args: &[OsString],
+    scummvm: bool,
+    limit: u64,
+    sink: impl FnMut(&[u8]) -> Result<(), String>,
+) -> ProviderResult<String> {
     let scratch = tempfile::tempdir().map_err(|e| e.to_string())?;
     let mut cmd = Command::new(executable);
     cmd.current_dir(scratch.path());
@@ -51,19 +92,17 @@ pub fn run(
         cmd.arg("-noreadconfig");
     }
     cmd.args(args);
-    let mut output = Vec::new();
     let outcome = run_supervised(
         cmd,
+        // MAME's full listxml needs more address space than a small probe (it
+        // starts worker threads); the real 0.264 build fails at 2 GiB.
         ProcessLimits {
-            address_space_bytes: 2 * 1024 * 1024 * 1024,
+            address_space_bytes: if scummvm { 2 } else { 4 } * 1024 * 1024 * 1024,
             cpu_seconds: 60,
         },
         Duration::from_secs(60),
-        limit.min(MAX_SNAPSHOT_BYTES),
-        |chunk| {
-            output.extend_from_slice(chunk);
-            Ok(())
-        },
+        limit,
+        sink,
         None,
     )
     .map_err(|e| e.to_string())?;
@@ -74,5 +113,5 @@ pub fn run(
             outcome.status
         ));
     }
-    Ok((output, stderr))
+    Ok(stderr)
 }

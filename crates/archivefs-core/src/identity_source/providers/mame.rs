@@ -25,6 +25,9 @@ pub const FULL_LISTXML_ARGS: &[&str] = &["-listxml"];
 
 /// Largest number of candidate names a directory result lists; the full count
 /// is always reported separately.
+/// Machine ceiling for the audit's parse of a full catalogue (today's MAME lists ~47k).
+const MAX_LISTXML_MACHINES: usize = 500_000;
+
 const MAX_LISTED_CANDIDATES: usize = 1000;
 
 /// Capture the complete machine catalogue from an installed MAME build.
@@ -39,23 +42,30 @@ pub fn capture(executable: &Path) -> ProviderResult<ProviderSnapshot> {
     let executable = executable.canonicalize().map_err(|e| e.to_string())?;
     let before = tool::fingerprint(&executable)?;
     let args: Vec<std::ffi::OsString> = FULL_LISTXML_ARGS.iter().map(Into::into).collect();
-    let (bytes, stderr) =
-        tool::run(&executable, &args, false, MAX_SNAPSHOT_BYTES).map_err(explain_capture_error)?;
+    // The full catalogue is hundreds of megabytes: stream it into a file in an
+    // EmuWiz-owned scratch directory (removed on every exit path) rather than
+    // collecting it as one in-memory response.
+    let spool = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let spool_path = spool.path().join("listxml.xml");
+    let (streamed_sha256, written, stderr) = {
+        let mut out =
+            std::io::BufWriter::new(std::fs::File::create(&spool_path).map_err(|e| e.to_string())?);
+        let result = tool::run_to_writer(&executable, &args, MAX_LISTXML_BYTES, &mut out)
+            .map_err(explain_capture_error)?;
+        out.flush().map_err(|e| e.to_string())?;
+        result
+    };
     if tool::fingerprint(&executable)? != before {
         return Err("MAME changed during capture".into());
     }
-    let mut file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-    file.write_all(&bytes).map_err(|e| e.to_string())?;
-    let imported = crate::identity_source::mame_listxml::import_mame_listxml(file.path())
-        .map_err(|e| e.to_string())?;
-    let mut catalogue = imported.dat;
-    catalogue.source.file_path = "official-local:mame/-listxml".into();
-    let version = catalogue
-        .source
-        .version
-        .clone()
-        .ok_or("MAME did not report a build version")?;
-    let mut warnings = catalogue.source.parse_warnings.clone();
+    let bytes = read_bounded(&spool_path, written)?;
+    drop(spool);
+    if sha256(&bytes) != streamed_sha256 {
+        return Err("MAME's output changed while it was being stored".into());
+    }
+    let scan = scan_listxml(&bytes)?;
+    let source_identifier = "official-local:mame/-listxml".to_string();
+    let mut warnings = Vec::new();
     warnings.push(
         "Full machine catalogue from the installed MAME; software lists are not included".into(),
     );
@@ -64,17 +74,146 @@ pub fn capture(executable: &Path) -> ProviderResult<ProviderSnapshot> {
     }
     Ok(ProviderSnapshot {
         provider: IdentityProvider::Mame,
-        version,
-        source_identifier: catalogue.source.file_path.clone(),
+        version: scan.build.clone(),
+        source_identifier: source_identifier.clone(),
         executable,
         executable_sha256: before,
-        source_sha256: sha256(&bytes),
+        source_sha256: streamed_sha256,
         parser_version: PARSER_VERSION,
         records: ProviderRecords::DatLike {
-            catalogue,
-            listxml: String::from_utf8(bytes).map_err(|e| e.to_string())?,
+            catalogue: scan.catalogue(&source_identifier),
+            machine_count: scan.machines,
+            listxml: String::from_utf8(bytes).map_err(|_| "MAME listxml is not UTF-8")?,
         },
         warnings,
+    })
+}
+
+/// Reads a whole file once into a single buffer, never past the listxml
+/// ceiling (the file is also checked against the length it was written with).
+fn read_bounded(path: &Path, expected: u64) -> ProviderResult<Vec<u8>> {
+    use std::io::Read;
+    if expected > MAX_LISTXML_BYTES {
+        return Err(too_large_message());
+    }
+    let mut bytes = Vec::with_capacity(expected as usize);
+    std::fs::File::open(path)
+        .map_err(|e| e.to_string())?
+        .take(MAX_LISTXML_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > MAX_LISTXML_BYTES {
+        return Err(too_large_message());
+    }
+    Ok(bytes)
+}
+
+fn too_large_message() -> String {
+    format!(
+        "That listxml is larger than the {} MiB import limit",
+        MAX_LISTXML_BYTES / (1024 * 1024)
+    )
+}
+
+/// What a constant-memory pass over a listxml learns: the declared build, the
+/// machine count, and proof that the document is complete and well formed. No
+/// machine is retained; per-machine parsing happens only in the bounded DAT
+/// audit, when a collection is actually verified.
+struct ListxmlScan {
+    build: String,
+    machines: usize,
+}
+
+impl ListxmlScan {
+    /// Header-only catalogue (no machines): enough to name the source and its
+    /// build without holding every machine in memory.
+    fn catalogue(&self, source: &str) -> crate::dat::model::ParsedDat {
+        use crate::dat::model::{DatEcosystem, DatFormat, DatPackingPolicy, DatSource, ParsedDat};
+        ParsedDat {
+            source: DatSource {
+                format: DatFormat::Logiqx,
+                ecosystem: DatEcosystem::MAMEArcade,
+                file_path: source.into(),
+                name: Some("MAME -listxml".into()),
+                description: None,
+                version: Some(self.build.clone()),
+                author: None,
+                homepage: None,
+                clrmamepro_header: None,
+                entry_count: self.machines,
+                rom_count: 0,
+                parse_warnings: Vec::new(),
+                packing_policy: DatPackingPolicy::Standard,
+            },
+            games: Vec::new(),
+        }
+    }
+}
+
+fn scan_listxml(bytes: &[u8]) -> ProviderResult<ListxmlScan> {
+    use quick_xml::{
+        Reader,
+        events::{BytesStart, Event},
+    };
+    let mut reader = Reader::from_reader(bytes);
+    let mut buf = Vec::new();
+    let (mut depth, mut machines) = (0_usize, 0_usize);
+    let mut build = None;
+    let mut root_closed = false;
+    let mut element = |e: &BytesStart, depth: usize, root_closed: bool| -> ProviderResult<()> {
+        if depth == 0 {
+            if root_closed || !e.name().as_ref().eq_ignore_ascii_case(b"mame") {
+                return Err("That file is not a MAME listxml (no <mame> root)".into());
+            }
+            for attribute in e.attributes().flatten() {
+                if attribute.key.as_ref() == b"build" {
+                    build = attribute
+                        .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .ok()
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty());
+                }
+            }
+        } else if depth == 1
+            && e.name().as_ref() == b"machine"
+            && e.attributes().flatten().any(|a| a.key.as_ref() == b"name")
+        {
+            machines += 1;
+        }
+        Ok(())
+    };
+    loop {
+        match reader
+            .read_event_into(&mut buf)
+            .map_err(|e| format!("That is not a complete MAME listxml: {e}"))?
+        {
+            Event::Eof => break,
+            Event::Start(e) => {
+                element(&e, depth, root_closed)?;
+                depth += 1;
+            }
+            Event::Empty(e) => {
+                element(&e, depth, root_closed)?;
+                if depth == 0 {
+                    root_closed = true;
+                }
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    root_closed = true;
+                }
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    if depth != 0 || !root_closed {
+        return Err("That listxml looks incomplete (the document is not closed)".into());
+    }
+    Ok(ListxmlScan {
+        build: build.ok_or("MAME listxml does not report a build version")?,
+        machines,
     })
 }
 
@@ -96,7 +235,7 @@ fn explain_capture_error(error: String) -> String {
         format!(
             "MAME's full machine list is larger than EmuWiz's snapshot limit ({} MiB). \
              Import a listxml for an older build instead. ({error})",
-            MAX_SNAPSHOT_BYTES / (1024 * 1024)
+            MAX_LISTXML_BYTES / (1024 * 1024)
         )
     } else {
         error
@@ -112,61 +251,36 @@ fn explain_capture_error(error: String) -> String {
 /// validation, staging, activation, history and rollback path as a live capture
 /// (through [`super::ManagedProviderStore::new_imported`]).
 pub fn snapshot_from_mame_listxml(path: &Path) -> ProviderResult<ProviderSnapshot> {
-    use std::io::Read;
     let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("Choose a regular MAME listxml file".into());
     }
-    if metadata.len() > MAX_SNAPSHOT_BYTES {
-        return Err(format!(
-            "That listxml is larger than the {} MiB import limit",
-            MAX_SNAPSHOT_BYTES / (1024 * 1024)
-        ));
+    if metadata.len() > MAX_LISTXML_BYTES {
+        return Err(too_large_message());
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    std::fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .take(MAX_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
-        return Err("That listxml grew past the import limit while it was read".into());
-    }
-    // A cut-off download would otherwise import as a quietly incomplete catalogue.
-    let tail = &bytes[bytes.len().saturating_sub(64)..];
-    if !String::from_utf8_lossy(tail)
-        .trim_end()
-        .ends_with("</mame>")
-    {
-        return Err("That listxml looks incomplete (it does not end with </mame>)".into());
-    }
-    let imported = crate::identity_source::mame_listxml::import_mame_listxml(path)
-        .map_err(|error| error.to_string())?;
+    let bytes = read_bounded(path, metadata.len())?;
+    // Scanned from the bytes just read, so what is checked is exactly what is stored.
+    let scan = scan_listxml(&bytes)?;
     let source_hash = sha256(&bytes);
-    if imported.artifact_sha256 != source_hash {
-        return Err("The listxml changed while it was being imported".into());
-    }
-    let version = imported
-        .upstream_version
-        .clone()
-        .ok_or("MAME listxml does not report a build version")?;
-    let mut warnings = imported.dat.source.parse_warnings.clone();
-    warnings.push("Imported locally; EmuWiz did not download or vouch for the source.".into());
-    let mut catalogue = imported.dat;
-    catalogue.source.file_path = format!("{LOCAL_IMPORT_PREFIX}{}", imported.artifact_name);
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let source_identifier = format!("{LOCAL_IMPORT_PREFIX}{name}");
     Ok(ProviderSnapshot {
         provider: IdentityProvider::Mame,
-        version,
-        source_identifier: format!("{LOCAL_IMPORT_PREFIX}{}", imported.artifact_name),
+        version: scan.build.clone(),
+        source_identifier: source_identifier.clone(),
         executable: PathBuf::from(format!("{LOCAL_IMPORT_PREFIX}mame-listxml")),
         executable_sha256: source_hash.clone(),
         source_sha256: source_hash,
         parser_version: PARSER_VERSION,
         records: ProviderRecords::DatLike {
-            catalogue,
+            catalogue: scan.catalogue(&source_identifier),
+            machine_count: scan.machines,
             listxml: String::from_utf8(bytes).map_err(|_| "MAME listxml is not UTF-8")?,
         },
-        warnings,
+        warnings: vec!["Imported locally; EmuWiz did not download or vouch for the source.".into()],
     })
 }
 
@@ -260,7 +374,12 @@ pub fn verify_expecting(
             dat_path: file.path().to_path_buf(),
             dat_kind: DatSourceKind::File,
             scan_root: path.into(),
-            limits: DatLimits::default(),
+            // The audit's own parser keeps the catalogue it reads, so its file
+            // ceiling is the real memory bound: raised to the listxml ceiling here.
+            limits: DatLimits::builder()
+                .max_file_size(MAX_LISTXML_BYTES)
+                .max_entries(MAX_LISTXML_MACHINES)
+                .build(),
             policy: None,
             platform: Some("arcade".into()),
         },

@@ -72,6 +72,10 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
     Ok(outcome)
 }
 
+/// Real `mame -listxml` opens with an inline DTD of about 10 KB before the
+/// `<mame>` root, so the root is looked for well beyond the 4 KB format sniff.
+const MAME_ROOT_SNIFF_BYTES: usize = 64 * 1024;
+
 /// Decides whether a Logiqx-shaped XML file is actually `mame -listxml`
 /// output, whose `<mame>` root uses a different element vocabulary
 /// (`<machine>`, not `<game>`) than a Logiqx `<datafile>`.
@@ -79,8 +83,7 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
 /// This inspects the parsed *root element's tag name* only - never a raw
 /// substring search - so a document that merely mentions "mame" in a
 /// comment, attribute value, or an unrelated tag (`<mameinfo>`) is never
-/// misdetected. Only the bounded first-4KB prefix already read for format
-/// sniffing is inspected; a truncated/malformed prefix is treated as "not
+/// misdetected. Only a bounded prefix (`MAME_ROOT_SNIFF_BYTES`) is inspected; a truncated/malformed prefix is treated as "not
 /// conclusively MAME listxml" rather than an error, since the real parser
 /// (or `parse_logiqx`) still validates the full document afterward.
 fn is_mame_listxml_root(path: &Path) -> Result<bool, ParseError> {
@@ -90,7 +93,7 @@ fn is_mame_listxml_root(path: &Path) -> Result<bool, ParseError> {
         path: path.to_path_buf(),
         error,
     })?;
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; MAME_ROOT_SNIFF_BYTES];
     let n = file.read(&mut buf).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
