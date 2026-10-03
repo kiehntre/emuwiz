@@ -895,6 +895,33 @@ def prepare_root(root: Path, profile: str, seed: int, recreate: bool) -> None:
     except FileExistsError as error: raise LabError("another generator holds the lab lock") from error
 
 
+def add_ux_recovery(builder: Builder) -> None:
+    """Deliberate failures for manual GUI QA, never commercial game data."""
+    for name, suffix, signature in [
+        ("7z", "7z", b"7z\xbc\xaf\x27\x1c"),
+        ("rar", "rar", b"Rar!\x1a\x07\x01\x00"),
+        ("cbz", "cbz", b"PK\x03\x04"),
+        ("pdf", "pdf", b"%PDF-1.7\n"),
+    ]:
+        folder = "library/Archives" if name in {"7z", "rar"} else "documents"
+        builder.add_file(f"ux.broken.{name}", f"{folder}/QA Damaged.{suffix}", signature,
+                         classification="Malformed", health="Malformed", expectation_type="DiagnosticOnly",
+                         notes="Intentionally truncated signature. Opening must report failure or a capability limit, never success.")
+    builder.add_zip("ux.manual.pages", "documents/QA Natural Page Order.cbz", [
+        (f"page{number}.png", png_bytes(24, 32, color))
+        for number, color in [(10, (30, 90, 120)), (2, (120, 60, 30)), (1, (70, 130, 80))]
+    ], classification="Support", support_only=True, expectation_type="ManualReviewExpected",
+       notes="Synthetic coloured pages stored 10,2,1; canonical viewer should display 1,2,10. No extraction beside the CBZ.")
+    builder.add_virtual("ux.manual.missing", "documents/QA Missing Manual.cbz", health="MissingCompanion",
+                        expectation_type="ManualReviewExpected", notes="Intentionally absent: select a copy then remove only that disposable copy to exercise missing-document recovery.")
+    builder.add_file("ux.bezel.corrupt", "artwork/bezels/QA Corrupt Bezel.png", b"\x89PNG\r\n\x1a\n",
+                     classification="Malformed", health="Malformed", expectation_type="ManualReviewExpected",
+                     notes="Truncated PNG: local bezel inspection must refuse it without claiming a successful apply.")
+    builder.add_file("ux.bezel.preview", "artwork/bezels/QA Preview Only.png", png_bytes(48, 32, (90, 40, 70)),
+                     classification="Artwork", expectation_type="ManualReviewExpected",
+                     notes="Preview image only. No verified game identity or emulator configuration is supplied; appearance alone cannot authorise apply.")
+
+
 def build_lab(root: Path, profile: str, seed: int, scale: int, arcade_sets: int, recreate: bool) -> dict[str, Any]:
     if scale < 0 or arcade_sets < 0: raise LabError("scale counts must be non-negative")
     started = time.monotonic(); root = validate_output_root(root); prepare_root(root, profile, seed, recreate)
@@ -902,7 +929,7 @@ def build_lab(root: Path, profile: str, seed: int, scale: int, arcade_sets: int,
         builder = Builder(root, profile, seed, repository_commit())
         add_platforms(builder); add_arcade(builder, arcade_sets); add_archives(builder); add_dat_fixtures(builder)
         add_bios_provider(builder); add_cheats_mods(builder); add_artwork_metadata_frontends(builder)
-        add_paths_duplicates_sources(builder); add_playing_library(builder); add_scale(builder, scale)
+        add_paths_duplicates_sources(builder); add_playing_library(builder); add_ux_recovery(builder); add_scale(builder, scale)
         generation_seconds = time.monotonic() - started
         manifest = build_manifest(builder, generation_seconds)
         manifest_bytes = canonical_json(manifest)
