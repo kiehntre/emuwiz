@@ -383,7 +383,7 @@ fn show_apply_outcome(ui: &mut egui::Ui, outcome: &ApplyOutcome) {
 }
 
 pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
-    ui.label("Local-first preview. Bezel resolution is separate from ordinary artwork.");
+    ui.label("A bezel is a decorative border around the game screen. Preview a local image first; applying it changes the selected emulator's overlay settings, not the game.");
 
     ui.horizontal_wrapped(|ui| {
         ui.label(format!(
@@ -427,20 +427,19 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
         for warning in state.catalogue.warnings.iter().take(3) {
             ui.small(warning);
         }
-        if state.apply_supported() {
-            ui.label("Apply is available after confirmation.");
-        } else {
-            ui.label("Preview only / apply unsupported");
-        }
+        ui.label("There is no compatible image to apply. Add or check a local bezel folder, then refresh the preview. No emulator settings were changed by this check.");
         return;
     };
 
     ui.separator();
-    ui.strong(format!("Resolved bezel: {}", selected.id));
-    ui.label(format!("Precedence: {}", precedence_reason(selected)));
-    ui.label(format!("Provider: {}", selected.provenance.provider));
-    ui.label(format!("Reference: {}", selected.provenance.reference));
-    ui.label(format!("Evidence: {}", evidence_label(&selected.evidence)));
+    ui.strong("Selected border image");
+    crate::ui::components::technical_details(ui, "bezel_selection", |ui| {
+        ui.label(format!("Asset: {}", selected.id));
+        ui.label(format!("Precedence: {}", precedence_reason(selected)));
+        ui.label(format!("Provider: {}", selected.provenance.provider));
+        ui.label(format!("Reference: {}", selected.provenance.reference));
+        ui.label(format!("Evidence: {}", evidence_label(&selected.evidence)));
+    });
     if let DecorationSource::LocalPack { path } | DecorationSource::UserOverride { path } =
         &selected.source
     {
@@ -472,7 +471,8 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
             state.catalogue.images.get(&selected.id),
         ),
         (_, Some(error)) => {
-            ui.centered_and_justified(|ui| ui.label(format!("Bezel preview unavailable\n{error}")));
+            ui.label("The border image could not be displayed. Check its location and use Refresh local bezel preview to try again. Previewing changes no emulator settings.");
+            technical_details(ui, "bezel_image_error", |ui| { ui.label(error); });
         }
         (None, None) => {
             ui.centered_and_justified(|ui| ui.spinner());
@@ -541,6 +541,9 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
             for refusal in &plan.refusals {
                 ui.small(format!("Blocked: {}", refusal_label(refusal)));
             }
+            ui.label("This changes only the reviewed overlay/configuration files listed above. Check the destination before confirming. Undo availability is shown below; do not remove its backup files.");
+            if !state.apply_confirmation { ui.label("Apply stays unavailable until you confirm the reviewed plan."); }
+            if !state.apply_supported() { ui.label("This plan cannot be applied safely. Review its conflicts and requirements, correct the setup, then preview again."); }
             ui.checkbox(
                 &mut state.apply_confirmation,
                 "I reviewed this plan and explicitly confirm it",

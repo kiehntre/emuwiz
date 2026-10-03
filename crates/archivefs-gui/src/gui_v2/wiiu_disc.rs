@@ -46,9 +46,9 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
                 .striped(true)
                 .show(ui, |ui| {
                     ui.label("Format");
-                    ui.label(format!("{:?}", report.format));
+                    ui.label(format_label(report.format));
                     ui.end_row();
-                    ui.label("Physical size");
+                    ui.label("Space used by this file");
                     ui.label(
                         report
                             .structure
@@ -57,7 +57,7 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
                             .unwrap_or_else(|| "Unavailable".to_string()),
                     );
                     ui.end_row();
-                    ui.label("Logical size");
+                    ui.label("Uncompressed disc size");
                     ui.label(
                         report
                             .structure
@@ -75,10 +75,10 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
                     });
                     ui.end_row();
                     ui.label("Key state");
-                    ui.label(format!("{:?}", report.key_state));
+                    ui.label(key_label(report.key_state));
                     ui.end_row();
-                    ui.label("Future readiness");
-                    ui.label(format!("{:?}", report.readiness));
+                    ui.label("What this check establishes");
+                    ui.label(readiness_label(report.readiness));
                     ui.end_row();
                 });
             if let Some(structure) = &report.structure {
@@ -90,8 +90,11 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
                     ui.label(format!("WUX block-table entries: {blocks}"));
                 }
             }
-            for issue in &report.issues {
-                ui.colored_label(ui.visuals().warn_fg_color, format!("Issue: {issue:?}"));
+            if !report.issues.is_empty() {
+                ui.colored_label(ui.visuals().warn_fg_color, "This inspection has limitations or found a problem. Keep every split part together and check the original dump before attempting conversion.");
+                crate::ui::components::technical_details(ui, "wiiu_inspection_issues", |ui| {
+                    for issue in &report.issues { ui.label(format!("{issue:?}")); }
+                });
             }
             ui.label("Your files are not changed by this inspection. Decryption and extraction are never performed.");
             show_conversion_readiness(ui, game, report.format);
@@ -115,4 +118,51 @@ fn show_conversion_readiness(
     egui::CollapsingHeader::new("Convert this disc image")
         .default_open(true)
         .show(ui, |ui| queue::show(ui, game, direction));
+}
+
+fn format_label(format: archivefs_core::wiiu_disc::WiiUDiscFormat) -> &'static str {
+    use archivefs_core::wiiu_disc::WiiUDiscFormat::*;
+    match format {
+        Wud => "WUD — uncompressed disc",
+        Wux => "WUX — compressed disc",
+        Wua => "WUA — separate archive format",
+        Unknown => "Not recognised",
+    }
+}
+fn key_label(state: archivefs_core::wiiu_disc::WiiUDiscKeyState) -> &'static str {
+    use archivefs_core::wiiu_disc::WiiUDiscKeyState::*;
+    match state {
+        NotRequiredForContainerInspection => "No key needed to check the container",
+        RequiredForDeeperInspection => "A key is needed to inspect encrypted contents",
+        AvailableLocally => "Available on this computer",
+        Missing => "Missing — encrypted contents cannot be checked",
+        Invalid => "The supplied key was not accepted",
+        Unknown => "Not checked",
+    }
+}
+fn readiness_label(state: archivefs_core::wiiu_disc::WiiUDiscReadiness) -> &'static str {
+    use archivefs_core::wiiu_disc::WiiUDiscReadiness::*;
+    match state {
+        ReadyForContainerInspection => "Container can be inspected; game contents are not verified",
+        StructurallyComplete => {
+            "Container structure is complete; this does not prove the game will run"
+        }
+        StructurallyIncomplete => {
+            "Container is incomplete or damaged; check the source and split parts"
+        }
+        RequiresKeysForDeeperInspection => "Encrypted contents require a separate key check",
+        UnsupportedRepresentation => "This type cannot be inspected here",
+    }
+}
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+    use archivefs_core::wiiu_disc::{WiiUDiscKeyState as K, WiiUDiscReadiness as R};
+    #[test]
+    fn container_readiness_does_not_claim_game_or_key_verification() {
+        assert!(readiness_label(R::StructurallyComplete).contains("does not prove"));
+        assert!(readiness_label(R::ReadyForContainerInspection).contains("not verified"));
+        assert!(key_label(K::Missing).contains("cannot be checked"));
+        assert_eq!(key_label(K::Unknown), "Not checked");
+    }
 }

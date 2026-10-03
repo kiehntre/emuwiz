@@ -89,6 +89,7 @@ pub(super) fn show(
                     ui.label("EmuWiz found both an EmuWiz setup and an older ArchiveFS setup.");
                     ui.label("Nothing will be merged automatically.");
                     ui.label("Run Upgrade Preflight before choosing which setup should remain active.");
+                    if button(ui, "Review upgrade and recovery tools") { action = Some(Action::Open(Section::Advanced)); }
                     ui.collapsing("Advanced details", |ui| {
                         if let Some(path) = &snapshot.active_config_root {
                             ui.label(format!("Active configuration folder: {}", path.display()));

@@ -583,6 +583,15 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             }
         });
         ui.label(&summary.explanation);
+        if summary.firmware == FirmwareSummary::Missing {
+            ui.label("BIOS / firmware is the system software this emulator needs. Use your own legally obtained files in BIOS Setup; a matching filename alone does not prove the right file.");
+        }
+        if summary.status == ReadinessPresentationState::Stale {
+            ui.label("The previous result is out of date. Recheck before trying to play; EmuWiz will not reuse an old approval.");
+        }
+        if summary.status == ReadinessPresentationState::NeedsEmulator {
+            ui.label("If you already installed an emulator, choose its executable or profile in Emulator Setup. You do not need to download another copy just because it was not detected.");
+        }
         ui.horizontal_wrapped(|ui| {
             if let Some(emulator) = &summary.emulator {
                 ui.label(format!("Using: {}", emulator.name));

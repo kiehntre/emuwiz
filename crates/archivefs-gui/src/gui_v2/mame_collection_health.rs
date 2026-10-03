@@ -44,7 +44,7 @@ pub(super) fn show_with_apply_plan(
         .show(ui, |ui| {
             ui.label("MAME Health");
             ui.label("Check whether your MAME sets are complete, then choose the safest next step.");
-            ui.label("Health checks read your collection. Repair changes files only after a reviewed preview and confirmation; reconstruction creates a separate output.");
+            ui.label("Health checks read your collection. Repair or reconstruction can change files only after a reviewed preview and confirmation. Review the output location and any replacement before applying it.");
             ui.horizontal_wrapped(|ui| {
                 for label in MAME_WORKFLOW_LABELS {
                     ui.label(egui::RichText::new(*label).strong());
@@ -70,9 +70,22 @@ pub(super) fn show_with_apply_plan(
                 ui.strong("No MAME collection report");
                 ui.label("Choose a MAME collection and current catalogue to check set health.");
             }
-            if ui.button("Export report").clicked() {
-                ui.ctx().copy_text("MAME collection health export is available after an inspection report is loaded.".into());
+            if repair_plan.is_some() || plan.is_some() {
+                if ui.button("Copy report details").clicked() {
+                    let report = serde_json::to_string_pretty(&(repair_plan, plan));
+                    match report {
+                        Ok(report) => ui.ctx().copy_text(report),
+                        Err(_) => { ui.label("The report could not be copied. Recheck the collection and try again."); }
+                    }
+                }
+            } else {
+                ui.label("Report export is unavailable until a collection check has produced results.");
             }
+            ui.collapsing("What do MAME sets mean?", |ui| {
+                ui.label("A set is the group of files MAME needs for one machine. Clones may share files with a parent. BIOS and device sets provide shared support files; they are not extra playable games.");
+                ui.label("Merged collections keep related variants together; split collections share parent files; non-merged collections repeat required files. Choose verification data for your collection's MAME version, not simply the newest version.");
+                ui.label("Software lists describe media used by emulated systems separately from arcade machine sets. A complete arcade report is not proof that software-list collections were checked.");
+            });
             ui.separator();
             ui.strong("Playing Library / 1G1R preview");
             ui.label("Creates a clean play-focused view without modifying the original ROM collection.");
@@ -458,6 +471,46 @@ mod tests {
             repair_confidence: MameRepairConfidence::Refused,
             disposition,
             refusal_reason: None,
+        }
+    }
+
+    #[test]
+    fn report_copy_requires_real_evidence_and_keeps_glossary_closed() {
+        fn text(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| text(s, out)),
+                _ => {}
+            }
+        }
+        let report = plan();
+        for available in [false, true] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(700.0, 520.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_with_plans(ui, None, available.then_some(&report));
+                    });
+                },
+            );
+            let mut rendered = String::new();
+            output
+                .shapes
+                .iter()
+                .for_each(|s| text(&s.shape, &mut rendered));
+            assert_eq!(rendered.contains("Copy report details"), available);
+            assert!(!rendered.contains("Export report"));
+            assert!(!rendered.contains("non-merged collections"));
         }
     }
 
