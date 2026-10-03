@@ -11,7 +11,8 @@ Usage: scripts/compare-release-builds.sh [--output-dir DIR]
        scripts/compare-release-builds.sh --archives FIRST.tar.xz SECOND.tar.xz
 
 Build the same commit twice in separate disposable checkouts, Cargo targets,
-and package/output roots. Require identical archive bytes and checksum files.
+temporary directories and package/output roots. Require identical archive bytes
+and checksum files.
 --archives compares existing artifacts without building or extracting them.
 HELP
 }
@@ -59,13 +60,19 @@ if [[ -z "$ARCHIVE_ONE" ]]; then
     BUNDLE_NAME="$(release_bundle_name "$VERSION" "$(release_target_name)")"
     SOURCE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
     export SOURCE_DATE_EPOCH="$(git -C "$REPO_ROOT" log -1 --format=%ct)"
+    # A fresh target must not silently fetch compiled products from sccache or
+    # another caller-configured compiler wrapper.
+    export RUSTC_WRAPPER="" RUSTC_WORKSPACE_WRAPPER="" CARGO_INCREMENTAL=0
     for run in 1 2; do
         SOURCE_ROOT="$TEMP_ROOT/source$run"
+        export TMPDIR="$TEMP_ROOT/tmp$run"
+        export TMP="$TMPDIR" TEMP="$TMPDIR"
+        mkdir -p "$TMPDIR"
         # Only immutable Git objects are shared. No registered worktrees, build
         # products, untracked files, or package staging directories are reused.
         git clone --quiet --shared --no-checkout "$REPO_ROOT" "$SOURCE_ROOT"
         git -C "$SOURCE_ROOT" -c advice.detachedHead=false checkout --quiet --detach "$SOURCE_SHA"
-        release_note "build $run: source=$SOURCE_ROOT target=$TEMP_ROOT/target$run output=$OUTPUT_DIR/run$run commit=$SOURCE_SHA"
+        release_note "build $run: source=$SOURCE_ROOT target=$TEMP_ROOT/target$run temporary=$TMPDIR staging/output=$OUTPUT_DIR/run$run commit=$SOURCE_SHA"
         started=$SECONDS
         "$SOURCE_ROOT/scripts/build-release.sh" \
             --output-dir "$OUTPUT_DIR/run$run" \

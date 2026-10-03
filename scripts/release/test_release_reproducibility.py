@@ -170,6 +170,9 @@ args=dict(zip(sys.argv[1::2],sys.argv[2::2]))
 out=pathlib.Path(args['--output-dir']); out.mkdir(parents=True)
 source=pathlib.Path(__file__).resolve().parents[1]
 record=dict(source=str(source), target=args['--target-dir'], output=str(out),
+            temporary=os.environ['TMPDIR'], tmp=os.environ['TMP'], temp=os.environ['TEMP'],
+            wrappers=[os.environ['RUSTC_WRAPPER'],os.environ['RUSTC_WORKSPACE_WRAPPER']],
+            incremental=os.environ['CARGO_INCREMENTAL'],
             head=subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip(),
             branch=subprocess.check_output(['git','-C',str(source),'branch','--show-current'],text=True).strip())
 (out/'roots.json').write_text(json.dumps(record))
@@ -187,11 +190,19 @@ path.with_name(path.name+'.sha256').write_text(hashlib.sha256(path.read_bytes())
         self.commit(root)
         output = self.root / "comparison-output"
         result = run("bash", str(root / "scripts/compare-release-builds.sh"),
-                     "--output-dir", str(output), env=dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}"))
+                     "--output-dir", str(output), env=dict(os.environ, PATH=f"{tools}:{os.environ['PATH']}",
+                     TMPDIR=str(self.root), TMP="must-not-use", TEMP="must-not-use",
+                     RUSTC_WRAPPER="must-not-run", RUSTC_WORKSPACE_WRAPPER="must-not-run", CARGO_INCREMENTAL="1"))
         self.assertEqual(result.returncode, 0, result.stdout)
         a, b = [json.loads((output / f"run{i}/roots.json").read_text()) for i in (1, 2)]
-        for key in ("source", "target", "output"):
+        for key in ("source", "target", "output", "temporary", "tmp", "temp"):
             self.assertNotEqual(a[key], b[key])
+        for record in (a, b):
+            self.assertNotEqual(record["temporary"], str(self.root))
+            self.assertEqual(record["temporary"], record["tmp"])
+            self.assertEqual(record["temporary"], record["temp"])
+            self.assertEqual(record["wrappers"], ["", ""])
+            self.assertEqual(record["incremental"], "0")
         self.assertNotEqual(a["source"], str(root))
         self.assertEqual(a["head"], b["head"])
         self.assertEqual((a["branch"], b["branch"]), ("", ""))

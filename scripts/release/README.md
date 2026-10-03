@@ -87,7 +87,9 @@ The existing smoke harness can consume the result without coupling:
 
 `scripts/compare-release-builds.sh --output-dir /tmp/emuwiz-reproduction`
 builds the current clean commit twice. Each run uses a separate disposable,
-detached local checkout, Cargo target, and package/output directory. Only
+detached local checkout, Cargo target, temporary directory (`TMPDIR`, `TMP`,
+and `TEMP`), and package/output directory. Compiler wrappers and incremental
+compilation are disabled during the comparison to prevent cache reuse. Only
 immutable Git objects and the downloaded Cargo dependency cache are shared;
 compiled outputs are not. The packager creates its own staging directory
 inside each output root. No remote is contacted by the checkout operation.
@@ -130,3 +132,13 @@ The historical reproducibility branch's independent-build/remapping intent
 is retained, not its obsolete gzip packager or old payload layout. Release
 and CI workflows now consume the current `.tar.xz` artifact; release naming
 continues to use the shared release helpers.
+
+Follow-up / needs review: plain multiline `RUSTFLAGS` are not fully retained
+by the existing `read -r -a` conversion in `build-release.sh`. This shared
+limitation is unchanged by proof-environment isolation. Supported single-line
+and encoded flags retain their existing behavior.
+
+Possible future strengthening: independently generate and compare optional
+SBOM bundles and scan all packaged files for build/home path leakage. These
+checks were external validation steps; the comparison driver does not perform
+them automatically (it does compare SBOM members when included in archives).
