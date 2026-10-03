@@ -269,11 +269,22 @@ impl RommTransport for UreqTransport {
             .into_body()
             .into_reader()
             .take(max_bytes as u64 + 1);
-        reader
-            .read_to_end(&mut body)
-            .map_err(|error| RommRequestError::Transport {
-                detail: format!("while reading the response: {}", error.kind()),
-            })?;
+        reader.read_to_end(&mut body).map_err(|error| {
+            let transport_error = error
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<ureq::Error>());
+            if error.kind() == std::io::ErrorKind::TimedOut
+                || matches!(transport_error, Some(ureq::Error::Timeout(_)))
+            {
+                RommRequestError::Timeout
+            } else {
+                RommRequestError::Transport {
+                    detail: transport_error
+                        .map(classify_transport_error)
+                        .unwrap_or_else(|| format!("while reading the response: {}", error.kind())),
+                }
+            }
+        })?;
         if body.len() > max_bytes {
             return Err(RommRequestError::ResponseTooLarge { limit: max_bytes });
         }
@@ -292,7 +303,7 @@ pub(crate) fn classify_transport_error(error: &ureq::Error) -> String {
         ureq::Error::HostNotFound => "the host could not be found".to_string(),
         ureq::Error::Io(io) => format!("an I/O error occurred ({})", io.kind()),
         ureq::Error::Tls(_) => "the TLS handshake failed".to_string(),
-        other => format!("an unexpected transport error occurred ({})", other),
+        _ => "an unexpected transport error occurred".to_string(),
     }
 }
 
@@ -502,7 +513,7 @@ impl<'a, T: RommTransport> RommClient<'a, T> {
     }
 
     /// Performs one GET and parses JSON, applying every bound.
-    fn get_json(
+    pub(super) fn get_json(
         &self,
         path: &str,
         authenticate: bool,

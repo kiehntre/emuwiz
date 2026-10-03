@@ -20,6 +20,7 @@
 //! What that instance actually exposes is recorded in [`capability`], along with
 //! how the adapter behaves when a field or endpoint is missing.
 
+pub mod browser;
 pub mod capability;
 pub mod client;
 pub mod config;
