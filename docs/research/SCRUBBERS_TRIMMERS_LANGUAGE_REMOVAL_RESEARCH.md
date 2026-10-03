@@ -281,7 +281,7 @@ Wii U, PS2 archives, PS3 UDF+EBOOT), language removal is a **romhack**, not a co
 
 1. **Never operate in place.** Copy, transform to a new path, verify, then replace. This matches the
    no-clobber transaction policy already used for CHD/CUE-BIN work.
-2. **Classify the operation.** Recompress (CHD/CSO/RVZ/WIA/NSZ/WUA) = reversible; scrub/trim = 
+2. **Classify the operation.** Recompress (CHD/CSO/RVZ/WIA/NSZ/WUA) = reversible; scrub/trim =
    reversible if only trailing pad; strip = irreversible mod.
 3. **Round-trip proof for recompressors.** CSO→ISO and CHD→source and RVZ→ISO must reproduce the
    original bytes; store SHA-256 of input and the reconstructed output.
