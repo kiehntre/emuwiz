@@ -143,15 +143,15 @@ write_case("wrong-permissions", wrong_permissions)
 write_case("unexpected-member", unexpected_member)
 write_case("malformed-package", malformed_member)
 
-# The current package intentionally contains no installer. Keep this assertion
-# here so a future packaging change cannot silently revive an old fixture
-# assumption without making the test reviewable.
-if any(member.name.endswith("/install.sh") for member, _ in source_members):
-    raise SystemExit("current tar.xz package unexpectedly contains historical install.sh")
+# Keep fixtures aligned with the current allow-listed installer payload.
+if not any(member.name == f"{root_name}/install.sh" and member.isfile()
+           for member, _ in source_members):
+    raise SystemExit("current tar.xz package is missing install.sh")
+
 PY
 
 for label_and_reason in \
-    "missing-file|expected file missing or symlinked: bin/emuwiz-cli" \
+    "missing-file|canonical payload files are missing: bin/emuwiz-cli" \
     "modified-binary|SHA-256 mismatch: bin/emuwiz" \
     "manifest-mismatch|manifest SHA-256 does not agree with SHA256SUMS" \
     "corrupted-metadata|manifest.json is unreadable" \

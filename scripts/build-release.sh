@@ -33,6 +33,27 @@ git -C "$REPO_ROOT" diff --cached --quiet
 if [[ "$OUTPUT_DIR" != /* ]]; then OUTPUT_DIR="$PWD/$OUTPUT_DIR"; fi
 if [[ "$TARGET_DIR" != /* ]]; then TARGET_DIR="$PWD/$TARGET_DIR"; fi
 mkdir -p "$OUTPUT_DIR" "$TARGET_DIR"
+TARGET_DIR="$(CDPATH= cd -- "$TARGET_DIR" && pwd -P)"
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" log -1 --format=%ct)}"
+export LC_ALL=C TZ=UTC
+
+# Rust panic locations and include!-generated bindings retain absolute paths,
+# even in release builds. Preserve caller flags; encoded flags also support
+# build roots containing spaces. More-specific mappings must come last.
+if [[ ! -v CARGO_ENCODED_RUSTFLAGS ]]; then
+    read -r -a rust_flags <<< "${RUSTFLAGS:-}"
+    printf -v CARGO_ENCODED_RUSTFLAGS '%s\x1f' "${rust_flags[@]}"
+    CARGO_ENCODED_RUSTFLAGS=${CARGO_ENCODED_RUSTFLAGS%$'\x1f'}
+fi
+for mapping in \
+    "${HOME:?}=/build/home" \
+    "${CARGO_HOME:-$HOME/.cargo}=/build/cargo" \
+    "${RUSTUP_HOME:-$HOME/.rustup}=/build/rustup" \
+    "$REPO_ROOT=/build/source" \
+    "$TARGET_DIR=/build/target"; do
+    CARGO_ENCODED_RUSTFLAGS+="${CARGO_ENCODED_RUSTFLAGS:+$'\x1f'}--remap-path-prefix=$mapping"
+done
+export CARGO_ENCODED_RUSTFLAGS
 
 (
     cd "$REPO_ROOT"

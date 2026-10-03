@@ -139,20 +139,20 @@ jobs:
       - name: Build and internally verify artifact
         run: scripts/build-release.sh --output-dir "$RUNNER_TEMP/release"
       - name: Reject representative malformed artifacts
-        run: scripts/test-release-artifact-verifier.sh "$RUNNER_TEMP/release/"*.tar.gz
+        run: scripts/test-release-artifact-verifier.sh "$RUNNER_TEMP/release/"*.tar.xz
       - name: Check artifact and binary versions
         run: |
           scripts/check-version-consistency.sh \
             --binary-dir target/release \
-            --artifact "$RUNNER_TEMP/release/"*.tar.gz \
-            --checksum "$RUNNER_TEMP/release/"*.tar.gz.sha256
+            --artifact "$RUNNER_TEMP/release/"*.tar.xz \
+            --checksum "$RUNNER_TEMP/release/"*.tar.xz.sha256
       - name: Upload untrusted CI artifact for verification
         uses: actions/upload-artifact@v4
         with:
           name: archivefs-release-candidate
           path: |
-            ${{ runner.temp }}/release/*.tar.gz
-            ${{ runner.temp }}/release/*.tar.gz.sha256
+            ${{ runner.temp }}/release/*.tar.xz
+            ${{ runner.temp }}/release/*.tar.xz.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -171,7 +171,7 @@ jobs:
           path: ${{ runner.temp }}/download
       - name: Install desktop-file-utils
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
-      - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.gz
+      - run: scripts/verify-release-artifact.sh "$RUNNER_TEMP/download/"*.tar.xz
 
   reproducibility:
     name: Reproducibility
@@ -182,5 +182,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
+      - name: Test reproducibility orchestration and archive diagnostics
+        run: python3 -B scripts/release/test_release_reproducibility.py
       - name: Build twice in independent clean directories
         run: scripts/compare-release-builds.sh --output-dir "$RUNNER_TEMP/reproducibility"

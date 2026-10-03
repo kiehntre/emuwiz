@@ -125,8 +125,10 @@ jobs:
         id: artifact
         run: |
           set -euo pipefail
-          ARTIFACT="$(find "$RUNNER_TEMP/reproducibility/run1" -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
-          test -n "$ARTIFACT"
+          source scripts/release-common.sh
+          BUNDLE="$(release_bundle_name "$(release_workspace_version "$PWD")" "$(release_target_name)")"
+          ARTIFACT="$RUNNER_TEMP/reproducibility/run1/$BUNDLE.tar.xz"
+          test -f "$ARTIFACT"
           test -f "$ARTIFACT.sha256"
           echo "archive=$ARTIFACT" >> "$GITHUB_OUTPUT"
           echo "checksum=$ARTIFACT.sha256" >> "$GITHUB_OUTPUT"

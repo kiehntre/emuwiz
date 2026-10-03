@@ -82,3 +82,51 @@ The existing smoke harness can consume the result without coupling:
 2. verify it with `verify-release.sh --strict`;
 3. pass the packaged `bin/emuwiz-cli` path to `release-smoke.sh` according to
    that harness's CLI.
+
+## Independent release reproduction
+
+`scripts/compare-release-builds.sh --output-dir /tmp/emuwiz-reproduction`
+builds the current clean commit twice. Each run uses a separate disposable,
+detached local checkout, Cargo target, and package/output directory. Only
+immutable Git objects and the downloaded Cargo dependency cache are shared;
+compiled outputs are not. The packager creates its own staging directory
+inside each output root. No remote is contacted by the checkout operation.
+Set `CARGO_NET_OFFLINE=true` to require already-cached dependencies.
+
+Both runs use the commit timestamp as `SOURCE_DATE_EPOCH`. `build-release.sh`
+remaps Rust source, generated target, Cargo, Rustup and home paths to stable
+`/build/...` locations, including when the input roots contain spaces. Caller
+Rust flags are retained. This is necessary for embedded panic locations and
+`include!`-generated bindings even without shipped debug information. A small
+real-rustc regression demonstrates different unremapped binaries and identical
+remapped binaries; the complete release comparison remains the final gate.
+
+The existing packager is unchanged: sorted PAX tar members, fixed mtimes,
+zero uid/gid, empty owner/group names, 0755 directories/executables and 0644
+other files, xz preset 9. Long-name PAX records are preserved. Links/special
+entries are rejected by canonical package verification. Generated provenance
+contains commit/tool versions and host kernel/architecture, so the guarantee
+is two independent builds in the **same toolchain/host environment**, not
+identity across different kernels/toolchains. Optional SBOM generation and
+signing remain explicit packager capabilities. Detached signatures remain
+outside the reproducible archive; the comparison does not generate keys,
+download SBOM data, or change signing policy.
+
+Success requires byte-identical `.tar.xz` archives, SHA-256 sidecars that match
+the actual archives, and identical ordered member manifests. On failure the
+comparison prints member paths, payload hashes (including binaries, generated
+text and SBOM files), ownership/mode/timestamp/PAX/link metadata differences.
+If member manifests match but compression bytes differ, `cmp` reports the
+first differing archive byte. Outputs remain available for inspection; the
+disposable checkouts and targets are removed on exit. Existing artifacts can
+be diagnosed without rebuilding using:
+
+```sh
+scripts/compare-release-builds.sh --archives /path/a.tar.xz /path/b.tar.xz
+python3 -B scripts/release/test_release_reproducibility.py
+```
+
+The historical reproducibility branch's independent-build/remapping intent
+is retained, not its obsolete gzip packager or old payload layout. Release
+and CI workflows now consume the current `.tar.xz` artifact; release naming
+continues to use the shared release helpers.
