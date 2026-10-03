@@ -1,5 +1,11 @@
 # Console scrubbers, trimmers and language-removal tools research
 
+> **Status note (added when promoted to main):** this is dated research from 2026-09-18, preserved
+> as written. Paths such as `~/bin/…` are the author's machine, tool versions are point-in-time, and
+> some implementation status has since changed (for example the read-only Xbox XISO analysis and PSP
+> Game Slimmer work described here as partial have landed). Nothing in this note is implemented as
+> scrub/trim functionality.
+
 Research-only note. No production code, converters, downloaders, GUI or tests were changed.
 
 Question asked: *discover and research the best console rippers/scrubbers to remove updates and
