@@ -120,16 +120,22 @@ removes a usable local title. The POC must exercise human-title cases, including
 
 | Local example | Official detection result | Class to report | Cleaned title / ID index | Enrichment |
 |---|---|---|---|---|
-| `Day Of The Tentacle (CD Dos)` | run detector and retain output | exact/fallback/coverage gap/unknown | local fallback if no official title | useful only if official identity is absent or incomplete |
-| `Chewy - Esc from F5 (CD - DOS)` | run detector and retain output | same | local fallback | likely useful; observed ScreenScraper match is metadata only |
-| `Blackwell Convergence (Windows)` | run detector and retain output | same | local fallback | likely useful; observed ScreenScraper match is metadata only |
-| `Clandestiny (CD - Windows)` | run detector and retain output | same | local fallback | likely useful; observed IGDB/ScreenScraper matches are metadata only |
-| `A Golden Wake (Windows)` | run detector and retain output | same | local fallback | likely useful; observed ScreenScraper match is metadata only |
-| `Detective Gallo (Windows)` | run detector and retain output | same | local fallback | useful to attempt, but observed unmatched |
+| `Day Of The Tentacle (CD Dos)` | ScummVM 2.8.0 runtime: `scumm:tentacle`, title `Day of the Tentacle (CD/English)`; the generated dump has no `tentacle` entry | `OfficialDetectionCoverageGap` for this POC snapshot | `Day Of The Tentacle`; no generated ID/title entry; `.scummvm` target is `tentacle` | useful for presentation metadata; it cannot change the coverage-gap identity result |
+| `Chewy - Esc from F5 (CD - DOS)` | example path was not present in the mounted audit tree | not run; preserve as an expected QA case | `Chewy - Esc from F5` | observed ScreenScraper enrichment is useful, identity contribution `NONE` |
+| `Blackwell Convergence (Windows)` | example path was not present in the mounted audit tree | not run; preserve as an expected QA case | `Blackwell Convergence` | observed ScreenScraper enrichment is useful, identity contribution `NONE` |
+| `Clandestiny (CD - Windows)` | example path was not present in the mounted audit tree | not run; preserve as an expected QA case | `Clandestiny` | observed IGDB/ScreenScraper enrichment is useful, identity contribution `NONE` |
+| `A Golden Wake (Windows)` | example path was not present in the mounted audit tree | not run; preserve as an expected QA case | `A Golden Wake` | observed ScreenScraper enrichment is useful, identity contribution `NONE` |
+| `Detective Gallo (Windows)` | example path was not present in the mounted audit tree | not run; preserve as an expected QA case | `Detective Gallo` | observed unmatched; local title remains usable |
 
 The POC report for each case must include runtime output, class, cleaned title,
 ID/title index result, whether enrichment would help, and preserved evidence.
 No source-game rename or filename normalization is performed.
+
+The mounted-library check did find the Day of the Tentacle directory and its
+`.scummvm` launcher. The runtime result above demonstrates why a printed game ID
+is not automatically exact: this build reports `tentacle`, while the exported
+detection snapshot used by the POC does not expose that SCUMM record. The POC
+therefore preserves the runtime ID and classifies the result as a coverage gap.
 
 ## Engine coverage matrix
 
