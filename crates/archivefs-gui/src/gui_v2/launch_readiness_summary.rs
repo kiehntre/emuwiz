@@ -640,7 +640,10 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
                 .on_disabled_hover_text(summary.headline.as_str());
             }
         });
-        ui.label(&summary.explanation);
+        // A finding's own reason replaces the generic sentence, not repeats it.
+        if summary.findings.is_empty() {
+            ui.label(&summary.explanation);
+        }
         if let Some(attempt) = &summary.attempt {
             if let Some(fix) = show_attempt(ui, attempt) {
                 action = Some(fix);
