@@ -121,7 +121,8 @@ pub(super) fn action_for_id(id: &str) -> Option<HubAction> {
     match id {
         "local-game-folders" => Some(HubAction::LocalSources),
         "dat-sources" => Some(HubAction::DatSources),
-        "local-artwork" | "es-de" | "screenscraper" | "romm" => Some(HubAction::ArtworkProviders),
+        "local-artwork" | "es-de" | "screenscraper" => Some(HubAction::ArtworkProviders),
+        "romm" => Some(HubAction::RommLibrary),
         _ => None,
     }
 }
@@ -139,7 +140,7 @@ pub(super) fn screenscraper_missing_credentials_reason(
 }
 
 pub(super) fn romm_purpose() -> &'static str {
-    "Read-only library snapshot, metadata and linked media associations where available."
+    "Read-only browsing of your RomM games, artwork and identity clues."
 }
 
 pub(super) fn show(ui: &mut egui::Ui, cards: &[ProviderCard]) -> Option<HubAction> {
@@ -297,7 +298,7 @@ mod tests {
     #[test]
     fn romm_description_does_not_claim_native_downloads() {
         let copy = romm_purpose();
-        assert!(copy.to_lowercase().contains("read-only library snapshot"));
+        assert!(copy.to_lowercase().contains("read-only browsing"));
         assert!(!copy.to_lowercase().contains("download games"));
     }
     #[test]

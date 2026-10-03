@@ -95,6 +95,8 @@ impl FieldState {
 /// values are derived from it by validation.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RommConfigDraft {
+    pub(crate) enabled: Option<bool>,
+    original_settings: Option<ProviderSettings>,
     pub(crate) url: String,
     pub(crate) token_path: String,
     pub(crate) path_kind: ProviderPathKind,
@@ -124,8 +126,15 @@ pub(crate) struct RommConfigDraft {
 impl RommConfigDraft {
     /// Opens the dialog on the configuration that is actually stored.
     pub(crate) fn from_snapshot(snapshot: &RommSnapshot) -> Self {
-        let source = &snapshot.settings.source;
+        Self::from_settings(&snapshot.settings)
+    }
+
+    /// Open the same editor without loading a cached catalogue just to read settings.
+    pub(crate) fn from_settings(settings: &ProviderSettings) -> Self {
+        let source = &settings.source;
         Self {
+            enabled: Some(source.enabled),
+            original_settings: Some(settings.clone()),
             url: source.url.clone(),
             // The path, never the contents.
             token_path: source
@@ -134,12 +143,8 @@ impl RommConfigDraft {
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
             path_kind: source.provider_path_kind,
-            page_size: snapshot.settings.effective_page_size().to_string(),
-            import_timeout_seconds: snapshot
-                .settings
-                .effective_import_timeout()
-                .as_secs()
-                .to_string(),
+            page_size: settings.effective_page_size().to_string(),
+            import_timeout_seconds: settings.effective_import_timeout().as_secs().to_string(),
             mappings: source.mappings.clone(),
             media_provider_prefix: source
                 .media_mapping
@@ -170,7 +175,11 @@ impl RommConfigDraft {
 
     /// The settings this draft would save, when it is valid.
     pub(crate) fn to_settings(&self, previous: Option<&ProviderSettings>) -> ProviderSettings {
+        let previous = previous.or(self.original_settings.as_ref());
         let mut settings = previous.cloned().unwrap_or_default();
+        if let Some(enabled) = self.enabled {
+            settings.source.enabled = enabled;
+        }
         settings.source.url = self.url.trim().to_string();
         settings.source.token_path = {
             let trimmed = self.token_path.trim();
@@ -842,7 +851,7 @@ pub(crate) fn show_config_dialog(
         preview,
         // The body no longer builds a `Save`; the footer owns that, and with
         // it the previous settings a save is derived from.
-        previous: _,
+        previous,
         busy,
         preview_running,
     } = *inputs;
@@ -853,13 +862,22 @@ pub(crate) fn show_config_dialog(
         Some("Nothing here contacts RomM. Saving writes EmuWiz's own configuration only."),
     );
     widgets::card(ui, |ui| {
+        let mut enabled = draft
+            .enabled
+            .unwrap_or_else(|| previous.is_some_and(|s| s.source.enabled));
+        if ui
+            .checkbox(&mut enabled, "Enable this RomM connection")
+            .changed()
+        {
+            draft.enabled = Some(enabled);
+            draft.dirty = true;
+        }
         // --- URL -----------------------------------------------------------
         ui.label("RomM address");
         ui.label(
-            "A stable hostname or FQDN is safer here than a container's IP address, which can \
-             change whenever the container restarts. A bare container/service name only \
-             resolves from inside that container's own network, not from this application, so \
-             it needs a real hostname/FQDN (or a pinned static IP) instead.",
+            "Enter the server address, including http:// or https:// and its port if needed. \
+             Prefer a stable hostname this machine can reach over a container address that \
+             may change on restart.",
         );
         if ui
             .add(
@@ -1122,7 +1140,7 @@ pub(crate) fn show_config_dialog_footer(
                 request = Some(ConfigDialogRequest::Close);
             }
         }
-        ui.label("Saving writes EmuWiz's configuration. It contacts nothing.");
+        ui.label("Local settings · contacts nothing.");
     });
     request
 }

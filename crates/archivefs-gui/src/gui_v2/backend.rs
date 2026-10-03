@@ -65,6 +65,7 @@ pub(super) enum Command {
     },
     EnvironmentCheck,
     LoadRommLibrary,
+    NativeRomm(Box<super::native_workflows::native_romm::Work>),
     RommOperation {
         operation: Box<crate::romm_source::RommOperation>,
     },
@@ -288,6 +289,10 @@ impl Backend {
 
 fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload, String> {
     match command {
+        Command::NativeRomm(work) => {
+            super::native_workflows::native_romm::run(*work);
+            Ok(Payload::Done)
+        }
         Command::EquivalentScan { kind, cancel } => Ok(Payload::EquivalentScan(Box::new(
             super::equivalent_duplicates::scan(kind, &cancel)?,
         ))),

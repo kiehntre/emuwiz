@@ -4,6 +4,9 @@
 //! discovery, launch planning and process execution. This bridge only gives
 //! those existing workflows v2 navigation and Activity integration.
 
+#[path = "native_romm.rs"]
+pub(super) mod native_romm;
+
 use super::{
     activity::Activity,
     environment::EnvironmentSnapshot,
@@ -27,6 +30,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub(super) struct NativeWorkflows {
     pub(super) app: ArchiveFsApp,
+    native_romm: native_romm::State,
     selected: Option<PathBuf>,
     catalogue_identity_report: Option<archivefs_core::game_identity::GameIdentityReport>,
     selected_game: Option<i64>,
@@ -249,6 +253,7 @@ impl NativeWorkflows {
         super::readable_style(&context);
         Self {
             app,
+            native_romm: native_romm::State::default(),
             selected: None,
             catalogue_identity_report: None,
             selected_game: None,
@@ -271,6 +276,13 @@ impl NativeWorkflows {
     }
 
     pub(super) fn poll(&mut self, context: &egui::Context, activity: &mut Activity) {
+        if self.native_romm.is_open()
+            && self.app.romm_ui.config_draft.is_some()
+            && context.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft))
+        {
+            self.app.close_romm_configuration();
+        }
+        self.native_romm.poll(context, activity);
         app_polling::poll_and_reconcile(&mut self.app, context);
 
         let changed = self.app.launch_retroarch.poll()
@@ -1668,6 +1680,15 @@ impl NativeWorkflows {
             HubAction, ProviderCard, SourceGroup, SourceNature, SourceStatus,
         };
 
+        crate::ui::components::card(ui, |ui| {
+            ui.strong("Your RomM library");
+            ui.label("Browse games on your RomM server. Read only — no downloads or changes.");
+            if ui.button("Browse RomM library").clicked() {
+                self.open_native_romm();
+            }
+        });
+        ui.add_space(8.0);
+
         let mut cards = Vec::new();
         let dat = self
             .app
@@ -1955,20 +1976,15 @@ impl NativeWorkflows {
             "Ready (offline)" => "Using the imported snapshot. RomM is currently unavailable; cached browsing still works.".into(),
             "Not configured" => "RomM address and read-only token are not configured. Configure them in Artwork & Metadata.".into(),
             "Disabled" => "The RomM source is disabled. Enable it in RomM setup to refresh data.".into(),
-            "Enabled, nothing imported yet" => "RomM is configured, but no library snapshot has been imported yet.".into(),
+            "Enabled, nothing imported yet" => "RomM is configured. Connect in the browser to see its games; no import is needed.".into(),
             "Error" => "RomM reported a problem. Review the provider details under Advanced.".into(),
-            _ => romm.state_detail.clone().unwrap_or_else(|| "RomM is an optional external library; its GUI-v2 browser reads the imported snapshot.".into()),
+            _ => "Connect in the RomM browser to see your server's games. Cached snapshots remain available separately.".into(),
         };
-        let mut romm_advanced = romm
-            .summary_rows
-            .iter()
-            .map(|row| format!("{}={}", row.label, row.value))
-            .collect::<Vec<_>>();
-        romm_advanced.push("provider_id=romm".into());
-        romm_advanced.push(format!("state_detail={:?}", romm.state_detail));
-        if let Some(error) = &romm.last_error {
-            romm_advanced.push(format!("raw_error={error}"));
-        }
+        // Saved, unvalidated URLs and arbitrary legacy diagnostics are not display evidence.
+        let romm_advanced = vec![
+            "provider_id=romm".into(),
+            "Live browsing uses the existing RomM connection settings.".into(),
+        ];
         cards.push(ProviderCard {
             id: "romm",
             group: SourceGroup::External,
@@ -1977,26 +1993,41 @@ impl NativeWorkflows {
             status: romm_status,
             reason: romm_reason,
             nature: SourceNature::Remote,
-            action: Some(if romm_status == SourceStatus::Ready {
-                "Open RomM library"
-            } else {
-                "Review RomM setup"
-            }),
-            target: Some(if romm_status == SourceStatus::Ready {
-                HubAction::RommLibrary
-            } else {
-                HubAction::ArtworkProviders
-            }),
+            action: Some("Browse RomM library"),
+            target: Some(HubAction::RommLibrary),
             advanced: romm_advanced,
         });
 
-        match super::sources_providers::show(ui, &cards) {
+        let route = match super::sources_providers::show(ui, &cards) {
             Some(HubAction::LocalSources) => Some(Route::Section(Section::Sources)),
             Some(HubAction::DatSources) => Some(Route::Section(Section::Dat)),
             Some(HubAction::ArtworkProviders) => Some(Route::Section(Section::Artwork)),
-            Some(HubAction::RommLibrary) => Some(Route::Section(Section::Romm)),
+            Some(HubAction::RommLibrary) => {
+                self.open_native_romm();
+                None
+            }
             None => None,
+        };
+        if self.native_romm.is_open() && self.app.romm_ui.config_draft.is_some() {
+            if let Some(request) = self.app.show_romm_configuration_window(ui.ctx()) {
+                self.app.handle_romm_config_request(ui.ctx(), request);
+            }
+        } else if self.native_romm.show(ui.ctx()) {
+            let draft = self.native_romm.settings_draft();
+            self.native_romm.settings_opened();
+            self.app.open_romm_configuration();
+            self.app.romm_ui.config_draft = Some(Box::new(draft));
         }
+        route
+    }
+
+    fn open_native_romm(&mut self) {
+        self.native_romm.open(
+            self.app
+                .gui_config
+                .source_roots()
+                .map_or_else(|_| Vec::new(), |roots| roots.to_vec()),
+        );
     }
 
     fn show_native_romm_provider(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
