@@ -9,6 +9,8 @@ pub const VICE_SUPPORTED_PLATFORM_ID: &str = "Commodore 64";
 pub const VICE_DISABLE_SAVE_RESOURCES: &str = "+saveres";
 pub const VICE_AUTOSTART: &str = "-autostart";
 pub const VICE_ATTACH_CRT: &str = "-cartcrt";
+/// VICE's documented option that runs a command file in the monitor at startup.
+pub const VICE_MONITOR_COMMANDS: &str = "-moncommands";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViceContentKind {
     Autostart,
@@ -45,10 +47,36 @@ pub(crate) fn vice_content_kind(path: &Path) -> Option<ViceContentKind> {
         _ => None,
     }
 }
+/// Cheat/POKE commands a person chose to run for one C64 game, taken from a
+/// launch-reviewed [`crate::patch_manager::ViceCheatProjection`]. It names the
+/// game they were chosen for and the monitor command file that carries them.
+/// Only the path crosses into the command; the file is created and owned by a
+/// [`crate::launch::vice_execution::ViceMonitorScript`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViceCheatLaunch {
+    pub game_key: String,
+    pub script_path: PathBuf,
+    /// SHA-256 of the command file as written; re-checked immediately before
+    /// spawn so a file changed in between is refused.
+    pub script_sha256: String,
+}
+
 pub fn build_vice_command_plan(
     identity: &CanonicalIdentityStatus,
     candidate: &LaunchCandidate,
     binding: &Result<ViceNativeLaunchBinding, ViceLaunchBlocker>,
+) -> ViceCommandPlan {
+    build_vice_command_plan_with_cheats(identity, candidate, binding, None)
+}
+
+/// Same plan as [`build_vice_command_plan`] plus `-moncommands <file>` when
+/// cheats were chosen. `None` is byte-identical to the baseline command. The
+/// cheats must be for this game and the file path must be absolute.
+pub fn build_vice_command_plan_with_cheats(
+    identity: &CanonicalIdentityStatus,
+    candidate: &LaunchCandidate,
+    binding: &Result<ViceNativeLaunchBinding, ViceLaunchBlocker>,
+    cheats: Option<&ViceCheatLaunch>,
 ) -> ViceCommandPlan {
     let mut blockers = Vec::new();
     let resolved = match identity {
@@ -120,6 +148,20 @@ pub fn build_vice_command_plan(
             "VICE accepts only direct strong C64 .t64, .g64, .d81ns, or .crt content",
         ));
     }
+    if let Some(cheats) = cheats {
+        if resolved.is_some_and(|x| x.game_key != cheats.game_key) {
+            blockers.push(block(
+                LaunchBlockerKind::IdentityConflict,
+                "the chosen cheats were made for a different game",
+            ));
+        }
+        if !cheats.script_path.is_absolute() {
+            blockers.push(block(
+                LaunchBlockerKind::ContentNotResolved,
+                "the cheat monitor command file must be an absolute path",
+            ));
+        }
+    }
     let binding = match binding {
         Ok(x) => Some(x),
         Err(x) => {
@@ -136,7 +178,7 @@ pub fn build_vice_command_plan(
             blockers,
         };
     }
-    let arguments = match vice_content_kind(content).unwrap() {
+    let mut arguments = match vice_content_kind(content).unwrap() {
         ViceContentKind::Autostart => vec![
             VICE_DISABLE_SAVE_RESOURCES.into(),
             VICE_AUTOSTART.into(),
@@ -149,6 +191,12 @@ pub fn build_vice_command_plan(
             content.clone().into_os_string(),
         ],
     };
+    if let Some(cheats) = cheats {
+        // Options come before the content; `-moncommands` is placed right after
+        // `+saveres` so the content stays the last argument.
+        arguments.insert(1, VICE_MONITOR_COMMANDS.into());
+        arguments.insert(2, cheats.script_path.clone().into_os_string());
+    }
     let resolved = resolved.unwrap();
     ViceCommandPlan {
         command: Some(ViceCommand {
@@ -243,6 +291,62 @@ mod tests {
                 OsString::from("-cartcrt"),
                 OsString::from("/roms/game.crt")
             ]
+        );
+    }
+    fn cheats(script: &str) -> ViceCheatLaunch {
+        ViceCheatLaunch {
+            game_key: "key".into(),
+            script_path: script.into(),
+            script_sha256: "00".repeat(32),
+        }
+    }
+    fn plan_with(path: &str, cheats: Option<&ViceCheatLaunch>) -> ViceCommandPlan {
+        build_vice_command_plan_with_cheats(
+            &identity("Commodore 64"),
+            &candidate(path),
+            &binding(),
+            cheats,
+        )
+    }
+    #[test]
+    fn chosen_cheats_add_moncommands_before_the_content() {
+        let c = cheats("/run/emuwiz-vice-cheat-x/commands.txt");
+        let autostart = plan_with("/roms/game.t64", Some(&c)).command.unwrap();
+        assert_eq!(
+            autostart.arguments,
+            vec![
+                OsString::from("+saveres"),
+                OsString::from("-moncommands"),
+                OsString::from("/run/emuwiz-vice-cheat-x/commands.txt"),
+                OsString::from("-autostart"),
+                OsString::from("/roms/game.t64"),
+            ]
+        );
+        let cart = plan_with("/roms/game.crt", Some(&c)).command.unwrap();
+        assert_eq!(
+            cart.arguments.last(),
+            Some(&OsString::from("/roms/game.crt"))
+        );
+        assert_eq!(cart.arguments[1], OsString::from("-moncommands"));
+    }
+    #[test]
+    fn no_cheats_is_byte_identical_to_the_baseline_command() {
+        for path in ["/roms/game.t64", "/roms/game.crt"] {
+            assert_eq!(
+                plan_with(path, None),
+                build_vice_command_plan(&identity("Commodore 64"), &candidate(path), &binding())
+            );
+        }
+    }
+    #[test]
+    fn cheats_for_another_game_or_a_relative_file_are_refused() {
+        let mut other = cheats("/run/c.txt");
+        other.game_key = "other".into();
+        assert!(plan_with("/roms/game.t64", Some(&other)).command.is_none());
+        assert!(
+            plan_with("/roms/game.t64", Some(&cheats("relative.txt")))
+                .command
+                .is_none()
         );
     }
     #[test]

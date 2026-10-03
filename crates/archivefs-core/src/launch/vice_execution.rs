@@ -5,11 +5,12 @@ use crate::launch::process_spawn::{
     self, CapturedFileIdentity, PreparedProcessCommand, WatchedProcess,
 };
 use crate::launch::vice_command::{
-    VICE_ATTACH_CRT, VICE_AUTOSTART, VICE_DISABLE_SAVE_RESOURCES, VICE_SUPPORTED_PLATFORM_ID,
-    ViceContentKind, vice_content_kind,
+    VICE_ATTACH_CRT, VICE_AUTOSTART, VICE_DISABLE_SAVE_RESOURCES, VICE_MONITOR_COMMANDS,
+    VICE_SUPPORTED_PLATFORM_ID, ViceCheatLaunch, ViceContentKind, vice_content_kind,
 };
 use crate::patch_manager::{
-    ViceProfileDiscoveryRoots, discover_vice_profiles, resolve_vice_native_launch_binding,
+    ViceCheatProjection, ViceCheatReadiness, ViceMemoryTarget, ViceProfileDiscoveryRoots,
+    discover_vice_profiles, resolve_vice_native_launch_binding,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -184,6 +185,231 @@ pub fn spawn_vice(command: &PreparedProcessCommand) -> std::io::Result<WatchedPr
     process_spawn::spawn_watched_process(command)
 }
 
+// ---------------------------------------------------------------------
+// Cheats: a launch-owned monitor command file passed with `-moncommands`
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViceCheatLaunchError {
+    pub detail: String,
+}
+fn cheat_error(detail: impl Into<String>) -> ViceCheatLaunchError {
+    ViceCheatLaunchError {
+        detail: detail.into(),
+    }
+}
+
+/// Largest monitor command file EmuWiz will write or accept.
+const MAX_MONITOR_SCRIPT_BYTES: usize = 64 * 1024;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// An EmuWiz-owned, private temporary directory holding the one monitor
+/// command file for one launch. It is removed when dropped, so keep it alive
+/// for as long as VICE may need the file (hold it in the same
+/// [`ViceCheatSession`] as the process). No VICE resource file, media image or
+/// global configuration is ever touched.
+pub struct ViceMonitorScript {
+    dir: Option<tempfile::TempDir>,
+    path: PathBuf,
+}
+
+impl ViceMonitorScript {
+    /// Writes the command file for a launch-reviewed projection.
+    ///
+    /// Refused: anything not `ReadyForLaunchReview` (weak identity, bank-
+    /// ambiguous or unsupported writes), no commands, and any write outside
+    /// normal RAM or colour RAM - I/O and ROM/cartridge-banked targets are
+    /// never applied automatically. The file is regenerated from the typed
+    /// commands, not copied from the projection's text.
+    pub fn create(
+        scratch_root: &Path,
+        projection: &ViceCheatProjection,
+        game_key: &str,
+    ) -> Result<(Self, ViceCheatLaunch), ViceCheatLaunchError> {
+        if game_key.trim().is_empty() {
+            return Err(cheat_error("cheats need a verified game key"));
+        }
+        if projection.readiness != ViceCheatReadiness::ReadyForLaunchReview
+            || projection.commands.is_empty()
+        {
+            return Err(cheat_error(
+                "these cheats are preview-only and cannot be used for a launch",
+            ));
+        }
+        let mut text = String::from("radix H\n");
+        for command in &projection.commands {
+            if !matches!(
+                command.memory,
+                ViceMemoryTarget::Ram | ViceMemoryTarget::ColourRam
+            ) {
+                return Err(cheat_error(
+                    "only normal RAM and colour RAM writes can be applied at launch",
+                ));
+            }
+            text.push_str(&format!(
+                "> {:04X} {:02X}\n",
+                command.address, command.value
+            ));
+        }
+        text.push_str("x\n");
+        if text.len() > MAX_MONITOR_SCRIPT_BYTES {
+            return Err(cheat_error("too many cheat commands for one launch"));
+        }
+        if !scratch_root.is_absolute() {
+            return Err(cheat_error("the launch scratch directory must be absolute"));
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("emuwiz-vice-cheat-")
+            .tempdir_in(scratch_root)
+            .map_err(|e| {
+                cheat_error(format!(
+                    "could not create the launch scratch directory: {e}"
+                ))
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).map_err(|e| {
+                cheat_error(format!("could not make the scratch directory private: {e}"))
+            })?;
+        }
+        let path = dir.path().join("commands.txt");
+        {
+            use std::io::Write;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options
+                .open(&path)
+                .map_err(|e| cheat_error(format!("could not write the cheat command file: {e}")))?;
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| cheat_error(format!("could not write the cheat command file: {e}")))?;
+        }
+        let launch = ViceCheatLaunch {
+            game_key: game_key.to_string(),
+            script_path: path.clone(),
+            script_sha256: sha256_hex(text.as_bytes()),
+        };
+        Ok((
+            Self {
+                dir: Some(dir),
+                path,
+            },
+            launch,
+        ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Keeps the directory when the owner is dropped while VICE still runs.
+    fn persist_if_running(&mut self, running: bool) {
+        if running {
+            if let Some(dir) = self.dir.take() {
+                let _ = dir.keep();
+            }
+        }
+    }
+}
+
+/// Like [`preflight_vice_launch`], and when cheats were chosen also proves the
+/// command file is still the one written: absolute, a regular non-symlink
+/// file, unchanged since it was hashed, and for this very game. Then adds
+/// `-moncommands <file>` after `+saveres`. `None` returns exactly the
+/// baseline command.
+pub fn preflight_vice_launch_with_cheats(
+    request: &ViceLaunchRequest,
+    roots: &ViceProfileDiscoveryRoots,
+    identity: &CanonicalIdentityStatus,
+    cheats: Option<&ViceCheatLaunch>,
+) -> Result<PreparedProcessCommand, ViceLaunchPreflightError> {
+    let mut command = preflight_vice_launch(request, roots, identity)?;
+    let Some(cheats) = cheats else {
+        return Ok(command);
+    };
+    let bad = |detail: &str| {
+        fail(
+            ViceLaunchPreflightErrorKind::IdentityMismatch,
+            detail.to_string(),
+        )
+    };
+    if cheats.game_key != request.expected_game_key {
+        return Err(bad("the chosen cheats were made for a different game"));
+    }
+    if !cheats.script_path.is_absolute() {
+        return Err(bad("the cheat command file must be an absolute path"));
+    }
+    let meta = fs::symlink_metadata(&cheats.script_path)
+        .map_err(|_| bad("the cheat command file is no longer available"))?;
+    if meta.file_type().is_symlink()
+        || !meta.is_file()
+        || meta.len() as usize > MAX_MONITOR_SCRIPT_BYTES
+    {
+        return Err(bad("the cheat command file is not a safe regular file"));
+    }
+    let bytes = fs::read(&cheats.script_path)
+        .map_err(|_| bad("the cheat command file could not be read"))?;
+    if !sha256_hex(&bytes).eq_ignore_ascii_case(cheats.script_sha256.trim()) {
+        return Err(bad("the cheat command file changed since it was written"));
+    }
+    command.arguments.insert(1, VICE_MONITOR_COMMANDS.into());
+    command
+        .arguments
+        .insert(2, cheats.script_path.clone().into_os_string());
+    Ok(command)
+}
+
+/// A running VICE with the launch-owned cheat command file it was started with.
+pub struct ViceCheatSession {
+    process: WatchedProcess,
+    script: ViceMonitorScript,
+}
+
+impl ViceCheatSession {
+    pub fn pid(&self) -> u32 {
+        self.process.pid
+    }
+    pub fn poll(&mut self) -> Option<&process_spawn::ProcessExitReport> {
+        self.process.poll()
+    }
+    pub fn is_running(&self) -> bool {
+        self.process.is_running()
+    }
+}
+
+impl Drop for ViceCheatSession {
+    fn drop(&mut self) {
+        // The command file is removed with the session once VICE has exited;
+        // a session dropped while VICE still runs leaves it for the OS temp
+        // cleaner rather than pulling it out from under the emulator.
+        let running = self.process.poll().is_none();
+        self.script.persist_if_running(running);
+    }
+}
+
+pub fn spawn_vice_with_cheats(
+    command: &PreparedProcessCommand,
+    script: ViceMonitorScript,
+) -> std::io::Result<ViceCheatSession> {
+    Ok(ViceCheatSession {
+        process: process_spawn::spawn_watched_process(command)?,
+        script,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +523,203 @@ mod tests {
         );
     }
 
+    fn ram_projection() -> ViceCheatProjection {
+        use crate::patch_manager::CheatOperation;
+        use crate::patch_manager::{ViceCheatIdentity, project_vice_c64_pokes};
+        project_vice_c64_pokes(
+            &[CheatOperation::Write8 {
+                address: 0xC000,
+                value: 0xFF,
+            }],
+            &ViceCheatIdentity::VerifiedGame("c64sha".into()),
+        )
+    }
+
+    #[test]
+    fn script_is_regenerated_private_and_removed_with_its_owner() {
+        let fx = fixture();
+        let scratch = tempdir().unwrap();
+        let (script, launch) =
+            ViceMonitorScript::create(scratch.path(), &ram_projection(), "c64sha").unwrap();
+        assert_eq!(
+            fs::read_to_string(script.path()).unwrap(),
+            "radix H\n> C000 FF\nx\n"
+        );
+        assert_eq!(launch.script_path, script.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(script.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let dir = script.path().parent().unwrap();
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let dir = script.path().parent().unwrap().to_path_buf();
+        // The game media is never touched by building cheats.
+        assert_eq!(fs::read(&fx.rom).unwrap(), b"rom-bytes");
+        drop(script);
+        assert!(!dir.exists(), "temporary command file must be cleaned up");
+    }
+
+    #[test]
+    fn only_launch_ready_ram_and_colour_ram_cheats_are_accepted() {
+        use crate::patch_manager::CheatOperation;
+        use crate::patch_manager::{ViceCheatIdentity, project_vice_c64_pokes};
+        let scratch = tempdir().unwrap();
+        let strong = ViceCheatIdentity::VerifiedGame("c64sha".into());
+        // Weak identity is preview-only.
+        let weak = project_vice_c64_pokes(
+            &[CheatOperation::Write8 {
+                address: 0xC000,
+                value: 1,
+            }],
+            &ViceCheatIdentity::TitleOnly("title".into()),
+        );
+        assert!(ViceMonitorScript::create(scratch.path(), &weak, "c64sha").is_err());
+        // I/O and ROM-mapped targets are never applied automatically.
+        for address in [0xD020_u64, 0xE000, 0x8000] {
+            let projection =
+                project_vice_c64_pokes(&[CheatOperation::Write8 { address, value: 1 }], &strong);
+            assert!(
+                ViceMonitorScript::create(scratch.path(), &projection, "c64sha").is_err(),
+                "{address:#x} must be refused"
+            );
+        }
+        // Colour RAM is allowed; an empty selection and a blank game key are not.
+        let colour = project_vice_c64_pokes(
+            &[CheatOperation::Write8 {
+                address: 0xD800,
+                value: 1,
+            }],
+            &strong,
+        );
+        assert!(ViceMonitorScript::create(scratch.path(), &colour, "c64sha").is_ok());
+        let none = project_vice_c64_pokes(&[], &strong);
+        assert!(ViceMonitorScript::create(scratch.path(), &none, "c64sha").is_err());
+        assert!(ViceMonitorScript::create(scratch.path(), &ram_projection(), " ").is_err());
+    }
+
+    #[test]
+    fn preflight_with_cheats_adds_moncommands_and_still_runs_the_canonical_checks() {
+        let fx = fixture();
+        let scratch = tempdir().unwrap();
+        let (script, launch) =
+            ViceMonitorScript::create(scratch.path(), &ram_projection(), "c64sha").unwrap();
+        let command = preflight_vice_launch_with_cheats(
+            &request(&fx),
+            &fx.roots,
+            &identity("Commodore 64", "c64sha"),
+            Some(&launch),
+        )
+        .unwrap();
+        assert_eq!(
+            command.arguments,
+            vec![
+                std::ffi::OsString::from("+saveres"),
+                std::ffi::OsString::from("-moncommands"),
+                script.path().as_os_str().to_owned(),
+                std::ffi::OsString::from("-autostart"),
+                fx.rom.clone().into_os_string(),
+            ]
+        );
+        // Without cheats the command is exactly the baseline one.
+        let plain = preflight_vice_launch(
+            &request(&fx),
+            &fx.roots,
+            &identity("Commodore 64", "c64sha"),
+        )
+        .unwrap();
+        assert_eq!(
+            preflight_vice_launch_with_cheats(
+                &request(&fx),
+                &fx.roots,
+                &identity("Commodore 64", "c64sha"),
+                None
+            )
+            .unwrap(),
+            plain
+        );
+        // The canonical preflight still refuses a changed game even with cheats.
+        let authorised = request(&fx);
+        fs::write(&fx.rom, b"changed").unwrap();
+        assert_eq!(
+            preflight_vice_launch_with_cheats(
+                &authorised,
+                &fx.roots,
+                &identity("Commodore 64", "c64sha"),
+                Some(&launch),
+            )
+            .unwrap_err()
+            .kind,
+            ViceLaunchPreflightErrorKind::ContentChangedBeforeSpawn
+        );
+    }
+
+    #[test]
+    fn stale_wrong_game_or_tampered_cheats_are_refused() {
+        let fx = fixture();
+        let scratch = tempdir().unwrap();
+        let (script, launch) =
+            ViceMonitorScript::create(scratch.path(), &ram_projection(), "c64sha").unwrap();
+        let go = |launch: &ViceCheatLaunch| {
+            preflight_vice_launch_with_cheats(
+                &request(&fx),
+                &fx.roots,
+                &identity("Commodore 64", "c64sha"),
+                Some(launch),
+            )
+        };
+        let mut other = launch.clone();
+        other.game_key = "other".into();
+        assert!(go(&other).is_err());
+        fs::write(script.path(), "radix H\n> C000 00\nx\n").unwrap();
+        assert!(go(&launch).unwrap_err().detail.contains("changed"));
+        fs::remove_file(script.path()).unwrap();
+        assert!(go(&launch).unwrap_err().detail.contains("no longer"));
+        #[cfg(unix)]
+        {
+            let target = scratch.path().join("elsewhere.txt");
+            fs::write(&target, "radix H\n> C000 FF\nx\n").unwrap();
+            std::os::unix::fs::symlink(&target, script.path()).unwrap();
+            assert!(
+                go(&launch)
+                    .unwrap_err()
+                    .detail
+                    .contains("not a safe regular")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_keeps_the_file_while_running_and_cleans_up_after_exit() {
+        let scratch = tempdir().unwrap();
+        let (script, _launch) =
+            ViceMonitorScript::create(scratch.path(), &ram_projection(), "c64sha").unwrap();
+        let dir = script.path().parent().unwrap().to_path_buf();
+        let command = PreparedProcessCommand {
+            executable: "/bin/sleep".into(),
+            arguments: vec!["0.3".into()],
+            working_directory: None,
+        };
+        let mut session = spawn_vice_with_cheats(&command, script).unwrap();
+        assert!(session.is_running());
+        assert!(dir.exists(), "file must stay while the process runs");
+        for _ in 0..100 {
+            if session.poll().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!session.is_running());
+        drop(session);
+        assert!(!dir.exists(), "file is removed once the process has exited");
+    }
     #[test]
     fn non_c64_platform_is_refused() {
         let fx = fixture();
