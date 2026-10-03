@@ -18,6 +18,9 @@ use std::path::{Path, PathBuf};
 pub type ProviderResult<T> = Result<T, String>;
 pub const PARSER_VERSION: u32 = 1;
 pub const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
+/// Prefix of `ProviderSnapshot::source_identifier` for evidence the user
+/// imported from a local file rather than captured from an installed tool.
+pub const LOCAL_IMPORT_PREFIX: &str = "local-import:";
 
 /// Provider-facing adapter over the generic immutable managed-source
 /// lifecycle. Provider payloads remain provider-owned JSON; this type only
@@ -26,6 +29,8 @@ pub const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 pub struct ManagedProviderStore {
     provider: IdentityProvider,
     store: ManagedSourceStore,
+    /// True for the separate store that holds locally imported evidence.
+    imported: bool,
 }
 
 impl ManagedProviderStore {
@@ -49,7 +54,43 @@ impl ManagedProviderStore {
             trust: ManagedSourceTrust::Official,
         };
         ManagedSourceStore::new(root, descriptor)
-            .map(|store| Self { provider, store })
+            .map(|store| Self {
+                provider,
+                store,
+                imported: false,
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    /// A separate store for evidence the user imported from a local file. It
+    /// is never labelled official: trust is `UserProvided`, the provider ID is
+    /// distinct (so histories never mix), and it refuses captured snapshots.
+    pub fn new_imported(root: PathBuf, provider: IdentityProvider) -> ProviderResult<Self> {
+        if provider != IdentityProvider::Mame {
+            return Err("Only MAME listxml can be imported as provider evidence".into());
+        }
+        let descriptor = ManagedSourceDescriptor {
+            provider_id: format!("{}-local-import", provider.slug()),
+            display_name: format!(
+                "{} listxml imported locally (not vouched for)",
+                provider.label()
+            ),
+            source_kind: ManagedSourceKind::Local,
+            source: ManagedSourceReference::LocalPath(PathBuf::from(format!(
+                "{LOCAL_IMPORT_PREFIX}mame-listxml"
+            ))),
+            expected_media_type: "application/vnd.emuwiz.identity-provider+json".into(),
+            maximum_size_bytes: MAX_SNAPSHOT_BYTES,
+            attribution_url: None,
+            parser_schema_version: PARSER_VERSION.to_string(),
+            trust: ManagedSourceTrust::UserProvided,
+        };
+        ManagedSourceStore::new(root, descriptor)
+            .map(|store| Self {
+                provider,
+                store,
+                imported: true,
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -63,6 +104,13 @@ impl ManagedProviderStore {
     ) -> ProviderResult<ValidatedCandidate> {
         if snapshot.provider != self.provider {
             return Err("provider snapshot does not match managed provider store".into());
+        }
+        if snapshot.is_local_import() != self.imported {
+            return Err(if self.imported {
+                "this store only holds locally imported evidence".into()
+            } else {
+                "imported evidence cannot be stored as an official provider snapshot".into()
+            });
         }
         snapshot.validate()?;
         let bytes = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
@@ -173,6 +221,11 @@ impl ProviderSnapshot {
             .map(|b| sha256(&b))
             .map_err(|e| e.to_string())
     }
+    /// True for evidence imported from a local file (not captured from an
+    /// installed tool, and not vouched for).
+    pub fn is_local_import(&self) -> bool {
+        self.source_identifier.starts_with(LOCAL_IMPORT_PREFIX)
+    }
     pub fn record_count(&self) -> usize {
         match &self.records {
             ProviderRecords::DatLike { catalogue, .. } => catalogue.games.len(),
@@ -249,6 +302,9 @@ impl MatchStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatchOrigin {
     OfficialMame,
+    /// A MAME listxml the user imported from a local file: real hash matching,
+    /// but EmuWiz did not obtain or vouch for the catalogue.
+    ImportedMame,
     OfficialScummVm,
     EmuwizDiscovery,
 }
@@ -256,6 +312,7 @@ impl MatchOrigin {
     pub fn label(self) -> &'static str {
         match self {
             Self::OfficialMame => "MAME official",
+            Self::ImportedMame => "MAME listxml imported locally (not vouched for)",
             Self::OfficialScummVm => "Official ScummVM match",
             Self::EmuwizDiscovery => "EmuWiz discovery — not an official match",
         }
@@ -301,6 +358,36 @@ pub fn check_provider(
         IdentityProvider::Mame => mame::capture(executable),
         IdentityProvider::ScummVm => scummvm::capture(executable),
         _ => Err("Only MAME and ScummVM belong to this proof of concept".into()),
+    }
+}
+
+/// Explicit import of locally supplied evidence. Nothing is published until the
+/// caller stages and activates the snapshot through an imported-evidence store.
+pub fn import_provider_snapshot(
+    provider: IdentityProvider,
+    path: &Path,
+) -> ProviderResult<ProviderSnapshot> {
+    match provider {
+        IdentityProvider::Mame => mame::snapshot_from_mame_listxml(path),
+        _ => Err("Only a MAME listxml can be imported as provider evidence".into()),
+    }
+}
+
+/// Like [`verify`], but refuses when the snapshot is for a different MAME
+/// build than `expected_version` (evidence is never silently substituted).
+pub fn verify_expecting_version(
+    snapshot: &ProviderSnapshot,
+    path: &Path,
+    expected_version: Option<&str>,
+) -> ProviderResult<ProviderIdentityResult> {
+    snapshot.validate()?;
+    match snapshot.provider {
+        IdentityProvider::Mame => mame::verify_expecting(snapshot, path, expected_version),
+        IdentityProvider::ScummVm if expected_version.is_some() => {
+            Err("Version pinning is only defined for MAME evidence".into())
+        }
+        IdentityProvider::ScummVm => scummvm::verify(snapshot, path),
+        _ => Err("Unsupported provider".into()),
     }
 }
 
