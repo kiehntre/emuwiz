@@ -9,7 +9,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
 use archivefs_core::dat::archive::{
-    limits::ArchiveLimits, rar::RarProvider, sevenz::SevenZArchiveSource,
+    ArchiveMemberSourceError,
+    limits::ArchiveLimits,
+    rar::{RarError, RarProvider},
+    sevenz::SevenZArchiveSource,
 };
 use archivefs_core::ingestion::ArchiveFormat;
 use archivefs_core::safe_read::TrustedRoots;
@@ -42,7 +45,7 @@ enum Status {
     Idle,
     Loading {
         target: ArchiveInspectorTarget,
-        receiver: Receiver<Result<ArchiveInspection, String>>,
+        receiver: Receiver<Result<ArchiveInspection, Failure>>,
     },
     Ready {
         target: ArchiveInspectorTarget,
@@ -50,8 +53,64 @@ enum Status {
     },
     Error {
         target: ArchiveInspectorTarget,
-        message: String,
+        failure: Failure,
     },
+}
+
+/// A failed inspection: plain-language `message` for the primary UI and the
+/// raw error text kept only for the Technical details disclosure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Failure {
+    message: String,
+    technical: String,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self {
+            technical: message.clone(),
+            message,
+        }
+    }
+}
+
+fn sevenz_failure(error: &ArchiveMemberSourceError) -> Failure {
+    use ArchiveMemberSourceError::*;
+    let message = match error {
+        Cancelled => "The inspection was cancelled.",
+        Open { .. } => "This 7z archive could not be opened.",
+        Corrupt { .. } => "This 7z archive looks damaged or incomplete.",
+        Encrypted => "This 7z archive is password-protected, so its contents can't be listed.",
+        Unsupported { .. } => "This 7z archive uses a feature EmuWiz can't read.",
+        RefusedLimits { .. } => "This 7z archive is too large or complex to inspect safely.",
+    };
+    Failure {
+        message: message.into(),
+        technical: format!("7z inspection refused this archive: {error:?}"),
+    }
+}
+
+fn rar_failure(error: &RarError) -> Failure {
+    use RarError::*;
+    let message = match error {
+        BackendNotFound | BackendUnavailable { .. } => {
+            "RAR support isn't available on this computer, so this archive can't be listed."
+        }
+        Timeout => "Reading this RAR archive took too long.",
+        EncryptedArchive => {
+            "This RAR archive is password-protected, so its contents can't be listed."
+        }
+        InvalidSignature | CorruptArchive { .. } => "This RAR archive looks damaged or incomplete.",
+        UnsupportedArchive { .. } => "This RAR archive uses a feature EmuWiz can't read.",
+        ProcessOutputLimit { .. } | OutputLimitExceeded { .. } | MemberTooLarge { .. } => {
+            "This RAR archive is too large or complex to inspect safely."
+        }
+        _ => "This RAR archive could not be read.",
+    };
+    Failure {
+        message: message.into(),
+        technical: format!("RAR inspection refused this archive: {error:?}"),
+    }
 }
 
 pub(crate) struct ArchiveInspectorPageState {
@@ -218,6 +277,19 @@ impl ArchiveInspectorPageState {
             self.status = Status::Idle;
             return;
         };
+        self.start(target, ctx);
+    }
+
+    /// Try again after a failure. Starts a fresh inspection even though the
+    /// target path is unchanged; a no-op unless currently in the Error state.
+    pub(crate) fn retry(&mut self, ctx: &egui::Context) {
+        if let Status::Error { target, .. } = &self.status {
+            let target = target.clone();
+            self.start(target, ctx);
+        }
+    }
+
+    fn start(&mut self, target: ArchiveInspectorTarget, ctx: &egui::Context) {
         let path = target.path.clone();
         let (sender, receiver) = mpsc::channel();
         let repaint = ctx.clone();
@@ -234,9 +306,9 @@ impl ArchiveInspectorPageState {
             Status::Loading { receiver, .. } => match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err(
-                    "The archive inspection worker stopped unexpectedly.".into(),
-                )),
+                Err(TryRecvError::Disconnected) => Some(Err(Failure::from(
+                    "The archive inspection worker stopped unexpectedly.".to_string(),
+                ))),
             },
             _ => None,
         };
@@ -249,23 +321,25 @@ impl ArchiveInspectorPageState {
         };
         self.status = match result {
             Ok(inspection) => Status::Ready { target, inspection },
-            Err(message) => Status::Error { target, message },
+            Err(failure) => Status::Error { target, failure },
         };
         ctx.request_repaint();
     }
 }
 
-fn inspect_path(path: &Path) -> Result<ArchiveInspection, String> {
+fn inspect_path(path: &Path) -> Result<ArchiveInspection, Failure> {
     let format = archive_format(
         path.extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or_default(),
     )
-    .ok_or_else(|| "This file is not a supported ZIP, 7z or RAR archive.".to_string())?;
+    .ok_or_else(|| {
+        Failure::from("This file is not a supported ZIP, 7z or RAR archive.".to_string())
+    })?;
     match format {
         ArchiveFormat::Zip => inspect_archive(path)
             .map(|report| inspection(format, report))
-            .map_err(|error| error.to_string()),
+            .map_err(|error| Failure::from(error.to_string())),
         ArchiveFormat::SevenZip => inspect_sevenz(path, format),
         ArchiveFormat::Rar => inspect_rar(path, format),
         ArchiveFormat::Tar => unreachable!("TAR is not exposed by archive_format"),
@@ -285,16 +359,22 @@ fn inspection(format: ArchiveFormat, report: InspectorReport) -> ArchiveInspecti
     }
 }
 
-fn inspect_sevenz(path: &Path, format: ArchiveFormat) -> Result<ArchiveInspection, String> {
+fn inspect_sevenz(path: &Path, format: ArchiveFormat) -> Result<ArchiveInspection, Failure> {
     let parent = path
         .parent()
-        .ok_or_else(|| "The 7z archive has no trusted parent directory.".to_string())?
+        .ok_or_else(|| {
+            Failure::from("The 7z archive has no trusted parent directory.".to_string())
+        })?
         .canonicalize()
-        .map_err(|error| format!("could not establish a trusted archive directory: {error}"))?;
+        .map_err(|error| {
+            Failure::from(format!(
+                "could not establish a trusted archive directory: {error}"
+            ))
+        })?;
     let trusted = TrustedRoots::from_paths([parent]);
     let cancel = AtomicBool::new(false);
     let source = SevenZArchiveSource::open(path, &trusted, ArchiveLimits::default(), &cancel)
-        .map_err(|error| format!("7z inspection refused this archive: {error:?}"))?;
+        .map_err(|error| sevenz_failure(&error))?;
     let members: Vec<_> = source.member_metadata().collect();
     let total = members.len();
     let entries = members
@@ -321,12 +401,11 @@ fn inspect_sevenz(path: &Path, format: ArchiveFormat) -> Result<ArchiveInspectio
     Ok(inspection(format, report))
 }
 
-fn inspect_rar(path: &Path, format: ArchiveFormat) -> Result<ArchiveInspection, String> {
-    let provider = RarProvider::discover(RAR_TIMEOUT)
-        .map_err(|error| format!("RAR inspection is unavailable: {error}"))?;
+fn inspect_rar(path: &Path, format: ArchiveFormat) -> Result<ArchiveInspection, Failure> {
+    let provider = RarProvider::discover(RAR_TIMEOUT).map_err(|error| rar_failure(&error))?;
     let session = provider
         .open(path, RAR_TIMEOUT)
-        .map_err(|error| format!("RAR inspection refused this archive: {error}"))?;
+        .map_err(|error| rar_failure(&error))?;
     let total = session.members.len();
     let entries = session
         .members
@@ -393,21 +472,26 @@ pub(crate) fn show(
             });
         }
         ui.add_space(8.0);
+        let mut retry = false;
         match &state.status {
             Status::Loading { .. } => {
                 ui.spinner();
                 ui.label("Inspecting archive metadata in the background…");
             }
-            Status::Error { message, .. } => {
+            Status::Error { failure, .. } => {
                 ui.colored_label(
                     ui.visuals().error_fg_color,
                     "Archive inspection unavailable",
                 );
-                ui.label(message);
-                ui.collapsing("Technical details", |ui| ui.monospace(message));
+                ui.label(&failure.message);
+                retry = ui.button("Try again").clicked();
+                ui.collapsing("Technical details", |ui| ui.monospace(&failure.technical));
             }
             Status::Ready { inspection, .. } => show_report(ui, inspection),
             Status::Idle => unreachable!(),
+        }
+        if retry {
+            state.retry(ui.ctx());
         }
         return;
     }
@@ -544,5 +628,63 @@ mod tests {
             assert_eq!(view.listed_logical_size, Some(42));
             assert_eq!(view.report.entries.len(), 1);
         }
+    }
+
+    fn target() -> ArchiveInspectorTarget {
+        ArchiveInspectorTarget {
+            game_id: None,
+            title: "Broken".into(),
+            path: PathBuf::from("/nonexistent/broken.7z"),
+            media: "Disc".into(),
+            platform: "PS1".into(),
+        }
+    }
+
+    #[test]
+    fn sevenz_failure_is_plain_language_not_debug() {
+        let error = ArchiveMemberSourceError::Corrupt {
+            detail: "bad header".into(),
+        };
+        let failure = sevenz_failure(&error);
+        assert_ne!(failure.message, format!("{error:?}"));
+        assert!(!failure.message.contains("Corrupt {"));
+        assert!(failure.technical.contains("Corrupt"));
+    }
+
+    #[test]
+    fn rar_failure_is_plain_language_not_debug() {
+        let error = RarError::CorruptArchive {
+            detail: "bad".into(),
+        };
+        let failure = rar_failure(&error);
+        assert_ne!(failure.message, format!("{error:?}"));
+        assert_ne!(failure.message, error.to_string());
+        assert!(failure.technical.contains("CorruptArchive"));
+    }
+
+    #[test]
+    fn retry_restarts_from_error_with_unchanged_target() {
+        let ctx = egui::Context::default();
+        let mut state = ArchiveInspectorPageState {
+            status: Status::Error {
+                target: target(),
+                failure: Failure::from("boom".to_string()),
+            },
+            rows: None,
+        };
+        // Same target again does nothing (documented set_target behaviour)...
+        state.set_target(Some(target()), &ctx);
+        assert!(matches!(state.status, Status::Error { .. }));
+        // ...but Retry starts a fresh inspection.
+        state.retry(&ctx);
+        assert!(matches!(state.status, Status::Loading { .. }));
+    }
+
+    #[test]
+    fn retry_without_a_target_is_a_safe_noop() {
+        let ctx = egui::Context::default();
+        let mut state = ArchiveInspectorPageState::default();
+        state.retry(&ctx);
+        assert!(matches!(state.status, Status::Idle));
     }
 }

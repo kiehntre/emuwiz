@@ -3,6 +3,8 @@
 //! RetroArch apply is limited to the exact discovered config scope and uses
 //! the core shared transaction/history executor for all mutation.
 
+use crate::ui::components::{StatusTone, banner, technical_details};
+use archivefs_core::bezel_apply::BezelPlanRefusal;
 use archivefs_core::bezel_apply::{
     BezelApplyPlan, BezelApplyRequest, BezelApplyStatus, BezelPlanError,
 };
@@ -16,6 +18,7 @@ use archivefs_core::patch_manager::{
     RetroArchBezelApplyOptions, apply_retroarch_bezel_plan, default_shared_backup_root,
     default_shared_history_root, prepare_retroarch_bezel_plan,
 };
+use archivefs_core::patch_manager::{SharedApplyResult, SharedApplyStatus};
 use eframe::egui;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,7 +37,7 @@ pub(super) struct BezelPanelState {
     preview_error: Option<String>,
     apply_plan: Option<BezelApplyPlan>,
     apply_error: Option<BezelPlanError>,
-    apply_result: Option<String>,
+    apply_result: Option<ApplyOutcome>,
     apply_confirmation: bool,
     retroarch_config_path: Option<PathBuf>,
     retroarch_overlay_root: Option<PathBuf>,
@@ -236,14 +239,14 @@ impl BezelPanelState {
         let history = match default_shared_history_root() {
             Ok(path) => path,
             Err(error) => {
-                self.apply_result = Some(format!("Apply refused: {error:?}"));
+                self.apply_result = Some(ApplyOutcome::refused(format!("{error:?}")));
                 return;
             }
         };
         let backup = match default_shared_backup_root() {
             Ok(path) => path,
             Err(error) => {
-                self.apply_result = Some(format!("Apply refused: {error:?}"));
+                self.apply_result = Some(ApplyOutcome::refused(format!("{error:?}")));
                 return;
             }
         };
@@ -261,18 +264,113 @@ impl BezelPanelState {
                 backup_root: backup,
             },
         ) {
-            Ok(result) => {
-                self.apply_result = Some(format!(
-                    "Apply {:?}; history journal: {}",
-                    result.journal.status,
-                    result
-                        .journal_path
-                        .map_or_else(|| "not written".into(), |path| path.display().to_string())
-                ))
-            }
-            Err(error) => self.apply_result = Some(format!("Apply refused: {error}")),
+            Ok(result) => self.apply_result = Some(ApplyOutcome::from_result(&result)),
+            Err(error) => self.apply_result = Some(ApplyOutcome::refused(error.to_string())),
         }
     }
+}
+
+/// User-facing result of an apply attempt. The headline is plain language;
+/// the raw status/refusal text lives only in `technical` (Details).
+#[derive(Clone, Debug, PartialEq)]
+struct ApplyOutcome {
+    tone: StatusTone,
+    headline: &'static str,
+    detail: &'static str,
+    undo_available: bool,
+    technical: String,
+}
+
+impl ApplyOutcome {
+    fn refused(technical: String) -> Self {
+        Self {
+            tone: StatusTone::Blocked,
+            headline: "Apply refused",
+            detail: "Nothing has changed.",
+            undo_available: false,
+            technical,
+        }
+    }
+
+    fn from_result(result: &SharedApplyResult) -> Self {
+        let journal = result
+            .journal_path
+            .as_ref()
+            .map_or_else(|| "not written".into(), |path| path.display().to_string());
+        let technical = format!("{:?}; history journal: {journal}", result.journal.status);
+        // Undo is only real when a history journal was persisted for a run
+        // that actually wrote something.
+        let (tone, headline, detail, wrote) = match result.journal.status {
+            SharedApplyStatus::Success => (
+                StatusTone::Success,
+                "Bezel applied",
+                "The bezel configuration was written.",
+                true,
+            ),
+            SharedApplyStatus::PartialFailure => (
+                StatusTone::Warning,
+                "Bezel only partly applied",
+                "Some changes were made and some were not. Review the history before retrying.",
+                true,
+            ),
+            SharedApplyStatus::Failed => (
+                StatusTone::Blocked,
+                "Apply failed",
+                "The bezel could not be applied.",
+                false,
+            ),
+            SharedApplyStatus::DryRun => (
+                StatusTone::Info,
+                "Dry run only",
+                "Nothing has changed.",
+                false,
+            ),
+        };
+        Self {
+            tone,
+            headline,
+            detail,
+            undo_available: wrote && result.journal_path.is_some(),
+            technical,
+        }
+    }
+}
+
+fn refusal_label(refusal: &BezelPlanRefusal) -> &'static str {
+    use BezelPlanRefusal::*;
+    match refusal {
+        MissingSourceAsset => "The bezel image is no longer available.",
+        SourceSymlink => "The bezel image is a shortcut (symlink), which isn't allowed.",
+        SourceOutsideApprovedRoot => "The bezel image is outside your approved bezel folders.",
+        SourceTooLarge => "The bezel image is too large.",
+        UnsupportedSource => "This kind of bezel image isn't supported.",
+        InvalidIdentity => "No game was identified for this bezel.",
+        InvalidViewport => "The bezel's screen cutout is not valid.",
+        UnsupportedEmulator => "Applying bezels isn't supported for this emulator yet.",
+        MissingRetroArchConfigPath => "RetroArch's config location was not found.",
+        MissingRetroArchOverlayRoot => "RetroArch's overlay folder was not found.",
+        DestinationOutsideApprovedRoot => "The destination is outside RetroArch's folders.",
+        RetroArchConfigWriterMissing => "Writing RetroArch config is not available yet.",
+        RetroArchCoreRequired => "Choose a RetroArch core first.",
+        RetroArchConfigScopeInvalid => "The RetroArch config scope is not valid.",
+        RetroArchOverlayOutsideConfigRoot => {
+            "The overlay folder is outside RetroArch's config folder."
+        }
+        RetroArchUnsafeName => "The game or core name can't be used safely as a file name.",
+        RetroArchDestinationUnsafe => "The destination isn't safe to write to.",
+    }
+}
+
+fn show_apply_outcome(ui: &mut egui::Ui, outcome: &ApplyOutcome) {
+    banner(ui, outcome.headline, outcome.detail, outcome.tone);
+    ui.label(if outcome.undo_available {
+        "Undo available"
+    } else {
+        "Undo not available"
+    });
+    technical_details(ui, "bezel_apply_outcome_details", |ui| {
+        ui.monospace(&outcome.technical);
+    });
 }
 
 pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
@@ -393,7 +491,13 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
         state.preview_apply();
     }
     if let Some(error) = &state.apply_error {
-        ui.collapsing("Apply plan refusal", |ui| {
+        banner(
+            ui,
+            "Can't apply this bezel",
+            &format!("{} Nothing has changed.", refusal_label(&error.refusal)),
+            StatusTone::Blocked,
+        );
+        technical_details(ui, "bezel_plan_refusal_details", |ui| {
             ui.label(&error.detail);
             ui.monospace(format!("Refusal: {:?}", error.refusal));
             if let Some(path) = &error.path {
@@ -426,7 +530,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
                 ui.small(warning);
             }
             for refusal in &plan.refusals {
-                ui.small(format!("Blocked: {refusal:?}"));
+                ui.small(format!("Blocked: {}", refusal_label(refusal)));
             }
             ui.checkbox(
                 &mut state.apply_confirmation,
@@ -445,7 +549,7 @@ pub(super) fn show(ui: &mut egui::Ui, state: &mut BezelPanelState) {
         });
     }
     if let Some(result) = &state.apply_result {
-        ui.colored_label(egui::Color32::LIGHT_GREEN, result);
+        show_apply_outcome(ui, result);
     }
     if state.apply_supported() {
         ui.label("Apply is available after confirmation.");
@@ -634,5 +738,59 @@ mod tests {
             egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
         });
         assert!(state.preview_error.is_some());
+    }
+
+    fn texts(output: &egui::FullOutput) -> String {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render(outcome: &ApplyOutcome) -> String {
+        let context = egui::Context::default();
+        let output = context.run(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| show_apply_outcome(ui, outcome));
+        });
+        texts(&output)
+    }
+
+    #[test]
+    fn refusal_is_plain_blocked_and_says_nothing_changed() {
+        let refusal = BezelPlanRefusal::SourceOutsideApprovedRoot;
+        let label = refusal_label(&refusal);
+        assert_ne!(label, format!("{refusal:?}"));
+        let outcome = ApplyOutcome::refused("SourceOutsideApprovedRoot".into());
+        assert_eq!(outcome.tone, StatusTone::Blocked);
+        assert!(outcome.detail.contains("Nothing has changed"));
+        let rendered = render(&outcome);
+        assert!(rendered.contains("Nothing has changed"));
+        assert!(rendered.contains("Undo not available"));
+        // Raw code stays behind the collapsed Technical details disclosure.
+        assert!(rendered.contains("Technical details"));
+        assert!(!rendered.contains("SourceOutsideApprovedRoot"));
+    }
+
+    #[test]
+    fn undo_wording_follows_whether_anything_was_written() {
+        let ok = ApplyOutcome {
+            tone: StatusTone::Success,
+            headline: "Bezel applied",
+            detail: "",
+            undo_available: true,
+            technical: "Success".into(),
+        };
+        assert!(render(&ok).contains("Undo available"));
+        assert!(!render(&ok).contains("Undo not available"));
+        assert_eq!(
+            ApplyOutcome::refused("x".into()).tone,
+            StatusTone::Blocked,
+            "failure must never use the success tone"
+        );
     }
 }

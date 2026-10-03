@@ -113,6 +113,33 @@ fn state_name(state: MediaSetState) -> &'static str {
     }
 }
 
+/// Plain-language name for an engine conflict kind. Exhaustive on purpose: a
+/// new engine kind must get a friendly label before it can compile.
+fn conflict_label(kind: ConflictKind) -> &'static str {
+    use ConflictKind::*;
+    match kind {
+        PlatformConflict => "These files look like they belong to different systems",
+        ReleaseConflict => "These files look like different releases of the game",
+        VariantConflict => "These files look like different versions or regions",
+        OrdinalConflict => "Two files claim to be the same disc number",
+        SideConflict => "Two files claim to be the same disk side",
+        RoleConflict => "These files seem to have different jobs (for example install vs. play)",
+        CountConflict => "The files disagree about how many discs the game has",
+        IdentityConflict => "These files appear to be different games",
+        CompetingMedia => "More than one file competes for the same disc slot",
+        MissingMedium => "A disc appears to be missing",
+        MissingSide => "A disk side appears to be missing",
+        UnknownCount => "The number of discs could not be worked out",
+        UnknownOrdinal => "The disc number of a file could not be worked out",
+        UnprovenGrouping => "Nothing confirms these files belong together",
+        UnsupportedFormat => "A file is in a format that can't be checked",
+        InvalidEvidence => "Some information about a file could not be trusted",
+        UnavailableRepresentation => "A file could not be reached",
+        UnresolvedRepresentation => "A file could not be matched to a disc",
+        RelationshipConflict => "The files' relationships to each other contradict one another",
+    }
+}
+
 fn is_multi(set: &MediaSet) -> bool {
     set.members.len() > 1
         || set
@@ -229,10 +256,10 @@ pub(super) fn view_of(set: &MediaSet, ids: &HashMap<PathBuf, i64>) -> SetView {
                 | ConflictKind::RelationshipConflict
         );
         if c.blocking && contradiction {
-            conflicts.push(text);
-        } else {
-            why.push(text);
+            conflicts.push(conflict_label(c.kind).to_string());
         }
+        // The raw engine vocabulary stays available under Details.
+        why.push(text);
     }
     let mut members: Vec<MemberView> = set
         .members
@@ -613,4 +640,41 @@ fn show_set(ui: &mut egui::Ui, set: &SetView, go: &mut Option<Route>) {
             });
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ConflictKind::*;
+
+    #[test]
+    fn every_conflict_kind_has_a_friendly_primary_label() {
+        let all = [
+            PlatformConflict,
+            ReleaseConflict,
+            VariantConflict,
+            OrdinalConflict,
+            SideConflict,
+            RoleConflict,
+            CountConflict,
+            IdentityConflict,
+            CompetingMedia,
+            MissingMedium,
+            MissingSide,
+            UnknownCount,
+            UnknownOrdinal,
+            UnprovenGrouping,
+            UnsupportedFormat,
+            InvalidEvidence,
+            UnavailableRepresentation,
+            UnresolvedRepresentation,
+            RelationshipConflict,
+        ];
+        assert_eq!(all.len(), 19);
+        for kind in all {
+            let label = conflict_label(kind);
+            assert_ne!(label, format!("{kind:?}"));
+            assert!(label.contains(' '), "{kind:?} label should be a sentence");
+        }
+    }
 }
