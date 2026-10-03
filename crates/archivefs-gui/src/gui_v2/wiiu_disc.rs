@@ -4,6 +4,10 @@ use eframe::egui;
 
 use super::library::Game;
 
+mod queue;
+#[cfg(test)]
+mod queue_tests;
+
 fn is_wii_u(game: &Game) -> bool {
     game.platform.eq_ignore_ascii_case("Wii U") || game.platform.eq_ignore_ascii_case("WiiU")
 }
@@ -36,7 +40,7 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
     egui::CollapsingHeader::new("Wii U disc container")
         .default_open(true)
         .show(ui, |ui| {
-            ui.label("Read-only bounded WUD/WUX inspection. No keys are exposed and no conversion is available.");
+            ui.label("Read-only bounded WUD/WUX inspection. No keys are exposed.");
             egui::Grid::new("wiiu_disc_summary")
                 .num_columns(2)
                 .striped(true)
@@ -89,7 +93,7 @@ pub(super) fn show(ui: &mut egui::Ui, game: &Game) {
             for issue in &report.issues {
                 ui.colored_label(ui.visuals().warn_fg_color, format!("Issue: {issue:?}"));
             }
-            ui.label("Source files remain unchanged. Decryption, extraction, conversion, and apply are not performed.");
+            ui.label("Your files are not changed by this inspection. Decryption and extraction are never performed.");
             show_conversion_readiness(ui, game, report.format);
         });
 }
@@ -108,38 +112,7 @@ fn show_conversion_readiness(
         }
         _ => return,
     };
-    let target = game.archive.absolute_path.with_extension(match direction {
-        archivefs_core::wiiu_conversion::WiiUConversionDirection::WudToWux => "wux",
-        archivefs_core::wiiu_conversion::WiiUConversionDirection::WuxToWud => "wud",
-    });
-    let plan = archivefs_core::wiiu_conversion::plan_wiiu_conversion(
-        &archivefs_core::wiiu_conversion::WiiUConversionRequest {
-            source: game.archive.absolute_path.clone(),
-            destination: target,
-            direction,
-            source_identity: archivefs_core::wiiu_conversion::WiiUConversionIdentity::HashMissing,
-            available_free_space: None,
-            tools: archivefs_core::wiiu_conversion::probe_wiiu_conversion_tools(),
-        },
-    );
-    egui::CollapsingHeader::new("Wii U conversion readiness")
+    egui::CollapsingHeader::new("Convert this disc image")
         .default_open(true)
-        .show(ui, |ui| {
-            ui.label(match direction {
-                archivefs_core::wiiu_conversion::WiiUConversionDirection::WudToWux => "WUD → WUX",
-                archivefs_core::wiiu_conversion::WiiUConversionDirection::WuxToWud => "WUX → WUD",
-            });
-            ui.label(format!("Readiness: {:?}", plan.readiness));
-            ui.label(format!("Source size: {} bytes", plan.space.source_bytes));
-            ui.label(format!("Expected output: {}", plan.space.destination_description));
-            ui.label("Verification required: reconstruct the logical source and compare its exact identity.");
-            ui.label("No key dependency is introduced by planning.");
-            if plan.tool.is_none() {
-                ui.label("No trusted local conversion capability was proven; no tool is downloaded or installed.");
-            }
-            for refusal in &plan.refusals {
-                ui.colored_label(ui.visuals().warn_fg_color, format!("Refusal: {refusal:?}"));
-            }
-            ui.label("Planning only — conversion and source mutation are unavailable here.");
-        });
+        .show(ui, |ui| queue::show(ui, game, direction));
 }
