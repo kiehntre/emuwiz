@@ -12,6 +12,7 @@ temporary or explicitly chosen folders.
 | `tests/test_synthetic_library.py`, `test_synthetic_ux.py` | Self-tests for the lab generator and its GUI recovery fixtures | same |
 | `upgrade_preflight.py`, `upgrade-preflight-selftest.sh` | Read-only check of which EmuWiz and ArchiveFS folders are active, with an optional backup manifest | [README-upgrade-preflight.md](README-upgrade-preflight.md) |
 | `pending-recovery-inspector.sh`, `pending-recovery.py` | Read-only inspector for unfinished operations | [Pending operation recovery](../../docs/QA_PENDING_OPERATION_RECOVERY.md) |
+| `sunshine-acceptance-helper.sh`, `sunshine-acceptance-helper-selftest.sh` | Prints the manual real-desktop (Sunshine/Moonlight) acceptance checklist and records run metadata (source SHA, artifact hash before and after, DISPLAY, PID, leftovers). It builds nothing, drives nothing, and writes records outside the repository (`EMUWIZ_QA_RUN_DIR`, default `~/.local/state/emuwiz-qa/sunshine-runs`) | [Real emulator launch matrix](../../docs/qa/REAL_EMULATOR_LAUNCH_MATRIX.md) |
 
 ## Release smoke
 
