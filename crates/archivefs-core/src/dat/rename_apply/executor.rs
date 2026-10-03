@@ -486,12 +486,31 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
     {
         return apply_copy_mutation(entry, expected_source, destination_root);
     }
+    // Re-prove the source immediately before the path-based rename. Preflight
+    // validated an earlier moment; a changed or swapped source is refused
+    // without touching it.
+    match capture_identity(&entry.source_path) {
+        Ok(current) if super::identity::identity_matches(&entry.identity, &current) => {}
+        Ok(_) => {
+            return Err((
+                EntryState::ApplyFailed,
+                "the source changed after review; it was not moved".to_string(),
+            ));
+        }
+        Err(error) => {
+            return Err((
+                EntryState::ApplyFailed,
+                format!("could not re-verify the source before the rename: {error}"),
+            ));
+        }
+    }
+    run_test_before_rename(&entry.source_path, &entry.destination_path);
     match rename_noreplace(&entry.source_path, &entry.destination_path) {
         Ok(()) => {
             // The filesystem must confirm the rename before Applied.
             match confirm_rename(entry) {
                 Ok(()) => Ok(()),
-                Err(reason) => Err((EntryState::ApplyFailed, reason)),
+                Err(reason) => restore_failed_rename(entry, reason),
             }
         }
         Err(NoClobberError::DestinationExists) => Err((
@@ -501,6 +520,58 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
         Err(error) => Err((EntryState::ApplyFailed, error.to_string())),
     }
 }
+
+/// The path-based rename cannot bind an inode (Linux has no source-fd
+/// `renameat2`), so a swap landing between the re-proof and the rename can
+/// still move the replacement. Never report that as success: if the object now
+/// at the destination is not the reviewed one and the source name is free, put
+/// it back without overwriting anything. A restore failure is reported, not
+/// hidden.
+fn restore_failed_rename(
+    entry: &TransactionEntry,
+    reason: String,
+) -> Result<(), (EntryState, String)> {
+    let moved_foreign_object = std::fs::symlink_metadata(&entry.source_path).is_err()
+        && matches!(
+            capture_identity(&entry.destination_path),
+            Ok(current) if !super::identity::identity_matches(&entry.identity, &current)
+        );
+    if moved_foreign_object {
+        return match rename_noreplace(&entry.destination_path, &entry.source_path) {
+            Ok(()) => Err((
+                EntryState::ApplyFailed,
+                format!("{reason}; the replacement object was restored to the source path"),
+            )),
+            Err(error) => Err((
+                EntryState::ApplyFailed,
+                format!("{reason}; could not restore the moved replacement: {error}"),
+            )),
+        };
+    }
+    Err((EntryState::ApplyFailed, reason))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BEFORE_RENAME: std::cell::Cell<Option<fn(&std::path::Path)>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_before_rename_hook(hook: Option<fn(&std::path::Path)>) {
+    TEST_BEFORE_RENAME.with(|cell| cell.set(hook));
+}
+
+#[cfg(test)]
+fn run_test_before_rename(source: &std::path::Path, _destination: &std::path::Path) {
+    TEST_BEFORE_RENAME.with(|cell| {
+        if let Some(hook) = cell.take() {
+            hook(source);
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn run_test_before_rename(_source: &std::path::Path, _destination: &std::path::Path) {}
 
 fn apply_copy_mutation(
     entry: &TransactionEntry,

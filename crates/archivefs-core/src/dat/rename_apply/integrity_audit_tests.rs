@@ -1,13 +1,19 @@
-//! Deterministic interleaving at the existing preflight/mutation boundary.
-//! Passing `known_gap` tests document an unfixed violation, not safe behavior.
+//! Deterministic interleaving at the preflight/mutation boundary.
 #![cfg(target_os = "linux")]
 
 use super::*;
+use crate::dat::rename_apply::executor::set_test_before_rename_hook;
 use crate::safe_read::TrustedRoots;
 use std::collections::BTreeSet;
 
-#[test]
-fn known_gap_source_swap_after_preflight_moves_the_wrong_object_before_reporting_failure() {
+struct Fixture {
+    _temp: tempfile::TempDir,
+    source: std::path::PathBuf,
+    destination: std::path::PathBuf,
+    entry: TransactionEntry,
+}
+
+fn fixture() -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.bin");
     let destination = temp.path().join("destination.bin");
@@ -33,20 +39,81 @@ fn known_gap_source_swap_after_preflight_moves_the_wrong_object_before_reporting
         },
     )
     .unwrap();
+    Fixture {
+        _temp: temp,
+        source,
+        destination,
+        entry,
+    }
+}
 
-    // Exactly the ordering an external writer can take after preflight
-    // (including while the executor writes the Applying journal checkpoint).
-    std::fs::rename(&source, temp.path().join("retained-original")).unwrap();
-    std::fs::write(&source, b"another game's only copy").unwrap();
-    let failure = executor::apply_mutation(&entry).unwrap_err();
+fn swap_source(source: &std::path::Path) {
+    std::fs::rename(source, source.with_file_name("retained-original")).unwrap();
+    std::fs::write(source, b"another game's only copy").unwrap();
+}
+
+#[test]
+fn source_swap_after_preflight_is_refused_without_moving_the_replacement() {
+    let f = fixture();
+    swap_source(&f.source);
+    let failure = executor::apply_mutation(&f.entry).unwrap_err();
     assert_eq!(failure.0, EntryState::ApplyFailed);
-    assert!(!source.exists());
+    assert!(!f.destination.exists(), "the replacement was not moved");
     assert_eq!(
-        std::fs::read(destination).unwrap(),
+        std::fs::read(&f.source).unwrap(),
         b"another game's only copy"
     );
     assert_eq!(
-        std::fs::read(temp.path().join("retained-original")).unwrap(),
+        std::fs::read(f.source.with_file_name("retained-original")).unwrap(),
         b"reviewed game"
     );
+}
+
+#[test]
+fn swap_inside_the_final_rename_window_is_restored_not_reported_applied() {
+    let f = fixture();
+    set_test_before_rename_hook(Some(swap_source));
+    let failure = executor::apply_mutation(&f.entry).unwrap_err();
+    assert_eq!(failure.0, EntryState::ApplyFailed);
+    assert!(failure.1.contains("restored"), "{}", failure.1);
+    assert!(!f.destination.exists(), "a refused move is not published");
+    assert_eq!(
+        std::fs::read(&f.source).unwrap(),
+        b"another game's only copy"
+    );
+    assert_eq!(
+        std::fs::read(f.source.with_file_name("retained-original")).unwrap(),
+        b"reviewed game"
+    );
+}
+
+#[test]
+fn source_content_change_after_preflight_is_refused_in_place() {
+    let f = fixture();
+    std::fs::write(&f.source, b"changed after review, longer").unwrap();
+    let failure = executor::apply_mutation(&f.entry).unwrap_err();
+    assert_eq!(failure.0, EntryState::ApplyFailed);
+    assert!(!f.destination.exists());
+    assert_eq!(
+        std::fs::read(&f.source).unwrap(),
+        b"changed after review, longer"
+    );
+}
+
+#[test]
+fn unchanged_source_still_renames() {
+    let f = fixture();
+    executor::apply_mutation(&f.entry).unwrap();
+    assert!(!f.source.exists());
+    assert_eq!(std::fs::read(&f.destination).unwrap(), b"reviewed game");
+}
+
+#[test]
+fn an_occupied_destination_is_never_overwritten() {
+    let f = fixture();
+    std::fs::write(&f.destination, b"someone else").unwrap();
+    let failure = executor::apply_mutation(&f.entry).unwrap_err();
+    assert_eq!(failure.0, EntryState::ApplyFailed);
+    assert_eq!(std::fs::read(&f.destination).unwrap(), b"someone else");
+    assert_eq!(std::fs::read(&f.source).unwrap(), b"reviewed game");
 }
