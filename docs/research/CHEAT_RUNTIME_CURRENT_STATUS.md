@@ -72,3 +72,27 @@ Per-launch executor: materialise the derivative in launch-owned scratch, spawn
 with the composed command, verify the state expectation, and clean up. Then
 route additional emulators beyond RetroArch, wire FS-UAE trainer arguments, and
 only then collect level 6-7 evidence.
+
+## Phase 1 update: RetroArch per-launch runtime handoff (feature branch, not on main)
+
+BEFORE: planner and staging only. No code materialised a plan, spawned with it,
+verified state or cleaned up.
+
+AFTER: `launch/cheat_runtime.rs` is a generic executor (plan -> owned temp
+workspace with lease marker -> fingerprint -> canonical spawn -> receipt ->
+ownership-gated cleanup, plus read-only stale scan and explicit stale cleanup).
+`launch/cheat_runtime_retroarch.rs` wires RetroArch through it:
+`preflight_and_launch_retroarch_with_cheats` runs the canonical preflight, the
+existing planner and the canonical `spawn_retroarch` with the prepared
+`--config`. The user's real config, saves, ROM and cheat files are only read and
+fingerprinted. The scratch config is seeded from the user's real settings
+(minus keys the launch owns) because `--config` replaces rather than layers.
+Unresolved save/state directories fail closed.
+
+Highest truthful level: 5-6 (launch wiring reachable at library level; process
+handed the prepared config). Level 7 is NOT reached: no test shows a cheat
+taking effect in a game, the receipt reports `RuntimeEffectUnknown`, and a
+successful result means only "RetroArch was launched with the prepared cheat
+configuration". Tests use a fake `retroarch` script. No GUI/CLI entry point is
+wired yet; the seam is the library function above. Other emulators are
+unchanged.

@@ -129,6 +129,8 @@ pub mod ppsspp_execution;
 pub mod process_spawn;
 pub use process_spawn::LaunchCommandSpec;
 pub mod cheat_launch_plan;
+pub mod cheat_runtime;
+pub mod cheat_runtime_retroarch;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
