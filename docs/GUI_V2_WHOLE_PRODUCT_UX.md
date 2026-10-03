@@ -1,11 +1,12 @@
 # GUI v2 whole-product UX pass
 
-Base: `1571f7e56500d75b383c2aa5c34f632d7f487656`.
+Starting base: `1571f7e56500d75b383c2aa5c34f632d7f487656`.
+Reconciled base: `401af8c9d16478a282f08e7c073736785038cd6b`.
 Branch: `feature/gui-v2-whole-product-ux-mega-pass`.
 
 ## Product map and ownership
 
-Study covers the 38 top-level GUI-v2 Rust modules, their entry points, primary
+Study covers the 39 top-level GUI-v2 Rust modules (including the shell), their entry points, primary
 presentation and worker/state boundaries, plus shared components, existing GUI
 tests, the milestone feature map and live-QA notes, and the synthetic lab tool.
 The old milestone feature map is historical: current source, not its old
@@ -46,7 +47,7 @@ Never attach input automation to the user's desktop. Inspect screenshots;
 automation does not replace human acceptance testing. Keep test logs and images
 outside the repository. No real games, saves, BIOS, credentials or profile.
 
-## Findings to resolve
+## Initial findings
 
 - Platform game counts currently claim verification setup readiness without proof.
 - Archive errors echo raw diagnostics and lack an explicit retry action.
@@ -59,7 +60,7 @@ outside the repository. No real games, saves, BIOS, credentials or profile.
 - MAME Export report copies placeholder text rather than a report.
 - The common shell/history/manual fixes must wait for ownership to clear.
 
-The implementation ledger and final validation results follow in later checkpoints.
+The implementation ledger below distinguishes this branch from concurrent main changes.
 
 ## Improvement ledger
 
@@ -72,7 +73,7 @@ strings. Related wording and controls are counted together.
 3. Platform counts implied verification readiness → cards explicitly distinguish catalogued games from verification setup, with **Review checks**.
 
 ### Error recovery
-4. Archive failures repeated raw diagnostics → accessible-file guidance, unchanged-file assurance, collapsed details and explicit **Retry inspection**.
+4. Generic ZIP/path failures could expose raw diagnostics → accessible-file guidance and retained technical details, alongside the newly landed typed 7z/RAR errors and Retry.
 5. Setup-file errors exposed raw failure text → retry instructions for file permissions/new export name, private diagnostics under Details.
 6. Missing-game failures ended at an error → source-drive guidance, direct Sources/Activity routes and a fresh-plan **Check again**.
 7. Equivalent-format failures had no recovery context → inspect History before another move, with direct History/Sources routes and retained technical cause.
@@ -80,56 +81,54 @@ strings. Related wording and controls are counted together.
 
 ### Blocked / disabled states
 9. An unresolved bezel could still sound applicable → no-match explanation directs users to local-folder selection and checking.
-10. Bezel plan refusal could be hidden → a visible refusal explains that no apply is available, with evidence below.
-11. Bezel Apply lacked a visible reason for its disabled state → unsupported plan / missing confirmation is explained beside the control.
-12. Wii U key/readiness Rust variants dominated the summary → plain key and inspection limits distinguish missing, invalid, untested and unsupported states.
+10. Bezel Apply lacked a visible reason for its disabled state → unsupported plan / missing confirmation is explained beside the control.
+11. Wii U key/readiness Rust variants dominated the summary → plain key and inspection limits distinguish missing, invalid, untested and unsupported states.
 
 ### Safety / consequences
-13. Bezel apply results could all appear green → only a successful journal reports success; failed/partial results direct users to recovery, and old success cannot colour a later refusal.
-14. Mod Activity offered cancellation without a connected cancel mechanism → no fake Cancel, and pending work states the limitation.
-15. MAME introductory copy implied reconstruction always made a separate output → review output and replacement consequences before applying.
-16. Wii U structural completeness could look like game readiness → explicit distinction between container checks, encrypted contents and proof that a game will run.
+12. Mod Activity offered cancellation without a connected cancel mechanism → no fake Cancel, and pending work states the limitation.
+13. MAME introductory copy implied reconstruction always made a separate output → review output and replacement consequences before applying.
+14. Wii U structural completeness could look like game readiness → explicit distinction between container checks, encrypted contents and proof that a game will run.
 
 ### Navigation / click reduction
-17. Mods without a game required manually hunting the library → **Choose a game**.
-18. Unconfirmed mod/game identity lacked a next step → **Check this game** routes with the current game ID.
-19. Mod recovery was hard to find → **Open History & Undo** directly from the workshop.
-20. Competing old/new setup evidence lacked a direct destination → **Review upgrade and recovery tools** opens Advanced.
-21. A per-game save view could hide unassigned records → **Review all saves, including unassigned** opens the full inventory.
+15. Mods without a game required manually hunting the library → **Choose a game**.
+16. Unconfirmed mod/game identity lacked a next step → **Check this game** routes with the current game ID.
+17. Mod recovery was hard to find → **Open History & Undo** directly from the workshop.
+18. Competing old/new setup evidence lacked a direct destination → **Review upgrade and recovery tools** opens Advanced.
+19. A per-game save view could hide unassigned records → **Review all saves, including unassigned** opens the full inventory.
 
 ### Empty states
-22. Save search/filter emptiness looked like missing saves → distinct no-match guidance and **Clear search and filters**.
-23. Empty installed-mod records could imply no mods existed → explains that external/unmatched changes are not necessarily recorded here.
+20. Save search/filter emptiness looked like missing saves → distinct no-match guidance and **Clear search and filters**.
+21. Empty installed-mod records could imply no mods existed → explains that external/unmatched changes are not necessarily recorded here.
 
 ### Success / progress
-24. Storage failure automatically retried every frame → a failure latch waits for deliberate **Check again**, with Activity details.
-25. Old-library storage results could replace current evidence → stale responses are rejected and old figures removed when a new check begins.
-26. Multi-disc failure automatically retried → explicit retry and Activity recovery, with no silent job loop.
-27. Previous multi-disc results looked current during library changes → clearly marked as old evidence until the new check finishes.
-28. Save refresh accepted redundant clicks and hid activity → disabled duplicate refresh and visible read-only progress.
-29. Mod history read the filesystem inside rendering → one background history worker, retained prior evidence and visible progress/retry.
-30. Partially unreadable mod history looked complete → visible incomplete-history warning and technical evidence.
-31. Pending missing-game work could look idle → visible progress describing catalogue-only consequences.
-32. Setup export success omitted location and coverage → exact destination and explicit distinction from a game/save backup.
+22. Storage failure automatically retried every frame → a failure latch waits for deliberate **Check again**, with Activity details.
+23. Old-library storage results could replace current evidence → stale responses are rejected and old figures removed when a new check begins.
+24. Multi-disc failure automatically retried → explicit retry and Activity recovery, with no silent job loop.
+25. Previous multi-disc results looked current during library changes → clearly marked as old evidence until the new check finishes.
+26. Save refresh accepted redundant clicks and hid activity → disabled duplicate refresh and visible read-only progress.
+27. Mod history read the filesystem inside rendering → one background history worker, retained prior evidence and visible progress/retry.
+28. Partially unreadable mod history looked complete → visible incomplete-history warning and technical evidence.
+29. Pending missing-game cleanup/Undo could look idle → visible progress describing catalogue-only consequences.
+30. Setup export success omitted location and coverage → exact destination and explicit distinction from a game/save backup.
 
 ### Emulator / BIOS
-33. Missing firmware lacked context → BIOS is explained as console startup software, with existing setup action retained.
-34. An undetected installed emulator could lead to another download → guidance to select the existing executable/profile in setup.
-35. Stale launch checks were obscure → explains that old approval is not reused and asks for Recheck.
+31. Missing firmware lacked context → BIOS is explained as console startup software, with existing setup action retained.
+32. An undetected installed emulator could lead to another download → guidance to select the existing executable/profile in setup.
+33. Stale launch checks were obscure → explains that old approval is not reused and asks for Recheck.
 
 ### Cheats
-36. Recognised/installed cheats could imply in-game success → syntax, game version/region/emulator compatibility and runtime activity are explicitly distinct.
+34. Recognised/installed cheats could imply in-game success → syntax, game version/region/emulator compatibility and runtime activity are explicitly distinct.
 
 ### Mods
-37. Historical mod receipts were labelled a current enabled stack → **Recorded changes** explains installation/undo records are not live activation or load order.
-38. Conflicts foregrounded opaque transaction IDs → explains overlapping destinations; IDs and paths remain under Details.
+35. Historical mod receipts were presented as enabled state → the existing Active stack tab opens a **Recorded changes** view explicitly explaining that receipts are not live activation or load order. The tab label is retained because its shared navigation test is owned elsewhere; rename both together later.
+36. Conflicts foregrounded opaque transaction IDs → explains overlapping destinations; IDs and paths remain under Details.
 
 ### MAME
-39. **Export report** copied a placeholder → **Copy report details** copies actual available evidence; no report means no enabled copy action.
-40. Set terminology lacked a beginner explanation → optional glossary covers parent/clone, support sets, merged/split/non-merged, software lists and matching the collection's version.
+37. **Export report** copied a placeholder → **Copy report details** copies actual available evidence; no report means no enabled copy action.
+38. Set terminology lacked a beginner explanation → optional glossary covers parent/clone, support sets, merged/split/non-merged, software lists and matching the collection's version.
 
 ### Saves / states
-41. Partial save discovery could look like a complete inventory → visible warning explains unavailable locations and where to reconfigure/recheck them.
+39. Partial save discovery could look like a complete inventory → visible warning explains unavailable locations and where to reconfigure/recheck them.
 
 ### Manuals / documents
 Friendly error helper wiring remains blocked by ownership of pages.rs. No parser,
@@ -137,18 +136,20 @@ renderer or viewer capability was added. New QA fixtures cover broken PDF/CBZ,
 missing documents and natural CBZ page order; these are test data, not support claims.
 
 ### History / Undo
-42. Missing-game Undo allowed repeat clicks during pending work → disabled until the operation completes.
-43. Missing-game Undo said only “Restored” → explains restored catalogue entries, without claiming game files were recreated.
+40. Missing-game Undo allowed repeat clicks during pending work → disabled until the operation completes.
+41. Missing-game Undo said only “Restored” → explains restored catalogue entries, without claiming game files were recreated.
 
 ### Accessibility / small window
-44. Forget-missing confirmation used a rigid window → viewport-bounded width and vertical scrolling keep consequences/actions reachable.
-45. Mod lane wrapping produced mismatched cramped cards → equal-width desktop cards and full-width narrow cards.
-46. Custom mod lane cards lacked an explicit button description/focus ring → egui button metadata and the existing theme focus ring.
-47. Platform illustrations crowded actions at narrow widths → smaller artwork leaves room for wrapping primary actions.
+42. Forget-missing confirmation used a rigid window → viewport-bounded width and vertical scrolling keep consequences/actions reachable.
+43. Mod lane wrapping produced mismatched cramped cards → equal-width desktop cards and full-width narrow cards.
+44. Custom mod lane cards lacked an explicit button description/focus ring → egui button metadata and the existing theme focus ring.
+45. Platform illustrations crowded actions at narrow widths → smaller artwork leaves room for wrapping primary actions.
+
+46. The decorative mod-workshop header hid useful controls at 700×520 → the existing compact workflow header keeps guidance, tabs and game/recovery actions reachable sooner.
 
 ### Consistency
-48. Archive listing success could imply verified content → explicitly distinguishes a readable member list from complete, undamaged game verification.
-49. Wii U issue Debug strings were primary warnings → concise recovery guidance with technical issue evidence collapsed by default.
+47. Archive listing success could imply verified content → explicitly distinguishes a readable member list from complete, undamaged game verification.
+48. Wii U issue Debug strings were primary warnings → concise recovery guidance with technical issue evidence collapsed by default.
 
 DAT/provider root changes are deliberately skipped because the native glue is
 actively owned. This pass never relabels local evidence as official or changes
@@ -184,7 +185,7 @@ catalogue evidence; filename-only fixture claims would be misleading.
 13. **Backend missing:** savestate compatibility/resume execution cannot be inferred from save-file discovery.
 14. **Ownership:** source enable/disable/freshness explanations in DAT/provider setup need a coordinated pass.
 15. **GUI:** durable conversion job failures need consistent output/retry/restart explanations across embedded panels.
-16. **Ownership:** root small-window navigation and family submenus require layout changes in the owned shell.
+16. **Ownership:** the shared Save hero counter overlaps its heading at 700x520; `ui/components.rs` is dirty elsewhere. Root breadcrumbs also clip at narrow widths. Coordinate fixes in the owned shared components/shell.
 17. **Ownership:** global Escape/Back/modal ordering must be rechecked when concurrent shell changes land.
 18. **GUI:** Wii U inspection still runs bounded local reads from presentation; cache/worker coordination belongs in a later focused pass.
 19. **GUI:** mod history cannot prove emulator activation; a genuinely live enabled/load-order view needs supported evidence.
@@ -199,3 +200,107 @@ catalogue evidence; filename-only fixture claims would be misleading.
 28. **Human QA:** high-DPI scaling, long translated titles and contrast settings need physical-desktop review.
 29. **GUI:** deterministic fixture seeding for authenticated/offline provider responses is not a network mock framework yet.
 30. **Human QA:** Undo/conflict recovery journeys need supervised synthetic mutation walkthroughs across embedded tools, beyond unit coverage.
+
+## Concurrent main reconciliation
+
+During this pass another lane promoted `401af8c9`, changing Archive Inspector,
+Bezel and Multi-disc. All 393 worktrees were rechecked; none held dirty ownership
+of this pass's selected paths. The four candidate commits were rebased and the
+three overlapping files reconciled deliberately: retain main's typed archive
+failures/retry, typed bezel outcomes/refusal labels and all 19 multi-disc conflict
+labels/tests; keep this pass's additional retry-loop/stale-result controls,
+read-only guidance and layout/selection explanations. No duplicate outcome model
+survives. Two improvements originally implemented here landed concurrently and
+are excluded from this pass's 48-item count. Authoritative main was advanced by
+the other lane, never by this task.
+
+## Validation record
+
+- 13 new Rust tests, plus 3 Python fixture tests.
+- Focused GUI checks: 107 passed.
+- Full GUI-v2 suite: 504 passed, 0 failed, 3 intentionally ignored (two report
+  printers and a real-catalogue performance test; no real catalogue supplied).
+- Three intermediate UI assertions failed. They passed on freshly rebuilt,
+  untouched `401af8c9` main. The candidate fixed its own label/layout regressions;
+  no baseline exception or owned-test edits were used to obtain the green suite.
+- Tiny synthetic lab: 137 fixtures, validation has zero failures/warnings; CLI
+  scan succeeded and catalogued 22 items. Eight scenarios are new in this pass.
+- All source fixture hashes still matched after scan and the completed sampled GUI walkthrough.
+- Existing warnings (unused helper/import/enum variant) remain; no unrelated fixes.
+- Initial optimized GUI and CLI builds completed. A later compile/test attempt was
+  terminated with exit 143 without a compiler diagnostic; successful reruns, not
+  that interrupted attempt, are used for final validation.
+
+Final full GUI-v2 rerun: 504 passed, 0 failed, 3 ignored (138.35 s).
+The final offline/locked workspace check passed (40.26 s). Formatting, diff
+checks, the three Python fixture tests and a fresh 393-worktree ownership scan
+passed. No selected path had another dirty owner. The repository scope and GUI
+root-boundary guards also passed.
+Final optimized GUI build passed (8m 59s), using its own release target.
+The final binary was reopened on the synthetic profile: the shortened platform
+verification label and both actions fit at 700x520 and 1280x800. Normal window
+closure exited successfully. The initial release CLI build and synthetic scan
+also passed; no CLI source was changed. Walkthrough details follow below.
+
+## Metrics
+
+Counts describe changed call sites or user journeys, and overlap; they must not
+be added together to inflate the 48-item improvement total.
+
+| Measure | Count |
+|---|---:|
+| Raw diagnostics/internal identifiers removed from primary presentation | 11 |
+| Recovery actions added (13 routes, clear save filters, multi-disc retry) | 15 |
+| Retry/recheck journeys added or repaired | 4 |
+| Important disabled states explained | 6 |
+| Empty states clarified | 5 |
+| Success states clarified | 3 |
+| Surfaces with additional read-only/safety explanations | 10 |
+| Undo/recovery visibility improvements | 3 |
+| Direct navigation shortcuts | 13 |
+| Specialist concepts clarified | 13 |
+| Small-window issues addressed | 4 |
+| Keyboard/accessibility focus improvements | 1 |
+| Synthetic scenarios added | 8 |
+
+The keyboard improvement is button semantics/focus rings for mod choices; this
+pass changes no global Escape/Back dispatch. Existing keyboard/navigation/modal
+regressions run in the full GUI-v2 suite. Controller and screen-reader usability
+still require human QA. The old **Active stack** navigation label is retained
+pending coordinated changes to the owned shared test; its content explicitly
+avoids claiming enabled-state or load-order knowledge.
+
+## Live walkthrough and limitations
+
+The freshly optimized GUI ran on a dedicated Xvfb `:2`, never the user's desktop.
+HOME, XDG config/data/cache and EmuWiz config/data all pointed under
+`/tmp/emuwiz-ux-mega-qa`. It was checked with an empty profile, then with the
+22-item synthetic catalogue. Screenshots were inspected at 1280x800 and 700x520;
+Home was additionally checked at 1600x1000. Sampled journeys: Home, Games,
+Mods/Cheats, Saves, Storage, Multi-disc, Platforms, Advanced/Archive Inspector,
+and Settings. Other state variants were covered through the headless suite;
+this is not a claim that every mutation or assistive-technology journey received
+a human acceptance test.
+
+Observed: Choose a game reaches Games; Escape from archive inspection returns to
+Advanced; damaged 7z/RAR has a friendly error and collapsed details; narrow error
+controls remain scroll-reachable; valid ZIP listing explicitly does not imply
+verified content. The new workshop cards fit and stack on narrow layouts. Its
+decorative header was replaced after the walkthrough showed it hiding controls.
+The platform verification label was shortened after it was visibly truncated.
+
+Remaining visible issue: the existing shared Save hero's decorative counter
+overlaps its heading in the narrow window. The helper is actively owned, so it
+was not edited; this is an explicit handoff gap, not a claim of a flawless
+700x520 application. Some narrow screens still require substantial scrolling
+below the owned shell/guidance.
+
+QA teardown correction: the first `xdotool windowclose` destroyed the X window
+and provoked a winit BadWindow panic. Subsequent teardown sent the normal
+WM_DELETE_WINDOW protocol and the GUI exited successfully. No application or
+backend workaround was introduced for the automation mistake.
+
+All synthetic source hashes still matched after the walkthrough; no extracted
+page files or unexpected corpus files appeared. No real game/save/profile was
+used, no conversion/repair/restore was applied, and no account was connected.
+Screenshots and logs stay outside Git under `/tmp/emuwiz-ux-*`.

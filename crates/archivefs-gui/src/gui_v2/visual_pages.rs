@@ -409,7 +409,7 @@ impl App {
 }
 
 fn platform_verification_note() -> &'static str {
-    "Listed in your library · verification setup not checked here"
+    "Listed · verification not checked"
 }
 
 #[cfg(test)]
