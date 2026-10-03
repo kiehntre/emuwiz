@@ -7,10 +7,10 @@
 > - Still useful: the capability matrix, backend inventory (organisation, DAT rename apply, Playing Library/1G1R), RomM and ES-DE status, other frontend targets, safety audit and the sets/multi-disc/support-file notes — each should be rechecked against current code before use.
 
 
-**Status:** research only; no production Rust or GUI changes.
-**Inspection date:** 2026-09-21
-**Authority:** `/home/davedap/emuwiz-main-release-fix` at
-`41c9a645464a3fec9fa68cad7de78cfadd19cf12`
+- **Status:** research only; no production Rust or GUI changes.
+- **Inspection date:** 2026-09-21
+- **Authority:** `/home/davedap/emuwiz-main-release-fix` at
+  `41c9a645464a3fec9fa68cad7de78cfadd19cf12`
 
 ## Scope and equivalent-audit check
 

@@ -6,9 +6,9 @@
 > - Kept only for its rationale: a low-noise, game-first front door, recovery routes from a blocked game back to the relevant fix, and preserving the user's game context across navigation.
 
 
-Status: research/design only
-Audited: authoritative main `7f421daf64639e2c80ecd869a20086eb25a73f40` and the prepared GUI-v2 candidate `64397113508b7cc1929d25127e70071cf22acfa7`
-Production code changed by this research: none
+- Status: research/design only
+- Audited: authoritative main `7f421daf64639e2c80ecd869a20086eb25a73f40` and the prepared GUI-v2 candidate `64397113508b7cc1929d25127e70071cf22acfa7`
+- Production code changed by this research: none
 
 ## Executive conclusion
 
@@ -16,10 +16,10 @@ Gamer View existed as a genuine legacy GUI mode. It was a low-noise, game-first 
 
 The prepared GUI-v2 candidate retains most of the underlying capabilities, but presents them through a management-oriented route/sidebar shell:
 
-`Route::Section(Section::Games)` → search, filters, grid/list, platform selection, and game rows
-`Route::Game(id)` → Game Details
-`Route::Section(Section::Launch)` / task routes → launch/readiness surfaces
-family homes → management workflows such as DATs, repair, sources, rename, and diagnostics
+- `Route::Section(Section::Games)` → search, filters, grid/list, platform selection, and game rows
+- `Route::Game(id)` → Game Details
+- `Route::Section(Section::Launch)` / task routes → launch/readiness surfaces
+- family homes → management workflows such as DATs, repair, sources, rename, and diagnostics
 
 What is missing is the mode boundary and composition: a single visually focused browse/play surface with platform browsing, artwork-forward cards, selected-game actions, and minimal technical noise. The right recovery is therefore a GUI-v2-native **Browse & Play** top-level mode, not a wholesale copy of the legacy renderer and not another management feature family.
 

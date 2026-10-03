@@ -8,12 +8,11 @@
 > - A familiar filename, write permission or a successful `--version` probe never establishes ownership.
 
 
-**Status:** research only; no production Rust or GUI changes.
-
-**Inspection date:** 2026-09-21
-**Authority:** `/home/davedap/emuwiz-main-release-fix` at
-`41c9a645464a3fec9fa68cad7de78cfadd19cf12`
-**Research branch:** `research/emulator-lifecycle`
+- **Status:** research only; no production Rust or GUI changes.
+- **Inspection date:** 2026-09-21
+- **Authority:** `/home/davedap/emuwiz-main-release-fix` at
+  `41c9a645464a3fec9fa68cad7de78cfadd19cf12`
+- **Research branch:** `research/emulator-lifecycle`
 
 ## Executive conclusion
 
