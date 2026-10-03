@@ -264,8 +264,107 @@ pub fn build_amiberry_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaW
     }
 }
 
+/// Trainer/custom options the person selected for one WHDLoad game, already
+/// rendered by `patch_manager::render_whdload_arguments` (`CUSTOMn=value`).
+///
+/// The selection is bound to the verified game identity and to the exact slave
+/// it was made against, so a selection for another game or a replaced slave is
+/// refused instead of being passed to FS-UAE. Nothing here edits the package,
+/// the slave or any configuration; the options travel only on the launch
+/// command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhdloadLaunchTrainer {
+    pub verified_game_identity: String,
+    pub slave_name: String,
+    /// SHA-256 of the slave the options were declared by (re-checked at launch).
+    pub slave_sha256: String,
+    pub arguments: Vec<String>,
+}
+
+const MAX_TRAINER_ARGUMENTS: usize = 32;
+
+fn safe_trainer_argument(argument: &str) -> bool {
+    let Some((slot, value)) = argument.split_once('=') else {
+        return false;
+    };
+    !slot.is_empty()
+        && slot.len() <= 16
+        && slot
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && !value.is_empty()
+        && value.len() <= 10
+        && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+impl WhdloadLaunchTrainer {
+    pub fn is_empty(&self) -> bool {
+        self.arguments.is_empty()
+    }
+
+    fn arguments_are_safe(&self) -> bool {
+        let mut slots = std::collections::BTreeSet::new();
+        self.arguments.len() <= MAX_TRAINER_ARGUMENTS
+            && self.arguments.iter().all(|argument| {
+                safe_trainer_argument(argument)
+                    && slots.insert(argument.split('=').next().unwrap_or_default().to_string())
+            })
+    }
+}
+
+/// The exact value of FS-UAE's `--x-whdload-args`: the slave name, then the
+/// selected options in order. With no trainer it is the slave name alone.
+pub fn fsuae_whdload_args_value(
+    slave_name: &str,
+    trainer: Option<&WhdloadLaunchTrainer>,
+) -> String {
+    let mut value = slave_name.to_string();
+    for argument in trainer.map(|t| t.arguments.as_slice()).unwrap_or_default() {
+        value.push(' ');
+        value.push_str(argument);
+    }
+    value
+}
+
 pub fn build_fsuae_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaWHDLoadCommandPlan {
-    let blockers = common_blockers(input, AmigaEmulatorKind::FsUae);
+    build_fsuae_whdload_command_plan_with_trainer(input, None)
+}
+
+/// Same plan as [`build_fsuae_whdload_command_plan`], plus the selected trainer
+/// options on the existing `--x-whdload-args` channel. `None` or an empty
+/// selection produces exactly the baseline command.
+pub fn build_fsuae_whdload_command_plan_with_trainer(
+    input: &WHDLoadLaunchInput,
+    trainer: Option<&WhdloadLaunchTrainer>,
+) -> AmigaWHDLoadCommandPlan {
+    let trainer = trainer.filter(|trainer| !trainer.is_empty());
+    let mut blockers = common_blockers(input, AmigaEmulatorKind::FsUae);
+    if let Some(trainer) = trainer {
+        if let (CanonicalIdentityStatus::Resolved(resolved), Some(slave)) =
+            (&input.identity, input.slave.as_ref())
+        {
+            if trainer.verified_game_identity != resolved.game_key
+                || trainer.verified_game_identity != input.profile.verified_identity
+            {
+                blockers.push(blocker(
+                    LaunchBlockerKind::IdentityConflict,
+                    "the selected trainer options were made for a different game",
+                ));
+            }
+            if trainer.slave_name != slave.name || trainer.slave_sha256.trim().is_empty() {
+                blockers.push(blocker(
+                    LaunchBlockerKind::WhdloadSlaveNotBound,
+                    "the selected trainer options are not bound to this slave",
+                ));
+            }
+        }
+        if !trainer.arguments_are_safe() {
+            blockers.push(blocker(
+                LaunchBlockerKind::WhdloadSlaveNotBound,
+                "the selected trainer options are not a safe CUSTOMn=number list",
+            ));
+        }
+    }
     if !blockers.is_empty() {
         return AmigaWHDLoadCommandPlan {
             command: None,
@@ -289,7 +388,10 @@ pub fn build_fsuae_whdload_command_plan(input: &WHDLoadLaunchInput) -> AmigaWHDL
     let arguments = vec![
         OsString::from(format!("--config={}", configuration.display())),
         OsString::from(format!("--hard-drive-0={}", target.package_path.display())),
-        OsString::from(format!("--x-whdload-args={}", slave.name)),
+        OsString::from(format!(
+            "--x-whdload-args={}",
+            fsuae_whdload_args_value(&slave.name, trainer)
+        )),
     ];
     let command = AmigaWHDLoadCommand {
         executable: executable.clone(),
@@ -385,6 +487,94 @@ pub(crate) mod tests {
                 OsString::from("--hard-drive-0=/games/My Game.lha"),
                 OsString::from("--x-whdload-args=My Game.Slave")
             ]
+        );
+    }
+    fn trainer(arguments: &[&str]) -> WhdloadLaunchTrainer {
+        WhdloadLaunchTrainer {
+            verified_game_identity: "game".into(),
+            slave_name: "My Game.Slave".into(),
+            slave_sha256: "ab".repeat(32),
+            arguments: arguments.iter().map(|a| a.to_string()).collect(),
+        }
+    }
+    fn fsuae_args(value: &WHDLoadLaunchInput, t: Option<&WhdloadLaunchTrainer>) -> Vec<OsString> {
+        build_fsuae_whdload_command_plan_with_trainer(value, t)
+            .command
+            .expect("plan should be ready")
+            .arguments
+    }
+    #[test]
+    fn selected_trainer_options_reach_the_fsuae_argv_in_order() {
+        let value = input(AmigaEmulatorKind::FsUae);
+        assert_eq!(
+            fsuae_args(&value, Some(&trainer(&["CUSTOM1=1", "CUSTOM2=5"]))),
+            vec![
+                OsString::from("--config=/games/profile.uae"),
+                OsString::from("--hard-drive-0=/games/My Game.lha"),
+                OsString::from("--x-whdload-args=My Game.Slave CUSTOM1=1 CUSTOM2=5")
+            ]
+        );
+    }
+    #[test]
+    fn no_or_empty_trainer_leaves_the_launch_unchanged() {
+        let value = input(AmigaEmulatorKind::FsUae);
+        let baseline = build_fsuae_whdload_command_plan(&value);
+        assert_eq!(
+            fsuae_args(&value, None),
+            baseline.command.clone().unwrap().arguments
+        );
+        assert_eq!(
+            build_fsuae_whdload_command_plan_with_trainer(&value, Some(&trainer(&[]))),
+            baseline
+        );
+    }
+    #[test]
+    fn a_selection_for_another_game_or_slave_is_refused() {
+        let value = input(AmigaEmulatorKind::FsUae);
+        let mut other_game = trainer(&["CUSTOM1=1"]);
+        other_game.verified_game_identity = "other".into();
+        let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&other_game));
+        assert!(plan.command.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::IdentityConflict)
+        );
+        let mut other_slave = trainer(&["CUSTOM1=1"]);
+        other_slave.slave_name = "Other.Slave".into();
+        let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&other_slave));
+        assert!(plan.command.is_none());
+        assert!(
+            plan.blockers
+                .iter()
+                .any(|b| b.kind == LaunchBlockerKind::WhdloadSlaveNotBound)
+        );
+    }
+    #[test]
+    fn unsafe_or_duplicate_options_are_refused() {
+        let value = input(AmigaEmulatorKind::FsUae);
+        for bad in [
+            vec!["CUSTOM1=1 CUSTOM2=2"],
+            vec!["CUSTOM1=$(x)"],
+            vec!["custom1=1"],
+            vec!["CUSTOM1="],
+            vec!["CUSTOM1=1", "CUSTOM1=2"],
+            vec!["NOEQUALS"],
+        ] {
+            let plan = build_fsuae_whdload_command_plan_with_trainer(&value, Some(&trainer(&bad)));
+            assert!(plan.command.is_none(), "{bad:?} must be refused");
+        }
+    }
+    #[test]
+    fn trainer_options_never_change_the_amiberry_command() {
+        let value = input(AmigaEmulatorKind::Amiberry);
+        assert_eq!(
+            build_amiberry_whdload_command_plan(&value)
+                .command
+                .unwrap()
+                .arguments
+                .len(),
+            4
         );
     }
     #[test]
