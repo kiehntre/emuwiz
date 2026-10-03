@@ -222,11 +222,11 @@ pub(crate) enum StartFailure {
     Other,
 }
 
-/// Sorts a failed start into what the evidence supports. The launch workers
-/// currently hand back a rendered error string, not a typed value, so this
-/// only recognises the standard operating-system error kinds and the
-/// preflight refusal; everything else is reported as "could not be started"
-/// without a guessed cause. (Backend evidence gap, see the launch-diagnosis doc.)
+/// Sorts a failed start into a *hint* from the rendered error text. The launch
+/// workers currently hand back a rendered error string, not a typed spawn
+/// result, so this is a best-effort reading of that text, never a confirmed
+/// diagnosis; the UI words it as "may" and keeps the original text in Details.
+/// (Backend evidence gap, see the launch-diagnosis doc.)
 pub(crate) fn classify_start_failure(technical: &str) -> StartFailure {
     if technical.contains("NotFound") {
         StartFailure::ProgramMissing
@@ -242,30 +242,39 @@ pub(crate) fn classify_start_failure(technical: &str) -> StartFailure {
 impl Attempt {
     pub(crate) fn title(&self) -> &'static str {
         match self {
-            Self::CouldNotStart { .. } => "The emulator could not be started",
-            Self::EndedQuickly { .. } => "The emulator closed again right away",
+            Self::CouldNotStart { .. } => "The emulator could not be started.",
+            Self::EndedQuickly { .. } => "The emulator closed shortly after it was started.",
         }
     }
 
+    /// What EmuWiz actually knows, with no cause implied.
     pub(crate) fn why(&self) -> &'static str {
         match self {
-            Self::CouldNotStart { cause, .. } => match cause {
-                StartFailure::ProgramMissing => {
-                    "EmuWiz tried to start the emulator, but its program wasn't where it was expected. It may have been moved or uninstalled."
-                }
-                StartFailure::PermissionDenied => {
-                    "EmuWiz tried to start the emulator, but the system wouldn't let it run that program."
-                }
-                StartFailure::Refused => {
-                    "EmuWiz checked the launch just before starting it and declined, so nothing was started."
-                }
-                StartFailure::Other => {
-                    "EmuWiz tried to start the emulator, but the system could not start it. EmuWiz can't tell why from what it was given."
-                }
-            },
-            Self::EndedQuickly { .. } => {
-                "The emulator was started but exited before EmuWiz could confirm a normal launch. EmuWiz can't tell what happened inside the emulator; check its own messages or settings."
+            Self::CouldNotStart { .. } => {
+                "EmuWiz tried to start the emulator and it did not start."
             }
+            Self::EndedQuickly { .. } => {
+                "EmuWiz cannot yet tell why it closed. The emulator's own messages or settings may say more."
+            }
+        }
+    }
+
+    /// An optional, hedged pointer taken from the error text. Not authoritative.
+    pub(crate) fn hint(&self) -> Option<&'static str> {
+        let Self::CouldNotStart { cause, .. } = self else {
+            return None;
+        };
+        match cause {
+            StartFailure::ProgramMissing => Some(
+                "The error text suggests the emulator's program may not be where EmuWiz expected it; it may have been moved or removed. This is a hint, not a confirmed diagnosis.",
+            ),
+            StartFailure::PermissionDenied => Some(
+                "The error text suggests the system may not have allowed that program to run. This is a hint, not a confirmed diagnosis.",
+            ),
+            StartFailure::Refused => Some(
+                "The error text suggests EmuWiz's final pre-launch check declined to start it. This is a hint, not a confirmed diagnosis.",
+            ),
+            StartFailure::Other => None,
         }
     }
 
@@ -279,15 +288,17 @@ impl Attempt {
     pub(crate) fn technical(&self) -> String {
         match self {
             Self::CouldNotStart { technical, .. } => technical.clone(),
-            Self::EndedQuickly { seconds } => {
-                format!("Process ended after about {seconds} s with no error reported")
-            }
+            Self::EndedQuickly { seconds } => format!(
+                "Startup observation window: {} s (an EmuWiz display rule, not a backend result). Observed about {seconds} s. No error was reported.",
+                QUICK_EXIT.as_secs()
+            ),
         }
     }
 }
 
-/// A process that stops sooner than this after starting is reported as
-/// "closed right away".
+/// Startup observation window: a process that stops sooner than this after
+/// starting is shown as "closed shortly after it was started". It is an
+/// EmuWiz display rule, not a backend success/failure boundary.
 const QUICK_EXIT: Duration = Duration::from_secs(5);
 
 /// Remembers the last launch attempt for the game it belongs to.

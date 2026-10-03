@@ -25,7 +25,7 @@ Presentation only: nothing here plans, probes or launches. Code:
 | Several emulators possible | Choose emulator |
 | Anything else the plan refused | Problems, listed honestly as "can't determine" |
 | Stale readiness | Recheck (in place, no duplicate, generation-guarded) |
-| Last Play: could not start / closed within 5 s | Emulator Setup / Activity |
+| Last Play: could not start / closed shortly after starting | Emulator Setup / Activity |
 
 ## Backend evidence gaps (recorded, not invented)
 
@@ -40,12 +40,27 @@ Presentation only: nothing here plans, probes or launches. Code:
    but unsupported".
 4. Disc-set blockers do not say incomplete vs conflicting; the card says there
    is a problem or that review is needed, and the detail text carries the rest.
-5. Launch workers return a rendered error `String`, not a typed spawn error
-   (`launch_readiness_page.rs`, owned by another lane at the time). Start
-   failures are classified only from the standard OS error kinds and the
-   preflight refusal. A typed `ProcessExitReport` would replace the "closed
-   within 5 s" timing heuristic with the real exit status.
+5. **Current limitation: launch workers return rendered error strings, not
+   typed spawn/exit outcomes** (`launch_readiness_page.rs`, owned by another
+   lane). So the card says only what it can know:
+   - A failed start is shown as "The emulator could not be started." Any reason
+     (program may be missing, permission may be denied, final check may have
+     declined) is a hedged *hint read from the error text*, labelled as not a
+     confirmed diagnosis; the original rendered error is kept only under
+     Technical details.
+   - An emulator that stops within a 5 s *startup observation window* is shown
+     as "closed shortly after it was started. EmuWiz cannot yet tell why it
+     closed." The window is an EmuWiz display rule, not a backend boundary, and
+     the card never says the emulator crashed, failed internally, has an exit
+     reason, or is an unsupported version.
 6. The full Launch page still prints its own failure text; only the Game
    Details card and Activity use the new wording.
 7. `scripts/qa/synthetic_library.py` cannot yet create emulator/BIOS fixtures,
    so only "no emulator", "game file moved" and multi-disc are reachable live.
+
+## Future improvements
+
+- A typed spawn result and typed exit status from the launch workers.
+- Structured adapter support/readiness in the plan.
+- Distinct emulator-detection blockers (not installed / not detected / moved /
+  unsupported version).

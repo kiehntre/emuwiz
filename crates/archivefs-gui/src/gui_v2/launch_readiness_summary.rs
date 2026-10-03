@@ -735,6 +735,9 @@ fn show_attempt(ui: &mut egui::Ui, attempt: &Attempt) -> Option<ReadinessAction>
     ui.separator();
     ui.label(egui::RichText::new(attempt.title()).strong());
     ui.label(attempt.why());
+    if let Some(hint) = attempt.hint() {
+        ui.label(hint);
+    }
     ui.label("EmuWiz did not change your game files.");
     let fix = attempt.fix();
     let clicked = ui.button(action_label(fix)).clicked();

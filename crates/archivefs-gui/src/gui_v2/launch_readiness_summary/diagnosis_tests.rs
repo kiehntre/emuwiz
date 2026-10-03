@@ -268,8 +268,12 @@ fn failed_process_start_is_distinct_from_a_readiness_refusal() {
         technical: "Spawn(Os { code: 2, kind: NotFound })".into(),
     });
     let text = text_of(&summary);
-    assert!(text.contains("The emulator could not be started"));
-    assert!(text.contains("wasn't where it was expected"));
+    assert!(text.contains("The emulator could not be started."));
+    assert!(text.contains("may not be where EmuWiz expected it"));
+    assert!(text.contains("not a confirmed diagnosis"));
+    for claim in ["crashed", "failed internally", "unsupported version"] {
+        assert!(!text.contains(claim), "must not claim: {claim}");
+    }
     assert!(text.contains("EmuWiz did not change your game files"));
     assert!(!text.contains("NotFound"));
     assert_eq!(
@@ -295,8 +299,17 @@ fn an_emulator_that_closes_immediately_is_described_without_guessing() {
     let mut summary = summary_for(&[]);
     summary.attempt = Some(attempt);
     let text = text_of(&summary);
-    assert!(text.contains("exited before EmuWiz could confirm a normal launch"));
-    assert!(text.contains("can't tell what happened inside the emulator"));
+    assert!(text.contains("The emulator closed shortly after it was started."));
+    assert!(text.contains("EmuWiz cannot yet tell why it closed."));
+    for claim in [
+        "crashed",
+        "failed",
+        "exit reason",
+        "confirm a normal launch",
+    ] {
+        assert!(!text.contains(claim), "must not claim: {claim}");
+    }
+    assert!(attempt_details(&summary).contains("not a backend result"));
 }
 
 #[test]
@@ -404,4 +417,23 @@ fn compact_window_keeps_the_explanation_and_fix_within_the_width() {
             .unwrap_or_else(|| panic!("{needle} missing at 700x520"));
         assert!(rect.max.x <= 700.0, "{needle} runs past the window edge");
     }
+}
+
+fn attempt_details(summary: &GameReadinessSummary) -> String {
+    summary
+        .attempt
+        .as_ref()
+        .map(Attempt::technical)
+        .unwrap_or_default()
+}
+
+#[test]
+fn an_unrecognised_start_error_gets_no_guessed_cause() {
+    let attempt = Attempt::CouldNotStart {
+        cause: classify_start_failure("something unexpected"),
+        technical: "something unexpected".into(),
+    };
+    assert_eq!(attempt.hint(), None);
+    assert!(attempt.why().contains("did not start"));
+    assert_eq!(attempt.technical(), "something unexpected");
 }
