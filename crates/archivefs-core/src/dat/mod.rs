@@ -41,6 +41,7 @@ pub mod classification;
 pub mod coverage;
 pub mod coverage_expectations;
 pub mod custom_dat;
+pub mod custom_sources;
 pub mod dependency;
 pub mod disk_audit;
 pub mod divergence;
