@@ -32,6 +32,8 @@ fn summary(status: State, freshness: ReadinessFreshness) -> GameReadinessSummary
         primary_action: None,
         details: Vec::new(),
         freshness,
+        findings: Vec::new(),
+        attempt: None,
     }
 }
 

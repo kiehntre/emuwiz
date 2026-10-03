@@ -10,6 +10,9 @@ use archivefs_core::launch::{
 };
 use eframe::egui;
 
+mod diagnosis;
+pub(crate) use diagnosis::{Attempt, AttemptTracker, Finding};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadinessPresentationState {
     Checking,
@@ -34,6 +37,8 @@ pub(crate) enum ReadinessAction {
     ReviewProblem,
     ChooseEmulator,
     RecheckReadiness,
+    ReviewDiscSet,
+    OpenActivity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +90,10 @@ pub(crate) struct GameReadinessSummary {
     pub(crate) primary_action: Option<ReadinessAction>,
     pub(crate) details: Vec<String>,
     pub(crate) freshness: ReadinessFreshness,
+    /// Everything currently blocking launch, most actionable first.
+    pub(crate) findings: Vec<Finding>,
+    /// What happened the last time Play was pressed for this game.
+    pub(crate) attempt: Option<Attempt>,
 }
 
 pub(crate) fn project(
@@ -105,6 +114,7 @@ pub(crate) fn project(
         } => project_plan(plan, *retroarch_scanned, *standalone_scans_complete),
     };
     summary.freshness = freshness;
+    attach_findings(&mut summary, input);
     if freshness == ReadinessFreshness::Stale {
         summary.status = ReadinessPresentationState::Stale;
         summary.headline = "Readiness needs to be checked again".into();
@@ -113,6 +123,44 @@ pub(crate) fn project(
         summary.primary_action = Some(ReadinessAction::RecheckReadiness);
     }
     summary
+}
+
+/// Adds the full list of blockers to a not-ready summary and points the
+/// primary action at the most actionable one.
+fn attach_findings(summary: &mut GameReadinessSummary, input: &LaunchReadinessInput) {
+    use diagnosis::{Cause, findings_for};
+    let findings = match input {
+        LaunchReadinessInput::IdentityUnknown | LaunchReadinessInput::IdentityConflicting => {
+            diagnosis::single(Cause::IdentityNotConfirmed)
+        }
+        LaunchReadinessInput::Plan { plan, .. } => {
+            if plan.candidates.is_empty() {
+                if summary.status == ReadinessPresentationState::NeedsEmulator {
+                    diagnosis::single(Cause::EmulatorMissing)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                selected_candidate(plan)
+                    .or_else(|| plan.candidates.iter().find(|c| !c.blockers.is_empty()))
+                    .map(findings_for)
+                    .unwrap_or_default()
+            }
+        }
+        _ => Vec::new(),
+    };
+    if findings.is_empty()
+        || matches!(
+            summary.status,
+            ReadinessPresentationState::Ready | ReadinessPresentationState::ReadyWithWarnings
+        )
+    {
+        return;
+    }
+    if let Some(fix) = findings[0].fix {
+        summary.primary_action = Some(fix);
+    }
+    summary.findings = findings;
 }
 
 fn checking_summary() -> GameReadinessSummary {
@@ -370,6 +418,12 @@ fn project_plan(
     );
     summary.warnings = warnings;
     summary.details = details;
+    if !has_warning && let Some(emulator) = &summary.emulator {
+        summary.explanation = format!(
+            "EmuWiz can now prepare this game for {}. Checking readiness does not change your game files.",
+            emulator.name
+        );
+    }
     summary
 }
 
@@ -395,6 +449,8 @@ fn base(
         primary_action,
         details: Vec::new(),
         freshness: ReadinessFreshness::Current,
+        findings: Vec::new(),
+        attempt: None,
     }
 }
 
@@ -542,6 +598,8 @@ pub(crate) fn action_label(action: ReadinessAction) -> &'static str {
         ReadinessAction::ReviewProblem => "Review problem",
         ReadinessAction::ChooseEmulator => "Choose emulator",
         ReadinessAction::RecheckReadiness => "Recheck readiness",
+        ReadinessAction::ReviewDiscSet => "Review multi-disc set",
+        ReadinessAction::OpenActivity => "Open Activity",
     }
 }
 
@@ -583,7 +641,15 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             }
         });
         ui.label(&summary.explanation);
-        if summary.firmware == FirmwareSummary::Missing {
+        if let Some(attempt) = &summary.attempt {
+            if let Some(fix) = show_attempt(ui, attempt) {
+                action = Some(fix);
+            }
+        }
+        if let Some(fix) = show_findings(ui, summary) {
+            action = Some(fix);
+        }
+        if summary.firmware == FirmwareSummary::Missing && summary.findings.is_empty() {
             ui.label("BIOS / firmware is the system software this emulator needs. Use your own legally obtained files in BIOS Setup; a matching filename alone does not prove the right file.");
         }
         if summary.status == ReadinessPresentationState::Stale {
@@ -612,6 +678,11 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
             for detail in &summary.details {
                 ui.monospace(detail);
             }
+            for finding in &summary.findings {
+                for line in &finding.technical {
+                    ui.monospace(line);
+                }
+            }
             ui.label(format!(
                 "Identity evidence: {}",
                 identity_label(summary.identity)
@@ -624,6 +695,51 @@ pub(crate) fn show(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<
         });
     });
     action
+}
+
+/// When more than one thing blocks the game, list them all now so nobody has
+/// to fix one just to discover the next. The first one's button is already the
+/// card's primary action, so it is not repeated.
+fn show_findings(ui: &mut egui::Ui, summary: &GameReadinessSummary) -> Option<ReadinessAction> {
+    if summary.findings.is_empty() {
+        return None;
+    }
+    let mut action = None;
+    if summary.findings.len() > 1 {
+        ui.strong(format!("{} things need attention", summary.findings.len()));
+    }
+    for (index, finding) in summary.findings.iter().enumerate() {
+        if summary.findings.len() > 1 {
+            ui.label(egui::RichText::new(format!("{}. {}", index + 1, finding.title)).strong());
+        } else {
+            ui.label(egui::RichText::new(finding.title).strong());
+        }
+        ui.label(finding.why);
+        if index > 0
+            && let Some(fix) = finding.fix
+            && ui.button(action_label(fix)).clicked()
+        {
+            action = Some(fix);
+        }
+    }
+    ui.label(
+        "Your game was not changed. Checking launch readiness does not change your game files.",
+    );
+    action
+}
+
+fn show_attempt(ui: &mut egui::Ui, attempt: &Attempt) -> Option<ReadinessAction> {
+    ui.separator();
+    ui.label(egui::RichText::new(attempt.title()).strong());
+    ui.label(attempt.why());
+    ui.label("EmuWiz did not change your game files.");
+    let fix = attempt.fix();
+    let clicked = ui.button(action_label(fix)).clicked();
+    crate::ui::components::technical_details(ui, "launch_attempt_details", |ui| {
+        ui.monospace(attempt.technical());
+    });
+    ui.separator();
+    clicked.then_some(fix)
 }
 
 fn identity_label(identity: IdentitySummary) -> &'static str {
@@ -652,6 +768,9 @@ fn source_label(source: SourceSummary) -> &'static str {
         SourceSummary::RecheckNeeded => "Recheck needed",
     }
 }
+
+#[cfg(test)]
+mod diagnosis_tests;
 
 #[cfg(test)]
 mod tests {

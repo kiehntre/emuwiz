@@ -39,6 +39,7 @@ pub(super) struct NativeWorkflows {
     launch_job: Option<u64>,
     launch_was_active: bool,
     launch_kind: Option<LaunchKind>,
+    launch_attempts: launch_readiness_summary::AttemptTracker,
     source_job: Option<u64>,
     provider_job: Option<u64>,
     metadata_job: Option<u64>,
@@ -262,6 +263,7 @@ impl NativeWorkflows {
             launch_job: None,
             launch_was_active: false,
             launch_kind: None,
+            launch_attempts: Default::default(),
             source_job: None,
             provider_job: None,
             metadata_job: None,
@@ -321,6 +323,7 @@ impl NativeWorkflows {
         let active = self.launch_active();
         if active && !self.launch_was_active {
             self.launch_kind = self.active_launch_kind();
+            self.launch_attempts.started();
             let job = activity.queue("Launching game", self.selected_route(), false);
             activity.start(job);
             self.launch_job = Some(job);
@@ -329,6 +332,8 @@ impl NativeWorkflows {
             && let Some(job) = self.launch_job.take()
         {
             let error = self.launch_failure();
+            self.launch_attempts
+                .finished(self.selected_game, error.clone());
             activity.finish(
                 job,
                 if error.is_some() {
@@ -473,12 +478,17 @@ impl NativeWorkflows {
             ReadinessFreshness::Current
         };
         self.observe_readiness_activity(activity);
-        let summary = launch_readiness_summary::project(&input, freshness);
+        let mut summary = launch_readiness_summary::project(&input, freshness);
+        summary.attempt = self.launch_attempts.for_game(game_id).cloned();
         let action = launch_readiness_summary::show(ui, &summary);
+        if action == Some(ReadinessAction::RecheckReadiness) {
+            self.recheck_readiness_in_place(ui.ctx());
+        }
         action.and_then(|action| match action {
-            ReadinessAction::Play
-            | ReadinessAction::ChooseEmulator
-            | ReadinessAction::RecheckReadiness => Some(Route::Task {
+            ReadinessAction::RecheckReadiness => None,
+            ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
+            ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
+            ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {
                 section: Section::Launch,
                 game: game_id,
             }),
@@ -2485,6 +2495,24 @@ impl NativeWorkflows {
         }
     }
 
+    /// Recheck from the compact card without leaving the page. A check that is
+    /// already running is never duplicated; a new one gets a new generation, so
+    /// a late result for an older check or another game is dropped by the
+    /// selected-evidence pipeline.
+    fn recheck_readiness_in_place(&mut self, context: &egui::Context) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let running = matches!(
+            &self.app.selected_evidence_ui.selected_evidence,
+            selected_evidence_page::SelectedEvidenceState::Loading { path: current, .. }
+                if current == &path
+        );
+        if !running {
+            self.app.start_selected_evidence_load(context.clone(), path);
+        }
+    }
+
     fn start_launch_readiness(&mut self, context: &egui::Context) {
         let Some(path) = self.selected.clone() else {
             return;
@@ -2652,6 +2680,55 @@ mod source_presentation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recheck_never_starts_a_second_check_for_the_same_game() {
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.select(Path::new("/synthetic/a.iso"));
+        workflows.recheck_readiness_in_place(&ctx);
+        let first = workflows
+            .app
+            .selected_evidence_ui
+            .selected_evidence_generation;
+        workflows.recheck_readiness_in_place(&ctx);
+        assert_eq!(
+            workflows
+                .app
+                .selected_evidence_ui
+                .selected_evidence_generation,
+            first,
+            "a running check must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn recheck_after_a_game_change_supersedes_the_older_result() {
+        let ctx = egui::Context::default();
+        let mut workflows = NativeWorkflows::new(ctx.clone());
+        workflows.select(Path::new("/synthetic/a.iso"));
+        workflows.recheck_readiness_in_place(&ctx);
+        let first = workflows
+            .app
+            .selected_evidence_ui
+            .selected_evidence_generation;
+        workflows.select(Path::new("/synthetic/b.iso"));
+        workflows.recheck_readiness_in_place(&ctx);
+        // A late result for game A carries the old generation and is dropped by
+        // the pipeline's generation check; the state now belongs to game B.
+        assert!(
+            workflows
+                .app
+                .selected_evidence_ui
+                .selected_evidence_generation
+                > first
+        );
+        assert!(matches!(
+            &workflows.app.selected_evidence_ui.selected_evidence,
+            selected_evidence_page::SelectedEvidenceState::Loading { path, .. }
+                if path == Path::new("/synthetic/b.iso")
+        ));
+    }
 
     #[test]
     fn recovery_routes_use_existing_gui_v2_sections() {
