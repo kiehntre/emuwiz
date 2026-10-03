@@ -284,7 +284,9 @@ impl Machine {
         }
         m
     }
-    fn finish(self) -> Option<DatGameEntry> {
+    fn finish(mut self) -> Option<DatGameEntry> {
+        // Do not carry the scratch vector's spare capacity into the catalogue.
+        self.roms.shrink_to_fit();
         Some(DatGameEntry {
             name: self.name?,
             description: self.description,

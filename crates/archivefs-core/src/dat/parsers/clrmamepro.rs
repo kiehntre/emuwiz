@@ -723,7 +723,7 @@ fn emit_game(
             // parser understands.
             id: None,
             description: desc.take(),
-            roms: std::mem::take(roms),
+            roms: take_exact(roms),
             clone_of: clone_of.take(),
             rom_of: fidelity.rom_of,
             sample_of: fidelity.sample_of,
@@ -1198,4 +1198,14 @@ mod tests {
         let error = parse_clrmamepro(&path, DatLimits::default()).unwrap_err();
         assert!(matches!(error, ParseError::MalformedXml { .. }));
     }
+}
+
+/// Moves a game's ROMs out of the parser's scratch vector without carrying its
+/// spare capacity into the retained catalogue. A fresh `Vec` reserves four
+/// slots on the first push, which for the usual one-ROM game kept three
+/// unused `DatRomEntry`-sized slots per game alive for the whole catalogue.
+fn take_exact(roms: &mut Vec<DatRomEntry>) -> Vec<DatRomEntry> {
+    let mut taken = std::mem::take(roms);
+    taken.shrink_to_fit();
+    taken
 }
