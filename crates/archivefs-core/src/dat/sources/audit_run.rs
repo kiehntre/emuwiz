@@ -65,7 +65,7 @@ use crate::dat::classification::{
 };
 use crate::dat::dependency::resolve::{CollectionEvidence, resolve_collection};
 use crate::dat::disk_audit::{DatDiskAudit, audit_chd_disk, is_chd_path};
-use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation};
+use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation, SharedRomRef};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, DatGameEntry, DatPackingPolicy, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
@@ -2135,13 +2135,17 @@ fn annotate_content_matches(
                                         .size_bytes
                                         .is_none_or(|size| candidate.size_bytes == Some(size))
                                 })
-                                .cloned()
+                                .map(SharedRomRef::to_owned_ref)
                                 .collect()
                         })
                         .unwrap_or_default()
                 }
                 AuditVerdict::FilenameOnly { .. } => {
-                    index.lookup_filename(&evidence.filename).to_vec()
+                    index
+                        .lookup_filename(&evidence.filename)
+                        .iter()
+                        .map(SharedRomRef::to_owned_ref)
+                        .collect()
                 }
                 AuditVerdict::Ambiguous { .. }
                 | AuditVerdict::NotInDat
@@ -2274,7 +2278,7 @@ fn verified_candidate_refs(known: &KnownFileEvidence, index: &DatIndex) -> Vec<D
             _ => continue,
         };
         if !candidates.is_empty() {
-            return candidates.to_vec();
+            return candidates.iter().map(SharedRomRef::to_owned_ref).collect();
         }
     }
     Vec::new()
@@ -2497,7 +2501,7 @@ mod nested_member_evidence_tests {
         let index = DatIndex {
             by_crc32: HashMap::new(),
             by_md5: HashMap::new(),
-            by_sha1: HashMap::from([(digest.to_string(), vec![candidate])]),
+            by_sha1: HashMap::from([(digest.to_string(), vec![SharedRomRef::new(candidate)])]),
             by_sha256: HashMap::new(),
             by_filename: HashMap::new(),
             game_clone_of: HashMap::new(),

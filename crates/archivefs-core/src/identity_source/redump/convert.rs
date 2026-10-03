@@ -1,6 +1,6 @@
 //! Turns direct Redump index hits into lineage-aware observations.
 
-use crate::dat::index::{DatDiskRef, DatIndex, DatRomRef};
+use crate::dat::index::{DatDiskRef, DatIndex, DatRomRef, SharedRomRef};
 use crate::dat::model::ChecksumAlgorithm;
 use crate::platform_evidence_fusion::evidence_lineage::{
     ClaimStrength, ClaimType, EvidenceChannel, EvidenceObservation, IdentityScope, LineageRelation,
@@ -97,7 +97,7 @@ pub fn lookup_redump<'a>(
     index: &'a DatIndex,
     algorithm: ChecksumAlgorithm,
     hash_value: &str,
-) -> &'a [DatRomRef] {
+) -> &'a [SharedRomRef] {
     let table = match algorithm {
         ChecksumAlgorithm::Sha1 => &index.by_sha1,
         ChecksumAlgorithm::Md5 => &index.by_md5,

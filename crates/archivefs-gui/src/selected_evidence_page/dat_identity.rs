@@ -5,7 +5,7 @@ use archivefs_core::dat::audit::AuditVerdict;
 use archivefs_core::dat::identity::{
     DatPlatformIdentity, identify_dat_source, resolve_dat_platform_identity,
 };
-use archivefs_core::dat::index::DatRomRef;
+use archivefs_core::dat::index::{DatRomRef, SharedRomRef};
 use archivefs_core::dat::model::ChecksumAlgorithm;
 use archivefs_core::identity_source::hashing::LocalHashes;
 use archivefs_core::identity_source::no_intro::convert::{
@@ -51,7 +51,7 @@ impl VerifiedSelectedDat {
             },
             catalogue: identify_dat_source(&source.dat),
             sha1: hashes.sha1.clone(),
-            matches: matches.to_vec(),
+            matches: matches.iter().map(SharedRomRef::to_owned_ref).collect(),
             observations: observations_from_no_intro_matches(
                 source,
                 ChecksumAlgorithm::Sha1,

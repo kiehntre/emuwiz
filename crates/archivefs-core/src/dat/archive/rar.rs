@@ -2162,7 +2162,7 @@ mod tests {
             ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
             ArchivePassCompletion, ArchivePassStopReason, ArchiveRunBudget,
         };
-        use crate::dat::index::{DatIndex, DatMemberKey, DatRomRef, MemberLocation};
+        use crate::dat::index::{DatIndex, DatMemberKey, DatRomRef, MemberLocation, SharedRomRef};
         use crate::dat::model::{ChecksumAlgorithm, DatChecksum};
 
         fn no_cancel() -> AtomicBool {
@@ -2201,7 +2201,10 @@ mod tests {
                 by_md5: HashMap::new(),
                 by_sha1: HashMap::new(),
                 by_sha256: HashMap::new(),
-                by_filename: HashMap::from([(filename.to_ascii_lowercase(), refs)]),
+                by_filename: HashMap::from([(
+                    filename.to_ascii_lowercase(),
+                    refs.into_iter().map(SharedRomRef::new).collect(),
+                )]),
                 game_clone_of: HashMap::new(),
             }
         }
@@ -2457,14 +2460,14 @@ mod tests {
             for (name, md5, sha1) in entries {
                 by_filename.insert(
                     name.to_string(),
-                    vec![rom_ref(
+                    vec![SharedRomRef::new(rom_ref(
                         name,
                         name,
                         vec![
                             DatChecksum::parse(ChecksumAlgorithm::Md5, md5).unwrap(),
                             DatChecksum::parse(ChecksumAlgorithm::Sha1, sha1).unwrap(),
                         ],
-                    )],
+                    ))],
                 );
             }
             let index = DatIndex {

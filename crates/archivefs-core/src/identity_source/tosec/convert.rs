@@ -1,6 +1,6 @@
 //! Converts a reused [`DatIndex`] lookup into lineage-aware TOSEC evidence.
 
-use crate::dat::index::{DatIndex, DatRomRef};
+use crate::dat::index::{DatIndex, DatRomRef, SharedRomRef};
 use crate::dat::model::ChecksumAlgorithm;
 use crate::platform_evidence_fusion::evidence_lineage::{
     ClaimStrength, ClaimType, EvidenceChannel, EvidenceObservation, IdentityScope, LineageRelation,
@@ -252,7 +252,7 @@ pub fn lookup_tosec<'a>(
     index: &'a DatIndex,
     algorithm: ChecksumAlgorithm,
     hash_value: &str,
-) -> &'a [DatRomRef] {
+) -> &'a [SharedRomRef] {
     let table = match algorithm {
         ChecksumAlgorithm::Sha1 => &index.by_sha1,
         ChecksumAlgorithm::Md5 => &index.by_md5,

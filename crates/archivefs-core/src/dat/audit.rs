@@ -314,7 +314,7 @@ fn normalise_for_lookup(value: &str, algorithm: &str) -> Option<String> {
 }
 
 fn handle_candidates(
-    candidates: &[super::index::DatRomRef],
+    candidates: &[super::index::SharedRomRef],
     algorithm: &'static str,
 ) -> AuditVerdict {
     match candidates.len() {

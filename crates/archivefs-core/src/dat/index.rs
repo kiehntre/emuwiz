@@ -6,6 +6,8 @@
 //! audit reports `ExactMultipleCandidates` rather than silently picking one.
 
 use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +66,54 @@ impl DatRomRef {
     /// Returns the exact declaration key without involving display names.
     pub fn key(&self) -> DatMemberKey {
         self.member_key
+    }
+}
+
+/// One canonical, immutable [`DatRomRef`] shared by every index bucket that
+/// points at it.
+///
+/// A ROM with CRC32, MD5, SHA-1, SHA-256 and a filename used to be deep
+/// cloned into five buckets; at 500k records that duplication dominated peak
+/// memory. Cloning a `SharedRomRef` only bumps a reference count, and it
+/// derefs to the unchanged `DatRomRef`, so every field read and lookup result
+/// is identical. Use [`SharedRomRef::to_owned_ref`] for an owned copy.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SharedRomRef(Arc<DatRomRef>);
+
+/// Transparent: prints exactly like the `DatRomRef` it shares.
+impl std::fmt::Debug for SharedRomRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.0, f)
+    }
+}
+
+impl SharedRomRef {
+    pub fn new(rom_ref: DatRomRef) -> Self {
+        Self(Arc::new(rom_ref))
+    }
+
+    /// Whether both handles point at the same canonical record.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// An independent owned copy of the referenced record.
+    pub fn to_owned_ref(&self) -> DatRomRef {
+        (*self.0).clone()
+    }
+}
+
+impl Deref for SharedRomRef {
+    type Target = DatRomRef;
+
+    fn deref(&self) -> &DatRomRef {
+        &self.0
+    }
+}
+
+impl From<DatRomRef> for SharedRomRef {
+    fn from(rom_ref: DatRomRef) -> Self {
+        Self::new(rom_ref)
     }
 }
 
@@ -240,11 +290,11 @@ impl DatDiskIndex {
 /// Index into a parsed DAT file, keyed by hash values.
 #[derive(Debug, Clone)]
 pub struct DatIndex {
-    pub by_crc32: HashMap<String, Vec<DatRomRef>>,
-    pub by_md5: HashMap<String, Vec<DatRomRef>>,
-    pub by_sha1: HashMap<String, Vec<DatRomRef>>,
-    pub by_sha256: HashMap<String, Vec<DatRomRef>>,
-    pub by_filename: HashMap<String, Vec<DatRomRef>>,
+    pub by_crc32: HashMap<String, Vec<SharedRomRef>>,
+    pub by_md5: HashMap<String, Vec<SharedRomRef>>,
+    pub by_sha1: HashMap<String, Vec<SharedRomRef>>,
+    pub by_sha256: HashMap<String, Vec<SharedRomRef>>,
+    pub by_filename: HashMap<String, Vec<SharedRomRef>>,
     /// Batch 12: every game's own `cloneof` value (verbatim, `None` when
     /// the DAT declares none), keyed by game name - built once here so a
     /// caller holding only a confident `AuditVerdict::Exact`'s `game_name`
@@ -334,6 +384,7 @@ impl DatIndex {
     }
 
     fn insert_rom(&mut self, rom: &super::model::DatRomEntry, rom_ref: DatRomRef) {
+        let rom_ref = SharedRomRef::new(rom_ref);
         if let Some(ref crc) = rom.crc32 {
             self.by_crc32
                 .entry(crc.clone())
@@ -366,22 +417,22 @@ impl DatIndex {
     }
 
     /// Look up by CRC32. Returns candidates (empty if none).
-    pub fn lookup_crc32(&self, crc: &str) -> &[DatRomRef] {
+    pub fn lookup_crc32(&self, crc: &str) -> &[SharedRomRef] {
         self.by_crc32.get(crc).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Look up by MD5.
-    pub fn lookup_md5(&self, md5: &str) -> &[DatRomRef] {
+    pub fn lookup_md5(&self, md5: &str) -> &[SharedRomRef] {
         self.by_md5.get(md5).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Look up by SHA-1.
-    pub fn lookup_sha1(&self, sha1: &str) -> &[DatRomRef] {
+    pub fn lookup_sha1(&self, sha1: &str) -> &[SharedRomRef] {
         self.by_sha1.get(sha1).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Look up by SHA-256.
-    pub fn lookup_sha256(&self, sha256: &str) -> &[DatRomRef] {
+    pub fn lookup_sha256(&self, sha256: &str) -> &[SharedRomRef] {
         self.by_sha256
             .get(sha256)
             .map(|v| v.as_slice())
@@ -389,7 +440,7 @@ impl DatIndex {
     }
 
     /// Look up by filename (case-insensitive).
-    pub fn lookup_filename(&self, filename: &str) -> &[DatRomRef] {
+    pub fn lookup_filename(&self, filename: &str) -> &[SharedRomRef] {
         self.by_filename
             .get(&filename.to_ascii_lowercase())
             .map(|v| v.as_slice())
@@ -620,6 +671,144 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn rom(name: &str, size: u64, crc: &str, sha1: Option<&str>) -> DatRomEntry {
+        DatRomEntry {
+            name: name.into(),
+            size_bytes: Some(size),
+            crc32: Some(crc.into()),
+            sha1: sha1.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn game(name: &str, clone_of: Option<&str>, roms: Vec<DatRomEntry>) -> DatGameEntry {
+        DatGameEntry {
+            name: name.into(),
+            clone_of: clone_of.map(str::to_string),
+            roms,
+            ..Default::default()
+        }
+    }
+
+    fn conflict_dat() -> ParsedDat {
+        let mut dat = make_dat();
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        dat.games = vec![
+            game(
+                "One",
+                None,
+                vec![rom("Shared.BIN", 1, "00000001", Some(sha))],
+            ),
+            game(
+                "Two",
+                Some("One"),
+                vec![rom("shared.bin", 2, "00000002", None)],
+            ),
+            game(
+                "Three",
+                None,
+                vec![rom("other.bin", 3, "00000001", Some(sha))],
+            ),
+        ];
+        dat
+    }
+
+    #[test]
+    fn duplicate_hash_returns_every_candidate_in_catalogue_order() {
+        let index = DatIndex::build(&conflict_dat());
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let games: Vec<_> = index
+            .lookup_sha1(sha)
+            .iter()
+            .map(|r| r.game_name.as_str())
+            .collect();
+        assert_eq!(games, ["One", "Three"]);
+        let crc: Vec<_> = index
+            .lookup_crc32("00000001")
+            .iter()
+            .map(|r| r.game_name.as_str())
+            .collect();
+        assert_eq!(crc, ["One", "Three"]);
+        assert_eq!(index.sha1_collisions(), 1);
+        assert_eq!(
+            index
+                .lookup_sha1("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn duplicate_filename_is_case_folded_and_keeps_distinct_hashes() {
+        let index = DatIndex::build(&conflict_dat());
+        let found = index.lookup_filename("SHARED.bin");
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].rom_name, "Shared.BIN");
+        assert_eq!(found[1].rom_name, "shared.bin");
+        assert_ne!(found[0].checksums, found[1].checksums);
+    }
+
+    #[test]
+    fn hash_and_filename_conflict_is_unchanged() {
+        // Same hash under two different filenames, same filename under two
+        // different hashes: both stay visible from both directions.
+        let index = DatIndex::build(&conflict_dat());
+        let by_hash: Vec<_> = index
+            .lookup_sha1("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .iter()
+            .map(|r| r.rom_name.to_ascii_lowercase())
+            .collect();
+        assert_eq!(by_hash, ["shared.bin", "other.bin"]);
+        assert_eq!(index.lookup_filename("other.bin")[0].game_name, "Three");
+    }
+
+    #[test]
+    fn shared_records_keep_provenance_and_clone_evidence() {
+        let index = DatIndex::build(&conflict_dat());
+        let two = &index.lookup_crc32("00000002")[0];
+        assert_eq!(two.game_name, "Two");
+        assert_eq!(two.clone_of.as_deref(), Some("One"));
+        assert_eq!(two.size_bytes, Some(2));
+        assert_eq!(two.key().game_index, 1);
+        assert_eq!(index.game_clone_of["Two"].as_deref(), Some("One"));
+        // An owned copy is an independent, equal record.
+        assert_eq!(two.to_owned_ref(), **two);
+    }
+
+    #[test]
+    fn one_canonical_record_is_shared_by_every_bucket() {
+        let index = DatIndex::build(&conflict_dat());
+        let by_sha1 = &index.lookup_sha1("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")[0];
+        let by_crc = &index.lookup_crc32("00000001")[0];
+        let by_name = &index.lookup_filename("shared.bin")[0];
+        assert!(by_sha1.ptr_eq(by_crc) && by_crc.ptr_eq(by_name));
+    }
+
+    #[test]
+    fn parsed_games_carry_no_spare_rom_capacity_and_malformed_input_still_fails() {
+        use crate::dat::limits::DatLimits;
+        use crate::dat::parsers::parse_dat_file;
+        let dir = tempfile::tempdir().unwrap();
+        let header = "<?xml version=\"1.0\"?><datafile><header><name>T</name></header>";
+        let good = dir.path().join("good.dat");
+        std::fs::write(
+            &good,
+            format!("{header}<game name=\"g\"><rom name=\"a.bin\" size=\"1\" crc=\"00000001\"/></game></datafile>"),
+        )
+        .unwrap();
+        let outcome = parse_dat_file(&good, DatLimits::default()).unwrap();
+        for game in &outcome.dat.games {
+            assert_eq!(game.roms.capacity(), game.roms.len());
+        }
+        let bad = dir.path().join("bad.dat");
+        std::fs::write(
+            &bad,
+            format!("{header}<game name=\"g\"><rom name=\"a.bin\" size=\"nope\" crc=\"zz\"/></game></datafile>"),
+        )
+        .unwrap();
+        assert!(parse_dat_file(&bad, DatLimits::default()).is_err());
     }
 
     mod disk_index {

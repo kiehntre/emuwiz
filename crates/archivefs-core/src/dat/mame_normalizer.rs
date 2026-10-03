@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use super::index::{DatIndex, DatRomRef};
+use super::index::{DatIndex, DatRomRef, SharedRomRef};
 use super::mame_arcade_join::{ArcadeJoinClass, ArcadeJoinEvidence, MemberEvidenceKind};
 use super::model::ParsedDat;
 use crate::dat::rename_apply::noclobber::rename_noreplace;
@@ -772,7 +772,7 @@ fn located_members_from_join(
         located.push(LocatedRom {
             archive: path.to_path_buf(),
             current: current_name.to_string(),
-            rom: candidates[0].clone(),
+            rom: candidates[0].to_owned_ref(),
             sha256: digest.sha256,
         });
     }
@@ -975,7 +975,7 @@ fn locate_zip_members(path: &Path, index: &DatIndex) -> Result<Vec<LocatedRom>, 
         located.push(LocatedRom {
             archive: path.to_path_buf(),
             current,
-            rom: candidates[0].clone(),
+            rom: candidates[0].to_owned_ref(),
             sha256: digest.sha256,
         });
     }
@@ -1154,7 +1154,7 @@ fn plan_zip(path: &Path, index: &DatIndex, mode: MameCollectionMode) -> Result<P
             matches
                 .entry(candidate.game_name.clone())
                 .or_default()
-                .push((name.clone(), candidate.clone()));
+                .push((name.clone(), candidate.to_owned_ref()));
         }
     }
     let Some((game_name, parent, found)) = choose_game(&matches, mode) else {
@@ -1197,7 +1197,7 @@ fn plan_directory(
             matches
                 .entry(candidate.game_name.clone())
                 .or_default()
-                .push((relative.clone(), candidate.clone()));
+                .push((relative.clone(), candidate.to_owned_ref()));
         }
     }
     let Some((game_name, parent, found)) = choose_game(&matches, mode) else {
@@ -1409,7 +1409,7 @@ fn hashes(bytes: &[u8]) -> Hashes {
     }
 }
 
-fn lookup<'a>(index: &'a DatIndex, hashes: &Hashes) -> Vec<&'a DatRomRef> {
+fn lookup<'a>(index: &'a DatIndex, hashes: &Hashes) -> Vec<&'a SharedRomRef> {
     let mut result = Vec::new();
     for candidate in index.lookup_sha256(&hashes.sha256) {
         result.push(candidate);
