@@ -38,12 +38,10 @@
 //! - `Unsupported` – well-formed hex pairs that contain an Action Replay
 //!   command Dolphin refuses at runtime (master codes, zero codes,
 //!   self-modifying codes).
-//! - `Malformed` – anything that is not a well-formed hex-pair line
-//!   (placeholders such as `XXXX`/`?`/`N/A`, the base-31 encrypted
-//!   `XXXX-XXXX-XXXXX` AR codes, free text). The encrypted dash-format codes
-//!   are real Action Replay content that Dolphin could decrypt, but EmuWiz
-//!   has no verified decryptor and therefore cannot inspect what they decode
-//!   to; they remain browse-only.
+//! - `Malformed` – placeholders, free text, mixed raw/encrypted input, or a
+//!   dash-format set that fails the bounded GameCube decoder. Verified fixed-key
+//!   sets enter the same classifier after decoding; master verifiers remain
+//!   unsupported even when their body contains otherwise installable writes.
 //!
 //! Every other BSFree system/device pairing (PS2 CodeBreaker/GameShark/ARMax
 //! and every retro platform) stays browse-only: no existing adapter can
@@ -59,6 +57,7 @@
 //! confirmed by the user before any Apply; nothing here ever applies
 //! automatically. See [`bsfree_gamecube_match`] and the CLI flow.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -73,6 +72,9 @@ use super::dolphin_code::{
 use super::dolphin_dedup::{
     DolphinCheat, DolphinDedupFinding, DolphinDedupFindingKind, analyze_dolphin_duplicates,
 };
+use super::gamecube_wii_ar_decrypt::{
+    GAMECUBE_AR_DECODER_VERSION, MAX_ENCRYPTED_BYTES, VerifiedGameCubeAr, decode_gamecube_ar,
+};
 use super::gamehacking_gamecube_install_plan::{
     GameCubeCheatSelection, GameCubeGameHackingInstallPreview,
     GameCubeGameHackingInstallPreviewRequest, GameCubeInstallPlanError,
@@ -83,6 +85,22 @@ use super::gamehacking_gamecube_provider::{GameCubeCodeFormat, GameHackingGameCu
 use super::gecko_document::{DolphinIniDocument, is_gecko_code_line};
 
 pub const BSFREE_GAMECUBE_PROVIDER_LABEL: &str = "BSFree Archive";
+
+/// Decode evidence is separate from output identity and never supplies a disc
+/// identity or permission to install. Oversized input retains its digest and
+/// byte count, without allocating another oversized copy for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", content = "evidence", rename_all = "snake_case")]
+pub enum BsFreeGameCubeArDecryption {
+    Verified(VerifiedGameCubeAr),
+    Refused {
+        original_encrypted_text: Option<String>,
+        original_bytes: usize,
+        source_sha256: String,
+        decoder_version: &'static str,
+        reason: String,
+    },
+}
 
 /// One BSFree GameCube cheat's classification, decided strictly from the
 /// authoritative Action Replay and Gecko semantics above - never guessed
@@ -101,8 +119,7 @@ pub enum BsFreeGameCubeCodeFormat {
     /// Well-formed hex pairs containing an Action Replay command Dolphin
     /// refuses at runtime (master/zero/self-modifying codes).
     Unsupported,
-    /// Not a well-formed `XXXXXXXX YYYY` hex-pair code (placeholders,
-    /// encrypted dash-format codes, free text).
+    /// Not a well-formed raw or verified dash-format code.
     Malformed,
 }
 
@@ -125,12 +142,12 @@ impl BsFreeGameCubeCodeFormat {
                  into Dolphin's [ActionReplay] section; it is not relabelled as Gecko."
             }
             Self::Unsupported => {
-                "The code body contains an Action Replay command Dolphin refuses to run \
-                 (a master code, zero code, or self-modifying code). Browse-only."
+                "The Action Replay set has a master verifier or a command Dolphin refuses \
+                 to run (a master code, zero code, or self-modifying code). Browse-only."
             }
             Self::Malformed => {
-                "The code body is not a well-formed X XXXXXXXX YYYYYYYY hex-pair code \
-                 (placeholders, encrypted codes, or free text). Browse-only."
+                "The code body is not a well-formed raw or verified encrypted Action Replay \
+                 code (placeholders, failed decoding, or free text). Browse-only."
             }
         }
     }
@@ -217,12 +234,57 @@ impl DolphinCheat for BsFreeGameCubeCheat {
     }
 }
 
-/// Classifies one raw BSFree record for GameCube. The record is accepted
-/// only when its device is exactly the GameCube "Action Replay" family; any
-/// other device yields a `Malformed`/browse-only result with the reason kept.
+/// Classifies a BSFree record in an explicit GameCube context. Encrypted
+/// records require the exact Action Replay device label; ordinary raw
+/// classification retains its existing behavior.
 pub fn classify_bsfree_gamecube_cheat(cheat: &BsFreeCheat) -> BsFreeGameCubeCheat {
-    let raw_lines = cheat
-        .code
+    classify_bsfree_gamecube_cheat_with_provenance(cheat).0
+}
+
+/// Explicit GameCube classification with exact decode evidence. Raw records
+/// retain their previous lines, classification, serialized shape and digest.
+pub fn classify_bsfree_gamecube_cheat_with_provenance(
+    cheat: &BsFreeCheat,
+) -> (BsFreeGameCubeCheat, Option<BsFreeGameCubeArDecryption>) {
+    classify_gamecube_record(cheat, true)
+}
+
+fn classify_gamecube_record(
+    cheat: &BsFreeCheat,
+    platform_is_gamecube: bool,
+) -> (BsFreeGameCubeCheat, Option<BsFreeGameCubeArDecryption>) {
+    let decryption = cheat.code.contains('-').then(|| {
+        let result = if !platform_is_gamecube {
+            Err("encrypted decoding requires an explicitly mapped GameCube provider game".into())
+        } else if cheat.device.name != "Action Replay" {
+            Err("encrypted decoding requires the explicit Action Replay device".into())
+        } else if cheat.truncated_fields.iter().any(|field| field == "code") {
+            Err("encrypted provider code was truncated; decoding is refused".into())
+        } else {
+            decode_gamecube_ar(&cheat.code).map_err(|error| error.to_string())
+        };
+        match result {
+            Ok(decoded) => BsFreeGameCubeArDecryption::Verified(decoded),
+            Err(reason) => BsFreeGameCubeArDecryption::Refused {
+                original_encrypted_text: (cheat.code.len() <= MAX_ENCRYPTED_BYTES)
+                    .then(|| cheat.code.clone()),
+                original_bytes: cheat.code.len(),
+                source_sha256: hex_sha256(&Sha256::digest(cheat.code.as_bytes())),
+                decoder_version: GAMECUBE_AR_DECODER_VERSION,
+                reason,
+            },
+        }
+    });
+    let body = match &decryption {
+        Some(BsFreeGameCubeArDecryption::Verified(decoded)) => decoded.raw_ar_text.as_str(),
+        Some(BsFreeGameCubeArDecryption::Refused { .. })
+            if cheat.code.len() > MAX_ENCRYPTED_BYTES =>
+        {
+            ""
+        }
+        _ => &cheat.code,
+    };
+    let raw_lines = body
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -234,18 +296,23 @@ pub fn classify_bsfree_gamecube_cheat(cheat: &BsFreeCheat) -> BsFreeGameCubeChea
         .map(|line| ar_line_family(line))
         .collect::<Vec<_>>();
 
-    let code_format = if families.is_empty()
+    let code_format = if matches!(
+        &decryption,
+        Some(BsFreeGameCubeArDecryption::Refused { .. })
+    ) || families.is_empty()
         || families
             .iter()
             .any(|family| matches!(family, ArLineFamily::Malformed))
     {
         BsFreeGameCubeCodeFormat::Malformed
-    } else if families.iter().any(|family| {
-        matches!(
-            family,
-            ArLineFamily::MasterCode | ArLineFamily::ZeroCode | ArLineFamily::SelfModifying
-        )
-    }) {
+    } else if matches!(&decryption, Some(BsFreeGameCubeArDecryption::Verified(decoded)) if decoded.verification.is_master)
+        || families.iter().any(|family| {
+            matches!(
+                family,
+                ArLineFamily::MasterCode | ArLineFamily::ZeroCode | ArLineFamily::SelfModifying
+            )
+        })
+    {
         BsFreeGameCubeCodeFormat::Unsupported
     } else if families
         .iter()
@@ -275,7 +342,7 @@ pub fn classify_bsfree_gamecube_cheat(cheat: &BsFreeCheat) -> BsFreeGameCubeChea
         canonical_digest: String::new(),
     };
     cheat.canonical_digest = cheat.output_digest();
-    cheat
+    (cheat, decryption)
 }
 
 /// The stable Dolphin display name EmuWiz uses for a BSFree-installed
@@ -332,17 +399,41 @@ pub fn bsfree_gamecube_cheats(
     catalogue: &BsFreeCatalogue,
     upstream_uid: i64,
 ) -> Result<Vec<BsFreeGameCubeCheat>, BsFreeError> {
+    bsfree_gamecube_cheats_with_provenance(catalogue, upstream_uid).map(|(cheats, _)| cheats)
+}
+
+fn bsfree_gamecube_cheats_with_provenance(
+    catalogue: &BsFreeCatalogue,
+    upstream_uid: i64,
+) -> Result<
+    (
+        Vec<BsFreeGameCubeCheat>,
+        BTreeMap<i64, BsFreeGameCubeArDecryption>,
+    ),
+    BsFreeError,
+> {
+    let platform_is_gamecube = catalogue
+        .game(upstream_uid)?
+        .is_some_and(|game| game.system.archivefs_platform_id.as_deref() == Some("GameCube"));
     let page = super::PageRequest {
         offset: 0,
         limit: super::PageRequest::HARD_LIMIT,
     }
     .bounded();
     let rows = catalogue.cheats(upstream_uid, page)?;
-    Ok(rows
+    let mut decryption = BTreeMap::new();
+    let cheats = rows
         .rows
         .into_iter()
-        .map(|cheat| classify_bsfree_gamecube_cheat(&cheat))
-        .collect())
+        .map(|cheat| {
+            let (classified, evidence) = classify_gamecube_record(&cheat, platform_is_gamecube);
+            if let Some(evidence) = evidence {
+                decryption.insert(cheat.upstream_id, evidence);
+            }
+            classified
+        })
+        .collect();
+    Ok((cheats, decryption))
 }
 
 /// GameCube duplicate/conflict finding kind.
@@ -841,6 +932,10 @@ pub struct BsFreeGameCubeSearchOutcome {
     pub candidates: Vec<BsFreeGameCubeMatch>,
     pub game: Option<BsFreeGameCubeMatch>,
     pub cheats: Vec<BsFreeGameCubeCheat>,
+    /// Original text, checked verifier and decoded body (or refusal) by provider
+    /// record ID. Absent for ordinary raw records; not a game-identity authority.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ar_decryption: BTreeMap<i64, BsFreeGameCubeArDecryption>,
 }
 
 /// Searches BSFree for the selected archive's GameCube game.
@@ -871,6 +966,7 @@ pub fn bsfree_gamecube_search(
             candidates: Vec::new(),
             game: None,
             cheats: Vec::new(),
+            ar_decryption: BTreeMap::new(),
         });
     }
     let search = catalogue.search_games(&super::BsFreeGameSearchRequest {
@@ -911,10 +1007,14 @@ pub fn bsfree_gamecube_search(
             candidates,
             game: None,
             cheats: Vec::new(),
+            ar_decryption: BTreeMap::new(),
         }),
         1 => {
             let game = candidates.remove(0);
-            let cheats = bsfree_gamecube_cheats(catalogue, game.matched_bsfree_game_upstream_uid)?;
+            let (cheats, ar_decryption) = bsfree_gamecube_cheats_with_provenance(
+                catalogue,
+                game.matched_bsfree_game_upstream_uid,
+            )?;
             Ok(BsFreeGameCubeSearchOutcome {
                 status: BsFreeGameCubeSearchStatus::Matched,
                 detail: format!(
@@ -924,6 +1024,7 @@ pub fn bsfree_gamecube_search(
                 candidates,
                 game: Some(game),
                 cheats,
+                ar_decryption,
             })
         }
         _ => Ok(BsFreeGameCubeSearchOutcome {
@@ -934,6 +1035,7 @@ pub fn bsfree_gamecube_search(
             candidates,
             game: None,
             cheats: Vec::new(),
+            ar_decryption: BTreeMap::new(),
         }),
     }
 }
@@ -964,13 +1066,14 @@ pub fn bsfree_gamecube_load_confirmed(
                  emulator-stable identifier, so this match still requires review before Apply"
             .to_string(),
     };
-    let cheats = bsfree_gamecube_cheats(catalogue, upstream_uid)?;
+    let (cheats, ar_decryption) = bsfree_gamecube_cheats_with_provenance(catalogue, upstream_uid)?;
     Ok(Some(BsFreeGameCubeSearchOutcome {
         status: BsFreeGameCubeSearchStatus::Matched,
         detail: format!("Review the cheats for {:?} before applying.", game_row.name),
         candidates: Vec::new(),
         game: Some(game),
         cheats,
+        ar_decryption,
     }))
 }
 

@@ -83,6 +83,7 @@ mod fbneo_cheat;
 mod flycast_cheats;
 mod flycast_local;
 mod fuse_local;
+mod gamecube_wii_ar_decrypt;
 mod gamehacking_browser_import;
 mod gamehacking_catalogue;
 mod gamehacking_gamecube_install_plan;
@@ -219,13 +220,14 @@ pub use bsfree::{
 };
 pub use bsfree_gamecube::{
     BSFREE_GAMECUBE_PROVIDER_LABEL, BsFreeDedupFinding, BsFreeDedupFindingKind,
-    BsFreeGameCubeCheat, BsFreeGameCubeCheatSelection, BsFreeGameCubeCodeFormat,
-    BsFreeGameCubeError, BsFreeGameCubeErrorKind, BsFreeGameCubeInstallPreview,
-    BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch, BsFreeGameCubeSearchOutcome,
-    BsFreeGameCubeSearchStatus, BsFreeGameCubeSelectionEntry, BsFreeStagedGameCubeInstall,
-    analyze_bsfree_gamecube_duplicates, bsfree_cheat_as_gamehacking, bsfree_dolphin_code_name,
-    bsfree_gamecube_cheats, bsfree_gamecube_load_confirmed, bsfree_gamecube_match,
-    bsfree_gamecube_search, build_bsfree_gamecube_install_preview, classify_bsfree_gamecube_cheat,
+    BsFreeGameCubeArDecryption, BsFreeGameCubeCheat, BsFreeGameCubeCheatSelection,
+    BsFreeGameCubeCodeFormat, BsFreeGameCubeError, BsFreeGameCubeErrorKind,
+    BsFreeGameCubeInstallPreview, BsFreeGameCubeInstallPreviewRequest, BsFreeGameCubeMatch,
+    BsFreeGameCubeSearchOutcome, BsFreeGameCubeSearchStatus, BsFreeGameCubeSelectionEntry,
+    BsFreeStagedGameCubeInstall, analyze_bsfree_gamecube_duplicates, bsfree_cheat_as_gamehacking,
+    bsfree_dolphin_code_name, bsfree_gamecube_cheats, bsfree_gamecube_load_confirmed,
+    bsfree_gamecube_match, bsfree_gamecube_search, build_bsfree_gamecube_install_preview,
+    classify_bsfree_gamecube_cheat, classify_bsfree_gamecube_cheat_with_provenance,
     stage_bsfree_gamecube_install,
 };
 pub use bsfree_wii::{
@@ -628,6 +630,10 @@ pub use fuse_local::{
     FuseLaunchBlocker, FuseLaunchBlockerKind, FuseNativeLaunchBinding, FuseProfile,
     FuseProfileDiscovery, FuseProfileDiscoveryRoots, discover_fuse_profiles,
     resolve_fuse_native_launch_binding,
+};
+pub use gamecube_wii_ar_decrypt::{
+    GAMECUBE_AR_DECODER_VERSION, GameCubeArDecodeError, GameCubeArVerification, VerifiedGameCubeAr,
+    decode_gamecube_ar,
 };
 pub use gamehacking_browser_import::{
     BROWSER_IMPORT_PARSER_SCHEMA_VERSION, BROWSER_IMPORT_PROVENANCE_SCHEMA_VERSION,
