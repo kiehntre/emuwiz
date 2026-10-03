@@ -358,7 +358,7 @@ fn receipt_card(ui: &mut egui::Ui, receipt: &ModReceiptSummary) {
                 "Potential mod conflict — review related transactions.",
             );
         }
-        ui.label("This receipt records what changed and whether recovery is available.");
+        ui.label("This record shows what changed and whether you can undo it.");
         ui.collapsing("Details", |ui| {
             ui.label(format!("Transaction: {}", receipt.transaction_id));
             if let Some(identity) = &receipt.verified_identity {
@@ -424,7 +424,7 @@ fn stack(
     game: Option<&crate::gui_v2::library::Game>,
 ) {
     ui.heading("Active stack");
-    ui.label("Enabled mods are shown in the deterministic order recorded by the existing activation and transaction history.");
+    ui.label("Enabled mods are listed in the order they were applied.");
     let Some(history) = history else { return };
     let receipts = for_game(history, game);
     if receipts.is_empty() {

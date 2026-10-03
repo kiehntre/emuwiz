@@ -297,7 +297,7 @@ fn motif_plate(ui: &mut egui::Ui, side: f32, kind: CardKind) {
 }
 
 fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
-    ui.label("Merged reconstruction is read-only until an explicitly reviewed staged apply.");
+    ui.label("Rebuilding a set only previews until you review and confirm it.");
     ui.horizontal_wrapped(|ui| {
         if ui.button("Choose MAME folder…").clicked()
             && let Some(path) = rfd::FileDialog::new()
@@ -331,10 +331,10 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             .map_or("not selected".into(), |p| p.display().to_string())
     ));
     ui.separator();
-    ui.heading("Refresh physical member evidence");
-    ui.label("Read-only: reusable checksum evidence is stored before any repair is considered.");
+    ui.heading("Re-check the files inside my sets");
+    ui.label("Nothing is changed. EmuWiz reads your files and remembers their checksums so later checks are faster.");
     ui.horizontal(|ui| {
-        ui.label("Optional set/family:");
+        ui.label("Only this set (optional):");
         ui.text_edit_singleline(&mut state.mame_evidence_set);
     });
     ui.horizontal_wrapped(|ui| {
@@ -367,8 +367,8 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
         ui.label(message);
     }
     if let Some(plan) = &state.mame_plan {
-        ui.strong("Reconstruction preview");
-        ui.label("Reconstruction builds a new complete merged set from verified evidence; it is different from repairing an existing set in place.");
+        ui.strong("Rebuild preview");
+        ui.label("Rebuilding makes a new, complete copy of a set from files EmuWiz has verified. It does not repair your existing set in place.");
         ui.label(format!(
             "Target parent set: {} · clone sets: {}",
             plan.parent,
@@ -388,7 +388,7 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
             plan.sources.len()
         ));
         if !plan.sources.is_empty() {
-            ui.strong("Verified source files");
+            ui.strong("Files EmuWiz will use");
             for source in plan.sources.iter().take(8) {
                 ui.push_id((&source.archive_path, &source.member_path), |ui| {
                     ui.label(format!("{} → {}", source.current_name, source.target_name));
@@ -432,8 +432,8 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
         } else {
             "Publish blocked: missing members, collisions, or insufficient ownership evidence must be resolved first."
         });
-        ui.label("Publishing creates a separate output; source archives remain untouched, and a completed transaction can be undone.");
-        ui.label("Verification plan: re-check the published output against the reviewed member evidence after publication.");
+        ui.label("This creates a separate new copy. Your original files stay untouched, and you can undo it afterwards.");
+        ui.label("After it finishes, EmuWiz re-checks the new copy against what you reviewed.");
         ui.collapsing("Advanced reconstruction evidence", |ui| {
             for reason in &plan.reasons {
                 ui.label(format!("• {reason}"));
@@ -476,7 +476,7 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                 }
             } else {
                 ui.group(|ui| {
-                    ui.strong("Confirm publication");
+                    ui.strong("Confirm: create the new copy");
                     let phrase = mame_publish_confirmation_phrase(1);
                     ui.label(format!(
                         "Type {phrase} exactly to create the destination ZIP."
@@ -499,7 +499,7 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
     }
     if !state.mame_history.is_empty() {
         ui.separator();
-        ui.heading("MAME reconstruction history");
+        ui.heading("MAME rebuild history");
         let history = state.mame_history.clone();
         for transaction in history.iter().rev() {
             ui.push_id(&transaction.transaction_id, |ui| {
@@ -551,7 +551,7 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                 }
                 ui.collapsing("Advanced transaction details", |ui| {
                     ui.label(format!("State: {}", transaction.state.label()));
-                    ui.label("The shared journal is the recovery record; source archives are never rollback targets.");
+                    ui.label("EmuWiz keeps a record so you can undo. Your original sets are never changed by an undo.");
                 });
                 });
             });
@@ -868,7 +868,7 @@ impl App {
                     if !self.organisation.mame_history.is_empty() {
                         widgets::banner(
                             ui,
-                            "MAME reconstruction history is available",
+                            "MAME rebuild history is available",
                             "Review publication and recovery state before starting another reconstruction.",
                             widgets::StatusTone::Info,
                         );
@@ -877,7 +877,7 @@ impl App {
                         }
                         ui.add_space(theme::SPACE_SM);
                     }
-                    ui.label("Choose one clear job. Every changing workflow starts with a preview.");
+                    ui.label("Pick one job. Anything that changes files shows a preview first.");
                     ui.horizontal_wrapped(|ui| {
                         if primary(ui, "Rename verified games") {
                             selected = Some(None);
@@ -895,8 +895,8 @@ impl App {
                             self.go(Route::Section(Section::Problems));
                         }
                     });
-                    ui.label("Advanced organisation options remain available below for specialist preferences and history.");
-                    ui.label("Source untouched until a reviewed preview is confirmed.");
+                    ui.label("Advanced organisation options, with more preferences and history, are further down.");
+                    ui.label("Source untouched until you confirm a preview.");
                     for card in ACTIONS {
                         widgets::workflow_card(ui, card.kind.accent(), |ui| {
                             ui.horizontal(|ui| {
@@ -929,7 +929,7 @@ impl App {
                             ui.add_space(theme::SPACE_SM);
                             ui.vertical(|ui| {
                                 ui.label(RichText::new("Fix my MAME library").size(theme::SECTION_TITLE_SIZE).strong());
-                                ui.label("Separate MAME set names, ROM members, parent/clone dependencies and dump state before repair.");
+                                ui.label("Check MAME set names, the files inside each set, shared parent files and dump quality before fixing anything.");
                                 ui.label(RichText::new("Preview required · Evidence must be sufficient · Recovery remains available").strong().color(theme::TEAL));
                                 if primary(ui, "Analyse MAME collection") {
                                     self.organisation.view = OrganisationView::MameNormalizer;
@@ -939,14 +939,14 @@ impl App {
                     });
                     ui.add_space(theme::SPACE_SM);
                     ui.collapsing("Advanced organisation options", |ui| {
-                        ui.label("These options stay inside the native v2 workflow; the old Build window is not used.");
-                        ui.label("Required normal option: choose a destination, then preview and explicitly confirm the safe transaction.");
-                        ui.label("Advanced but supported: adjust 1G1R region, language, revision and Beta/Proto/Demo/Sample preferences inside Playing Library.");
+                        ui.label("Everything here happens in this window.");
+                        ui.label("Choose where the result goes, look at the preview, then confirm.");
+                        ui.label("Advanced: in Playing Library you can prefer a region, language or version, and choose whether to include betas, prototypes, demos and samples (1G1R = one game, one ROM).");
                         if ui.button("Open 1G1R preferences").clicked() {
                             selected = Some(Some(PlayingLibraryDestination::Generic));
                         }
-                        ui.label("RomM, ES-DE and RetroDECK each retain their own visibility/publication checks and recovery actions.");
-                        ui.label("Specialist/deferred: obsolete duplicate controls from the former Build shell are not reproduced here.");
+                        ui.label("RomM, ES-DE and RetroDECK each keep their own checks and undo options.");
+                        ui.label("Some old duplicate-handling options from the previous version are not included here.");
                         if ui.button("Review organisation history").clicked() {
                             open_history = true;
                         }
@@ -983,12 +983,12 @@ impl App {
                         );
                     });
                     ui.label("1 Choose  ·  2 Preview  ·  3 Confirm  ·  4 Apply");
-                    ui.label("Original files stay untouched. EmuWiz creates reviewed links in the destination, then publishes metadata separately when required.");
+                    ui.label("Original files stay untouched. EmuWiz creates links in the destination you chose, then adds game info separately if needed.");
                     if self.playing_library.destination == PlayingLibraryDestination::Romm {
                         ui.label("This creates files for RomM to scan. It does not edit your RomM server.");
                     }
                     if self.playing_library.destination == PlayingLibraryDestination::RetroDeck {
-                        ui.label("RetroDECK uses ES-DE internally and also needs both linked paths to be visible inside its sandbox.");
+                        ui.label("RetroDECK runs ES-DE inside a sandbox, so both the original and linked folders must be visible to it.");
                     }
                     playing_action = crate::playing_library_page::show_playing_library_page_with_busy(
                         ui,
@@ -1004,13 +1004,13 @@ impl App {
                         ui.heading("Fix my MAME library");
                     });
                     widgets::workflow_card(ui, theme::TEAL, |ui| {
-                        ui.strong("What MAME names mean");
-                        ui.label("Set/archive name: the outer set such as pacman.zip.");
-                        ui.label("ROM member: a file inside that set. Parent and clone relationships explain which shared files are required.");
-                        ui.label("A clone may use files stored in its parent set. Missing member, wrong hash, duplicate, and collision are separate outcomes.");
-                        ui.label("BAD_DUMP is a known imperfect reference dump. NO_DUMP means no verified dump is known; neither is an ordinary rename repair.");
-                        ui.label("Packed ZIP member in-place repair is unsupported.");
-                        ui.label("CHD repair is preview-only.");
+                        ui.strong("What these MAME words mean");
+                        ui.label("Set name: the whole package, for example pacman.zip.");
+                        ui.label("ROM file: one file inside a set. A clone game can need files that live in its parent set.");
+                        ui.label("Missing file, wrong checksum, duplicate and name clash are different problems and are reported separately.");
+                        ui.label("BAD_DUMP means the only known copy is imperfect. NO_DUMP means no good copy is known. Renaming files cannot fix either.");
+                        ui.label("Repairing a file inside a ZIP in place is not supported.");
+                        ui.label("CHD files can be previewed but not repaired.");
                     });
                     self.organisation.ensure_mame_history_loaded();
                     super::mame_collection_health::show(ui);
@@ -1306,12 +1306,12 @@ mod tests {
         let text = rendered_mame_text(&mut state).join("\n");
         for expected in [
             "Target parent set: pacman",
-            "Verified source files",
+            "Files EmuWiz will use",
             "board.bin → maincpu.bin",
             "/output/pacman.zip",
             "output collision(s) prevent reconstruction",
-            "Verification plan:",
-            "transaction can be undone",
+            "After it finishes, EmuWiz re-checks",
+            "you can undo it afterwards",
         ] {
             assert!(
                 text.contains(expected),
