@@ -19,6 +19,7 @@ pub(super) struct SetupPortabilityState {
     remaps: SetupPathRemaps,
     worker: Option<Receiver<Result<Outcome, String>>>,
     status: Option<String>,
+    error_detail: Option<String>,
     // Built from the live native window; headless tests leave this unset.
     dialog: Option<rfd::FileDialog>,
 }
@@ -27,7 +28,7 @@ enum Outcome {
     Collected(SetupManifest),
     Imported(SetupManifest, SetupImportPreview),
     Reviewed(SetupImportPreview),
-    Exported,
+    Exported(std::path::PathBuf),
 }
 
 impl SetupPortabilityState {
@@ -86,6 +87,11 @@ impl SetupPortabilityState {
         if let Some(status) = &self.status {
             ui.label(status);
         }
+        if let Some(error) = &self.error_detail {
+            crate::ui::components::technical_details(ui, "setup_portability_error", |ui| {
+                ui.label(error);
+            });
+        }
         if let Some(manifest) = &self.export {
             ui.group(|ui| {
                 ui.strong("Export preview");
@@ -123,7 +129,7 @@ impl SetupPortabilityState {
                 {
                     let manifest = manifest.clone();
                     self.start(ui.ctx(), move || {
-                        export_setup_new(&path, &manifest).map(|_| Outcome::Exported)
+                        export_setup_new(&path, &manifest).map(|_| Outcome::Exported(path))
                     });
                 } else {
                     self.status = Some("Saving cancelled. No setup file was written.".into());
@@ -207,6 +213,7 @@ impl SetupPortabilityState {
         let context = context.clone();
         self.worker = Some(receiver);
         self.status = None;
+        self.error_detail = None;
         std::thread::spawn(move || {
             let _ = sender.send(work());
             context.request_repaint();
@@ -234,12 +241,16 @@ impl SetupPortabilityState {
                         self.preview = Some(preview);
                     }
                     Ok(Outcome::Reviewed(preview)) => self.preview = Some(preview),
-                    Ok(Outcome::Exported) => {
-                        self.status = Some(
-                            "Setup file saved. Your settings and game files were unchanged.".into(),
-                        )
+                    Ok(Outcome::Exported(path)) => {
+                        self.status = Some(format!(
+                            "Setup file saved to {}. Your settings and game files were unchanged. This is a setup summary, not a backup of saves or games.",
+                            path.display()
+                        ));
                     }
-                    Err(error) => self.status = Some(error),
+                    Err(error) => {
+                        self.error_detail = Some(error);
+                        self.status = Some("Setup file operation could not finish. Check the selected file and folder permissions; when exporting, choose a new filename. Your current settings were not changed. Try Export setup or Preview setup file again.".into());
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {}
@@ -460,7 +471,14 @@ mod tests {
         };
         sender.send(Err("Setup file invalid.".into())).unwrap();
         state.poll();
-        assert_eq!(state.status.as_deref(), Some("Setup file invalid."));
+        assert!(
+            state
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("could not finish")
+        );
+        assert_eq!(state.error_detail.as_deref(), Some("Setup file invalid."));
         assert!(state.worker.is_none());
     }
 
@@ -548,5 +566,22 @@ mod tests {
         let strings = rendered_text(&mut state, [1280.0, 900.0]);
         assert!(strings.iter().any(|text| text.contains("Export preview")));
         assert!(strings.iter().any(|text| text.contains("Save setup file")));
+    }
+
+    #[test]
+    fn failure_keeps_private_diagnostics_collapsed_at_both_sizes() {
+        let mut state = SetupPortabilityState {
+            status: Some(
+                "The setup check could not finish. Try again after checking the selected file."
+                    .into(),
+            ),
+            error_detail: Some("/private/user/config: synthetic failure".into()),
+            ..Default::default()
+        };
+        for size in [[700.0, 520.0], [1280.0, 800.0]] {
+            let text = rendered_text(&mut state, size).join("\n");
+            assert!(text.contains("Try again"));
+            assert!(!text.contains("/private/user"));
+        }
     }
 }

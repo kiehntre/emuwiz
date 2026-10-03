@@ -397,7 +397,12 @@ impl App {
                 }
             });
             if let Some(error) = self.equiv.error.clone() {
-                ui.colored_label(theme::WARNING, error);
+                ui.colored_label(theme::WARNING, "The duplicate check or move could not finish. Review History before retrying a move; run a fresh check if the source files changed.");
+                crate::ui::components::technical_details(ui, "equivalent_error", |ui| { ui.label(error); });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Review source folders").clicked() { self.go(Route::Section(Section::Sources)); }
+                    if ui.button("Review History & Undo").clicked() { self.go(Route::Section(Section::History)); }
+                });
             }
             if let Some((message, index)) = self.equiv.result.clone() {
                 ui.strong(message);

@@ -190,9 +190,13 @@ impl App {
         if let Some(error) = self.missing.error.clone() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong("Missing games review");
-                ui.colored_label(theme::WARNING, &error);
-                if ui.button("Check again").clicked() {
+                ui.colored_label(theme::WARNING, "The missing-game operation could not finish. Check the source drive and review Activity before trying again.");
+                crate::ui::components::technical_details(ui, "missing_review_error", |ui| { ui.label(&error); });
+                if ui.button("Review game folders").clicked() { self.go(Route::Section(Section::Sources)); }
+                if ui.button("Open Activity details").clicked() { self.go(Route::Section(Section::Activity)); }
+                if ui.add_enabled(self.missing.job.is_none(), egui::Button::new("Check again")).clicked() {
                     self.missing.error = None;
+                    self.missing.plan = None;
                 }
             });
         }
@@ -201,7 +205,13 @@ impl App {
                 ui.strong("Missing games");
                 ui.label(message);
                 if let Some(receipt) = self.missing.receipt.clone() {
-                    if ui.button("Undo — restore these entries").clicked() {
+                    if ui
+                        .add_enabled(
+                            self.missing.job.is_none(),
+                            egui::Button::new("Undo — restore these entries"),
+                        )
+                        .clicked()
+                    {
                         self.start_missing_undo(receipt.clone());
                     }
                     ui.collapsing("Details", |ui| {
@@ -210,7 +220,11 @@ impl App {
                 }
             });
         }
-        // Checking is silent: the panel appears only once there is something to show.
+        if self.missing.job.is_some() {
+            ui.spinner();
+            ui.label("Checking or updating the missing-game list. Please wait before starting another operation; game files are not deleted by this workflow.");
+        }
+        // The review appears once its evidence is available.
         let Some(plan) = self.missing.plan.clone() else {
             return;
         };
@@ -290,7 +304,10 @@ impl App {
             let confirmed = plan.counts.confirmed_missing;
             egui::Window::new("Forget missing games?")
                 .collapsible(false)
-                .resizable(false)
+                .resizable(true)
+                .default_width(420.0)
+                .max_width((ui.ctx().content_rect().width() - 40.0).max(240.0))
+                .vscroll(true)
                 .show(ui.ctx(), |ui| {
                     ui.label(format!(
                         "Remove {} from EmuWiz's catalogue? No game files are deleted, and you can undo this.",
@@ -327,7 +344,10 @@ impl App {
         self.missing.job = None;
         self.missing.plan = None;
         self.missing.receipt = None;
-        self.missing.result = Some(format!("Restored {}.", plural(restored)));
+        self.missing.result = Some(format!(
+            "Restored {} to EmuWiz's game list. No game files were recreated or changed.",
+            plural(restored)
+        ));
         self.load(false);
     }
 }
