@@ -90,7 +90,7 @@ fn family_for_extension(extension: &str) -> Option<MediaFamily> {
     }
 }
 
-fn record_from_catalogue(archive: &PersistedArchive) -> Option<MediaRecord> {
+pub(crate) fn record_from_catalogue(archive: &PersistedArchive) -> Option<MediaRecord> {
     let extension = archive
         .absolute_path
         .extension()
@@ -199,7 +199,7 @@ fn family_label(family: Option<MediaFamily>) -> &'static str {
     }
 }
 
-fn ordinal_label(
+pub(crate) fn ordinal_label(
     ordinal: Option<&MediaOrdinal>,
     side: Option<&MediaSide>,
     family: Option<MediaFamily>,

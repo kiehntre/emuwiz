@@ -111,6 +111,10 @@ pub(super) enum Command {
     StorageReview {
         library: SharedLibrary,
     },
+    MediaSetReview {
+        library: SharedLibrary,
+        key: usize,
+    },
     MissingPreview,
     MissingApply {
         token: String,
@@ -178,6 +182,7 @@ pub(super) enum Payload {
     EquivalentScan(Box<super::equivalent_duplicates::EquivalentScan>),
     EquivalentApplied(Box<DuplicateRepairRecord>),
     StorageReview(Box<super::storage_review::StorageReview>),
+    MediaSetReview(Box<super::media_sets::MediaSetReview>),
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
     MissingUndone(usize),
@@ -288,6 +293,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         ))),
         Command::EquivalentApply { group } => Ok(Payload::EquivalentApplied(Box::new(
             super::equivalent_duplicates::apply(&group)?,
+        ))),
+        Command::MediaSetReview { library, key } => Ok(Payload::MediaSetReview(Box::new(
+            super::media_sets::analyse(&library, key),
         ))),
         Command::StorageReview { library } => Ok(Payload::StorageReview(Box::new(
             super::storage_review::analyse(&library),

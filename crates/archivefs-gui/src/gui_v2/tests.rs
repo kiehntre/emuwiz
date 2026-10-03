@@ -114,6 +114,7 @@ fn fixture(context: &egui::Context) -> App {
         missing: Default::default(),
         equiv: Default::default(),
         storage: Default::default(),
+        multi: Default::default(),
     }
 }
 
@@ -6074,6 +6075,140 @@ fn gui_v2_storage_page_handles_empty_library_and_a_synthetic_review() {
     app.storage.for_library = 0;
     frame(&context, &mut app, [1024.0, 700.0]);
     assert!(app.storage.job.is_some());
+    // Escape leaves the page.
+    frame_with(
+        &context,
+        &mut app,
+        [1024.0, 700.0],
+        vec![key_event(egui::Key::Escape)],
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Games));
+}
+
+fn multidisc_rows(
+    titles: &[(i64, &str)],
+) -> Vec<(std::path::PathBuf, i64, archivefs_core::PersistedArchive)> {
+    titles
+        .iter()
+        .map(|(id, title)| {
+            let a = archive(*id, title, Some("PSX"));
+            (a.absolute_path.clone(), *id, a)
+        })
+        .collect()
+}
+
+#[test]
+fn multidisc_review_buckets_follow_the_engine_and_never_overclaim() {
+    use super::media_sets::{Bucket, analyse_rows};
+    let review = analyse_rows(
+        &multidisc_rows(&[
+            (1, "Alpha (Disc 1)"),
+            (2, "Alpha (Disc 2)"),
+            (3, "Eps (Disc 1 of 3)"),
+            (4, "Eps (Disc 2 of 3)"),
+            (5, "Gamma (Disc 1 of 2)"),
+            (6, "Gamma (Disc 2 of 3)"),
+            (7, "Delta (Disc 1 of 2)"),
+            (8, "Delta (Disc 2 of 2)"),
+            (9, "Solo Game"),
+        ]),
+        7,
+    );
+    let by = |t: &str| {
+        review
+            .sets
+            .iter()
+            .find(|s| s.title == t)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{t}: {:?}",
+                    review.sets.iter().map(|s| &s.title).collect::<Vec<_>>()
+                )
+            })
+    };
+    // Missing disc names the exact ordinal from the engine's expected count.
+    assert_eq!(by("eps").bucket, Bucket::MissingDisc);
+    assert_eq!(by("eps").missing, ["Disc 3"]);
+    // "Unproven" notes are not contradictions: nothing red up front for a plain missing disc.
+    assert!(by("eps").conflicts.is_empty());
+    assert!(by("eps").why.iter().any(|l| l.contains("UnprovenGrouping")));
+    // Contradicting counts are a blocked conflict with no missing-disc guess.
+    assert_eq!(by("gamma").bucket, Bucket::Conflicting);
+    assert!(by("gamma").missing.is_empty());
+    assert!(!by("gamma").conflicts.is_empty());
+    // File names alone never make a set Ready, even when counts line up.
+    for title in ["alpha", "delta"] {
+        assert_eq!(by(title).bucket, Bucket::CantTell, "{title}");
+        assert!(by(title).filename_only);
+    }
+    assert!(by("delta").completeness.contains("file names only"));
+    assert!(!review.sets.iter().any(|s| s.bucket == Bucket::Ready));
+    // Single-disc items are counted, not listed.
+    assert_eq!(review.single_media, 1);
+    assert!(review.sets.iter().all(|s| s.title != "solo game"));
+    assert_eq!(review.key, 7);
+    let headline = super::media_sets::headline(&review);
+    assert!(
+        headline
+            .starts_with("4 multi-disc games: 0 ready · 2 need attention · 2 can't be confirmed"),
+        "{headline}"
+    );
+}
+
+#[test]
+fn multidisc_swap_order_lists_discs_in_order() {
+    use super::media_sets::analyse_rows;
+    let review = analyse_rows(
+        &multidisc_rows(&[(1, "Alpha (Disc 2)"), (2, "Alpha (Disc 1)")]),
+        1,
+    );
+    let swap = &review.sets[0].swap;
+    assert!(
+        swap.first()
+            .is_some_and(|l| l.starts_with("Start with: Disc 1")),
+        "{swap:?}"
+    );
+    assert!(
+        swap.get(1).is_some_and(|l| l.contains("Disc 2")),
+        "{swap:?}"
+    );
+}
+
+#[test]
+fn multidisc_page_renders_navigates_and_discards_stale_results() {
+    use super::media_sets::analyse_rows;
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Section(Section::Games));
+    app.go(Route::Section(Section::MultiDisc));
+    let strings = text(&frame(&context, &mut app, [1024.0, 700.0]));
+    assert!(strings.iter().any(|s| s.contains("nothing to check")));
+
+    let rows = multidisc_rows(&[(1, "Eps (Disc 1 of 3)"), (2, "Eps (Disc 2 of 3)")]);
+    app.library = Arc::new(Library::new(rows.iter().map(|r| r.2.clone()).collect()));
+    let key = Arc::as_ptr(&app.library) as usize;
+    // A result computed for some other library is dropped, never shown.
+    app.media_sets_done(analyse_rows(&rows, key.wrapping_add(8)));
+    assert!(app.multi.review.is_none());
+    app.media_sets_done(analyse_rows(&rows, key));
+    for size in [[1280.0, 800.0], [700.0, 520.0]] {
+        let strings = text(&frame(&context, &mut app, size));
+        assert!(
+            strings.iter().any(|s| s.contains("1 multi-disc games")),
+            "{strings:?}"
+        );
+        // Below the fold in the small window; must be drawn at full size.
+        if size[0] > 900.0 {
+            assert!(strings.iter().any(|s| s.contains("Missing a disc")));
+        }
+    }
+    // Libraries that changed since the review trigger exactly one new job.
+    app.library = Arc::new(Library::new(rows.iter().map(|r| r.2.clone()).collect()));
+    frame(&context, &mut app, [1024.0, 700.0]);
+    let first = app.multi.job;
+    assert!(first.is_some());
+    frame(&context, &mut app, [1024.0, 700.0]);
+    assert_eq!(app.multi.job, first);
     // Escape leaves the page.
     frame_with(
         &context,

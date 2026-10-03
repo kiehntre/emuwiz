@@ -9,6 +9,7 @@ pub(super) enum Section {
     Games,
     Saves,
     Duplicates,
+    MultiDisc,
     Storage,
     Platforms,
     Check,
@@ -49,6 +50,7 @@ pub(super) const SECTIONS: &[Section] = &[
     Section::Games,
     Section::Saves,
     Section::Duplicates,
+    Section::MultiDisc,
     Section::Storage,
     Section::Platforms,
     Section::Check,
@@ -91,6 +93,7 @@ impl Section {
             Self::Games => "Games",
             Self::Saves => "Saves & States",
             Self::Duplicates => "Duplicates",
+            Self::MultiDisc => "Multi-disc games",
             Self::Storage => "Storage",
             Self::Platforms => "Platforms",
             Self::Check => "Check Games",
@@ -156,6 +159,9 @@ impl Section {
             Self::Duplicates => {
                 "Review exact copies without silently collapsing different releases."
             }
+            Self::MultiDisc => {
+                "Check that every disc of your multi-disc games is present and in order."
+            }
             Self::Storage => "See how much space your library uses and what could safely shrink.",
             Self::Platforms => "Choose a system to explore its games.",
             Self::Check => "Find missing, unknown, damaged or mismatched games.",
@@ -208,6 +214,7 @@ impl Section {
             Self::Check => "Check my games",
             Self::Setup => "Check my setup",
             Self::Duplicates => "Review duplicates",
+            Self::MultiDisc => "Check my multi-disc games",
             Self::Storage => "Check my storage",
             Self::Problems => "Review problems",
             Self::Build => "Choose an organisation method",
@@ -243,7 +250,7 @@ impl Section {
         match self {
             Self::Games => Some("LIBRARY"),
             Self::Saves => Some("LIBRARY"),
-            Self::Duplicates => Some("LIBRARY"),
+            Self::Duplicates | Self::MultiDisc => Some("LIBRARY"),
             Self::Launch => Some("PLAY"),
             Self::Mods => Some("TOOLS"),
             Self::Converter | Self::Storage | Self::Tape | Self::Museum => Some("TOOLS"),
@@ -375,7 +382,7 @@ pub(super) fn family_for_route(route: &Route) -> Option<FeatureFamily> {
         Section::Build | Section::OrganisationFamily | Section::Games | Section::Launch => {
             FeatureFamily::Organisation
         }
-        Section::Problems | Section::ProblemsRepair | Section::Duplicates => {
+        Section::Problems | Section::ProblemsRepair | Section::Duplicates | Section::MultiDisc => {
             FeatureFamily::ProblemsRepair
         }
         Section::Sources | Section::Romm | Section::SourcesProviders => {

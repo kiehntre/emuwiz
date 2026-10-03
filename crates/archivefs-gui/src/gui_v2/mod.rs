@@ -16,6 +16,7 @@ mod launch_readiness_summary;
 mod legacy;
 pub(crate) mod library;
 mod mame_collection_health;
+mod media_sets;
 mod media_sources;
 mod missing_review;
 mod mods;
@@ -310,6 +311,7 @@ pub(super) struct App {
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
     storage: storage_review::StorageState,
+    multi: media_sets::MultiDiscState,
 }
 
 impl App {
@@ -392,6 +394,7 @@ impl App {
             missing: Default::default(),
             equiv: Default::default(),
             storage: Default::default(),
+            multi: Default::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1483,6 +1486,7 @@ impl App {
                                 Payload::EquivalentApplied(record) => {
                                     self.equivalent_applied(*record)
                                 }
+                                Payload::MediaSetReview(review) => self.media_sets_done(*review),
                                 Payload::StorageReview(review) => self.storage_review_done(*review),
                                 Payload::MissingPreview(plan) => {
                                     self.missing.job = None;
@@ -1592,6 +1596,9 @@ impl App {
                             }
                             if self.storage.job == Some(id) {
                                 self.storage_review_failed();
+                            }
+                            if self.multi.job == Some(id) {
+                                self.media_sets_failed();
                             }
                             self.settle_romm_library_load(id, Err(error.clone()));
                             if self

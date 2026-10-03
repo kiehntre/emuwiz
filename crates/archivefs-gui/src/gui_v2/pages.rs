@@ -530,6 +530,7 @@ impl App {
                         Route::QuickRename => self.quick_rename(ui),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
                         Route::Section(Section::Storage) => self.storage_page(ui),
+                        Route::Section(Section::MultiDisc) => self.multi_disc_page(ui),
                         Route::Section(Section::Problems) => self.problems(ui, None),
                         Route::Section(Section::Build) => self.organisation_page(ui),
                         Route::Section(Section::Converter) => self.converter(ui),
