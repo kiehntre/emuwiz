@@ -111,6 +111,19 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "ciso",
         kind: ArchiveKind::DirectGameImage,
     },
+    // Wii U disc containers. Recognised as media worth inspecting only: the
+    // bounded `wiiu_disc` inspector, not the extension, decides whether a
+    // file is a structurally valid disc, and the platform registry (folder
+    // alias / strong-extension evidence) assigns the platform, never verified
+    // identity.
+    MediaFormat {
+        extension: "wud",
+        kind: ArchiveKind::DirectGameImage,
+    },
+    MediaFormat {
+        extension: "wux",
+        kind: ArchiveKind::DirectGameImage,
+    },
     MediaFormat {
         extension: "xiso",
         kind: ArchiveKind::DirectGameImage,
@@ -563,6 +576,22 @@ mod tests {
             kind_for_extension("ngc"),
             Some(ArchiveKind::DirectGameImage)
         );
+    }
+
+    #[test]
+    fn wii_u_disc_containers_are_direct_game_images_and_siblings_are_unchanged() {
+        for extension in ["wud", "wux"] {
+            assert_eq!(
+                kind_for_extension(extension),
+                Some(ArchiveKind::DirectGameImage),
+                ".{extension} must be recognised media"
+            );
+            assert!(is_watch_relevant_extension(extension));
+        }
+        // Registration is per extension: companions and other Wii U files are not swept in.
+        for extension in ["wua", "rpx", "key", "wup"] {
+            assert_eq!(kind_for_extension(extension), None, ".{extension}");
+        }
     }
 
     #[test]

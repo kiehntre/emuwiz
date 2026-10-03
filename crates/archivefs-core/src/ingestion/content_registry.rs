@@ -124,6 +124,10 @@ const CONTENT_FORMATS: &[ContentFormat] = &[
     cf("gcz", ContentKind::DiscImage),
     cf("rvz", ContentKind::DiscImage),
     cf("wbfs", ContentKind::DiscImage),
+    // Wii U disc containers: classified as disc media only; the bounded
+    // `wiiu_disc` inspector decides whether a file is actually a valid disc.
+    cf("wud", ContentKind::DiscImage),
+    cf("wux", ContentKind::DiscImage),
     cf("ciso", ContentKind::DiscImage),
     cf("chd", ContentKind::DiscImage),
     // PSP/PS1 EBOOT.PBP is a bounded container; its platform and exact

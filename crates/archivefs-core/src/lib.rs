@@ -9569,6 +9569,116 @@ mod tests {
         let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 
+    /// Same synthetic 8-sector WUX the Wii U queue tests use.
+    fn synthetic_wux() -> Vec<u8> {
+        let sector = crate::wiiu_disc::WUD_SECTOR_SIZE as usize;
+        let mut raw = vec![0_u8; 8 * sector];
+        raw[..10].copy_from_slice(b"WUP-P-TEST");
+        raw[0x10000..0x10004].copy_from_slice(&0xcc54_9eb9_u32.to_be_bytes());
+        raw[0x10005] = 1;
+        raw[0x18000..crate::wiiu_disc::WUD_HEADER_SIZE as usize].fill(0xa5);
+        let mut data = vec![0_u8; 5 * sector];
+        data[..4].copy_from_slice(b"WUX0");
+        data[4..8].copy_from_slice(&0x1099_d02e_u32.to_le_bytes());
+        data[8..12].copy_from_slice(&crate::wiiu_disc::WUD_SECTOR_SIZE.to_le_bytes());
+        data[16..24].copy_from_slice(&(raw.len() as u64).to_le_bytes());
+        for (i, block) in [0_u32, 1, 2, 3, 1, 1, 1, 1].into_iter().enumerate() {
+            data[32 + i * 4..36 + i * 4].copy_from_slice(&block.to_le_bytes());
+        }
+        data[sector..].copy_from_slice(&raw[..4 * sector]);
+        data
+    }
+
+    fn scan_wiiu(root: &Path) -> ArchiveScanDiscovery {
+        let config = Config {
+            source_folders: vec![root.to_path_buf()],
+            mount_root: root.join("mount"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        ArchiveScanner::new(&config)
+            .scan_archives_with_summary()
+            .unwrap()
+    }
+
+    /// Registration makes `.wud`/`.wux` discoverable and nothing more: the
+    /// platform comes from the registry, and the bounded inspector alone says
+    /// whether a file is really a disc.
+    #[test]
+    fn wud_and_wux_are_catalogued_but_never_gain_verified_identity_from_the_extension() {
+        let root = test_root("wiiu-media-registration").join("wiiu");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Good Game.wux"), synthetic_wux()).unwrap();
+        fs::write(root.join("Bad Game.wux"), b"WUX0 not really").unwrap();
+        fs::write(root.join("Bad Disc.wud"), vec![0_u8; 4096]).unwrap();
+        fs::write(root.join("UPPER.WUX"), synthetic_wux()).unwrap();
+        fs::write(root.join("Game.key"), b"companion").unwrap();
+        fs::write(root.join("Game.rpx"), b"not media").unwrap();
+
+        let discovery = scan_wiiu(&root);
+        let found = |name: &str| {
+            discovery
+                .archives
+                .iter()
+                .find(|archive| archive.path.ends_with(name))
+        };
+        for name in ["Good Game.wux", "Bad Game.wux", "Bad Disc.wud", "UPPER.WUX"] {
+            let archive = found(name).unwrap_or_else(|| panic!("{name} must be catalogued"));
+            assert_eq!(archive.kind, ArchiveKind::DirectGameImage, "{name}");
+            // Platform evidence is registry-derived (here the `wiiu` folder alias)...
+            assert_eq!(archive.identity.platform.as_deref(), Some("WiiU"), "{name}");
+            // ...and is never a verified header identity.
+            assert_ne!(
+                archive.identity.platform_provenance,
+                Some(PlatformProvenance::HeaderIdentity),
+                "{name}: extension/folder evidence must not claim a verified identity"
+            );
+        }
+        assert!(found("Game.key").is_none() && found("Game.rpx").is_none());
+        assert_eq!(discovery.archives.len(), 4);
+
+        // The inspector, not the extension, decides validity.
+        assert!(
+            crate::wiiu_disc::inspect_wii_u_disc(&root.join("Good Game.wux")).structural_complete
+        );
+        assert!(
+            !crate::wiiu_disc::inspect_wii_u_disc(&root.join("Bad Game.wux")).structural_complete
+        );
+        assert!(
+            !crate::wiiu_disc::inspect_wii_u_disc(&root.join("Bad Disc.wud")).structural_complete
+        );
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn wii_u_extensions_follow_the_existing_case_policy_and_stay_unresolved_without_evidence() {
+        for name in ["Game.wud", "Game.WUD", "Game.wux", "Game.WuX"] {
+            assert_eq!(
+                archive_kind(Path::new(name)),
+                Some(ArchiveKind::DirectGameImage),
+                "{name}"
+            );
+        }
+        assert_eq!(archive_kind(Path::new("Game.wua")), None);
+        // An unrelated extension is untouched.
+        assert_eq!(archive_kind(Path::new("Game.xyz")), None);
+        // Outside a recognised folder, a malformed file is catalogued as media
+        // but never as a verified identity.
+        let root = test_root("wiiu-no-folder");
+        fs::write(root.join("Mystery.wud"), vec![0_u8; 2048]).unwrap();
+        let discovery = scan_wiiu(&root);
+        let archive = discovery
+            .archives
+            .iter()
+            .find(|a| a.path.ends_with("Mystery.wud"))
+            .expect("catalogued as media");
+        assert_ne!(
+            archive.identity.platform_provenance,
+            Some(PlatformProvenance::HeaderIdentity)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn archive_kind_recognizes_loose_commodore_disk_images() {
         assert_eq!(
