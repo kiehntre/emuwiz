@@ -65,7 +65,9 @@ use crate::dat::classification::{
 };
 use crate::dat::dependency::resolve::{CollectionEvidence, resolve_collection};
 use crate::dat::disk_audit::{DatDiskAudit, audit_chd_disk, is_chd_path};
-use crate::dat::index::{DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation, SharedRomRef};
+use crate::dat::index::{
+    DatDiskIndex, DatIndex, DatMemberKey, DatRomRef, MemberLocation, SharedRomRef,
+};
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, DatGameEntry, DatPackingPolicy, ParsedDat};
 use crate::dat::parsers::parse_dat_file;
@@ -2140,13 +2142,11 @@ fn annotate_content_matches(
                         })
                         .unwrap_or_default()
                 }
-                AuditVerdict::FilenameOnly { .. } => {
-                    index
-                        .lookup_filename(&evidence.filename)
-                        .iter()
-                        .map(SharedRomRef::to_owned_ref)
-                        .collect()
-                }
+                AuditVerdict::FilenameOnly { .. } => index
+                    .lookup_filename(&evidence.filename)
+                    .iter()
+                    .map(SharedRomRef::to_owned_ref)
+                    .collect(),
                 AuditVerdict::Ambiguous { .. }
                 | AuditVerdict::NotInDat
                 | AuditVerdict::NoUsableEvidence => Vec::new(),

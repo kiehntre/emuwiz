@@ -97,7 +97,10 @@ fn golden_corpus(dir: &Path) -> PathBuf {
             String::new()
         };
         let extra = if i % 4 == 0 {
-            format!("<rom name=\"extra{i}.bin\" size=\"16\" crc=\"{}\"/>", hex(i + 7, 4))
+            format!(
+                "<rom name=\"extra{i}.bin\" size=\"16\" crc=\"{}\"/>",
+                hex(i + 7, 4)
+            )
         } else {
             String::new()
         };
@@ -162,9 +165,15 @@ fn lookups(index: &DatIndex, records: usize) {
             t.elapsed().as_nanos() as f64 / sample as f64
         );
     };
-    time("sha1", &|| sha1.iter().map(|k| index.lookup_sha1(k).len()).sum());
-    time("md5", &|| md5.iter().map(|k| index.lookup_md5(k).len()).sum());
-    time("crc32", &|| crc.iter().map(|k| index.lookup_crc32(k).len()).sum());
+    time("sha1", &|| {
+        sha1.iter().map(|k| index.lookup_sha1(k).len()).sum()
+    });
+    time("md5", &|| {
+        md5.iter().map(|k| index.lookup_md5(k).len()).sum()
+    });
+    time("crc32", &|| {
+        crc.iter().map(|k| index.lookup_crc32(k).len()).sum()
+    });
     time("filename", &|| {
         names.iter().map(|k| index.lookup_filename(k).len()).sum()
     });
@@ -195,7 +204,11 @@ fn main() {
                 DatSourceKind::File,
             );
             let (report_, projection) = validate_dat_source(&entry, limits());
-            println!("entries={} state={:?}", projection.entries.len(), report_.state);
+            println!(
+                "entries={} state={:?}",
+                projection.entries.len(),
+                report_.state
+            );
             report("validate_project", t0);
             let db_path = dir.join(format!("bench-{records}.sqlite"));
             let _ = std::fs::remove_file(&db_path);
@@ -230,10 +243,17 @@ fn main() {
             // Malformed input must keep failing closed with the same error.
             let bad = dir.join("golden-bad.dat");
             std::fs::write(&bad, "<?xml version=\"1.0\"?><datafile><header><name>B</name></header><game name=\"g\"><rom name=\"b.bin\" size=\"notanumber\" crc=\"zz\"/></game></datafile>").unwrap();
-            println!("malformed={:?}", parse_dat_file(&bad, DatLimits::default()).err());
+            println!(
+                "malformed={:?}",
+                parse_dat_file(&bad, DatLimits::default()).err()
+            );
             let outcome = parse_dat_file(&path, DatLimits::default()).unwrap();
             let index = DatIndex::build(&outcome.dat);
-            println!("games={} warnings={}", outcome.dat.games.len(), outcome.warnings.len());
+            println!(
+                "games={} warnings={}",
+                outcome.dat.games.len(),
+                outcome.warnings.len()
+            );
             let mut dump = String::new();
             macro_rules! bucket {
                 ($name:literal, $map:expr) => {{
@@ -243,7 +263,12 @@ fn main() {
                     for k in &keys {
                         let _ = writeln!(text, "{k} => {:?}", $map[k]);
                     }
-                    println!("{} keys={} digest={:016x}", $name, keys.len(), digest(&text));
+                    println!(
+                        "{} keys={} digest={:016x}",
+                        $name,
+                        keys.len(),
+                        digest(&text)
+                    );
                     dump.push_str(&text);
                 }};
             }
@@ -267,13 +292,32 @@ fn main() {
                     index.lookup_filename(&format!("ROM{i}.BIN")),
                 );
             }
-            let _ = write!(api, "{:?}{:?}", index.lookup_filename("shared.bin"), index.lookup_sha1("nope"));
+            let _ = write!(
+                api,
+                "{:?}{:?}",
+                index.lookup_filename("shared.bin"),
+                index.lookup_sha1("nope")
+            );
             println!("lookup_api digest={:016x}", digest(&api));
-            println!("counts {} {} {} {} coll {} {} {} {}",
-                index.crc32_count(), index.md5_count(), index.sha1_count(), index.sha256_count(),
-                index.crc32_collisions(), index.md5_collisions(), index.sha1_collisions(), index.sha256_collisions());
-            let projection = archivefs_core::dat::expected_inventory::project_expected_dat_inventory(&outcome.dat.games);
-            println!("projection digest={:016x}", digest(&format!("{:?}", projection.entries)));
+            println!(
+                "counts {} {} {} {} coll {} {} {} {}",
+                index.crc32_count(),
+                index.md5_count(),
+                index.sha1_count(),
+                index.sha256_count(),
+                index.crc32_collisions(),
+                index.md5_collisions(),
+                index.sha1_collisions(),
+                index.sha256_collisions()
+            );
+            let projection =
+                archivefs_core::dat::expected_inventory::project_expected_dat_inventory(
+                    &outcome.dat.games,
+                );
+            println!(
+                "projection digest={:016x}",
+                digest(&format!("{:?}", projection.entries))
+            );
         }
         _ => eprintln!("unknown mode"),
     }
