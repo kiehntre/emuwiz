@@ -256,6 +256,12 @@ pub struct ObjectFreshness {
 pub enum TransactionOperation {
     #[default]
     RenameMove,
+    /// Exchange a verified staged regular file with a reviewed existing target.
+    /// The exact original remains at `source_path` for durable recovery/undo.
+    ReplaceExisting {
+        original_identity: ObjectIdentity,
+        destination_root: PathBuf,
+    },
     CreateSymlink {
         expected_target: PathBuf,
         /// The sole root beneath which this transaction may create or remove

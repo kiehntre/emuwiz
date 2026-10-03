@@ -144,6 +144,12 @@ pub fn run_preflight(
 
     let link_operation = match &entry.operation {
         TransactionOperation::RenameMove => None,
+        TransactionOperation::ReplaceExisting { .. } => {
+            if super::replacement::published(entry) != Ok(false) {
+                failures.push(PreflightFailure::DestinationUnsafe);
+            }
+            None
+        }
         TransactionOperation::CreateSymlink {
             expected_target,
             destination_root,
@@ -271,7 +277,12 @@ pub fn run_preflight(
     }
 
     // Destination must not exist.
-    if let Ok(metadata) = std::fs::symlink_metadata(&entry.destination_path) {
+    if matches!(
+        entry.operation,
+        TransactionOperation::ReplaceExisting { .. }
+    ) {
+        // The exact existing target was checked above; existence alone grants no authority.
+    } else if let Ok(metadata) = std::fs::symlink_metadata(&entry.destination_path) {
         if let Some(expected_target) = link_operation {
             if !metadata.file_type().is_symlink()
                 || std::fs::read_link(&entry.destination_path).ok().as_deref()

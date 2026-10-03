@@ -19,7 +19,7 @@
 //! The executor is the **only** place rename/link mutations happen; the GUI
 //! never calls `std::fs::rename`. Mutations use a no-clobber primitive
 //! (`renameat2(RENAME_NOREPLACE)` on Linux) so an existing destination is
-//! never overwritten, there is no copy+delete fallback, and a destination that
+//! never overwritten by an ordinary move. There is no copy+delete fallback; a destination that
 //! appears between preflight and rename is refused atomically. A batch is
 //! journaled durably before the first mutation and updated after every
 //! transition, so a crash leaves a recoverable record. Nothing here runs
@@ -28,10 +28,14 @@
 //! # Unsupported cases
 //!
 //! Symlink sources, broken symlinks, directories, archive members, cross-
-//! directory or cross-filesystem moves, overwrites, and any rename outside the
+//! filesystem moves, unreviewed overwrites, and any rename outside the
 //! trusted roots are never performed. On platforms without a verified
 //! no-clobber primitive (everything but Linux in this build) the executor
 //! refuses to mutate rather than risk a TOCTOU-prone exists+rename sequence.
+//!
+//! Explicit `ReplaceExisting` is a separate reviewed operation: Linux atomic
+//! exchange preserves the exact original at the staged source path. Both file
+//! identities are journalled and checked for publication, recovery and undo.
 
 pub mod exact_resume;
 pub mod executor;
@@ -42,6 +46,7 @@ pub mod model;
 pub mod noclobber;
 pub mod preflight;
 pub mod reconcile;
+mod replacement;
 pub mod rollback;
 
 pub use exact_resume::{

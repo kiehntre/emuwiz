@@ -55,6 +55,41 @@ pub fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), NoClobb
     }
 }
 
+/// Atomic exchange for an explicitly reviewed replacement. Both complete files
+/// survive the syscall; unlike an overwrite, the original remains recoverable.
+pub(super) fn exchange(source: &Path, destination: &Path) -> Result<(), NoClobberError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let source = std::ffi::CString::new(source.as_os_str().as_bytes())
+            .map_err(|e| NoClobberError::Io(e.to_string()))?;
+        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            .map_err(|e| NoClobberError::Io(e.to_string()))?;
+        // SAFETY: both NUL-terminated paths live for the duration of the syscall.
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(NoClobberError::Io(
+                std::io::Error::last_os_error().to_string(),
+            ))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (source, destination);
+        Err(NoClobberError::UnsupportedPlatform)
+    }
+}
+
 /// The Linux implementation: `renameat2(AT_FDCWD, src, AT_FDCWD, dst,
 /// RENAME_NOREPLACE)`.
 #[cfg(target_os = "linux")]

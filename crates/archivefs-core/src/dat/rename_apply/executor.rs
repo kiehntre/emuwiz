@@ -459,6 +459,12 @@ pub(crate) fn validate_classifier_version(plan_version: Option<&str>) -> Result<
 /// delegate the whole batch to [`apply_transaction`]. Semantics here are not
 /// altered by that reuse.
 pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState, String)> {
+    if matches!(
+        entry.operation,
+        TransactionOperation::ReplaceExisting { .. }
+    ) {
+        return super::replacement::apply(entry);
+    }
     if let TransactionOperation::CreateSymlink {
         expected_target,
         destination_root,

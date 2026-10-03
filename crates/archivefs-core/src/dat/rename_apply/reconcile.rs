@@ -169,6 +169,27 @@ fn reconcile_transaction_level_state(transaction: &mut RenameTransaction) -> boo
 
 /// Classifies one in-flight entry against the live filesystem.
 fn classify_entry(entry: &TransactionEntry, index: usize) -> RecoveryIssue {
+    if matches!(
+        entry.operation,
+        TransactionOperation::ReplaceExisting { .. }
+    ) {
+        let (kind, detail) = match super::replacement::published(entry) {
+            Ok(true) => (
+                RecoveryIssueKind::RenameConfirmed,
+                "replacement and preserved original confirmed".into(),
+            ),
+            Ok(false) => (
+                RecoveryIssueKind::RenameDidNotHappen,
+                "original target and staged replacement confirmed".into(),
+            ),
+            Err(reason) => (RecoveryIssueKind::DestinationIdentityChanged, reason),
+        };
+        return RecoveryIssue {
+            entry_index: index,
+            kind,
+            detail,
+        };
+    }
     if let TransactionOperation::CreateSymlink {
         expected_target,
         destination_root,

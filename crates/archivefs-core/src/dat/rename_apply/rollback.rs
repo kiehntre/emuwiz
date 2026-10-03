@@ -161,7 +161,14 @@ fn rollback_transaction_inner(
                 rolled_back.push(transaction.entries[index].source_path.clone());
             }
             Err(reason) => {
-                transaction.entries[index].state = EntryState::RollbackFailed;
+                transaction.entries[index].state = if matches!(
+                    transaction.entries[index].operation,
+                    TransactionOperation::ReplaceExisting { .. }
+                ) {
+                    EntryState::RollingBack
+                } else {
+                    EntryState::RollbackFailed
+                };
                 transaction.entries[index].failure_reason = Some(reason.clone());
                 failed.push((transaction.entries[index].source_path.clone(), reason));
                 break;
@@ -236,6 +243,23 @@ fn rollback_mutation(
     entry: &super::model::TransactionEntry,
     trusted: Option<&TrustedRoots>,
 ) -> Result<(), String> {
+    if matches!(
+        entry.operation,
+        TransactionOperation::ReplaceExisting { .. }
+    ) {
+        if let Some(trusted) = trusted
+            && !trusted.is_empty()
+            && [&entry.source_path, &entry.destination_path]
+                .iter()
+                .any(|path| {
+                    path.parent()
+                        .is_none_or(|parent| !ancestor_chain_is_confined(parent, trusted))
+                })
+        {
+            return Err("replacement undo is outside the current trusted roots".into());
+        }
+        return super::replacement::undo(entry);
+    }
     if let TransactionOperation::CreateSymlink {
         expected_target,
         destination_root,
