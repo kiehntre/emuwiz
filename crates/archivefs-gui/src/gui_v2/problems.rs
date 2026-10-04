@@ -166,7 +166,7 @@ impl ProblemSummary {
         let mut problems = Vec::new();
         for game in &library.games {
             if game.archive.last_verified_missing_at.is_some()
-                || !game.archive.absolute_path.is_file()
+                || !path_is_present(game)
                 || matches!(
                     game.archive.last_known_health.as_str(),
                     "missing" | "corrupt" | "damaged" | "error"
@@ -233,8 +233,17 @@ impl ProblemSummary {
     }
 }
 
+/// Whether the recorded object exists. An arcade set is a folder, not a file.
+fn path_is_present(game: &Game) -> bool {
+    if game.archive.archive_kind == "arcade_set_directory" {
+        game.archive.absolute_path.is_dir()
+    } else {
+        game.archive.absolute_path.is_file()
+    }
+}
+
 fn file_problem(game: &Game) -> Problem {
-    let path_is_current = game.archive.absolute_path.is_file();
+    let path_is_current = path_is_present(game);
     Problem {
         id: format!("missing-{}", game.archive.id),
         game_id: Some(game.archive.id),

@@ -153,8 +153,17 @@ impl Game {
     }
 }
 
+/// A catalogue row from an older library location that a current row replaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct HistoricalLink {
+    pub current_id: i64,
+    pub evidence: archivefs_core::catalogue_supersession::SupersessionEvidence,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Library {
+    /// Current catalogue rows only. A row that a current row confidently
+    /// replaces is kept in [`Self::historical`], never listed as a second game.
     pub games: Vec<Game>,
     pub by_id: HashMap<i64, usize>,
     pub platforms: BTreeMap<String, usize>,
@@ -163,15 +172,43 @@ pub(super) struct Library {
     pub sources: usize,
     pub load_ms: u128,
     pub scan_warning: Option<String>,
+    /// Superseded rows, preserved for provenance and Advanced details.
+    pub historical: Vec<Game>,
+    pub historical_links: HashMap<i64, HistoricalLink>,
+    pub(super) historical_of: HashMap<i64, Vec<usize>>,
 }
 
 impl Library {
     pub fn new(archives: Vec<PersistedArchive>) -> Self {
-        let platform_projection = project_platforms(&archives);
-        let mut games: Vec<_> = archives.into_iter().map(Game::from_archive).collect();
+        Self::with_history(archives, &[], None)
+    }
+
+    /// Builds the library from every persisted row. `renames` are EmuWiz's own
+    /// applied rename moves and `configured_sources` the sources still in the
+    /// configuration (`None`: all of them); both are evidence that an old row has
+    /// been replaced. Nothing is deleted: replaced rows move to
+    /// [`Self::historical`].
+    pub fn with_history(
+        archives: Vec<PersistedArchive>,
+        renames: &[(std::path::PathBuf, std::path::PathBuf)],
+        configured_sources: Option<&std::collections::HashSet<i64>>,
+    ) -> Self {
+        let links = archivefs_core::catalogue_supersession::derive_supersessions(
+            &archives,
+            renames,
+            configured_sources,
+        );
+        let (old, current): (Vec<_>, Vec<_>) = archives
+            .into_iter()
+            .partition(|archive| links.contains_key(&archive.id));
+        let platform_projection = project_platforms(&current);
+        let mut games: Vec<_> = current.into_iter().map(Game::from_archive).collect();
         games.sort_by_cached_key(|game| (game.title.to_lowercase(), game.archive.id));
+        let mut historical: Vec<_> = old.into_iter().map(Game::from_archive).collect();
+        historical.sort_by_cached_key(|game| game.archive.id);
         let mut library = Self {
             games,
+            historical,
             ..Self::default()
         };
         library.platforms = platform_projection
@@ -195,7 +232,40 @@ impl Library {
                 .or_default() += 1;
             library.attention += usize::from(game.attention);
         }
+        for (index, game) in library.historical.iter().enumerate() {
+            if let Some(link) = links.get(&game.archive.id) {
+                library.historical_links.insert(
+                    game.archive.id,
+                    HistoricalLink {
+                        current_id: link.current_id,
+                        evidence: link.evidence,
+                    },
+                );
+                library
+                    .historical_of
+                    .entry(link.current_id)
+                    .or_default()
+                    .push(index);
+            }
+        }
         library
+    }
+
+    /// The id to show for a catalogue id: an old row's id becomes its current
+    /// row's id, every other id is unchanged.
+    pub fn resolve(&self, id: i64) -> i64 {
+        self.historical_links
+            .get(&id)
+            .map_or(id, |link| link.current_id)
+    }
+
+    /// Older-location rows that a current game replaces, for Advanced details.
+    pub fn historical_for(&self, current_id: i64) -> impl Iterator<Item = &Game> {
+        self.historical_of
+            .get(&current_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.historical.get(*index))
     }
     pub fn game(&self, id: i64) -> Option<&Game> {
         self.by_id.get(&id).and_then(|index| self.games.get(*index))

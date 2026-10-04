@@ -796,6 +796,19 @@ impl Route {
             _ => None,
         }
     }
+
+    /// The same route with its game id replaced.
+    pub fn with_game(&self, new: i64) -> Self {
+        match self {
+            Self::BrowsePlayGame(_) => Self::BrowsePlayGame(new),
+            Self::Game(_) => Self::Game(new),
+            Self::Task { section, .. } => Self::Task {
+                section: *section,
+                game: new,
+            },
+            other => other.clone(),
+        }
+    }
 }
 
 /// Presentation-only location labels for the app chrome. Navigation remains
@@ -920,6 +933,18 @@ impl Router {
     }
     pub fn back(&mut self) {
         self.current = self.back.pop().unwrap_or(Route::Home);
+    }
+
+    /// Re-points every remembered game id (current page and back stack).
+    pub fn remap_games(&mut self, resolve: impl Fn(i64) -> i64) {
+        let remap = |route: &Route| match route.game() {
+            Some(id) if resolve(id) != id => route.with_game(resolve(id)),
+            _ => route.clone(),
+        };
+        self.current = remap(&self.current);
+        for route in &mut self.back {
+            *route = remap(route);
+        }
     }
 
     pub fn can_back(&self) -> bool {

@@ -775,7 +775,24 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
     let archives = database
         .load_archives()
         .map_err(|error| error.to_string())?;
-    let mut library = Library::new(archives);
+    // EmuWiz's own applied renames are evidence that an old row has moved. They
+    // sit beside the database; nothing is written.
+    let renames = path
+        .parent()
+        .map(|dir| {
+            archivefs_core::catalogue_supersession::applied_renames_from_journals(
+                &dir.join(archivefs_core::dat::rename_apply::RENAME_TRANSACTIONS_DIRECTORY),
+            )
+        })
+        .unwrap_or_default();
+    // A source that is no longer configured is an old library location.
+    let configured: std::collections::HashSet<i64> = database
+        .list_source_folders()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|source| source.id)
+        .collect();
+    let mut library = Library::with_history(archives, &renames, Some(&configured));
     for enrichment in database
         .load_screenscraper_enrichments()
         .map_err(|error| error.to_string())?

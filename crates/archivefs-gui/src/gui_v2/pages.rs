@@ -2218,6 +2218,14 @@ impl App {
         // One scroll area holds the whole page. Specialist evidence used to be
         // drawn above it, which pushed the title and Play off small windows.
         egui::ScrollArea::vertical().id_salt(("v2_detail", id)).show(ui, |ui| {
+            if self.moved_game == Some(id) {
+                ui.group(|ui| {
+                    ui.strong("This game has moved");
+                    ui.label("This catalogue entry is from an older library location. EmuWiz found the current copy.");
+                    ui.label("No action is needed.");
+                });
+                ui.add_space(theme::SPACE_SM);
+            }
             let wide = ui.available_width() >= 760.0;
             let cover = if wide { egui::vec2(240.0, 320.0) } else { egui::vec2(168.0, 224.0) };
             ui.horizontal_top(|ui| {
@@ -2350,6 +2358,12 @@ impl App {
                 ui.label(if game.identified { "Identified in the saved game list" } else { "Identity is not confirmed" });
                 ui.monospace(format!("Source: {}", game.archive.relative_path.display()));
                 ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
+                for old in library.historical_for(id) {
+                    ui.label(format!("Old library location (no action needed): {}", old.archive.relative_path.display()));
+                    if let Some(link) = library.historical_links.get(&old.archive.id) {
+                        ui.label(format!("Why EmuWiz treats it as the same game: {}.", link.evidence.describe()));
+                    }
+                }
                 if let Some(detail) = self.detail.as_ref().filter(|detail| detail.game == id) {
                     ui.label(detail.emulator_status());
                     ui.label(&detail.technical);

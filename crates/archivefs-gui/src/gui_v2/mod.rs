@@ -257,6 +257,9 @@ pub(super) struct App {
     loaded: bool,
     /// Why the library could not load; `None` once a load succeeds.
     library_failure: Option<library_failure::LibraryLoadFailure>,
+    /// The current game a navigation was redirected to because the requested
+    /// catalogue entry is from an older library location.
+    moved_game: Option<i64>,
     notice: Option<Notice>,
     /// Non-alarming confirmation that a separate window was opened; cleared on
     /// navigation or dismissal.
@@ -345,6 +348,7 @@ impl App {
             interacted: false,
             loaded: false,
             library_failure: None,
+            moved_game: None,
             notice: None,
             handoff_status: None,
             confirm_scan: false,
@@ -630,7 +634,12 @@ impl App {
         if route == Route::MameWorkflow {
             self.organisation.view = organisation::OrganisationView::MameNormalizer;
         }
-        self.router.go(route);
+        let resolved = match route.game() {
+            Some(id) if self.library.resolve(id) != id => route.with_game(self.library.resolve(id)),
+            _ => route.clone(),
+        };
+        self.moved_game = (resolved != route).then(|| resolved.game()).flatten();
+        self.router.go(resolved);
         self.handoff_status = None;
         self.navigation_changed();
     }
@@ -1407,6 +1416,12 @@ impl App {
                                         });
                                     }
                                     self.library = library;
+                                    // Remembered pages may name a game by an older catalogue
+                                    // entry; point them at the current copy.
+                                    let before = self.router.current.game();
+                                    self.router.remap_games(|id| self.library.resolve(id));
+                                    let after = self.router.current.game();
+                                    self.moved_game = (before != after).then_some(after).flatten();
                                     self.library_failure = None;
                                     self.problem_summary = None;
                                     self.missing.plan = None;

@@ -53,6 +53,7 @@ pub mod bezel_apply;
 /// Read-only master BIOS inventory and emulator projection planning.
 pub mod bios_projection;
 pub mod catalogue_health;
+pub mod catalogue_supersession;
 mod database;
 /// Read-only Doctor diagnostics: one shared finding model plus adapters
 /// over the existing per-subsystem reports. See the module documentation

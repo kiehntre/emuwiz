@@ -42,6 +42,7 @@ fn fixture(context: &egui::Context) -> App {
         router: Router::default(),
         backend: Backend::start(context.clone()),
         library: Arc::new(Library::default()),
+        moved_game: None,
         indices: Vec::new(),
         filter: Filter::default(),
         filter_generation: 0,
@@ -6370,4 +6371,390 @@ fn a_later_failed_refresh_keeps_the_last_good_library_and_says_so() {
     assert!(has(&strings, "The game list could not be refreshed"));
     assert!(has(&strings, "last game list that loaded"));
     assert!(has(&strings, "Sonic"));
+}
+
+// ---------------------------------------------------------------------------
+// Old library locations: a row a current row confidently replaces is history,
+// never a second (broken) game.
+// ---------------------------------------------------------------------------
+
+fn moved_row(id: i64, rel: &str, size: u64, missing: bool) -> PersistedArchive {
+    PersistedArchive {
+        id,
+        source_folder_id: 1,
+        relative_path: rel.into(),
+        absolute_path: format!("/fixture/{rel}").into(),
+        archive_kind: if rel.starts_with("arcade/") && !rel.ends_with(".img") {
+            "arcade_set_directory".into()
+        } else {
+            "zip".into()
+        },
+        display_name: rel.rsplit('/').next().unwrap().into(),
+        normalized_name: rel.to_lowercase(),
+        size_bytes: Some(size),
+        modified_time_unix_seconds: Some(1),
+        platform: Some("Game Boy".into()),
+        platform_source: Some("manual".into()),
+        last_known_health: "pending".into(),
+        last_seen_at: "2026-09-19".into(),
+        last_verified_missing_at: missing.then(|| "2026-09-20T00:00:00Z".into()),
+        identity_report: None,
+    }
+}
+
+/// ids: 1 old Tetris (moved, unique) -> 2; 3 old Dup with two current copies
+/// (4, 5) -> ambiguous; 6 old Alpha with only a same-size different title (7)
+/// -> not the same game; 9 old raw arcade member -> set 8.
+fn moved_library() -> Library {
+    let mut member = moved_row(9, "arcade/blackbdb/chip_04b.img", 65536, true);
+    member.archive_kind = "direct_game_image".into();
+    Library::new(vec![
+        moved_row(1, "gameboy/Tetris.gb", 32768, true),
+        moved_row(2, "gb/Tetris.gb", 32768, false),
+        moved_row(3, "old/Dup.zip", 5, true),
+        moved_row(4, "b/Dup.zip", 5, false),
+        moved_row(5, "c/Dup.zip", 5, false),
+        moved_row(6, "x/Alpha.zip", 7, true),
+        moved_row(7, "y/Alpha Remix.zip", 7, false),
+        moved_row(8, "arcade/blackbdb", 0, false),
+        member,
+    ])
+}
+
+#[test]
+fn a_replaced_old_row_leaves_the_game_list_but_stays_as_history() {
+    let library = moved_library();
+    let ids: Vec<i64> = library.games.iter().map(|game| game.archive.id).collect();
+    assert!(!ids.contains(&1) && !ids.contains(&9), "{ids:?}");
+    for kept in [2, 3, 4, 5, 6, 7, 8] {
+        assert!(ids.contains(&kept), "{kept} must stay visible: {ids:?}");
+    }
+    assert_eq!(library.filter(&Filter::default()).len(), 7);
+    assert_eq!(
+        library.platforms.values().sum::<usize>(),
+        7,
+        "platform totals count current rows"
+    );
+    // Provenance stays reachable from the current game.
+    let history: Vec<_> = library.historical_for(2).collect();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].archive.relative_path.to_str(),
+        Some("gameboy/Tetris.gb")
+    );
+    assert_eq!(library.historical_links[&1].current_id, 2);
+    assert_eq!(
+        library.historical_for(8).count(),
+        1,
+        "the arcade member is kept as evidence"
+    );
+    assert_eq!(library.historical.len(), 2);
+}
+
+#[test]
+fn ambiguous_and_title_only_rows_stay_visible_and_keep_counting() {
+    let library = moved_library();
+    for id in [3, 6] {
+        let game = library.game(id).expect("an unresolved row stays a game");
+        assert!(game.attention, "{id} is still a missing-file row");
+        assert_eq!(
+            library.resolve(id),
+            id,
+            "no redirect without strong evidence"
+        );
+    }
+    assert_eq!(
+        library.attention, 2,
+        "only the unresolved missing rows need attention"
+    );
+}
+
+#[test]
+fn problems_do_not_count_a_replaced_row_and_an_arcade_set_folder_is_not_a_missing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let make = |rel: &str, size: u64, missing: bool| {
+        let mut row = moved_row(0, rel, size, missing);
+        row.absolute_path = dir.path().join(rel);
+        row
+    };
+    let mut rows = vec![
+        make("gameboy/Tetris.gb", 32768, true),
+        make("gb/Tetris.gb", 32768, false),
+        make("old/Dup.zip", 5, true),
+        make("b/Dup.zip", 5, false),
+        make("c/Dup.zip", 5, false),
+        make("arcade/blackbdb", 0, false),
+    ];
+    for (index, row) in rows.iter_mut().enumerate() {
+        row.id = index as i64 + 1;
+    }
+    for rel in ["gb/Tetris.gb", "b/Dup.zip", "c/Dup.zip"] {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("arcade/blackbdb")).unwrap();
+    let library = Library::new(rows);
+    assert_eq!(
+        library.historical.len(),
+        1,
+        "the moved Tetris row is history"
+    );
+    let summary = ProblemSummary::from_library(&library, None);
+    let titles: Vec<&str> = summary
+        .problems
+        .iter()
+        .filter(|problem| problem.category == super::problems::Category::Files)
+        .map(|problem| problem.title.as_str())
+        .collect();
+    // Only the ambiguous missing Dup row is a missing-file problem: not the
+    // replaced Tetris row and not the existing arcade set folder.
+    assert_eq!(titles.len(), 1, "{titles:?}");
+    assert!(titles[0].contains("Dup.zip"), "{titles:?}");
+    assert!(
+        summary
+            .problems
+            .iter()
+            .all(|problem| !problem.title.starts_with("Tetris.gb is missing")),
+        "{titles:?}"
+    );
+}
+
+#[test]
+fn navigating_to_an_old_entry_opens_the_current_copy_and_says_so() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(moved_library());
+    app.loaded = true;
+    app.go(Route::Game(1));
+    assert_eq!(app.router.current, Route::Game(2));
+    assert_eq!(app.moved_game, Some(2));
+    app.go(Route::Task {
+        section: Section::Launch,
+        game: 1,
+    });
+    assert_eq!(
+        app.router.current,
+        Route::Task {
+            section: Section::Launch,
+            game: 2
+        }
+    );
+    // The page names no obsolete location as unavailable and explains the move.
+    app.go(Route::Game(1));
+    let page = page_text(&context, &mut app, Route::Game(2));
+    assert!(has(&page, "from an older library location"), "{page:?}");
+    assert!(has(&page, "No action is needed"), "{page:?}");
+    assert!(!has(&page, "not in the current game list"), "{page:?}");
+    // An ordinary navigation shows no banner.
+    app.go(Route::Game(4));
+    assert_eq!(app.moved_game, None);
+    let page = page_text(&context, &mut app, Route::Game(4));
+    assert!(!has(&page, "from an older library location"), "{page:?}");
+}
+
+#[test]
+fn remembered_pages_are_repointed_when_the_library_loads() {
+    let library = moved_library();
+    let mut router = Router::default();
+    router.go(Route::Game(1));
+    router.go(Route::BrowsePlayGame(1));
+    router.remap_games(|id| library.resolve(id));
+    assert_eq!(router.current, Route::BrowsePlayGame(2));
+    router.back();
+    assert_eq!(router.current, Route::Game(2));
+}
+
+#[test]
+fn launch_inspector_and_artwork_only_ever_see_the_current_path() {
+    let library = moved_library();
+    // Launch readiness and artwork take the game's path from the library row.
+    let resolved = library.game(library.resolve(1)).unwrap();
+    assert_eq!(
+        resolved.archive.absolute_path.to_str(),
+        Some("/fixture/gb/Tetris.gb")
+    );
+    // Neither the inspector's rows nor the id lookups used for artwork keys
+    // contain the obsolete entry.
+    let rows = super::archive_inspector::inspector_rows(&library.games);
+    assert!(rows.iter().all(|row| row.id != 1 && row.id != 9));
+    assert!(library.by_id.get(&1).is_none() && library.by_id.get(&9).is_none());
+    assert!(library.games.iter().all(|game| {
+        !game
+            .archive
+            .absolute_path
+            .to_string_lossy()
+            .contains("gameboy/")
+    }));
+}
+
+#[test]
+fn applied_rename_history_links_a_renamed_file_to_its_new_name() {
+    let library = Library::with_history(
+        vec![
+            moved_row(1, "atari2600/A-Team, The (USA) (Proto).zip", 100, true),
+            moved_row(2, "atari2600/A-Team, The (1984)(Atari).zip", 100, false),
+        ],
+        &[(
+            "/fixture/atari2600/A-Team, The (USA) (Proto).zip".into(),
+            "/fixture/atari2600/A-Team, The (1984)(Atari).zip".into(),
+        )],
+        None,
+    );
+    assert_eq!(library.games.len(), 1);
+    assert_eq!(library.resolve(1), 2);
+    // Without the history the same two rows are not assumed to be one game.
+    let without = Library::new(vec![
+        moved_row(1, "atari2600/A-Team, The (USA) (Proto).zip", 100, true),
+        moved_row(2, "atari2600/A-Team, The (1984)(Atari).zip", 100, false),
+    ]);
+    assert_eq!(without.games.len(), 2);
+}
+
+#[test]
+fn building_the_library_touches_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |rel: &str| {
+        let path = dir.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"game").unwrap();
+    };
+    write("gb/Tetris.gb");
+    write("gameboy/Tetris.gb");
+    let snapshot = |root: &std::path::Path| {
+        let mut entries = Vec::new();
+        for walk in ["gb/Tetris.gb", "gameboy/Tetris.gb"] {
+            let meta = std::fs::metadata(root.join(walk)).unwrap();
+            entries.push((walk, meta.len(), meta.modified().unwrap()));
+        }
+        entries
+    };
+    let before = snapshot(dir.path());
+    let mut rows = vec![
+        moved_row(1, "gameboy/Tetris.gb", 4, true),
+        moved_row(2, "gb/Tetris.gb", 4, false),
+    ];
+    for row in &mut rows {
+        row.absolute_path = dir.path().join(&row.relative_path);
+    }
+    let library = Library::new(rows);
+    assert_eq!(library.games.len(), 1);
+    assert_eq!(snapshot(dir.path()), before);
+    assert!(
+        dir.path().join("gameboy/Tetris.gb").exists(),
+        "the old file is not removed"
+    );
+}
+
+/// Read-only measurement against a real catalogue (not part of the normal run):
+/// `REAL_CATALOGUE_DB=<library.sqlite3> cargo test -p archivefs-gui --lib -- --ignored real_catalogue_supersession_counts --nocapture`.
+/// Opens the database read-only and only stats files; nothing is written.
+#[test]
+#[ignore]
+fn real_catalogue_supersession_counts() {
+    use super::problems::{Category, Severity};
+    let path =
+        std::path::PathBuf::from(std::env::var("REAL_CATALOGUE_DB").expect("REAL_CATALOGUE_DB"));
+    let after = super::backend::load_library(&path).expect("read-only load");
+    let rows: Vec<PersistedArchive> = after
+        .games
+        .iter()
+        .chain(after.historical.iter())
+        .map(|game| game.archive.clone())
+        .collect();
+    let before = Library {
+        games: rows
+            .iter()
+            .cloned()
+            .map(super::library::Game::from_archive)
+            .collect(),
+        ..Library::default()
+    };
+    let report = |label: &str, library: &Library| {
+        let summary = ProblemSummary::from_library(library, None);
+        let files = summary
+            .problems
+            .iter()
+            .filter(|p| p.category == Category::Files)
+            .count();
+        println!(
+            "{label}: games={} attention={} problems_total={} actionable={} needs_attention={} missing_file_findings={}",
+            library.games.len(),
+            library.attention,
+            summary.problems.len(),
+            summary.actionable_count(),
+            summary.count(Severity::NeedsAttention),
+            files
+        );
+    };
+    println!("catalogue rows={}", rows.len());
+    let attention = before.games.iter().filter(|game| game.attention).count();
+    println!(
+        "BEFORE projected games={} flagged-missing={attention}",
+        before.games.len()
+    );
+    report(
+        "BEFORE",
+        &Library {
+            attention,
+            ..before.clone()
+        },
+    );
+    report("AFTER ", &after);
+    println!(
+        "hidden historical rows={} (each has one current counterpart); by evidence:",
+        after.historical.len()
+    );
+    let mut by = std::collections::BTreeMap::new();
+    for link in after.historical_links.values() {
+        *by.entry(format!("{:?}", link.evidence)).or_insert(0usize) += 1;
+    }
+    println!("{by:?}");
+    let (mut flagged, mut unconfigured, mut unconfigured_present) = (0, 0, 0);
+    for game in &after.historical {
+        if game.archive.last_verified_missing_at.is_some() {
+            flagged += 1;
+        } else {
+            unconfigured += 1;
+            unconfigured_present += usize::from(game.archive.absolute_path.exists());
+        }
+    }
+    println!(
+        "hidden: flagged-missing rows={flagged}, rows of no-longer-configured sources={unconfigured} (old path still exists on disk: {unconfigured_present})"
+    );
+    let still_missing = after
+        .games
+        .iter()
+        .filter(|game| game.archive.last_verified_missing_at.is_some())
+        .count();
+    println!("missing rows still visible (unresolved)={still_missing}");
+}
+
+#[test]
+fn rows_of_a_source_that_is_no_longer_configured_are_hidden_only_with_a_unique_current_copy() {
+    let mut old = moved_row(1, "roms/snes/Game.sfc", 10, false);
+    old.source_folder_id = 9;
+    let mut unmatched = moved_row(2, "roms/snes/Lonely.sfc", 11, false);
+    unmatched.source_folder_id = 9;
+    let current = moved_row(3, "snes/Game.sfc", 10, false);
+    let configured = std::collections::HashSet::from([1]);
+    let library = Library::with_history(vec![old, unmatched, current], &[], Some(&configured));
+    let ids: Vec<i64> = library.games.iter().map(|game| game.archive.id).collect();
+    assert_eq!(
+        ids,
+        vec![3, 2]
+            .into_iter()
+            .filter(|id| ids.contains(id))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ids.contains(&2) && ids.contains(&3) && !ids.contains(&1),
+        "{ids:?}"
+    );
+    assert_eq!(library.resolve(1), 3);
+    assert_eq!(
+        library.resolve(2),
+        2,
+        "no counterpart: the row stays visible"
+    );
 }
