@@ -131,6 +131,7 @@ pub use process_spawn::LaunchCommandSpec;
 pub mod cheat_launch_plan;
 pub mod cheat_runtime;
 pub mod cheat_runtime_mame;
+pub mod cheat_runtime_melonds;
 pub mod cheat_runtime_retroarch;
 pub mod readiness;
 pub mod resource_grants;

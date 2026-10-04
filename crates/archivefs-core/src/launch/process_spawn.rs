@@ -168,6 +168,16 @@ pub fn spawn_watched_process(command: &PreparedProcessCommand) -> std::io::Resul
     spawn_watched_process_inner(command, &[], None, None, None)
 }
 
+/// Like [`spawn_watched_process`] but sets `environment` on the child only
+/// (the parent environment is untouched). For launches that must redirect an
+/// emulator's profile directory, such as a per-launch cheat runtime.
+pub(crate) fn spawn_watched_process_with_environment(
+    command: &PreparedProcessCommand,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> std::io::Result<WatchedProcess> {
+    spawn_watched_process_inner(command, environment, None, None, None)
+}
+
 /// Opt-in preservation workspace seam. Legacy callers retain their exact
 /// command/env/cwd behavior. The lifecycle callback is owned by the watcher,
 /// not the GUI's selected game, so switching selection cannot delete a live
