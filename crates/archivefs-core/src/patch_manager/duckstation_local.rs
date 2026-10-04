@@ -21,6 +21,11 @@ use std::os::unix::fs::PermissionsExt;
 use serde::Serialize;
 
 use crate::game_identity::serial_from_boot_path;
+use crate::launch::installation::LaunchInstallation;
+use crate::launch::installation_known::{
+    DUCKSTATION as KNOWN_DUCKSTATION, KnownInstallRoots, discover_appimages, discover_flatpaks,
+    flatpak_binary, flatpak_wrapper_app_id, portable_marker_beside,
+};
 use crate::platform_evidence_fusion::evidence_lineage::{ClaimType, Representation};
 
 pub const DUCKSTATION_MAX_PROFILES: usize = 16;
@@ -75,6 +80,8 @@ pub struct DuckStationWarning {
 pub struct DuckStationExecutable {
     pub path: PathBuf,
     pub installation_type: DuckStationInstallationType,
+    /// Native, AppImage or `flatpak run` (then `path` is the `flatpak` program).
+    pub launch: LaunchInstallation,
     /// Discovery never executes a binary.  An authorized outer probe may pass
     /// its text to [`parse_duckstation_version`] through discovery roots.
     pub version: Option<String>,
@@ -161,13 +168,24 @@ impl DuckStationProfileDiscoveryRoots {
         let appimage_directory = env::var_os("APPIMAGE")
             .map(PathBuf::from)
             .and_then(|path| path.parent().map(Path::to_path_buf));
+        // The data root of a known portable AppImage is the directory it
+        // sits in; only AppImages with a marker beside them qualify.
+        let portable_configuration_roots = KnownInstallRoots::from_environment()
+            .map(|known| {
+                discover_appimages(&KNOWN_DUCKSTATION, &known)
+                    .into_iter()
+                    .filter(|found| found.portable_marker.is_some())
+                    .filter_map(|found| found.path.parent().map(Path::to_path_buf))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             home,
             xdg_config_home,
             xdg_data_home,
             xdg_config_home_explicit,
             explicit_configuration_roots: Vec::new(),
-            portable_configuration_roots: Vec::new(),
+            portable_configuration_roots,
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory,
@@ -641,33 +659,83 @@ fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckSta
             ]);
         }
     }
+    let known = known_install_roots(roots);
+    // Known AppImage locations beyond the fixed names above (for example
+    // `~/Applications/emulators/DuckStation.AppImage`).
+    candidates.extend(
+        discover_appimages(&KNOWN_DUCKSTATION, &known)
+            .into_iter()
+            .map(|found| found.path),
+    );
     candidates.sort();
     candidates.dedup();
-    candidates
+    let mut executables: Vec<DuckStationExecutable> = candidates
         .into_iter()
         .filter(|path| is_regular_file(path))
-        .map(|path| DuckStationExecutable {
-            installation_type: if roots.explicit_executables.contains(&path) {
-                DuckStationInstallationType::Explicit
-            } else if roots
-                .appimage_directory
-                .as_ref()
-                .is_some_and(|root| path.starts_with(root))
-                || path
-                    .extension()
-                    .is_some_and(|extension| extension == "AppImage")
-            {
-                DuckStationInstallationType::Portable
-            } else {
-                DuckStationInstallationType::Native
-            },
-            version: roots
-                .known_version_outputs
-                .get(&path)
-                .and_then(|text| parse_duckstation_version(text)),
-            path,
+        .filter(|path| flatpak_wrapper_app_id(path).is_none())
+        .map(|path| {
+            let is_appimage = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("AppImage"));
+            // An AppImage with a portable marker beside it keeps its data
+            // there (Portable profile); without one it uses the default
+            // data root, like a native install.
+            let portable =
+                is_appimage && portable_marker_beside(&KNOWN_DUCKSTATION, &path).is_some();
+            DuckStationExecutable {
+                installation_type: if roots.explicit_executables.contains(&path) {
+                    DuckStationInstallationType::Explicit
+                } else if portable
+                    || roots
+                        .appimage_directory
+                        .as_ref()
+                        .is_some_and(|root| path.starts_with(root))
+                {
+                    DuckStationInstallationType::Portable
+                } else {
+                    DuckStationInstallationType::Native
+                },
+                launch: if is_appimage {
+                    LaunchInstallation::AppImage {
+                        extract_and_run: false,
+                    }
+                } else {
+                    LaunchInstallation::Native
+                },
+                version: roots
+                    .known_version_outputs
+                    .get(&path)
+                    .and_then(|text| parse_duckstation_version(text)),
+                path,
+            }
         })
-        .collect()
+        .collect();
+    if let (Some(found), Some(program)) = (
+        discover_flatpaks(&KNOWN_DUCKSTATION, &known).first(),
+        flatpak_binary(&known),
+    ) && let Ok(launch) = LaunchInstallation::flatpak(&found.app_id)
+    {
+        executables.push(DuckStationExecutable {
+            path: program,
+            installation_type: DuckStationInstallationType::FlatpakUser,
+            launch,
+            version: None,
+        });
+    }
+    executables
+}
+
+fn known_install_roots(roots: &DuckStationProfileDiscoveryRoots) -> KnownInstallRoots {
+    KnownInstallRoots {
+        home: roots.home.clone(),
+        user_data: roots.xdg_data_home.clone(),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: roots.path_override.clone().unwrap_or_else(|| {
+            env::var_os("PATH")
+                .map(|path| env::split_paths(&path).take(128).collect())
+                .unwrap_or_default()
+        }),
+    }
 }
 
 fn select_serial(
@@ -1444,6 +1512,9 @@ fn is_real_directory(path: &Path) -> bool {
 pub struct DuckStationNativeLaunchBinding {
     pub executable: PathBuf,
     pub user_directory_mode: DuckStationUserDirectoryMode,
+    /// Native, AppImage or Flatpak. For Flatpak, `executable` is the
+    /// `flatpak` program.
+    pub installation: LaunchInstallation,
 }
 
 /// How DuckStation's single unified user directory (BIOS/settings/memory
@@ -1458,6 +1529,11 @@ pub enum DuckStationUserDirectoryMode {
     /// that variable is set and absolute, else the hardcoded
     /// `$HOME/.local/share/duckstation`.
     DefaultNative,
+    /// A `portable.txt`/`settings.ini` beside the executable makes its own
+    /// directory the data root. Recorded, never created or moved by EmuWiz.
+    PortableBesideExecutable,
+    /// The Flatpak sandbox's own profile.
+    FlatpakSandbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1536,9 +1612,9 @@ pub fn resolve_duckstation_native_launch_binding(
     }
     match profile.installation_type {
         DuckStationInstallationType::Native => resolve_default_native_binding(profile, roots),
-        DuckStationInstallationType::FlatpakUser
-        | DuckStationInstallationType::Portable
-        | DuckStationInstallationType::Explicit => Err(launch_blocker(
+        DuckStationInstallationType::Portable => resolve_portable_binding(profile),
+        DuckStationInstallationType::FlatpakUser => resolve_flatpak_binding(profile),
+        DuckStationInstallationType::Explicit => Err(launch_blocker(
             DuckStationLaunchBlockerKind::UnsupportedInstallationType,
             format!(
                 "only {:?} DuckStation installations are supported by this native launch \
@@ -1590,13 +1666,82 @@ fn resolve_default_native_binding(
             "DuckStation configuration evidence (settings.ini) is no longer present",
         ));
     }
-    let executable = resolve_native_duckstation_executable(profile)?;
+    let (executable, installation) = resolve_native_duckstation_executable(profile)?;
     if let Some(blocker) = portable_marker_conflict(&executable) {
         return Err(blocker);
     }
     Ok(DuckStationNativeLaunchBinding {
         executable,
         user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        installation,
+    })
+}
+
+/// A portable AppImage: the profile root must be the AppImage's own
+/// directory, with a portable marker beside it. EmuWiz only launches it; the
+/// marker is left exactly as it is.
+fn resolve_portable_binding(
+    profile: &DuckStationProfile,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    let matching: Vec<&DuckStationExecutable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.installation_type == DuckStationInstallationType::Portable
+                && candidate.path.parent() == Some(profile.configuration_path.as_path())
+                && portable_marker_beside(&KNOWN_DUCKSTATION, &candidate.path).is_some()
+        })
+        .collect();
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_duckstation_executable(&candidate.path) {
+            Ok(()) => valid.push((candidate.path.clone(), candidate.launch.clone())),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.unwrap_or_else(|| {
+            launch_blocker(
+                DuckStationLaunchBlockerKind::ExecutableMissing,
+                "no portable DuckStation executable with a portable marker sits in this profile root",
+            )
+        })),
+        1 => {
+            let (executable, installation) = valid.remove(0);
+            Ok(DuckStationNativeLaunchBinding {
+                executable,
+                user_directory_mode: DuckStationUserDirectoryMode::PortableBesideExecutable,
+                installation,
+            })
+        }
+        count => Err(launch_blocker(
+            DuckStationLaunchBlockerKind::AmbiguousExecutable,
+            format!("{count} portable executables match this profile root"),
+        )),
+    }
+}
+
+/// The Flatpak installation: `flatpak run org.duckstation.DuckStation`, using
+/// the sandbox's own profile.
+fn resolve_flatpak_binding(
+    profile: &DuckStationProfile,
+) -> Result<DuckStationNativeLaunchBinding, DuckStationLaunchBlocker> {
+    let candidate = profile
+        .executable_candidates
+        .iter()
+        .find(|candidate| candidate.installation_type == DuckStationInstallationType::FlatpakUser);
+    let Some(candidate) = candidate else {
+        return Err(launch_blocker(
+            DuckStationLaunchBlockerKind::ExecutableMissing,
+            "the DuckStation Flatpak (or the flatpak program) was not found",
+        ));
+    };
+    validate_native_duckstation_executable(&candidate.path)?;
+    Ok(DuckStationNativeLaunchBinding {
+        executable: candidate.path.clone(),
+        user_directory_mode: DuckStationUserDirectoryMode::FlatpakSandbox,
+        installation: candidate.launch.clone(),
     })
 }
 
@@ -1639,7 +1784,7 @@ fn portable_marker_conflict(executable: &Path) -> Option<DuckStationLaunchBlocke
 /// verified-safe candidate is always blocked.
 fn resolve_native_duckstation_executable(
     profile: &DuckStationProfile,
-) -> Result<PathBuf, DuckStationLaunchBlocker> {
+) -> Result<(PathBuf, LaunchInstallation), DuckStationLaunchBlocker> {
     // `resolve_default_native_binding` only ever routes a `Native` profile
     // here (the top-level match in `resolve_duckstation_native_launch_binding`
     // rejects `FlatpakUser` / `Portable` / `Explicit` *profiles*). Such a
@@ -1671,7 +1816,7 @@ fn resolve_native_duckstation_executable(
     let mut last_error = None;
     for candidate in matching {
         match validate_native_duckstation_executable(&candidate.path) {
-            Ok(()) => valid.push(candidate.path.clone()),
+            Ok(()) => valid.push((candidate.path.clone(), candidate.launch.clone())),
             Err(error) => last_error = Some(error),
         }
     }
@@ -2144,6 +2289,7 @@ mod tests {
             path,
             installation_type,
             version: None,
+            launch: crate::launch::installation::LaunchInstallation::Native,
         }
     }
 
@@ -2249,10 +2395,14 @@ mod tests {
             );
             profile.installation_type = forced;
             let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
-            assert_eq!(
-                blocker.kind,
+            // The confirmed executable is not a Portable/Flatpak candidate, so
+            // it never binds there; `Explicit` stays unsupported outright.
+            let expected = if forced == DuckStationInstallationType::Explicit {
                 DuckStationLaunchBlockerKind::UnsupportedInstallationType
-            );
+            } else {
+                DuckStationLaunchBlockerKind::ExecutableMissing
+            };
+            assert_eq!(blocker.kind, expected, "{forced:?}");
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -2493,7 +2643,7 @@ mod tests {
     // --- 9: unsupported Flatpak -----------------------------------------------------------------
 
     #[test]
-    fn flatpak_installation_is_unsupported() {
+    fn a_flatpak_profile_without_a_flatpak_candidate_has_no_binding() {
         let root = binding_fixture_root("flatpak");
         let roots = binding_roots(&root);
         let mut profile = native_duckstation_profile(&roots, Vec::new());
@@ -2501,7 +2651,7 @@ mod tests {
         let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
         assert_eq!(
             blocker.kind,
-            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+            DuckStationLaunchBlockerKind::ExecutableMissing
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -2509,7 +2659,7 @@ mod tests {
     // --- 10: unsupported AppImage/portable ------------------------------------------------------
 
     #[test]
-    fn portable_installation_is_unsupported() {
+    fn a_portable_profile_without_a_portable_appimage_has_no_binding() {
         let root = binding_fixture_root("portable");
         let roots = binding_roots(&root);
         let mut profile = native_duckstation_profile(&roots, Vec::new());
@@ -2518,19 +2668,15 @@ mod tests {
         let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
         assert_eq!(
             blocker.kind,
-            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+            DuckStationLaunchBlockerKind::ExecutableMissing
         );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn caller_confirmed_portable_root_is_still_unsupported_today() {
-        // Even the *genuine* portable case (never AppImage-derived) is
-        // refused today - see the module's own doc comment: the current
-        // model cannot distinguish this from an AppImage-derived
-        // `Portable` profile from `installation_type` alone, and blocking
-        // uniformly is the conservative, provable choice for this task's
-        // scope.
+    fn a_caller_confirmed_portable_root_without_its_executable_has_no_binding() {
+        // A portable root binds only when a portable-marked AppImage sits in
+        // that exact directory; a bare root has nothing to launch.
         let root = binding_fixture_root("genuine-portable");
         let roots = binding_roots(&root);
         let mut profile = native_duckstation_profile(&roots, Vec::new());
@@ -2539,7 +2685,7 @@ mod tests {
         let blocker = resolve_duckstation_native_launch_binding(&profile, &roots).unwrap_err();
         assert_eq!(
             blocker.kind,
-            DuckStationLaunchBlockerKind::UnsupportedInstallationType
+            DuckStationLaunchBlockerKind::ExecutableMissing
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -2621,7 +2767,9 @@ mod tests {
         // argv-shaped field, this would fail to compile, forcing a review.
         let mode = DuckStationUserDirectoryMode::DefaultNative;
         match mode {
-            DuckStationUserDirectoryMode::DefaultNative => {}
+            DuckStationUserDirectoryMode::DefaultNative
+            | DuckStationUserDirectoryMode::PortableBesideExecutable
+            | DuckStationUserDirectoryMode::FlatpakSandbox => {}
         }
         let root = binding_fixture_root("mode-is-data");
         let roots = binding_roots(&root);
@@ -2638,6 +2786,7 @@ mod tests {
         let DuckStationNativeLaunchBinding {
             executable: _,
             user_directory_mode: _,
+            installation: _,
         } = binding;
         fs::remove_dir_all(root).unwrap();
     }

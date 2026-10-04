@@ -199,7 +199,15 @@ pub fn build_ppsspp_command_plan(
     PpssppCommandPlan {
         command: Some(PpssppCommand {
             executable: binding.executable.clone(),
-            arguments: vec![content_path.clone().into_os_string()],
+            arguments: match wrap_for_installation(&binding.installation, &content_path) {
+                Ok(arguments) => arguments,
+                Err(detail) => {
+                    return PpssppCommandPlan::blocked(vec![blocker(
+                        LaunchBlockerKind::PpssppBindingUnavailable,
+                        detail,
+                    )]);
+                }
+            },
             working_directory: None,
             selection: PpssppCommandSelection {
                 profile_id: profile_id.clone(),
@@ -210,6 +218,23 @@ pub fn build_ppsspp_command_plan(
         }),
         blockers: Vec::new(),
     }
+}
+
+/// The emulator's own argument (the content path) wrapped for the bound
+/// installation. Native and AppImage launches pass it through unchanged;
+/// Flatpak adds `run`, a read-only grant for the content folder and the app id.
+fn wrap_for_installation(
+    installation: &crate::launch::installation::LaunchInstallation,
+    content_path: &Path,
+) -> Result<Vec<OsString>, String> {
+    let mut visibility = crate::launch::installation::VisibilityPlan::new();
+    visibility.content(content_path);
+    installation
+        .wrap_arguments(
+            &visibility,
+            vec![content_path.to_path_buf().into_os_string()],
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

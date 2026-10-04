@@ -40,6 +40,7 @@ fn candidate(path: Option<PathBuf>) -> LaunchCandidate {
 fn binding() -> Result<PpssppNativeLaunchBinding, PpssppLaunchBlocker> {
     Ok(PpssppNativeLaunchBinding {
         executable: PathBuf::from("/opt/ppsspp/PPSSPP"),
+        installation: crate::launch::installation::LaunchInstallation::Native,
     })
 }
 
@@ -188,5 +189,80 @@ fn non_ppsspp_candidate_is_refused() {
     assert!(has_blocker(
         &plan,
         LaunchBlockerKind::PpssppCandidateRequired
+    ));
+}
+
+fn ppsspp_binding(
+    executable: &str,
+    installation: crate::launch::installation::LaunchInstallation,
+) -> Result<PpssppNativeLaunchBinding, PpssppLaunchBlocker> {
+    Ok(PpssppNativeLaunchBinding {
+        executable: PathBuf::from(executable),
+        installation,
+    })
+}
+
+#[test]
+fn an_appimage_binding_is_the_executable_with_the_same_arguments_as_native() {
+    let path = PathBuf::from("/games/PSP titles/a b.iso");
+    let plan = build_ppsspp_command_plan(
+        &resolved(),
+        Some("ULUS-10000"),
+        &candidate(Some(path.clone())),
+        &ppsspp_binding(
+            "/home/u/Applications/PPSSPP.AppImage",
+            crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false,
+            },
+        ),
+    );
+    let command = plan.command.unwrap();
+    assert_eq!(
+        command.executable,
+        PathBuf::from("/home/u/Applications/PPSSPP.AppImage")
+    );
+    assert_eq!(command.arguments, vec![OsString::from(path)]);
+}
+
+#[test]
+fn a_flatpak_binding_runs_the_app_with_a_read_only_grant_for_the_content_folder() {
+    let path = PathBuf::from("/mnt/usbdrive/games/PSP titles/a b.iso");
+    let plan = build_ppsspp_command_plan(
+        &resolved(),
+        Some("ULUS-10000"),
+        &candidate(Some(path.clone())),
+        &ppsspp_binding(
+            "/usr/bin/flatpak",
+            crate::launch::installation::LaunchInstallation::flatpak("org.ppsspp.PPSSPP").unwrap(),
+        ),
+    );
+    let command = plan.command.unwrap();
+    assert_eq!(command.executable, PathBuf::from("/usr/bin/flatpak"));
+    assert_eq!(
+        command.arguments,
+        vec![
+            OsString::from("run"),
+            OsString::from("--filesystem=/mnt/usbdrive/games/PSP titles:ro"),
+            OsString::from("org.ppsspp.PPSSPP"),
+            OsString::from(path),
+        ]
+    );
+}
+
+#[test]
+fn a_flatpak_content_folder_that_would_be_a_broad_host_grant_blocks_the_plan() {
+    let plan = build_ppsspp_command_plan(
+        &resolved(),
+        Some("ULUS-10000"),
+        &candidate(Some(PathBuf::from("/mnt/game.iso"))),
+        &ppsspp_binding(
+            "/usr/bin/flatpak",
+            crate::launch::installation::LaunchInstallation::flatpak("org.ppsspp.PPSSPP").unwrap(),
+        ),
+    );
+    assert!(plan.command.is_none());
+    assert!(has_blocker(
+        &plan,
+        LaunchBlockerKind::PpssppBindingUnavailable
     ));
 }

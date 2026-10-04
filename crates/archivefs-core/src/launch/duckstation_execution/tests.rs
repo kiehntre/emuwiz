@@ -373,6 +373,7 @@ fn fresh_identity_revalidates_a_real_ps1_chd() {
         profile_id: format!("duckstation:{}", profile_root.display()),
         expected_executable: executable,
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
     // Identity itself must succeed for the CHD, exactly as it does for the
     // equivalent ISO above. The caller-confirmed Explicit executable now
@@ -403,6 +404,7 @@ fn fresh_identity_rejects_a_mismatched_real_ps1_chd_serial() {
         profile_id: "duckstation:test".to_string(),
         expected_executable: root.join("duckstation-qt"),
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
 
     let error = fresh_identity_status(&request.selected_content_path, &request).unwrap_err();
@@ -451,6 +453,7 @@ fn fresh_identity_revalidates_a_real_ps1_disc() {
         profile_id: format!("duckstation:{}", profile_root.display()),
         expected_executable: executable,
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
     // The caller-confirmed Explicit executable binds against this Native XDG
     // profile; the terminal failure is now the independent, unverified-BIOS
@@ -509,6 +512,7 @@ fn preflight_revalidates_a_real_ps1_cue_bin_disc() {
         profile_id: format!("duckstation:{}", profile_root.display()),
         expected_executable: executable,
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
     // The caller-confirmed Explicit executable binds against this Native XDG
     // profile; the terminal failure is now the independent, unverified-BIOS
@@ -545,6 +549,7 @@ fn fresh_identity_rejects_a_mismatched_real_ps1_cue_bin_serial() {
         profile_id: "duckstation:test".to_string(),
         expected_executable: root.join("duckstation-qt"),
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
     let error = fresh_identity_status(&request.selected_content_path, &request).unwrap_err();
     assert_eq!(
@@ -568,6 +573,7 @@ fn fresh_identity_rejects_a_mismatched_real_ps1_serial() {
         profile_id: "duckstation:test".to_string(),
         expected_executable: root.join("duckstation-qt"),
         expected_user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
 
     let error = fresh_identity_status(&request.selected_content_path, &request).unwrap_err();

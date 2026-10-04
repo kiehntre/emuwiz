@@ -371,6 +371,17 @@ pub fn preflight_and_launch_melonds_with_cheats(
 ) -> Result<MelonDsCheatLaunch, MelonDsCheatLaunchError> {
     let command = preflight_melonds_launch(request, roots, identity, game_key)
         .map_err(MelonDsCheatLaunchError::Preflight)?;
+    if cheat.is_some()
+        && matches!(
+            request.expected_installation,
+            crate::launch::installation::LaunchInstallation::Flatpak { .. }
+        )
+    {
+        // XDG_CONFIG_HOME on the host process does not reach the sandbox.
+        return Err(MelonDsCheatLaunchError::Cheats(MelonDsCheatError::Runtime(
+            "cheat launches are not supported for a Flatpak melonDS".into(),
+        )));
+    }
     let Some(cheat) = cheat else {
         return spawn_melonds(&command)
             .map(MelonDsCheatLaunch::Plain)

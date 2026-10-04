@@ -1550,6 +1550,7 @@ fn pcsx2_launch_request(
         profile_id: profile.profile_id.clone(),
         expected_executable: binding.executable,
         expected_user_directory_mode: binding.user_directory_mode,
+        expected_installation: binding.installation,
     })
 }
 
@@ -2324,6 +2325,7 @@ fn standalone_launch_request(
                     profile_id: profile.profile_id.clone(),
                     expected_executable: binding.executable,
                     expected_user_directory_mode: binding.user_directory_mode,
+                    expected_installation: binding.installation,
                 },
                 context.roots.clone(),
                 context.firmware_evidence.clone(),
@@ -2348,6 +2350,7 @@ fn standalone_launch_request(
                     expected_psp_disc_id: disc_id,
                     profile_id: profile.profile_id.clone(),
                     expected_executable: binding.executable,
+                    expected_installation: binding.installation,
                 },
                 context.roots.clone(),
             ))

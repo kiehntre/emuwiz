@@ -4,8 +4,9 @@
 //!
 //! # Scope (first slice)
 //!
-//! - Native PCSX2 profiles only - `NativeAlternate`, `Portable`,
-//!   `FlatpakUser`, `FlatpakSystem`, and any profile
+//! - Native, AppImage (portable or not) and Flatpak PCSX2 installs, as
+//!   resolved by [`crate::patch_manager::resolve_pcsx2_native_launch_binding`]
+//!   (see [`crate::launch::installation`]). `NativeAlternate`, and any profile
 //!   [`crate::patch_manager::resolve_pcsx2_native_launch_binding`] itself
 //!   refuses are never attempted.
 //! - `PS2` only - the only platform
@@ -26,7 +27,7 @@
 //! # What this module is not
 //!
 //! - It never builds a GUI Launch button and is not wired to one yet.
-//! - It never launches Flatpak/Portable/AppImage/`NativeAlternate` PCSX2,
+//! - It never launches `NativeAlternate` PCSX2,
 //!   RetroArch, or Dolphin.
 //! - It never touches cheats, mods, RomM, DAT, Library View History, ES-DE
 //!   writes, or the shared transaction system.
@@ -105,6 +106,8 @@ pub struct Pcsx2LaunchRequest {
     pub profile_id: String,
     pub expected_executable: PathBuf,
     pub expected_user_directory_mode: Pcsx2UserDirectoryMode,
+    /// Native, AppImage or Flatpak, as shown at readiness time.
+    pub expected_installation: crate::launch::installation::LaunchInstallation,
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +336,7 @@ pub fn preflight_pcsx2_launch(
     })?;
     if binding.executable != request.expected_executable
         || binding.user_directory_mode != request.expected_user_directory_mode
+        || binding.installation != request.expected_installation
     {
         return Err(preflight_error(
             Pcsx2LaunchPreflightErrorKind::BindingDrift,

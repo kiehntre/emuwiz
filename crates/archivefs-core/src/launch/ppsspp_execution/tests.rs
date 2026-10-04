@@ -219,6 +219,7 @@ fn build_ready_fixture(label: &str) -> ReadyFixture {
         expected_psp_disc_id: PSP_DISC_ID.to_string(),
         profile_id,
         expected_executable: executable,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
     ReadyFixture {
         fixture,
@@ -650,6 +651,9 @@ fn build_explicit_appimage_fixture(label: &str) -> ExplicitAppImageFixture {
         expected_psp_disc_id: PSP_DISC_ID.to_string(),
         profile_id,
         expected_executable: appimage.clone(),
+        expected_installation: crate::launch::installation::LaunchInstallation::AppImage {
+            extract_and_run: false,
+        },
     };
 
     ExplicitAppImageFixture {

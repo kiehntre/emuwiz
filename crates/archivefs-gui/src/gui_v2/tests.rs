@@ -5143,6 +5143,8 @@ fn lifecycle_fixture(
                 channel: LifecycleChannel::Unknown,
                 local_health: LocalHealth::Unknown,
                 launch_readiness: None,
+                launch_support:
+                    archivefs_core::launch::installation_support::LaunchSupport::NotAssessed,
                 package: None,
                 update_authority: UpdateAuthority::Unknown,
                 update_status: None,

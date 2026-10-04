@@ -28,6 +28,8 @@ pub struct MelonDsLaunchRequest {
     pub content_identity: CapturedFileIdentity,
     pub executable_identity: CapturedFileIdentity,
     pub config_identity: Option<CapturedFileIdentity>,
+    /// Native, AppImage or Flatpak, as shown at readiness time.
+    pub expected_installation: crate::launch::installation::LaunchInstallation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +211,9 @@ pub fn preflight_melonds_launch(
             e.detail,
         )
     })?;
-    if binding.executable != request.expected_executable {
+    if binding.executable != request.expected_executable
+        || binding.installation != request.expected_installation
+    {
         return Err(error(
             MelonDsLaunchPreflightErrorKind::BindingDrift,
             "melonDS executable binding changed since authorization",
@@ -235,9 +239,23 @@ pub fn preflight_melonds_launch(
             "selected content changed immediately before spawn",
         ));
     }
+    let mut visibility = crate::launch::installation::VisibilityPlan::new();
+    visibility.content(&request.selected_content_path);
+    let arguments = binding
+        .installation
+        .wrap_arguments(
+            &visibility,
+            vec![request.selected_content_path.clone().into_os_string()],
+        )
+        .map_err(|e| {
+            error(
+                MelonDsLaunchPreflightErrorKind::BindingUnavailable,
+                e.to_string(),
+            )
+        })?;
     Ok(PreparedProcessCommand {
         executable: binding.executable,
-        arguments: vec![request.selected_content_path.clone().into_os_string()],
+        arguments,
         working_directory: None,
     })
 }
@@ -301,6 +319,7 @@ mod tests {
             content_identity,
             executable_identity,
             config_identity: Some(config_identity),
+            expected_installation: crate::launch::installation::LaunchInstallation::Native,
         };
         let identity = CanonicalIdentityStatus::Resolved(ResolvedIdentity {
             platform_id: "Nintendo DS".into(),

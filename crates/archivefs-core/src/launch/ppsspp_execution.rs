@@ -22,7 +22,7 @@
 //! # What this module is not
 //!
 //! - It never builds a GUI Launch button and is not wired to one yet.
-//! - It never launches Flatpak/Portable/Explicit PPSSPP, RetroArch, PCSX2,
+//! - It never launches Explicit-profile PPSSPP, RetroArch, PCSX2,
 //!   xemu, or Dolphin.
 //! - It never touches cheats, mods, RomM, DAT, Library View History, ES-DE
 //!   writes, or the shared transaction system.
@@ -96,6 +96,8 @@ pub struct PpssppLaunchRequest {
     /// the binding must belong to.
     pub profile_id: String,
     pub expected_executable: PathBuf,
+    /// Native, AppImage or Flatpak, as shown at readiness time.
+    pub expected_installation: crate::launch::installation::LaunchInstallation,
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +303,9 @@ pub fn preflight_ppsspp_launch(
             format!("{:?}: {}", error.kind, error.detail),
         )
     })?;
-    if binding.executable != request.expected_executable {
+    if binding.executable != request.expected_executable
+        || binding.installation != request.expected_installation
+    {
         return Err(preflight_error(
             PpssppLaunchPreflightErrorKind::BindingDrift,
             "the freshly resolved launch binding no longer matches the user-authorized executable",

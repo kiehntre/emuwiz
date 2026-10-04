@@ -10710,6 +10710,7 @@ mod tests {
         let binding = Ok(Pcsx2NativeLaunchBinding {
             executable: PathBuf::from("/usr/bin/pcsx2-qt"),
             user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+            installation: crate::launch::installation::LaunchInstallation::Native,
         });
 
         let plan = build_pcsx2_command_plan(&identity, None, &candidate, &binding);

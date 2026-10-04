@@ -288,11 +288,24 @@ pub fn build_duckstation_command_plan(
         content_path.expect("a resolved content path is required when no blockers exist");
     let binding = binding.expect("a launch binding is required when no blockers exist");
 
-    let arguments = vec![
-        OsString::from("-batch"),
-        OsString::from("--"),
-        content_path.clone().into_os_string(),
-    ];
+    let mut visibility = crate::launch::installation::VisibilityPlan::new();
+    visibility.content(&content_path);
+    let arguments = match binding.installation.wrap_arguments(
+        &visibility,
+        vec![
+            OsString::from("-batch"),
+            OsString::from("--"),
+            content_path.clone().into_os_string(),
+        ],
+    ) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return DuckStationCommandPlan::blocked(vec![blocker(
+                LaunchBlockerKind::DuckStationBindingUnavailable,
+                error.to_string(),
+            )]);
+        }
+    };
 
     DuckStationCommandPlan {
         command: Some(DuckStationCommand {

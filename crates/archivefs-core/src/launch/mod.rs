@@ -133,6 +133,11 @@ pub mod cheat_runtime;
 pub mod cheat_runtime_mame;
 pub mod cheat_runtime_melonds;
 pub mod cheat_runtime_retroarch;
+pub mod installation;
+#[cfg(test)]
+mod installation_kinds_tests;
+pub mod installation_known;
+pub mod installation_support;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;

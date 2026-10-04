@@ -426,6 +426,12 @@ fn lifecycle_installation_card(
         if let Some(readiness) = installation.launch_readiness {
             ui.label(format!("Launch: {}", launch_readiness_label(readiness)));
         }
+        if !matches!(
+            installation.launch_support,
+            archivefs_core::launch::installation_support::LaunchSupport::NotAssessed
+        ) {
+            ui.label(installation.launch_support.label());
+        }
         if installation.update_authority != UpdateAuthority::Unknown
             && let Some(status) = installation.update_status
         {

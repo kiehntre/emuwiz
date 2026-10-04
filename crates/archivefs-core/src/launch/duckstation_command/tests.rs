@@ -42,6 +42,7 @@ fn default_native_binding(
     Ok(DuckStationNativeLaunchBinding {
         executable: PathBuf::from(executable),
         user_directory_mode: DuckStationUserDirectoryMode::DefaultNative,
+        installation: crate::launch::installation::LaunchInstallation::Native,
     })
 }
 
@@ -357,4 +358,62 @@ fn non_duckstation_candidate_is_rejected() {
         &plan,
         LaunchBlockerKind::DuckStationCandidateRequired
     ));
+}
+
+#[test]
+fn a_portable_appimage_binding_keeps_the_native_argv_shape() {
+    let plan = build_duckstation_command_plan(
+        &resolved(),
+        Some("SLUS-12345"),
+        &candidate(Some(PathBuf::from("/games/a b.iso"))),
+        &Ok(DuckStationNativeLaunchBinding {
+            executable: PathBuf::from("/home/u/Applications/DuckStation/DuckStation.AppImage"),
+            user_directory_mode: DuckStationUserDirectoryMode::PortableBesideExecutable,
+            installation: crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false,
+            },
+        }),
+    );
+    let command = plan.command.unwrap();
+    assert_eq!(
+        command.arguments,
+        vec![
+            OsString::from("-batch"),
+            OsString::from("--"),
+            OsString::from("/games/a b.iso")
+        ]
+    );
+    assert_eq!(
+        command.selection.user_directory_mode,
+        DuckStationUserDirectoryMode::PortableBesideExecutable
+    );
+}
+
+#[test]
+fn a_flatpak_binding_puts_run_options_and_the_app_id_before_the_emulator_arguments() {
+    let plan = build_duckstation_command_plan(
+        &resolved(),
+        Some("SLUS-12345"),
+        &candidate(Some(PathBuf::from("/mnt/usbdrive/games/PSX/a b.iso"))),
+        &Ok(DuckStationNativeLaunchBinding {
+            executable: PathBuf::from("/usr/bin/flatpak"),
+            user_directory_mode: DuckStationUserDirectoryMode::FlatpakSandbox,
+            installation: crate::launch::installation::LaunchInstallation::flatpak(
+                "org.duckstation.DuckStation",
+            )
+            .unwrap(),
+        }),
+    );
+    let command = plan.command.unwrap();
+    assert_eq!(
+        command.arguments,
+        vec![
+            OsString::from("run"),
+            OsString::from("--filesystem=/mnt/usbdrive/games/PSX:ro"),
+            OsString::from("org.duckstation.DuckStation"),
+            OsString::from("-batch"),
+            OsString::from("--"),
+            OsString::from("/mnt/usbdrive/games/PSX/a b.iso"),
+        ]
+    );
 }

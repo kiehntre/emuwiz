@@ -214,6 +214,7 @@ fn build_ready_fixture(label: &str) -> ReadyFixture {
         profile_id,
         expected_executable: executable,
         expected_user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
     ReadyFixture {
         fixture,
@@ -441,6 +442,7 @@ fn unsupported_install_type_is_rejected() {
         profile_id,
         expected_executable: executable,
         expected_user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+        expected_installation: crate::launch::installation::LaunchInstallation::Native,
     };
     let error = preflight_pcsx2_launch(&request, &roots, &[]).unwrap_err();
     assert_eq!(

@@ -23,6 +23,10 @@ use crate::emulator_environment::EncodedPath;
 use super::destination_safety::{
     DestinationRootState, DestinationSafetyFailureReason, validate_destination_root,
 };
+use crate::launch::installation::LaunchInstallation;
+use crate::launch::installation_known::{
+    KnownInstallRoots, discover_flatpaks, flatpak_binary, flatpak_wrapper_app_id,
+};
 
 pub const PPSSPP_MAX_PROFILES: usize = 16;
 pub const PPSSPP_MAX_CONFIG_BYTES: u64 = 256 * 1024;
@@ -103,6 +107,9 @@ pub struct PpssppInspectionWarning {
 pub struct PpssppExecutable {
     pub path: PathBuf,
     pub installation_type: PpssppInstallationType,
+    /// How this installation is started: a plain executable, an AppImage,
+    /// or `flatpak run` (then `path` is the `flatpak` program).
+    pub launch: LaunchInstallation,
     /// Deliberately optional: discovery never executes a user binary.  A
     /// caller that has already obtained read-only version text can use
     /// [`parse_ppsspp_version`] without changing this safety boundary.
@@ -317,6 +324,9 @@ pub struct PpssppGameInspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PpssppNativeLaunchBinding {
     pub executable: PathBuf,
+    /// Native, AppImage or Flatpak. For Flatpak, `executable` is the
+    /// `flatpak` program.
+    pub installation: LaunchInstallation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -366,11 +376,12 @@ fn launch_blocker(kind: PpssppLaunchBlockerKind, detail: impl Into<String>) -> P
 /// [`PpssppInstallationType::Explicit`] *profile* (a caller-supplied
 /// configuration root) still requires an equally explicit executable.
 ///
-/// [`PpssppInstallationType::Portable`] stays refused on purpose: a
-/// `*.AppImage` merely *found* beside `$APPIMAGE` or by name is never a
-/// caller-confirmed path, so it must never become a trusted binding.
-/// [`PpssppInstallationType::FlatpakUser`] is refused because this slice
-/// invents no sandbox invocation.
+/// [`PpssppInstallationType::Portable`] binds only a `Portable` candidate (an
+/// AppImage in a known location), never a caller-confirmed `Explicit` path,
+/// so a confirmed executable cannot leak into a different profile form.
+/// [`PpssppInstallationType::FlatpakUser`] binds the real Flatpak
+/// installation (`flatpak run org.ppsspp.PPSSPP`), whose launch options are
+/// built by [`crate::launch::installation`].
 pub fn resolve_ppsspp_native_launch_binding(
     profile: &PpssppProfile,
 ) -> Result<PpssppNativeLaunchBinding, PpssppLaunchBlocker> {
@@ -386,15 +397,8 @@ pub fn resolve_ppsspp_native_launch_binding(
             PpssppInstallationType::Explicit,
         ],
         PpssppInstallationType::Explicit => &[PpssppInstallationType::Explicit],
-        other @ (PpssppInstallationType::FlatpakUser | PpssppInstallationType::Portable) => {
-            return Err(launch_blocker(
-                PpssppLaunchBlockerKind::UnsupportedInstallationType,
-                format!(
-                    "only native or caller-confirmed explicit PPSSPP installations are \
-                     supported, got {other:?}"
-                ),
-            ));
-        }
+        PpssppInstallationType::FlatpakUser => &[PpssppInstallationType::FlatpakUser],
+        PpssppInstallationType::Portable => &[PpssppInstallationType::Portable],
     };
     let matching: Vec<&PpssppExecutable> = profile
         .executable_candidates
@@ -411,15 +415,20 @@ pub fn resolve_ppsspp_native_launch_binding(
     let mut last_error = None;
     for candidate in matching {
         match validate_native_ppsspp_executable(&candidate.path) {
-            Ok(()) => valid.push(candidate.path.clone()),
+            Ok(()) => valid.push((candidate.path.clone(), candidate.launch.clone())),
             Err(error) => last_error = Some(error),
         }
     }
     match valid.len() {
         0 => Err(last_error.expect("at least one candidate was inspected")),
-        1 => Ok(PpssppNativeLaunchBinding {
-            executable: valid.into_iter().next().expect("length checked above"),
-        }),
+        1 => {
+            let (executable, installation) =
+                valid.into_iter().next().expect("length checked above");
+            Ok(PpssppNativeLaunchBinding {
+                executable,
+                installation,
+            })
+        }
         count => Err(launch_blocker(
             PpssppLaunchBlockerKind::AmbiguousExecutable,
             format!(
@@ -759,31 +768,67 @@ fn discover_executables(roots: &PpssppProfileDiscoveryRoots) -> Vec<PpssppExecut
     }
     paths.sort();
     paths.dedup();
-    paths
+    let mut executables: Vec<PpssppExecutable> = paths
         .into_iter()
         .filter(|path| is_regular_file(path))
-        .map(|path| PpssppExecutable {
-            installation_type: if roots.explicit_executables.contains(&path) {
-                PpssppInstallationType::Explicit
-            } else if roots
-                .appimage_directory
-                .as_ref()
-                .is_some_and(|directory| path.starts_with(directory))
-                || path
-                    .extension()
-                    .is_some_and(|extension| extension == "AppImage")
-            {
-                PpssppInstallationType::Portable
-            } else {
-                PpssppInstallationType::Native
-            },
-            version: roots
-                .known_version_outputs
-                .get(&path)
-                .and_then(|output| parse_ppsspp_version(output)),
-            path,
+        // A script that only runs `flatpak run <known app>` is not a native
+        // emulator; the real Flatpak installation is reported below.
+        .filter(|path| flatpak_wrapper_app_id(path).is_none())
+        .map(|path| {
+            let is_appimage = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("AppImage"));
+            PpssppExecutable {
+                installation_type: if roots.explicit_executables.contains(&path) {
+                    PpssppInstallationType::Explicit
+                } else if roots
+                    .appimage_directory
+                    .as_ref()
+                    .is_some_and(|directory| path.starts_with(directory))
+                    || is_appimage
+                {
+                    PpssppInstallationType::Portable
+                } else {
+                    PpssppInstallationType::Native
+                },
+                launch: if is_appimage {
+                    LaunchInstallation::AppImage {
+                        extract_and_run: false,
+                    }
+                } else {
+                    LaunchInstallation::Native
+                },
+                version: roots
+                    .known_version_outputs
+                    .get(&path)
+                    .and_then(|output| parse_ppsspp_version(output)),
+                path,
+            }
         })
-        .collect()
+        .collect();
+    let known = KnownInstallRoots {
+        home: roots.home.clone(),
+        user_data: roots.xdg_data_home.clone(),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: roots.path_override.clone().unwrap_or_else(|| {
+            env::var_os("PATH")
+                .map(|path| env::split_paths(&path).take(128).collect())
+                .unwrap_or_default()
+        }),
+    };
+    if let (Some(found), Some(program)) = (
+        discover_flatpaks(&crate::launch::installation_known::PPSSPP, &known).first(),
+        flatpak_binary(&known),
+    ) && let Ok(launch) = LaunchInstallation::flatpak(&found.app_id)
+    {
+        executables.push(PpssppExecutable {
+            path: program,
+            installation_type: PpssppInstallationType::FlatpakUser,
+            launch,
+            version: None,
+        });
+    }
+    executables
 }
 
 fn select_game_id(request: &PpssppGameRequest) -> (Option<String>, PpssppGameIdMapping) {
@@ -1468,6 +1513,9 @@ mod tests {
             vec![PpssppExecutable {
                 path: executable,
                 installation_type: PpssppInstallationType::Explicit,
+                launch: LaunchInstallation::AppImage {
+                    extract_and_run: false
+                },
                 version: Some("1.18.0".to_string()),
             }]
         );
@@ -1706,6 +1754,7 @@ mod tests {
         profile.executable_candidates = vec![PpssppExecutable {
             path: executable.clone(),
             installation_type: PpssppInstallationType::Native,
+            launch: LaunchInstallation::Native,
             version: None,
         }];
         let binding = resolve_ppsspp_native_launch_binding(&profile).unwrap();
@@ -1713,7 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn native_launch_binding_refuses_ambiguous_or_non_native_profiles() {
+    fn a_flatpak_profile_with_no_flatpak_candidate_has_no_binding() {
         let temp = TempDir::new().unwrap();
         let roots = roots(&temp);
         let root = profile_root(&roots);
@@ -1721,10 +1770,7 @@ mod tests {
         let mut profile = eligible(root);
         profile.installation_type = PpssppInstallationType::FlatpakUser;
         let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
-        assert_eq!(
-            blocker.kind,
-            PpssppLaunchBlockerKind::UnsupportedInstallationType
-        );
+        assert_eq!(blocker.kind, PpssppLaunchBlockerKind::ExecutableMissing);
     }
 
     // --- caller-confirmed explicit (local AppImage) launch binding ---------
@@ -1864,6 +1910,7 @@ mod tests {
         forced.executable_candidates = vec![PpssppExecutable {
             path: link,
             installation_type: PpssppInstallationType::Explicit,
+            launch: LaunchInstallation::Native,
             version: None,
         }];
         assert_eq!(
@@ -1875,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn a_guessed_portable_appimage_is_still_refused() {
+    fn a_portable_root_with_no_appimage_in_it_has_no_binding() {
         // A `*.AppImage` fed only through `portable_configuration_roots`
         // (never `explicit_executables`) is a guess, not a confirmed path.
         let temp = TempDir::new().unwrap();
@@ -1890,10 +1937,7 @@ mod tests {
             .find(|profile| profile.installation_type == PpssppInstallationType::Portable)
             .expect("portable profile must be discovered");
         let blocker = resolve_ppsspp_native_launch_binding(&profile).unwrap_err();
-        assert_eq!(
-            blocker.kind,
-            PpssppLaunchBlockerKind::UnsupportedInstallationType
-        );
+        assert_eq!(blocker.kind, PpssppLaunchBlockerKind::ExecutableMissing);
     }
 
     #[test]
@@ -1939,7 +1983,7 @@ mod tests {
                 resolve_ppsspp_native_launch_binding(&untrusted)
                     .unwrap_err()
                     .kind,
-                PpssppLaunchBlockerKind::UnsupportedInstallationType,
+                PpssppLaunchBlockerKind::ExecutableMissing,
             );
         }
     }

@@ -25,6 +25,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::emulator_environment::EncodedPath;
+use crate::launch::installation::LaunchInstallation;
+use crate::launch::installation_known::{
+    FlatpakScope, KnownInstallRoots, PCSX2 as KNOWN_PCSX2, discover_appimages, discover_flatpaks,
+    flatpak_binary, flatpak_wrapper_app_id, portable_marker_beside,
+};
 
 use super::destination_safety::{
     DestinationRootState, DestinationSafetyFailureReason, validate_destination_root,
@@ -132,6 +137,8 @@ pub struct Pcsx2DirectoryIdentity {
 pub struct Pcsx2Executable {
     pub path: PathBuf,
     pub installation_type: Pcsx2InstallationType,
+    /// Native, AppImage or `flatpak run` (then `path` is the `flatpak` program).
+    pub launch: LaunchInstallation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +221,17 @@ impl Pcsx2ProfileDiscoveryRoots {
             documents_home,
             flatpak_system_root: PathBuf::from("/var/lib/flatpak"),
             appimage_directory,
-            portable_configuration_roots: Vec::new(),
+            // The data root of a known portable AppImage is its own
+            // directory; only AppImages with a marker beside them qualify.
+            portable_configuration_roots: KnownInstallRoots::from_environment()
+                .map(|known| {
+                    discover_appimages(&KNOWN_PCSX2, &known)
+                        .into_iter()
+                        .filter(|found| found.portable_marker.is_some())
+                        .filter_map(|found| found.path.parent().map(Path::to_path_buf))
+                        .collect()
+                })
+                .unwrap_or_default(),
             explicit_executables: Vec::new(),
             path_override: None,
         })
@@ -677,21 +694,73 @@ fn discover_pcsx2_local_executables(roots: &Pcsx2ProfileDiscoveryRoots) -> Vec<P
         .path_override
         .clone()
         .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).collect()));
-    if let Some(path_directories) = path_directories {
-        for directory in path_directories.into_iter().take(128) {
+    if let Some(path_directories) = &path_directories {
+        for directory in path_directories.iter().take(128) {
             paths.push(directory.join("pcsx2-qt"));
         }
     }
+    let known = KnownInstallRoots {
+        home: roots.home.clone(),
+        user_data: roots.xdg_data_home.clone(),
+        system_data: roots
+            .flatpak_system_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("/var/lib")),
+        path_dirs: path_directories
+            .map(|directories| directories.into_iter().take(128).collect())
+            .unwrap_or_default(),
+    };
+    let appimages = discover_appimages(&KNOWN_PCSX2, &known);
+    paths.extend(appimages.iter().map(|found| found.path.clone()));
     paths.sort();
     paths.dedup();
-    paths
+    let mut executables: Vec<Pcsx2Executable> = paths
         .into_iter()
         .filter(|path| is_regular_file_no_follow(path))
-        .map(|path| Pcsx2Executable {
-            path,
-            installation_type: Pcsx2InstallationType::Native,
+        .filter(|path| flatpak_wrapper_app_id(path).is_none())
+        .map(|path| {
+            let is_appimage = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("AppImage"));
+            // An AppImage with a portable marker beside it keeps its data
+            // there; without one it uses the default data root like a
+            // native install.
+            let portable = is_appimage && portable_marker_beside(&KNOWN_PCSX2, &path).is_some();
+            Pcsx2Executable {
+                installation_type: if portable {
+                    Pcsx2InstallationType::Portable
+                } else {
+                    Pcsx2InstallationType::Native
+                },
+                launch: if is_appimage {
+                    LaunchInstallation::AppImage {
+                        extract_and_run: false,
+                    }
+                } else {
+                    LaunchInstallation::Native
+                },
+                path,
+            }
         })
-        .collect()
+        .collect();
+    if let (Some(found), Some(program)) = (
+        discover_flatpaks(&KNOWN_PCSX2, &known)
+            .into_iter()
+            .min_by_key(|found| found.scope == FlatpakScope::System),
+        flatpak_binary(&known),
+    ) && let Ok(launch) = LaunchInstallation::flatpak(&found.app_id)
+    {
+        executables.push(Pcsx2Executable {
+            path: program,
+            installation_type: match found.scope {
+                FlatpakScope::User => Pcsx2InstallationType::FlatpakUser,
+                FlatpakScope::System => Pcsx2InstallationType::FlatpakSystem,
+            },
+            launch,
+        });
+    }
+    executables
 }
 
 // --- Native launch binding ---------------------------------------------
@@ -734,6 +803,12 @@ pub enum Pcsx2UserDirectoryMode {
     /// No `-datapath`/`-portable` argument; PCSX2 resolves its own default
     /// `$XDG_CONFIG_HOME/PCSX2` directory.
     DefaultNative,
+    /// A `portable.ini`/`portable.txt` beside the executable makes its own
+    /// directory the data root (and outranks `-datapath`). Recorded only;
+    /// the marker is never created, moved or deleted.
+    PortableBesideExecutable,
+    /// The Flatpak sandbox's own profile.
+    FlatpakSandbox,
     /// `-datapath <path>` - PCSX2 uses this directory for all application
     /// data. Never produced by [`resolve_pcsx2_native_launch_binding`] in
     /// this build: the only way to prove a genuine, caller-confirmed
@@ -755,6 +830,9 @@ pub enum Pcsx2UserDirectoryMode {
 pub struct Pcsx2NativeLaunchBinding {
     pub executable: PathBuf,
     pub user_directory_mode: Pcsx2UserDirectoryMode,
+    /// Native, AppImage or Flatpak. For Flatpak, `executable` is the
+    /// `flatpak` program.
+    pub installation: LaunchInstallation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -822,10 +900,11 @@ pub fn resolve_pcsx2_native_launch_binding(
     }
     match profile.installation_type {
         Pcsx2InstallationType::Native => resolve_default_native_binding(profile, roots),
-        Pcsx2InstallationType::NativeAlternate
-        | Pcsx2InstallationType::Portable
-        | Pcsx2InstallationType::FlatpakUser
-        | Pcsx2InstallationType::FlatpakSystem => Err(launch_blocker(
+        Pcsx2InstallationType::Portable => resolve_portable_binding(profile),
+        Pcsx2InstallationType::FlatpakUser | Pcsx2InstallationType::FlatpakSystem => {
+            resolve_flatpak_binding(profile)
+        }
+        Pcsx2InstallationType::NativeAlternate => Err(launch_blocker(
             Pcsx2LaunchBlockerKind::UnsupportedInstallationType,
             format!(
                 "only {:?} PCSX2 installations are supported by this native launch binding, got \
@@ -864,13 +943,81 @@ fn resolve_default_native_binding(
             "PCSX2 configuration evidence (PCSX2.ini or inis/) is no longer present",
         ));
     }
-    let executable = resolve_native_pcsx2_executable(profile)?;
+    let (executable, installation) = resolve_native_pcsx2_executable(profile)?;
     if let Some(blocker) = portable_marker_conflict(&executable) {
         return Err(blocker);
     }
     Ok(Pcsx2NativeLaunchBinding {
         executable,
         user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+        installation,
+    })
+}
+
+/// A portable AppImage: the profile root must be the AppImage's own
+/// directory with a portable marker beside it. EmuWiz only launches it.
+fn resolve_portable_binding(
+    profile: &Pcsx2Profile,
+) -> Result<Pcsx2NativeLaunchBinding, Pcsx2LaunchBlocker> {
+    let matching: Vec<&Pcsx2Executable> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| {
+            candidate.installation_type == Pcsx2InstallationType::Portable
+                && candidate.path.parent() == Some(profile.configuration_path.as_path())
+                && portable_marker_beside(&KNOWN_PCSX2, &candidate.path).is_some()
+        })
+        .collect();
+    let mut valid = Vec::new();
+    let mut last_error = None;
+    for candidate in matching {
+        match validate_native_pcsx2_executable(&candidate.path) {
+            Ok(()) => valid.push((candidate.path.clone(), candidate.launch.clone())),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match valid.len() {
+        0 => Err(last_error.unwrap_or_else(|| {
+            launch_blocker(
+                Pcsx2LaunchBlockerKind::ExecutableMissing,
+                "no portable PCSX2 executable with a portable marker sits in this profile root",
+            )
+        })),
+        1 => {
+            let (executable, installation) = valid.remove(0);
+            Ok(Pcsx2NativeLaunchBinding {
+                executable,
+                user_directory_mode: Pcsx2UserDirectoryMode::PortableBesideExecutable,
+                installation,
+            })
+        }
+        count => Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::AmbiguousExecutable,
+            format!("{count} portable executables match this profile root"),
+        )),
+    }
+}
+
+/// The Flatpak installation: `flatpak run net.pcsx2.PCSX2`, with the
+/// sandbox's own profile.
+fn resolve_flatpak_binding(
+    profile: &Pcsx2Profile,
+) -> Result<Pcsx2NativeLaunchBinding, Pcsx2LaunchBlocker> {
+    let candidate = profile
+        .executable_candidates
+        .iter()
+        .find(|candidate| candidate.installation_type == profile.installation_type);
+    let Some(candidate) = candidate else {
+        return Err(launch_blocker(
+            Pcsx2LaunchBlockerKind::ExecutableMissing,
+            "the PCSX2 Flatpak (or the flatpak program) was not found",
+        ));
+    };
+    validate_native_pcsx2_executable(&candidate.path)?;
+    Ok(Pcsx2NativeLaunchBinding {
+        executable: candidate.path.clone(),
+        user_directory_mode: Pcsx2UserDirectoryMode::FlatpakSandbox,
+        installation: candidate.launch.clone(),
     })
 }
 
@@ -895,7 +1042,9 @@ fn portable_marker_conflict(executable: &Path) -> Option<Pcsx2LaunchBlocker> {
 /// across every discovered profile and is not otherwise scoped per-profile.
 /// Never falls back to a hard-coded name: a profile with no matching,
 /// verified-safe candidate is always blocked.
-fn resolve_native_pcsx2_executable(profile: &Pcsx2Profile) -> Result<PathBuf, Pcsx2LaunchBlocker> {
+fn resolve_native_pcsx2_executable(
+    profile: &Pcsx2Profile,
+) -> Result<(PathBuf, LaunchInstallation), Pcsx2LaunchBlocker> {
     let matching: Vec<&Pcsx2Executable> = profile
         .executable_candidates
         .iter()
@@ -911,7 +1060,7 @@ fn resolve_native_pcsx2_executable(profile: &Pcsx2Profile) -> Result<PathBuf, Pc
     let mut last_error = None;
     for candidate in matching {
         match validate_native_pcsx2_executable(&candidate.path) {
-            Ok(()) => valid.push(candidate.path.clone()),
+            Ok(()) => valid.push((candidate.path.clone(), candidate.launch.clone())),
             Err(error) => last_error = Some(error),
         }
     }
@@ -3576,6 +3725,7 @@ mod tests {
         Pcsx2Executable {
             path,
             installation_type,
+            launch: LaunchInstallation::Native,
         }
     }
 
@@ -3717,10 +3867,16 @@ mod tests {
             );
             profile.installation_type = kind;
             let blocker = resolve_pcsx2_native_launch_binding(&profile, &roots).unwrap_err();
+            // A Native-typed executable never binds to a Portable/Flatpak
+            // profile; NativeAlternate stays unsupported outright.
+            let expected = if kind == Pcsx2InstallationType::NativeAlternate {
+                Pcsx2LaunchBlockerKind::UnsupportedInstallationType
+            } else {
+                Pcsx2LaunchBlockerKind::ExecutableMissing
+            };
             assert_eq!(
-                blocker.kind,
-                Pcsx2LaunchBlockerKind::UnsupportedInstallationType,
-                "installation type {kind:?} must be blocked"
+                blocker.kind, expected,
+                "installation type {kind:?} must not bind"
             );
         }
         fs::remove_dir_all(root).unwrap();
@@ -3796,6 +3952,7 @@ mod tests {
         let binding = Pcsx2NativeLaunchBinding {
             executable: PathBuf::from("/usr/bin/pcsx2-qt"),
             user_directory_mode: Pcsx2UserDirectoryMode::ExplicitDataPath(root.clone()),
+            installation: crate::launch::installation::LaunchInstallation::Native,
         };
         assert_eq!(
             binding.user_directory_mode,

@@ -4,10 +4,12 @@
 //!
 //! # Scope (first slice)
 //!
-//! - Native DuckStation profiles only - `FlatpakUser`, `Portable`, and
-//!   `Explicit` (and any profile
+//! - Native, AppImage (portable or not) and Flatpak DuckStation installs,
+//!   as resolved by
 //!   [`crate::patch_manager::resolve_duckstation_native_launch_binding`]
-//!   itself refuses) are never attempted.
+//!   (see [`crate::launch::installation`] for how each is started).
+//!   `Explicit` profiles, and any profile the binding itself refuses, are
+//!   never attempted.
 //! - `PSX` only - the only platform
 //!   [`crate::launch::duckstation_command::DUCKSTATION_SUPPORTED_PLATFORM_ID`]
 //!   names in this phase.
@@ -42,7 +44,7 @@
 //! # What this module is not
 //!
 //! - It never builds a GUI Launch button and is not wired to one yet.
-//! - It never launches Flatpak/Portable/AppImage/`Explicit` DuckStation,
+//! - It never launches `Explicit` DuckStation,
 //!   RetroArch, Dolphin, or PCSX2.
 //! - It never touches cheats, mods, RomM, DAT, Library View History, ES-DE
 //!   writes, or the shared transaction system.
@@ -127,6 +129,8 @@ pub struct DuckStationLaunchRequest {
     pub profile_id: String,
     pub expected_executable: PathBuf,
     pub expected_user_directory_mode: DuckStationUserDirectoryMode,
+    /// Native, AppImage or Flatpak, as shown at readiness time.
+    pub expected_installation: crate::launch::installation::LaunchInstallation,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +378,7 @@ pub fn preflight_duckstation_launch(
     })?;
     if binding.executable != request.expected_executable
         || binding.user_directory_mode != request.expected_user_directory_mode
+        || binding.installation != request.expected_installation
     {
         return Err(preflight_error(
             DuckStationLaunchPreflightErrorKind::BindingDrift,

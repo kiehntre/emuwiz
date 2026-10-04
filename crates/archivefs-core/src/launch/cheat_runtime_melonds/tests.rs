@@ -81,6 +81,7 @@ impl Fx {
             content_identity: capture(&rom),
             executable_identity: capture(&exe),
             config_identity: Some(capture(&config)),
+            expected_installation: crate::launch::installation::LaunchInstallation::Native,
         };
         Self {
             dir,

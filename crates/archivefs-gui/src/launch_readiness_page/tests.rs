@@ -2310,6 +2310,7 @@ fn clicking_pcsx2_uses_a_facts_only_request_never_argv_or_shell() {
         profile_id: _,
         expected_executable: _,
         expected_user_directory_mode: _,
+        expected_installation: _,
     } = request;
 }
 
@@ -2406,6 +2407,7 @@ fn pcsx2_preflight_failure_and_stale_selection_are_isolated_honestly() {
         profile_id: ready.profile_id.clone(),
         expected_executable: ready.executable.clone(),
         expected_user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+        expected_installation: archivefs_core::launch::installation::LaunchInstallation::Native,
     };
     let key = Pcsx2LaunchKey::from_request(&request);
     let error =

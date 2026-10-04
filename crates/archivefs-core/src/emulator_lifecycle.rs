@@ -21,6 +21,7 @@ use crate::emulator_inventory::{
     VersionConfidence, VersionSource,
 };
 use crate::emulator_update::{UpdateReport, UpdateStatus};
+use crate::launch::installation_support::{KnownAppImage, LaunchAssessment, LaunchSupport};
 use crate::launch::readiness::LaunchReadiness;
 use crate::managed_emulator_install::{
     ManagedInstallHealth, ManagedInstallInventory, ManagedInstallInventoryEntry,
@@ -45,6 +46,7 @@ pub const SUPPORTED_EMULATOR_IDS: &[&str] = &[
     "xemu",
     "Cemu",
     "Vita3K",
+    "melonDS",
     "MAME",
     "FBNeo",
     "Hatari",
@@ -177,6 +179,9 @@ pub struct EmulatorLifecycleInstallation {
     pub local_health: LocalHealth,
     /// This is an existing adapter result, never recomputed here.
     pub launch_readiness: Option<LaunchReadiness>,
+    /// Whether the launch layer's own profile/binding resolution can start
+    /// this exact installation. Detected-but-unlaunchable is its own state.
+    pub launch_support: LaunchSupport,
     pub package: Option<PackageEvidence>,
     pub update_authority: UpdateAuthority,
     pub update_status: Option<UpdateStatus>,
@@ -212,6 +217,10 @@ pub struct LifecycleContext {
     /// Exact package ownership evidence keyed by an already discovered path.
     pub package_evidence: BTreeMap<PathBuf, PackageEvidence>,
     pub offline: bool,
+    /// Results of the launch layer's real profile/binding resolution, plus
+    /// the AppImages found in known locations. Empty in tests that do not
+    /// need it (every installation is then `NotAssessed`).
+    pub launch_assessment: LaunchAssessment,
 }
 
 impl LifecycleContext {
@@ -383,6 +392,10 @@ fn installation_record(
             .launch_readiness
             .get(&canonical_id(installation.emulator))
             .copied(),
+        launch_support: context.launch_assessment.support_for(
+            &canonical_id(installation.emulator),
+            &binding_for(installation),
+        ),
         package,
         update_authority: installation_authority,
         update_status: update_for(&installation.executable_path, &context.updates),
@@ -409,6 +422,7 @@ fn flatpak_emulator_id(app_id: &str) -> Option<&'static str> {
         "org.flycast.Flycast" => Some("Flycast"),
         "app.xemu.xemu" => Some("xemu"),
         "org.ppsspp.PPSSPP" => Some("PPSSPP"),
+        "net.kuribo64.melonDS" => Some("melonDS"),
         "org.duckstation.DuckStation" => Some("DuckStation"),
         "net.rpcs3.RPCS3" => Some("RPCS3"),
         "info.cemu.Cemu" => Some("Cemu"),
@@ -458,6 +472,12 @@ fn flatpak_record(
             .launch_readiness
             .get(flatpak_emulator_id(&app.app_id)?)
             .copied(),
+        launch_support: context.launch_assessment.support_for(
+            flatpak_emulator_id(&app.app_id)?,
+            &ExactBinding::FlatpakApp {
+                app_id: app.app_id.clone(),
+            },
+        ),
         package: None,
         update_authority: if restricted {
             UpdateAuthority::None
@@ -478,6 +498,57 @@ fn flatpak_record(
             metadata_timestamp_unix: None,
         },
     })
+}
+
+/// An AppImage found in a known location. Its version is not probed (that
+/// would run it), so it is reported with an unknown version rather than a
+/// guessed one.
+fn appimage_record(
+    app: &KnownAppImage,
+    context: &LifecycleContext,
+    selected: bool,
+) -> EmulatorLifecycleInstallation {
+    let binding = ExactBinding::PortableExecutable {
+        path: app.path.clone(),
+    };
+    let installation_type = if app.portable_marker.is_some() {
+        InstallationType::Portable
+    } else {
+        InstallationType::AppImage
+    };
+    EmulatorLifecycleInstallation {
+        emulator_id: app.emulator_id.to_string(),
+        launch_support: context
+            .launch_assessment
+            .support_for(app.emulator_id, &binding),
+        exact_binding: binding,
+        installation_type,
+        ownership_category: OwnershipCategory::PortableUserManaged,
+        version: VersionEvidence {
+            version: None,
+            raw_output: None,
+            source: VersionSource::Unknown,
+            confidence: VersionConfidence::Unknown,
+        },
+        channel: LifecycleChannel::Unknown,
+        local_health: local_health(&app.path, installation_type),
+        launch_readiness: context.launch_readiness.get(app.emulator_id).copied(),
+        package: None,
+        update_authority: UpdateAuthority::UserManaged,
+        update_status: None,
+        selected,
+        provenance: LifecycleProvenance {
+            discovered_by: vec!["known_appimage_location".into()],
+            selected_by: if selected {
+                vec!["profile_or_user_selection".into()]
+            } else {
+                Vec::new()
+            },
+            package_manager: None,
+            flatpak_scope: None,
+            metadata_timestamp_unix: None,
+        },
+    }
 }
 
 fn managed_record(
@@ -506,7 +577,7 @@ fn managed_record(
         emulator_id: entry.emulator_id.clone(),
         exact_binding: ExactBinding::ManagedInstall {
             manifest_path,
-            executable_path: executable,
+            executable_path: executable.clone(),
         },
         installation_type: install_type,
         ownership_category: OwnershipCategory::OfficialManaged,
@@ -519,6 +590,13 @@ fn managed_record(
         channel: channel(entry.channel.unwrap_or(BuildChannel::Unknown)),
         local_health: health,
         launch_readiness: context.launch_readiness.get(&entry.emulator_id).copied(),
+        launch_support: context.launch_assessment.support_for(
+            &entry.emulator_id,
+            &ExactBinding::ManagedInstall {
+                manifest_path: executable.parent()?.join("manifest.json"),
+                executable_path: executable.clone(),
+            },
+        ),
         package: None,
         update_authority: UpdateAuthority::EmuWizManaged,
         update_status: None,
@@ -592,6 +670,31 @@ pub fn inspect_all_emulator_lifecycles(
         if let Some(record) = flatpak_record(app, context, selected) {
             grouped.entry(id.to_string()).or_default().push(record);
         }
+    }
+    for app in &context.launch_assessment.appimages {
+        let binding = ExactBinding::PortableExecutable {
+            path: app.path.clone(),
+        };
+        let already = grouped.get(app.emulator_id).is_some_and(|items| {
+            items.iter().any(|item| {
+                matches!(&item.exact_binding,
+                    ExactBinding::NativeExecutable { path }
+                    | ExactBinding::PortableExecutable { path }
+                    | ExactBinding::UnknownExternal { path } if path == &app.path)
+            })
+        });
+        if already {
+            continue;
+        }
+        let selected = context
+            .selected_bindings
+            .get(app.emulator_id)
+            .map(|chosen| chosen == &binding)
+            .unwrap_or(false);
+        grouped
+            .entry(app.emulator_id.to_string())
+            .or_default()
+            .push(appimage_record(app, context, selected));
     }
     let mut result = Vec::new();
     for (id, mut installations) in grouped {
@@ -837,6 +940,7 @@ pub fn inspect_discovered_emulator_lifecycles_with_selections(
     let flatpak_installations = discover_flatpak().unwrap_or_default();
     inspect_all_emulator_lifecycles(&LifecycleContext {
         inventory,
+        launch_assessment: crate::launch::installation_support::assess_from_environment(),
         flatpak_installations,
         package_evidence,
         raw_version_output,

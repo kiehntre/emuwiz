@@ -152,7 +152,25 @@ pub fn build_melonds_command_plan(
     MelonDsCommandPlan {
         command: Some(MelonDsCommand {
             executable: b.executable.clone(),
-            arguments: vec![content.clone().into_os_string()],
+            arguments: {
+                let mut visibility = crate::launch::installation::VisibilityPlan::new();
+                visibility.content(&content);
+                match b
+                    .installation
+                    .wrap_arguments(&visibility, vec![content.clone().into_os_string()])
+                {
+                    Ok(arguments) => arguments,
+                    Err(error) => {
+                        return MelonDsCommandPlan {
+                            command: None,
+                            blockers: vec![blocker(
+                                LaunchBlockerKind::MelonDsBindingUnavailable,
+                                error.to_string(),
+                            )],
+                        };
+                    }
+                }
+            },
             working_directory: None,
             selection: MelonDsCommandSelection {
                 profile_id: profile_id.clone(),
@@ -205,6 +223,7 @@ mod tests {
     fn binding() -> Result<MelonDsNativeLaunchBinding, MelonDsLaunchBlocker> {
         Ok(MelonDsNativeLaunchBinding {
             executable: "/usr/bin/melonDS".into(),
+            installation: crate::launch::installation::LaunchInstallation::Native,
         })
     }
 
@@ -223,6 +242,46 @@ mod tests {
         );
         assert_eq!(command.selection.platform_id, "Nintendo DS");
         assert!(plan.blockers.is_empty());
+    }
+
+    #[test]
+    fn melonds_appimage_and_flatpak_wrap_the_same_positional_argument() {
+        let appimage = build_melonds_command_plan(
+            &identity(),
+            Some("DS-TEST"),
+            &candidate("/games/DS Game.nds"),
+            &Ok(MelonDsNativeLaunchBinding {
+                executable: "/home/u/Applications/melonDS/melonDS-x86_64.AppImage".into(),
+                installation: crate::launch::installation::LaunchInstallation::AppImage {
+                    extract_and_run: false,
+                },
+            }),
+        );
+        assert_eq!(
+            appimage.command.unwrap().arguments,
+            vec![OsString::from("/games/DS Game.nds")]
+        );
+        let flatpak = build_melonds_command_plan(
+            &identity(),
+            Some("DS-TEST"),
+            &candidate("/mnt/usbdrive/games/DS/DS Game.nds"),
+            &Ok(MelonDsNativeLaunchBinding {
+                executable: "/usr/bin/flatpak".into(),
+                installation: crate::launch::installation::LaunchInstallation::flatpak(
+                    "net.kuribo64.melonDS",
+                )
+                .unwrap(),
+            }),
+        );
+        assert_eq!(
+            flatpak.command.unwrap().arguments,
+            vec![
+                OsString::from("run"),
+                OsString::from("--filesystem=/mnt/usbdrive/games/DS:ro"),
+                OsString::from("net.kuribo64.melonDS"),
+                OsString::from("/mnt/usbdrive/games/DS/DS Game.nds"),
+            ]
+        );
     }
 
     #[test]

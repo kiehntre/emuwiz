@@ -259,6 +259,17 @@ pub fn build_pcsx2_command_plan(
         arguments.push(root.clone().into_os_string());
     }
     arguments.push(content_path.clone().into_os_string());
+    let mut visibility = crate::launch::installation::VisibilityPlan::new();
+    visibility.content(&content_path);
+    let arguments = match binding.installation.wrap_arguments(&visibility, arguments) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return Pcsx2CommandPlan::blocked(vec![blocker(
+                LaunchBlockerKind::Pcsx2BindingUnavailable,
+                error.to_string(),
+            )]);
+        }
+    };
 
     Pcsx2CommandPlan {
         command: Some(Pcsx2Command {

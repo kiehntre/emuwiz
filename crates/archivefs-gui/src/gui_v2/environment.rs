@@ -25,6 +25,7 @@ const LIFECYCLE_DISPLAY_IDS: &[&str] = &[
     "FBNeo",
     "Hatari",
     "FS-UAE",
+    "melonDS",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -9,6 +9,12 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::launch::installation::LaunchInstallation;
+use crate::launch::installation_known::{
+    KnownInstallRoots, MELONDS as KNOWN_MELONDS, discover_appimages, discover_flatpaks,
+    flatpak_binary, flatpak_wrapper_app_id,
+};
+
 pub const MELONDS_MAX_PROFILES: usize = 16;
 pub const MELONDS_MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const FLATPAK_APP_ID: &str = "net.kuribo64.melonDS";
@@ -48,6 +54,8 @@ pub struct MelonDsFirmwareEvidence {
 pub struct MelonDsExecutable {
     pub path: PathBuf,
     pub installation_type: MelonDsInstallationType,
+    /// Native, AppImage or `flatpak run` (then `path` is the `flatpak` program).
+    pub launch: LaunchInstallation,
     pub version: Option<String>,
 }
 
@@ -143,30 +151,71 @@ fn executable_candidates(roots: &MelonDsProfileDiscoveryRoots) -> Vec<MelonDsExe
             paths.push((dir.join(name), MelonDsInstallationType::Portable));
         }
     }
-    if let Some(path_env) = env::var_os("PATH") {
-        for dir in env::split_paths(&path_env) {
-            for name in ["melonDS", "melonds"] {
-                paths.push((dir.join(name), MelonDsInstallationType::Native));
-            }
+    let path_dirs: Vec<PathBuf> = env::var_os("PATH")
+        .map(|path_env| env::split_paths(&path_env).take(128).collect())
+        .unwrap_or_default();
+    for dir in &path_dirs {
+        for name in ["melonDS", "melonds"] {
+            paths.push((dir.join(name), MelonDsInstallationType::Native));
         }
     }
+    let known = KnownInstallRoots {
+        home: roots.home.clone(),
+        user_data: env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| roots.home.join(".local/share")),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs,
+    };
+    // Known AppImage locations. melonDS has no portable marker file, so an
+    // AppImage uses the default configuration directory like a native build.
+    paths.extend(
+        discover_appimages(&KNOWN_MELONDS, &known)
+            .into_iter()
+            .map(|found| (found.path, MelonDsInstallationType::Native)),
+    );
     paths.sort();
     paths.dedup();
-    paths
+    let mut executables: Vec<MelonDsExecutable> = paths
         .into_iter()
         .filter(|(p, _)| regular(p))
+        .filter(|(p, _)| flatpak_wrapper_app_id(p).is_none())
         .map(|(path, installation_type)| {
             let version = roots
                 .known_version_outputs
                 .get(&path)
                 .and_then(|o| parse_melonds_version(o));
+            let is_appimage = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("AppImage"));
             MelonDsExecutable {
+                launch: if is_appimage {
+                    LaunchInstallation::AppImage {
+                        extract_and_run: false,
+                    }
+                } else {
+                    LaunchInstallation::Native
+                },
                 path,
                 installation_type,
                 version,
             }
         })
-        .collect()
+        .collect();
+    if let (Some(found), Some(program)) = (
+        discover_flatpaks(&KNOWN_MELONDS, &known).first(),
+        flatpak_binary(&known),
+    ) && let Ok(launch) = LaunchInstallation::flatpak(&found.app_id)
+    {
+        executables.push(MelonDsExecutable {
+            path: program,
+            installation_type: MelonDsInstallationType::FlatpakUser,
+            launch,
+            version: None,
+        });
+    }
+    executables
 }
 
 fn config_path(root: &Path) -> Option<PathBuf> {
@@ -399,6 +448,9 @@ pub struct MelonDsLaunchBlocker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MelonDsNativeLaunchBinding {
     pub executable: PathBuf,
+    /// Native, AppImage or Flatpak. For Flatpak, `executable` is the
+    /// `flatpak` program.
+    pub installation: LaunchInstallation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -433,6 +485,9 @@ pub fn resolve_melonds_native_launch_binding(
                 && is_executable(&e.path)
         })
         .collect();
+    // A Native config location can be served by one native executable or one
+    // AppImage; both are the same default profile. More than one stays
+    // ambiguous rather than being silently chosen.
     match valid.as_slice() {
         [] => Err(MelonDsLaunchBlocker {
             kind: MelonDsLaunchBlockerKind::ExecutableMissing,
@@ -440,6 +495,7 @@ pub fn resolve_melonds_native_launch_binding(
         }),
         [one] => Ok(MelonDsNativeLaunchBinding {
             executable: one.path.clone(),
+            installation: one.launch.clone(),
         }),
         _ => Err(MelonDsLaunchBlocker {
             kind: MelonDsLaunchBlockerKind::AmbiguousExecutable,

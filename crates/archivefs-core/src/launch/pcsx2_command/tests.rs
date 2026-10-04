@@ -42,6 +42,7 @@ fn default_native_binding(
     Ok(Pcsx2NativeLaunchBinding {
         executable: PathBuf::from(executable),
         user_directory_mode: Pcsx2UserDirectoryMode::DefaultNative,
+        installation: crate::launch::installation::LaunchInstallation::Native,
     })
 }
 
@@ -52,6 +53,7 @@ fn explicit_datapath_binding(
     Ok(Pcsx2NativeLaunchBinding {
         executable: PathBuf::from(executable),
         user_directory_mode: Pcsx2UserDirectoryMode::ExplicitDataPath(PathBuf::from(root)),
+        installation: crate::launch::installation::LaunchInstallation::Native,
     })
 }
 
@@ -340,4 +342,50 @@ fn blocked_candidate_is_not_reauthorized() {
         &plan,
         LaunchBlockerKind::RequiredFirmwareMissing
     ));
+}
+
+#[test]
+fn a_portable_appimage_binding_adds_no_datapath_and_keeps_the_native_argv_shape() {
+    let plan = build_pcsx2_command_plan(
+        &resolved(),
+        Some("SLUS-12345"),
+        &candidate(Some(PathBuf::from("/games/a b.iso"))),
+        &Ok(Pcsx2NativeLaunchBinding {
+            executable: PathBuf::from("/home/u/Applications/PCSX2/PCSX2.AppImage"),
+            user_directory_mode: Pcsx2UserDirectoryMode::PortableBesideExecutable,
+            installation: crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false,
+            },
+        }),
+    );
+    let command = plan.command.unwrap();
+    assert_eq!(command.arguments, vec![OsString::from("/games/a b.iso")]);
+}
+
+#[test]
+fn a_flatpak_binding_puts_run_options_and_the_app_id_before_the_emulator_arguments() {
+    let plan = build_pcsx2_command_plan(
+        &resolved(),
+        Some("SLUS-12345"),
+        &candidate(Some(PathBuf::from("/mnt/usbdrive/games/PS2/a b.iso"))),
+        &Ok(Pcsx2NativeLaunchBinding {
+            executable: PathBuf::from("/usr/bin/flatpak"),
+            user_directory_mode: Pcsx2UserDirectoryMode::FlatpakSandbox,
+            installation: crate::launch::installation::LaunchInstallation::flatpak(
+                "net.pcsx2.PCSX2",
+            )
+            .unwrap(),
+        }),
+    );
+    let command = plan.command.unwrap();
+    assert_eq!(command.executable, PathBuf::from("/usr/bin/flatpak"));
+    assert_eq!(
+        command.arguments,
+        vec![
+            OsString::from("run"),
+            OsString::from("--filesystem=/mnt/usbdrive/games/PS2:ro"),
+            OsString::from("net.pcsx2.PCSX2"),
+            OsString::from("/mnt/usbdrive/games/PS2/a b.iso"),
+        ]
+    );
 }
