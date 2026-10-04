@@ -26,6 +26,7 @@ mod native_workflows;
 mod onboarding;
 mod organisation;
 mod pages;
+mod problem_actions;
 mod problems;
 mod romm_library;
 mod routes;
@@ -281,6 +282,7 @@ pub(super) struct App {
     duplicate_ignored: std::collections::HashSet<String>,
     problem_selected: Option<String>,
     problem_filter: problems::ProblemFilter,
+    problem_nav: problem_actions::ProblemNav,
     problem_query: String,
     repair_preview: Option<DuplicateRepairPreview>,
     repair_confirm: bool,
@@ -367,6 +369,7 @@ impl App {
             duplicate_ignored: std::collections::HashSet::new(),
             problem_selected: None,
             problem_filter: problems::ProblemFilter::default(),
+            problem_nav: Default::default(),
             problem_query: String::new(),
             repair_preview: None,
             repair_confirm: false,

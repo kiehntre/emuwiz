@@ -78,6 +78,7 @@ fn fixture(context: &egui::Context) -> App {
         duplicate_ignored: std::collections::HashSet::new(),
         problem_selected: None,
         problem_filter: super::problems::ProblemFilter::default(),
+        problem_nav: Default::default(),
         problem_query: String::new(),
         repair_preview: None,
         repair_confirm: false,
@@ -4789,8 +4790,8 @@ fn problems_page_hands_proven_mame_findings_to_the_mame_workflow() {
     let output = frame(&context, &mut app, [1280.0, 1600.0]);
     let strings = text(&output);
     assert!(strings.iter().any(|value| value == "Review in MAME"));
-    // The non-MAME problem keeps its own destination.
-    assert!(strings.iter().any(|value| value == "Review Games"));
+    // The non-MAME problem keeps its own action (its folder is not there).
+    assert!(strings.iter().any(|value| value == "Review game folders"));
     // Painting does not mutate problem state, selection or route.
     frame(&context, &mut app, [1280.0, 1600.0]);
     assert_eq!(app.problem_summary.as_deref(), Some(&*summary));
@@ -4802,7 +4803,7 @@ fn problems_page_hands_proven_mame_findings_to_the_mame_workflow() {
         .iter()
         .find(|p| p.id == "missing-1")
         .unwrap();
-    app.go(mame.destination.route());
+    app.run_problem_action(mame.primary.as_ref().unwrap());
     assert_eq!(app.router.current, Route::MameWorkflow);
     assert_eq!(app.router.current.section(), Section::Mame);
 }
@@ -7211,4 +7212,209 @@ fn gui_v2_completed_scan_replaces_the_spinner_with_a_result_and_failures_are_act
         "{strings:?}"
     );
     assert!(!app.activity.jobs[&id].active());
+}
+
+// ---- Problems & Repair: direct actions ------------------------------------
+
+fn problem_app_with_library(context: &egui::Context) -> App {
+    let mut app = fixture(context);
+    app.library = Arc::new(Library::new(vec![
+        archive(1, "Mario", Some("NES")),
+        archive(2, "Mystery", None),
+    ]));
+    app
+}
+
+fn action_of(kind: super::problems::ProblemKind) -> super::problems::ProblemAction {
+    super::problems::tests::sample_problem(kind)
+        .primary
+        .unwrap()
+}
+
+#[test]
+fn problem_actions_carry_their_context_and_start_no_work() {
+    use super::problems::{ProblemAction, ProblemContext, ProblemKind};
+    let context = egui::Context::default();
+    let mut app = problem_app_with_library(&context);
+    assert!(app.library.platforms.contains_key("NES"));
+    let jobs_before = app.activity.jobs.len();
+
+    let mut platform_action = action_of(ProblemKind::DatMatchAvailable);
+    platform_action.context = ProblemContext::CheckPlatform("NES".into());
+    app.run_problem_action(&platform_action);
+    assert_eq!(app.router.current, Route::Section(Section::Check));
+    assert_eq!(app.check_platform.as_deref(), Some("NES"));
+    assert!(app.verification.is_none());
+
+    let mut system_action = action_of(ProblemKind::NoSystem);
+    app.run_problem_action(&system_action);
+    assert_eq!(app.router.current, Route::Section(Section::Games));
+    assert_eq!(app.filter.platform, super::library::UNKNOWN_PLATFORM);
+    system_action.context = ProblemContext::GamesSystem("NES".into());
+    app.run_problem_action(&system_action);
+    assert_eq!(app.filter.platform, "NES");
+
+    let missing = action_of(ProblemKind::FileMissing);
+    app.run_problem_action(&missing);
+    assert_eq!(app.router.current, Route::Section(Section::Problems));
+    assert!(app.problem_nav.focus_missing_review);
+
+    // Opening a destination never queues a job (no scan, verification or duplicate run).
+    assert_eq!(app.activity.jobs.len(), jobs_before);
+    assert!(app.duplicate_job.is_none() && app.verification_job.is_none());
+    let _: ProblemAction = missing;
+}
+
+#[test]
+fn a_context_that_no_longer_matches_fails_safely_and_still_opens_the_page() {
+    use super::problems::{ProblemAction, ProblemContext};
+    let context = egui::Context::default();
+    let mut app = problem_app_with_library(&context);
+    app.filter.platform = "SNES".into();
+    let stale = [
+        ProblemContext::GamesSystem("Removed system".into()),
+        ProblemContext::CheckPlatform("Removed system".into()),
+        ProblemContext::DuplicateGroup("not-in-the-report".into()),
+    ];
+    for ctx in stale {
+        let action = ProblemAction {
+            label: "Show".into(),
+            route: Route::Section(Section::Games),
+            context: ctx,
+        };
+        app.run_problem_action(&action);
+        assert_eq!(app.router.current, Route::Section(Section::Games));
+    }
+    assert_eq!(
+        app.filter.platform, "SNES",
+        "an unknown system is not applied"
+    );
+    assert!(app.check_platform.is_none());
+    assert!(app.problem_nav.duplicate_focus.is_none());
+}
+
+#[test]
+fn the_duplicate_group_context_survives_a_page_switch_and_return() {
+    use super::problems::ProblemKind;
+    let context = egui::Context::default();
+    let mut app = problem_app_with_library(&context);
+    app.duplicate_report = Some(super::library::DuplicateReport {
+        files_examined: 2,
+        exact_groups: Vec::new(),
+        groups: vec![super::library::DuplicateGroup {
+            exact_index: 0,
+            kind: "Exact duplicates".into(),
+            sha256: "abc".into(),
+            size_bytes: 4,
+            members: Vec::new(),
+        }],
+    });
+    let jobs_before = app.activity.jobs.len();
+    app.run_problem_action(&action_of(ProblemKind::DuplicateGroup));
+    assert_eq!(app.router.current, Route::Section(Section::Duplicates));
+    assert_eq!(app.problem_nav.duplicate_focus.as_deref(), Some("abc"));
+    app.go(Route::Section(Section::Settings));
+    app.go(Route::Section(Section::Duplicates));
+    assert_eq!(app.problem_nav.duplicate_focus.as_deref(), Some("abc"));
+    frame(&context, &mut app, [1280.0, 1600.0]);
+    assert_eq!(
+        app.activity.jobs.len(),
+        jobs_before,
+        "returning does not enqueue work"
+    );
+}
+
+#[test]
+fn home_needs_attention_opens_problems_on_the_actionable_view() {
+    use super::problems::ProblemFilter;
+    let context = egui::Context::default();
+    let mut app = problem_app_with_library(&context);
+    app.problem_filter = ProblemFilter::All;
+    app.problem_query = "stale search".into();
+    app.open_problems_from_home();
+    assert_eq!(app.router.current, Route::Section(Section::Problems));
+    assert_eq!(app.problem_filter, ProblemFilter::Actionable);
+    assert!(app.problem_query.is_empty());
+}
+
+#[test]
+fn informational_findings_are_not_attention_and_have_no_fix_button() {
+    use super::problems::{ProblemFilter, ProblemKind, ProblemSummary, Severity};
+    let context = egui::Context::default();
+    let mut app = problem_app_with_library(&context);
+    let info = super::problems::tests::sample_problem(ProblemKind::NoReferenceSource);
+    let summary = Arc::new(ProblemSummary {
+        category_indices: [(info.category, vec![0])].into_iter().collect(),
+        problems: vec![info],
+    });
+    assert_eq!(summary.attention_count(), 0);
+    assert_eq!(summary.actionable_count(), 0);
+    assert_eq!(summary.count(Severity::Informational), 1);
+    app.problem_summary = Some(summary);
+    app.router.current = Route::Section(Section::Problems);
+    // Actionable view: plain "nothing needs attention", no scary warning, no buttons.
+    let strings = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s == "Nothing needs your attention right now.")
+    );
+    for forbidden in [
+        "Repair",
+        "Fix",
+        "Resolve",
+        "Review matches",
+        "Set up identification data",
+    ] {
+        assert!(!strings.iter().any(|s| s == forbidden), "{forbidden}");
+    }
+    // Informational view: the note is there and still has no button of its own.
+    app.problem_filter = ProblemFilter::All;
+    let strings = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("no identification database"))
+    );
+    assert!(!strings.iter().any(|s| s == "Show games without a system"));
+}
+
+#[test]
+fn actionable_findings_show_their_primary_and_secondary_buttons() {
+    use super::problems::{ProblemKind, ProblemSummary};
+    let context = egui::Context::default();
+    let mut app = problem_app_with_library(&context);
+    let problems: Vec<_> = [
+        ProblemKind::FileMissing,
+        ProblemKind::NoSystem,
+        ProblemKind::DatMatchAvailable,
+    ]
+    .into_iter()
+    .map(super::problems::tests::sample_problem)
+    .collect();
+    let mut category_indices = std::collections::BTreeMap::new();
+    for (index, problem) in problems.iter().enumerate() {
+        category_indices
+            .entry(problem.category)
+            .or_insert_with(Vec::new)
+            .push(index);
+    }
+    app.problem_summary = Some(Arc::new(ProblemSummary {
+        problems,
+        category_indices,
+    }));
+    app.router.current = Route::Section(Section::Problems);
+    let strings = text(&frame(&context, &mut app, [1280.0, 1600.0]));
+    for label in [
+        "Review missing games",
+        "Show game",
+        "Show games without a system",
+        "Review matches",
+    ] {
+        assert!(
+            strings.iter().any(|s| s == label),
+            "missing button {label}: {strings:?}"
+        );
+    }
+    assert!(!strings.iter().any(|s| s.starts_with("Next:")));
 }

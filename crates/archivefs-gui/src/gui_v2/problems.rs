@@ -40,17 +40,117 @@ impl ProblemState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ProblemDestination {
-    CheckGames,
-    Games,
-    Duplicates,
-    /// Identification data (DAT) sources and matching.
-    Dat,
-    /// Findings that existing typed evidence proves are MAME set findings.
-    /// MAME sets are judged as complete sets, so these go to the dedicated
-    /// MAME workflow rather than a generic rename/repair page.
-    Mame,
+/// Every kind of finding GUI-v2 can show. Adding a kind forces the three
+/// exhaustive matches below (`is_actionable`, `ALL` through the coverage test,
+/// and the constructors) to say whether the person gets a next step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(super) enum ProblemKind {
+    /// The file is gone and its folder is still there.
+    FileMissing,
+    /// The file is gone and so is its folder (a drive that is not connected).
+    FileFolderUnavailable,
+    /// The file is there but its saved health says it is not usable.
+    FileUnhealthy,
+    /// A MAME set (judged as a whole set) with a file problem.
+    FileMame,
+    IdentityConflict,
+    IdentityAmbiguous,
+    IdentityMame,
+    /// Games with no system assigned.
+    NoSystem,
+    /// A reference database exists for the system but is not installed.
+    DatSetupRequired,
+    /// A reference database is installed and these games are not matched yet.
+    DatMatchAvailable,
+    NoReferenceSource,
+    MatchedByReference,
+    SpecialRelease,
+    DuplicateGroup,
+}
+
+impl ProblemKind {
+    pub(super) const ALL: [ProblemKind; 14] = [
+        Self::FileMissing,
+        Self::FileFolderUnavailable,
+        Self::FileUnhealthy,
+        Self::FileMame,
+        Self::IdentityConflict,
+        Self::IdentityAmbiguous,
+        Self::IdentityMame,
+        Self::NoSystem,
+        Self::DatSetupRequired,
+        Self::DatMatchAvailable,
+        Self::NoReferenceSource,
+        Self::MatchedByReference,
+        Self::SpecialRelease,
+        Self::DuplicateGroup,
+    ];
+
+    /// Informational kinds need nothing from the person and get no button.
+    pub(super) fn is_actionable(self) -> bool {
+        match self {
+            Self::FileMissing
+            | Self::FileFolderUnavailable
+            | Self::FileUnhealthy
+            | Self::FileMame
+            | Self::IdentityConflict
+            | Self::IdentityAmbiguous
+            | Self::IdentityMame
+            | Self::NoSystem
+            | Self::DatSetupRequired
+            | Self::DatMatchAvailable
+            | Self::DuplicateGroup => true,
+            Self::NoReferenceSource | Self::MatchedByReference | Self::SpecialRelease => false,
+        }
+    }
+}
+
+/// What the destination should open on, carried with the navigation so the
+/// person does not have to find the thing again. It only ever selects
+/// something that already exists; opening it never starts work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ProblemContext {
+    None,
+    /// Games list on one system (the library's own label for it).
+    GamesSystem(String),
+    /// Check Games on one platform.
+    CheckPlatform(String),
+    /// Duplicates page showing one exact-duplicate group (by SHA-256).
+    DuplicateGroup(String),
+    /// Problems page positioned on the Missing games review.
+    MissingReview,
+}
+
+/// One next step for a finding: what the button says, where it goes, and what
+/// it opens on. Navigation only; nothing here changes a file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProblemAction {
+    pub(super) label: String,
+    pub(super) route: Route,
+    pub(super) context: ProblemContext,
+}
+
+impl ProblemAction {
+    fn new(label: impl Into<String>, route: Route) -> Self {
+        Self {
+            label: label.into(),
+            route,
+            context: ProblemContext::None,
+        }
+    }
+
+    fn with(mut self, context: ProblemContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    fn show_game(game_id: i64) -> Self {
+        Self::new("Show game", Route::Game(game_id))
+    }
+
+    fn review_mame() -> Self {
+        Self::new("Review in MAME", Route::MameWorkflow)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,30 +172,6 @@ impl ProblemFilter {
         match self {
             Self::Actionable => problem.state.is_actionable(),
             Self::All => true,
-        }
-    }
-}
-
-impl ProblemDestination {
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::CheckGames => "Open Check Games",
-            Self::Games => "Review Games",
-            Self::Duplicates => "Review Duplicates",
-            Self::Dat => "Open identification data",
-            Self::Mame => "Review in MAME",
-        }
-    }
-
-    /// The existing route this destination opens. `MameWorkflow` is a global
-    /// route with no set/game payload, so no context is invented for it.
-    pub(super) fn route(self) -> Route {
-        match self {
-            Self::CheckGames => Route::Section(Section::Check),
-            Self::Games => Route::Section(Section::Games),
-            Self::Duplicates => Route::Section(Section::Duplicates),
-            Self::Dat => Route::Section(Section::Dat),
-            Self::Mame => Route::MameWorkflow,
         }
     }
 }
@@ -152,7 +228,10 @@ pub(super) struct Problem {
     pub(super) category: Category,
     pub(super) severity: Severity,
     pub(super) state: ProblemState,
-    pub(super) destination: ProblemDestination,
+    pub(super) kind: ProblemKind,
+    /// The one obvious next step. `None` only for informational findings.
+    pub(super) primary: Option<ProblemAction>,
+    pub(super) secondary: Option<ProblemAction>,
     pub(super) affected: String,
     pub(super) location: String,
     pub(super) why: String,
@@ -221,7 +300,12 @@ impl ProblemSummary {
                     category: Category::Duplicates,
                     severity: Severity::Warning,
                     state: ProblemState::Current,
-                    destination: ProblemDestination::Duplicates,
+                    kind: ProblemKind::DuplicateGroup,
+                    primary: Some(
+                        ProblemAction::new("Review duplicates", Route::Section(Section::Duplicates))
+                            .with(ProblemContext::DuplicateGroup(group.sha256.clone())),
+                    ),
+                    secondary: None,
                     affected: group.members.iter().map(|member| member.title.as_str()).collect::<Vec<_>>().join(", "),
                     location: "Current duplicate candidates".into(),
                     why: "Keeping multiple byte-for-byte copies makes it harder to know which file to use and wastes space.".into(),
@@ -283,36 +367,72 @@ fn path_is_present(game: &Game) -> bool {
 }
 
 fn file_problem(game: &Game) -> Problem {
-    let path_is_current = path_is_present(game);
+    let present = path_is_present(game);
+    let mame = proves_mame(game);
+    // A missing file whose folder is also gone usually means a drive that is not
+    // connected; a missing file in a folder that is there is a file that moved.
+    let folder_reachable = game
+        .archive
+        .absolute_path
+        .parent()
+        .is_some_and(std::path::Path::is_dir);
+    let kind = if mame {
+        ProblemKind::FileMame
+    } else if present {
+        ProblemKind::FileUnhealthy
+    } else if folder_reachable {
+        ProblemKind::FileMissing
+    } else {
+        ProblemKind::FileFolderUnavailable
+    };
+    let id = game.archive.id;
+    let (primary, action) = match kind {
+        ProblemKind::FileMame => (ProblemAction::review_mame(), MAME_ACTION.to_string()),
+        ProblemKind::FileUnhealthy => (
+            ProblemAction::new(
+                "Check this game",
+                Route::Task {
+                    section: Section::Check,
+                    game: id,
+                },
+            )
+            .with(ProblemContext::CheckPlatform(game.platform.clone())),
+            "Check this game again to see whether the file can be read.".to_string(),
+        ),
+        ProblemKind::FileFolderUnavailable => (
+            ProblemAction::new("Review game folders", Route::Section(Section::Sources)),
+            "The folder this game lives in is not available. Make sure the drive is connected, then review your game folders.".to_string(),
+        ),
+        _ => (
+            ProblemAction::new("Review missing games", Route::Section(Section::Problems))
+                .with(ProblemContext::MissingReview),
+            "Review the missing games. EmuWiz can forget entries you confirm are gone, and you can undo that.".to_string(),
+        ),
+    };
     Problem {
-        id: format!("missing-{}", game.archive.id),
-        game_id: Some(game.archive.id),
+        id: format!("missing-{id}"),
+        game_id: Some(id),
         title: format!("{} is missing or has a saved health problem", game.title),
         category: Category::Files,
         severity: Severity::NeedsAttention,
         state: ProblemState::Current,
-        destination: if proves_mame(game) {
-            ProblemDestination::Mame
-        } else {
-            ProblemDestination::Games
-        },
+        kind,
+        primary: Some(primary),
+        secondary: Some(ProblemAction::show_game(id)),
         affected: format!("{} · {}", game.platform, game.title),
-        location: if path_is_current {
+        location: if present {
             format!("Current path: {}", game.archive.absolute_path.display())
         } else {
             format!("Last recorded path: {}", game.archive.absolute_path.display())
         },
         why: "EmuWiz cannot safely verify or prepare this game until the recorded file is available and readable.".into(),
-        action: if proves_mame(game) {
-            MAME_ACTION.into()
-        } else {
-            "Review the game and its folder, then run verification again.".into()
-        },
+        action,
         safety: "Read-only. Browsing and verification do not rename, move, delete, or repair the source file.".into(),
         undo: "No file change was made, so there is nothing to undo.".into(),
         technical: format!(
-            "Catalogue id {} · recorded path {} · health {}",
+            "Catalogue id {} · source folder {} · recorded path {} · health {}",
             game.archive.id,
+            game.archive.source_folder_id,
             game.archive.absolute_path.display(),
             game.archive.last_known_health
         ),
@@ -321,34 +441,56 @@ fn file_problem(game: &Game) -> Problem {
 
 /// A game whose evidence conflicts or is ambiguous: a person has to choose.
 fn identity_choice_problem(game: &Game, reason: ChoiceReason) -> Problem {
-    let (title, why, action) = match reason {
+    let (title, why, action, kind, label) = match reason {
         ChoiceReason::Conflict => (
             format!("{} has conflicting identification evidence", game.title),
             "Two trusted sources disagree about which game this is, so EmuWiz will not pick one for you.",
             "Review the evidence in the game details and decide which one is right.",
+            ProblemKind::IdentityConflict,
+            "Review evidence",
         ),
         _ => (
             format!("{} has more than one possible match", game.title),
             "EmuWiz found several possible matches and will not guess between them.",
             "Choose the correct match in the game details.",
+            ProblemKind::IdentityAmbiguous,
+            "Review matches",
         ),
     };
+    let id = game.archive.id;
+    let mame = proves_mame(game);
     Problem {
-        id: format!("identity-{}", game.archive.id),
-        game_id: Some(game.archive.id),
+        id: format!("identity-{id}"),
+        game_id: Some(id),
         title,
         category: Category::Identity,
         severity: Severity::NeedsAttention,
         state: ProblemState::NeedsEvidence,
-        destination: if proves_mame(game) {
-            ProblemDestination::Mame
+        kind: if mame {
+            ProblemKind::IdentityMame
         } else {
-            ProblemDestination::CheckGames
+            kind
         },
+        primary: Some(if mame {
+            ProblemAction::review_mame()
+        } else {
+            ProblemAction::new(label, Route::Game(id))
+        }),
+        secondary: (!mame && game.platform != UNKNOWN_PLATFORM).then(|| {
+            ProblemAction::new(
+                format!("Check {} games", game.platform),
+                Route::Section(Section::Check),
+            )
+            .with(ProblemContext::CheckPlatform(game.platform.clone()))
+        }),
         affected: format!("{} · {}", game.platform, game.title),
         location: format!("Current path: {}", game.archive.absolute_path.display()),
         why: why.into(),
-        action: action.into(),
+        action: if mame {
+            MAME_ACTION.into()
+        } else {
+            action.into()
+        },
         safety: "Read-only. EmuWiz will not turn a filename hint into a verified identity.".into(),
         undo: "No file change was made, so there is nothing to undo.".into(),
         technical: format!(
@@ -404,54 +546,67 @@ fn identity_group_problem(key: &IdentityGroupKey, group: &IdentityGroup) -> Prob
     let n = group.count;
     let games = if n == 1 { "game" } else { "games" };
     let have = if n == 1 { "has" } else { "have" };
-    let (title, why, action, destination, severity, state) = match key.kind {
+    let platform = key.platform.clone();
+    let (title, why, action, kind, severity, state, primary) = match key.kind {
         0 => (
             format!("{n} {games} {have} no system assigned"),
             "EmuWiz cannot launch or identify a game until it knows which system it belongs to.".to_string(),
-            "Choose a system for these games.".to_string(),
-            ProblemDestination::Games,
+            "Show these games. Choosing a system for them is not available in this window yet.".to_string(),
+            ProblemKind::NoSystem,
             Severity::Warning,
             ProblemState::NeedsEvidence,
+            Some(
+                ProblemAction::new("Show games without a system", Route::Section(Section::Games))
+                    .with(ProblemContext::GamesSystem(UNKNOWN_PLATFORM.to_string())),
+            ),
         ),
         1 => (
             format!("{}: identification data is not set up yet", key.platform),
             format!("EmuWiz knows an identification database for this system ({}) but none is installed. {n} {games} can still be played; identification is optional.", key.reason),
             "Set up identification data for this system.".to_string(),
-            ProblemDestination::Dat,
+            ProblemKind::DatSetupRequired,
             Severity::Warning,
             ProblemState::NeedsEvidence,
+            Some(ProblemAction::new("Set up identification data", Route::Section(Section::Dat))),
         ),
         2 => (
             format!("{}: {n} {games} {have} not been matched to identification data yet", key.platform),
             "These games can still be played. Matching them gives EmuWiz stronger proof of exactly which release each one is.".to_string(),
-            "Open identification data and match this system's games.".to_string(),
-            ProblemDestination::Dat,
+            "Open Check Games for this system to match its games.".to_string(),
+            ProblemKind::DatMatchAvailable,
             Severity::Warning,
             ProblemState::NeedsEvidence,
+            Some(
+                ProblemAction::new("Review matches", Route::Section(Section::Check))
+                    .with(ProblemContext::CheckPlatform(platform)),
+            ),
         ),
         3 => (
             format!("{}: no identification database is available", key.platform),
             format!("EmuWiz does not know a reference database for this system, so there is nothing to match {n} {games} against. This is not a problem."),
             "No action is needed.".to_string(),
-            ProblemDestination::Games,
+            ProblemKind::NoReferenceSource,
             Severity::Informational,
             ProblemState::Informational,
+            None,
         ),
         4 => (
             format!("{n} arcade {games} matched the reference data"),
             "These sets were checked against the MAME reference data. Nothing is wrong.".to_string(),
             "No action is needed.".to_string(),
-            ProblemDestination::Mame,
+            ProblemKind::MatchedByReference,
             Severity::Informational,
             ProblemState::Informational,
+            None,
         ),
         _ => (
             format!("{n} special {} (homebrew, prototypes, hacks, translations)", if n == 1 { "release" } else { "releases" }),
             "Normal identification databases do not describe these releases, so they stay unmatched. They can still be played.".to_string(),
             "No action is needed.".to_string(),
-            ProblemDestination::Games,
+            ProblemKind::SpecialRelease,
             Severity::Informational,
             ProblemState::Informational,
+            None,
         ),
     };
     Problem {
@@ -461,7 +616,9 @@ fn identity_group_problem(key: &IdentityGroupKey, group: &IdentityGroup) -> Prob
         category: Category::Identity,
         severity,
         state,
-        destination,
+        kind,
+        primary,
+        secondary: None,
         affected: if key.platform.is_empty() { "Several systems".into() } else { key.platform.clone() },
         location: format!("{n} {games} in your library"),
         why,
@@ -473,7 +630,7 @@ fn identity_group_problem(key: &IdentityGroupKey, group: &IdentityGroup) -> Prob
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::gui_v2) mod tests {
     use super::*;
     use archivefs_core::PersistedArchive;
     use archivefs_core::identity_attention::ReferenceInventory;
@@ -565,10 +722,10 @@ mod tests {
         assert_eq!(first.problems[0].category, Category::Duplicates);
         assert!(first.problems[0].action.contains("Review"));
         assert_eq!(first.problems[0].state, ProblemState::Current);
-        assert_eq!(
-            first.problems[0].destination,
-            ProblemDestination::Duplicates
-        );
+        let action = first.problems[0].primary.as_ref().unwrap();
+        assert_eq!(action.label, "Review duplicates");
+        assert_eq!(action.route, Route::Section(Section::Duplicates));
+        assert_eq!(action.context, ProblemContext::DuplicateGroup("abc".into()));
     }
 
     #[test]
@@ -578,7 +735,12 @@ mod tests {
         let summary = ProblemSummary::from_library(&library, None);
         let problem = &summary.problems[0];
         assert_eq!(problem.state, ProblemState::NeedsEvidence);
-        assert_eq!(problem.destination, ProblemDestination::Dat);
+        let action = problem.primary.as_ref().unwrap();
+        assert_eq!(action.route, Route::Section(Section::Check));
+        assert_eq!(
+            action.context,
+            ProblemContext::CheckPlatform("Arcade".into())
+        );
         assert!(!problem.action.to_lowercase().contains("rename"));
         assert!(problem.safety.contains("filename hint"));
     }
@@ -609,7 +771,12 @@ mod tests {
             category: Category::Identity,
             severity: Severity::Warning,
             state: ProblemState::NeedsEvidence,
-            destination: ProblemDestination::CheckGames,
+            kind: ProblemKind::DatMatchAvailable,
+            primary: Some(ProblemAction::new(
+                "Review matches",
+                Route::Section(Section::Check)
+            )),
+            secondary: None,
             game_id: None,
             affected: "Arcade · Game".into(),
             location: "Current path: /game.zip".into(),
@@ -665,9 +832,10 @@ mod tests {
     fn proven_mame_problem_opens_the_existing_mame_workflow() {
         let summary = summary_for(vec![mame_game(10, "pacman", true, true)]);
         let problem = &summary.problems[0];
-        assert_eq!(problem.destination, ProblemDestination::Mame);
-        assert_eq!(problem.destination.label(), "Review in MAME");
-        assert_eq!(problem.destination.route(), Route::MameWorkflow);
+        let action = problem.primary.as_ref().unwrap();
+        assert_eq!(problem.kind, ProblemKind::FileMame);
+        assert_eq!(action.label, "Review in MAME");
+        assert_eq!(action.route, Route::MameWorkflow);
         // the game is retained for the separate Game Details link only;
         // MameWorkflow carries no set/game payload, so none is invented
         assert_eq!(problem.game_id, Some(10));
@@ -679,8 +847,9 @@ mod tests {
         let action = summary.problems[0].action.to_lowercase();
         assert!(action.contains("mame workflow"));
         assert!(action.contains("not renamed or repaired"));
-        assert_ne!(summary.problems[0].destination, ProblemDestination::Games);
-        assert_ne!(summary.problems[0].destination.label(), "Review Games");
+        let action = summary.problems[0].primary.as_ref().unwrap();
+        assert_eq!(action.route, Route::MameWorkflow);
+        assert_ne!(action.label, "Review missing games");
     }
 
     #[test]
@@ -693,37 +862,37 @@ mod tests {
             game(3, "Plain unknown", false, false),
         ]);
         for problem in &summary.problems {
-            assert_ne!(
-                problem.destination,
-                ProblemDestination::Mame,
+            assert!(
+                problem
+                    .primary
+                    .as_ref()
+                    .is_none_or(|a| a.route != Route::MameWorkflow),
                 "{}",
                 problem.id
             );
         }
         let by_id = |id: &str| summary.problems.iter().find(|p| p.id == id).unwrap();
-        assert_eq!(by_id("missing-1").destination, ProblemDestination::Games);
-        assert_eq!(by_id("missing-2").destination, ProblemDestination::Games);
-        assert_eq!(
-            by_id("identity-group-2--Arcade").destination,
-            ProblemDestination::Dat
-        );
-        assert_eq!(
-            ProblemDestination::Games.route(),
-            Route::Section(Section::Games)
-        );
+        // The test files do not exist and neither does their folder.
+        for id in ["missing-1", "missing-2"] {
+            let action = by_id(id).primary.as_ref().unwrap();
+            assert_eq!(action.label, "Review game folders");
+            assert_eq!(action.route, Route::Section(Section::Sources));
+        }
+        let matching = by_id("identity-group-2--Arcade").primary.as_ref().unwrap();
+        assert_eq!(matching.route, Route::Section(Section::Check));
     }
 
     #[test]
     fn filter_and_search_do_not_change_mame_classification() {
         let summary = summary_for(vec![mame_game(10, "pacman", true, true)]);
-        let before = summary.problems[0].destination;
+        let before = summary.problems[0].primary.clone();
         for filter in [ProblemFilter::Actionable, ProblemFilter::All] {
             let _ = filter.accepts(&summary.problems[0]);
         }
         let query = "pacman";
         let _visible = summary.problems[0].title.to_lowercase().contains(query);
-        assert_eq!(summary.problems[0].destination, before);
-        assert_eq!(before, ProblemDestination::Mame);
+        assert_eq!(summary.problems[0].primary, before);
+        assert_eq!(before.unwrap().route, Route::MameWorkflow);
     }
 
     #[test]
@@ -796,9 +965,14 @@ mod tests {
             &[],
         );
         assert_eq!(summary.problems.len(), 2);
-        assert!(summary.problems.iter().all(|p| p.state.is_actionable()
-            && p.severity == Severity::Warning
-            && p.destination == ProblemDestination::Dat));
+        assert!(summary.problems.iter().all(|p| {
+            p.state.is_actionable()
+                && p.severity == Severity::Warning
+                && p.kind == ProblemKind::DatMatchAvailable
+                && p.primary
+                    .as_ref()
+                    .is_some_and(|a| a.route == Route::Section(Section::Check))
+        }));
         assert!(
             summary
                 .problems
@@ -818,7 +992,13 @@ mod tests {
             None,
             &[],
         );
-        assert_eq!(summary.problems[0].destination, ProblemDestination::Games);
+        let action = summary.problems[0].primary.as_ref().unwrap();
+        assert_eq!(summary.problems[0].kind, ProblemKind::NoSystem);
+        assert_eq!(action.route, Route::Section(Section::Games));
+        assert_eq!(
+            action.context,
+            ProblemContext::GamesSystem(super::super::library::UNKNOWN_PLATFORM.into())
+        );
         assert!(summary.problems[0].title.contains("no system assigned"));
     }
 
@@ -874,5 +1054,197 @@ mod tests {
             .count();
         assert_eq!(summary.attention_count(), listed);
         assert_eq!(listed, 1);
+    }
+
+    // ---- action coverage -------------------------------------------------
+
+    /// One real finding of the given kind, built by the same constructors the
+    /// summary uses.
+    pub(in crate::gui_v2) fn sample_problem(kind: ProblemKind) -> Problem {
+        let dir = tempfile::tempdir().unwrap();
+        let group = |key_kind: u8, platform: &str| {
+            identity_group_problem(
+                &IdentityGroupKey {
+                    kind: key_kind,
+                    reason: "No-Intro".into(),
+                    platform: platform.into(),
+                },
+                &IdentityGroup {
+                    count: 3,
+                    samples: vec!["A".into()],
+                },
+            )
+        };
+        let mut missing_in_reachable_folder = game(1, "Gone", true, true);
+        missing_in_reachable_folder.archive.absolute_path = dir.path().join("gone.zip");
+        let mut unhealthy = game(2, "Broken", true, false);
+        unhealthy.archive.last_known_health = "corrupt".into();
+        let plain = game(3, "Plain", true, false);
+        match kind {
+            ProblemKind::FileMissing => file_problem(&missing_in_reachable_folder),
+            ProblemKind::FileFolderUnavailable => file_problem(&game(4, "Away", true, true)),
+            ProblemKind::FileUnhealthy => file_problem(&unhealthy),
+            ProblemKind::FileMame => file_problem(&mame_game(5, "mame", true, true)),
+            ProblemKind::IdentityConflict => {
+                identity_choice_problem(&plain, ChoiceReason::Conflict)
+            }
+            ProblemKind::IdentityAmbiguous => {
+                identity_choice_problem(&plain, ChoiceReason::Ambiguous)
+            }
+            ProblemKind::IdentityMame => {
+                identity_choice_problem(&mame_game(6, "mame", false, true), ChoiceReason::Conflict)
+            }
+            ProblemKind::NoSystem => group(0, UNKNOWN_PLATFORM),
+            ProblemKind::DatSetupRequired => group(1, "NES"),
+            ProblemKind::DatMatchAvailable => group(2, "NES"),
+            ProblemKind::NoReferenceSource => group(3, "Obscure"),
+            ProblemKind::MatchedByReference => group(4, ""),
+            ProblemKind::SpecialRelease => group(5, ""),
+            ProblemKind::DuplicateGroup => {
+                let report = DuplicateReport {
+                    files_examined: 2,
+                    exact_groups: Vec::new(),
+                    groups: vec![super::super::library::DuplicateGroup {
+                        exact_index: 0,
+                        kind: "Exact duplicates".into(),
+                        sha256: "abc".into(),
+                        size_bytes: 4,
+                        members: Vec::new(),
+                    }],
+                };
+                ProblemSummary::from_library(&Library::new(Vec::new()), Some(&report))
+                    .problems
+                    .remove(0)
+            }
+        }
+    }
+
+    const VAGUE_LABELS: &[&str] = &[
+        "Fix",
+        "Resolve",
+        "Continue",
+        "Repair",
+        "Advanced",
+        "Open specialist interface",
+        "OK",
+    ];
+
+    #[test]
+    fn every_problem_kind_has_a_truthful_action_or_is_informational() {
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in ProblemKind::ALL {
+            let problem = sample_problem(kind);
+            assert_eq!(problem.kind, kind, "{kind:?} built a different kind");
+            seen.insert(kind);
+            assert_eq!(
+                problem.state.is_actionable(),
+                kind.is_actionable(),
+                "{kind:?}: state and kind disagree about needing action"
+            );
+            if kind.is_actionable() {
+                let primary = problem
+                    .primary
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{kind:?} is actionable but has no action"));
+                for action in std::iter::once(primary).chain(problem.secondary.as_ref()) {
+                    assert!(!action.label.trim().is_empty(), "{kind:?}");
+                    assert!(
+                        !VAGUE_LABELS.contains(&action.label.as_str()),
+                        "{kind:?}: `{}` does not say what will happen",
+                        action.label
+                    );
+                    // No escape into the legacy window: a game-scoped Task route is
+                    // only valid for the sections that have a native page.
+                    if let Route::Task { section, .. } = &action.route {
+                        assert!(
+                            matches!(section, Section::Check | Section::Problems),
+                            "{kind:?}: Task route into {section:?} would fall back to the legacy handoff"
+                        );
+                    }
+                }
+                assert_ne!(problem.severity, Severity::Informational, "{kind:?}");
+            } else {
+                assert!(problem.primary.is_none(), "{kind:?} must not have a button");
+                assert!(problem.secondary.is_none(), "{kind:?}");
+                assert_eq!(problem.severity, Severity::Informational, "{kind:?}");
+                assert_eq!(problem.state, ProblemState::Informational, "{kind:?}");
+            }
+        }
+        assert_eq!(seen.len(), ProblemKind::ALL.len());
+    }
+
+    #[test]
+    fn the_primary_actions_land_on_the_documented_destinations_with_context() {
+        let action = |kind| sample_problem(kind).primary.unwrap();
+        let a = action(ProblemKind::FileMissing);
+        assert_eq!(
+            (a.label.as_str(), &a.route, &a.context),
+            (
+                "Review missing games",
+                &Route::Section(Section::Problems),
+                &ProblemContext::MissingReview
+            )
+        );
+        let a = action(ProblemKind::FileFolderUnavailable);
+        assert_eq!(
+            (a.label.as_str(), &a.route),
+            ("Review game folders", &Route::Section(Section::Sources))
+        );
+        let a = action(ProblemKind::FileUnhealthy);
+        assert_eq!(a.label, "Check this game");
+        assert!(matches!(
+            a.route,
+            Route::Task {
+                section: Section::Check,
+                game: 2
+            }
+        ));
+        assert_eq!(a.context, ProblemContext::CheckPlatform("Arcade".into()));
+        let a = action(ProblemKind::IdentityConflict);
+        assert_eq!(
+            (a.label.as_str(), &a.route),
+            ("Review evidence", &Route::Game(3))
+        );
+        let a = action(ProblemKind::IdentityAmbiguous);
+        assert_eq!(
+            (a.label.as_str(), &a.route),
+            ("Review matches", &Route::Game(3))
+        );
+        let a = action(ProblemKind::NoSystem);
+        assert_eq!(a.route, Route::Section(Section::Games));
+        assert_eq!(
+            a.context,
+            ProblemContext::GamesSystem(UNKNOWN_PLATFORM.into())
+        );
+        let a = action(ProblemKind::DatSetupRequired);
+        assert_eq!(
+            (a.label.as_str(), &a.route),
+            ("Set up identification data", &Route::Section(Section::Dat))
+        );
+        let a = action(ProblemKind::DatMatchAvailable);
+        assert_eq!(
+            (a.label.as_str(), &a.route),
+            ("Review matches", &Route::Section(Section::Check))
+        );
+        assert_eq!(a.context, ProblemContext::CheckPlatform("NES".into()));
+        let a = action(ProblemKind::DuplicateGroup);
+        assert_eq!(a.context, ProblemContext::DuplicateGroup("abc".into()));
+        for kind in [ProblemKind::FileMame, ProblemKind::IdentityMame] {
+            assert_eq!(action(kind).route, Route::MameWorkflow, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_missing_file_always_also_offers_the_game_itself() {
+        for kind in [
+            ProblemKind::FileMissing,
+            ProblemKind::FileFolderUnavailable,
+            ProblemKind::FileUnhealthy,
+            ProblemKind::FileMame,
+        ] {
+            let secondary = sample_problem(kind).secondary.unwrap();
+            assert_eq!(secondary.label, "Show game", "{kind:?}");
+            assert!(matches!(secondary.route, Route::Game(_)), "{kind:?}");
+        }
     }
 }

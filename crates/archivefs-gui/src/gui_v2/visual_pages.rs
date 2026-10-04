@@ -113,7 +113,9 @@ impl App {
                             ui.label("Start by adding a folder you already keep games in. EmuWiz lists the files; it does not move them.");
                             if ui.button("Add my game folders").clicked() { self.go(Route::Section(Section::Sources)); }
                         } else if attention.unwrap_or(0) > 0 {
-                            if ui.button("Understand what needs attention").clicked() { self.go(Route::Section(Section::Problems)); }
+                            if ui.button("Review what needs attention").clicked() {
+                                self.open_problems_from_home();
+                            }
                         }
                     } else {
                         ui.horizontal(|ui| {

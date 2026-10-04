@@ -1598,9 +1598,25 @@ impl App {
             report.files_examined,
             report.groups.len()
         ));
+        let focus = self
+            .problem_nav
+            .duplicate_focus
+            .clone()
+            .filter(|sha| report.groups.iter().any(|group| &group.sha256 == sha));
+        if focus.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Showing the group from Problems & Repair.");
+                if ui.button("Show all groups").clicked() {
+                    self.problem_nav.duplicate_focus = None;
+                }
+            });
+        }
         for (index, group) in report.groups.iter().enumerate() {
             let key = format!("{}:{}", group.sha256, index);
             if self.duplicate_ignored.contains(&key) {
+                continue;
+            }
+            if focus.as_ref().is_some_and(|sha| sha != &group.sha256) {
                 continue;
             }
             ui.push_id(("duplicate-group", &group.sha256), |ui| {
@@ -1854,6 +1870,9 @@ impl App {
                 self.duplicate_preview(ui, &preview);
             }
             if game_id.is_none() {
+                if std::mem::take(&mut self.problem_nav.focus_missing_review) {
+                    ui.scroll_to_cursor(Some(egui::Align::TOP));
+                }
                 self.missing_review_panel(ui);
             }
             let Some(summary) = summary else {
@@ -1894,6 +1913,31 @@ impl App {
                 });
                 return;
             }
+            let informational = summary
+                .problems
+                .iter()
+                .filter(|problem| !problem.state.is_actionable())
+                .count();
+            if visible_count == 0
+                && game_id.is_none()
+                && problem_query.is_empty()
+                && problem_filter == ProblemFilter::Actionable
+                && informational > 0
+            {
+                // Nothing to do: say so plainly, with the notes one click away.
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Nothing needs your attention right now.");
+                    ui.label(format!(
+                        "{informational} informational note{} {} available. They need no action.",
+                        if informational == 1 { "" } else { "s" },
+                        if informational == 1 { "is" } else { "are" }
+                    ));
+                    if ui.button("Show informational notes").clicked() {
+                        self.problem_filter = ProblemFilter::All;
+                    }
+                });
+                return;
+            }
             if visible_count == 0 {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.heading("No problems match the current filters.");
@@ -1915,6 +1959,7 @@ impl App {
                 if ui.button("Check for exact duplicates").clicked() { self.start_duplicate_scan(); }
             }
             let mut selected = self.problem_selected.clone();
+            let mut run: Option<super::problems::ProblemAction> = None;
             for category in [Category::Files, Category::Duplicates, Category::Identity, Category::Verification] {
                 let Some(entries) = summary.category_indices.get(&category) else { continue; };
                 let entries: Vec<_> = entries
@@ -1951,10 +1996,19 @@ impl App {
                         });
                         ui.label(&problem.affected);
                         ui.label(&problem.location);
-                        ui.label(format!("Next: {}", problem.action));
-                        if ui.button(problem.destination.label()).clicked() {
-                            self.go(problem.destination.route());
-                        }
+                        ui.label(&problem.action);
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(action) = problem.primary.as_ref()
+                                && primary(ui, &action.label)
+                            {
+                                run = Some(action.clone());
+                            }
+                            if let Some(action) = problem.secondary.as_ref()
+                                && ui.button(&action.label).clicked()
+                            {
+                                run = Some(action.clone());
+                            }
+                        });
                         if problem.category == Category::Duplicates
                             && self.repair_preview.is_none()
                             && self.repair_job.is_none()
@@ -1970,6 +2024,9 @@ impl App {
                 });
             }
             self.problem_selected = selected;
+            if let Some(action) = run {
+                self.run_problem_action(&action);
+            }
         });
     }
 
@@ -2217,8 +2274,10 @@ impl App {
         {
             self.go(Route::Game(game_id));
         }
-        if primary(ui, problem.destination.label()) {
-            self.go(problem.destination.route());
+        if let Some(action) = problem.primary.clone()
+            && primary(ui, &action.label)
+        {
+            self.run_problem_action(&action);
         }
         ui.collapsing("Advanced details", |ui| {
             ui.monospace(&problem.technical);
