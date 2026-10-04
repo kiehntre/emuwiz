@@ -139,3 +139,17 @@ generated cheat file). Level 7 (a visible in-game effect) is not shown.
   removes the workspace (it also runs when the process is seen to exit). A crash
   leaves a marked workspace that `scan_cheat_runtime_workspaces` finds and
   `cleanup_stale_workspace` removes on request.
+
+## Known gaps and scanning
+
+* A true `ProfileKind::Flatpak` profile is still refused by
+  `preflight_retroarch_launch`: the command planner deliberately plans no
+  executable for it (`flatpak run ...` would be an invented launcher command)
+  and exposing the content to the sandbox would need its own design. What works
+  is a native-classified wrapper that execs `flatpak run <app>`. This is a
+  separate blocker; it is not addressed here.
+* A crash can leave a marked workspace in either root. Scan each of
+  `CheatRuntimeRoots::all_known()` (the temporary root and the EmuWiz data root
+  used for Flatpak) with `scan_cheat_runtime_workspaces`.
+* Highest proven level is 6; the "5-6" wording in the Phase 1 section above is
+  the earlier, fake-emulator-only assessment. No GUI/CLI caller exists yet.

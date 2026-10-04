@@ -1044,3 +1044,27 @@ fn assessed_hard_findings_survive_variant_choice_and_acknowledgement() {
         }
     }
 }
+
+#[test]
+fn the_planner_accepts_the_emuwiz_data_root_and_rejects_everything_else() {
+    use crate::launch::retroarch_resource_projection::approved_retroarch_data_launch_root;
+    let Some(data_root) = approved_retroarch_data_launch_root() else {
+        return; // no resolvable data directory on this host
+    };
+    let plan_with = |root: PathBuf| {
+        let mut request = base_request(vec![select("lives")]);
+        request.retroarch.as_mut().unwrap().launch_root = Some(root);
+        plan_cheat_launch(&request)
+    };
+    assert_eq!(
+        plan_with(data_root.join("cheats-launch-1")).status,
+        CheatLaunchPlanStatus::Ready
+    );
+    for root in [
+        data_root.clone(),
+        data_root.parent().unwrap().join("elsewhere"),
+        PathBuf::from("/var/tmp/emuwiz-x"),
+    ] {
+        assert_eq!(plan_with(root).status, CheatLaunchPlanStatus::Blocked);
+    }
+}

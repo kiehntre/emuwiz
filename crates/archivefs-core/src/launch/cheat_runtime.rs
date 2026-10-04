@@ -56,7 +56,9 @@ use super::cheat_launch_plan::{
     LaunchStateClass, LaunchStateExpectation, StateBaseline, StateExpectation, StateOutcome,
     ViolationSeverity, capture_baseline, verify_expectation,
 };
-use super::retroarch_resource_projection::approved_retroarch_launch_root;
+use super::retroarch_resource_projection::{
+    approved_retroarch_data_launch_root, approved_retroarch_launch_root,
+};
 
 pub const WORKSPACE_MARKER_NAME: &str = ".emuwiz-cheat-runtime.json";
 pub const WORKSPACE_DIR_PREFIX: &str = "cheats-";
@@ -389,6 +391,20 @@ impl Default for CheatRuntimeRoots {
         Self {
             approved_root: approved_retroarch_launch_root(),
         }
+    }
+}
+
+impl CheatRuntimeRoots {
+    /// Every root a workspace may live under (the temporary root and, when
+    /// resolvable, the EmuWiz data root used for Flatpak). A stale-workspace
+    /// scan must look at each of them.
+    #[must_use]
+    pub fn all_known() -> Vec<Self> {
+        let mut roots = vec![Self::default()];
+        roots.extend(
+            approved_retroarch_data_launch_root().map(|approved_root| Self { approved_root }),
+        );
+        roots
     }
 }
 
