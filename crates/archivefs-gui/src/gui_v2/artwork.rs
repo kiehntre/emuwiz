@@ -7,7 +7,7 @@ use super::{
 };
 use archivefs_core::identity_source::romm::connectivity::RommConnectivity;
 use archivefs_core::identity_source::romm::local_discovery::{
-    EndpointSource, validate_with_local_fallback, verify_romm,
+    validate_with_local_fallback, verify_romm,
 };
 use eframe::egui;
 use std::{
@@ -672,23 +672,9 @@ where
             // Cache first: a cached picture never needs the provider, so it is
             // shown whether or not RomM can be reached.
             let configured = request.index.settings.source.url.trim().to_string();
-            let fallback = health
-                .endpoints
-                .map(|session| session.effective(&configured));
-            let cached = cache
-                .lookup(&request.index.server, &request_art)
-                .or_else(|| {
-                    // A cover fetched through the session fallback is stored under that
-                    // server's own id, never under the configured one.
-                    fallback
-                        .as_ref()
-                        .filter(|effective| {
-                            effective.endpoint_source == EndpointSource::LocalDockerFallback
-                        })
-                        .and_then(|effective| {
-                            cache.lookup(&effective.effective_endpoint, &request_art)
-                        })
-                });
+            // A cover fetched through a session-only local route is stored under the
+            // configured server's id, so one lookup serves every route.
+            let cached = cache.lookup(&request.index.server, &request_art);
             timings.lookup = start.elapsed();
             timings.cache_hit = cached.is_some();
             let thumbnail = if let Some(cached) = cached {
@@ -749,47 +735,55 @@ where
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs() as i64;
-                let answer = cache
-                    .fetch(&source, transport, &request_art, now, Some(&request.cancel))
-                    .map_err(|refusal| {
-                        let state = RommConnectivity::from_artwork_refusal(&refusal);
-                        if let Some(state) = state.filter(|state| {
-                            state.is_unreachable()
-                                || state.is_recoverable_by_waiting()
-                                || *state == RommConnectivity::AuthenticationFailed
-                        }) {
-                            health.record(state);
-                        }
-                        // The endpoint answered nothing: look for a local RomM once.
-                        // The next attempt then uses it; this picture retries.
-                        if let (Some(session), Some(state)) = (health.endpoints, state) {
-                            if session.effective(&configured).endpoint_source
-                                == EndpointSource::LocalDockerFallback
-                                && state.is_unreachable()
-                            {
-                                session.invalidate();
-                            }
-                            let found = session.recover(&configured, state, &mut |url| {
-                                verify_romm(
-                                    url,
-                                    &token,
-                                    &request.index.trusted_roots,
-                                    resolver,
-                                    transport,
-                                )
-                            });
-                            if found.endpoint_source == EndpointSource::LocalDockerFallback {
-                                health.reset();
-                            }
-                        }
-                        ResolveFailure {
-                            message: match state {
-                                Some(state) => state.plain_message().to_string(),
-                                None => refusal.detail(),
-                            },
-                            connectivity: state,
-                        }
-                    })?;
+                let fetch = |source: &archivefs_core::identity_source::romm::config::ValidatedRommSource| {
+                    cache.fetch(source, transport, &request_art, now, Some(&request.cancel))
+                };
+                let mut result = fetch(&source);
+                // The endpoint answered nothing: if a local Docker route is (or was)
+                // in use, rediscover it once, verify RomM again and retry this
+                // picture once. Never more than once, and never for auth/API errors.
+                if let (Err(refusal), Some(session)) = (&result, health.endpoints)
+                    && let Some(state) = RommConnectivity::from_artwork_refusal(refusal)
+                    && state.is_unreachable()
+                    && let Some(_next) =
+                        session.recover_after_failure(&configured, state, &mut |url| {
+                            verify_romm(
+                                url,
+                                &token,
+                                &request.index.trusted_roots,
+                                resolver,
+                                transport,
+                            )
+                        })
+                    && let Ok(fresh) = validate_with_local_fallback(
+                        health.endpoints,
+                        settings,
+                        &token,
+                        &request.index.trusted_roots,
+                        resolver,
+                        transport,
+                    )
+                {
+                    health.reset();
+                    result = fetch(&fresh);
+                }
+                let answer = result.map_err(|refusal| {
+                    let state = RommConnectivity::from_artwork_refusal(&refusal);
+                    if let Some(state) = state.filter(|state| {
+                        state.is_unreachable()
+                            || state.is_recoverable_by_waiting()
+                            || *state == RommConnectivity::AuthenticationFailed
+                    }) {
+                        health.record(state);
+                    }
+                    ResolveFailure {
+                        message: match state {
+                            Some(state) => state.plain_message().to_string(),
+                            None => refusal.detail(),
+                        },
+                        connectivity: state,
+                    }
+                })?;
                 timings.network = transport.elapsed();
                 if transport.contacted() {
                     health.record(RommConnectivity::Reachable);
@@ -1337,6 +1331,331 @@ mod tests {
                 .effective("http://romm.saltbox:8080")
                 .effective_endpoint,
             "http://127.0.0.1:8080"
+        );
+    }
+
+    /// A local engine whose only RomM container is on a bridge network and has
+    /// no published port. The address can be changed between calls.
+    struct BridgeRomm(Mutex<String>, AtomicUsize);
+    struct SharedBridge(std::sync::Arc<BridgeRomm>);
+    impl archivefs_core::identity_source::romm::local_discovery::DockerCli for SharedBridge {
+        fn run(
+            &self,
+            args: &[&str],
+        ) -> Result<String, archivefs_core::identity_source::romm::local_discovery::DockerFailure>
+        {
+            self.0.1.fetch_add(1, Ordering::Relaxed);
+            Ok(match args[0] {
+                "context" => "unix:///var/run/docker.sock".into(),
+                "ps" => "abc123".into(),
+                "network" => "bridge".into(),
+                _ => serde_json::json!([{
+                    "Name": "/romm", "State": {"Running": true},
+                    "Config": {"Image": "rommapp/romm:5", "Labels": {}, "Env": []},
+                    "HostConfig": {"NetworkMode": "saltbox"},
+                    "NetworkSettings": {
+                        "Ports": {"8080/tcp": null},
+                        "Networks": {"saltbox": {"IPAddress": self.0 .0.lock().unwrap().clone(), "NetworkID": "8a87"}}
+                    }
+                }])
+                .to_string(),
+            })
+        }
+    }
+
+    struct NamesFail;
+    impl HostResolver for NamesFail {
+        fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+            host.parse::<IpAddr>()
+                .map(|address| vec![address])
+                .map_err(|_| "failed to lookup address information".to_string())
+        }
+    }
+
+    fn heartbeat_ok() -> Result<RommHttpResponse, RommRequestError> {
+        Ok(RommHttpResponse {
+            status: 200,
+            body: br#"{"SYSTEM":{"VERSION":"5.3.1"}}"#.to_vec(),
+            location: None,
+        })
+    }
+
+    #[test]
+    fn a_cover_is_fetched_through_the_verified_local_bridge_when_nothing_is_published() {
+        use archivefs_core::identity_source::romm::local_discovery::{
+            EndpointSession, EndpointSource,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let request = remote_request(directory.path(), "http://romm.saltbox:8080", true);
+        let docker = std::sync::Arc::new(BridgeRomm(
+            Mutex::new("172.19.0.24".into()),
+            AtomicUsize::new(0),
+        ));
+        let session: &'static EndpointSession = Box::leak(Box::new(EndpointSession::new(
+            Box::new(SharedBridge(docker)),
+            None,
+        )));
+        let mut health = health();
+        health.endpoints = Some(session);
+        let server = FakeServer::serving_png();
+        server.script.lock().unwrap().insert(0, heartbeat_ok());
+        let transport = TimedTransport::new(server);
+        let result = resolve_with(&request, &transport, &NamesFail, &health);
+        assert!(matches!(result, Ok(Some(_))), "{:?}", state_of(&result));
+        let effective = session.effective("http://romm.saltbox:8080");
+        assert_eq!(effective.endpoint_source, EndpointSource::LocalDockerBridge);
+        assert_eq!(effective.effective_endpoint, "http://172.19.0.24:8080");
+        // the saved endpoint is untouched and the cache still names the configured server
+        assert_eq!(
+            request.index.settings.source.url,
+            "http://romm.saltbox:8080"
+        );
+    }
+
+    #[test]
+    fn a_stale_bridge_address_is_rediscovered_once_and_this_cover_is_retried_once() {
+        use archivefs_core::identity_source::romm::local_discovery::{
+            EndpointSession, EndpointSource, Verification,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let configured = "http://romm.saltbox:8080";
+        let request = remote_request(directory.path(), configured, true);
+        let docker = std::sync::Arc::new(BridgeRomm(
+            Mutex::new("172.19.0.24".into()),
+            AtomicUsize::new(0),
+        ));
+        let session: &'static EndpointSession = Box::leak(Box::new(EndpointSession::new(
+            Box::new(SharedBridge(docker.clone())),
+            None,
+        )));
+        // the session already holds the old bridge address ...
+        session.recover(configured, RommConnectivity::DnsFailure, &mut |_| {
+            Verification::Romm
+        });
+        assert_eq!(
+            session.effective(configured).endpoint_source,
+            EndpointSource::LocalDockerBridge
+        );
+        // ... then the container is recreated with a new one
+        *docker.0.lock().unwrap() = "172.19.0.31".into();
+        let mut health = health();
+        health.endpoints = Some(session);
+        let server = FakeServer::serving_png();
+        {
+            let mut script = server.script.lock().unwrap();
+            script.insert(
+                0,
+                Err(RommRequestError::Transport {
+                    detail: "an I/O error occurred (connection refused)".into(),
+                }),
+            );
+            script.insert(1, heartbeat_ok());
+        }
+        let transport = TimedTransport::new(server);
+        let result = resolve_with(&request, &transport, &NamesFail, &health);
+        assert!(matches!(result, Ok(Some(_))), "{:?}", state_of(&result));
+        assert_eq!(
+            session.effective(configured).effective_endpoint,
+            "http://172.19.0.31:8080"
+        );
+        // stale attempt, one heartbeat to verify the new address, one retry: three requests
+        assert_eq!(transport.inner.calls(), 3);
+    }
+
+    #[test]
+    fn an_authentication_failure_through_the_bridge_is_reported_and_never_rediscovered() {
+        use archivefs_core::identity_source::romm::local_discovery::{
+            EndpointSession, Verification,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let configured = "http://romm.saltbox:8080";
+        let request = remote_request(directory.path(), configured, true);
+        let docker = std::sync::Arc::new(BridgeRomm(
+            Mutex::new("172.19.0.24".into()),
+            AtomicUsize::new(0),
+        ));
+        let session: &'static EndpointSession = Box::leak(Box::new(EndpointSession::new(
+            Box::new(SharedBridge(docker.clone())),
+            None,
+        )));
+        session.recover(configured, RommConnectivity::DnsFailure, &mut |_| {
+            Verification::Romm
+        });
+        *docker.0.lock().unwrap() = "172.19.0.31".into();
+        let mut health = health();
+        health.endpoints = Some(session);
+        let transport = TimedTransport::new(FakeServer::failing(RommRequestError::Unauthorised {
+            status: 401,
+        }));
+        let docker_calls = docker.1.load(Ordering::Relaxed);
+        let result = resolve_with(&request, &transport, &NamesFail, &health);
+        assert_eq!(
+            state_of(&result),
+            Some(RommConnectivity::AuthenticationFailed)
+        );
+        assert_eq!(
+            docker.1.load(Ordering::Relaxed),
+            docker_calls,
+            "Docker was not asked again after an authentication failure"
+        );
+        assert_eq!(
+            session.effective(configured).effective_endpoint,
+            "http://172.19.0.24:8080",
+            "the endpoint was not rediscovered"
+        );
+    }
+
+    /// Real, read-only-on-the-user's-data probe of the production path:
+    /// the configured host fails, local Docker is discovered, RomM is verified,
+    /// and exactly one cover is fetched through the shipped resolver into a
+    /// scratch directory that is deleted afterwards.
+    /// `EMUWIZ_PROBE_COVER_RECORD=<json file with one identity record>
+    ///  cargo test -p archivefs-gui --lib -- --ignored real_bridge_artwork_probe --nocapture`
+    #[test]
+    #[ignore = "talks to the real local Docker engine and the real RomM"]
+    fn real_bridge_artwork_probe() {
+        use archivefs_core::identity_source::{
+            model::IdentityProvider,
+            net_policy::SystemResolver,
+            romm::local_discovery::{shared_session, verify_romm},
+            settings::{SettingsLocation, default_identity_root, load_token_file},
+        };
+        let record_path = std::env::var("EMUWIZ_PROBE_COVER_RECORD").expect("record file");
+        let record: archivefs_core::identity_source::model::ExternalIdentityRecord =
+            serde_json::from_slice(&std::fs::read(record_path).unwrap()).unwrap();
+        let real_root = default_identity_root().unwrap();
+        let settings = SettingsLocation::new(&real_root, IdentityProvider::Romm)
+            .load()
+            .unwrap();
+        let configured = settings.source.url.trim().to_string();
+        let token = load_token_file(settings.source.token_path.as_deref()).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let mut index = MediaIndex {
+            identity_root: scratch.path().join("identity"),
+            server: configured.trim_end_matches('/').to_string(),
+            settings,
+            ..MediaIndex::default()
+        };
+        index.covers.insert(
+            1,
+            Source::Remote {
+                record: Arc::new(record),
+                kind: Kind::Cover,
+            },
+        );
+        let request = Request {
+            key: Key {
+                game: 1,
+                kind: Kind::Cover,
+                generation: 1,
+            },
+            index: Arc::new(index),
+            remote: true,
+            cancel: Arc::new(AtomicBool::new(false)),
+            cache: Some(scratch.path().join("thumbs")),
+        };
+        let health = ProviderHealth::new(Duration::from_secs(60)).with_local_discovery();
+        let transport = TimedTransport::default();
+        let started = Instant::now();
+        let result = resolve_with(&request, &transport, &SystemResolver, &health);
+        let total = started.elapsed();
+        let pixels = match result {
+            Ok(Some(pixels)) => pixels,
+            other => panic!("artwork request failed: {:?}", state_of(&other)),
+        };
+        let effective = shared_session().effective(&configured);
+        println!("configured          = {configured}");
+        println!("effective source    = {:?}", effective.endpoint_source);
+        println!(
+            "effective endpoint  = {} (session only)",
+            effective.effective_endpoint
+        );
+        println!(
+            "image               = {}x{} px decoded",
+            pixels.image.size[0], pixels.image.size[1]
+        );
+        println!(
+            "artwork request     = network {:?}, total incl. configured-fail + Docker discovery + RomM verify {:?}",
+            pixels.timings.network, total
+        );
+        // heartbeat latency through the same effective endpoint
+        let beat = Instant::now();
+        let verdict = verify_romm(
+            &effective.effective_endpoint,
+            &token,
+            &[],
+            &SystemResolver,
+            &archivefs_core::identity_source::romm::client::UreqTransport::new(),
+        );
+        println!("heartbeat           = {verdict:?} in {:?}", beat.elapsed());
+        assert!(effective.endpoint_source.is_fallback());
+        assert_eq!(request.index.settings.source.url, configured);
+        drop(scratch);
+    }
+
+    /// Read-only count of how many library covers come from RomM and how many of
+    /// those are already in the artwork cache (the index file is read, never
+    /// opened through the cache, so nothing is touched):
+    /// `cargo test -p archivefs-gui --lib -- --ignored real_artwork_availability --nocapture`.
+    #[test]
+    #[ignore = "reads the real library database and artwork index read-only"]
+    fn real_artwork_availability() {
+        use archivefs_core::identity_source::artwork::{ArtworkCache, ArtworkRequest};
+        let database = archivefs_core::default_database_path().unwrap();
+        let library = super::super::backend::load_library(&database).unwrap();
+        let index = super::super::media_sources::MediaIndex::discover(&library);
+        let (cached_keys, cached_game_ids): (HashSet<String>, HashSet<String>) = {
+            let path = archivefs_core::identity_source::settings::default_identity_root()
+                .unwrap()
+                .join("romm")
+                .join("artwork")
+                .join("index.json");
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap_or_default())
+                    .unwrap_or_default();
+            let entries = value["entries"].as_array().cloned().unwrap_or_default();
+            (
+                entries
+                    .iter()
+                    .filter_map(|entry| entry["key"].as_str().map(str::to_string))
+                    .collect(),
+                entries
+                    .iter()
+                    .filter_map(|entry| entry["provider_game_id"].as_str().map(str::to_string))
+                    .collect(),
+            )
+        };
+        let mut remote_with_any_entry = 0usize;
+        let (mut local, mut remote, mut remote_cached) = (0usize, 0usize, 0usize);
+        for source in index.covers.values() {
+            match source {
+                Source::Local(_) => local += 1,
+                Source::Remote { record, .. } => {
+                    remote += 1;
+                    let request = ArtworkRequest::from_record(record);
+                    let exact = cached_keys
+                        .contains(&ArtworkCache::key_for(&index.server, &request))
+                        || cached_keys.contains(&ArtworkCache::key_for(
+                            &index.server,
+                            &request.without_large(),
+                        ));
+                    if exact {
+                        remote_cached += 1;
+                    }
+                    if cached_game_ids.contains(request.provider_game_id) {
+                        remote_with_any_entry += 1;
+                    }
+                }
+            }
+        }
+        println!("covers total          = {}", index.covers.len());
+        println!("covers already local  = {local} (mapped files)");
+        println!("covers from RomM      = {remote}");
+        println!("  already cached      = {remote_cached}");
+        println!("  not cached          = {}", remote - remote_cached);
+        println!(
+            "  cache entries (any identity) = {} total, {remote_with_any_entry} for these games",
+            cached_game_ids.len()
         );
     }
 

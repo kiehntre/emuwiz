@@ -5,14 +5,18 @@
 //! failure (DNS, refused, no route, timeout) ever starts a discovery; an
 //! authentication or protocol failure is a different problem and never switches
 //! servers. A discovered endpoint is used for the session only: nothing here
-//! writes configuration, and the address of a bridge-network container is never
-//! used or stored - only a port Docker publishes on the host.
+//! writes configuration. A port Docker publishes on the host is preferred; only
+//! when there is none, the address of a RomM container on a local bridge network
+//! may be used as a *session-only* endpoint, after it answered the RomM
+//! heartbeat. That address is held in memory, is dropped on a connectivity
+//! failure (it changes when the container is recreated), and is never written
+//! to settings, the database or a cache key.
 //!
 //! Docker is asked through the existing `docker` CLI with a fixed argument list
 //! (no shell), a deadline and an output ceiling. It is read-only: `context
 //! inspect`, `ps` and `inspect`. No sudo, no `exec`, no network changes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -33,6 +37,8 @@ const MAX_CONTAINERS: usize = 64;
 pub const REDISCOVERY_COOLDOWN: Duration = Duration::from_secs(60);
 /// RomM listens on this port inside its container unless `ROMM_PORT` says so.
 const ROMM_CONTAINER_PORT: u16 = 8080;
+/// At most this many distinct networks are asked for their driver.
+const MAX_NETWORK_QUERIES: usize = 16;
 
 /// Why Docker could not be asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -123,17 +129,27 @@ pub enum Reach {
     Published { host: String, port: u16 },
     /// The container uses the host network and RomM's port is known.
     HostNetwork { port: u16 },
-    /// Running, but not published to the host (only a bridge-network address
-    /// exists, which is deliberately never used).
+    /// Running, but neither published to the host nor reachable on a verified
+    /// local bridge network.
     NotPublished,
+    /// Not published, but on a local bridge network with a concrete address.
+    /// Session-only: never persisted.
+    Bridge {
+        network: String,
+        address: String,
+        port: u16,
+    },
+    /// Several bridge addresses and nothing to choose between them.
+    BridgeAmbiguous,
     /// Published on IPv6 only, which is not supported here.
     Ipv6Only,
     /// Host network, but RomM's port is not known.
     HostNetworkPortUnknown,
 }
 
-/// A container with positive evidence of being RomM. No token, no environment
-/// and no container IP is ever kept.
+/// A container with positive evidence of being RomM. No token and no
+/// environment is ever kept; a bridge address exists only inside `Reach::Bridge`
+/// and only for this process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalRommCandidate {
     pub container: String,
@@ -148,6 +164,17 @@ impl LocalRommCandidate {
         match &self.reach {
             Reach::Published { host, port } => Some(format!("http://{host}:{port}")),
             Reach::HostNetwork { port } => Some(format!("http://127.0.0.1:{port}")),
+            _ => None,
+        }
+    }
+
+    /// The session-only bridge URL, used only when no published one exists.
+    pub fn bridge_url(&self) -> Option<String> {
+        match &self.reach {
+            Reach::Bridge { address, port, .. } if address.contains(':') => {
+                Some(format!("http://[{address}]:{port}"))
+            }
+            Reach::Bridge { address, port, .. } => Some(format!("http://{address}:{port}")),
             _ => None,
         }
     }
@@ -250,6 +277,106 @@ fn reach_of(container: &serde_json::Value, configured_port: Option<u16>) -> Reac
     }
 }
 
+/// RomM's own listening port: `ROMM_PORT` when set, else the documented 8080.
+fn container_romm_port(container: &serde_json::Value) -> u16 {
+    container["Config"]["Env"]
+        .as_array()
+        .and_then(|env| {
+            env.iter()
+                .filter_map(|item| item.as_str())
+                .find_map(|item| item.strip_prefix("ROMM_PORT="))
+        })
+        .and_then(|port| port.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(ROMM_CONTAINER_PORT)
+}
+
+/// Only an id (hex) or a conservative network name is ever passed to Docker.
+fn safe_network_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+}
+
+/// Whether `key` names a plain local bridge network, asked once per network.
+fn is_bridge_network(
+    docker: &dyn DockerCli,
+    key: &str,
+    drivers: &mut BTreeMap<String, bool>,
+) -> bool {
+    if let Some(known) = drivers.get(key) {
+        return *known;
+    }
+    if drivers.len() >= MAX_NETWORK_QUERIES || !safe_network_key(key) {
+        return false;
+    }
+    let is_bridge = docker
+        .run(&["network", "inspect", "--format", "{{.Driver}}", key])
+        .is_ok_and(|driver| driver.trim() == "bridge");
+    drivers.insert(key.to_string(), is_bridge);
+    is_bridge
+}
+
+/// A concrete address on a local bridge network, for a container that has no
+/// published port. `None` keeps the container as "not published".
+fn bridge_of(
+    container: &serde_json::Value,
+    docker: &dyn DockerCli,
+    drivers: &mut BTreeMap<String, bool>,
+) -> Option<Reach> {
+    let mode = container["HostConfig"]["NetworkMode"]
+        .as_str()
+        .unwrap_or("");
+    if matches!(mode, "host" | "none") || mode.starts_with("container:") {
+        return None;
+    }
+    let networks = container["NetworkSettings"]["Networks"].as_object()?;
+    let mut usable: Vec<(String, String)> = Vec::new();
+    for (name, network) in networks {
+        let address = ["IPAddress", "GlobalIPv6Address"]
+            .iter()
+            .filter_map(|field| network[*field].as_str())
+            .map(str::trim)
+            .find(|text| !text.is_empty())
+            .and_then(|text| text.parse::<std::net::IpAddr>().ok())
+            .filter(|ip| !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast());
+        let Some(address) = address else { continue };
+        let id = network["NetworkID"].as_str().unwrap_or("");
+        let key = if id.is_empty() { name.as_str() } else { id };
+        if is_bridge_network(docker, key, drivers) {
+            usable.push((name.clone(), address.to_string()));
+        }
+    }
+    let port = container_romm_port(container);
+    let pick = |(network, address): &(String, String)| Reach::Bridge {
+        network: network.clone(),
+        address: address.clone(),
+        port,
+    };
+    match usable.as_slice() {
+        [] => None,
+        [only] => Some(pick(only)),
+        several => {
+            // The network the container was started on decides; otherwise it
+            // is a guess, which fails closed.
+            let named: Vec<&(String, String)> = several
+                .iter()
+                .filter(|(name, _)| name == mode || (mode == "default" && name == "bridge"))
+                .collect();
+            match named.as_slice() {
+                [one] => Some(pick(one)),
+                _ => Some(Reach::BridgeAmbiguous),
+            }
+        }
+    }
+}
+
 /// Asks the local engine which running containers are RomM and how each could be
 /// reached from the host.
 pub fn discover_candidates(
@@ -297,6 +424,7 @@ pub fn discover_candidates(
         return DiscoveryOutcome::Malformed;
     };
     let mut candidates = Vec::new();
+    let mut drivers: BTreeMap<String, bool> = BTreeMap::new();
     for container in &containers {
         if container["State"]["Running"].as_bool() != Some(true) {
             continue;
@@ -317,7 +445,12 @@ pub fn discover_candidates(
                 .as_str()
                 .unwrap_or("")
                 .to_string(),
-            reach: reach_of(container, configured_port),
+            reach: match reach_of(container, configured_port) {
+                Reach::NotPublished => {
+                    bridge_of(container, docker, &mut drivers).unwrap_or(Reach::NotPublished)
+                }
+                other => other,
+            },
         });
     }
     DiscoveryOutcome::Candidates(candidates)
@@ -378,6 +511,11 @@ pub fn validate_with_local_fallback(
     let mut effective = config.clone();
     effective.url = session.effective(&configured).effective_endpoint;
     let first = ValidatedRommSource::validate(&effective, token, trusted_roots, resolver);
+    let first = if session.effective(&configured).endpoint_source.is_fallback() {
+        first.map(|source| keep_configured_identity(source, &configured))
+    } else {
+        first
+    };
     let dns = matches!(
         &first,
         Err(super::config::ConfigRefusal::Endpoint(
@@ -387,17 +525,28 @@ pub fn validate_with_local_fallback(
     if !dns {
         return first;
     }
-    if session.effective(&configured).endpoint_source == EndpointSource::LocalDockerFallback {
+    if session.effective(&configured).endpoint_source.is_fallback() {
         session.invalidate();
     }
     let recovered = session.recover(&configured, RommConnectivity::DnsFailure, &mut |url| {
         verify_romm(url, token, trusted_roots, resolver, transport)
     });
-    if recovered.endpoint_source == EndpointSource::LocalDockerFallback {
+    if recovered.endpoint_source.is_fallback() {
         effective.url = recovered.effective_endpoint;
-        return ValidatedRommSource::validate(&effective, token, trusted_roots, resolver);
+        return ValidatedRommSource::validate(&effective, token, trusted_roots, resolver)
+            .map(|source| keep_configured_identity(source, &configured));
     }
     first
+}
+
+/// A source reached through a session-only local address keeps the configured
+/// server's identity for cache and index keys, so no container address is ever
+/// written to disk as a server id.
+fn keep_configured_identity(source: ValidatedRommSource, configured: &str) -> ValidatedRommSource {
+    match crate::identity_source::net_policy::endpoint_origin(configured) {
+        Some(origin) => source.with_cache_identity(origin),
+        None => source,
+    }
 }
 
 /// One discovery memory for the whole process.
@@ -408,8 +557,20 @@ pub fn shared_session() -> &'static EndpointSession {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum EndpointSource {
+    /// The address the user configured.
     Configured,
-    LocalDockerFallback,
+    /// A host port Docker publishes for the local RomM (session-only).
+    LocalDockerPublished,
+    /// The local RomM container's bridge-network address (session-only, and it
+    /// changes when the container is recreated).
+    LocalDockerBridge,
+}
+
+impl EndpointSource {
+    /// True for either session-only local Docker route.
+    pub fn is_fallback(self) -> bool {
+        !matches!(self, Self::Configured)
+    }
 }
 
 /// The endpoint requests should use right now.
@@ -424,7 +585,10 @@ pub struct EffectiveEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum LocalRommStatus {
     /// "RomM found locally. Connected automatically through Docker."
-    ConnectedAutomatically { endpoint: String },
+    ConnectedAutomatically {
+        endpoint: String,
+        source: EndpointSource,
+    },
     /// "RomM is running in Docker, but it is not published to the host."
     FoundNotHostAccessible { reach: Reach },
     /// "Several RomM servers were found on this computer." (for a later choice)
@@ -437,7 +601,7 @@ pub enum LocalRommStatus {
 
 struct State {
     configured: String,
-    fallback: Option<String>,
+    fallback: Option<(String, EndpointSource)>,
     status: Option<LocalRommStatus>,
     last_attempt: Option<Instant>,
 }
@@ -477,10 +641,10 @@ impl EndpointSession {
                 .flatten()
         });
         match fallback {
-            Some(url) => EffectiveEndpoint {
+            Some((url, source)) => EffectiveEndpoint {
                 configured_endpoint: configured.to_string(),
                 effective_endpoint: url,
-                endpoint_source: EndpointSource::LocalDockerFallback,
+                endpoint_source: source,
             },
             None => EffectiveEndpoint {
                 configured_endpoint: configured.to_string(),
@@ -561,7 +725,7 @@ impl EndpointSession {
         &self,
         configured_port: Option<u16>,
         verify: &mut dyn FnMut(&str) -> Verification,
-    ) -> (LocalRommStatus, Option<String>) {
+    ) -> (LocalRommStatus, Option<(String, EndpointSource)>) {
         let outcome = discover_candidates(
             self.docker.as_ref(),
             self.docker_host_env.as_deref(),
@@ -574,6 +738,7 @@ impl EndpointSession {
         let mut verified: BTreeSet<String> = BTreeSet::new();
         let mut unverified = false;
         let mut blocked: Option<Reach> = None;
+        // 1. A port Docker publishes on the host is always preferred.
         for candidate in &candidates {
             match candidate.url() {
                 Some(url) => match verify(&url) {
@@ -582,55 +747,112 @@ impl EndpointSession {
                     }
                     _ => unverified = true,
                 },
-                None => blocked = blocked.or(Some(candidate.reach.clone())),
-            }
-        }
-        match verified.len() {
-            1 => {
-                let endpoint = verified.into_iter().next().unwrap_or_default();
-                (
-                    LocalRommStatus::ConnectedAutomatically {
-                        endpoint: endpoint.clone(),
-                    },
-                    Some(endpoint),
-                )
-            }
-            0 => (
-                match (blocked, unverified) {
-                    (Some(reach), _) => LocalRommStatus::FoundNotHostAccessible { reach },
-                    (None, true) => LocalRommStatus::FoundButNotVerified,
-                    (None, false) => LocalRommStatus::NoneFound,
-                },
-                None,
-            ),
-            _ => {
-                // Only the configured port may break a tie; anything else is a
-                // guess, so it fails closed.
-                let matching: Vec<&String> = verified
-                    .iter()
-                    .filter(|url| {
-                        url.rsplit_once(':')
-                            .and_then(|(_, port)| port.parse::<u16>().ok())
-                            == configured_port
-                    })
-                    .collect();
-                if let [only] = matching.as_slice() {
-                    let endpoint = (*only).clone();
-                    return (
-                        LocalRommStatus::ConnectedAutomatically {
-                            endpoint: endpoint.clone(),
-                        },
-                        Some(endpoint),
-                    );
+                None => {
+                    if candidate.bridge_url().is_none() {
+                        blocked = blocked.or(Some(candidate.reach.clone()));
+                    }
                 }
-                (
-                    LocalRommStatus::MultipleFound {
-                        endpoints: verified.into_iter().collect(),
-                    },
-                    None,
-                )
             }
         }
+        if !verified.is_empty() {
+            return Self::choose(
+                verified,
+                configured_port,
+                EndpointSource::LocalDockerPublished,
+            );
+        }
+        // 2. Only with nothing published, a verified bridge-network address.
+        let mut bridge_verified: BTreeSet<String> = BTreeSet::new();
+        for candidate in &candidates {
+            if let Some(url) = candidate.bridge_url() {
+                match verify(&url) {
+                    Verification::Romm => {
+                        bridge_verified.insert(url);
+                    }
+                    _ => unverified = true,
+                }
+            }
+        }
+        if !bridge_verified.is_empty() {
+            // Bridge ports are all the container's internal one, so the
+            // configured port cannot choose between servers: several fail closed.
+            return Self::choose(bridge_verified, None, EndpointSource::LocalDockerBridge);
+        }
+        (
+            match (blocked, unverified) {
+                (Some(reach), _) => LocalRommStatus::FoundNotHostAccessible { reach },
+                (None, true) => LocalRommStatus::FoundButNotVerified,
+                (None, false) => LocalRommStatus::NoneFound,
+            },
+            None,
+        )
+    }
+
+    /// One verified endpoint wins; several fail closed unless the configured
+    /// port singles exactly one out (published endpoints only).
+    fn choose(
+        verified: BTreeSet<String>,
+        tie_break_port: Option<u16>,
+        source: EndpointSource,
+    ) -> (LocalRommStatus, Option<(String, EndpointSource)>) {
+        let connected = |endpoint: String| {
+            (
+                LocalRommStatus::ConnectedAutomatically {
+                    endpoint: endpoint.clone(),
+                    source,
+                },
+                Some((endpoint, source)),
+            )
+        };
+        if verified.len() == 1 {
+            return connected(verified.into_iter().next().unwrap_or_default());
+        }
+        let matching: Vec<&String> = verified
+            .iter()
+            .filter(|url| {
+                tie_break_port.is_some()
+                    && url
+                        .rsplit_once(':')
+                        .and_then(|(_, port)| port.trim_end_matches('/').parse::<u16>().ok())
+                        == tie_break_port
+            })
+            .collect();
+        if let [only] = matching.as_slice() {
+            return connected((*only).clone());
+        }
+        (
+            LocalRommStatus::MultipleFound {
+                endpoints: verified.into_iter().collect(),
+            },
+            None,
+        )
+    }
+
+    /// A request through the *current* local Docker endpoint failed with a
+    /// connectivity-class error: forget it, ask Docker once more, verify RomM
+    /// again, and report the endpoint to retry once against. `None` when there
+    /// is nothing new to try (no fallback was found), so the caller reports the
+    /// failure instead of looping.
+    pub fn recover_after_failure(
+        &self,
+        configured: &str,
+        cause: RommConnectivity,
+        verify: &mut dyn FnMut(&str) -> Verification,
+    ) -> Option<EffectiveEndpoint> {
+        if !matches!(
+            cause,
+            RommConnectivity::DnsFailure
+                | RommConnectivity::ConnectionRefused
+                | RommConnectivity::ConnectionFailed
+                | RommConnectivity::Timeout
+        ) {
+            return None;
+        }
+        if self.effective(configured).endpoint_source.is_fallback() {
+            self.invalidate();
+        }
+        let after = self.recover(configured, cause, verify);
+        after.endpoint_source.is_fallback().then_some(after)
     }
 }
 
@@ -916,7 +1138,7 @@ mod tests {
             });
             assert_eq!(
                 effective.endpoint_source,
-                EndpointSource::LocalDockerFallback
+                EndpointSource::LocalDockerPublished
             );
             assert_eq!(effective.effective_endpoint, "http://127.0.0.1:8080");
             // the configured value is reported unchanged, never rewritten
@@ -1261,6 +1483,450 @@ mod tests {
         assert_eq!(session.status(), None);
     }
 
+    // --- bridge fallback (session-only) -----------------------------------
+
+    fn on_bridge(name: &str, ip: &str, network: &str, mode: &str) -> serde_json::Value {
+        let mut value = container(
+            name,
+            "rommapp/romm:5.3.1",
+            mode,
+            serde_json::json!({"8080/tcp": null}),
+        );
+        value["NetworkSettings"]["Networks"] = serde_json::json!({
+            network: {"IPAddress": ip, "NetworkID": "8a872bb56623f3d9fd68b139b7f1948528525c8ac70158960405c08e853141ea"}
+        });
+        value
+    }
+
+    fn bridge_docker(containers: serde_json::Value) -> FakeDocker {
+        FakeDocker::new()
+            .local(containers)
+            .with("network", Ok("bridge\n".into()))
+    }
+
+    #[test]
+    fn an_unpublished_romm_on_a_local_bridge_network_gets_a_session_only_bridge_endpoint() {
+        let docker = bridge_docker(serde_json::json!([on_bridge(
+            "romm",
+            "172.19.0.24",
+            "saltbox",
+            "saltbox"
+        )]));
+        let found = candidates(&docker);
+        assert_eq!(
+            found[0].reach,
+            Reach::Bridge {
+                network: "saltbox".into(),
+                address: "172.19.0.24".into(),
+                port: 8080
+            }
+        );
+        assert_eq!(found[0].url(), None, "it is not a published endpoint");
+        assert_eq!(
+            found[0].bridge_url().as_deref(),
+            Some("http://172.19.0.24:8080")
+        );
+    }
+
+    #[test]
+    fn only_a_plain_local_bridge_network_qualifies_and_docker_is_only_read() {
+        for driver in ["overlay", "macvlan", "host", "null", "ipvlan"] {
+            let docker = FakeDocker::new()
+                .local(serde_json::json!([on_bridge(
+                    "romm", "10.0.0.5", "net", "net"
+                )]))
+                .with("network", Ok(format!("{driver}\n")));
+            assert_eq!(
+                candidates(&docker)[0].reach,
+                Reach::NotPublished,
+                "{driver}"
+            );
+        }
+        // an unreadable driver also fails closed
+        let docker = FakeDocker::new()
+            .local(serde_json::json!([on_bridge(
+                "romm", "10.0.0.5", "net", "net"
+            )]))
+            .with("network", Err(DockerFailure::Failed));
+        assert_eq!(candidates(&docker)[0].reach, Reach::NotPublished);
+        // every call Docker received was a read-only inspection
+        let docker = bridge_docker(serde_json::json!([on_bridge(
+            "romm",
+            "172.19.0.24",
+            "saltbox",
+            "saltbox"
+        )]));
+        candidates(&docker);
+        for call in docker.calls.lock().unwrap().iter() {
+            let head = call[0].as_str();
+            assert!(
+                matches!(head, "context" | "ps" | "inspect" | "network"),
+                "{call:?}"
+            );
+            if head == "network" {
+                assert_eq!(&call[1..4], ["inspect", "--format", "{{.Driver}}"]);
+            }
+            assert!(
+                !call.iter().any(|arg| arg == "exec" || arg == "run"),
+                "{call:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_none_and_shared_network_modes_and_missing_addresses_are_refused() {
+        for mode in ["host", "none", "container:abcd"] {
+            let docker = bridge_docker(serde_json::json!([on_bridge(
+                "romm",
+                "172.19.0.24",
+                "n",
+                mode
+            )]));
+            let reach = candidates(&docker)[0].reach.clone();
+            assert!(!matches!(reach, Reach::Bridge { .. }), "{mode}: {reach:?}");
+        }
+        let docker = bridge_docker(serde_json::json!([on_bridge(
+            "romm", "", "saltbox", "saltbox"
+        )]));
+        assert_eq!(candidates(&docker)[0].reach, Reach::NotPublished);
+        let docker = bridge_docker(serde_json::json!([on_bridge(
+            "romm", "0.0.0.0", "saltbox", "saltbox"
+        )]));
+        assert_eq!(candidates(&docker)[0].reach, Reach::NotPublished);
+        // a stopped container is never a candidate
+        let mut stopped = on_bridge("romm", "172.19.0.24", "saltbox", "saltbox");
+        stopped["State"]["Running"] = false.into();
+        assert!(candidates(&bridge_docker(serde_json::json!([stopped]))).is_empty());
+    }
+
+    #[test]
+    fn a_container_on_several_bridge_networks_needs_the_started_network_to_decide() {
+        let mut value = on_bridge("romm", "172.19.0.24", "saltbox", "saltbox");
+        value["NetworkSettings"]["Networks"]["other"] =
+            serde_json::json!({"IPAddress": "172.20.0.5", "NetworkID": "bbbb"});
+        let docker = bridge_docker(serde_json::json!([value.clone()]));
+        assert!(
+            matches!(&candidates(&docker)[0].reach, Reach::Bridge { address, .. } if address == "172.19.0.24")
+        );
+        value["HostConfig"]["NetworkMode"] = "elsewhere".into();
+        let docker = bridge_docker(serde_json::json!([value]));
+        assert_eq!(candidates(&docker)[0].reach, Reach::BridgeAmbiguous);
+    }
+
+    #[test]
+    fn a_verified_bridge_endpoint_becomes_the_session_endpoint_without_touching_configuration() {
+        let session = EndpointSession::new(
+            Box::new(bridge_docker(serde_json::json!([on_bridge(
+                "romm",
+                "172.19.0.24",
+                "saltbox",
+                "saltbox"
+            )]))),
+            None,
+        );
+        let configured = "http://romm.saltbox:8080";
+        let effective = session.recover(configured, RommConnectivity::DnsFailure, &mut |url| {
+            assert_eq!(url, "http://172.19.0.24:8080");
+            Verification::Romm
+        });
+        assert_eq!(effective.endpoint_source, EndpointSource::LocalDockerBridge);
+        assert_eq!(effective.effective_endpoint, "http://172.19.0.24:8080");
+        assert_eq!(effective.configured_endpoint, configured);
+        assert!(matches!(
+            session.status(),
+            Some(LocalRommStatus::ConnectedAutomatically {
+                source: EndpointSource::LocalDockerBridge,
+                ..
+            })
+        ));
+        // a different configured endpoint never inherits it
+        assert_eq!(
+            session.effective("http://other:1").endpoint_source,
+            EndpointSource::Configured
+        );
+    }
+
+    #[test]
+    fn a_published_endpoint_beats_a_bridge_one_and_the_bridge_is_not_even_asked() {
+        let containers = serde_json::json!([
+            on_bridge("romm-hidden", "172.19.0.24", "saltbox", "saltbox"),
+            romm_published("8080"),
+        ]);
+        let session = EndpointSession::new(Box::new(bridge_docker(containers)), None);
+        let effective = session.recover(
+            "http://romm.saltbox:8080",
+            RommConnectivity::DnsFailure,
+            &mut |url| {
+                assert_eq!(
+                    url, "http://127.0.0.1:8080",
+                    "the bridge address must not be verified"
+                );
+                Verification::Romm
+            },
+        );
+        assert_eq!(
+            effective.endpoint_source,
+            EndpointSource::LocalDockerPublished
+        );
+        // if the published one is NOT RomM, the bridge one may then be tried
+        let containers = serde_json::json!([
+            on_bridge("romm-hidden", "172.19.0.24", "saltbox", "saltbox"),
+            romm_published("8080"),
+        ]);
+        let session = EndpointSession::new(Box::new(bridge_docker(containers)), None);
+        let effective = session.recover(
+            "http://romm.saltbox:8080",
+            RommConnectivity::DnsFailure,
+            &mut |url| {
+                if url.contains("127.0.0.1") {
+                    Verification::NotRomm
+                } else {
+                    Verification::Romm
+                }
+            },
+        );
+        assert_eq!(effective.endpoint_source, EndpointSource::LocalDockerBridge);
+    }
+
+    #[test]
+    fn a_bridge_address_that_does_not_answer_like_romm_is_not_used() {
+        let session = EndpointSession::new(
+            Box::new(bridge_docker(serde_json::json!([on_bridge(
+                "romm",
+                "172.19.0.24",
+                "saltbox",
+                "saltbox"
+            )]))),
+            None,
+        );
+        let effective = session.recover(
+            "http://romm:8080",
+            RommConnectivity::DnsFailure,
+            &mut |_| Verification::NotRomm,
+        );
+        assert_eq!(effective.endpoint_source, EndpointSource::Configured);
+        assert_eq!(session.status(), Some(LocalRommStatus::FoundButNotVerified));
+    }
+
+    #[test]
+    fn several_verified_bridge_romm_servers_fail_closed() {
+        let containers = serde_json::json!([
+            on_bridge("romm-a", "172.19.0.24", "saltbox", "saltbox"),
+            on_bridge("romm-b", "172.19.0.30", "saltbox", "saltbox"),
+        ]);
+        let session = EndpointSession::new(Box::new(bridge_docker(containers)), None);
+        // even a configured port equal to RomM's own cannot choose between two bridge servers
+        let effective = session.recover(
+            "http://romm.saltbox:8080",
+            RommConnectivity::DnsFailure,
+            &mut |_| Verification::Romm,
+        );
+        assert_eq!(effective.endpoint_source, EndpointSource::Configured);
+        assert!(
+            matches!(session.status(), Some(LocalRommStatus::MultipleFound { endpoints }) if endpoints.len() == 2)
+        );
+    }
+
+    /// A docker whose RomM container address can change between calls.
+    struct MovingBridge {
+        ip: Mutex<String>,
+        calls: Mutex<usize>,
+    }
+    impl DockerCli for MovingBridge {
+        fn run(&self, args: &[&str]) -> Result<String, DockerFailure> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(match args[0] {
+                "context" => "unix:///var/run/docker.sock".into(),
+                "ps" => "aaaa".into(),
+                "network" => "bridge".into(),
+                _ => serde_json::json!([on_bridge(
+                    "romm",
+                    &self.ip.lock().unwrap(),
+                    "saltbox",
+                    "saltbox"
+                )])
+                .to_string(),
+            })
+        }
+    }
+    struct SharedMoving(std::sync::Arc<MovingBridge>);
+    impl DockerCli for SharedMoving {
+        fn run(&self, args: &[&str]) -> Result<String, DockerFailure> {
+            self.0.run(args)
+        }
+    }
+
+    #[test]
+    fn a_stale_bridge_address_is_rediscovered_once_and_the_new_address_is_verified_and_used() {
+        let moving = std::sync::Arc::new(MovingBridge {
+            ip: Mutex::new("172.19.0.24".into()),
+            calls: Mutex::new(0),
+        });
+        let session = EndpointSession::new(Box::new(SharedMoving(moving.clone())), None);
+        let configured = "http://romm.saltbox:8080";
+        let first = session.recover(configured, RommConnectivity::DnsFailure, &mut |_| {
+            Verification::Romm
+        });
+        assert_eq!(first.effective_endpoint, "http://172.19.0.24:8080");
+        // the container is recreated: the old address now refuses connections
+        *moving.ip.lock().unwrap() = "172.19.0.31".into();
+        let mut asked = Vec::new();
+        let next = session
+            .recover_after_failure(
+                configured,
+                RommConnectivity::ConnectionRefused,
+                &mut |url| {
+                    asked.push(url.to_string());
+                    Verification::Romm
+                },
+            )
+            .expect("a fresh verified endpoint");
+        assert_eq!(next.endpoint_source, EndpointSource::LocalDockerBridge);
+        assert_eq!(next.effective_endpoint, "http://172.19.0.31:8080");
+        assert_eq!(
+            asked,
+            vec!["http://172.19.0.31:8080"],
+            "RomM is verified again, once"
+        );
+        assert_eq!(
+            session.effective(configured).effective_endpoint,
+            "http://172.19.0.31:8080"
+        );
+    }
+
+    #[test]
+    fn authentication_and_api_errors_never_rediscover_and_a_missing_romm_ends_the_retry() {
+        let moving = std::sync::Arc::new(MovingBridge {
+            ip: Mutex::new("172.19.0.24".into()),
+            calls: Mutex::new(0),
+        });
+        let session = EndpointSession::new(Box::new(SharedMoving(moving.clone())), None);
+        let configured = "http://romm.saltbox:8080";
+        session.recover(configured, RommConnectivity::DnsFailure, &mut |_| {
+            Verification::Romm
+        });
+        let before = *moving.calls.lock().unwrap();
+        for cause in [
+            RommConnectivity::AuthenticationFailed,
+            RommConnectivity::HttpError(500),
+            RommConnectivity::EndpointRefused,
+            RommConnectivity::TlsFailure,
+        ] {
+            assert!(
+                session
+                    .recover_after_failure(configured, cause, &mut |_| panic!("must not verify"))
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            *moving.calls.lock().unwrap(),
+            before,
+            "docker was not asked again"
+        );
+        assert_eq!(
+            session.effective(configured).effective_endpoint,
+            "http://172.19.0.24:8080"
+        );
+        // connectivity failure but RomM is really gone: nothing to retry against
+        let none = session.recover_after_failure(
+            configured,
+            RommConnectivity::ConnectionRefused,
+            &mut |_| Verification::Unreachable,
+        );
+        assert!(none.is_none());
+        assert_eq!(
+            session.effective(configured).endpoint_source,
+            EndpointSource::Configured
+        );
+    }
+
+    #[test]
+    fn a_bridge_endpoint_is_session_only_the_configuration_and_cache_identity_stay_configured() {
+        let token = RommToken::parse(SECRET).unwrap();
+        let config = RommSourceConfig {
+            enabled: true,
+            url: "http://romm.saltbox:8080".into(),
+            ..RommSourceConfig::default()
+        };
+        let before = config.clone();
+        let heartbeat = fake(200, r#"{"SYSTEM":{"VERSION":"5.3.1"}}"#);
+        let session = EndpointSession::new(
+            Box::new(bridge_docker(serde_json::json!([on_bridge(
+                "romm",
+                "172.19.0.24",
+                "saltbox",
+                "saltbox"
+            )]))),
+            None,
+        );
+        let source = validate_with_local_fallback(
+            Some(&session),
+            &config,
+            &token,
+            &[],
+            &StaticResolver::new(),
+            &heartbeat,
+        )
+        .unwrap();
+        assert_eq!(source.endpoint().origin(), "http://172.19.0.24:8080");
+        assert_eq!(
+            source.server_id(),
+            "http://romm.saltbox:8080",
+            "cache keys name the configured server"
+        );
+        assert_eq!(config, before);
+        // a second request in the session keeps the same identity
+        let again = validate_with_local_fallback(
+            Some(&session),
+            &config,
+            &token,
+            &[],
+            &StaticResolver::new(),
+            &heartbeat,
+        )
+        .unwrap();
+        assert_eq!(again.server_id(), "http://romm.saltbox:8080");
+        // nothing the session exposes for persistence mentions the address in a config-shaped type
+        assert!(!serde_json::to_string(&config).unwrap().contains("172.19"));
+    }
+
+    #[test]
+    fn the_configured_endpoint_still_wins_when_it_resolves() {
+        let docker = std::sync::Arc::new(bridge_docker(serde_json::json!([on_bridge(
+            "romm",
+            "172.19.0.24",
+            "saltbox",
+            "saltbox"
+        )])));
+        struct Shared(std::sync::Arc<FakeDocker>);
+        impl DockerCli for Shared {
+            fn run(&self, args: &[&str]) -> Result<String, DockerFailure> {
+                self.0.run(args)
+            }
+        }
+        let session = EndpointSession::new(Box::new(Shared(docker.clone())), None);
+        let token = RommToken::parse(SECRET).unwrap();
+        let config = RommSourceConfig {
+            enabled: true,
+            url: "http://romm.saltbox:8080".into(),
+            ..RommSourceConfig::default()
+        };
+        let resolver =
+            StaticResolver::new().with_v4("romm.saltbox", std::net::Ipv4Addr::new(10, 0, 0, 5));
+        let source = validate_with_local_fallback(
+            Some(&session),
+            &config,
+            &token,
+            &[],
+            &resolver,
+            &fake(200, "{}"),
+        )
+        .unwrap();
+        assert_eq!(source.server_id(), "http://romm.saltbox:8080");
+        assert_eq!(source.endpoint().origin(), "http://romm.saltbox:8080");
+        assert_eq!(docker.calls(), 0);
+    }
+
     /// Read-only probe of the real local engine (never part of the normal run):
     /// `cargo test -p archivefs-core --lib -- --ignored real_local_docker_probe --nocapture`.
     #[test]
@@ -1272,7 +1938,8 @@ mod tests {
         if let DiscoveryOutcome::Candidates(list) = &outcome {
             let token = RommToken::parse("probe-token-never-sent").unwrap();
             for candidate in list {
-                let verdict = candidate.url().map(|url| {
+                let probe_url = candidate.url().or_else(|| candidate.bridge_url());
+                let verdict = probe_url.clone().map(|url| {
                     verify_romm(
                         &url,
                         &token,
@@ -1282,9 +1949,8 @@ mod tests {
                     )
                 });
                 println!(
-                    "{} url={:?} verification={verdict:?}",
-                    candidate.container,
-                    candidate.url()
+                    "{} reach={:?} url={probe_url:?} verification={verdict:?}",
+                    candidate.container, candidate.reach
                 );
             }
         }

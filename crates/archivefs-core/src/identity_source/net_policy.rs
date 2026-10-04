@@ -414,6 +414,16 @@ pub fn validate_endpoint(
     })
 }
 
+/// The origin an endpoint URL would have once approved, computed without any
+/// DNS lookup. Used to keep one stable identity (cache keys) for a server that
+/// is temporarily reached through a different, session-only address.
+#[must_use]
+pub fn endpoint_origin(url: &str) -> Option<String> {
+    ParsedEndpoint::parse(url)
+        .ok()
+        .map(|parsed| parsed.origin())
+}
+
 /// Revalidates a redirect destination against the same policy.
 ///
 /// Stage 1 does not follow redirects - the client is configured with none - so

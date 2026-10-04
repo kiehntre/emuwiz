@@ -262,6 +262,10 @@ pub struct ValidatedRommSource {
     mappings: PathMappings,
     media_mapping: Option<ValidatedRommMediaMapping>,
     token: RommToken,
+    /// Set only when the request goes to a session-only address (a local
+    /// Docker endpoint). Cache and index keys then still name the *configured*
+    /// server, so a container address never becomes persistent identity.
+    cache_identity: Option<String>,
 }
 
 /// Why a configuration cannot be used.
@@ -324,7 +328,16 @@ impl ValidatedRommSource {
             mappings,
             media_mapping,
             token: token.clone(),
+            cache_identity: None,
         })
+    }
+
+    /// Keeps cache and index keys on the configured server's identity while the
+    /// request itself goes to a different, session-only address.
+    #[must_use]
+    pub fn with_cache_identity(mut self, configured_origin: String) -> Self {
+        self.cache_identity = Some(configured_origin);
+        self
     }
 
     pub fn endpoint(&self) -> &ApprovedEndpoint {
@@ -346,6 +359,8 @@ impl ValidatedRommSource {
     /// The stable, non-secret identifier for this instance, used to keep two
     /// servers' cached records apart. The approved origin - never the token.
     pub fn server_id(&self) -> &str {
-        self.endpoint.origin()
+        self.cache_identity
+            .as_deref()
+            .unwrap_or_else(|| self.endpoint.origin())
     }
 }

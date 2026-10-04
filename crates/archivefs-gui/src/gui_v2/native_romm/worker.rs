@@ -45,7 +45,54 @@ pub(super) fn run_with<T: RommTransport>(
     run_with_endpoints(root, request, roots, resolver, transport, cancel, None)
 }
 
-fn run_with_endpoints<T: RommTransport>(
+pub(super) fn run_with_endpoints<T: RommTransport>(
+    root: &Path,
+    request: Request,
+    roots: &[PathBuf],
+    resolver: &impl HostResolver,
+    transport: &T,
+    cancel: &AtomicBool,
+    endpoints: Option<&archivefs_core::identity_source::romm::local_discovery::EndpointSession>,
+) -> Result<Reply, Problem> {
+    use archivefs_core::identity_source::romm::{
+        connectivity::RommConnectivity, local_discovery::verify_romm,
+    };
+    let retry = request.clone();
+    let first =
+        attempt_with_endpoints(root, request, roots, resolver, transport, cancel, endpoints);
+    let Some(session) = endpoints else {
+        return first;
+    };
+    // Only a connectivity-class failure may start (or refresh) a local Docker
+    // route, and the request is retried at most once against it.
+    let cause = match &first {
+        Err(Problem::Backend(RommBrowseError::Unreachable)) => RommConnectivity::ConnectionFailed,
+        Err(Problem::Backend(RommBrowseError::Timeout)) => RommConnectivity::Timeout,
+        Ok(Reply::Connection { info, .. }) => match info.error {
+            Some(RommBrowseError::Unreachable) => RommConnectivity::ConnectionFailed,
+            Some(RommBrowseError::Timeout) => RommConnectivity::Timeout,
+            _ => return first,
+        },
+        _ => return first,
+    };
+    let location = SettingsLocation::new(root, IdentityProvider::Romm);
+    let Ok(settings) = location.load() else {
+        return first;
+    };
+    let Ok(token) = load_token_file(settings.source.token_path.as_deref()) else {
+        return first;
+    };
+    let configured = settings.source.url.trim().to_string();
+    let recovered = session.recover_after_failure(&configured, cause, &mut |url| {
+        verify_romm(url, &token, roots, resolver, transport)
+    });
+    if recovered.is_none() {
+        return first;
+    }
+    attempt_with_endpoints(root, retry, roots, resolver, transport, cancel, endpoints)
+}
+
+fn attempt_with_endpoints<T: RommTransport>(
     root: &Path,
     request: Request,
     roots: &[PathBuf],

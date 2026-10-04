@@ -952,3 +952,188 @@ fn existing_gui_worker_keeps_slow_network_off_the_ui_thread() {
     assert!(state.problem.is_some());
     assert!(activity.jobs.values().all(|j| !j.active()));
 }
+
+// --- local Docker route (session-only) ---------------------------------------
+
+use archivefs_core::identity_source::romm::local_discovery::{
+    DockerCli, DockerFailure, EndpointSession, EndpointSource,
+};
+
+/// A local engine whose RomM has no published port; its bridge address can change.
+struct BridgeDocker(Mutex<String>);
+struct SharedBridgeDocker(std::sync::Arc<BridgeDocker>);
+impl DockerCli for SharedBridgeDocker {
+    fn run(&self, args: &[&str]) -> Result<String, DockerFailure> {
+        Ok(match args[0] {
+            "context" => "unix:///var/run/docker.sock".into(),
+            "ps" => "abc123".into(),
+            "network" => "bridge".into(),
+            _ => json!([{
+                "Name": "/romm", "State": {"Running": true},
+                "Config": {"Image": "rommapp/romm:5", "Labels": {}, "Env": []},
+                "HostConfig": {"NetworkMode": "saltbox"},
+                "NetworkSettings": {
+                    "Ports": {"8080/tcp": null},
+                    "Networks": {"saltbox": {"IPAddress": self.0.0.lock().unwrap().clone(), "NetworkID": "8a87"}}
+                }
+            }])
+            .to_string(),
+        })
+    }
+}
+
+/// Refuses connections to one address, otherwise behaves like the fixture.
+struct Refusing<'a> {
+    refuse: &'a str,
+    inner: &'a Fixture,
+}
+impl RommTransport for Refusing<'_> {
+    fn get(
+        &self,
+        url: &str,
+        authorization: Option<&str>,
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> Result<RommHttpResponse, RommRequestError> {
+        if url.contains(self.refuse) {
+            self.inner.requests.lock().unwrap().push(url.to_owned());
+            return Err(RommRequestError::Transport {
+                detail: "an I/O error occurred (connection refused)".into(),
+            });
+        }
+        self.inner.get(url, authorization, max_bytes, timeout)
+    }
+}
+
+fn leaked_session(docker: &std::sync::Arc<BridgeDocker>) -> &'static EndpointSession {
+    Box::leak(Box::new(EndpointSession::new(
+        Box::new(SharedBridgeDocker(docker.clone())),
+        None,
+    )))
+}
+
+#[test]
+fn the_native_browser_connects_through_the_same_verified_bridge_endpoint() {
+    let docker = std::sync::Arc::new(BridgeDocker(Mutex::new("172.19.0.24".into())));
+    let session = leaked_session(&docker);
+    let root = tempfile::tempdir().unwrap();
+    settings(root.path(), "http://romm.saltbox:8080");
+    let fixture = Fixture::default();
+    let reply = worker::run_with_endpoints(
+        root.path(),
+        Request::Connect,
+        &[],
+        &StaticResolver::new(), // romm.saltbox does not resolve; address literals do
+        &fixture,
+        &AtomicBool::new(false),
+        Some(session),
+    )
+    .unwrap();
+    assert!(matches!(reply, Reply::Connection { .. }));
+    let effective = session.effective("http://romm.saltbox:8080");
+    assert_eq!(effective.endpoint_source, EndpointSource::LocalDockerBridge);
+    let requests = fixture.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|url| url.starts_with("http://172.19.0.24:8080/")),
+        "{requests:?}"
+    );
+    // the saved endpoint is untouched
+    let saved = SettingsLocation::new(root.path(), IdentityProvider::Romm)
+        .load()
+        .unwrap();
+    assert_eq!(saved.source.url, "http://romm.saltbox:8080");
+    let on_disk = std::fs::read_to_string(
+        SettingsLocation::new(root.path(), IdentityProvider::Romm).config_path(),
+    )
+    .unwrap();
+    assert!(!on_disk.contains("172.19"), "{on_disk}");
+}
+
+#[test]
+fn a_stale_bridge_address_in_the_browser_is_rediscovered_and_the_request_retried_once() {
+    let docker = std::sync::Arc::new(BridgeDocker(Mutex::new("172.19.0.24".into())));
+    let session = leaked_session(&docker);
+    let root = tempfile::tempdir().unwrap();
+    settings(root.path(), "http://romm.saltbox:8080");
+    let fixture = Fixture::default();
+    let first = worker::run_with_endpoints(
+        root.path(),
+        Request::Connect,
+        &[],
+        &StaticResolver::new(),
+        &fixture,
+        &AtomicBool::new(false),
+        Some(session),
+    );
+    assert!(first.is_ok());
+    // the container is recreated: the old address refuses, a new one answers
+    *docker.0.lock().unwrap() = "172.19.0.31".into();
+    let transport = Refusing {
+        refuse: "172.19.0.24",
+        inner: &fixture,
+    };
+    let reply = worker::run_with_endpoints(
+        root.path(),
+        Request::Games {
+            offset: 0,
+            filter: Default::default(),
+        },
+        &[],
+        &StaticResolver::new(),
+        &transport,
+        &AtomicBool::new(false),
+        Some(session),
+    )
+    .unwrap();
+    assert!(matches!(reply, Reply::Page(..)));
+    assert_eq!(
+        session
+            .effective("http://romm.saltbox:8080")
+            .effective_endpoint,
+        "http://172.19.0.31:8080"
+    );
+}
+
+#[test]
+fn an_authentication_failure_through_the_bridge_is_not_a_reason_to_look_again() {
+    let docker = std::sync::Arc::new(BridgeDocker(Mutex::new("172.19.0.24".into())));
+    let session = leaked_session(&docker);
+    let root = tempfile::tempdir().unwrap();
+    settings(root.path(), "http://romm.saltbox:8080");
+    let healthy = Fixture::default();
+    worker::run_with_endpoints(
+        root.path(),
+        Request::Connect,
+        &[],
+        &StaticResolver::new(),
+        &healthy,
+        &AtomicBool::new(false),
+        Some(session),
+    )
+    .unwrap();
+    *docker.0.lock().unwrap() = "172.19.0.31".into();
+    let rejecting = Fixture {
+        status: 401,
+        ..Fixture::default()
+    };
+    let result = worker::run_with_endpoints(
+        root.path(),
+        Request::Connect,
+        &[],
+        &StaticResolver::new(),
+        &rejecting,
+        &AtomicBool::new(false),
+        Some(session),
+    );
+    assert!(!matches!(result, Ok(Reply::Page(..))));
+    assert_eq!(
+        session
+            .effective("http://romm.saltbox:8080")
+            .effective_endpoint,
+        "http://172.19.0.24:8080",
+        "no rediscovery after an authentication failure"
+    );
+}

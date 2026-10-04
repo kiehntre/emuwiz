@@ -160,7 +160,7 @@ impl<'a> ArtworkRequest<'a> {
         }
     }
 
-    fn without_large(&self) -> ArtworkRequest<'a> {
+    pub fn without_large(&self) -> ArtworkRequest<'a> {
         ArtworkRequest {
             provider_game_id: self.provider_game_id,
             kind: self.kind,
