@@ -4,6 +4,8 @@
 //! directory. Generic restore apply is intentionally limited to explicitly
 //! bound, single-file native saves.
 
+pub mod tree_restore;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
