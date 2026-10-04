@@ -1885,3 +1885,104 @@ fn romm_specific_resolution_still_fails_honestly_when_mapping_is_missing() {
         Some(master.join(&expected_folder))
     );
 }
+
+// --- progress and cancellation of the preview --------------------------------
+
+fn preview_fixture(count: usize) -> (tempfile::TempDir, PathBuf, Vec<OrganisationCandidate>) {
+    let dir = tempfile::tempdir().unwrap();
+    let master = dir.path().join("roms");
+    let source = dir.path().join("library");
+    std::fs::create_dir_all(&source).unwrap();
+    let candidates = (0..count)
+        .map(|index| {
+            candidate(
+                &source,
+                &format!("Game{index}.iso"),
+                resolved("PSP", PlatformIdentitySource::Romm),
+            )
+        })
+        .collect();
+    (dir, master, candidates)
+}
+
+fn tree_listing(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            for entry in read.flatten() {
+                found.push(entry.path());
+                if entry.path().is_dir() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+#[test]
+fn the_preview_reports_its_real_phases_and_matches_the_plain_planner() {
+    use crate::job_progress::{JobProgress, ProgressReporter};
+    let (dir, master, candidates) = preview_fixture(6);
+    let request = OrganisationPlanRequest {
+        master_root: &master,
+        mode: OrganisationMode::MoveRealFile,
+        content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
+        candidates: &candidates,
+        generation: 1,
+    };
+    let mut seen: Vec<JobProgress> = Vec::new();
+    let plan = {
+        let mut sink = |progress| seen.push(progress);
+        let mut reporter = ProgressReporter::new(&mut sink);
+        build_organisation_plan_reporting(&request, None, &mut reporter).unwrap()
+    };
+    assert_eq!(plan, build_organisation_plan(&request));
+    let mut phases: Vec<&str> = seen.iter().map(|p| p.phase.as_str()).collect();
+    phases.dedup();
+    assert_eq!(
+        phases,
+        [
+            "Analysing files",
+            "Checking destination conflicts",
+            "Building the preview"
+        ]
+    );
+    let analysing = seen
+        .iter()
+        .filter(|p| p.phase == "Analysing files")
+        .next_back()
+        .unwrap();
+    assert_eq!((analysing.completed, analysing.total), (6, Some(6)));
+    drop(dir);
+}
+
+#[test]
+fn a_cancelled_preview_yields_no_plan_and_changes_nothing_on_disk() {
+    use crate::job_progress::ProgressReporter;
+    let (dir, master, candidates) = preview_fixture(8);
+    let before = tree_listing(dir.path());
+    let request = OrganisationPlanRequest {
+        master_root: &master,
+        mode: OrganisationMode::MoveRealFile,
+        content_policy: crate::dat::classification::ContentSelectionPolicy::AllEntries,
+        candidates: &candidates,
+        generation: 1,
+    };
+    let cancel = AtomicBool::new(false);
+    let mut sink = |progress: crate::job_progress::JobProgress| {
+        if progress.phase == "Analysing files" && progress.completed >= 3 {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    let mut reporter = ProgressReporter::with_interval(&mut sink, std::time::Duration::ZERO);
+    assert!(build_organisation_plan_reporting(&request, Some(&cancel), &mut reporter).is_none());
+    assert_eq!(
+        before,
+        tree_listing(dir.path()),
+        "a preview never touches the filesystem"
+    );
+    assert!(!master.exists());
+}

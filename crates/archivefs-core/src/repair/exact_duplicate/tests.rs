@@ -1172,3 +1172,154 @@ fn a_user_choice_on_a_blocked_multi_file_group_stays_blocked() {
         chosen.readiness
     );
 }
+
+// --- progress and cancellation ----------------------------------------------
+
+#[test]
+fn the_scan_reports_real_phases_in_order_with_known_totals() {
+    use crate::job_progress::{JobProgress, ProgressReporter};
+    let temp = tempfile::tempdir().unwrap();
+    let mut files = Vec::new();
+    for (name, body) in [("a", "same"), ("b", "same"), ("c", "different")] {
+        let path = temp.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        files.push(path);
+    }
+    let trusted = trusted_for(temp.path());
+    let mut seen: Vec<JobProgress> = Vec::new();
+    let report = {
+        let mut sink = |progress| seen.push(progress);
+        let mut reporter = ProgressReporter::new(&mut sink);
+        scan_exact_duplicates_reporting(
+            &files,
+            &trusted,
+            &[],
+            &BTreeSet::new(),
+            None,
+            &mut reporter,
+        )
+        .unwrap()
+    };
+    assert_eq!(report.groups.len(), 1);
+    let mut phases: Vec<&str> = seen.iter().map(|p| p.phase.as_str()).collect();
+    phases.dedup();
+    assert_eq!(
+        phases,
+        [
+            "Hashing candidate files",
+            "Comparing matching files",
+            "Building results"
+        ]
+    );
+    let hashing = seen
+        .iter()
+        .filter(|p| p.phase.starts_with("Hashing"))
+        .next_back()
+        .unwrap();
+    assert_eq!((hashing.completed, hashing.total), (3, Some(3)));
+    let comparing = seen
+        .iter()
+        .filter(|p| p.phase.starts_with("Comparing"))
+        .next_back()
+        .unwrap();
+    assert_eq!((comparing.completed, comparing.total), (2, Some(2)));
+    assert!(
+        seen.iter()
+            .all(|p| p.total.is_none_or(|t| p.completed <= t))
+    );
+}
+
+#[test]
+fn a_cancelled_scan_stops_between_files_changes_nothing_and_returns_no_partial_report() {
+    use crate::job_progress::ProgressReporter;
+    let temp = tempfile::tempdir().unwrap();
+    let mut files = Vec::new();
+    for index in 0..5 {
+        let path = temp.path().join(format!("f{index}"));
+        std::fs::write(&path, "same").unwrap();
+        files.push(path);
+    }
+    let before: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    let trusted = trusted_for(temp.path());
+    let cancel = AtomicBool::new(false);
+    let mut hashed_when_cancelled = 0u64;
+    let result = {
+        let mut sink = |progress: crate::job_progress::JobProgress| {
+            if progress.phase.starts_with("Hashing") && progress.completed >= 2 {
+                hashed_when_cancelled = progress.completed;
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let mut reporter = ProgressReporter::with_interval(&mut sink, std::time::Duration::ZERO);
+        scan_exact_duplicates_reporting(
+            &files,
+            &trusted,
+            &[],
+            &BTreeSet::new(),
+            Some(&cancel),
+            &mut reporter,
+        )
+    };
+    assert_eq!(result.unwrap_err(), ScanCancelled);
+    assert!(hashed_when_cancelled < 5, "it stopped before finishing");
+    let after: Vec<_> = files.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert_eq!(before, after, "scanning never writes");
+    // already cancelled before it starts: no work at all
+    let mut ignore = |_| {};
+    let mut reporter = ProgressReporter::new(&mut ignore);
+    assert_eq!(
+        scan_exact_duplicates_reporting(
+            &files,
+            &trusted,
+            &[],
+            &BTreeSet::new(),
+            Some(&cancel),
+            &mut reporter
+        )
+        .unwrap_err(),
+        ScanCancelled
+    );
+}
+
+#[test]
+fn progress_reporting_on_a_large_synthetic_scan_is_throttled_and_does_not_slow_it() {
+    use crate::job_progress::{JobProgress, ProgressReporter};
+    let temp = tempfile::tempdir().unwrap();
+    let files: Vec<_> = (0..3000)
+        .map(|index| {
+            let path = temp.path().join(format!("f{index}.bin"));
+            std::fs::write(&path, format!("unique {index}")).unwrap();
+            path
+        })
+        .collect();
+    let trusted = trusted_for(temp.path());
+    let plain_start = std::time::Instant::now();
+    let plain = scan_exact_duplicates(&files, &trusted, &[], &BTreeSet::new(), None);
+    let plain_time = plain_start.elapsed();
+    let mut updates: Vec<JobProgress> = Vec::new();
+    let start = std::time::Instant::now();
+    let reported = {
+        let mut sink = |progress| updates.push(progress);
+        let mut reporter = ProgressReporter::new(&mut sink);
+        scan_exact_duplicates_reporting(
+            &files,
+            &trusted,
+            &[],
+            &BTreeSet::new(),
+            None,
+            &mut reporter,
+        )
+        .unwrap()
+    };
+    let reported_time = start.elapsed();
+    assert_eq!(plain.files_examined, reported.files_examined);
+    assert!(
+        updates.len() < 100,
+        "{} updates for 3000 files",
+        updates.len()
+    );
+    assert!(
+        reported_time < plain_time * 3 + std::time::Duration::from_millis(500),
+        "reporting {reported_time:?} vs plain {plain_time:?}"
+    );
+}

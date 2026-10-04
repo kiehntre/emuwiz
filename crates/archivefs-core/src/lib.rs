@@ -73,6 +73,7 @@ pub mod evidence_resolution;
 pub mod game_firmware_readiness;
 pub mod game_profile_planner;
 pub mod identity_attention;
+pub mod job_progress;
 /// Typed library presentation visibility, separate from source ownership and
 /// subsystem evidence availability.
 pub mod library_visibility;

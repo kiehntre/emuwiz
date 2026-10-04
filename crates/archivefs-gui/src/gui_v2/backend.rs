@@ -89,6 +89,7 @@ pub(super) enum Command {
     },
     ScanDuplicates {
         games: Vec<Game>,
+        cancel: Arc<AtomicBool>,
     },
     PrepareDuplicateRepair {
         group: Box<archivefs_core::repair::ExactDuplicateGroup>,
@@ -144,6 +145,7 @@ pub(super) enum Command {
         state: Box<crate::rom_organisation_page::RomOrganisationPageState>,
         generation: u64,
         kind: super::CanonicalOrganisationJobKind,
+        cancel: Arc<AtomicBool>,
     },
     PersistentStateInventory {
         roots: Vec<archivefs_core::persistent_state_inventory::PersistentStateRoot>,
@@ -233,9 +235,7 @@ pub(super) enum Event {
     Started(u64),
     Progress {
         id: u64,
-        done: u64,
-        total: u64,
-        item: String,
+        progress: super::activity::JobProgress,
     },
     Finished {
         id: u64,
@@ -330,17 +330,19 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                     crate::romm_source::RommProgressEvent::Import(progress) => {
                         let _ = answers.send(Event::Progress {
                             id,
-                            done: progress.records_fetched as u64,
-                            total: progress.reported_total.unwrap_or(0),
-                            item: format!("Fetched {} RomM game(s)", progress.records_fetched),
+                            progress: super::activity::JobProgress::new(
+                                "Reading RomM games",
+                                "games",
+                            )
+                            .with_total(progress.reported_total.unwrap_or(0))
+                            .at(progress.records_fetched as u64),
                         });
                     }
                     crate::romm_source::RommProgressEvent::Note(note) => {
                         let _ = answers.send(Event::Progress {
                             id,
-                            done: 0,
-                            total: 0,
-                            item: note,
+                            progress: super::activity::JobProgress::new("RomM update", "steps")
+                                .with_message(note),
                         });
                     }
                     _ => {}
@@ -406,6 +408,11 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 total: games.len(),
                 ..Default::default()
             };
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            let mut reporter = archivefs_core::job_progress::ProgressReporter::new(&mut send);
+            reporter.phase("Checking games", "games", Some(total));
             for (index, game) in games.into_iter().enumerate() {
                 if cancel.load(Ordering::Relaxed) {
                     break;
@@ -429,16 +436,11 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                     "Unknown"
                 };
                 result.statuses.insert(game.archive.id, status.into());
-                let _ = answers.send(Event::Progress {
-                    id,
-                    done: index as u64 + 1,
-                    total,
-                    item: game.title,
-                });
+                reporter.tick(index as u64 + 1);
             }
             Ok(Payload::Verification(result))
         }
-        Command::ScanDuplicates { games } => {
+        Command::ScanDuplicates { games, cancel } => {
             let candidates: Vec<_> = games
                 .iter()
                 .map(|game| game.archive.absolute_path.clone())
@@ -447,13 +449,19 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 archivefs_core::Config::load_default().map_err(|error| error.to_string())?;
             let trusted =
                 archivefs_core::safe_read::TrustedRoots::from_paths(config.source_folders.clone());
-            let report = archivefs_core::repair::scan_exact_duplicates(
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            let mut reporter = archivefs_core::job_progress::ProgressReporter::new(&mut send);
+            let report = archivefs_core::repair::scan_exact_duplicates_reporting(
                 &candidates,
                 &trusted,
                 &config.source_folders,
                 &std::collections::BTreeSet::new(),
-                None,
-            );
+                Some(&cancel),
+                &mut reporter,
+            )
+            .map_err(|_| super::activity::CANCELLED.to_string())?;
             let exact_groups = report.groups.clone();
             let groups = report
                 .groups
@@ -553,9 +561,11 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             .map_err(|error| format!("The preview is no longer safe: {error}"))?;
             let _ = answers.send(Event::Progress {
                 id,
-                done: 0,
-                total: transaction.entries.len() as u64,
-                item: "Validating the approved files".into(),
+                progress: super::activity::JobProgress::new(
+                    "Validating the approved files",
+                    "files",
+                )
+                .with_total(transaction.entries.len() as u64),
             });
             let outcome = archivefs_core::repair::apply_quarantine_transaction(
                 &mut transaction,
@@ -570,9 +580,9 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             .map_err(|error| error.to_string())?;
             let _ = answers.send(Event::Progress {
                 id,
-                done: outcome.transaction.applied_count() as u64,
-                total: outcome.transaction.entries.len() as u64,
-                item: "Writing the repair receipt".into(),
+                progress: super::activity::JobProgress::new("Writing the repair receipt", "files")
+                    .with_total(outcome.transaction.entries.len() as u64)
+                    .at(outcome.transaction.applied_count() as u64),
             });
             Ok(Payload::DuplicateApplied(Box::new(DuplicateRepairRecord {
                 transaction: outcome.transaction,
@@ -734,11 +744,30 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             mut state,
             generation,
             kind,
+            cancel,
         } => {
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            let mut reporter = archivefs_core::job_progress::ProgressReporter::new(&mut send);
             match kind {
-                super::CanonicalOrganisationJobKind::Preview => state.generate_plan(),
-                super::CanonicalOrganisationJobKind::Apply => state.apply(),
-                super::CanonicalOrganisationJobKind::Rollback => state.rollback(),
+                super::CanonicalOrganisationJobKind::Preview => {
+                    // A cancelled preview only read files: drop it and keep the
+                    // person's previous plan exactly as it was.
+                    if !state.generate_plan_reporting(Some(&cancel), &mut reporter) {
+                        return Err(super::activity::CANCELLED.to_string());
+                    }
+                }
+                super::CanonicalOrganisationJobKind::Apply => {
+                    reporter.phase("Applying the approved changes", "changes", None);
+                    reporter.flush();
+                    state.apply_cancellable(&cancel);
+                }
+                super::CanonicalOrganisationJobKind::Rollback => {
+                    reporter.phase("Undoing the organisation", "changes", None);
+                    reporter.flush();
+                    state.rollback();
+                }
             }
             Ok(Payload::CanonicalOrganisation {
                 state,

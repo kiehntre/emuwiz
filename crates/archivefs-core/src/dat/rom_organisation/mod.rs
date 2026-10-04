@@ -41,7 +41,10 @@ mod linked_library_tests;
 mod tests;
 
 pub use model::{OrganisationMode, OrganisationPlan, OrganisationPlanEntry, OrganisationStatus};
-pub use plan::{OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan};
+pub use plan::{
+    OrganisationCandidate, OrganisationPlanRequest, build_organisation_plan,
+    build_organisation_plan_reporting,
+};
 pub use transaction::{
     OrganisationRollbackOutcome, apply_organisation_transaction, build_organisation_transaction,
     revalidate_organisation_plan, rollback_organisation_transaction,

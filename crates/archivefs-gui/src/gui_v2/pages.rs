@@ -1,4 +1,5 @@
 //! Paint-only pages: layout, in-memory projections and explicit user intents.
+use super::DUPLICATE_SCAN_TITLE;
 use super::{
     App,
     activity::Phase,
@@ -359,6 +360,17 @@ impl App {
                         running + queued
                     ));
                 }
+                let failed = self.activity.failed();
+                if failed > 0 {
+                    ui.label(format!(
+                        "{failed} {} attention",
+                        if failed == 1 {
+                            "job needs"
+                        } else {
+                            "jobs need"
+                        }
+                    ));
+                }
                 if ui.button("View Activity").clicked() {
                     self.go(Route::Section(Section::Activity));
                 }
@@ -370,9 +382,8 @@ impl App {
                 .rev()
                 .find(|job| job.phase == Phase::Running)
             {
-                ui.label(&job.title);
-                if let Some(fraction) = job.fraction() {
-                    ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                if super::job_card::show(ui, job, true).cancel {
+                    job.request_cancel();
                 }
             }
         });
@@ -1519,12 +1530,7 @@ impl App {
         {
             ui.separator();
             ui.label("Checking in Activity");
-            if let Some((done, total)) = id.progress {
-                ui.add(
-                    egui::ProgressBar::new((done as f32 / total.max(1) as f32).min(1.0))
-                        .show_percentage(),
-                );
-            }
+            super::job_card::show(ui, id, true);
         }
     }
 
@@ -1540,10 +1546,34 @@ impl App {
         self.equivalent_duplicates_section(ui);
         ui.label("Only byte-identical files are called exact duplicates. Different regions, revisions and titles remain separate unless their contents are proven identical.");
         if self.duplicate_report.is_none() {
-            if self.duplicate_job.is_some() {
-                ui.spinner();
-                ui.label("Hashing candidate files safely…");
+            if let Some(job) = self
+                .duplicate_job
+                .and_then(|id| self.activity.jobs.get(&id))
+            {
+                // The Activity model owns this job, so leaving and returning
+                // shows the same one instead of starting another.
+                if super::job_card::show(ui, job, false).cancel {
+                    job.request_cancel();
+                }
             } else {
+                if let Some(last) = self
+                    .activity
+                    .jobs
+                    .values()
+                    .rev()
+                    .find(|job| job.title == DUPLICATE_SCAN_TITLE)
+                    .filter(|job| matches!(job.phase, Phase::Failed | Phase::Cancelled))
+                {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        super::job_card::show(ui, last, true);
+                        if last.phase == Phase::Failed {
+                            ui.label("You can try again; nothing was changed.");
+                            ui.collapsing("Details", |ui| {
+                                ui.label(&last.technical);
+                            });
+                        }
+                    });
+                }
                 let clicked = if ui.available_width() < 560.0 {
                     self.duplicate_narrow_empty_state(ui)
                 } else {
@@ -3096,24 +3126,36 @@ impl App {
             self.go(Route::Section(Section::Games));
         }
         let mut destination = None;
-        egui::ScrollArea::vertical().id_salt("v2_jobs").show(ui, |ui| {
-            for (id, job) in self.activity.jobs.iter().rev() {
-                ui.push_id(id, |ui| { egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(ui.available_width()); ui.heading(&job.title);
-                    ui.strong(job.phase.label());
-                    ui.label(&job.summary);
-                    ui.label(format!("Elapsed: {} seconds", job.elapsed().as_secs()));
-                    if let Some((done, total)) = job.progress { ui.label(format!("{done} / {total} requests finished (including off-screen cancellations)")); }
-                    if let Some(fraction) = job.fraction() { ui.add(egui::ProgressBar::new(fraction).show_percentage()); }
-                    if let Some(item) = &job.item { ui.label(item); }
-                    if job.active() {
-                        if job.cancel.is_some() { if primary(ui, "Cancel safely") { job.request_cancel(); } }
-                        else { ui.label("This operation must finish safely; you can keep browsing."); }
-                    } else if primary(ui, if job.phase == Phase::Failed { "Return to task / retry" } else { "View result" }) { destination = Some(job.result.clone()); }
-                    ui.collapsing("Technical details", |ui| { ui.label(&job.technical); });
-                }); });
-            }
-        });
+        egui::ScrollArea::vertical()
+            .id_salt("v2_jobs")
+            .show(ui, |ui| {
+                for (id, job) in self.activity.jobs.iter().rev() {
+                    ui.push_id(id, |ui| {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            let card = super::job_card::show(ui, job, false);
+                            if card.cancel {
+                                job.request_cancel();
+                            }
+                            if !job.active()
+                                && primary(
+                                    ui,
+                                    if job.phase == Phase::Failed {
+                                        "Return to task / retry"
+                                    } else {
+                                        "View result"
+                                    },
+                                )
+                            {
+                                destination = Some(job.result.clone());
+                            }
+                            ui.collapsing("Technical details", |ui| {
+                                ui.label(&job.technical);
+                            });
+                        });
+                    });
+                }
+            });
         if let Some(route) = destination {
             self.go(route);
         }

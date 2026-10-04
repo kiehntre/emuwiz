@@ -1114,6 +1114,7 @@ fn gui_v2_canonical_organisation_preview_runs_on_the_background_worker() {
                 state: Box::new(crate::rom_organisation_page::RomOrganisationPageState::default()),
                 generation: 11,
                 kind: super::CanonicalOrganisationJobKind::Preview,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         )
         .unwrap();
@@ -2661,7 +2662,11 @@ fn gui_v2_activity_covers_all_states_and_never_invents_eta() {
     activity.start(id);
     assert_eq!(activity.jobs[&id].phase, Phase::Running);
     assert_eq!(activity.running(), 1);
-    activity.jobs.get_mut(&id).unwrap().progress = Some((25, 100));
+    activity.jobs.get_mut(&id).unwrap().progress = Some(
+        activity::JobProgress::new("Test", "items")
+            .with_total(100)
+            .at(25),
+    );
     assert_eq!(activity.jobs[&id].fraction(), Some(0.25));
     activity.finish(id, "Done".into(), None);
     assert_eq!(activity.jobs[&id].phase, Phase::Complete);
@@ -2830,7 +2835,11 @@ fn gui_v2_activity_safe_cancellation_and_unknown_total() {
     let id = activity.queue("Scan", Route::Home, false);
     activity.jobs[&id].request_cancel();
     assert!(activity.jobs[&id].cancel.is_none());
-    activity.jobs.get_mut(&id).unwrap().progress = Some((4, 0));
+    activity.jobs.get_mut(&id).unwrap().progress = Some(
+        activity::JobProgress::new("Scan", "items")
+            .with_total(0)
+            .at(4),
+    );
     assert!(activity.jobs[&id].fraction().is_none());
     let id = activity.queue("Pictures", Route::Home, true);
     activity.jobs[&id].request_cancel();
@@ -6958,4 +6967,248 @@ fn real_identity_attention_counts() {
             problem.severity, problem.state, problem.title
         );
     }
+}
+
+// --- shared job progress, phases and cancellation ---------------------------
+
+fn dup_games(directory: &Path, count: usize) -> Vec<Game> {
+    (0..count)
+        .map(|index| {
+            let path = directory.join(format!("game{index}.bin"));
+            std::fs::write(&path, b"identical bytes").unwrap();
+            Game::from_archive(PersistedArchive {
+                id: index as i64 + 1,
+                source_folder_id: 1,
+                relative_path: format!("game{index}.bin").into(),
+                absolute_path: path,
+                archive_kind: "zip".into(),
+                display_name: format!("Game {index}"),
+                normalized_name: format!("game {index}"),
+                size_bytes: Some(15),
+                modified_time_unix_seconds: Some(1),
+                platform: Some("Arcade".into()),
+                platform_source: Some("test".into()),
+                last_known_health: "pending".into(),
+                last_seen_at: "now".into(),
+                last_verified_missing_at: None,
+                identity_report: None,
+            })
+        })
+        .collect()
+}
+
+fn drain(
+    backend: &super::backend::Backend,
+    id: u64,
+) -> (Vec<activity::JobProgress>, Result<(), String>) {
+    let mut progress = Vec::new();
+    loop {
+        match backend
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        {
+            super::backend::Event::Started(_) => {}
+            super::backend::Event::Progress {
+                id: seen,
+                progress: p,
+            } => {
+                assert_eq!(seen, id);
+                progress.push(p);
+            }
+            super::backend::Event::Finished { outcome, .. } => {
+                return (progress, outcome.map(|_| ()));
+            }
+        }
+    }
+}
+
+#[test]
+fn gui_v2_duplicate_scan_on_the_real_worker_emits_phase_progress() {
+    let context = egui::Context::default();
+    let backend = super::backend::Backend::start(context);
+    let directory = tempfile::tempdir().unwrap();
+    let games = dup_games(directory.path(), 5);
+    backend
+        .send(
+            7,
+            super::backend::Command::ScanDuplicates {
+                games,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        )
+        .unwrap();
+    let (progress, outcome) = drain(&backend, 7);
+    outcome.unwrap();
+    let hashing = progress
+        .iter()
+        .find(|p| p.phase == "Hashing candidate files")
+        .unwrap();
+    assert_eq!(hashing.total, Some(5));
+    assert!(
+        progress
+            .iter()
+            .all(|p| p.total.is_none_or(|t| p.completed <= t))
+    );
+}
+
+#[test]
+fn gui_v2_cancelled_duplicate_scan_and_preview_stop_with_the_cancel_marker_and_change_nothing() {
+    let context = egui::Context::default();
+    let backend = super::backend::Backend::start(context);
+    let directory = tempfile::tempdir().unwrap();
+    let games = dup_games(directory.path(), 4);
+    let before: Vec<_> = games
+        .iter()
+        .map(|g| std::fs::read(&g.archive.absolute_path).unwrap())
+        .collect();
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    backend
+        .send(
+            8,
+            super::backend::Command::ScanDuplicates {
+                games: games.clone(),
+                cancel: cancel.clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(drain(&backend, 8).1.unwrap_err(), activity::CANCELLED);
+    backend
+        .send(
+            9,
+            super::backend::Command::CanonicalOrganisation {
+                state: Box::new(crate::rom_organisation_page::RomOrganisationPageState::default()),
+                generation: 1,
+                kind: super::CanonicalOrganisationJobKind::Preview,
+                cancel,
+            },
+        )
+        .unwrap();
+    assert_eq!(drain(&backend, 9).1.unwrap_err(), activity::CANCELLED);
+    let after: Vec<_> = games
+        .iter()
+        .map(|g| std::fs::read(&g.archive.absolute_path).unwrap())
+        .collect();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn gui_v2_duplicate_scan_survives_navigation_and_revisiting_never_enqueues_a_second() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Duplicates);
+    app.start_duplicate_scan();
+    let id = app.duplicate_job.expect("scan queued");
+    assert_eq!(
+        app.activity.jobs[&id].cancel_policy,
+        activity::CancelPolicy::SafeNow
+    );
+    app.activity.start(id);
+    app.activity.update_progress(
+        id,
+        activity::JobProgress::new("Hashing candidate files", "files")
+            .with_total(104_525)
+            .at(38_421),
+    );
+    // leave, browse elsewhere, come back, and press the start action again
+    for route in [
+        Route::Home,
+        Route::Section(Section::Games),
+        Route::Section(Section::Duplicates),
+    ] {
+        app.router.current = route;
+        frame(&context, &mut app, [1280.0, 720.0]);
+        app.start_duplicate_scan();
+    }
+    assert_eq!(
+        app.activity
+            .jobs
+            .values()
+            .filter(|j| j.title == super::DUPLICATE_SCAN_TITLE)
+            .count(),
+        1,
+        "revisiting must show the existing job, not start another"
+    );
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("38,421 / 104,525 files · 36%")),
+        "{strings:?}"
+    );
+    assert!(strings.iter().any(|s| s.contains("Cancel")));
+    // the global status bar names the running job from any page
+    app.router.current = Route::Home;
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("active jobs · 1 running")),
+        "{strings:?}"
+    );
+}
+
+#[test]
+fn gui_v2_cancel_on_the_page_shows_cancelling_until_the_worker_reports_it_stopped() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.start_duplicate_scan();
+    let id = app.duplicate_job.unwrap();
+    app.activity.start(id);
+    app.activity.jobs[&id].request_cancel();
+    app.router.current = Route::Section(Section::Duplicates);
+    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    assert!(strings.iter().any(|s| s.contains("Cancelling…")));
+    assert!(!strings.iter().any(|s| s == "Stopped" || s == "Cancelled"));
+    // the worker stops: only now is it Stopped, and a new scan may start
+    app.activity.settle(
+        id,
+        "Stopped at your request. Nothing was changed.".into(),
+        activity::Settled::Stopped,
+    );
+    app.duplicate_job = None;
+    assert_eq!(app.activity.jobs[&id].phase, Phase::Cancelled);
+    app.start_duplicate_scan();
+    assert_ne!(app.duplicate_job, Some(id));
+}
+
+#[test]
+fn gui_v2_completed_scan_replaces_the_spinner_with_a_result_and_failures_are_actionable() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    let id = app.activity.queue_with(
+        super::DUPLICATE_SCAN_TITLE,
+        Route::Section(Section::Duplicates),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(id);
+    app.activity.settle(
+        id,
+        "104,525 files checked · 312 duplicate groups found".into(),
+        activity::Settled::Done,
+    );
+    let failed = app.activity.queue_with(
+        "Planning verified-game organisation",
+        Route::Section(Section::Build),
+        activity::CancelPolicy::SafeNow,
+    );
+    app.activity.start(failed);
+    app.activity.settle(
+        failed,
+        "The organisation preview could not be completed. Nothing was changed.".into(),
+        activity::Settled::Failed("Os { code: 13 }".into()),
+    );
+    app.router.current = Route::Section(Section::Activity);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|s| s.contains("312 duplicate groups found"))
+    );
+    assert!(strings.iter().any(|s| s.contains("Return to task / retry")));
+    assert!(
+        strings.iter().any(|s| s.contains("1 job needs attention")),
+        "{strings:?}"
+    );
+    assert!(!app.activity.jobs[&id].active());
 }

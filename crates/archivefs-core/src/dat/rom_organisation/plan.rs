@@ -54,12 +54,45 @@ pub struct OrganisationPlanRequest<'a> {
 
 /// Builds a read-only organisation plan. Never mutates the filesystem.
 pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> OrganisationPlan {
-    let mut entries: Vec<OrganisationPlanEntry> = request
-        .candidates
-        .iter()
-        .map(|candidate| plan_entry(request, candidate))
-        .collect();
+    let mut ignore = |_: crate::job_progress::JobProgress| {};
+    let mut reporter = crate::job_progress::ProgressReporter::new(&mut ignore);
+    build_organisation_plan_reporting(request, None, &mut reporter)
+        .expect("a plan without a cancel flag is never cancelled")
+}
+
+/// [`build_organisation_plan`] with real checkpoints and cooperative
+/// cancellation between candidates. Planning only reads (it stats sources and
+/// computes destinations), so `None` - cancelled - means nothing on disk was
+/// touched and there is no half-built plan to reason about.
+pub fn build_organisation_plan_reporting(
+    request: &OrganisationPlanRequest<'_>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    progress: &mut crate::job_progress::ProgressReporter<'_>,
+) -> Option<OrganisationPlan> {
+    let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    progress.phase(
+        "Analysing files",
+        "files",
+        Some(request.candidates.len() as u64),
+    );
+    let mut entries: Vec<OrganisationPlanEntry> = Vec::with_capacity(request.candidates.len());
+    for (position, candidate) in request.candidates.iter().enumerate() {
+        if stop() {
+            return None;
+        }
+        progress.tick(position as u64);
+        entries.push(plan_entry(request, candidate));
+    }
+    progress.tick(request.candidates.len() as u64);
+    if stop() {
+        return None;
+    }
+    progress.phase("Checking destination conflicts", "files", None);
     detect_collisions(request.master_root, &mut entries);
+    if stop() {
+        return None;
+    }
+    progress.phase("Building the preview", "changes", None);
     entries.sort_by(|left, right| {
         (
             left.status_rank(),
@@ -72,14 +105,14 @@ pub fn build_organisation_plan(request: &OrganisationPlanRequest<'_>) -> Organis
                 &right.destination_path,
             ))
     });
-    OrganisationPlan {
+    Some(OrganisationPlan {
         master_root: request.master_root.to_path_buf(),
         mode: request.mode,
         content_policy: request.content_policy,
         classifier_version: crate::dat::classification::CLASSIFIER_VERSION.to_string(),
         generation: request.generation,
         entries,
-    }
+    })
 }
 
 /// Plans one candidate into an entry, classifying the status.

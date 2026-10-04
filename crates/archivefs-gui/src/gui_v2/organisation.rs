@@ -953,6 +953,7 @@ impl App {
                     });
                 }
                 OrganisationView::VerifiedGames => {
+                    self.organisation_job_card(ui);
                     self.invalidate_changed_canonical_organisation_plan();
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("← Organisation").clicked() {
@@ -1076,7 +1077,26 @@ impl App {
         }
     }
 
+    /// The running (or just-finished) organisation/rename job, drawn by the one
+    /// shared job card. The job lives in Activity, so it is still here when the
+    /// person leaves this page and comes back.
+    fn organisation_job_card(&mut self, ui: &mut egui::Ui) {
+        let Some(job) = self
+            .canonical_organisation_job
+            .as_ref()
+            .and_then(|job| self.activity.jobs.get(&job.id))
+        else {
+            return;
+        };
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if super::job_card::show(ui, job, true).cancel {
+                job.request_cancel();
+            }
+        });
+    }
+
     pub(super) fn quick_rename(&mut self, ui: &mut egui::Ui) {
+        self.organisation_job_card(ui);
         self.invalidate_changed_canonical_organisation_plan();
         let action = rom_organisation_page::show_quick_rename_page_with_busy(
             ui,

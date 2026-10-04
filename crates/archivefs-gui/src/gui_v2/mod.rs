@@ -12,6 +12,7 @@ mod equivalent_duplicates;
 mod guidance;
 mod hackhash;
 mod imagery;
+mod job_card;
 mod launch_readiness_summary;
 mod legacy;
 pub(crate) mod library;
@@ -44,6 +45,8 @@ mod wiiu_disc;
 use crate::optical_conversion_page::OpticalConversionPageState;
 use crate::playing_library_page::{PlayingLibraryPageAction, PlayingLibraryPageState};
 use activity::Activity;
+
+pub(super) const DUPLICATE_SCAN_TITLE: &str = "Finding exact duplicate files";
 use artwork::Artwork;
 use backend::{
     Backend, Command, DuplicateRepairPreview, DuplicateRepairRecord, Event, Payload, Preferences,
@@ -733,18 +736,28 @@ impl App {
         if self.duplicate_job.is_some() {
             return;
         }
-        let id = self.activity.queue(
-            "Finding exact duplicate files",
+        let id = self.activity.queue_with(
+            DUPLICATE_SCAN_TITLE,
             Route::Section(Section::Duplicates),
-            true,
+            activity::CancelPolicy::SafeNow,
         );
+        let cancel = self.job_cancel_flag(id);
         self.duplicate_job = Some(id);
         self.send(
             id,
             Command::ScanDuplicates {
                 games: self.library.games.clone(),
+                cancel,
             },
         );
+    }
+    /// The cancel flag the job's worker polls; the Activity model owns it.
+    fn job_cancel_flag(&self, id: u64) -> Arc<std::sync::atomic::AtomicBool> {
+        self.activity
+            .jobs
+            .get(&id)
+            .and_then(|job| job.cancel.clone())
+            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
     }
     fn start_problem_summary(&mut self) {
         if self.problem_summary_job.is_some() {
@@ -866,15 +879,23 @@ impl App {
             self.canonical_organisation_generation.wrapping_add(1);
         let generation = self.canonical_organisation_generation;
         let input_fingerprint = self.canonical_organisation.input_fingerprint();
-        let id = self.activity.queue(
+        let id = self.activity.queue_with(
             match kind {
                 CanonicalOrganisationJobKind::Preview => "Planning verified-game organisation",
                 CanonicalOrganisationJobKind::Apply => "Organising verified games",
                 CanonicalOrganisationJobKind::Rollback => "Undoing game organisation",
             },
             Route::Section(Section::Build),
-            false,
+            match kind {
+                // A preview only reads files, so it can stop between files.
+                CanonicalOrganisationJobKind::Preview => activity::CancelPolicy::SafeNow,
+                // The journalled executor stops only at its own safe checkpoints.
+                CanonicalOrganisationJobKind::Apply => activity::CancelPolicy::AfterCurrentStep,
+                // Undo must run to the end so the library is left consistent.
+                CanonicalOrganisationJobKind::Rollback => activity::CancelPolicy::NotCancellable,
+            },
         );
+        let cancel = self.job_cancel_flag(id);
         self.canonical_organisation_job = Some(CanonicalOrganisationJob {
             id,
             kind,
@@ -885,6 +906,7 @@ impl App {
             state: Box::new(self.canonical_organisation.clone()),
             generation,
             kind,
+            cancel,
         };
         if !self.send(id, command) {
             self.canonical_organisation_job = None;
@@ -938,9 +960,17 @@ impl App {
             .applied()
             .map(|transaction| transaction.transaction_id.clone());
         let error = state.error().map(str::to_owned);
+        let stopped = state.was_stopped();
         let transaction = state.applied().cloned();
         self.canonical_organisation = *state;
-        if let Some(error) = error {
+        if error.is_some() && stopped {
+            // The executor honoured Cancel at one of its own safe checkpoints.
+            self.activity.settle(
+                job.id,
+                "Stopped at a safe point. Some changes may already have been made; check History, where they can be undone.".into(),
+                activity::Settled::Stopped,
+            );
+        } else if let Some(error) = error {
             self.activity.finish(
                 job.id,
                 match kind {
@@ -1341,17 +1371,7 @@ impl App {
             };
             match event {
                 Event::Started(id) => self.activity.start(id),
-                Event::Progress {
-                    id,
-                    done,
-                    total,
-                    item,
-                } => {
-                    if let Some(job) = self.activity.jobs.get_mut(&id) {
-                        job.progress = Some((done, total));
-                        job.item = Some(item);
-                    }
-                }
+                Event::Progress { id, progress } => self.activity.update_progress(id, progress),
                 Event::Finished { id, outcome } => {
                     let was_load_job = self.load_job == Some(id);
                     if was_load_job {
@@ -1461,6 +1481,20 @@ impl App {
                                 }
                                 Payload::Duplicates(report) => {
                                     self.duplicate_job = None;
+                                    self.activity.settle(
+                                        id,
+                                        format!(
+                                            "{} files checked · {} duplicate group{} found",
+                                            job_card::count(report.files_examined as u64),
+                                            job_card::count(report.exact_groups.len() as u64),
+                                            if report.exact_groups.len() == 1 {
+                                                ""
+                                            } else {
+                                                "s"
+                                            },
+                                        ),
+                                        activity::Settled::Done,
+                                    );
                                     self.duplicate_report = Some(report);
                                     self.problem_summary = None;
                                 }
@@ -1582,6 +1616,9 @@ impl App {
                             );
                         }
                         Err(error) => {
+                            if self.duplicate_job == Some(id) {
+                                self.duplicate_job = None;
+                            }
                             if was_load_job {
                                 self.library_load_failed(&error);
                             }
@@ -1638,13 +1675,20 @@ impl App {
                             self.detail_failed = self.detail_pending.take();
                             self.filter_inflight = false;
                             let title = self.activity.jobs.get(&id).map(|job| job.title.clone());
-                            if let Some(notice) =
+                            if error == activity::CANCELLED {
+                                // The worker stopped on request: say so, with no error banner.
+                                self.activity.settle(
+                                    id,
+                                    "Stopped at your request. Nothing was changed.".into(),
+                                    activity::Settled::Stopped,
+                                );
+                            } else if let Some(notice) =
                                 notice_for_background_error(title.as_deref(), &error)
                             {
-                                self.activity.finish(
+                                self.activity.settle(
                                     id,
                                     notice.message.clone(),
-                                    Some(error.clone()),
+                                    activity::Settled::Failed(error.clone()),
                                 );
                                 self.notice = Some(notice);
                             } else {
@@ -1758,7 +1802,11 @@ impl App {
         }
         if let Some(id) = self.artwork_job {
             if let Some(job) = self.activity.jobs.get_mut(&id) {
-                job.progress = Some((self.artwork.completed, self.artwork.requested));
+                job.progress = Some(
+                    activity::JobProgress::new("Loading pictures", "pictures")
+                        .with_total(self.artwork.requested)
+                        .at(self.artwork.completed),
+                );
                 job.summary = "Loading visible pictures. Off-screen requests are cancelled.".into();
                 if job
                     .cancel

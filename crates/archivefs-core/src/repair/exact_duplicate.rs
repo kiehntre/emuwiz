@@ -629,13 +629,58 @@ pub fn scan_exact_duplicates(
     elected_paths: &BTreeSet<PathBuf>,
     cancel: Option<&AtomicBool>,
 ) -> ExactDuplicateScanReport {
+    let mut ignore = |_: crate::job_progress::JobProgress| {};
+    let mut reporter = crate::job_progress::ProgressReporter::new(&mut ignore);
+    scan_exact_duplicates_reporting(
+        candidates,
+        trusted,
+        trusted_roots,
+        elected_paths,
+        cancel,
+        &mut reporter,
+    )
+    .unwrap_or(ExactDuplicateScanReport {
+        groups: Vec::new(),
+        excluded: Vec::new(),
+        files_examined: 0,
+    })
+}
+
+/// The scan was stopped by its cancel flag. Nothing had been changed: the scan
+/// only reads, so stopping it at any checkpoint is always safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCancelled;
+
+/// [`scan_exact_duplicates`] with real phase checkpoints and cooperative
+/// cancellation between files.
+pub fn scan_exact_duplicates_reporting(
+    candidates: &[PathBuf],
+    trusted: &TrustedRoots,
+    trusted_roots: &[PathBuf],
+    elected_paths: &BTreeSet<PathBuf>,
+    cancel: Option<&AtomicBool>,
+    progress: &mut crate::job_progress::ProgressReporter<'_>,
+) -> Result<ExactDuplicateScanReport, ScanCancelled> {
+    let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+    if stop() {
+        return Err(ScanCancelled);
+    }
+    progress.phase(
+        "Hashing candidate files",
+        "files",
+        Some(candidates.len() as u64),
+    );
     let mut excluded = Vec::new();
     // Step 1 narrowing key: (size, crc32, md5, sha1). Never itself the
     // authority for a group - see the function doc comment.
     let mut narrow_buckets: BTreeMap<(u64, String, String, String), Vec<PathBuf>> = BTreeMap::new();
     let mut files_examined = 0usize;
 
-    for candidate in candidates {
+    for (position, candidate) in candidates.iter().enumerate() {
+        if stop() {
+            return Err(ScanCancelled);
+        }
+        progress.tick(position as u64);
         match std::fs::symlink_metadata(candidate) {
             Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -680,6 +725,10 @@ pub fn scan_exact_duplicates(
         }
     }
 
+    if stop() {
+        return Err(ScanCancelled);
+    }
+    progress.tick(candidates.len() as u64);
     let ownership = build_ownership_map(candidates);
 
     // Step 2 authorization key: (size_bytes, sha256) - the only key that
@@ -694,11 +743,23 @@ pub fn scan_exact_duplicates(
         paths: Vec<PathBuf>,
     }
     let mut sha256_buckets: BTreeMap<(u64, String), Sha256Bucket> = BTreeMap::new();
+    let to_confirm: u64 = narrow_buckets
+        .values()
+        .filter(|paths| paths.len() >= 2)
+        .map(|paths| paths.len() as u64)
+        .sum();
+    progress.phase("Comparing matching files", "files", Some(to_confirm));
+    let mut confirmed = 0u64;
     for ((_narrowed_size, crc32, md5, sha1), paths) in narrow_buckets {
         if paths.len() < 2 {
             continue;
         }
         for path in paths {
+            if stop() {
+                return Err(ScanCancelled);
+            }
+            progress.tick(confirmed);
+            confirmed += 1;
             match hash_full_file_sha256(&path, trusted, cancel) {
                 Ok(identity) => {
                     let bucket = sha256_buckets
@@ -720,6 +781,12 @@ pub fn scan_exact_duplicates(
             }
         }
     }
+
+    if stop() {
+        return Err(ScanCancelled);
+    }
+    progress.tick(to_confirm);
+    progress.phase("Building results", "groups", None);
 
     // First pass: every group's members, size/hash, and canonical
     // recommendation - independent of any other group.
@@ -821,11 +888,11 @@ pub fn scan_exact_duplicates(
     }
     groups.sort_by(|a, b| a.sha256.cmp(&b.sha256));
 
-    ExactDuplicateScanReport {
+    Ok(ExactDuplicateScanReport {
         groups,
         excluded,
         files_examined,
-    }
+    })
 }
 
 /// Re-hashes `path` and fails closed unless it still matches `approved`

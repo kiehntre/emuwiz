@@ -62,6 +62,8 @@ pub(crate) struct RomOrganisationPageState {
     applied_journal: PathBuf,
     result_message: Option<String>,
     error: Option<String>,
+    /// The last apply stopped at a safe point because it was cancelled.
+    stopped: bool,
     /// Set when the user asked to apply; holds the count awaiting a typed
     /// confirmation for large batches.
     pending_apply: Option<usize>,
@@ -186,6 +188,7 @@ impl Default for RomOrganisationPageState {
                     .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
             result_message: None,
             error: None,
+            stopped: false,
             pending_apply: None,
             confirm_text: String::new(),
             pending_preview: false,
@@ -214,6 +217,11 @@ impl RomOrganisationPageState {
 
     pub(crate) fn applied(&self) -> Option<&archivefs_core::dat::rename_apply::RenameTransaction> {
         self.applied.as_ref()
+    }
+
+    /// The last apply was stopped by a cancel request at a safe point.
+    pub(crate) fn was_stopped(&self) -> bool {
+        self.stopped
     }
 
     pub(crate) fn error(&self) -> Option<&str> {
@@ -354,12 +362,29 @@ impl RomOrganisationPageState {
     /// Builds a fresh read-only plan from the current candidates. Every
     /// rebuild bumps the generation, so any earlier review decision is stale.
     pub(crate) fn generate_plan(&mut self) {
+        let mut ignore = |_: archivefs_core::job_progress::JobProgress| {};
+        let mut progress = archivefs_core::job_progress::ProgressReporter::new(&mut ignore);
+        self.generate_plan_reporting(None, &mut progress);
+    }
+
+    /// Builds the preview, reporting real checkpoints. Returns `false` when the
+    /// cancel flag stopped it: a preview only reads, so nothing on disk changed
+    /// and the previous plan is left exactly as it was.
+    pub(crate) fn generate_plan_reporting(
+        &mut self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+        progress: &mut archivefs_core::job_progress::ProgressReporter<'_>,
+    ) -> bool {
+        let stop = || cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed));
+        if stop() {
+            return false;
+        }
         self.plan_generation += 1;
         if self.sources.is_empty() && !self.unavailable_source_roots.is_empty() {
             self.error =
                 Some("source drive may not be mounted; nothing was scanned or changed".to_string());
             self.plan = None;
-            return;
+            return true;
         }
         let Some(master_root) = self.effective_root() else {
             self.error = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
@@ -368,25 +393,36 @@ impl RomOrganisationPageState {
                 "configure a master ROM root first".to_string()
             });
             self.plan = None;
-            return;
+            return true;
         };
+        progress.phase("Reading your game list", "steps", None);
         let cache = load_romm_cache();
         let Some(candidates) =
             build_candidates(&self.sources, self.plan_generation, cache.as_ref())
         else {
             self.error = Some("could not read the platform identity database".to_string());
             self.plan = None;
-            return;
+            return true;
         };
+        if stop() {
+            return false;
+        }
         // No RomM mapping is consulted: generic destinations derive from the
         // neutral EmuWiz platform layout identity.
-        let plan = build_organisation_plan(&OrganisationPlanRequest {
-            master_root: &master_root,
-            mode: self.mode,
-            content_policy: archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
-            candidates: &candidates,
-            generation: self.plan_generation,
-        });
+        let Some(plan) = build_organisation_plan_reporting(
+            &OrganisationPlanRequest {
+                master_root: &master_root,
+                mode: self.mode,
+                content_policy:
+                    archivefs_core::dat::classification::ContentSelectionPolicy::AllEntries,
+                candidates: &candidates,
+                generation: self.plan_generation,
+            },
+            cancel,
+            progress,
+        ) else {
+            return false;
+        };
         self.approved = plan
             .suggested()
             .map(|entry| entry.source_path.to_string_lossy().into_owned())
@@ -397,6 +433,7 @@ impl RomOrganisationPageState {
         // Persist that, so the user's earlier per-entry customisation (if
         // any) is gone but a fresh restart sees the new default.
         self.persist_approved_set();
+        true
     }
 
     pub(crate) fn toggle_approved(&mut self, source: &str) {
@@ -412,6 +449,13 @@ impl RomOrganisationPageState {
 
     /// Applies the approved Suggested entries after the caller has confirmed.
     pub(crate) fn apply(&mut self) {
+        self.apply_cancellable(&std::sync::atomic::AtomicBool::new(false));
+    }
+
+    /// Applies with the existing journalled executor, which honours `cancel`
+    /// only at its own transaction-safe checkpoints.
+    pub(crate) fn apply_cancellable(&mut self, cancel: &std::sync::atomic::AtomicBool) {
+        self.stopped = false;
         let Some(plan) = &self.plan else {
             return;
         };
@@ -467,14 +511,13 @@ impl RomOrganisationPageState {
                 trusted_roots.push(canonical);
             }
         }
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         match archivefs_core::dat::rom_organisation::apply_organisation_transaction(
             &mut transaction,
             &approved,
             plan.generation,
             archivefs_core::safe_read::TrustedRoots::from_paths(trusted_roots),
             &journal,
-            cancel.as_ref(),
+            cancel,
             self.mode,
             &master_root,
         ) {
@@ -493,7 +536,13 @@ impl RomOrganisationPageState {
                     )
                 });
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => {
+                self.stopped = matches!(
+                    error,
+                    archivefs_core::dat::rename_apply::ApplyError::Cancelled
+                );
+                self.error = Some(error.to_string());
+            }
         }
     }
 
