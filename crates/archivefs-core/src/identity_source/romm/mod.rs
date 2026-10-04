@@ -29,6 +29,7 @@ pub mod duplicate_provider_report;
 pub mod enrichment;
 pub mod import;
 pub mod linkage;
+pub mod local_discovery;
 pub mod manual;
 pub mod mapping_plan;
 pub mod media_mapping;

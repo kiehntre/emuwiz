@@ -7,7 +7,7 @@ use archivefs_core::identity_source::{
     romm::{
         browser::{RommBrowseError, RommBrowser, RommServerStatus},
         client::{RommTransport, UreqTransport},
-        config::{ConfigRefusal, ValidatedRommSource},
+        config::ConfigRefusal,
     },
     settings::{SettingsLocation, load_token_file},
 };
@@ -23,13 +23,14 @@ pub(super) fn run(
 ) -> Result<Reply, Problem> {
     let root = archivefs_core::identity_source::settings::default_identity_root()
         .map_err(|_| Problem::Settings)?;
-    run_with(
+    run_with_endpoints(
         &root,
         request,
         roots,
         &SystemResolver,
         &UreqTransport::new(),
         cancel,
+        Some(archivefs_core::identity_source::romm::local_discovery::shared_session()),
     )
 }
 
@@ -40,6 +41,18 @@ pub(super) fn run_with<T: RommTransport>(
     resolver: &impl HostResolver,
     transport: &T,
     cancel: &AtomicBool,
+) -> Result<Reply, Problem> {
+    run_with_endpoints(root, request, roots, resolver, transport, cancel, None)
+}
+
+fn run_with_endpoints<T: RommTransport>(
+    root: &Path,
+    request: Request,
+    roots: &[PathBuf],
+    resolver: &impl HostResolver,
+    transport: &T,
+    cancel: &AtomicBool,
+    endpoints: Option<&archivefs_core::identity_source::romm::local_discovery::EndpointSession>,
 ) -> Result<Reply, Problem> {
     if cancel.load(Ordering::Acquire) {
         return Err(Problem::Backend(RommBrowseError::Cancelled));
@@ -61,7 +74,15 @@ pub(super) fn run_with<T: RommTransport>(
     }
     let token =
         load_token_file(settings.source.token_path.as_deref()).map_err(|_| Problem::Credentials)?;
-    let source = ValidatedRommSource::validate(&settings.source, &token, roots, resolver)
+    let source =
+        archivefs_core::identity_source::romm::local_discovery::validate_with_local_fallback(
+            endpoints,
+            &settings.source,
+            &token,
+            roots,
+            resolver,
+            transport,
+        )
         .map_err(config_problem)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

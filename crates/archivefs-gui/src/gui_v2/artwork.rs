@@ -6,6 +6,9 @@ use super::{
     thumbnail::{self, Pixels, Timings},
 };
 use archivefs_core::identity_source::romm::connectivity::RommConnectivity;
+use archivefs_core::identity_source::romm::local_discovery::{
+    EndpointSource, validate_with_local_fallback, verify_romm,
+};
 use eframe::egui;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -72,13 +75,23 @@ impl From<&str> for ResolveFailure {
 pub(super) struct ProviderHealth {
     backoff: Duration,
     last: Mutex<Option<(RommConnectivity, Instant)>>,
+    /// Local Docker fallback for the session; `None` where discovery is not
+    /// wanted (tests), so nothing ever runs `docker` by accident.
+    endpoints:
+        Option<&'static archivefs_core::identity_source::romm::local_discovery::EndpointSession>,
 }
 impl ProviderHealth {
     pub(super) fn new(backoff: Duration) -> Self {
         Self {
             backoff,
             last: Mutex::new(None),
+            endpoints: None,
         }
+    }
+    pub(super) fn with_local_discovery(mut self) -> Self {
+        self.endpoints =
+            Some(archivefs_core::identity_source::romm::local_discovery::shared_session());
+        self
     }
     /// `Some(state)` when a request should fail fast without any network use.
     /// When the window has passed, the caller becomes the single probe: the
@@ -252,7 +265,7 @@ impl Artwork {
         indexer: Indexer,
     ) -> Self {
         let queue: SharedQueue = Arc::default();
-        let health = Arc::new(ProviderHealth::new(PROVIDER_BACKOFF));
+        let health = Arc::new(ProviderHealth::new(PROVIDER_BACKOFF).with_local_discovery());
         let (answers, replies) = mpsc::sync_channel(32);
         let (index_answers, index_replies) = mpsc::sync_channel(1);
         let (index_requests, index_rx) = mpsc::channel::<(u64, SharedLibrary)>();
@@ -639,7 +652,7 @@ where
             use archivefs_core::identity_source::{
                 artwork::{ArtworkCache, ArtworkRequest},
                 model::IdentityProvider,
-                romm::config::{ConfigRefusal, ValidatedRommSource},
+                romm::config::ConfigRefusal,
                 settings::load_token_file,
             };
             let request_art = match kind {
@@ -658,7 +671,24 @@ where
             let start = Instant::now();
             // Cache first: a cached picture never needs the provider, so it is
             // shown whether or not RomM can be reached.
-            let cached = cache.lookup(&request.index.server, &request_art);
+            let configured = request.index.settings.source.url.trim().to_string();
+            let fallback = health
+                .endpoints
+                .map(|session| session.effective(&configured));
+            let cached = cache
+                .lookup(&request.index.server, &request_art)
+                .or_else(|| {
+                    // A cover fetched through the session fallback is stored under that
+                    // server's own id, never under the configured one.
+                    fallback
+                        .as_ref()
+                        .filter(|effective| {
+                            effective.endpoint_source == EndpointSource::LocalDockerFallback
+                        })
+                        .and_then(|effective| {
+                            cache.lookup(&effective.effective_endpoint, &request_art)
+                        })
+                });
             timings.lookup = start.elapsed();
             timings.cache_hit = cached.is_some();
             let thumbnail = if let Some(cached) = cached {
@@ -689,11 +719,13 @@ where
                     message: "Artwork access needs attention. Open Sources & Providers to check the connection.".into(),
                     connectivity: Some(RommConnectivity::AuthenticationFailed),
                 })?;
-                let source = ValidatedRommSource::validate(
+                let source = validate_with_local_fallback(
+                    health.endpoints,
                     settings,
                     &token,
                     &request.index.trusted_roots,
                     resolver,
+                    transport,
                 )
                 .map_err(|refusal| {
                     let state = match &refusal {
@@ -727,6 +759,28 @@ where
                                 || *state == RommConnectivity::AuthenticationFailed
                         }) {
                             health.record(state);
+                        }
+                        // The endpoint answered nothing: look for a local RomM once.
+                        // The next attempt then uses it; this picture retries.
+                        if let (Some(session), Some(state)) = (health.endpoints, state) {
+                            if session.effective(&configured).endpoint_source
+                                == EndpointSource::LocalDockerFallback
+                                && state.is_unreachable()
+                            {
+                                session.invalidate();
+                            }
+                            let found = session.recover(&configured, state, &mut |url| {
+                                verify_romm(
+                                    url,
+                                    &token,
+                                    &request.index.trusted_roots,
+                                    resolver,
+                                    transport,
+                                )
+                            });
+                            if found.endpoint_source == EndpointSource::LocalDockerFallback {
+                                health.reset();
+                            }
                         }
                         ResolveFailure {
                             message: match state {
@@ -1216,6 +1270,96 @@ mod tests {
         }
         assert_eq!(resolver.calls(), 1);
         assert_eq!(transport.inner.calls(), 0);
+    }
+
+    /// A local engine whose RomM is published on host port 8080.
+    struct PublishedRomm;
+    impl archivefs_core::identity_source::romm::local_discovery::DockerCli for PublishedRomm {
+        fn run(
+            &self,
+            args: &[&str],
+        ) -> Result<String, archivefs_core::identity_source::romm::local_discovery::DockerFailure>
+        {
+            Ok(match args[0] {
+                "context" => "unix:///var/run/docker.sock".into(),
+                "ps" => "abc123".into(),
+                _ => serde_json::json!([{
+                    "Name": "/romm", "State": {"Running": true},
+                    "Config": {"Image": "rommapp/romm:5", "Labels": {}, "Env": []},
+                    "HostConfig": {"NetworkMode": "bridge"},
+                    "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}]}}
+                }])
+                .to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_cover_is_fetched_through_a_verified_local_romm_when_the_configured_host_does_not_resolve()
+    {
+        use archivefs_core::identity_source::romm::local_discovery::EndpointSession;
+        let directory = tempfile::tempdir().unwrap();
+        let request = remote_request(directory.path(), "http://romm.saltbox:8080", true);
+        let session: &'static EndpointSession = Box::leak(Box::new(EndpointSession::new(
+            Box::new(PublishedRomm),
+            None,
+        )));
+        let mut health = health();
+        health.endpoints = Some(session);
+        let server = FakeServer::serving_png();
+        server.script.lock().unwrap().insert(
+            0,
+            Ok(RommHttpResponse {
+                status: 200,
+                body: br#"{"SYSTEM":{"VERSION":"5.3.1"}}"#.to_vec(),
+                location: None,
+            }),
+        );
+        let transport = TimedTransport::new(server);
+        // names do not resolve (like romm.saltbox); address literals do
+        struct NamesFail;
+        impl HostResolver for NamesFail {
+            fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+                host.parse::<IpAddr>()
+                    .map(|address| vec![address])
+                    .map_err(|_| "failed to lookup address information".to_string())
+            }
+        }
+        let result = resolve_with(&request, &transport, &NamesFail, &health);
+        assert!(matches!(result, Ok(Some(_))), "{:?}", state_of(&result));
+        // the saved endpoint is untouched; only the session knows the fallback
+        assert_eq!(
+            request.index.settings.source.url,
+            "http://romm.saltbox:8080"
+        );
+        assert_eq!(
+            session
+                .effective("http://romm.saltbox:8080")
+                .effective_endpoint,
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn without_a_local_romm_the_dns_failure_is_still_reported_honestly() {
+        use archivefs_core::identity_source::romm::local_discovery::{
+            DockerCli, DockerFailure, EndpointSession,
+        };
+        struct NoDocker;
+        impl DockerCli for NoDocker {
+            fn run(&self, _: &[&str]) -> Result<String, DockerFailure> {
+                Err(DockerFailure::NotInstalled)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let request = remote_request(directory.path(), "http://romm.saltbox:8080", true);
+        let session: &'static EndpointSession =
+            Box::leak(Box::new(EndpointSession::new(Box::new(NoDocker), None)));
+        let mut health = health();
+        health.endpoints = Some(session);
+        let transport = TimedTransport::new(FakeServer::serving_png());
+        let result = resolve_with(&request, &transport, &FakeResolver::failing(), &health);
+        assert_eq!(state_of(&result), Some(RommConnectivity::DnsFailure));
     }
 
     #[test]
