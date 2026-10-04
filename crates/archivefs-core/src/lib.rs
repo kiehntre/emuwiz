@@ -72,6 +72,7 @@ pub mod evidence_resolution;
 /// already selected launch candidate. Explains; never decides or mutates.
 pub mod game_firmware_readiness;
 pub mod game_profile_planner;
+pub mod identity_attention;
 /// Typed library presentation visibility, separate from source ownership and
 /// subsystem evidence availability.
 pub mod library_visibility;

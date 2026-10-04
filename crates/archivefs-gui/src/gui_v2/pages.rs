@@ -670,8 +670,7 @@ impl App {
             Route::Section(Section::Problems) => {
                 if let Some(summary) = &self.problem_summary {
                     context.evidence.problems_actionable = Some(summary.actionable_count());
-                    context.evidence.problems_needing_attention =
-                        Some(summary.count(super::problems::Severity::NeedsAttention));
+                    context.evidence.problems_needing_attention = Some(summary.attention_count());
                 }
             }
             Route::Section(Section::Activity) => {
@@ -1721,7 +1720,7 @@ impl App {
             let summary = self.problem_summary.clone();
             let (attention, warnings) = summary
                 .as_ref()
-                .map(|summary| (summary.count(Severity::NeedsAttention), summary.count(Severity::Warning)))
+                .map(|summary| (summary.attention_count(), summary.count(Severity::Warning)))
                 .unwrap_or_default();
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Inbox view");
@@ -1877,7 +1876,7 @@ impl App {
                 return;
             }
             ui.horizontal_wrapped(|ui| {
-                ui.strong(format!("Needs attention: {}", summary.count(Severity::NeedsAttention)));
+                ui.strong(format!("Needs attention: {}", summary.attention_count()));
                 ui.label(format!("Warnings: {}", summary.count(Severity::Warning)));
                 ui.label(format!("Informational: {}", summary.count(Severity::Informational)));
             });

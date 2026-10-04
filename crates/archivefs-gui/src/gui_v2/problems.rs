@@ -4,9 +4,12 @@
 //! filesystem, infer identities, or invent repair actions. Findings come from
 //! the saved library state and the existing exact-duplicate proof.
 
-use super::library::{DuplicateReport, Game, Library};
+use super::library::{DuplicateReport, Game, Library, UNKNOWN_PLATFORM};
 use super::routes::{Route, Section};
 use archivefs_core::game_identity::{IdentityKind, IdentityStatus};
+use archivefs_core::identity_attention::{
+    ChoiceReason, IdentityAttention, IdentityFacts, InformationalReason, classify_identity,
+};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -42,6 +45,8 @@ pub(super) enum ProblemDestination {
     CheckGames,
     Games,
     Duplicates,
+    /// Identification data (DAT) sources and matching.
+    Dat,
     /// Findings that existing typed evidence proves are MAME set findings.
     /// MAME sets are judged as complete sets, so these go to the dedicated
     /// MAME workflow rather than a generic rename/repair page.
@@ -77,6 +82,7 @@ impl ProblemDestination {
             Self::CheckGames => "Open Check Games",
             Self::Games => "Review Games",
             Self::Duplicates => "Review Duplicates",
+            Self::Dat => "Open identification data",
             Self::Mame => "Review in MAME",
         }
     }
@@ -88,6 +94,7 @@ impl ProblemDestination {
             Self::CheckGames => Route::Section(Section::Check),
             Self::Games => Route::Section(Section::Games),
             Self::Duplicates => Route::Section(Section::Duplicates),
+            Self::Dat => Route::Section(Section::Dat),
             Self::Mame => Route::MameWorkflow,
         }
     }
@@ -164,6 +171,7 @@ pub(super) struct ProblemSummary {
 impl ProblemSummary {
     pub(super) fn from_library(library: &Library, duplicates: Option<&DuplicateReport>) -> Self {
         let mut problems = Vec::new();
+        let mut groups: BTreeMap<IdentityGroupKey, IdentityGroup> = BTreeMap::new();
         for game in &library.games {
             if game.archive.last_verified_missing_at.is_some()
                 || !path_is_present(game)
@@ -173,10 +181,37 @@ impl ProblemSummary {
                 )
             {
                 problems.push(file_problem(game));
-            } else if !game.identified {
-                problems.push(identity_problem(game));
+            } else {
+                let facts = IdentityFacts {
+                    platform: (game.platform != UNKNOWN_PLATFORM).then_some(game.platform.as_str()),
+                    relative_path: &game.archive.relative_path,
+                    report: game.archive.identity_report.as_ref(),
+                    matched_by_reference_data: library
+                        .identity_context
+                        .matched
+                        .contains(&game.archive.id),
+                };
+                match classify_identity(&facts, library.identity_context.inventory.as_ref()) {
+                    IdentityAttention::Identified => {}
+                    IdentityAttention::NeedsChoice(
+                        reason @ (ChoiceReason::Conflict | ChoiceReason::Ambiguous),
+                    ) => problems.push(identity_choice_problem(game, reason)),
+                    other => {
+                        let key = IdentityGroupKey::of(other, &game.platform);
+                        let group = groups.entry(key).or_default();
+                        group.count += 1;
+                        if group.samples.len() < 5 {
+                            group.samples.push(game.title.clone());
+                        }
+                    }
+                }
             }
         }
+        problems.extend(
+            groups
+                .into_iter()
+                .map(|(key, group)| identity_group_problem(&key, &group)),
+        );
         if let Some(report) = duplicates {
             for group in &report.groups {
                 problems.push(Problem {
@@ -223,6 +258,11 @@ impl ProblemSummary {
             .iter()
             .filter(|problem| problem.severity == severity)
             .count()
+    }
+
+    /// The one "needs attention" number: Home and Problems & Repair both show it.
+    pub(super) fn attention_count(&self) -> usize {
+        self.count(Severity::NeedsAttention)
     }
 
     pub(super) fn actionable_count(&self) -> usize {
@@ -279,13 +319,26 @@ fn file_problem(game: &Game) -> Problem {
     }
 }
 
-fn identity_problem(game: &Game) -> Problem {
+/// A game whose evidence conflicts or is ambiguous: a person has to choose.
+fn identity_choice_problem(game: &Game, reason: ChoiceReason) -> Problem {
+    let (title, why, action) = match reason {
+        ChoiceReason::Conflict => (
+            format!("{} has conflicting identification evidence", game.title),
+            "Two trusted sources disagree about which game this is, so EmuWiz will not pick one for you.",
+            "Review the evidence in the game details and decide which one is right.",
+        ),
+        _ => (
+            format!("{} has more than one possible match", game.title),
+            "EmuWiz found several possible matches and will not guess between them.",
+            "Choose the correct match in the game details.",
+        ),
+    };
     Problem {
         id: format!("identity-{}", game.archive.id),
         game_id: Some(game.archive.id),
-        title: format!("{} needs identity review", game.title),
+        title,
         category: Category::Identity,
-        severity: Severity::Warning,
+        severity: Severity::NeedsAttention,
         state: ProblemState::NeedsEvidence,
         destination: if proves_mame(game) {
             ProblemDestination::Mame
@@ -294,17 +347,128 @@ fn identity_problem(game: &Game) -> Problem {
         },
         affected: format!("{} · {}", game.platform, game.title),
         location: format!("Current path: {}", game.archive.absolute_path.display()),
-        why:
-            "EmuWiz has not established enough trusted evidence to say exactly which game this is."
-                .into(),
-        action: if proves_mame(game) {
-            MAME_ACTION.into()
-        } else {
-            "Open the game details or verification page to review available evidence.".into()
-        },
+        why: why.into(),
+        action: action.into(),
         safety: "Read-only. EmuWiz will not turn a filename hint into a verified identity.".into(),
         undo: "No file change was made, so there is nothing to undo.".into(),
-        technical: format!("Catalogue id {} · identified=false", game.archive.id),
+        technical: format!(
+            "Catalogue id {} · identity evidence {reason:?}",
+            game.archive.id
+        ),
+    }
+}
+
+/// Games that share one unconfirmed-identity situation are one finding, not one
+/// finding per game.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct IdentityGroupKey {
+    kind: u8,
+    reason: String,
+    platform: String,
+}
+
+#[derive(Default)]
+struct IdentityGroup {
+    count: usize,
+    samples: Vec<String>,
+}
+
+impl IdentityGroupKey {
+    fn of(attention: IdentityAttention, platform: &str) -> Self {
+        let (kind, reason, platform) = match attention {
+            IdentityAttention::SetupRequired(ecosystem) => {
+                (1, ecosystem.label().to_string(), platform)
+            }
+            IdentityAttention::ActionAvailable => (2, String::new(), platform),
+            IdentityAttention::NeedsChoice(_) => (0, String::new(), ""),
+            IdentityAttention::Informational(InformationalReason::NoReferenceSource) => {
+                (3, String::new(), platform)
+            }
+            IdentityAttention::Informational(InformationalReason::MatchedByReferenceData) => {
+                (4, String::new(), "")
+            }
+            IdentityAttention::Informational(InformationalReason::SpecialRelease) => {
+                (5, String::new(), "")
+            }
+            IdentityAttention::Identified => (9, String::new(), ""),
+        };
+        Self {
+            kind,
+            reason,
+            platform: platform.to_string(),
+        }
+    }
+}
+
+fn identity_group_problem(key: &IdentityGroupKey, group: &IdentityGroup) -> Problem {
+    let n = group.count;
+    let games = if n == 1 { "game" } else { "games" };
+    let have = if n == 1 { "has" } else { "have" };
+    let (title, why, action, destination, severity, state) = match key.kind {
+        0 => (
+            format!("{n} {games} {have} no system assigned"),
+            "EmuWiz cannot launch or identify a game until it knows which system it belongs to.".to_string(),
+            "Choose a system for these games.".to_string(),
+            ProblemDestination::Games,
+            Severity::Warning,
+            ProblemState::NeedsEvidence,
+        ),
+        1 => (
+            format!("{}: identification data is not set up yet", key.platform),
+            format!("EmuWiz knows an identification database for this system ({}) but none is installed. {n} {games} can still be played; identification is optional.", key.reason),
+            "Set up identification data for this system.".to_string(),
+            ProblemDestination::Dat,
+            Severity::Warning,
+            ProblemState::NeedsEvidence,
+        ),
+        2 => (
+            format!("{}: {n} {games} {have} not been matched to identification data yet", key.platform),
+            "These games can still be played. Matching them gives EmuWiz stronger proof of exactly which release each one is.".to_string(),
+            "Open identification data and match this system's games.".to_string(),
+            ProblemDestination::Dat,
+            Severity::Warning,
+            ProblemState::NeedsEvidence,
+        ),
+        3 => (
+            format!("{}: no identification database is available", key.platform),
+            format!("EmuWiz does not know a reference database for this system, so there is nothing to match {n} {games} against. This is not a problem."),
+            "No action is needed.".to_string(),
+            ProblemDestination::Games,
+            Severity::Informational,
+            ProblemState::Informational,
+        ),
+        4 => (
+            format!("{n} arcade {games} matched the reference data"),
+            "These sets were checked against the MAME reference data. Nothing is wrong.".to_string(),
+            "No action is needed.".to_string(),
+            ProblemDestination::Mame,
+            Severity::Informational,
+            ProblemState::Informational,
+        ),
+        _ => (
+            format!("{n} special {} (homebrew, prototypes, hacks, translations)", if n == 1 { "release" } else { "releases" }),
+            "Normal identification databases do not describe these releases, so they stay unmatched. They can still be played.".to_string(),
+            "No action is needed.".to_string(),
+            ProblemDestination::Games,
+            Severity::Informational,
+            ProblemState::Informational,
+        ),
+    };
+    Problem {
+        id: format!("identity-group-{}-{}-{}", key.kind, key.reason, key.platform),
+        game_id: None,
+        title,
+        category: Category::Identity,
+        severity,
+        state,
+        destination,
+        affected: if key.platform.is_empty() { "Several systems".into() } else { key.platform.clone() },
+        location: format!("{n} {games} in your library"),
+        why,
+        action,
+        safety: "Read-only. EmuWiz will not turn a filename hint into a verified identity, and nothing is renamed or moved.".into(),
+        undo: "No file change was made, so there is nothing to undo.".into(),
+        technical: format!("{n} games · examples: {}", group.samples.join(", ")),
     }
 }
 
@@ -312,6 +476,7 @@ fn identity_problem(game: &Game) -> Problem {
 mod tests {
     use super::*;
     use archivefs_core::PersistedArchive;
+    use archivefs_core::identity_attention::ReferenceInventory;
 
     fn game(id: i64, title: &str, identified: bool, missing: bool) -> Game {
         let mut archive = PersistedArchive {
@@ -360,7 +525,7 @@ mod tests {
             summary
                 .problems
                 .iter()
-                .any(|p| p.title.contains("needs identity review"))
+                .any(|p| p.title.contains("has not been matched"))
         );
         assert!(summary.problems.iter().all(|p| !p.title.contains("::")));
     }
@@ -413,9 +578,9 @@ mod tests {
         let summary = ProblemSummary::from_library(&library, None);
         let problem = &summary.problems[0];
         assert_eq!(problem.state, ProblemState::NeedsEvidence);
-        assert_eq!(problem.destination, ProblemDestination::CheckGames);
+        assert_eq!(problem.destination, ProblemDestination::Dat);
         assert!(!problem.action.to_lowercase().contains("rename"));
-        assert!(problem.location.starts_with("Current path:"));
+        assert!(problem.safety.contains("filename hint"));
     }
 
     #[test]
@@ -539,8 +704,8 @@ mod tests {
         assert_eq!(by_id("missing-1").destination, ProblemDestination::Games);
         assert_eq!(by_id("missing-2").destination, ProblemDestination::Games);
         assert_eq!(
-            by_id("identity-3").destination,
-            ProblemDestination::CheckGames
+            by_id("identity-group-2--Arcade").destination,
+            ProblemDestination::Dat
         );
         assert_eq!(
             ProblemDestination::Games.route(),
@@ -566,5 +731,148 @@ mod tests {
         assert!(proves_mame(&mame_game(1, "a", false, true)));
         assert!(!proves_mame(&mame_game(2, "b", false, false)));
         assert!(!proves_mame(&game(3, "c", true, false)));
+    }
+
+    fn identity_summary(
+        games: Vec<Game>,
+        inventory: Option<ReferenceInventory>,
+        matched: &[i64],
+    ) -> ProblemSummary {
+        let mut library = Library::new(Vec::new());
+        library.games = games;
+        library.identity_context = super::super::library::IdentityContext {
+            inventory,
+            matched: matched.iter().copied().collect(),
+        };
+        ProblemSummary::from_library(&library, None)
+    }
+
+    fn platform_game(id: i64, title: &str, platform: &str) -> Game {
+        let mut game = game(id, title, false, false);
+        game.platform = platform.into();
+        game
+    }
+
+    #[test]
+    fn ambiguous_evidence_is_a_per_game_choice_and_fails_closed() {
+        let mut game = mame_game(5, "twin", false, false);
+        game.archive.identity_report.as_mut().unwrap().evidence[0].status =
+            archivefs_core::game_identity::IdentityStatus::Ambiguous;
+        // even a reference-data match must not hide an ambiguous game
+        let summary = identity_summary(vec![game], None, &[5]);
+        assert_eq!(summary.problems.len(), 1);
+        let problem = &summary.problems[0];
+        assert_eq!(problem.severity, Severity::NeedsAttention);
+        assert!(problem.title.contains("more than one possible match"));
+        assert!(!problem.technical.contains("Identified"));
+    }
+
+    #[test]
+    fn informational_identity_rows_do_not_count_as_attention() {
+        let summary = identity_summary(
+            vec![
+                platform_game(1, "Mystery", "Acorn Electron"),
+                platform_game(2, "Cool Demo (Homebrew)", "NES"),
+                platform_game(3, "pacman", "Arcade"),
+            ],
+            None,
+            &[3],
+        );
+        assert_eq!(summary.problems.len(), 3);
+        assert_eq!(summary.actionable_count(), 0);
+        assert_eq!(summary.count(Severity::NeedsAttention), 0);
+        assert_eq!(summary.count(Severity::Informational), 3);
+    }
+
+    #[test]
+    fn unmatched_games_are_one_actionable_group_per_system() {
+        let summary = identity_summary(
+            vec![
+                platform_game(1, "A", "NES"),
+                platform_game(2, "B", "NES"),
+                platform_game(3, "C", "SNES"),
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(summary.problems.len(), 2);
+        assert!(summary.problems.iter().all(|p| p.state.is_actionable()
+            && p.severity == Severity::Warning
+            && p.destination == ProblemDestination::Dat));
+        assert!(
+            summary
+                .problems
+                .iter()
+                .any(|p| p.title.starts_with("NES: 2 games"))
+        );
+    }
+
+    #[test]
+    fn games_without_a_system_ask_for_a_system_choice() {
+        let summary = identity_summary(
+            vec![platform_game(
+                1,
+                "Who knows",
+                super::super::library::UNKNOWN_PLATFORM,
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(summary.problems[0].destination, ProblemDestination::Games);
+        assert!(summary.problems[0].title.contains("no system assigned"));
+    }
+
+    #[test]
+    fn missing_identification_data_is_setup_only_when_proven_absent() {
+        let (platform, _) = ("NES", ());
+        let nothing = ReferenceInventory {
+            platforms: Default::default(),
+            ecosystems: Vec::new(),
+            has_unattributed: false,
+        };
+        let proven = identity_summary(vec![platform_game(1, "A", platform)], Some(nothing), &[]);
+        assert!(proven.problems[0].title.contains("not set up yet"));
+        // an unattributed catalogue might cover it: only an ordinary action
+        let unclear = ReferenceInventory {
+            platforms: Default::default(),
+            ecosystems: Vec::new(),
+            has_unattributed: true,
+        };
+        let unproven = identity_summary(vec![platform_game(1, "A", platform)], Some(unclear), &[]);
+        assert!(
+            unproven.problems[0].title.contains("have not been matched")
+                || unproven.problems[0].title.contains("has not been matched")
+        );
+    }
+
+    #[test]
+    fn nothing_is_promoted_to_verified_by_projection() {
+        let games = vec![
+            platform_game(1, "A", "NES"),
+            platform_game(2, "pacman", "Arcade"),
+        ];
+        let mut library = Library::new(Vec::new());
+        library.games = games;
+        library.identity_context.matched.insert(2);
+        let _ = ProblemSummary::from_library(&library, None);
+        assert!(library.games.iter().all(|g| !g.identified));
+    }
+
+    #[test]
+    fn home_and_problems_share_one_attention_number() {
+        let mut library = Library::new(Vec::new());
+        library.games = vec![
+            game(1, "Missing", true, true),
+            platform_game(2, "A", "NES"),
+            platform_game(3, "Cool (Homebrew)", "NES"),
+        ];
+        let summary = ProblemSummary::from_library(&library, None);
+        let listed = summary
+            .problems
+            .iter()
+            .filter(|p| p.severity == Severity::NeedsAttention)
+            .count();
+        assert_eq!(summary.attention_count(), listed);
+        assert_eq!(listed, 1);
     }
 }

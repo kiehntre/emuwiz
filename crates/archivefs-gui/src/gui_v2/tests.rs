@@ -6758,3 +6758,202 @@ fn rows_of_a_source_that_is_no_longer_configured_are_hidden_only_with_a_unique_c
         "no counterpart: the row stays visible"
     );
 }
+
+/// Read-only audit of every visible game that is not identified (not part of
+/// the normal run): `REAL_CATALOGUE_DB=<library.sqlite3> cargo test -p archivefs-gui
+/// --lib -- --ignored real_identity_review_population --nocapture`.
+#[test]
+#[ignore]
+fn real_identity_review_population() {
+    use archivefs_core::dat::coverage_expectations::{
+        PlatformCoverageExpectation, expected_authoritative_coverage,
+    };
+    use archivefs_core::launch::{CanonicalIdentityStatus, canonical_identity_from_game_report};
+    use std::collections::BTreeMap;
+    let path =
+        std::path::PathBuf::from(std::env::var("REAL_CATALOGUE_DB").expect("REAL_CATALOGUE_DB"));
+    let library = super::backend::load_library(&path).expect("read-only load");
+    let tags = [
+        "(homebrew",
+        "homebrew",
+        "(proto",
+        "(beta",
+        "(demo",
+        "(sample",
+        "(unl",
+        "(hack",
+        "[hack",
+        "(translated",
+        "(aftermarket",
+        "(pirate",
+        "(bootleg",
+        "[cr ",
+        "[t+",
+        "(pd)",
+        "public domain",
+    ];
+    let mut total = 0usize;
+    let mut by: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut bump = |dimension: &str, key: String| {
+        *by.entry(dimension.to_string())
+            .or_default()
+            .entry(key)
+            .or_default() += 1;
+    };
+    let mut combos: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for game in library.games.iter().filter(|game| !game.identified) {
+        total += 1;
+        let archive = &game.archive;
+        let name = archive.relative_path.to_string_lossy().to_lowercase();
+        let ext = std::path::Path::new(&name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "(none)".into());
+        let status = match archive.identity_report.as_ref() {
+            None => "no saved evidence".to_string(),
+            Some(report) => match canonical_identity_from_game_report(report).0 {
+                CanonicalIdentityStatus::Resolved(_) => "resolved?".into(),
+                CanonicalIdentityStatus::Conflicting => "conflicting verified facts".into(),
+                CanonicalIdentityStatus::Unknown => {
+                    let mut kinds: Vec<String> = report
+                        .evidence
+                        .iter()
+                        .map(|e| format!("{:?}/{:?}", e.status, e.confidence))
+                        .collect();
+                    kinds.sort();
+                    kinds.dedup();
+                    format!("saved evidence, unresolved [{}]", kinds.join(","))
+                }
+            },
+        };
+        let coverage = match expected_authoritative_coverage(Some(&game.platform)) {
+            PlatformCoverageExpectation::ExpectedAuthoritativeSource { source, .. } => {
+                format!("expected: {}", source.source.label())
+            }
+            PlatformCoverageExpectation::MultipleCandidateSources { .. } => {
+                "expected: several sources".into()
+            }
+            PlatformCoverageExpectation::NoKnownAuthoritativeSource { .. } => {
+                "no known reference source".into()
+            }
+            PlatformCoverageExpectation::UnsupportedOrUnknown { .. } => {
+                "unknown/unsupported platform".into()
+            }
+        };
+        let special = tags.iter().any(|tag| name.contains(tag));
+        let launchable = archivefs_core::launch::platform_map::LAUNCH_COMPATIBILITY
+            .iter()
+            .any(|entry| entry.platform_id == game.platform);
+        bump("status", status.clone());
+        bump("coverage", coverage.clone());
+        bump("kind", archive.archive_kind.clone());
+        bump("ext", ext);
+        bump("platform", game.platform.clone());
+        bump("source", archive.source_folder_id.to_string());
+        bump("special-tag", special.to_string());
+        bump("platform has a launch path", launchable.to_string());
+        *combos
+            .entry((
+                game.platform.clone(),
+                format!(
+                    "{coverage} | {}",
+                    if status.starts_with("saved") {
+                        "saved-unresolved"
+                    } else {
+                        &status
+                    }
+                ),
+            ))
+            .or_default() += 1;
+    }
+    println!(
+        "identity-unresolved visible games: {total} of {}",
+        library.games.len()
+    );
+    for (dimension, counts) in &by {
+        let mut rows: Vec<_> = counts.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1));
+        println!("--- {dimension} ({} values)", rows.len());
+        for (key, value) in rows
+            .iter()
+            .take(if dimension == "platform" { 30 } else { 14 })
+        {
+            println!(
+                "  {value:6}  {:5.1}%  {key}",
+                100.0 * **value as f64 / total as f64
+            );
+        }
+    }
+    let mut rows: Vec<_> = combos.iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(a.1));
+    println!("--- top 30 platform x coverage x evidence");
+    for ((platform, reason), value) in rows.iter().take(30) {
+        println!("  {value:6}  {platform} | {reason}");
+    }
+}
+
+/// Read-only before/after of the identity-review findings against a real
+/// catalogue (not part of the normal run): `REAL_CATALOGUE_DB=<library.sqlite3>
+/// cargo test -p archivefs-gui --lib -- --ignored real_identity_attention_counts --nocapture`.
+#[test]
+#[ignore]
+fn real_identity_attention_counts() {
+    use super::library::UNKNOWN_PLATFORM;
+    use super::problems::{Category, Severity};
+    use archivefs_core::identity_attention::{IdentityAttention, IdentityFacts, classify_identity};
+    use std::collections::BTreeMap;
+    let path =
+        std::path::PathBuf::from(std::env::var("REAL_CATALOGUE_DB").expect("REAL_CATALOGUE_DB"));
+    let library = super::backend::load_library(&path).expect("read-only load");
+    println!("visible games={}", library.games.len());
+    let unidentified = library.games.iter().filter(|game| !game.identified).count();
+    println!("BEFORE: identity-review findings (one per unidentified game)={unidentified}");
+    let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+    for game in &library.games {
+        let facts = IdentityFacts {
+            platform: (game.platform != UNKNOWN_PLATFORM).then_some(game.platform.as_str()),
+            relative_path: &game.archive.relative_path,
+            report: game.archive.identity_report.as_ref(),
+            matched_by_reference_data: library.identity_context.matched.contains(&game.archive.id),
+        };
+        let class = classify_identity(&facts, library.identity_context.inventory.as_ref());
+        if class != IdentityAttention::Identified {
+            *classes.entry(format!("{class:?}")).or_default() += 1;
+        }
+    }
+    println!("classification of the unconfirmed games: {classes:#?}");
+    println!(
+        "installed identification data: {:?}",
+        library.identity_context.inventory.as_ref().map(|i| (
+            i.platforms.len(),
+            i.ecosystems.len(),
+            i.has_unattributed
+        ))
+    );
+    let summary = ProblemSummary::from_library(&library, None);
+    let identity: Vec<_> = summary
+        .problems
+        .iter()
+        .filter(|p| p.category == Category::Identity)
+        .collect();
+    println!(
+        "AFTER: problems_total={} actionable={} needs_attention(Home)={} warnings={} informational={}",
+        summary.problems.len(),
+        summary.actionable_count(),
+        summary.count(Severity::NeedsAttention),
+        summary.count(Severity::Warning),
+        summary.count(Severity::Informational)
+    );
+    println!(
+        "identity findings: total={} actionable={} informational={}",
+        identity.len(),
+        identity.iter().filter(|p| p.state.is_actionable()).count(),
+        identity.iter().filter(|p| !p.state.is_actionable()).count()
+    );
+    for problem in &identity {
+        println!(
+            "  [{:?}/{:?}] {}",
+            problem.severity, problem.state, problem.title
+        );
+    }
+}

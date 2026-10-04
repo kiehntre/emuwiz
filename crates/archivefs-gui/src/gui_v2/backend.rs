@@ -792,7 +792,21 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
         .into_iter()
         .map(|source| source.id)
         .collect();
+    let matched: std::collections::HashSet<i64> = [
+        archivefs_core::dat::set::SetState::Complete,
+        archivefs_core::dat::set::SetState::Incomplete,
+    ]
+    .iter()
+    .filter_map(|state| database.set_audit_results_by_state(state).ok())
+    .flatten()
+    .filter(|result| !result.stale)
+    .filter_map(|result| result.archive_id)
+    .collect();
     let mut library = Library::with_history(archives, &renames, Some(&configured));
+    library.identity_context = super::library::IdentityContext {
+        inventory: crate::dat_catalogue_picker::reference_inventory(),
+        matched,
+    };
     for enrichment in database
         .load_screenscraper_enrichments()
         .map_err(|error| error.to_string())?

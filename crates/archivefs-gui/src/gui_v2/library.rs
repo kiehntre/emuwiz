@@ -176,6 +176,18 @@ pub(super) struct Library {
     pub historical: Vec<Game>,
     pub historical_links: HashMap<i64, HistoricalLink>,
     pub(super) historical_of: HashMap<i64, Vec<usize>>,
+    /// What the identity classification needs beyond the rows themselves.
+    pub identity_context: IdentityContext,
+}
+
+/// Reference-data facts used to explain unconfirmed identities. Filled when the
+/// library loads; empty (so nothing is claimed) otherwise.
+#[derive(Clone, Debug, Default)]
+pub(super) struct IdentityContext {
+    /// Installed identification catalogues, when they could be listed.
+    pub inventory: Option<archivefs_core::identity_attention::ReferenceInventory>,
+    /// Games already matched against reference data by an audit.
+    pub matched: std::collections::HashSet<i64>,
 }
 
 impl Library {

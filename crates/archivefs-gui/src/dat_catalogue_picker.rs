@@ -460,6 +460,45 @@ fn load_inventory() -> archivefs_core::Result<LoadedInventory> {
     })
 }
 
+/// What identification data is installed, for explaining unconfirmed identities.
+/// Reads the same inventory as the picker and changes nothing; `None` when it
+/// cannot be listed. A catalogue whose system or kind is unclear sets
+/// `has_unattributed`, so "nothing is installed" is only reported when proven.
+pub(crate) fn reference_inventory() -> Option<archivefs_core::identity_attention::ReferenceInventory>
+{
+    let loaded = load_inventory().ok()?;
+    let mut inventory = archivefs_core::identity_attention::ReferenceInventory::default();
+    for summary in &loaded.summaries {
+        let usable = summary.enabled
+            && matches!(
+                summary.availability,
+                CatalogueAvailability::Ready | CatalogueAvailability::NeedsValidation { .. }
+            );
+        if !usable {
+            continue;
+        }
+        match &summary.platform {
+            EvidenceValue::Assigned(platform) | EvidenceValue::Confirmed(platform) => {
+                inventory.platforms.insert(
+                    archivefs_core::canonical_platform_for_alias(platform)
+                        .unwrap_or(platform)
+                        .to_lowercase(),
+                );
+            }
+            _ => inventory.has_unattributed = true,
+        }
+        match summary.ecosystem.confirmed() {
+            Some(ecosystem) => {
+                if !inventory.ecosystems.contains(ecosystem) {
+                    inventory.ecosystems.push(*ecosystem);
+                }
+            }
+            None => inventory.has_unattributed = true,
+        }
+    }
+    Some(inventory)
+}
+
 fn summary_matches(summary: &InstalledCatalogueSummary, query: &str) -> bool {
     summary.display_name.to_ascii_lowercase().contains(query)
         || summary.store.label().to_ascii_lowercase().contains(query)

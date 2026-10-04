@@ -66,6 +66,14 @@ impl App {
     pub(super) fn home_hero(&mut self, ui: &mut egui::Ui) {
         let wide = ui.available_width() >= 760.0;
         let mut open_setup = false;
+        // Home and Problems & Repair count the same findings: one summary.
+        if self.loaded && self.problem_summary.is_none() {
+            self.start_problem_summary();
+        }
+        let attention = self
+            .problem_summary
+            .as_ref()
+            .map(|summary| summary.attention_count());
         hero_card(ui, |ui| {
             ui.horizontal(|ui| {
                 if wide {
@@ -88,16 +96,23 @@ impl App {
                             .strong(),
                     );
                     if self.loaded {
-                        ui.label(format!(
-                            "{} games · {} systems · {} need attention",
-                            self.library.games.len(),
-                            self.library.platforms.len(),
-                            self.library.attention
-                        ));
+                        ui.label(match attention {
+                            Some(count) => format!(
+                                "{} games · {} systems · {} need attention",
+                                self.library.games.len(),
+                                self.library.platforms.len(),
+                                count
+                            ),
+                            None => format!(
+                                "{} games · {} systems · checking what needs attention",
+                                self.library.games.len(),
+                                self.library.platforms.len()
+                            ),
+                        });
                         if self.library.games.is_empty() {
                             ui.label("Start by adding a folder you already keep games in. EmuWiz lists the files; it does not move them.");
                             if ui.button("Add my game folders").clicked() { self.go(Route::Section(Section::Sources)); }
-                        } else if self.library.attention > 0 {
+                        } else if attention.unwrap_or(0) > 0 {
                             if ui.button("Understand what needs attention").clicked() { self.go(Route::Section(Section::Problems)); }
                         }
                     } else {
