@@ -134,6 +134,7 @@ pub mod cheat_runtime_retroarch;
 pub mod readiness;
 pub mod resource_grants;
 pub mod retroarch_command;
+pub mod retroarch_launch_visibility;
 pub mod retroarch_resource_projection;
 pub mod rmg_command;
 pub mod rmg_execution;
@@ -417,7 +418,8 @@ pub use retroarch_command::{
 pub use retroarch_resource_projection::{
     RetroArchBiosRequirement, RetroArchProjectionError, RetroArchProjectionReceipt,
     RetroArchResourcePlan, RetroArchResourcePlanError, RetroArchResourceRequest,
-    approved_retroarch_launch_root, cleanup_retroarch_projection,
+    approved_retroarch_data_launch_root, approved_retroarch_launch_root,
+    approved_retroarch_launch_roots, cleanup_retroarch_projection,
     command_with_retroarch_resource_plan, materialize_retroarch_resource_plan,
     plan_retroarch_resource_grants,
 };

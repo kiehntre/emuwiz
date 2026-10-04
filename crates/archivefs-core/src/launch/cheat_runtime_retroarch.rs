@@ -54,6 +54,11 @@ use super::execution::{
 };
 use super::resource_grants::{LaunchProjectionMethod, LaunchResourceRole};
 use super::retroarch_command::RetroArchCommand;
+use super::retroarch_launch_visibility::{
+    FlatpakHost, RetroArchLaunchResources, RetroArchRootError, ensure_retroarch_resources_visible,
+    select_retroarch_approved_root,
+};
+use super::retroarch_resource_projection::approved_retroarch_data_launch_root;
 use crate::emulator_environment::retroarch::{
     DiscoveryEnvironment, DiscoveryError, PathPurpose, discover_retroarch_environment,
 };
@@ -457,6 +462,10 @@ pub enum RetroArchCheatLaunchError {
     /// A launch without cheats could not be started.
     Spawn(LaunchSpawnError),
     InvalidLaunchId,
+    /// The sandbox RetroArch runs in cannot be shown to reach a resource the
+    /// cheat launch needs (workspace, content, core, saves or states). Nothing
+    /// was created and nothing was started.
+    Sandbox(RetroArchRootError),
 }
 
 /// How a launch went. Either way the canonical launcher started the process.
@@ -473,36 +482,51 @@ pub enum RetroArchCheatLaunch {
     },
 }
 
-/// Canonical RetroArch launch, optionally with explicitly selected cheats.
+/// THE product entry point: canonical RetroArch launch, optionally with
+/// explicitly selected cheats.
 ///
 /// With no selection this is exactly [`super::execution::preflight_and_launch_retroarch`].
-/// With a selection it runs the canonical preflight, plans, materialises an
-/// EmuWiz-owned workspace and starts RetroArch through the canonical spawn with
-/// the prepared `--config`. The user's real configuration, saves and source
-/// media are only fingerprinted, never written.
+/// With a selection it runs the canonical preflight, picks a workspace root the
+/// real spawned RetroArch can see (a Flatpak RetroArch has a private `/tmp`, so
+/// it gets the EmuWiz data-directory root), proves that RetroArch can reach
+/// every resource it will open, plans, materialises an EmuWiz-owned workspace
+/// and starts RetroArch through the canonical spawn with the prepared
+/// `--config`. The user's real configuration, saves and source media are only
+/// fingerprinted, never written, and nothing is ever relocated.
 pub fn preflight_and_launch_retroarch_with_cheats(
     request: &RetroArchLaunchRequest,
     filesystem: &dyn ReadOnlyHostFilesystem,
     environment: &DiscoveryEnvironment,
     cheats: &RetroArchCheatSelection,
-    roots: &CheatRuntimeRoots,
     launch_id: &str,
 ) -> Result<RetroArchCheatLaunch, RetroArchCheatLaunchError> {
     let command = preflight_retroarch_launch(request, filesystem, environment)
         .map_err(RetroArchCheatLaunchError::Preflight)?;
+    if cheats.selections.is_empty() {
+        let process = spawn_retroarch(command).map_err(RetroArchCheatLaunchError::Spawn)?;
+        return Ok(RetroArchCheatLaunch::Plain(process));
+    }
+    let approved_root = select_retroarch_approved_root(
+        &command.executable,
+        approved_retroarch_data_launch_root().as_deref(),
+    )
+    .map_err(RetroArchCheatLaunchError::Sandbox)?;
     launch_prepared_command(
         request,
         command,
         filesystem,
         environment,
         cheats,
-        roots,
+        &CheatRuntimeRoots { approved_root },
         launch_id,
+        FlatpakHost::from_env().as_ref(),
     )
 }
 
-/// The composition after preflight, separate so it can be tested with a
-/// command built around a fake emulator executable.
+/// The composition after preflight and root selection, separate so it can be
+/// tested with a command built around a fake emulator executable and a known
+/// Flatpak layout.
+#[allow(clippy::too_many_arguments)]
 pub fn launch_prepared_command(
     request: &RetroArchLaunchRequest,
     command: RetroArchCommand,
@@ -511,6 +535,7 @@ pub fn launch_prepared_command(
     cheats: &RetroArchCheatSelection,
     roots: &CheatRuntimeRoots,
     launch_id: &str,
+    host: Option<&FlatpakHost>,
 ) -> Result<RetroArchCheatLaunch, RetroArchCheatLaunchError> {
     if cheats.selections.is_empty() {
         let process = spawn_retroarch(command).map_err(RetroArchCheatLaunchError::Spawn)?;
@@ -525,6 +550,33 @@ pub fn launch_prepared_command(
         launch_root.clone(),
     )
     .map_err(RetroArchCheatLaunchError::Facts)?;
+    // The process EmuWiz starts - not EmuWiz - opens these. Prove it can.
+    let core = command
+        .arguments
+        .iter()
+        .position(|argument| argument == "-L")
+        .and_then(|at| command.arguments.get(at + 1))
+        .map(PathBuf::from);
+    let (Some(saves), Some(states)) = (
+        facts.real_save_directory.as_deref(),
+        facts.real_state_directory.as_deref(),
+    ) else {
+        return Err(RetroArchCheatLaunchError::Facts(
+            "RetroArch's save or save-state directory is not resolved".into(),
+        ));
+    };
+    ensure_retroarch_resources_visible(
+        &command.executable,
+        &RetroArchLaunchResources {
+            workspace: &launch_root,
+            content: &command.selection.content_path,
+            core: core.as_deref(),
+            saves,
+            states,
+        },
+        host,
+    )
+    .map_err(RetroArchCheatLaunchError::Sandbox)?;
     let seed_path = facts.real_config_path.clone();
     let planner_request = CheatLaunchRequest {
         launch_id: launch_id.to_string(),

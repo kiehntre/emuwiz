@@ -40,7 +40,7 @@ use super::resource_grants::{
     LaunchResourceGrantSet, LaunchResourceLifetime, LaunchResourceRole,
 };
 use super::retroarch_command::RetroArchCommand;
-use super::retroarch_resource_projection::approved_retroarch_launch_root;
+use super::retroarch_resource_projection::approved_retroarch_launch_roots;
 use crate::patch_manager::{
     CheatApplicabilityReport, CheatApplicabilityState, CheatApplySupport,
     CheatDerivativeEntryRecord, CheatDerivativeError, CheatDerivativeInput,
@@ -749,9 +749,13 @@ fn safe_absolute(path: &Path) -> bool {
 }
 
 fn check_retroarch_facts(facts: &RetroArchLaunchFacts, blocks: &mut Vec<CheatLaunchBlockReason>) {
-    let approved = approved_retroarch_launch_root();
+    let approved = approved_retroarch_launch_roots();
     match facts.launch_root.as_deref() {
-        Some(root) if safe_absolute(root) && root != approved && root.starts_with(&approved) => {}
+        Some(root)
+            if safe_absolute(root)
+                && approved
+                    .iter()
+                    .any(|approved| root != approved && root.starts_with(approved)) => {}
         _ => blocks.push(CheatLaunchBlockReason::ScratchUnavailable),
     }
     match facts.real_config_path.as_deref() {

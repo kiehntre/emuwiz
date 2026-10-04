@@ -96,3 +96,46 @@ successful result means only "RetroArch was launched with the prepared cheat
 configuration". Tests use a fake `retroarch` script. No GUI/CLI entry point is
 wired yet; the seam is the library function above. Other emulators are
 unchanged.
+
+## Reconciliation update: Flatpak resource visibility and real-RetroArch evidence
+
+The generic executor above is the one production materialiser. A separate
+branch's materialiser and launch wrapper were dropped as duplicates; what they
+proved is kept as tests.
+
+A Flatpak RetroArch has a private `/tmp`, so a `/tmp` workspace is invisible to
+it (`[Config] Config not found`). `launch/retroarch_launch_visibility.rs`
+classifies the executable that will really be spawned (native, `flatpak run
+<app>`, or unknown) and, for Flatpak, reads the installed app's metadata plus
+system/user, global/app overrides and its own `~/.var/app/<id>` directory.
+`preflight_and_launch_retroarch_with_cheats` now refuses, before anything is
+created or started, unless it can prove the spawned RetroArch reaches **all** of:
+the workspace (read/write, in the EmuWiz data-dir launch root, never `/tmp`),
+the game content (read), the `-L` core (read), and the save and save-state
+directories (read/write). The refusal names the first resource it cannot prove.
+Unknown sandboxes and unreadable permissions fail closed; a game in `/tmp` is
+refused even when the app has `host` access; nothing is ever copied or moved.
+A launch with no cheats selected never consults any of this.
+
+Evidence (real Flatpak RetroArch 1.22.2, Genesis Plus GX, synthetic ROM under
+`$HOME`, no `TMPDIR` override, `real_flatpak_retroarch_cheat_launch_end_to_end`):
+the log shows `[Cheats] Load game-specific cheatfile: "<workspace>/retroarch/
+cheats/Genesis Plus GX/game.cht"` then `[Cheats] Applying cheat changes`; the
+config was found, the content opened, save/state directories were accepted, the
+user's `retroarch.cfg` hash and the ROM were unchanged, and the workspace was
+removed. Highest proven level: **6** (RetroArch demonstrably loaded the
+generated cheat file). Level 7 (a visible in-game effect) is not shown.
+
+## The one future product entry point
+
+* Selection model: `RetroArchCheatSelection` (candidates, selections, core
+  library name, effective overrides).
+* Call: `preflight_and_launch_retroarch_with_cheats(request, filesystem,
+  environment, &selection, launch_id)`.
+* Retain: the returned `RetroArchCheatLaunch` (`Plain(process)` or
+  `WithCheats { session: Box<CheatRuntimeSession<LaunchedRetroArchProcess>>, .. }`).
+* Lifecycle: call `session.poll()` on the page's existing process poll; when
+  `session.is_finished()` the receipt holds the outcome, and `session.cleanup_now()`
+  removes the workspace (it also runs when the process is seen to exit). A crash
+  leaves a marked workspace that `scan_cheat_runtime_workspaces` finds and
+  `cleanup_stale_workspace` removes on request.

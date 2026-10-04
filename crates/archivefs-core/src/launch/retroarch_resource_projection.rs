@@ -408,6 +408,21 @@ pub fn approved_retroarch_launch_root() -> PathBuf {
     std::env::temp_dir().join("emuwiz/retroarch-launches")
 }
 
+/// EmuWiz-owned launch root for sandboxes that cannot see the host `/tmp`
+/// (Flatpak): `<EmuWiz data dir>/retroarch-launches`.
+pub fn approved_retroarch_data_launch_root() -> Option<PathBuf> {
+    crate::app_dirs::data_dir()
+        .ok()
+        .map(|dir| dir.join("retroarch-launches"))
+}
+
+/// Every root a per-launch cheat workspace may live under.
+pub fn approved_retroarch_launch_roots() -> Vec<PathBuf> {
+    let mut roots = vec![approved_retroarch_launch_root()];
+    roots.extend(approved_retroarch_data_launch_root());
+    roots
+}
+
 fn validate_launch_root(root: &Path) -> Result<(), RetroArchProjectionError> {
     let approved = approved_retroarch_launch_root();
     if !root.is_absolute()

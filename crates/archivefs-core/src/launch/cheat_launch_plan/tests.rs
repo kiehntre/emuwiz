@@ -1,6 +1,7 @@
 use super::*;
 use crate::emulator_environment::retroarch::{ProfileKind, ProfileRef, ProfileScope};
 use crate::launch::retroarch_command::RetroArchCommandSelection;
+use crate::launch::retroarch_resource_projection::approved_retroarch_launch_root;
 use crate::patch_manager::parse_cht_text;
 
 fn source(id: &str) -> CheatSourceReference {
