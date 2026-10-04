@@ -1501,6 +1501,7 @@ fn spawn_test_dolphin_process(
         working_directory: None,
         selection: DolphinCommandSelection {
             profile_id: profile_id.to_string(),
+            installation: archivefs_core::launch::installation::LaunchInstallation::Native,
             user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
             platform_id: DOLPHIN_SUPPORTED_PLATFORM_ID.to_string(),
             game_id: "GALE01".to_string(),
@@ -1695,6 +1696,7 @@ fn gui_never_emits_argv_or_command_strings() {
 fn default_native_binding_produces_request_without_gui_inventing_u() {
     let binding = DolphinNativeLaunchBinding {
         executable: PathBuf::from("/usr/bin/dolphin-emu"),
+        installation: archivefs_core::launch::installation::LaunchInstallation::Native,
         user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
     };
     let request = dolphin_launch_request_from_binding(
@@ -1718,6 +1720,7 @@ fn explicit_root_binding_preserves_the_verified_mode_and_path_as_facts_only() {
     let root = PathBuf::from("/profiles/dolphin-portable");
     let binding = DolphinNativeLaunchBinding {
         executable: PathBuf::from("/opt/dolphin/dolphin-emu"),
+        installation: archivefs_core::launch::installation::LaunchInstallation::Native,
         user_directory_mode: DolphinUserDirectoryMode::ExplicitRoot(root.clone()),
     };
     let request = dolphin_launch_request_from_binding(

@@ -4,7 +4,8 @@ EmuWiz used to detect installs it could not launch: the PCSX2, DuckStation,
 PPSSPP and melonDS launch bindings accepted native executables only, so
 Doctor could say "installed" while the launcher said "unsupported" (or a
 package kind simply was not looked for). This change makes the three package
-kinds first-class for those four adapters.
+kinds first-class for those four adapters. Dolphin and RPCS3 now use the same
+resolver and launch wrapper while retaining their existing content planners.
 
 ## Model (nothing new beside two small modules)
 
@@ -23,10 +24,15 @@ kinds first-class for those four adapters.
   that only runs `flatpak run <known app>` (for example `~/.local/bin/PPSSPPSDL`)
   is not a native emulator; the real Flatpak is bound instead.
 - Existing per-emulator bindings (`resolve_*_native_launch_binding`) gained
-  an `installation` field and now bind: a portable AppImage to the profile in
-  its own directory (portable marker recorded, never touched), a plain
-  AppImage to the default profile, a Flatpak to its `~/.var/app/<id>` profile.
-  Requests carry `expected_installation`, so drift between kinds is refused.
+  an `installation` field. Existing adapters retain their marked-portable
+  versus default AppImage rules. Dolphin uses its proven adjacent `User` root
+  when `portable.txt` and `Config/Dolphin.ini` exist; RPCS3 uses its standard
+  XDG configuration path. Flatpaks bind to their exact `~/.var/app/<id>`
+  profile. Requests carry `expected_installation`, so drift between kinds is
+  refused.
+- Dolphin and RPCS3 command plans carry that same `LaunchInstallation` value.
+  Their resolver rechecks the exact profile and executable before spawn; a
+  Flatpak plan adds only a transient read-only content grant and exact app id.
 - `launch/installation_support.rs` runs those same bindings to answer
   "launchable?" for Doctor. `EmulatorLifecycleInstallation.launch_support` is
   `Launchable{kind}`, `NotLaunchableYet{reason}` or `NotAssessed`; AppImages in
@@ -55,6 +61,29 @@ Each probe is the exact wrapped argv run through `spawn_watched_process`
 (pid and exit status captured) and again to capture text; Qt AppImages and the
 Qt Flatpak ran under `xvfb-run` because even `--version` needs a display.
 
+### Dolphin and RPCS3 (saltbox26)
+
+`flatpak list` confirms the exact installed IDs below. The PATH entries
+`dolphin-emu` and `rpcs3` are Flatpak forwarding scripts, so neither is
+counted as a native binary. Dolphin's desktop entry passes `-u` with the
+AppImage's adjacent `User` root; EmuWiz binds it only when the root contains a
+regular `Config/Dolphin.ini`. RPCS3 AppImages use only the established XDG
+configuration path; no unverified per-AppImage portable layout is assumed.
+
+| Emulator | Kind | Installed form | Resolver result | Safe probe | Readiness |
+|---|---|---|---|---|---|
+| Dolphin | Native | no native executable observed; PATH `dolphin-emu` is a Flatpak forwarding script | - | - | not installed |
+| Dolphin | AppImage | `/home/davedap/Applications/Dolphin/Dolphin.AppImage`; existing `User/` portable profile | AppImage, `User/Config/Dolphin.ini` | watched `--version`, `Dolphin 2606a`, exit 0 | ready |
+| Dolphin | Flatpak | `org.DolphinEmu.dolphin-emu` (user deployment, version `2606a`) | `/usr/bin/flatpak run org.DolphinEmu.dolphin-emu`; profile `.var/app/org.DolphinEmu.dolphin-emu/config/dolphin-emu` | watched `--version`, `Dolphin 2606a`, exit 0 | ready |
+| RPCS3 | Native | PATH `rpcs3` is a Flatpak forwarding script; no native binary observed | - | - | not installed |
+| RPCS3 | AppImage | none found in bounded known locations | - | - | not installed |
+| RPCS3 | Flatpak | `net.rpcs3.RPCS3` (user + system deployments; selected version `0.0.42-19980-028d1e8f`) | `/usr/bin/flatpak run net.rpcs3.RPCS3`; profile `.var/app/net.rpcs3.RPCS3/config/rpcs3` | watched `--version`, `RPCS3 0.0.42-19980-028d1e8f Alpha`, exit 0 | ready |
+
+Both Flatpak wrappers remained alive through their applications in the watched
+process test and returned the harmless child process's exit code 23. The
+selected RPCS3 Flatpak command uses the canonical app ID; Flatpak reports both
+user and system deployments on this host.
+
 ### Flatpak transient visibility (Flatpak 1.14.6)
 
 Fixture outside the library (`/tmp/emuwiz-fp-probe/sub/fixture file.txt`):
@@ -78,6 +107,6 @@ process: still running after 1.5 s and exit code 7 after 3.45 s, so the
 
 ## Not covered
 
-Cheat runtimes (PCSX2/DuckStation/PPSSPP stay as documented), Dolphin, RPCS3
-and the other emulators' adapters, and a cheat launch for a Flatpak melonDS
-(refused: the child environment does not reach the sandbox).
+Cheat runtimes (PCSX2/DuckStation/PPSSPP stay as documented), the other
+emulators' adapters, and a cheat launch for a Flatpak melonDS (refused: the
+child environment does not reach the sandbox).

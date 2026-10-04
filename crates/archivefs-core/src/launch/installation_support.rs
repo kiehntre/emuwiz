@@ -13,14 +13,17 @@ use std::path::PathBuf;
 use crate::emulator_lifecycle::ExactBinding;
 use crate::launch::installation::{InstallationKind, LaunchInstallation};
 use crate::launch::installation_known::{
-    DUCKSTATION, KnownEmulator, KnownInstallRoots, MELONDS, PCSX2, PPSSPP, discover_appimages,
+    DOLPHIN, DUCKSTATION, KnownEmulator, KnownInstallRoots, MELONDS, PCSX2, PPSSPP, RPCS3,
+    discover_appimages,
 };
 use crate::patch_manager::{
-    DuckStationProfileDiscoveryRoots, MelonDsProfileDiscoveryRoots, Pcsx2ProfileDiscoveryRoots,
-    PpssppProfileDiscoveryRoots, discover_duckstation_profiles, discover_melonds_profiles,
-    discover_pcsx2_profiles, discover_ppsspp_profiles, resolve_duckstation_native_launch_binding,
+    DolphinLocalDiscoveryRoots, DuckStationProfileDiscoveryRoots, MelonDsProfileDiscoveryRoots,
+    Pcsx2ProfileDiscoveryRoots, PpssppProfileDiscoveryRoots, Rpcs3ProfileDiscoveryRoots,
+    discover_dolphin_local_profiles, discover_duckstation_profiles, discover_melonds_profiles,
+    discover_pcsx2_profiles, discover_ppsspp_profiles, discover_rpcs3_profiles,
+    resolve_dolphin_native_launch_binding, resolve_duckstation_native_launch_binding,
     resolve_melonds_native_launch_binding, resolve_pcsx2_native_launch_binding,
-    resolve_ppsspp_native_launch_binding,
+    resolve_ppsspp_native_launch_binding, resolve_rpcs3_native_launch_binding,
 };
 
 /// Whether an installation can be launched by EmuWiz.
@@ -162,6 +165,8 @@ pub struct AssessmentRoots {
     pub duckstation: DuckStationProfileDiscoveryRoots,
     pub ppsspp: PpssppProfileDiscoveryRoots,
     pub melonds: MelonDsProfileDiscoveryRoots,
+    pub dolphin: DolphinLocalDiscoveryRoots,
+    pub rpcs3: Rpcs3ProfileDiscoveryRoots,
 }
 
 impl AssessmentRoots {
@@ -173,6 +178,8 @@ impl AssessmentRoots {
             duckstation: DuckStationProfileDiscoveryRoots::from_environment().ok()?,
             ppsspp: PpssppProfileDiscoveryRoots::from_environment().ok()?,
             melonds: MelonDsProfileDiscoveryRoots::from_environment().ok()?,
+            dolphin: DolphinLocalDiscoveryRoots::from_environment().ok()?,
+            rpcs3: Rpcs3ProfileDiscoveryRoots::from_environment().ok()?,
         })
     }
 }
@@ -190,7 +197,7 @@ pub fn assess_from_environment() -> LaunchAssessment {
 #[must_use]
 pub fn assess(roots: &AssessmentRoots) -> LaunchAssessment {
     let mut out = LaunchAssessment::default();
-    for def in [&PCSX2, &DUCKSTATION, &PPSSPP, &MELONDS] {
+    for def in [&PCSX2, &DUCKSTATION, &PPSSPP, &MELONDS, &DOLPHIN, &RPCS3] {
         out.appimages.extend(appimages_of(def, &roots.known));
     }
     if let Ok(discovery) = discover_pcsx2_profiles(&roots.pcsx2) {
@@ -240,6 +247,42 @@ pub fn assess(roots: &AssessmentRoots) -> LaunchAssessment {
         match resolve_melonds_native_launch_binding(profile) {
             Ok(binding) => out.add_resolved(MELONDS.id, binding.executable, binding.installation),
             Err(e) => out.add_blocker(MELONDS.id, e.detail),
+        }
+    }
+    out.assessed.push(DOLPHIN.id);
+    let dolphin = discover_dolphin_local_profiles(&roots.dolphin);
+    for profile in dolphin.profiles {
+        if !profile.eligible {
+            out.add_blocker(
+                DOLPHIN.id,
+                profile
+                    .blocker
+                    .unwrap_or_else(|| "profile is not launchable".into()),
+            );
+            continue;
+        }
+        match resolve_dolphin_native_launch_binding(&profile, &roots.dolphin) {
+            Ok(binding) => out.add_resolved(DOLPHIN.id, binding.executable, binding.installation),
+            Err(error) => out.add_blocker(DOLPHIN.id, error.detail),
+        }
+    }
+    out.assessed.push(RPCS3.id);
+    let rpcs3 = discover_rpcs3_profiles(&roots.rpcs3);
+    for profile in rpcs3.profiles {
+        if !profile.eligible {
+            out.add_blocker(
+                RPCS3.id,
+                profile
+                    .blockers
+                    .first()
+                    .map(|blocker| blocker.detail.clone())
+                    .unwrap_or_else(|| "profile is not launchable".into()),
+            );
+            continue;
+        }
+        match resolve_rpcs3_native_launch_binding(&profile) {
+            Ok(binding) => out.add_resolved(RPCS3.id, binding.executable, binding.installation),
+            Err(error) => out.add_blocker(RPCS3.id, error.detail),
         }
     }
     out

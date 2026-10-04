@@ -49,10 +49,22 @@ pub const MELONDS: KnownEmulator = KnownEmulator {
     flatpak_ids: &["net.kuribo64.melonDS"],
     portable_markers: &[],
 };
+pub const DOLPHIN: KnownEmulator = KnownEmulator {
+    id: "Dolphin",
+    appimage_stems: &["dolphin"],
+    flatpak_ids: &["org.DolphinEmu.dolphin-emu"],
+    portable_markers: &["portable.txt"],
+};
+pub const RPCS3: KnownEmulator = KnownEmulator {
+    id: "RPCS3",
+    appimage_stems: &["rpcs3"],
+    flatpak_ids: &["net.rpcs3.RPCS3"],
+    portable_markers: &[],
+};
 
 #[must_use]
 pub fn known_emulator(id: &str) -> Option<&'static KnownEmulator> {
-    [&PCSX2, &DUCKSTATION, &PPSSPP, &MELONDS]
+    [&PCSX2, &DUCKSTATION, &PPSSPP, &MELONDS, &DOLPHIN, &RPCS3]
         .into_iter()
         .find(|e| e.id.eq_ignore_ascii_case(id))
 }
@@ -281,7 +293,7 @@ pub fn resolve_flatpak_launch(
     Ok((binary, installation))
 }
 
-const KNOWN: [&KnownEmulator; 4] = [&PCSX2, &DUCKSTATION, &PPSSPP, &MELONDS];
+const KNOWN: [&KnownEmulator; 6] = [&PCSX2, &DUCKSTATION, &PPSSPP, &MELONDS, &DOLPHIN, &RPCS3];
 
 #[cfg(test)]
 mod tests;

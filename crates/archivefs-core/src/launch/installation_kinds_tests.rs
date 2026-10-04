@@ -99,6 +99,29 @@ fn machine() -> Machine {
         &home.join(".config/melonDS/melonDS.toml"),
         b"Emu.DirectBoot = true\n",
     );
+    // Dolphin: AppImage user root and Flatpak config, with no native binary.
+    let dolphin = "org.DolphinEmu.dolphin-emu";
+    flatpak_app(&home, dolphin);
+    write(
+        &home.join(format!(".var/app/{dolphin}/config/dolphin-emu/Dolphin.ini")),
+        b"[Core]\n",
+    );
+    exe(&home.join("Applications/Dolphin/Dolphin.AppImage"));
+    write(
+        &home.join("Applications/Dolphin/User/Config/Dolphin.ini"),
+        b"[Core]\n",
+    );
+    // RPCS3: AppImage and Flatpak share the official XDG config, but retain
+    // separate profile identities so the Doctor result names the executable kind.
+    let rpcs3 = "net.rpcs3.RPCS3";
+    flatpak_app(&home, rpcs3);
+    write(
+        &home.join(format!(".var/app/{rpcs3}/config/rpcs3/config.yml")),
+        b"Core:\n",
+    );
+    write(&home.join(".config/rpcs3/config.yml"), b"Core:\n");
+    fs::create_dir_all(home.join(".config/rpcs3/dev_hdd0")).unwrap();
+    exe(&home.join("Applications/RPCS3/RPCS3.AppImage"));
 
     let user_data = home.join(".local/share");
     let known = KnownInstallRoots {
@@ -136,13 +159,13 @@ fn machine() -> Machine {
         ppsspp: PpssppProfileDiscoveryRoots {
             home: home.clone(),
             xdg_config_home: home.join(".config"),
-            xdg_data_home: user_data,
+            xdg_data_home: user_data.clone(),
             explicit_configuration_roots: Vec::new(),
             portable_configuration_roots: Vec::new(),
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
-            path_override: Some(vec![bin, home.join(".local/bin")]),
+            path_override: Some(vec![bin.clone(), home.join(".local/bin")]),
         },
         melonds: MelonDsProfileDiscoveryRoots {
             home: home.clone(),
@@ -152,6 +175,29 @@ fn machine() -> Machine {
             explicit_executables: Vec::new(),
             known_version_outputs: BTreeMap::new(),
             appimage_directory: None,
+        },
+        dolphin: crate::patch_manager::DolphinLocalDiscoveryRoots {
+            home: home.clone(),
+            xdg_config_home: home.join(".config"),
+            xdg_data_home: user_data.clone(),
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            dolphin_emu_userpath_override: None,
+            path_override: Some(vec![bin.clone(), home.join(".local/bin")]),
+        },
+        rpcs3: crate::patch_manager::Rpcs3ProfileDiscoveryRoots {
+            home: home.clone(),
+            xdg_config_home: home.join(".config"),
+            xdg_data_home: user_data,
+            explicit_configuration_roots: Vec::new(),
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(vec![bin, home.join(".local/bin")]),
         },
     };
     Machine { dir, home, roots }
@@ -204,6 +250,26 @@ fn every_installed_package_kind_on_the_machine_is_launchable() {
             "melonDS",
             appimage(apps.join("melonDS/melonDS-x86_64.AppImage")),
             InstallationKind::AppImage,
+        ),
+        (
+            "Dolphin",
+            appimage(apps.join("Dolphin/Dolphin.AppImage")),
+            InstallationKind::AppImage,
+        ),
+        (
+            "Dolphin",
+            flatpak("org.DolphinEmu.dolphin-emu"),
+            InstallationKind::Flatpak,
+        ),
+        (
+            "RPCS3",
+            appimage(apps.join("RPCS3/RPCS3.AppImage")),
+            InstallationKind::AppImage,
+        ),
+        (
+            "RPCS3",
+            flatpak("net.rpcs3.RPCS3"),
+            InstallationKind::Flatpak,
         ),
     ];
     for (id, binding, kind) in cases {

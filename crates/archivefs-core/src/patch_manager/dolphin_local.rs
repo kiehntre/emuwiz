@@ -1630,6 +1630,7 @@ const DOLPHIN_LOCAL_MAX_LINES: usize = 8_192;
 pub enum DolphinLocalInstallationType {
     Native,
     FlatpakUser,
+    AppImage,
     Portable,
     Explicit,
 }
@@ -1902,6 +1903,26 @@ pub fn discover_dolphin_local_profiles(
                 data_root: root,
             }),
     );
+    for image in dolphin_known_appimages(roots) {
+        let directory = image.path.parent().unwrap_or_else(|| Path::new("/"));
+        let portable_root = [directory.join("User"), directory.join("user")]
+            .into_iter()
+            .find(|root| root.join("Config/Dolphin.ini").is_file());
+        let (configuration_root, data_root) = portable_root.map_or_else(
+            || {
+                (
+                    roots.xdg_config_home.join("dolphin-emu"),
+                    roots.xdg_data_home.join("dolphin-emu"),
+                )
+            },
+            |root| (root.clone(), root),
+        );
+        candidates.push(DolphinLocalCandidate {
+            installation_type: DolphinLocalInstallationType::AppImage,
+            configuration_root,
+            data_root,
+        });
+    }
     if let Some(directory) = &roots.appimage_directory {
         candidates.push(DolphinLocalCandidate {
             installation_type: DolphinLocalInstallationType::Portable,
@@ -1926,7 +1947,9 @@ pub fn discover_dolphin_local_profiles(
             .then_with(|| left.data_root.cmp(&right.data_root))
     });
     candidates.dedup_by(|left, right| {
-        left.configuration_root == right.configuration_root && left.data_root == right.data_root
+        left.installation_type == right.installation_type
+            && left.configuration_root == right.configuration_root
+            && left.data_root == right.data_root
     });
     let executables = discover_dolphin_local_executables(roots);
     DolphinLocalProfileDiscovery {
@@ -2026,7 +2049,13 @@ fn dolphin_local_profile(
     candidate: DolphinLocalCandidate,
     executables: &[DolphinExecutable],
 ) -> DolphinLocalProfile {
-    let dolphin_ini_path = candidate.configuration_root.join("Dolphin.ini");
+    let dolphin_ini_path = if candidate.installation_type == DolphinLocalInstallationType::AppImage
+        && is_regular_file_local(&candidate.configuration_root.join("Config/Dolphin.ini"))
+    {
+        candidate.configuration_root.join("Config/Dolphin.ini")
+    } else {
+        candidate.configuration_root.join("Dolphin.ini")
+    };
     let blocker =
         if !candidate.configuration_root.is_absolute() || !candidate.data_root.is_absolute() {
             Some("configuration and data roots must be absolute".to_string())
@@ -2038,7 +2067,14 @@ fn dolphin_local_profile(
             None
         };
     DolphinLocalProfile {
-        profile_id: format!("dolphin:{}", candidate.configuration_root.display()),
+        profile_id: if candidate.installation_type == DolphinLocalInstallationType::AppImage {
+            format!(
+                "dolphin:appimage:{}",
+                candidate.configuration_root.display()
+            )
+        } else {
+            format!("dolphin:{}", candidate.configuration_root.display())
+        },
         installation_type: candidate.installation_type,
         configuration_root: candidate.configuration_root.clone(),
         data_root: candidate.data_root.clone(),
@@ -2075,6 +2111,11 @@ fn discover_dolphin_local_executables(
     roots: &DolphinLocalDiscoveryRoots,
 ) -> Vec<DolphinExecutable> {
     let mut paths = roots.explicit_executables.clone();
+    paths.extend(
+        dolphin_known_appimages(roots)
+            .into_iter()
+            .map(|image| image.path),
+    );
     if let Some(directory) = &roots.appimage_directory {
         paths.extend([
             directory.join("Dolphin.AppImage"),
@@ -2095,10 +2136,16 @@ fn discover_dolphin_local_executables(
     paths.dedup();
     paths
         .into_iter()
+        .filter(|path| crate::launch::installation_known::flatpak_wrapper_app_id(path).is_none())
         .filter(|path| is_regular_file_local(path))
         .map(|path| DolphinExecutable {
             installation_type: if roots.explicit_executables.contains(&path) {
                 DolphinLocalInstallationType::Explicit
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
+            {
+                DolphinLocalInstallationType::AppImage
             } else if roots
                 .appimage_directory
                 .as_ref()
@@ -2115,6 +2162,40 @@ fn discover_dolphin_local_executables(
             path,
         })
         .collect()
+}
+
+fn dolphin_known_appimages(
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Vec<crate::launch::installation_known::FoundAppImage> {
+    let known = known_install_roots(
+        &roots.home,
+        &roots.xdg_data_home,
+        roots.path_override.as_deref(),
+    );
+    crate::launch::installation_known::discover_appimages(
+        &crate::launch::installation_known::DOLPHIN,
+        &known,
+    )
+}
+
+fn known_install_roots(
+    home: &Path,
+    user_data: &Path,
+    path_override: Option<&[PathBuf]>,
+) -> crate::launch::installation_known::KnownInstallRoots {
+    crate::launch::installation_known::KnownInstallRoots {
+        home: home.to_path_buf(),
+        user_data: user_data.to_path_buf(),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: path_override.map_or_else(
+            || {
+                env::var_os("PATH")
+                    .map(|path| env::split_paths(&path).take(64).collect())
+                    .unwrap_or_default()
+            },
+            <[PathBuf]>::to_vec,
+        ),
+    }
 }
 
 // --- Native launch binding -------------------------------------------------
@@ -2148,6 +2229,7 @@ pub enum DolphinUserDirectoryMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DolphinNativeLaunchBinding {
     pub executable: PathBuf,
+    pub installation: crate::launch::installation::LaunchInstallation,
     pub user_directory_mode: DolphinUserDirectoryMode,
 }
 
@@ -2217,11 +2299,9 @@ pub fn resolve_dolphin_native_launch_binding(
     }
     match profile.installation_type {
         DolphinLocalInstallationType::Native => resolve_default_native_binding(profile, roots),
+        DolphinLocalInstallationType::AppImage => resolve_appimage_binding(profile, roots),
         DolphinLocalInstallationType::Explicit => resolve_explicit_root_binding(profile),
-        DolphinLocalInstallationType::FlatpakUser => Err(launch_blocker(
-            DolphinLaunchBlockerKind::UnsupportedInstallationType,
-            "Flatpak Dolphin installations are not supported by this native launch binding",
-        )),
+        DolphinLocalInstallationType::FlatpakUser => resolve_flatpak_binding(profile, roots),
         DolphinLocalInstallationType::Portable => Err(launch_blocker(
             DolphinLaunchBlockerKind::UnsupportedInstallationType,
             "portable/AppImage Dolphin profiles cannot be proven native-equivalent; failing closed",
@@ -2280,9 +2360,97 @@ fn resolve_default_native_binding(
         return Err(blocker);
     }
     Ok(DolphinNativeLaunchBinding {
+        installation: dolphin_launch_installation(profile.installation_type, &executable),
         executable,
         user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
     })
+}
+
+fn resolve_appimage_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    let default_config = roots.xdg_config_home.join("dolphin-emu");
+    if profile.configuration_root == default_config {
+        resolve_default_native_binding(profile, roots)
+    } else {
+        resolve_explicit_root_binding(profile)
+    }
+}
+
+fn resolve_flatpak_binding(
+    profile: &DolphinLocalProfile,
+    roots: &DolphinLocalDiscoveryRoots,
+) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
+    let expected_config = roots
+        .home
+        .join(".var/app")
+        .join(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+        .join("config/dolphin-emu");
+    let expected_data = roots
+        .home
+        .join(".var/app")
+        .join(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+        .join("data/dolphin-emu");
+    if profile.configuration_root != expected_config || profile.data_root != expected_data {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::ProfileRootMismatch,
+            "profile is not the exact Dolphin Flatpak configuration/data location",
+        ));
+    }
+    let known = known_install_roots(
+        &roots.home,
+        &roots.xdg_data_home,
+        roots.path_override.as_deref(),
+    );
+    let found_flatpaks = crate::launch::installation_known::discover_flatpaks(
+        &crate::launch::installation_known::DOLPHIN,
+        &known,
+    );
+    let Some(found) = found_flatpaks.first() else {
+        return Err(launch_blocker(
+            DolphinLaunchBlockerKind::UnsupportedInstallationType,
+            "Dolphin Flatpak deployment was not found",
+        ));
+    };
+    let executable =
+        crate::launch::installation_known::flatpak_binary(&known).ok_or_else(|| {
+            launch_blocker(
+                DolphinLaunchBlockerKind::ExecutableMissing,
+                "the flatpak command was not found on PATH",
+            )
+        })?;
+    Ok(DolphinNativeLaunchBinding {
+        installation: crate::launch::installation::LaunchInstallation::flatpak(&found.app_id)
+            .map_err(|error| {
+                launch_blocker(
+                    DolphinLaunchBlockerKind::UnsupportedInstallationType,
+                    error.to_string(),
+                )
+            })?,
+        executable,
+        user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
+    })
+}
+
+fn dolphin_launch_installation(
+    kind: DolphinLocalInstallationType,
+    executable: &Path,
+) -> crate::launch::installation::LaunchInstallation {
+    use crate::launch::installation::LaunchInstallation;
+    if executable
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
+    {
+        LaunchInstallation::AppImage {
+            extract_and_run: false,
+        }
+    } else if kind == DolphinLocalInstallationType::FlatpakUser {
+        LaunchInstallation::flatpak(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+            .expect("the built-in Dolphin app id is valid")
+    } else {
+        LaunchInstallation::Native
+    }
 }
 
 fn resolve_explicit_root_binding(
@@ -2346,6 +2514,7 @@ fn resolve_explicit_root_binding(
     }
     let executable = resolve_native_executable(profile)?;
     Ok(DolphinNativeLaunchBinding {
+        installation: dolphin_launch_installation(profile.installation_type, &executable),
         executable,
         user_directory_mode: DolphinUserDirectoryMode::ExplicitRoot(root),
     })
@@ -2396,6 +2565,10 @@ fn resolve_native_executable(
     match valid.len() {
         0 => Err(last_error.expect("at least one candidate was inspected")),
         1 => Ok(valid.into_iter().next().expect("length checked above")),
+        _ if profile.installation_type == DolphinLocalInstallationType::AppImage => {
+            valid.sort();
+            Ok(valid.remove(0))
+        }
         count => Err(launch_blocker(
             DolphinLaunchBlockerKind::AmbiguousExecutable,
             format!(
@@ -3819,6 +3992,64 @@ mod tests {
     }
 
     #[test]
+    fn flatpak_and_appimage_profiles_bind_the_exact_installation_kind() {
+        let root = fixture("launch-installation-kinds");
+        let mut roots = local_roots(&root);
+        let flatpak = root.join("bin/flatpak");
+        make_executable(&flatpak);
+        roots.path_override = Some(vec![flatpak.parent().unwrap().to_path_buf()]);
+        let app_id = crate::launch::installation_known::DOLPHIN.flatpak_ids[0];
+        let deployment = roots
+            .xdg_data_home
+            .join("flatpak/app")
+            .join(app_id)
+            .join("current/active/metadata");
+        fs::create_dir_all(deployment.parent().unwrap()).unwrap();
+        fs::write(deployment, b"[Application]\n").unwrap();
+        let flatpak_config = root
+            .join("home/.var/app")
+            .join(app_id)
+            .join("config/dolphin-emu");
+        make_local_profile(&flatpak_config, &flatpak_config);
+        let flatpak_profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == DolphinLocalInstallationType::FlatpakUser)
+            .unwrap();
+        let binding = resolve_dolphin_native_launch_binding(&flatpak_profile, &roots).unwrap();
+        assert_eq!(binding.executable, flatpak);
+        assert!(matches!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Flatpak { app_id: ref id }
+                if id == app_id
+        ));
+
+        let image = root.join("home/Applications/Dolphin/Dolphin.AppImage");
+        make_executable(&image);
+        let user_root = image.parent().unwrap().join("User");
+        fs::create_dir_all(user_root.join("Config")).unwrap();
+        fs::write(user_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let image_profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == DolphinLocalInstallationType::AppImage)
+            .unwrap();
+        let binding = resolve_dolphin_native_launch_binding(&image_profile, &roots).unwrap();
+        assert_eq!(binding.executable, image);
+        assert_eq!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false
+            }
+        );
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::ExplicitRoot(user_root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn genuine_single_user_root_produces_explicit_root() {
         let root = fixture("launch-explicit-root");
         let profile_root = root.join("portable");
@@ -3838,6 +4069,46 @@ mod tests {
         assert_eq!(
             binding.user_directory_mode,
             DolphinUserDirectoryMode::ExplicitRoot(profile_root)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_dolphin_executable_is_not_replaced_by_discovered_package_kinds() {
+        let root = fixture("launch-explicit-precedence");
+        let explicit_root = root.join("chosen/User");
+        fs::create_dir_all(explicit_root.join("Config")).unwrap();
+        fs::write(explicit_root.join("Dolphin.ini"), b"[Core]\n").unwrap();
+        fs::write(explicit_root.join("Config/Dolphin.ini"), b"[Core]\n").unwrap();
+        let selected = root.join("chosen/dolphin-emu");
+        make_executable(&selected);
+        let appimage = root.join("home/Applications/Dolphin/Dolphin.AppImage");
+        make_executable(&appimage);
+        let flatpak_dir = root
+            .join("data/flatpak/app")
+            .join(crate::launch::installation_known::DOLPHIN.flatpak_ids[0])
+            .join("current/active");
+        fs::create_dir_all(&flatpak_dir).unwrap();
+        fs::write(flatpak_dir.join("metadata"), b"[Application]\n").unwrap();
+        let mut roots = local_roots(&root);
+        roots
+            .explicit_configuration_roots
+            .push(explicit_root.clone());
+        roots.explicit_executables.push(selected.clone());
+        let profile = discover_dolphin_local_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == DolphinLocalInstallationType::Explicit)
+            .unwrap();
+        let binding = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap();
+        assert_eq!(binding.executable, selected);
+        assert_eq!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Native
+        );
+        assert_eq!(
+            binding.user_directory_mode,
+            DolphinUserDirectoryMode::ExplicitRoot(explicit_root)
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -3969,10 +4240,7 @@ mod tests {
         let mut profile = native_profile(&roots, Vec::new());
         profile.installation_type = DolphinLocalInstallationType::FlatpakUser;
         let blocker = resolve_dolphin_native_launch_binding(&profile, &roots).unwrap_err();
-        assert_eq!(
-            blocker.kind,
-            DolphinLaunchBlockerKind::UnsupportedInstallationType
-        );
+        assert_eq!(blocker.kind, DolphinLaunchBlockerKind::ProfileRootMismatch);
         fs::remove_dir_all(root).unwrap();
     }
 

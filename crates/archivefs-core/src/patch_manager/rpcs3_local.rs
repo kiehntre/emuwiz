@@ -158,6 +158,7 @@ pub struct Rpcs3Profile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rpcs3LaunchBinding {
     pub executable: PathBuf,
+    pub installation: crate::launch::installation::LaunchInstallation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -201,11 +202,9 @@ fn rpcs3_launch_blocker(
 /// "exactly one candidate" rule - this is the same equivalence PCSX2 and
 /// PPSSPP already make for their `explicit_executables`.
 ///
-/// [`Rpcs3InstallationType::Portable`] (a `*.AppImage` merely *found* by
-/// name or beside `$APPIMAGE`), [`Rpcs3InstallationType::FlatpakUser`], and
-/// a caller-supplied [`Rpcs3InstallationType::Explicit`] *configuration
-/// root* are still refused: this milestone has no reviewed
-/// configuration-directory/argv contract for them.
+/// AppImages bind only to an eligible discovered profile using RPCS3's
+/// per-AppImage `.home` location when present or the normal XDG root
+/// otherwise. Flatpak binds to its exact installed app and profile root.
 pub fn resolve_rpcs3_native_launch_binding(
     profile: &Rpcs3Profile,
 ) -> Result<Rpcs3LaunchBinding, Rpcs3LaunchBlocker> {
@@ -215,11 +214,16 @@ pub fn resolve_rpcs3_native_launch_binding(
             "profile is not eligible",
         ));
     }
+    if profile.installation_type == Rpcs3InstallationType::FlatpakUser {
+        return resolve_rpcs3_flatpak_binding(profile);
+    }
     let acceptable: &[Rpcs3InstallationType] = match profile.installation_type {
         Rpcs3InstallationType::Native => &[
             Rpcs3InstallationType::Native,
             Rpcs3InstallationType::Explicit,
         ],
+        Rpcs3InstallationType::Explicit => &[Rpcs3InstallationType::Explicit],
+        Rpcs3InstallationType::Portable => &[Rpcs3InstallationType::Portable],
         other => {
             return Err(rpcs3_launch_blocker(
                 Rpcs3LaunchBlockerKind::UnsupportedInstallation,
@@ -249,16 +253,102 @@ pub fn resolve_rpcs3_native_launch_binding(
             Err(error) => last_error = Some(error),
         }
     }
-    match valid.len() {
-        0 => Err(last_error.expect("at least one executable was inspected")),
-        1 => Ok(Rpcs3LaunchBinding {
-            executable: valid.pop().expect("length checked above"),
-        }),
-        count => Err(rpcs3_launch_blocker(
-            Rpcs3LaunchBlockerKind::AmbiguousExecutable,
-            format!("{count} viable native RPCS3 executables remain"),
-        )),
+    let executable = match valid.len() {
+        0 => return Err(last_error.expect("at least one executable was inspected")),
+        1 => valid.pop().expect("length checked above"),
+        _ if profile.installation_type == Rpcs3InstallationType::Portable => valid.remove(0),
+        count => {
+            return Err(rpcs3_launch_blocker(
+                Rpcs3LaunchBlockerKind::AmbiguousExecutable,
+                format!("{count} viable native RPCS3 executables remain"),
+            ));
+        }
+    };
+    let installation = if executable
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
+    {
+        crate::launch::installation::LaunchInstallation::AppImage {
+            extract_and_run: false,
+        }
+    } else {
+        crate::launch::installation::LaunchInstallation::Native
+    };
+    Ok(Rpcs3LaunchBinding {
+        executable,
+        installation,
+    })
+}
+
+fn resolve_rpcs3_flatpak_binding(
+    profile: &Rpcs3Profile,
+) -> Result<Rpcs3LaunchBinding, Rpcs3LaunchBlocker> {
+    let Some(home) = profile.configuration_path.ancestors().find(|path| {
+        path.file_name()
+            .is_some_and(|name| name == "net.rpcs3.RPCS3")
+    }) else {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::UnsupportedInstallation,
+            "profile is not under the RPCS3 Flatpak data root",
+        ));
+    };
+    let user_home = home.ancestors().nth(3).unwrap_or(home).to_path_buf();
+    let expected_config = home.join("config/rpcs3");
+    let expected_data = home.join("data/rpcs3");
+    if profile.configuration_path != expected_config && profile.configuration_path != expected_data
+    {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::UnsupportedInstallation,
+            "profile is not the exact RPCS3 Flatpak configuration/data directory",
+        ));
     }
+    let known = crate::launch::installation_known::KnownInstallRoots {
+        home: user_home.clone(),
+        user_data: user_home.join(".local/share"),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: Vec::new(),
+    };
+    if crate::launch::installation_known::discover_flatpaks(
+        &crate::launch::installation_known::RPCS3,
+        &known,
+    )
+    .is_empty()
+    {
+        return Err(rpcs3_launch_blocker(
+            Rpcs3LaunchBlockerKind::UnsupportedInstallation,
+            "RPCS3 Flatpak deployment was not found",
+        ));
+    }
+    let flatpak_candidates: Vec<_> = profile
+        .executable_candidates
+        .iter()
+        .filter(|candidate| candidate.installation_type == Rpcs3InstallationType::FlatpakUser)
+        .collect();
+    let executable = match flatpak_candidates.as_slice() {
+        [candidate] => {
+            validate_rpcs3_executable(&candidate.path)?;
+            candidate.path.clone()
+        }
+        [] => {
+            return Err(rpcs3_launch_blocker(
+                Rpcs3LaunchBlockerKind::ExecutableMissing,
+                "flatpak was not discovered on PATH",
+            ));
+        }
+        many => {
+            return Err(rpcs3_launch_blocker(
+                Rpcs3LaunchBlockerKind::AmbiguousExecutable,
+                format!("{} flatpak executables were discovered", many.len()),
+            ));
+        }
+    };
+    Ok(Rpcs3LaunchBinding {
+        executable,
+        installation: crate::launch::installation::LaunchInstallation::flatpak(
+            crate::launch::installation_known::RPCS3.flatpak_ids[0],
+        )
+        .expect("the built-in RPCS3 app id is valid"),
+    })
 }
 
 fn validate_rpcs3_executable(path: &Path) -> Result<(), Rpcs3LaunchBlocker> {
@@ -420,12 +510,16 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
                 provenance: "caller-supplied RPCS3 portable/AppImage configuration directory",
             }),
     );
-    if let Some(directory) = &roots.appimage_directory {
+    let known = rpcs3_known_install_roots(roots);
+    for _image in crate::launch::installation_known::discover_appimages(
+        &crate::launch::installation_known::RPCS3,
+        &known,
+    ) {
         candidates.push(ProfileCandidate {
             installation_type: Rpcs3InstallationType::Portable,
             scope: Rpcs3ProfileScope::Explicit,
-            configuration_path: directory.join("config"),
-            provenance: "APPIMAGE-adjacent RPCS3 portable configuration directory",
+            configuration_path: roots.xdg_config_home.join("rpcs3"),
+            provenance: "discovered RPCS3 AppImage with the standard XDG configuration path",
         });
     }
     candidates.extend(
@@ -441,7 +535,11 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
             }),
     );
     candidates.sort_by(|left, right| left.configuration_path.cmp(&right.configuration_path));
-    candidates.dedup_by(|left, right| left.configuration_path == right.configuration_path);
+    candidates.dedup_by(|left, right| {
+        left.installation_type == right.installation_type
+            && left.scope == right.scope
+            && left.configuration_path == right.configuration_path
+    });
 
     let executables = discover_executables(roots);
     let mut profiles = Vec::new();
@@ -529,7 +627,11 @@ fn validate_profile(candidate: ProfileCandidate, executables: &[Rpcs3Executable]
     let dev_hdd0_path = path.join("dev_hdd0");
     let games_path = dev_hdd0_path.join("game");
     Rpcs3Profile {
-        profile_id: format!("rpcs3:{}", path.display()),
+        profile_id: if candidate.installation_type == Rpcs3InstallationType::Portable {
+            format!("rpcs3:appimage:{}", path.display())
+        } else {
+            format!("rpcs3:{}", path.display())
+        },
         installation_type: candidate.installation_type,
         scope: candidate.scope,
         configuration_path: path.clone(),
@@ -565,6 +667,15 @@ fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executab
             directory.join("RPCS3").join("rpcs3"),
         ]);
     }
+    let known = rpcs3_known_install_roots(roots);
+    paths.extend(
+        crate::launch::installation_known::discover_appimages(
+            &crate::launch::installation_known::RPCS3,
+            &known,
+        )
+        .into_iter()
+        .map(|image| image.path),
+    );
     if let Some(directory) = &roots.appimage_directory {
         paths.extend([directory.join("RPCS3.AppImage"), directory.join("rpcs3")]);
     }
@@ -579,8 +690,9 @@ fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executab
     }
     paths.sort();
     paths.dedup();
-    paths
+    let mut discovered: Vec<Rpcs3Executable> = paths
         .into_iter()
+        .filter(|path| crate::launch::installation_known::flatpak_wrapper_app_id(path).is_none())
         .filter(|path| is_regular_file(path))
         .map(|path| Rpcs3Executable {
             installation_type: if roots.explicit_executables.contains(&path) {
@@ -591,7 +703,7 @@ fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executab
                 .is_some_and(|directory| path.starts_with(directory))
                 || path
                     .extension()
-                    .is_some_and(|extension| extension == "AppImage")
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
             {
                 Rpcs3InstallationType::Portable
             } else {
@@ -603,7 +715,36 @@ fn discover_executables(roots: &Rpcs3ProfileDiscoveryRoots) -> Vec<Rpcs3Executab
                 .and_then(|output| parse_rpcs3_version(output)),
             path,
         })
-        .collect()
+        .collect();
+    if !crate::launch::installation_known::discover_flatpaks(
+        &crate::launch::installation_known::RPCS3,
+        &known,
+    )
+    .is_empty()
+        && let Some(flatpak) = crate::launch::installation_known::flatpak_binary(&known)
+    {
+        discovered.push(Rpcs3Executable {
+            path: flatpak,
+            installation_type: Rpcs3InstallationType::FlatpakUser,
+            version: None,
+        });
+    }
+    discovered
+}
+
+fn rpcs3_known_install_roots(
+    roots: &Rpcs3ProfileDiscoveryRoots,
+) -> crate::launch::installation_known::KnownInstallRoots {
+    crate::launch::installation_known::KnownInstallRoots {
+        home: roots.home.clone(),
+        user_data: roots.xdg_data_home.clone(),
+        system_data: PathBuf::from("/var/lib"),
+        path_dirs: roots
+            .path_override
+            .clone()
+            .or_else(|| env::var_os("PATH").map(|path| env::split_paths(&path).take(64).collect()))
+            .unwrap_or_default(),
+    }
 }
 
 /// Parses an RPCS3 version from output already obtained by a caller. The
@@ -1644,6 +1785,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn flatpak_and_appimage_profiles_resolve_to_their_exact_installation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let app_id = crate::launch::installation_known::RPCS3.flatpak_ids[0];
+        let flatpak = root.join("bin/flatpak");
+        write_file(&flatpak, b"flatpak executable");
+        std::fs::set_permissions(&flatpak, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut roots = roots_for(root);
+        roots.path_override = Some(vec![flatpak.parent().unwrap().to_path_buf()]);
+        let config = root.join(".var/app").join(app_id).join("config/rpcs3");
+        write_file(&config.join("config.yml"), b"Core:\n");
+        write_file(
+            &root
+                .join(".local/share/flatpak/app")
+                .join(app_id)
+                .join("current/active/metadata"),
+            b"[Application]\n",
+        );
+        let profile = discover_rpcs3_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == Rpcs3InstallationType::FlatpakUser)
+            .unwrap();
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, flatpak);
+        assert!(matches!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Flatpak { app_id: ref id }
+                if id == app_id
+        ));
+
+        write_file(&root.join("rpcs3/config.yml"), b"Core:\n");
+        let appimage = root.join("Applications/RPCS3/RPCS3.AppImage");
+        write_file(&appimage, b"appimage");
+        std::fs::set_permissions(&appimage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let roots = roots_for(root);
+        let profile = discover_rpcs3_profiles(&roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == Rpcs3InstallationType::Portable)
+            .unwrap();
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, appimage);
+        assert_eq!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_rpcs3_binary_remains_authoritative_over_detected_appimages() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("chosen/rpcs3");
+        write_file(&explicit, b"explicit executable");
+        std::fs::set_permissions(&explicit, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut profile = native_profile(&dir);
+        profile.installation_type = Rpcs3InstallationType::Explicit;
+        profile.executable_candidates = vec![Rpcs3Executable {
+            path: explicit.clone(),
+            installation_type: Rpcs3InstallationType::Explicit,
+            version: None,
+        }];
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, explicit);
+        assert_eq!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Native
+        );
+    }
+
     fn native_profile(dir: &TempDir) -> Rpcs3Profile {
         let config = dir.path().join("rpcs3");
         std::fs::create_dir_all(config.join("dev_hdd0")).unwrap();
@@ -1700,14 +1918,17 @@ mod tests {
         let blocker = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
         assert_eq!(blocker.kind, Rpcs3LaunchBlockerKind::ExecutableMissing);
 
-        // A caller-supplied Explicit *config-root* profile is still refused
-        // outright (the widening is Native-profile-only).
+        // Explicit profile authority is retained: the selected profile uses
+        // only its own caller-confirmed executable.
         profile.installation_type = Rpcs3InstallationType::Explicit;
         profile.executable_candidates[0].installation_type = Rpcs3InstallationType::Explicit;
-        let blocker = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, appimage);
         assert_eq!(
-            blocker.kind,
-            Rpcs3LaunchBlockerKind::UnsupportedInstallation
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false
+            }
         );
     }
 

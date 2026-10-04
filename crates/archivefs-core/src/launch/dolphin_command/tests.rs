@@ -45,6 +45,7 @@ fn default_native_binding(
 ) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
     Ok(DolphinNativeLaunchBinding {
         executable: PathBuf::from(executable),
+        installation: crate::launch::installation::LaunchInstallation::Native,
         user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
     })
 }
@@ -55,6 +56,7 @@ fn explicit_root_binding(
 ) -> Result<DolphinNativeLaunchBinding, DolphinLaunchBlocker> {
     Ok(DolphinNativeLaunchBinding {
         executable: PathBuf::from(executable),
+        installation: crate::launch::installation::LaunchInstallation::Native,
         user_directory_mode: DolphinUserDirectoryMode::ExplicitRoot(PathBuf::from(root)),
     })
 }
@@ -97,6 +99,59 @@ fn default_native_produces_exact_argv() {
             ],
             working_directory: None,
         }
+    );
+}
+
+#[test]
+fn appimage_and_flatpak_wrap_dolphin_arguments_without_rewriting_them() {
+    let path = PathBuf::from("/games/GC Collection/Wind Waker.iso");
+    let appimage = build_dolphin_command_plan(
+        &resolved(),
+        &candidate(Some(path.clone())),
+        &Ok(DolphinNativeLaunchBinding {
+            executable: "/apps/Dolphin.AppImage".into(),
+            installation: crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false,
+            },
+            user_directory_mode: DolphinUserDirectoryMode::DefaultNative,
+        }),
+    )
+    .command
+    .unwrap();
+    assert_eq!(appimage.executable, PathBuf::from("/apps/Dolphin.AppImage"));
+    assert_eq!(
+        appimage.arguments,
+        vec!["-e".into(), path.clone().into_os_string()]
+    );
+
+    let flatpak = build_dolphin_command_plan(
+        &resolved(),
+        &candidate(Some(path.clone())),
+        &Ok(DolphinNativeLaunchBinding {
+            executable: "/usr/bin/flatpak".into(),
+            installation: crate::launch::installation::LaunchInstallation::flatpak(
+                "org.DolphinEmu.dolphin-emu",
+            )
+            .unwrap(),
+            user_directory_mode: DolphinUserDirectoryMode::ExplicitRoot(
+                "/profiles/Dolphin User".into(),
+            ),
+        }),
+    )
+    .command
+    .unwrap();
+    assert_eq!(flatpak.executable, PathBuf::from("/usr/bin/flatpak"));
+    assert_eq!(
+        flatpak.arguments,
+        vec![
+            "run".into(),
+            "--filesystem=/games/GC Collection:ro".into(),
+            "org.DolphinEmu.dolphin-emu".into(),
+            "-u".into(),
+            "/profiles/Dolphin User".into(),
+            "-e".into(),
+            path.into_os_string(),
+        ]
     );
 }
 

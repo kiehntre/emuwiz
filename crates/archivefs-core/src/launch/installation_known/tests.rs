@@ -114,6 +114,24 @@ fn flatpak_launch_needs_both_the_app_and_the_flatpak_program() {
 }
 
 #[test]
+fn dolphin_and_rpcs3_flatpak_forwarding_scripts_are_not_native_binaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let dolphin = dir.path().join("dolphin-emu");
+    let rpcs3 = dir.path().join("rpcs3");
+    for (path, app_id) in [
+        (&dolphin, DOLPHIN.flatpak_ids[0]),
+        (&rpcs3, RPCS3.flatpak_ids[0]),
+    ] {
+        fs::write(
+            path,
+            format!("#!/usr/bin/env bash\nexec flatpak run \"{app_id}\" \"$@\"\n"),
+        )
+        .unwrap();
+        assert_eq!(flatpak_wrapper_app_id(path), Some(app_id));
+    }
+}
+
+#[test]
 fn appimage_validation_reports_each_failure() {
     let dir = tempfile::tempdir().unwrap();
     let good = dir.path().join("A B/Good.AppImage");

@@ -69,6 +69,7 @@ impl DolphinCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DolphinCommandSelection {
     pub profile_id: String,
+    pub installation: crate::launch::installation::LaunchInstallation,
     pub user_directory_mode: DolphinUserDirectoryMode,
     pub platform_id: String,
     pub game_id: String,
@@ -256,13 +257,31 @@ pub fn build_dolphin_command_plan(
         content_path.expect("a resolved content path is required when no blockers exist");
     let binding = binding.expect("a launch binding is required when no blockers exist");
 
-    let mut arguments = Vec::with_capacity(4);
+    let mut emulator_arguments = Vec::with_capacity(4);
     if let DolphinUserDirectoryMode::ExplicitRoot(root) = &binding.user_directory_mode {
-        arguments.push(OsString::from("-u"));
-        arguments.push(root.clone().into_os_string());
+        emulator_arguments.push(OsString::from("-u"));
+        emulator_arguments.push(root.clone().into_os_string());
     }
-    arguments.push(OsString::from("-e"));
-    arguments.push(content_path.clone().into_os_string());
+    emulator_arguments.push(OsString::from("-e"));
+    emulator_arguments.push(content_path.clone().into_os_string());
+    let mut visibility = crate::launch::installation::VisibilityPlan::new();
+    if std::fs::metadata(&content_path).is_ok_and(|metadata| metadata.is_dir()) {
+        visibility.read_only(&content_path, "Dolphin directory content");
+    } else {
+        visibility.content(&content_path);
+    }
+    let arguments = match binding
+        .installation
+        .wrap_arguments(&visibility, emulator_arguments)
+    {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return DolphinCommandPlan::blocked(vec![blocker(
+                LaunchBlockerKind::DolphinBindingUnavailable,
+                error.to_string(),
+            )]);
+        }
+    };
 
     DolphinCommandPlan {
         command: Some(DolphinCommand {
@@ -271,6 +290,7 @@ pub fn build_dolphin_command_plan(
             working_directory: None,
             selection: DolphinCommandSelection {
                 profile_id: profile_id.clone(),
+                installation: binding.installation.clone(),
                 user_directory_mode: binding.user_directory_mode.clone(),
                 platform_id: resolved.platform_id.clone(),
                 game_id: resolved.game_key.clone(),

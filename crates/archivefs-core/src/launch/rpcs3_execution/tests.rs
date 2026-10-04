@@ -568,14 +568,27 @@ fn a_forced_portable_or_flatpak_profile_never_binds_the_caller_confirmed_executa
     for forced in [
         Rpcs3InstallationType::Portable,
         Rpcs3InstallationType::FlatpakUser,
-        Rpcs3InstallationType::Explicit,
     ] {
         let mut profile = base.clone();
         profile.installation_type = forced;
         let error = resolve_rpcs3_native_launch_binding(&profile)
-            .expect_err("only a Native profile may bind a caller-confirmed executable");
-        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::UnsupportedInstallation);
+            .expect_err("a different installation kind must not bind the Native executable");
+        assert!(matches!(
+            (forced, error.kind),
+            (
+                Rpcs3InstallationType::Portable,
+                Rpcs3LaunchBlockerKind::ExecutableMissing
+            ) | (
+                Rpcs3InstallationType::FlatpakUser,
+                Rpcs3LaunchBlockerKind::UnsupportedInstallation
+            )
+        ));
     }
+    let mut explicit = base;
+    explicit.installation_type = Rpcs3InstallationType::Explicit;
+    explicit.executable_candidates[0].installation_type = Rpcs3InstallationType::Explicit;
+    resolve_rpcs3_native_launch_binding(&explicit)
+        .expect("the explicit configured installation remains authoritative");
 }
 
 // --- final pre-spawn recheck units (step 10) --------------------------------------------------------
@@ -642,6 +655,7 @@ fn hand_built_command(executable: PathBuf, content_path: PathBuf) -> Rpcs3Comman
         working_directory: None,
         selection: crate::launch::rpcs3_command::Rpcs3CommandSelection {
             profile_id: "test".to_string(),
+            installation: crate::launch::installation::LaunchInstallation::Native,
             platform_id: "PS3".to_string(),
             verified_ps3_title_id: PS3_TITLE_ID.to_string(),
             content_path,

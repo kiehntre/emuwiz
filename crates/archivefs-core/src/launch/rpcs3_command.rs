@@ -41,6 +41,7 @@ impl Rpcs3Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rpcs3CommandSelection {
     pub profile_id: String,
+    pub installation: crate::launch::installation::LaunchInstallation,
     pub platform_id: String,
     pub verified_ps3_title_id: String,
     pub content_path: PathBuf,
@@ -202,13 +203,32 @@ pub fn build_rpcs3_command_plan(
         .to_string();
     let content_path = content_path.expect("content required without blockers");
     let binding = binding.expect("binding required without blockers");
+    let mut visibility = crate::launch::installation::VisibilityPlan::new();
+    if std::fs::metadata(&content_path).is_ok_and(|metadata| metadata.is_dir()) {
+        visibility.read_only(&content_path, "RPCS3 directory content");
+    } else {
+        visibility.content(&content_path);
+    }
+    let arguments = match binding
+        .installation
+        .wrap_arguments(&visibility, vec![content_path.clone().into_os_string()])
+    {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return Rpcs3CommandPlan::blocked(vec![blocker(
+                LaunchBlockerKind::Rpcs3BindingUnavailable,
+                error.to_string(),
+            )]);
+        }
+    };
     Rpcs3CommandPlan {
         command: Some(Rpcs3Command {
             executable: binding.executable.clone(),
-            arguments: vec![content_path.clone().into_os_string()],
+            arguments,
             working_directory: None,
             selection: Rpcs3CommandSelection {
                 profile_id: profile_id.clone(),
+                installation: binding.installation.clone(),
                 platform_id: resolved.platform_id.clone(),
                 verified_ps3_title_id,
                 content_path,

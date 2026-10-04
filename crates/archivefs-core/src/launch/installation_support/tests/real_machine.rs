@@ -25,6 +25,145 @@ fn probe_args(emulator_id: &str) -> Vec<&'static str> {
 }
 
 #[test]
+#[ignore = "read-only Dolphin/RPCS3 install matrix and non-game probes on saltbox26"]
+fn dolphin_rpcs3_real_machine_matrix() {
+    let assessment = assess_from_environment();
+    let known = KnownInstallRoots::from_environment().unwrap();
+    let xvfb = known
+        .path_dirs
+        .iter()
+        .map(|directory| directory.join("xvfb-run"))
+        .find(|path| path.is_file());
+    for def in [
+        &crate::launch::installation_known::DOLPHIN,
+        &crate::launch::installation_known::RPCS3,
+    ] {
+        println!("\n{} AppImages:", def.id);
+        for appimage in discover_appimages(def, &known) {
+            println!("  {}", appimage.path.display());
+            let binding = ExactBinding::PortableExecutable {
+                path: appimage.path.clone(),
+            };
+            println!("    {}", assessment.support_for(def.id, &binding).label());
+        }
+        println!("{} Flatpaks:", def.id);
+        for app in discover_flatpaks(def, &known) {
+            let binding = ExactBinding::FlatpakApp {
+                app_id: app.app_id.clone(),
+            };
+            println!(
+                "  {} ({:?}): {}",
+                app.app_id,
+                app.scope,
+                assessment.support_for(def.id, &binding).label()
+            );
+        }
+    }
+
+    let mut probed = std::collections::BTreeSet::new();
+    for resolved in assessment
+        .resolved
+        .iter()
+        .filter(|row| matches!(row.emulator_id, "Dolphin" | "RPCS3"))
+    {
+        let key = format!(
+            "{}|{:?}|{}",
+            resolved.emulator_id,
+            resolved.installation.kind(),
+            resolved.executable.display()
+        );
+        if !probed.insert(key) {
+            continue;
+        }
+        let argv = resolved
+            .installation
+            .wrap_arguments(
+                &VisibilityPlan::new(),
+                probe_args(resolved.emulator_id)
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            )
+            .unwrap();
+        let (executable, arguments) = if let Some(xvfb) = &xvfb {
+            let mut args = vec!["-a".into(), resolved.executable.clone().into_os_string()];
+            args.extend(argv);
+            (xvfb.clone(), args)
+        } else {
+            (resolved.executable.clone(), argv)
+        };
+        println!(
+            "{} {:?} probe: {} {:?}",
+            resolved.emulator_id,
+            resolved.installation.kind(),
+            executable.display(),
+            arguments
+        );
+        let started = Instant::now();
+        let mut process = spawn_watched_process(&PreparedProcessCommand {
+            executable,
+            arguments,
+            working_directory: None,
+        })
+        .expect("version/help probe should spawn");
+        let pid = process.pid;
+        let report = loop {
+            if let Some(report) = process.poll() {
+                break report;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(40),
+                "probe timed out"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        println!(
+            "  watched pid={pid}; exit={:?}; elapsed={:?}",
+            report.status.as_ref().ok().and_then(|status| status.code()),
+            started.elapsed()
+        );
+    }
+
+    for resolved in assessment.resolved.iter().filter(|row| {
+        matches!(row.emulator_id, "Dolphin" | "RPCS3")
+            && matches!(row.installation, LaunchInstallation::Flatpak { .. })
+    }) {
+        let LaunchInstallation::Flatpak { app_id } = &resolved.installation else {
+            unreachable!()
+        };
+        let arguments: Vec<std::ffi::OsString> =
+            ["run", "--command=sh", app_id, "-c", "sleep 2; exit 23"]
+                .into_iter()
+                .map(Into::into)
+                .collect();
+        let mut process = spawn_watched_process(&PreparedProcessCommand {
+            executable: resolved.executable.clone(),
+            arguments,
+            working_directory: None,
+        })
+        .expect("Flatpak process should start");
+        std::thread::sleep(Duration::from_millis(900));
+        assert!(
+            process.poll().is_none(),
+            "Flatpak wrapper exited before app"
+        );
+        let started = Instant::now();
+        let code = loop {
+            if let Some(report) = process.poll() {
+                break report.status.as_ref().ok().and_then(|status| status.code());
+            }
+            assert!(started.elapsed() < Duration::from_secs(30));
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(code, Some(23), "Flatpak must return the app's exit status");
+        println!(
+            "{} Flatpak watched-process lifecycle: exit 23",
+            resolved.emulator_id
+        );
+    }
+}
+
+#[test]
 #[ignore = "reads this machine's real installs and spawns version/help probes"]
 fn real_machine_acceptance_matrix() {
     let assessment = assess_from_environment();

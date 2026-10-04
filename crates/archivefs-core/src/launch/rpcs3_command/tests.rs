@@ -40,6 +40,7 @@ fn candidate(path: Option<PathBuf>) -> LaunchCandidate {
 fn binding() -> Result<Rpcs3LaunchBinding, Rpcs3LaunchBlocker> {
     Ok(Rpcs3LaunchBinding {
         executable: PathBuf::from("/opt/rpcs3/rpcs3"),
+        installation: crate::launch::installation::LaunchInstallation::Native,
     })
 }
 
@@ -65,6 +66,76 @@ fn verified_ps3_content_produces_exact_structured_argv() {
     assert_eq!(spec.executable, command.executable);
     assert_eq!(spec.arguments, command.arguments);
     assert_eq!(spec.working_directory, command.working_directory);
+}
+
+#[test]
+fn appimage_and_flatpak_keep_rpc_content_arguments_and_visibility_narrow() {
+    let content = PathBuf::from("/games/PS3 Collection/BLUS00001.iso");
+    let appimage = build_rpcs3_command_plan(
+        &identity(),
+        Some("BLUS00001"),
+        &candidate(Some(content.clone())),
+        &Ok(Rpcs3LaunchBinding {
+            executable: "/apps/RPCS3.AppImage".into(),
+            installation: crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false,
+            },
+        }),
+    )
+    .command
+    .unwrap();
+    assert_eq!(appimage.executable, PathBuf::from("/apps/RPCS3.AppImage"));
+    assert_eq!(appimage.arguments, vec![content.clone().into_os_string()]);
+
+    let flatpak = build_rpcs3_command_plan(
+        &identity(),
+        Some("BLUS00001"),
+        &candidate(Some(content.clone())),
+        &Ok(Rpcs3LaunchBinding {
+            executable: "/usr/bin/flatpak".into(),
+            installation: crate::launch::installation::LaunchInstallation::flatpak(
+                "net.rpcs3.RPCS3",
+            )
+            .unwrap(),
+        }),
+    )
+    .command
+    .unwrap();
+    assert_eq!(
+        flatpak.arguments,
+        vec![
+            "run".into(),
+            "--filesystem=/games/PS3 Collection:ro".into(),
+            "net.rpcs3.RPCS3".into(),
+            content.into_os_string(),
+        ]
+    );
+}
+
+#[test]
+fn flatpak_directory_content_is_granted_at_the_directory_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = dir.path().join("PS3_GAME");
+    std::fs::create_dir(&content).unwrap();
+    let command = build_rpcs3_command_plan(
+        &identity(),
+        Some("BLUS00001"),
+        &candidate(Some(content.clone())),
+        &Ok(Rpcs3LaunchBinding {
+            executable: "/usr/bin/flatpak".into(),
+            installation: crate::launch::installation::LaunchInstallation::flatpak(
+                "net.rpcs3.RPCS3",
+            )
+            .unwrap(),
+        }),
+    )
+    .command
+    .unwrap();
+    assert_eq!(
+        command.arguments[1],
+        std::ffi::OsString::from(format!("--filesystem={}:ro", content.display()))
+    );
+    assert_eq!(command.arguments.last().unwrap(), &content.as_os_str());
 }
 
 #[test]
