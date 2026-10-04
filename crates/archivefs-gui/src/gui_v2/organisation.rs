@@ -1309,6 +1309,7 @@ mod tests {
         plan.destination = PathBuf::from("/output/pacman.zip");
         plan.sources.push(
             archivefs_core::dat::mame_merged_reconstruction::ReconstructionMemberSource {
+                archive_identity: None,
                 archive_path: PathBuf::from("/roms/pacman.zip"),
                 member_path: PathBuf::from("/roms/pacman.zip/board.bin"),
                 current_name: "board.bin".into(),

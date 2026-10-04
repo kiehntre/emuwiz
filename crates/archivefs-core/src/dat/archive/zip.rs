@@ -397,6 +397,10 @@ pub enum ZipExtractError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZipMemberRequest {
     pub member_name: Option<String>,
+    /// When set, only the entry whose name is exactly `member_name` may be
+    /// selected (the plan chose that entry), and two entries with that exact
+    /// name make the request ambiguous. Otherwise the name is only a hint.
+    pub require_exact_name: bool,
     pub size_bytes: Option<u64>,
     pub sha1: Option<String>,
     pub crc32: Option<String>,
@@ -417,10 +421,14 @@ pub enum ZipMemberError {
     Ambiguous,
     BadChecksum,
     Encrypted,
-    UnsupportedCompression { method: u16 },
+    UnsupportedCompression {
+        method: u16,
+    },
     Malformed(String),
     BoundsExceeded(&'static str),
     UnsafeMemberName,
+    /// A symlink, device, FIFO, socket or other non-regular entry.
+    SpecialEntry,
     SourceChanged,
     Open(String),
     Cancelled,
@@ -441,6 +449,7 @@ impl std::fmt::Display for ZipMemberError {
                 write!(formatter, "ZIP safety bound exceeded: {reason}")
             }
             Self::UnsafeMemberName => write!(formatter, "ZIP member name is unsafe"),
+            Self::SpecialEntry => write!(formatter, "ZIP entry is not a regular file"),
             Self::SourceChanged => write!(formatter, "source ZIP changed during staging"),
             Self::Open(detail) => write!(formatter, "could not stage ZIP member: {detail}"),
             Self::Cancelled => write!(formatter, "ZIP member staging was cancelled"),
@@ -476,6 +485,7 @@ pub fn copy_zip_member_to(
 
     let mut matches = Vec::new();
     let mut identity_candidate_seen = false;
+    let mut exact_name_entries = 0usize;
     for entry in &source.preflight.entries {
         let name =
             std::str::from_utf8(&entry.name_raw).map_err(|_| ZipMemberError::UnsafeMemberName)?;
@@ -483,7 +493,14 @@ pub fn copy_zip_member_to(
             return Err(ZipMemberError::UnsafeMemberName);
         }
         if entry.is_directory {
+            // A directory can never satisfy a required file member.
+            if request.require_exact_name && request.member_name.as_deref() == Some(name) {
+                return Err(ZipMemberError::SpecialEntry);
+            }
             continue;
+        }
+        if !is_regular_file_entry(entry) {
+            return Err(ZipMemberError::SpecialEntry);
         }
         if entry.flags & ((1 << 0) | (1 << 6) | (1 << 13)) != 0 {
             return Err(ZipMemberError::Encrypted);
@@ -497,6 +514,14 @@ pub fn copy_zip_member_to(
             return Err(ZipMemberError::UnsupportedCompression {
                 method: entry.method,
             });
+        }
+        let exact_name = request.member_name.as_deref() == Some(name);
+        if request.require_exact_name {
+            if exact_name {
+                exact_name_entries += 1;
+            } else {
+                continue;
+            }
         }
         if request
             .size_bytes
@@ -527,17 +552,24 @@ pub fn copy_zip_member_to(
         let hashed = decode_hash_entry(&mut source.file, entry, limits, cancel)?;
         let sha1 = hashed.0;
         let crc32 = hashed.1;
-        let sha_matches = request
+        // Every authoritative checksum that is available must agree; a
+        // matching CRC32 never excuses a different SHA-1.
+        let sha_ok = request
             .sha1
             .as_deref()
-            .is_some_and(|expected| expected.eq_ignore_ascii_case(&sha1));
-        let crc_matches = request
+            .is_none_or(|expected| expected.eq_ignore_ascii_case(&sha1));
+        let crc_ok = request
             .crc32
             .as_deref()
-            .is_some_and(|expected| expected.eq_ignore_ascii_case(&crc32));
-        if sha_matches || crc_matches {
+            .is_none_or(|expected| expected.eq_ignore_ascii_case(&crc32));
+        if sha_ok && crc_ok {
             matches.push((entry.clone(), name.to_string(), sha1, crc32));
         }
+    }
+    if request.require_exact_name && exact_name_entries > 1 {
+        // The plan named one entry but several share the name: no stable way
+        // to say which one was reviewed.
+        return Err(ZipMemberError::Ambiguous);
     }
     if matches.is_empty() {
         return Err(if identity_candidate_seen {
@@ -579,13 +611,31 @@ pub fn copy_zip_member_to(
 
 fn unsafe_member_name(name: &str) -> bool {
     let path = Path::new(name);
-    path.is_absolute()
+    let bytes = name.as_bytes();
+    name.contains('\0')
+        || name.starts_with(['/', '\\'])
+        // "C:" style drive prefixes.
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        // Backslash separators are traversal on other platforms' tools.
+        || name
+            .split(['/', '\\'])
+            .any(|part| part == ".." || part == ".")
+        || path.is_absolute()
         || path.components().any(|component| {
             matches!(
                 component,
                 std::path::Component::ParentDir | std::path::Component::CurDir
             )
         })
+}
+
+/// A normal file entry. A Unix-made entry whose mode says symlink, device,
+/// FIFO, socket or directory is refused rather than materialised as bytes.
+fn is_regular_file_entry(entry: &super::zip_preflight::ZipPreflightEntry) -> bool {
+    if (entry.version_made_by >> 8) != 3 {
+        return true;
+    }
+    matches!((entry.external_attributes >> 16) & 0xf000, 0 | 0x8000)
 }
 
 fn decode_hash_entry(
@@ -1784,6 +1834,7 @@ mod tests {
             &ArchiveLimits::default(),
             &AtomicBool::new(false),
             &ZipMemberRequest {
+                require_exact_name: false,
                 member_name: Some("expected-name.bin".into()),
                 size_bytes: Some(7),
                 sha1: Some(digest.clone()),
@@ -1825,6 +1876,7 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let request = ZipMemberRequest {
+            require_exact_name: false,
             member_name: None,
             size_bytes: Some(4),
             sha1: Some(digest),
@@ -1843,6 +1895,7 @@ mod tests {
             ZipMemberError::Ambiguous
         );
         let bad = ZipMemberRequest {
+            require_exact_name: false,
             member_name: Some("one.bin".into()),
             size_bytes: Some(4),
             sha1: Some("0".repeat(40)),
@@ -1876,6 +1929,7 @@ mod tests {
             &ArchiveLimits::default(),
             &AtomicBool::new(false),
             &ZipMemberRequest {
+                require_exact_name: false,
                 member_name: None,
                 size_bytes: Some(7),
                 sha1: Some("0".repeat(40)),
@@ -1902,6 +1956,7 @@ mod tests {
             &ArchiveLimits::default(),
             &AtomicBool::new(false),
             &ZipMemberRequest {
+                require_exact_name: false,
                 member_name: Some("member.bin".into()),
                 size_bytes: Some(7),
                 sha1: Some("0".repeat(40)),
@@ -1926,6 +1981,7 @@ mod tests {
             },
             &AtomicBool::new(false),
             &ZipMemberRequest {
+                require_exact_name: false,
                 member_name: Some("member.bin".into()),
                 size_bytes: Some(100),
                 sha1: Some("0".repeat(40)),
@@ -1969,6 +2025,7 @@ mod tests {
                 &ArchiveLimits::default(),
                 &AtomicBool::new(false),
                 &ZipMemberRequest {
+                    require_exact_name: false,
                     member_name: Some(name.into()),
                     size_bytes: Some(content.len() as u64),
                     sha1: Some(digest),

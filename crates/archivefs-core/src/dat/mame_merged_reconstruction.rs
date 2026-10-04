@@ -31,8 +31,33 @@ pub struct ReconstructionMemberRequirement {
     pub crc32: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceArchiveIdentity {
+    pub size_bytes: u64,
+    pub modified_unix_nanos: Option<u128>,
+}
+
+impl SourceArchiveIdentity {
+    pub fn of(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            size_bytes: metadata.len(),
+            modified_unix_nanos: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_nanos()),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconstructionMemberSource {
+    /// Size and modification time of a packed source archive when the plan was
+    /// made. Staging refuses a changed archive and asks for a new preview; the
+    /// member's own checksum is still verified either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_identity: Option<SourceArchiveIdentity>,
     pub archive_path: PathBuf,
     pub member_path: PathBuf,
     pub current_name: String,
@@ -483,6 +508,9 @@ pub fn build_merged_reconstruction_plan(
                 .entry(identity)
                 .or_default()
                 .push(ReconstructionMemberSource {
+                    archive_identity: (!archive_path.is_dir())
+                        .then(|| SourceArchiveIdentity::of(archive_path))
+                        .flatten(),
                     archive_path: archive_path.clone(),
                     member_path: if archive_path.is_dir() {
                         archive_path.join(&current_name)
@@ -541,6 +569,22 @@ pub fn build_merged_reconstruction_plan(
     });
     if plan.destination.exists() {
         plan.collisions.push(plan.destination.display().to_string());
+    }
+    // Two different required payloads cannot share one destination member name,
+    // and a destination member name must be a plain file name.
+    let mut destination_names = BTreeSet::new();
+    for requirement in &plan.required_members {
+        if !is_plain_member_name(&requirement.member_name) {
+            plan.collisions.push(format!(
+                "unsafe destination member name: {}",
+                requirement.member_name
+            ));
+        } else if !destination_names.insert(requirement.member_name.clone()) {
+            plan.collisions.push(format!(
+                "duplicate destination member name: {}",
+                requirement.member_name
+            ));
+        }
     }
     if plan.sources.iter().any(|source| {
         !source.archive_path.is_dir()
@@ -729,12 +773,39 @@ pub fn discover_packed_zip_sources(
     Ok(discovered)
 }
 
+/// Free bytes on the filesystem that holds `path` (or its nearest existing
+/// ancestor); `None` when it cannot be determined, in which case the check is
+/// skipped rather than guessed.
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut probe = path;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+    let c_path = std::ffi::CString::new(probe.as_os_str().as_bytes()).ok()?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated path and `stats` is a valid out-pointer.
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) } != 0 {
+        return None;
+    }
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
 /// Writes only a staging ZIP. It never opens a source archive for writing and
 /// never removes or renames a source member. Publication is intentionally a
 /// separate caller action after [`verify_staged_output`].
 pub fn stage_reconstruction_output(
     plan: &MameMergedReconstructionPlan,
     staging_root: &Path,
+) -> Result<PathBuf, String> {
+    stage_reconstruction_output_with(plan, staging_root, &free_space_bytes)
+}
+
+/// [`stage_reconstruction_output`] with the free-space probe injected.
+pub fn stage_reconstruction_output_with(
+    plan: &MameMergedReconstructionPlan,
+    staging_root: &Path,
+    free_space: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<PathBuf, String> {
     if !plan.ready_to_apply {
         return Err("reconstruction plan is blocked; no staged output was created".into());
@@ -759,6 +830,57 @@ pub fn stage_reconstruction_output(
             _ => return Err("unsafe staging ancestor".into()),
         }
     }
+
+    // Everything that can be refused before a single byte is written.
+    let mut total_bytes = 0_u64;
+    let mut largest_member = 0_u64;
+    for source in &plan.sources {
+        let requirement = plan
+            .required_members
+            .iter()
+            .find(|requirement| requirement.member_name == source.target_name)
+            .ok_or_else(|| {
+                format!(
+                    "source has no reviewed requirement for {}",
+                    source.target_name
+                )
+            })?;
+        let member_size = requirement
+            .size_bytes
+            .unwrap_or(MAX_RECONSTRUCTION_STAGED_BYTES.saturating_add(1));
+        total_bytes = total_bytes
+            .checked_add(member_size)
+            .ok_or_else(|| "reconstruction staged-byte bound overflowed".to_string())?;
+        if total_bytes > MAX_RECONSTRUCTION_STAGED_BYTES {
+            return Err(format!(
+                "reconstruction staged-byte bound exceeded ({MAX_RECONSTRUCTION_STAGED_BYTES} bytes)"
+            ));
+        }
+        largest_member = largest_member.max(member_size);
+        // A packed source archive must be the one that was reviewed.
+        if !source.archive_path.is_dir()
+            && let Some(expected) = source.archive_identity
+            && SourceArchiveIdentity::of(&source.archive_path) != Some(expected)
+        {
+            return Err(format!(
+                "source archive {} changed since the preview; nothing was staged. Preview again.",
+                source.archive_path.display()
+            ));
+        }
+    }
+    // The staged ZIP (at most the sum of its members) plus one member being
+    // copied out of its source archive, with a small margin.
+    let needed = total_bytes
+        .saturating_add(largest_member)
+        .saturating_add(1024 * 1024);
+    if let Some(free) = free_space(staging_root)
+        && free < needed
+    {
+        return Err(format!(
+            "not enough free space to stage the reconstruction: {needed} bytes needed, {free} available; nothing was staged"
+        ));
+    }
+
     std::fs::create_dir_all(staging_root).map_err(|e| e.to_string())?;
     let staged = staging_root.join(format!("{}.zip.staged", plan.parent));
     let file = std::fs::OpenOptions::new()
@@ -766,10 +888,33 @@ pub fn stage_reconstruction_output(
         .create_new(true)
         .open(&staged)
         .map_err(|e| e.to_string())?;
-    let mut writer = zip::ZipWriter::new(file);
-    let mut staged_bytes = 0_u64;
-    let cancel = AtomicBool::new(false);
     let temp_root = staging_root.join("source-members");
+    let mut temporaries = Vec::new();
+    let result = stage_members(plan, file, &temp_root, &mut temporaries);
+    // The staging ZIP is ours (create_new succeeded) and disposable on failure:
+    // nothing was published, and no half-built set is left behind.
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    for temporary in temporaries {
+        let _ = std::fs::remove_file(temporary);
+    }
+    let _ = std::fs::remove_dir(&temp_root);
+    result?;
+    verify_staged_output(plan, &staged).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })?;
+    Ok(staged)
+}
+
+fn stage_members(
+    plan: &MameMergedReconstructionPlan,
+    file: std::fs::File,
+    temp_root: &Path,
+    temporaries: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut writer = zip::ZipWriter::new(file);
+    let cancel = AtomicBool::new(false);
     for (index, source) in plan.sources.iter().enumerate() {
         let requirement = plan
             .required_members
@@ -784,15 +929,6 @@ pub fn stage_reconstruction_output(
         let member_size = requirement
             .size_bytes
             .unwrap_or(MAX_RECONSTRUCTION_STAGED_BYTES.saturating_add(1));
-        staged_bytes = staged_bytes
-            .checked_add(member_size)
-            .ok_or_else(|| "reconstruction staged-byte bound overflowed".to_string())?;
-        if staged_bytes > MAX_RECONSTRUCTION_STAGED_BYTES {
-            return Err(format!(
-                "reconstruction staged-byte bound exceeded ({MAX_RECONSTRUCTION_STAGED_BYTES} bytes)"
-            ));
-        }
-        let mut temporary_source = None;
         let source_file = if source.archive_path.is_dir() {
             std::fs::File::open(&source.member_path).map_err(|e| {
                 format!(
@@ -803,12 +939,16 @@ pub fn stage_reconstruction_output(
         } else {
             let temporary = temp_root.join(format!("{index}.member"));
             let trusted = TrustedRoots::from_paths(source.archive_path.parent().into_iter());
+            // Exactly the entry the plan chose, by exact name and by every
+            // authoritative checksum: never "something similar".
             let requirement_request = crate::dat::archive::zip::ZipMemberRequest {
                 member_name: Some(source.current_name.clone()),
+                require_exact_name: true,
                 size_bytes: requirement.size_bytes,
                 sha1: requirement.sha1.clone(),
                 crc32: requirement.crc32.clone(),
             };
+            temporaries.push(temporary.clone());
             crate::dat::archive::zip::copy_zip_member_to(
                 &source.archive_path,
                 &trusted,
@@ -818,8 +958,7 @@ pub fn stage_reconstruction_output(
                 &temporary,
             )
             .map_err(|error| format!("ZIP member {} refused: {error}", source.current_name))?;
-            temporary_source = Some(temporary);
-            std::fs::File::open(temporary_source.as_ref().unwrap()).map_err(|e| e.to_string())?
+            std::fs::File::open(&temporary).map_err(|e| e.to_string())?
         };
         writer
             .start_file(
@@ -835,7 +974,7 @@ pub fn stage_reconstruction_output(
             return Err("source member size changed while staging".into());
         }
         drop(source_file);
-        if let Some(temporary) = temporary_source {
+        if let Some(temporary) = temporaries.last().filter(|_| !source.archive_path.is_dir()) {
             let _ = std::fs::remove_file(temporary);
         }
     }
@@ -844,8 +983,7 @@ pub fn stage_reconstruction_output(
         .map_err(|e| e.to_string())?
         .sync_all()
         .map_err(|e| e.to_string())?;
-    verify_staged_output(plan, &staged)?;
-    Ok(staged)
+    Ok(())
 }
 
 /// Verifies the staged archive against the reviewed member list before any
@@ -979,6 +1117,20 @@ fn publish_staged(
     })
 }
 
+/// A destination ZIP member name: no absolute path, traversal, backslash,
+/// drive prefix or NUL (a relative path inside the set is allowed).
+fn is_plain_member_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(['\\', '\0'])
+        && !name.starts_with('/')
+        && !(name.len() >= 2
+            && name.as_bytes()[1] == b':'
+            && name.as_bytes()[0].is_ascii_alphabetic())
+        && name
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 fn is_non_physical(rom: &DatRomEntry) -> bool {
     rom.optional
         .as_deref()
@@ -1012,6 +1164,9 @@ fn evidence_identity(sha1: Option<&str>, crc32: Option<&str>) -> Option<String> 
     sha1.map(|v| format!("sha1:{}", v.to_ascii_lowercase()))
         .or_else(|| crc32.map(|v| format!("crc32:{}", v.to_ascii_lowercase())))
 }
+
+#[cfg(test)]
+mod packed_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1240,6 +1395,7 @@ mod tests {
                 crc32: None,
             }],
             sources: vec![ReconstructionMemberSource {
+                archive_identity: None,
                 archive_path: source_root,
                 member_path: member_path.clone(),
                 current_name: "member.bin".into(),
@@ -1629,6 +1785,8 @@ mod tests {
             let donor = f.root.path().join("clean-parent.zip");
             zip(&donor, &[("a.bin", b"a")]);
             f.plan.sources[0].archive_path = donor;
+            f.plan.sources[0].archive_identity =
+                SourceArchiveIdentity::of(&f.plan.sources[0].archive_path);
             let review = f.review().unwrap();
             let output = review.apply(&f.stage(), &f.journal()).unwrap().unwrap();
             verify_staged_output(&f.plan, &f.plan.destination).unwrap();
@@ -1690,6 +1848,7 @@ mod tests {
                         crc32: None,
                     });
                 f.plan.sources.push(ReconstructionMemberSource {
+                    archive_identity: None,
                     archive_path: donor.clone(),
                     member_path: PathBuf::from(&name),
                     current_name: name.clone(),
@@ -1697,6 +1856,9 @@ mod tests {
                     observed_sha1: Some(hash),
                     observed_crc32: None,
                 });
+            }
+            for source in &mut f.plan.sources {
+                source.archive_identity = SourceArchiveIdentity::of(&source.archive_path);
             }
             let before = capture_for_test(&donor);
             let started = std::time::Instant::now();
