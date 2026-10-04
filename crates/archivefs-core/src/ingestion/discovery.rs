@@ -25,10 +25,8 @@ use std::path::{Path, PathBuf};
 
 pub const INGESTION_PARSER_VERSION: &str = "ingestion-parser-v1";
 
-/// Bounds mirroring the existing archive scanner's own limits (see
-/// `crate::ArchiveScanner`), so a pathological source cannot make
-/// discovery consume unbounded memory or time.
-pub const MAX_DISCOVERY_ENTRIES: usize = 250_000;
+/// A defensive recursion bound. Reaching it is an explicit discovery error;
+/// a successful report always represents a complete walk.
 pub const MAX_DISCOVERY_DEPTH: usize = 128;
 
 /// Extensions of files real collections are full of that are never game
@@ -341,6 +339,52 @@ pub struct DiscoveryReuseStats {
 pub enum DiscoveryError {
     Io(String),
     NotADirectory,
+    DepthLimitReached { path: PathBuf, max_depth: usize },
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn source_walk_visits_more_than_the_old_entry_cap_without_retaining_paths() {
+        const ENTRY_COUNT: usize = 250_001;
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..ENTRY_COUNT {
+            fs::File::create(temp.path().join(format!("game-{index:06}.bin"))).unwrap();
+        }
+
+        let mut visited = 0;
+        walk_source(temp.path(), |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(visited, ENTRY_COUNT);
+    }
+
+    #[test]
+    fn enumeration_error_and_depth_limit_are_errors_not_successful_partial_walks() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+        assert!(matches!(
+            walk_source(&file, |_| Ok(())),
+            Err(DiscoveryError::Io(_))
+        ));
+
+        let mut root = temp.path().to_path_buf();
+        for index in 0..=MAX_DISCOVERY_DEPTH {
+            root.push(format!("d{index}"));
+            fs::create_dir(&root).unwrap();
+        }
+        assert!(matches!(
+            discover_source(temp.path()),
+            Err(DiscoveryError::DepthLimitReached { .. })
+        ));
+    }
 }
 
 /// Discover every game-content item under `root`, bounded and read-only.
@@ -397,40 +441,36 @@ fn discover_source_inner(
         return Err(DiscoveryError::NotADirectory);
     }
 
-    let files = walk_bounded(root)?;
-
     // CUE sheets are resolved first so their referenced `.bin`s are known
-    // and excluded from independent classification - see module docs.
+    // and excluded from independent classification - see module docs. Walk
+    // twice instead of retaining a second Vec of every path in the source.
     let mut consumed: BTreeSet<PathBuf> = BTreeSet::new();
     let mut items = Vec::new();
     let mut structural_evidence: Vec<DiscoveredStructuralEvidence> = Vec::new();
     let mut archive_evidence = Vec::new();
     let mut reuse = DiscoveryReuseStats::default();
 
-    for path in &files {
-        if extension_lowercase(path).as_deref() != Some("cue") {
-            continue;
-        }
-        items.push(discover_cue(path, &mut consumed));
-    }
-
-    for path in &files {
-        if consumed.contains(path) {
-            continue;
-        }
+    walk_source(root, |path| {
         if extension_lowercase(path).as_deref() == Some("cue") {
-            continue; // already handled above
+            items.push(discover_cue(path, &mut consumed));
         }
-        items.push(discover_file(
-            path,
-            root,
-            whdload_dat,
-            &mut structural_evidence,
-            cache,
-            &mut archive_evidence,
-            &mut reuse,
-        ));
-    }
+        Ok(())
+    })?;
+
+    walk_source(root, |path| {
+        if !consumed.contains(path) && extension_lowercase(path).as_deref() != Some("cue") {
+            items.push(discover_file(
+                path,
+                root,
+                whdload_dat,
+                &mut structural_evidence,
+                cache,
+                &mut archive_evidence,
+                &mut reuse,
+            ));
+        }
+        Ok(())
+    })?;
 
     let mut stats = DiscoveryStats::default();
     let mut skip_reasons = SkipReasonCounts::default();
@@ -479,31 +519,31 @@ fn discovery_detail_fingerprint(items: &[GameDiscovery]) -> String {
         .collect()
 }
 
-/// Iterative, symlink-refusing, bounded walk collecting every regular
-/// file and every folder that resolves to a leaf [`FolderRole`] (WHDLoad
-/// install or extracted game folder) - both stop recursion, matching
-/// "a container holds one game" rather than "a container is a nested
-/// source". Read-only: only ever `read_dir`/`symlink_metadata`.
-fn walk_bounded(root: &Path) -> Result<Vec<PathBuf>, DiscoveryError> {
+/// Iterative, symlink-refusing walk visiting every regular file and every
+/// folder that resolves to a leaf [`FolderRole`] (WHDLoad install or
+/// extracted game folder). A walk error fails the whole discovery; callers
+/// never receive partial results as a successful report. Read-only: only
+/// ever `read_dir`/`symlink_metadata`.
+fn walk_source(
+    root: &Path,
+    mut visit: impl FnMut(&Path) -> Result<(), DiscoveryError>,
+) -> Result<(), DiscoveryError> {
     let mut stack = vec![(root.to_path_buf(), 0_usize)];
-    let mut collected = Vec::new();
     while let Some((dir, depth)) = stack.pop() {
-        if depth > MAX_DISCOVERY_DEPTH || collected.len() >= MAX_DISCOVERY_ENTRIES {
-            break;
+        if depth > MAX_DISCOVERY_DEPTH {
+            return Err(DiscoveryError::DepthLimitReached {
+                path: dir,
+                max_depth: MAX_DISCOVERY_DEPTH,
+            });
         }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| DiscoveryError::Io(format!("{}: {error}", dir.display())))?;
         for entry in entries {
-            if collected.len() >= MAX_DISCOVERY_ENTRIES {
-                break;
-            }
-            let Ok(entry) = entry else { continue };
+            let entry =
+                entry.map_err(|error| DiscoveryError::Io(format!("{}: {error}", dir.display())))?;
             let path = entry.path();
-            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| DiscoveryError::Io(format!("{}: {error}", path.display())))?;
             if metadata.file_type().is_symlink() {
                 continue; // never follow symlinks during discovery
             }
@@ -512,19 +552,19 @@ fn walk_bounded(root: &Path) -> Result<Vec<PathBuf>, DiscoveryError> {
                     ContainerKind::Folder(FolderRole::Plain) => {
                         stack.push((path, depth + 1));
                     }
-                    ContainerKind::Folder(_) => collected.push(path),
+                    ContainerKind::Folder(_) => visit(&path)?,
                     _ => unreachable!("detect_container(_, true) always returns Folder"),
                 }
             } else if metadata.is_file() {
                 let is_known_non_game = extension_lowercase(&path)
                     .is_some_and(|extension| is_known_non_game_extension(&extension));
                 if !is_known_non_game {
-                    collected.push(path);
+                    visit(&path)?;
                 }
             }
         }
     }
-    Ok(collected)
+    Ok(())
 }
 
 fn discover_cue(cue_path: &Path, consumed: &mut BTreeSet<PathBuf>) -> GameDiscovery {
