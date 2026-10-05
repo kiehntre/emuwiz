@@ -6645,6 +6645,31 @@ impl Database {
         library_dat_identity_for_item_conn(&self.connection, archive_id, dat_source_id)
     }
 
+    /// Library items whose current, non-stale DAT audit found exactly one
+    /// cryptographic-hash match. A pure read of rows an audit already wrote:
+    /// nothing is hashed, matched or inferred here, and a CRC-only
+    /// (`probable`), filename-only, ambiguous, conflicting or no-match row is
+    /// never included.
+    pub fn library_dat_verified_archive_ids(&self) -> Result<std::collections::HashSet<i64>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT archive_id FROM library_dat_identities \
+                 WHERE verification_state = 'verified_single_match' AND revision_marked_stale = 0",
+            )
+            .map_err(|error| db_error("failed to prepare DAT-verified archive query", error))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|error| db_error("failed to query DAT-verified archives", error))?;
+        let mut ids = std::collections::HashSet::new();
+        for row in rows {
+            ids.insert(
+                row.map_err(|error| db_error("failed to read DAT-verified archive", error))?,
+            );
+        }
+        Ok(ids)
+    }
+
     /// Persists per-library-item DAT identity rows from one completed,
     /// single-source DAT audit outcome - a projection of the audit the
     /// caller already ran (see
@@ -17157,6 +17182,64 @@ mod tests {
                 )
                 .unwrap()
                 .expect("a stored summary")
+        }
+
+        #[test]
+        fn only_a_current_single_hash_match_counts_as_dat_verified() {
+            let (root, mut database) = open("verified-ids");
+            let good = seed_archive(&database, "Good.nes");
+            let named = seed_archive(&database, "NamedOnly.nes");
+            let none = seed_archive(&database, "None.nes");
+            let stale = seed_archive(&database, "Stale.nes");
+            database
+                .persist_library_dat_identity(
+                    good,
+                    &verified(
+                        "no-intro-nes",
+                        DatEcosystem::NoIntro,
+                        Some("v1"),
+                        "Good (USA)",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            let mut filename_only = verified(
+                "no-intro-nes",
+                DatEcosystem::NoIntro,
+                Some("v1"),
+                "Named (USA)",
+                DatAuditCompleteness::Exhaustive,
+            );
+            filename_only.verification_state = DatVerificationState::FilenameOnlyNotVerified;
+            database
+                .persist_library_dat_identity(named, &filename_only)
+                .unwrap();
+            database
+                .persist_library_dat_identity(
+                    none,
+                    &no_match("no-intro-nes", DatAuditCompleteness::Exhaustive),
+                )
+                .unwrap();
+            database
+                .persist_library_dat_identity(
+                    stale,
+                    &verified(
+                        "no-intro-nes",
+                        DatEcosystem::NoIntro,
+                        Some("v1"),
+                        "Stale (USA)",
+                        DatAuditCompleteness::Exhaustive,
+                    ),
+                )
+                .unwrap();
+            database.connection.execute(
+                "UPDATE library_dat_identities SET revision_marked_stale = 1 WHERE archive_id = ?1",
+                params![stale],
+            ).unwrap();
+            let ids = database.library_dat_verified_archive_ids().unwrap();
+            assert_eq!(ids, std::collections::HashSet::from([good]));
+            database.close().unwrap();
+            let _ = fs::remove_dir_all(&root);
         }
 
         #[test]

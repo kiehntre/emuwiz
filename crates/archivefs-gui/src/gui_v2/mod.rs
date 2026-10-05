@@ -11,6 +11,8 @@ mod environment;
 mod equivalent_duplicates;
 mod guidance;
 mod hackhash;
+mod identity_review;
+mod identity_review_page;
 mod imagery;
 mod job_card;
 mod launch_readiness_summary;
@@ -264,6 +266,7 @@ pub(super) struct App {
     /// The current game a navigation was redirected to because the requested
     /// catalogue entry is from an older library location.
     moved_game: Option<i64>,
+    review: identity_review_page::ReviewUi,
     notice: Option<Notice>,
     /// Non-alarming confirmation that a separate window was opened; cleared on
     /// navigation or dismissal.
@@ -354,6 +357,7 @@ impl App {
             loaded: false,
             library_failure: None,
             moved_game: None,
+            review: Default::default(),
             notice: None,
             handoff_status: None,
             confirm_scan: false,
@@ -645,6 +649,11 @@ impl App {
             _ => route.clone(),
         };
         self.moved_game = (resolved != route).then(|| resolved.game()).flatten();
+        if matches!(resolved, Route::ReviewIdentity(_)) {
+            // Re-read what is recorded each time the review is opened, so a
+            // check or setup done elsewhere is reflected on return.
+            self.review.invalidate();
+        }
         self.router.go(resolved);
         self.handoff_status = None;
         self.navigation_changed();
@@ -1610,6 +1619,30 @@ impl App {
                                         id, kind, state, generation,
                                     );
                                 }
+                                Payload::IdentityKnowledge {
+                                    archive_id,
+                                    knowledge,
+                                } => {
+                                    if self.review.knowledge_job == Some(id) {
+                                        self.review.knowledge_job = None;
+                                    }
+                                    self.review.knowledge = knowledge;
+                                    self.review.knowledge_for = Some(archive_id);
+                                    self.activity.settle(
+                                        id,
+                                        "Read what EmuWiz has recorded. Nothing was changed."
+                                            .into(),
+                                        activity::Settled::Done,
+                                    );
+                                }
+                                Payload::SystemAssigned { archive_id } => {
+                                    self.activity.settle(
+                                        id,
+                                        "System saved. Your game file was not changed.".into(),
+                                        activity::Settled::Done,
+                                    );
+                                    self.finish_system_assignment(archive_id);
+                                }
                                 Payload::Done => {}
                             }
                             self.activity.finish(
@@ -1621,6 +1654,13 @@ impl App {
                         Err(error) => {
                             if self.duplicate_job == Some(id) {
                                 self.duplicate_job = None;
+                            }
+                            if self.review.knowledge_job == Some(id) {
+                                self.review.knowledge_job = None;
+                                self.review.knowledge_for = None;
+                            }
+                            if self.review.assign_job.is_some_and(|(job, _)| job == id) {
+                                self.review.assign_job = None;
                             }
                             if was_load_job {
                                 self.library_load_failed(&error);

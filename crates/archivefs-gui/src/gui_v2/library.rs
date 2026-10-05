@@ -188,6 +188,8 @@ pub(super) struct IdentityContext {
     pub inventory: Option<archivefs_core::identity_attention::ReferenceInventory>,
     /// Games already matched against reference data by an audit.
     pub matched: std::collections::HashSet<i64>,
+    /// Games whose recorded DAT audit found exactly one exact hash match.
+    pub dat_verified: std::collections::HashSet<i64>,
 }
 
 impl Library {

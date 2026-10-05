@@ -771,6 +771,9 @@ pub(super) enum Route {
     MameWorkflow,
     Section(Section),
     Game(i64),
+    /// The one place a game's identity is explained and, where it failed to
+    /// verify automatically, finished.
+    ReviewIdentity(i64),
     QuickRename,
     Task {
         section: Section,
@@ -786,13 +789,14 @@ impl Route {
             Self::MameWorkflow => Section::Mame,
             Self::Section(section) | Self::Task { section, .. } => *section,
             Self::Game(_) => Section::Games,
+            Self::ReviewIdentity(_) => Section::Check,
             Self::QuickRename => Section::Dat,
         }
     }
     pub fn game(&self) -> Option<i64> {
         match self {
             Self::BrowsePlayGame(id) => Some(*id),
-            Self::Game(id) | Self::Task { game: id, .. } => Some(*id),
+            Self::Game(id) | Self::ReviewIdentity(id) | Self::Task { game: id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -802,6 +806,7 @@ impl Route {
         match self {
             Self::BrowsePlayGame(_) => Self::BrowsePlayGame(new),
             Self::Game(_) => Self::Game(new),
+            Self::ReviewIdentity(_) => Self::ReviewIdentity(new),
             Self::Task { section, .. } => Self::Task {
                 section: *section,
                 game: new,
@@ -823,6 +828,14 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
     }
     if matches!(route, Route::QuickRename) {
         return vec!["DATs & Verification".into(), "Quick Rename".into()];
+    }
+    if matches!(route, Route::ReviewIdentity(_)) {
+        let mut labels = vec!["Games".to_string()];
+        if let Some(game_title) = game_title.filter(|title| !title.trim().is_empty()) {
+            labels.push(game_title.to_string());
+        }
+        labels.push("Review identity".to_string());
+        return labels;
     }
     if matches!(route, Route::Game(_)) {
         // Game Details is opened from the Games library, not from Organisation.

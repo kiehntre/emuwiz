@@ -43,6 +43,7 @@ fn fixture(context: &egui::Context) -> App {
         backend: Backend::start(context.clone()),
         library: Arc::new(Library::default()),
         moved_game: None,
+        review: Default::default(),
         indices: Vec::new(),
         filter: Filter::default(),
         filter_generation: 0,
@@ -7417,4 +7418,475 @@ fn actionable_findings_show_their_primary_and_secondary_buttons() {
         );
     }
     assert!(!strings.iter().any(|s| s.starts_with("Next:")));
+}
+
+// --- Review Identity: one canonical flow --------------------------------------
+
+use super::identity_review::{DatKnowledge, NoMatchReason, ReviewState, review_for};
+use super::identity_review_page::{assign_system_at, knowledge_at, system_choices};
+
+fn review_app(context: &egui::Context, games: Vec<(i64, &str, &str)>) -> App {
+    let mut app = fixture(context);
+    app.library = Arc::new(Library::new(
+        games
+            .into_iter()
+            .map(|(id, title, platform)| archive(id, title, Some(platform)))
+            .collect(),
+    ));
+    // The recorded-data read is already "done" so no worker ever opens a real database.
+    app.review.knowledge_for = Some(1);
+    app
+}
+
+fn render_review(context: &egui::Context, app: &mut App, id: i64) -> Vec<String> {
+    app.router.current = Route::ReviewIdentity(id);
+    text(&frame(context, app, [1280.0, 900.0]))
+}
+
+fn shows(strings: &[String], needle: &str) -> bool {
+    strings.iter().any(|value| value.contains(needle))
+}
+
+fn knowledge(
+    state: archivefs_core::dat::library_identity_summary::DatVerificationState,
+) -> DatKnowledge {
+    DatKnowledge {
+        state,
+        trusted_source: true,
+        stale: false,
+        title: Some("Amidar (USA)".into()),
+        region: Some("USA".into()),
+        revision: None,
+        source_name: "No-Intro".into(),
+        ecosystem: Some("No-Intro"),
+        candidates: vec!["Amidar (USA)".into(), "Amidar (Europe)".into()],
+        technical: "SHA-1 abc".into(),
+    }
+}
+
+#[test]
+fn review_identity_verified_game_shows_the_result_and_never_a_confirm_button() {
+    use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+    app.review.knowledge = Some(knowledge(S::VerifiedSingleMatch {
+        algorithm: "SHA-1".into(),
+    }));
+    let strings = render_review(&context, &mut app, 1);
+    assert!(shows(&strings, "Verified"), "{strings:?}");
+    assert!(shows(&strings, "Amidar (USA)"));
+    assert!(shows(&strings, "Reference source: No-Intro"));
+    assert!(shows(&strings, "Back to game"));
+    for forbidden in [
+        "Confirm match",
+        "Confirm system",
+        "Choose this match",
+        "Choose system",
+    ] {
+        assert!(!shows(&strings, forbidden), "{forbidden}");
+    }
+}
+
+#[test]
+fn review_identity_explains_each_failed_state_with_its_direct_next_action() {
+    use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
+    let context = egui::Context::default();
+    // no system -> Choose system
+    let mut app = review_app(&context, vec![(1, "Mystery", "Unknown system")]);
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(&strings, "This game needs a system") && shows(&strings, "Choose system"),
+        "{strings:?}"
+    );
+    // identification data missing -> Set up identification data
+    let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
+    Arc::make_mut(&mut app.library).identity_context.inventory =
+        Some(archivefs_core::identity_attention::ReferenceInventory {
+            platforms: Default::default(),
+            ecosystems: Vec::new(),
+            has_unattributed: false,
+        });
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(
+            &strings,
+            "Identification data for this system is not installed yet"
+        ),
+        "{strings:?}"
+    );
+    assert!(shows(&strings, "Set up identification data"));
+    // never compared -> explained, not "Unknown"
+    let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(
+            &strings,
+            "has not been compared with identification data yet"
+        ),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Unknown"));
+    // searched, not found
+    let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
+    app.review.knowledge = Some(knowledge(S::NoMatch));
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(&strings, "No trusted match was found for this file"),
+        "{strings:?}"
+    );
+    assert!(shows(&strings, "does not mean the file is bad"));
+    assert!(!shows(&strings, "Confirm"));
+    // ambiguous: candidates shown, nothing chosen for the person
+    let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
+    app.review.knowledge = Some(knowledge(S::AmbiguousMultipleCandidates {
+        algorithm: "SHA-1".into(),
+        candidate_count: 2,
+    }));
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(&strings, "more than one possible match") && shows(&strings, "Amidar (Europe)"),
+        "{strings:?}"
+    );
+    assert!(!shows(&strings, "Choose this match") && !shows(&strings, "Confirm"));
+    // conflict: shown directly, not hidden behind "Unknown"
+    let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
+    app.review.knowledge = Some(knowledge(S::Conflicting {
+        detail: "filename suggests USA, hash matches Europe".into(),
+    }));
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(&strings, "The evidence disagrees") && shows(&strings, "hash matches Europe"),
+        "{strings:?}"
+    );
+}
+
+#[test]
+fn review_identity_special_release_label_is_explained_not_called_broken() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Super Game (USA) (Proto)", "SNES")]);
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(&strings, "prototype release") && shows(&strings, "not a fault with the file"),
+        "{strings:?}"
+    );
+}
+
+#[test]
+fn review_identity_for_a_game_that_is_gone_fails_safely() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
+    let strings = render_review(&context, &mut app, 999);
+    assert!(
+        shows(&strings, "not in the current game list"),
+        "{strings:?}"
+    );
+    assert!(app.review.assign_job.is_none());
+}
+
+#[test]
+fn opening_review_and_picking_a_system_without_confirming_changes_nothing() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Mystery", "Unknown system")]);
+    let jobs_before = app.activity.jobs.len();
+    render_review(&context, &mut app, 1);
+    app.review.choosing = Some(super::identity_review_page::SystemChoice {
+        query: "game".into(),
+        selected: Some("GameCube"),
+    });
+    render_review(&context, &mut app, 1);
+    let strings = render_review(&context, &mut app, 1);
+    assert!(
+        shows(&strings, "Which system is") && shows(&strings, "Confirm system"),
+        "{strings:?}"
+    );
+    assert!(
+        shows(&strings, "nothing changes until you confirm") || shows(&strings, "does not guess")
+    );
+    assert_eq!(
+        app.activity.jobs.len(),
+        jobs_before,
+        "no job, so no mutation"
+    );
+    assert!(app.review.assign_job.is_none());
+    // nothing is preselected when the chooser opens
+    assert_eq!(
+        super::identity_review_page::SystemChoice::default().selected,
+        None
+    );
+}
+
+#[test]
+fn the_system_picker_only_offers_registry_systems_and_never_guesses() {
+    let (all, total) = system_choices("");
+    assert!(total >= all.len() && !all.is_empty());
+    let (narrow, _) = system_choices("gamecube");
+    assert!(narrow.iter().all(|(id, name)| {
+        id.to_lowercase().contains("gamecube") || name.to_lowercase().contains("gamecube")
+    }));
+    assert!(system_choices("zzzz-not-a-system").0.is_empty());
+}
+
+fn temp_catalogue() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    i64,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir_all(source.join("misc")).unwrap();
+    // A name and a folder that mention a system must not be used to assign one.
+    let archive_path = source.join("misc/GameCube Demo.zip");
+    std::fs::write(&archive_path, b"contents").unwrap();
+    let config = archivefs_core::Config {
+        source_folders: vec![source],
+        mount_root: dir.path().join("mount"),
+        ratarmount_bin: "ratarmount".into(),
+        master_rom_root: None,
+    };
+    let database_path = dir.path().join("library.sqlite3");
+    let mut database = archivefs_core::Database::open_or_create(&database_path).unwrap();
+    archivefs_core::scan_and_persist(&mut database, &config, "test").unwrap();
+    let id = database
+        .find_archive_id_by_absolute_path(&archive_path)
+        .unwrap()
+        .unwrap();
+    (dir, database_path, archive_path, id)
+}
+
+fn current_platform(database_path: &Path, id: i64) -> (Option<String>, Option<String>) {
+    let database = archivefs_core::Database::open_read_only(database_path).unwrap();
+    let archive = database
+        .load_archives()
+        .unwrap()
+        .into_iter()
+        .find(|archive| archive.id == id)
+        .unwrap();
+    (archive.platform, archive.platform_source)
+}
+
+#[test]
+fn choosing_a_system_uses_the_canonical_manual_assignment_and_nothing_else() {
+    let (_dir, database_path, archive_path, id) = temp_catalogue();
+    let before = current_platform(&database_path, id);
+    // reading what is recorded changes nothing
+    let bytes = std::fs::read(&database_path).unwrap();
+    assert_eq!(knowledge_at(&database_path, id).unwrap(), None);
+    assert_eq!(
+        std::fs::read(&database_path).unwrap(),
+        bytes,
+        "a read never writes"
+    );
+    // a name that is not in the registry is refused, even if it sounds right
+    assert!(assign_system_at(&database_path, &archive_path, "GameCube Demo").is_err());
+    assert_eq!(current_platform(&database_path, id), before);
+    // an explicit registry choice goes through the canonical path (source "manual")
+    assign_system_at(&database_path, &archive_path, "GameCube").unwrap();
+    let after = current_platform(&database_path, id);
+    assert_eq!(after.0.as_deref(), Some("GameCube"));
+    assert_eq!(after.1.as_deref(), Some("manual"));
+    // the game file itself is untouched
+    assert_eq!(std::fs::read(&archive_path).unwrap(), b"contents");
+}
+
+#[test]
+fn the_library_projection_re_evaluates_identity_after_a_system_is_assigned() {
+    let context = egui::Context::default();
+    let before = review_app(&context, vec![(1, "Mystery", "Unknown system")]);
+    let game = before.library.game(1).unwrap();
+    assert_eq!(
+        review_for(game, &before.library.identity_context, None).state,
+        ReviewState::NoSystem
+    );
+    let after = review_app(&context, vec![(1, "Mystery", "SNES")]);
+    let game = after.library.game(1).unwrap();
+    assert!(!matches!(
+        review_for(game, &after.library.identity_context, None).state,
+        ReviewState::NoSystem
+    ));
+}
+
+#[test]
+fn identity_blockers_all_route_to_the_one_review_screen() {
+    use super::launch_readiness_summary::ReadinessAction;
+    // Launch (and Game Details, which shows the same readiness card)
+    assert_eq!(
+        super::native_workflows::route_for_action(ReadinessAction::ReviewIdentity, 7),
+        Some(Route::ReviewIdentity(7))
+    );
+    // Problems: a per-game identity finding
+    let mut library = Library::new(Vec::new());
+    library.games = vec![{
+        let mut game = Game::from_archive(archive(7, "Twin", Some("SNES")));
+        game.platform = "SNES".into();
+        game
+    }];
+    let problem = super::problems::tests_support_identity_choice(&library.games[0]);
+    assert_eq!(problem, Route::ReviewIdentity(7));
+    // routes carry their game for navigation and moved-game handling
+    assert_eq!(Route::ReviewIdentity(7).game(), Some(7));
+    assert_eq!(
+        Route::ReviewIdentity(7).with_game(8),
+        Route::ReviewIdentity(8)
+    );
+    assert_eq!(
+        super::routes::breadcrumb_labels(&Route::ReviewIdentity(7), Some("Amidar")),
+        ["Games", "Amidar", "Review identity"]
+    );
+}
+
+#[test]
+fn cheats_and_mods_say_identify_first_and_offer_the_same_review() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Unidentified", "SNES")]);
+    app.router.current = Route::Task {
+        section: Section::Mods,
+        game: 1,
+    };
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(
+            &strings,
+            "We need to identify this game before cheats or mods can be matched safely"
+        ),
+        "{strings:?}"
+    );
+    assert!(shows(&strings, "Review identity"));
+    assert!(!shows(&strings, "Cheat identity is not ready"));
+}
+
+#[test]
+fn check_games_leads_with_what_verified_automatically_and_lists_only_the_rest() {
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![
+            (1, "Good", "SNES"),
+            (2, "Needs help", "SNES"),
+            (3, "Other", "NES"),
+        ],
+    );
+    Arc::make_mut(&mut app.library)
+        .identity_context
+        .dat_verified
+        .insert(1);
+    app.check_platform = Some("SNES".into());
+    app.router.current = Route::Section(Section::Check);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(shows(&strings, "1 verified automatically"), "{strings:?}");
+    assert!(shows(&strings, "1 could not be identified yet"));
+    assert!(shows(&strings, "Review 1 game"));
+    assert!(
+        shows(&strings, "Needs help") && !shows(&strings, "Good"),
+        "only failures are listed"
+    );
+    assert!(!shows(&strings, "Manage DAT sources") && !shows(&strings, "Unknown:"));
+}
+
+#[test]
+fn one_game_has_one_identity_status_on_every_page() {
+    use archivefs_core::dat::library_identity_summary::DatVerificationState as S;
+    let context = egui::Context::default();
+    for verified in [false, true] {
+        let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
+        if verified {
+            Arc::make_mut(&mut app.library)
+                .identity_context
+                .dat_verified
+                .insert(1);
+        } else {
+            app.review.knowledge = Some(knowledge(S::NoMatch));
+        }
+        let label = app.identity_review_for(1).unwrap().list_label();
+        // Game Details
+        app.router.current = Route::Game(1);
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, &format!("Identity: {label}")),
+            "details {label}: {strings:?}"
+        );
+        // Problems for this one game
+        app.router.current = Route::Task {
+            section: Section::Problems,
+            game: 1,
+        };
+        app.problem_summary = Some(Arc::new(ProblemSummary::from_library(&app.library, None)));
+        let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+        assert!(
+            shows(&strings, &format!("Identity: {label}")),
+            "problems {label}: {strings:?}"
+        );
+        // Check Games (the same function decides whether the game is listed)
+        let listed = super::identity_review_page::summarize_platform(&app.library, "Atari2600")
+            .rows
+            .iter()
+            .any(|(id, _)| *id == 1);
+        assert_eq!(listed, !verified);
+        // Review Identity
+        let strings = render_review(&context, &mut app, 1);
+        assert!(shows(
+            &strings,
+            if verified {
+                "Verified"
+            } else {
+                "No trusted match"
+            }
+        ));
+        // a verified game is never listed as an unmatched identity problem
+        if verified {
+            let summary = ProblemSummary::from_library(&app.library, None);
+            assert!(
+                !summary
+                    .problems
+                    .iter()
+                    .any(|p| p.category == super::problems::Category::Identity)
+            );
+        }
+    }
+}
+
+#[test]
+fn problems_for_one_game_puts_the_game_first_and_does_not_show_the_library_inbox() {
+    let context = egui::Context::default();
+    let mut app = review_app(
+        &context,
+        vec![(1, "Amidar", "Atari2600"), (2, "Other", "SNES")],
+    );
+    app.problem_summary = Some(Arc::new(ProblemSummary::from_library(&app.library, None)));
+    app.router.current = Route::Task {
+        section: Section::Problems,
+        game: 1,
+    };
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(shows(&strings, "Amidar"), "{strings:?}");
+    assert!(shows(&strings, "Review identity"));
+    assert!(
+        !shows(&strings, "PROBLEM INBOX") && !shows(&strings, "Needs attention:"),
+        "{strings:?}"
+    );
+}
+
+#[test]
+fn setting_up_identification_data_carries_the_game_and_system_and_offers_the_way_back() {
+    let context = egui::Context::default();
+    let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
+    app.open_identification_data(1, "SNES");
+    assert_eq!(app.router.current, Route::Section(Section::Dat));
+    assert_eq!(app.review.dat_context, Some((1, "SNES".into())));
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Setting up identification data for SNES"),
+        "{strings:?}"
+    );
+    assert!(shows(&strings, "Back to Review identity"));
+    // returning re-reads what is recorded
+    app.review.knowledge_for = Some(1);
+    app.go(Route::ReviewIdentity(1));
+    assert_eq!(app.review.knowledge_for, None);
+}
+
+#[test]
+fn no_match_reasons_are_distinct_states() {
+    assert_ne!(NoMatchReason::NotInData, NoMatchReason::WeakEvidenceOnly);
+    assert_ne!(NoMatchReason::NotInData, NoMatchReason::NoUsableEvidence);
 }

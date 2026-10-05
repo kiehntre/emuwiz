@@ -484,20 +484,7 @@ impl NativeWorkflows {
         if action == Some(ReadinessAction::RecheckReadiness) {
             self.recheck_readiness_in_place(ui.ctx());
         }
-        action.and_then(|action| match action {
-            ReadinessAction::RecheckReadiness => None,
-            ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
-            ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
-            ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {
-                section: Section::Launch,
-                game: game_id,
-            }),
-            ReadinessAction::SetUpEmulator => Some(Route::Section(Section::Emulators)),
-            ReadinessAction::CheckFirmware => Some(Route::Section(Section::Firmware)),
-            ReadinessAction::ReviewIdentity => Some(Route::Section(Section::Check)),
-            ReadinessAction::CheckGamesFolder => Some(Route::Section(Section::Sources)),
-            ReadinessAction::ReviewProblem => Some(Route::Section(Section::Problems)),
-        })
+        action.and_then(|action| route_for_action(action, game_id))
     }
 
     /// Native v2 presentation of the existing bounded tape-analysis result.
@@ -1313,9 +1300,26 @@ impl NativeWorkflows {
             self.app.open_cheats_mods_workspace(ui.ctx(), path);
         }
         let Some(workflow) = self.app.cheat_workflow.as_ref() else {
+            if !game.identified {
+                crate::ui::components::banner(
+                    ui,
+                    "This game needs identifying first",
+                    "We need to identify this game before cheats or mods can be matched safely. No files were changed.",
+                    crate::ui::components::StatusTone::Warning,
+                );
+                if ui.button("Review identity").clicked() {
+                    return Some(Route::ReviewIdentity(game.archive.id));
+                }
+                ui.collapsing("Details", |ui| {
+                    ui.label(
+                        "The cheat workspace could not be bound to the loaded library record.",
+                    );
+                });
+                return None;
+            }
             crate::ui::components::banner(
                 ui,
-                "Cheat identity is not ready",
+                "Cheats are not ready for this game",
                 "EmuWiz could not bind this selection to the loaded library record. Refresh the library and try again; no files were changed.",
                 crate::ui::components::StatusTone::Warning,
             );
@@ -3212,5 +3216,24 @@ mod lifecycle_selection_tests {
             lifecycle_executable_path(&binding),
             Some(Path::new("/home/test/.local/bin/mame"))
         );
+    }
+}
+
+/// Where each readiness action goes. Identity problems always go to the one
+/// Review Identity screen.
+pub(super) fn route_for_action(action: ReadinessAction, game_id: i64) -> Option<Route> {
+    match action {
+        ReadinessAction::RecheckReadiness => None,
+        ReadinessAction::ReviewDiscSet => Some(Route::Section(Section::MultiDisc)),
+        ReadinessAction::OpenActivity => Some(Route::Section(Section::Activity)),
+        ReadinessAction::Play | ReadinessAction::ChooseEmulator => Some(Route::Task {
+            section: Section::Launch,
+            game: game_id,
+        }),
+        ReadinessAction::SetUpEmulator => Some(Route::Section(Section::Emulators)),
+        ReadinessAction::CheckFirmware => Some(Route::Section(Section::Firmware)),
+        ReadinessAction::ReviewIdentity => Some(Route::ReviewIdentity(game_id)),
+        ReadinessAction::CheckGamesFolder => Some(Route::Section(Section::Sources)),
+        ReadinessAction::ReviewProblem => Some(Route::Section(Section::Problems)),
     }
 }

@@ -260,6 +260,12 @@ impl ProblemSummary {
                 )
             {
                 problems.push(file_problem(game));
+            } else if library
+                .identity_context
+                .dat_verified
+                .contains(&game.archive.id)
+            {
+                // An exact authoritative DAT match is verified automatically.
             } else {
                 let facts = IdentityFacts {
                     platform: (game.platform != UNKNOWN_PLATFORM).then_some(game.platform.as_str()),
@@ -474,7 +480,7 @@ fn identity_choice_problem(game: &Game, reason: ChoiceReason) -> Problem {
         primary: Some(if mame {
             ProblemAction::review_mame()
         } else {
-            ProblemAction::new(label, Route::Game(id))
+            ProblemAction::new(label, Route::ReviewIdentity(id))
         }),
         secondary: (!mame && game.platform != UNKNOWN_PLATFORM).then(|| {
             ProblemAction::new(
@@ -912,6 +918,7 @@ pub(in crate::gui_v2) mod tests {
         library.identity_context = super::super::library::IdentityContext {
             inventory,
             matched: matched.iter().copied().collect(),
+            dat_verified: Default::default(),
         };
         ProblemSummary::from_library(&library, None)
     }
@@ -1203,12 +1210,12 @@ pub(in crate::gui_v2) mod tests {
         let a = action(ProblemKind::IdentityConflict);
         assert_eq!(
             (a.label.as_str(), &a.route),
-            ("Review evidence", &Route::Game(3))
+            ("Review evidence", &Route::ReviewIdentity(3))
         );
         let a = action(ProblemKind::IdentityAmbiguous);
         assert_eq!(
             (a.label.as_str(), &a.route),
-            ("Review matches", &Route::Game(3))
+            ("Review matches", &Route::ReviewIdentity(3))
         );
         let a = action(ProblemKind::NoSystem);
         assert_eq!(a.route, Route::Section(Section::Games));
@@ -1247,4 +1254,13 @@ pub(in crate::gui_v2) mod tests {
             assert!(matches!(secondary.route, Route::Game(_)), "{kind:?}");
         }
     }
+}
+
+/// Test seam: the route a per-game identity-choice finding sends the person to.
+#[cfg(test)]
+pub(super) fn tests_support_identity_choice(game: &Game) -> Route {
+    identity_choice_problem(game, ChoiceReason::Ambiguous)
+        .primary
+        .map(|action| action.route)
+        .unwrap()
 }

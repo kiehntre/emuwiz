@@ -91,6 +91,16 @@ pub(super) enum Command {
         games: Vec<Game>,
         cancel: Arc<AtomicBool>,
     },
+    /// Read-only: what the saved DAT audits say about one game.
+    LoadIdentityKnowledge {
+        archive_id: i64,
+    },
+    /// The explicit, confirmed system choice for one game.
+    AssignSystem {
+        archive_id: i64,
+        archive_path: PathBuf,
+        platform: String,
+    },
     PrepareDuplicateRepair {
         group: Box<archivefs_core::repair::ExactDuplicateGroup>,
     },
@@ -154,6 +164,13 @@ pub(super) enum Command {
 }
 
 pub(super) enum Payload {
+    IdentityKnowledge {
+        archive_id: i64,
+        knowledge: Option<super::identity_review::DatKnowledge>,
+    },
+    SystemAssigned {
+        archive_id: i64,
+    },
     Library(SharedLibrary),
     Environment(crate::gui_v2::environment::EnvironmentSnapshot),
     RommLibrary(crate::gui_v2::romm_library::RommBrowserSnapshot),
@@ -439,6 +456,22 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
                 reporter.tick(index as u64 + 1);
             }
             Ok(Payload::Verification(result))
+        }
+        Command::LoadIdentityKnowledge { archive_id } => {
+            let path = default_database_path().map_err(|error| error.to_string())?;
+            Ok(Payload::IdentityKnowledge {
+                archive_id,
+                knowledge: super::identity_review_page::knowledge_at(&path, archive_id)?,
+            })
+        }
+        Command::AssignSystem {
+            archive_id,
+            archive_path,
+            platform,
+        } => {
+            let path = default_database_path().map_err(|error| error.to_string())?;
+            super::identity_review_page::assign_system_at(&path, &archive_path, &platform)?;
+            Ok(Payload::SystemAssigned { archive_id })
         }
         Command::ScanDuplicates { games, cancel } => {
             let candidates: Vec<_> = games
@@ -831,10 +864,15 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
     .filter(|result| !result.stale)
     .filter_map(|result| result.archive_id)
     .collect();
+    // Games a recorded DAT audit already matched exactly: verified, nobody confirms them.
+    let dat_verified = database
+        .library_dat_verified_archive_ids()
+        .unwrap_or_default();
     let mut library = Library::with_history(archives, &renames, Some(&configured));
     library.identity_context = super::library::IdentityContext {
         inventory: crate::dat_catalogue_picker::reference_inventory(),
         matched,
+        dat_verified,
     };
     for enrichment in database
         .load_screenscraper_enrichments()

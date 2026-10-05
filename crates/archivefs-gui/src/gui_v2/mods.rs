@@ -149,8 +149,8 @@ pub(super) fn show_mods_page(
                 if selected_game.is_none() && ui.button("Choose a game").clicked() { destination = Some(Route::Section(Section::Games)); }
                 if let Some(game) = selected_game {
                     if selected_identity(Some(game)).is_none() {
-                        ui.label("This game's identity is not confirmed, so its installed mods cannot be matched safely.");
-                        if ui.button("Check this game").clicked() { destination = Some(Route::Task { section: Section::Check, game: game.archive.id }); }
+                        ui.label("We need to identify this game before cheats or mods can be matched safely.");
+                        if ui.button("Review identity").clicked() { destination = Some(Route::ReviewIdentity(game.archive.id)); }
                     }
                 }
                 if ui.button("Open History & Undo").clicked() { destination = Some(Route::Section(Section::History)); }
