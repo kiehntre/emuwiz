@@ -17158,6 +17158,7 @@ mod tests {
                 audited_hashes: hashes(),
                 audited_at: "2026-05-01T00:00:00Z".into(),
                 completeness,
+                archive_member: None,
             }
         }
 
@@ -17180,6 +17181,7 @@ mod tests {
                 audited_hashes: hashes(),
                 audited_at: "2026-06-01T00:00:00Z".into(),
                 completeness,
+                archive_member: None,
             }
         }
 

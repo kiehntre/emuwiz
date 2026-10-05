@@ -703,6 +703,25 @@ pub struct PersistedLibraryDatIdentity {
     pub audited_at: String,
     /// Whether the audit that produced this examined everything.
     pub completeness: DatAuditCompleteness,
+    /// Set only when this identity belongs to the outer archive row because
+    /// one safe member of it matched exactly. `audited_hashes` is then the
+    /// *outer* archive's (the freshness baseline); the member's own matched
+    /// hash is `hash_evidence.matched_value`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_member: Option<ArchiveMemberProvenance>,
+}
+
+/// Which member of the outer archive produced a parent identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveMemberProvenance {
+    /// Safe display name of the member inside the archive.
+    pub member_name: String,
+    /// Position in the archive's deterministic member enumeration.
+    pub member_index: usize,
+    /// Archive container format, e.g. `zip` / `7z`.
+    pub archive_format: String,
+    /// Algorithm the member's exact match was made on, e.g. `SHA-1`.
+    pub algorithm: String,
 }
 
 /// A durable pointer to one catalogue entry a library item matched. Carries
@@ -788,6 +807,7 @@ impl PersistedLibraryDatIdentity {
             audited_hashes: audited_hashes.clone(),
             audited_at: audited_at.into(),
             completeness,
+            archive_member: None,
         }
     }
 
