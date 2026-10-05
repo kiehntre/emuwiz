@@ -351,3 +351,156 @@ fn raw_fixture_crc_matches_the_header_declaration() {
     assert_eq!(parsed[0].original_size, 7);
     assert_eq!(parsed[0].method_str(), "-lh0-");
 }
+
+/// Corpus survey, run by hand: `EMUWIZ_LHA_SURVEY_DIR=<dir> cargo test -p
+/// archivefs-core --lib survey_real_lha_corpus -- --ignored --nocapture`.
+/// Read-only; prints a histogram of what real archives look like.
+#[test]
+#[ignore]
+fn survey_real_lha_corpus() {
+    use std::collections::BTreeMap;
+    let Ok(dir) = std::env::var("EMUWIZ_LHA_SURVEY_DIR") else {
+        return;
+    };
+    let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
+    let mut archives = 0;
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !ext.eq_ignore_ascii_case("lha") && !ext.eq_ignore_ascii_case("lzh") {
+            continue;
+        }
+        archives += 1;
+        let file = File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        match scan_headers(&file, len, 100_000) {
+            Err(error) => {
+                *histogram
+                    .entry(format!("ARCHIVE-ERROR {error}"))
+                    .or_default() += 1
+            }
+            Ok(entries) => {
+                for raw in entries {
+                    let host = raw
+                        .host_os
+                        .map_or("none".to_string(), |h| format!("{}", h as char));
+                    let kind = match &raw.kind {
+                        LhaEntryKind::Unknown(why) => format!("Unknown({why})"),
+                        other => format!("{other:?}"),
+                    };
+                    let key = format!(
+                        "level={} host={host} method={} kind={kind} ext={:02x?}",
+                        raw.header_level,
+                        raw.method_str(),
+                        raw.extended_types
+                    );
+                    *histogram.entry(key).or_default() += 1;
+                }
+            }
+        }
+    }
+    eprintln!("SURVEY archives={archives}");
+    for (key, count) in histogram {
+        eprintln!("SURVEY {count:7} {key}");
+    }
+}
+
+// ---- Amiga host ('A'): encoding per the Lha 40.57 guide ----------------------
+//
+// Links are written as method `-lhd-` plus extended header 0x60 (hard link) or
+// 0x61 (soft link) carrying the target; level 0 cannot describe links; older
+// Lhas (and `-Ql3`, the default) store the target's content as an ordinary
+// entry.  Extended header 0x40 on an Amiga host is Amiga protection bits.
+
+#[test]
+fn amiga_ordinary_files_are_regular_whatever_their_protection_bits() {
+    for level in 0..=2 {
+        for bits in [0x00_u8, 0x10, 0x08, 0xff, 0x01] {
+            let mut entry = Entry::amiga("Game/Game.slave", b"SLAVE").level(level);
+            entry.extra_extended = vec![(0x40, vec![bits, 0])];
+            assert_eq!(
+                kind_of(entry),
+                LhaEntryKind::Regular,
+                "level {level} protection {bits:#04x} must not be read as DOS attributes"
+            );
+        }
+    }
+    // The real-corpus shape: level 1, host A, no extended headers at all.
+    assert_eq!(
+        kind_of({
+            let mut entry = Entry::amiga("x", b"R").level(1);
+            entry.extra_extended.clear();
+            entry
+        }),
+        LhaEntryKind::Regular
+    );
+}
+
+#[test]
+fn amiga_soft_and_hard_links_are_never_regular() {
+    for level in 1..=2 {
+        let soft = Entry::amiga_link("soft.rom", 0x61, "/real.rom").level(level);
+        assert_eq!(kind_of(soft), LhaEntryKind::Symlink, "soft, level {level}");
+        let hard = Entry::amiga_link("hard.rom", 0x60, "real.rom").level(level);
+        assert_eq!(kind_of(hard), LhaEntryKind::HardLink, "hard, level {level}");
+        // Whatever the method, a link marker wins over "ordinary file".
+        let mut disguised = Entry::amiga_link("soft.rom", 0x61, "/real.rom").level(level);
+        disguised.method = *b"-lh0-";
+        disguised.payload = b"/real.rom".to_vec();
+        assert_eq!(kind_of(disguised), LhaEntryKind::Symlink, "level {level}");
+        let mut both = Entry::amiga_link("x", 0x61, "/y").level(level);
+        both.extra_extended.push((0x60, b"y".to_vec()));
+        assert!(
+            matches!(kind_of(both), LhaEntryKind::Unknown(_)),
+            "level {level}"
+        );
+    }
+    for kind in [LhaEntryKind::Symlink, LhaEntryKind::HardLink] {
+        assert!(kind.refusal_reason().is_some());
+    }
+}
+
+#[test]
+fn amiga_directory_and_unrecognised_forms_fail_closed() {
+    let mut directory = Entry::amiga("Dir", b"").level(1);
+    directory.method = *b"-lhd-";
+    assert_eq!(kind_of(directory), LhaEntryKind::Directory);
+    // Any extended header this inspector does not know could be a link-like
+    // marker from a newer Lha: unproven, never regular.
+    for unknown in [0x62_u8, 0x70, 0x80, 0x42, 0x5f] {
+        for level in 1..=2 {
+            let mut entry = Entry::amiga("Game.rom", b"R").level(level);
+            entry.extra_extended.push((unknown, vec![1, 2, 3]));
+            assert!(
+                matches!(kind_of(entry), LhaEntryKind::Unknown(_)),
+                "ext {unknown:#04x} level {level}"
+            );
+        }
+    }
+    // Known benign blocks (file note 0x71, padding 0xff) keep it regular.
+    let mut noted = Entry::amiga("Game.rom", b"R").level(2);
+    noted.extra_extended.push((0x71, b"note".to_vec()));
+    noted.extra_extended.push((0xff, vec![0, 0]));
+    assert_eq!(kind_of(noted), LhaEntryKind::Regular);
+    // Amiga host with a '|' name and no marker stays unproven.
+    assert!(matches!(
+        kind_of(Entry::amiga("a|b", b"R")),
+        LhaEntryKind::Unknown(_)
+    ));
+}
+
+#[test]
+fn amiga_file_note_after_the_name_terminator_is_not_part_of_the_name() {
+    // Seen in real WHDLoad archives: `Disk.1\0<note>` with the path in 0x02.
+    for level in 0..=1 {
+        let mut entry = Entry::amiga("x", b"DISK").level(level);
+        entry.name = b"Disk.1\0Dragonstone".to_vec();
+        let parsed = scan(&archive(&[entry])).unwrap();
+        assert_eq!(parsed[0].name, b"Disk.1", "level {level}");
+        assert_eq!(parsed[0].kind, LhaEntryKind::Regular);
+    }
+    // A NUL smuggled into an extended-header name is unproven.
+    let mut entry = Entry::amiga("x", b"DISK").level(2);
+    entry.name = b"a\0b".to_vec();
+    assert!(matches!(kind_of(entry), LhaEntryKind::Unknown(_)));
+}

@@ -346,3 +346,56 @@ fn backend_unavailable_is_reported_distinctly_from_a_bad_archive() {
         }
     );
 }
+
+// ---- Amiga-host (Lha 40.x style) archives: header-proven types only ----
+
+use crate::dat::archive::lha_header::fixtures::{Entry, archive as header_archive};
+
+fn write_entries(dir: &Path, name: &str, entries: &[Entry]) -> std::path::PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, header_archive(entries)).unwrap();
+    path
+}
+
+#[test]
+fn traditional_amiga_host_level_one_archives_still_yield_the_slave() {
+    let Some(_provider) = provider() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    // The shape of every real WHDLoad archive surveyed: level 1, host `A`.
+    let archive = write_entries(
+        dir.path(),
+        "game.lha",
+        &[
+            Entry::amiga("Game/Game.slave", &valid_slave_bytes()).level(1),
+            Entry::amiga("Game.info", b"icon").level(1),
+        ],
+    );
+    let cancel = AtomicBool::new(false);
+    let result = discover_whdload_slaves_in_archive(&archive, &cancel).unwrap();
+    assert_eq!(result.candidates.len(), 1);
+    assert!(result.diagnostics.is_empty());
+}
+
+#[test]
+fn amiga_link_members_named_slave_are_never_read_as_slaves() {
+    let Some(_provider) = provider() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    for (level, marker) in [(1, 0x61_u8), (1, 0x60), (2, 0x61), (2, 0x60)] {
+        let archive = write_entries(
+            dir.path(),
+            "links.lha",
+            &[
+                Entry::amiga("Real.slave", &valid_slave_bytes()).level(level),
+                Entry::amiga_link("Link.slave", marker, "Real.slave").level(level),
+            ],
+        );
+        let cancel = AtomicBool::new(false);
+        let result = discover_whdload_slaves_in_archive(&archive, &cancel).unwrap();
+        let names: Vec<_> = result
+            .candidates
+            .iter()
+            .map(|c| c.member_path.as_str())
+            .collect();
+        assert_eq!(names, ["Real.slave"], "level {level} marker {marker:#x}");
+    }
+}

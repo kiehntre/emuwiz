@@ -831,6 +831,50 @@ fn lha_unix_symlink_is_refused_as_authoritative_member_evidence() {
     assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
 }
 
+/// Amiga Lha 40.x writes links as `-lhd-` + extended header 0x60/0x61 (see
+/// `dat::archive::lha_header`).  Even a link whose stored bytes equal the DAT
+/// ROM must never become verified identity.
+#[test]
+fn lha_amiga_links_are_never_authoritative_rom_evidence() {
+    use crate::dat::archive::lha_header::fixtures::{Entry, archive};
+    if !external_readers_available() {
+        return;
+    }
+    for marker in [0x60_u8, 0x61] {
+        for disguised in [false, true] {
+            let mut fx = Fixture::new(
+                Format::Lha,
+                &[("Game.rom", GAME)],
+                &[Dat::Full("Game A", "Game.rom", GAME)],
+            );
+            let mut link = Entry::amiga_link("Game.rom", marker, "Other.rom").level(1);
+            if disguised {
+                // Ordinary method carrying exactly the DAT's ROM bytes.
+                link.method = *b"-lh0-";
+                link.payload = GAME.to_vec();
+            }
+            let bytes = archive(&[link]);
+            std::fs::write(&fx.archive, &bytes).unwrap();
+            let (outcome, row) = fx.run();
+            let member = &outcome.archives[0].members[0];
+            assert!(
+                matches!(
+                    member.evidence.status,
+                    crate::dat::archive::ArchiveMemberStatus::NotVerified { .. }
+                ),
+                "marker {marker:#x} disguised={disguised}: {:?}",
+                member.evidence.status
+            );
+            assert!(member.evidence.hashes.is_none());
+            assert!(member.verdict.is_none());
+            assert!(!is_verified(&row));
+            assert!(row.is_none());
+            assert_eq!(std::fs::read(&fx.archive).unwrap(), bytes);
+            assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
+        }
+    }
+}
+
 fn external_readers_available() -> bool {
     let timeout = std::time::Duration::from_secs(10);
     let available = crate::dat::archive::rar::RarProvider::discover(timeout).is_ok()

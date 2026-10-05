@@ -42,12 +42,22 @@ const S_IFCHR: u16 = 0o020000;
 const S_IFBLK: u16 = 0o060000;
 const S_IFSOCK: u16 = 0o140000;
 
+/// Extended-header types this inspector understands.  Anything else leaves
+/// the entry's type unproven: an unknown block could be a link marker.
+/// `0x42` (64-bit size) is deliberately absent - it would override the base
+/// header's sizes, which correlation relies on.
+const KNOWN_EXTENDED_TYPES: [u8; 15] = [
+    0x00, 0x01, 0x02, 0x3f, 0x40, 0x41, 0x50, 0x51, 0x52, 0x53, 0x54, 0x60, 0x61, 0x71, 0xff,
+];
+
 /// What the raw header proves an entry to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LhaEntryKind {
     Regular,
     Directory,
     Symlink,
+    /// An Amiga Lha 40.x hard link (`-lhd-` + extended header `0x60`).
+    HardLink,
     /// FIFO, device node, socket, or a DOS volume label.
     Special,
     /// The header does not prove a type (or contradicts itself).
@@ -65,6 +75,7 @@ impl LhaEntryKind {
             Self::Regular => None,
             Self::Directory => Some("LHA directory member"),
             Self::Symlink => Some("LHA symbolic-link member"),
+            Self::HardLink => Some("LHA hard-link member"),
             Self::Special => Some("LHA special member"),
             Self::Unknown(_) => Some("LHA member type unproven"),
         }
@@ -83,6 +94,8 @@ pub struct LhaRawEntry {
     pub crc16: u16,
     pub host_os: Option<u8>,
     pub unix_mode: Option<u16>,
+    /// Extended-header types present, in order.
+    pub extended_types: Vec<u8>,
     pub header_offset: u64,
     pub data_offset: u64,
 }
@@ -199,11 +212,22 @@ struct Extended {
     unix_mode: Option<u16>,
     /// A structural irregularity that forbids trusting the entry's type.
     doubt: Option<&'static str>,
+    /// Amiga link markers: `0x60` hard link, `0x61` soft link.
+    amiga_hard_link: bool,
+    amiga_soft_link: bool,
+    /// Every extended-header type seen, in order (bounded by the walk).
+    types: Vec<u8>,
 }
 
 impl Extended {
     fn absorb(&mut self, kind: u8, data: &[u8]) {
+        self.types.push(kind);
+        if !KNOWN_EXTENDED_TYPES.contains(&kind) {
+            self.doubt = Some("unrecognised extended header");
+        }
         match kind {
+            0x60 => self.amiga_hard_link = true,
+            0x61 => self.amiga_soft_link = true,
             0x00 if data.len() >= 2 => set_once(&mut self.header_crc, le16(data), &mut self.doubt),
             0x01 => set_once(&mut self.filename, data.to_vec(), &mut self.doubt),
             0x02 => set_once(&mut self.directory, data.to_vec(), &mut self.doubt),
@@ -363,7 +387,14 @@ fn parse_entry<R: ReadAt + ?Sized>(
                 });
             }
             let name_end = 22 + name_len as usize;
-            base_name = separators(&header[22..name_end]);
+            // `NameAndNote`: the name is NUL-terminated and an Amiga file note
+            // may follow the NUL (Amiga Lha guide, level 0/1 headers).
+            let name_and_note = &header[22..name_end];
+            let name_only = name_and_note
+                .split(|byte| *byte == 0)
+                .next()
+                .unwrap_or_default();
+            base_name = separators(name_only);
             crc = le16(&header[name_end..name_end + 2]);
             let after_crc = &header[name_end + 2..];
             if level == 0 {
@@ -462,17 +493,25 @@ fn parse_entry<R: ReadAt + ?Sized>(
     }
     let (name, name_doubt) = assemble_name(base_name, &extended);
     let doubt = extended.doubt.or(name_doubt);
-    let dos_attr = extended.dos_attr.or(dos_attr_byte);
-    let kind = classify(
-        &method,
+    // On an Amiga host `0x40` holds Amiga protection bits (`a` = 0x10, ...),
+    // not MS-DOS directory/volume attributes, so it must not be read as such.
+    let dos_attr = if host_os == Some(b'A') {
+        None
+    } else {
+        extended.dos_attr.or(dos_attr_byte)
+    };
+    let kind = classify(&Facts {
+        method: &method,
         unix_mode,
         dos_attr,
         host_os,
-        &name,
+        name: &name,
         doubt,
-        packed_size,
+        packed: packed_size,
         original,
-    );
+        amiga_hard_link: extended.amiga_hard_link,
+        amiga_soft_link: extended.amiga_soft_link,
+    });
     Ok(LhaRawEntry {
         header_level: level,
         kind,
@@ -483,6 +522,7 @@ fn parse_entry<R: ReadAt + ?Sized>(
         crc16: crc,
         host_os,
         unix_mode,
+        extended_types: extended.types,
         header_offset: offset,
         data_offset,
     })
@@ -528,6 +568,9 @@ fn assemble_name(base_name: Vec<u8>, extended: &Extended) -> (Vec<u8>, Option<&'
         path.extend_from_slice(&name);
         name = path;
     }
+    if name.contains(&0) {
+        return (name, Some("NUL in member name"));
+    }
     // A directory entry may be stored with a trailing separator.
     while name.len() > 1 && name.last() == Some(&b'/') {
         name.pop();
@@ -535,22 +578,59 @@ fn assemble_name(base_name: Vec<u8>, extended: &Extended) -> (Vec<u8>, Option<&'
     (name, None)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn classify(
-    method: &[u8; 5],
+struct Facts<'a> {
+    method: &'a [u8; 5],
     unix_mode: Option<u16>,
     dos_attr: Option<u8>,
     host_os: Option<u8>,
-    name: &[u8],
+    name: &'a [u8],
     doubt: Option<&'static str>,
     packed: u64,
     original: u64,
-) -> LhaEntryKind {
+    amiga_hard_link: bool,
+    amiga_soft_link: bool,
+}
+
+/// Type from header facts only.
+///
+/// Amiga Lha 40.x (guide, "Specification of the Lha header") stores a link
+/// as method `-lhd-` plus extended header `0x60` (hard link, target relative
+/// to the archive root) or `0x61` (soft link, target relative to the link's
+/// directory); level 0 cannot describe links at all, and with `-Ql3` (the
+/// default) and every older Lha the link target's *content* is stored as an
+/// ordinary entry.  So an Amiga entry is a plain file only when its method is
+/// not `-lhd-`, it carries no link marker, and every extended header was
+/// recognised; any unknown block fails closed in [`KNOWN_EXTENDED_TYPES`].
+fn classify(facts: &Facts) -> LhaEntryKind {
     use LhaEntryKind::*;
+    let Facts {
+        method,
+        unix_mode,
+        dos_attr,
+        host_os,
+        name,
+        doubt,
+        packed,
+        original,
+        amiga_hard_link,
+        amiga_soft_link,
+    } = *facts;
     if let Some(reason) = doubt {
         return Unknown(reason);
     }
     let directory_method = method == b"-lhd-";
+    if amiga_hard_link || amiga_soft_link {
+        if amiga_hard_link && amiga_soft_link {
+            return Unknown("both hard- and soft-link markers");
+        }
+        // A link marker contradicting a Unix mode that says otherwise.
+        if let Some(mode) = unix_mode {
+            if !matches!(mode & S_IFMT, S_IFLNK | S_IFREG | S_IFDIR) {
+                return Unknown("link marker with a special Unix mode");
+            }
+        }
+        return if amiga_hard_link { HardLink } else { Symlink };
+    }
     let attr_directory = dos_attr.is_some_and(|attr| attr & 0x10 != 0);
     let attr_volume = dos_attr.is_some_and(|attr| attr & 0x08 != 0);
     let kind = match unix_mode {
@@ -569,7 +649,8 @@ fn classify(
         None => match host_os {
             // A Unix host must carry a mode; its absence proves nothing.
             Some(b'U') => Unknown("Unix host without a mode"),
-            // Hosts with no symlink encoding in the LHA header.
+            // Hosts whose headers have no other link encoding (see above for
+            // Amiga).
             None | Some(0) | Some(b'M') | Some(b'w') | Some(b'W') | Some(b'2') | Some(b'A') => {
                 if directory_method {
                     Directory

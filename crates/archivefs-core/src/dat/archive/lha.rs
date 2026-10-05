@@ -626,7 +626,8 @@ fn correlate(
         if entry.method_str() != listed.method {
             return Err(conflict(index, "method"));
         }
-        if raw_directory != listed.is_folder {
+        // 7-Zip's folder flag is the `-lhd-` method; links share it.
+        if (entry.method == *b"-lhd-") != listed.is_folder {
             return Err(conflict(index, "directory flag"));
         }
         if raw_directory {
@@ -1517,5 +1518,91 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    // ---- Amiga host ('A'): links are -lhd- + extended header 0x60/0x61 ----
+
+    #[test]
+    fn amiga_links_are_non_regular_per_member_and_never_streamed() {
+        let Some(provider) = provider() else { return };
+        for level in 1..=2 {
+            let bytes = archive(&[
+                Entry::amiga("Real.rom", ROM).level(level),
+                Entry::amiga_link("Soft.rom", 0x61, "/Real.rom").level(level),
+                Entry::amiga_link("Hard.rom", 0x60, "Real.rom").level(level),
+            ]);
+            let (_dir, source) = open_bytes(&provider, &bytes);
+            let mut source = source.unwrap_or_else(|error| panic!("level {level}: {error:?}"));
+            let outcome = verify(&mut source);
+            assert!(outcome.members[0].is_hash_complete(), "level {level}");
+            for (index, reason) in [(1, "LHA symbolic-link member"), (2, "LHA hard-link member")] {
+                assert_eq!(
+                    outcome.members[index].status,
+                    ArchiveMemberStatus::NotVerified { reason },
+                    "level {level}"
+                );
+                assert!(outcome.members[index].hashes.is_none());
+            }
+            let cancel = AtomicBool::new(false);
+            for link in ["Soft.rom", "Hard.rom"] {
+                assert!(source.read_member(link, 1024, &cancel).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn amiga_link_disguised_with_an_ordinary_method_is_still_refused() {
+        let Some(provider) = provider() else { return };
+        // A link marker on a stored (-lh0-) entry whose bytes are the target
+        // path: 7-Zip lists and would stream it as a file.
+        let mut disguised = Entry::amiga_link("Soft.rom", 0x61, "/Real.rom").level(1);
+        disguised.method = *b"-lh0-";
+        disguised.payload = b"/Real.rom".to_vec();
+        let (_dir, source) = open_bytes(&provider, &archive(&[disguised]));
+        let mut source = source.unwrap();
+        let outcome = verify(&mut source);
+        assert!(outcome.members[0].hashes.is_none());
+        assert!(matches!(
+            outcome.members[0].status,
+            ArchiveMemberStatus::NotVerified { .. }
+        ));
+    }
+
+    #[test]
+    fn amiga_entry_with_an_unrecognised_extended_header_is_unproven() {
+        let Some(provider) = provider() else { return };
+        let mut entry = Entry::amiga("Real.rom", ROM).level(1);
+        entry
+            .extra_extended
+            .push((0x62, b"future link kind".to_vec()));
+        let (_dir, source) = open_bytes(&provider, &archive(&[entry]));
+        let outcome = verify(&mut source.unwrap());
+        assert!(outcome.members[0].hashes.is_none());
+        assert!(matches!(
+            outcome.members[0].status,
+            ArchiveMemberStatus::NotVerified {
+                reason: "LHA member type unproven"
+            }
+        ));
+    }
+
+    #[test]
+    fn raw_link_versus_a_plain_file_listing_refuses_the_archive() {
+        // Header says -lhd- (link/directory), 7-Zip lists an ordinary file.
+        let raw = {
+            use crate::dat::archive::lha_header::scan_headers;
+            let bytes = archive(&[Entry::amiga_link("Soft.rom", 0x61, "/Real.rom").level(1)]);
+            scan_headers(bytes.as_slice(), bytes.len() as u64, 8)
+                .unwrap()
+                .remove(0)
+        };
+        let mut listed = listed_like(&raw);
+        listed.is_folder = false;
+        assert!(correlate(vec![raw.clone()], vec![listed]).is_err());
+        // Consistent listing: kept, per-member non-regular.
+        let mut listed = listed_like(&raw);
+        listed.is_folder = true;
+        let members = correlate(vec![raw], vec![listed]).unwrap();
+        assert_eq!(members[0].kind, LhaEntryKind::Symlink);
     }
 }

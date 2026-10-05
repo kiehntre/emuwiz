@@ -41,6 +41,28 @@ impl Entry {
         }
     }
 
+    /// An Amiga-host (`A`) ordinary file as Lha 40.x writes it: no Unix mode,
+    /// Amiga protection bits in extended header `0x40` (level 1+).
+    pub fn amiga(name: &str, payload: &[u8]) -> Self {
+        let mut entry = Self::file(name, payload);
+        entry.host = b'A';
+        entry.extra_extended.push((0x40, vec![0x10, 0]));
+        entry
+    }
+
+    /// An Amiga Lha 40.x link per its guide ("Specification of the Lha
+    /// header"): method `-lhd-`, no payload, target in extended header
+    /// `0x60` (hard link) or `0x61` (soft link).
+    pub fn amiga_link(name: &str, marker: u8, target: &str) -> Self {
+        let mut entry = Self::file(name, b"");
+        entry.host = b'A';
+        entry.method = *b"-lhd-";
+        entry
+            .extra_extended
+            .push((marker, target.as_bytes().to_vec()));
+        entry
+    }
+
     pub fn directory(name: &str) -> Self {
         Self {
             method: *b"-lhd-",
