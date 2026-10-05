@@ -8321,6 +8321,240 @@ mod library_files_check {
             // read-only check, and never starts a checksum run.
             assert!(app.reconcile.hash_job.is_none());
             assert!(app.reconcile.hashes.is_empty());
+            // Navigating there is passive: no check, no checksum run, no job.
+            assert_eq!(app.reconcile.runs_started, 0);
+            assert_eq!(app.reconcile.hash_runs_started, 0);
+            assert_eq!(reconcile_jobs(&app), 0);
         }
+    }
+
+    // ---- opening the page is passive; every run is an explicit click ------------
+
+    /// Jobs this feature would queue; the Problems page has its own, unrelated one.
+    fn reconcile_jobs(app: &App) -> usize {
+        app.activity
+            .jobs
+            .values()
+            .filter(|job| {
+                job.title == "Checking library files"
+                    || job.title == "Calculating checksums to confirm moves"
+            })
+            .count()
+    }
+
+    /// An app whose checks can only ever read a catalogue that does not exist.
+    fn passive_app(context: &egui::Context, dir: &std::path::Path) -> App {
+        let mut app = fixture(context);
+        app.reconcile.source_override = Some(ReconcileSource {
+            database: dir.join("absent.sqlite3"),
+            roots: vec![],
+        });
+        app
+    }
+
+    fn click_text(context: &egui::Context, app: &mut App, size: [f32; 2], label: &str) {
+        let output = frame(context, app, size);
+        let at = text_pos(&output, label).unwrap_or_else(|| panic!("no `{label}` painted"))
+            + egui::vec2(8.0, 8.0);
+        for pressed in [true, false] {
+            frame_with(
+                context,
+                app,
+                size,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            );
+        }
+        frame(context, app, size);
+    }
+
+    #[test]
+    fn opening_the_page_walks_nothing_hashes_nothing_and_offers_an_explicit_button() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = passive_app(&context, dir.path());
+        app.go(Route::LibraryFiles);
+        let mut strings = Vec::new();
+        for _ in 0..8 {
+            strings = render(&context, &mut app);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.poll(&context);
+        }
+        // No check was started, so no walker ran, and no checksum run either.
+        assert_eq!(app.reconcile.runs_started, 0);
+        assert_eq!(app.reconcile.hash_runs_started, 0);
+        assert!(app.reconcile.job.is_none() && app.reconcile.hash_job.is_none());
+        assert!(app.activity.jobs.is_empty(), "no job was even queued");
+        assert!(app.reconcile.view.is_none() && app.reconcile.error.is_none());
+        assert!(shows(&strings, "Check library now"), "{strings:?}");
+        assert!(shows(
+            &strings,
+            "Compare EmuWiz's catalogue with the files currently on disk. Nothing will be changed."
+        ));
+        assert!(!shows(&strings, "Check again"));
+    }
+
+    #[test]
+    fn clicking_check_library_now_starts_exactly_one_run_that_never_hashes() {
+        use archivefs_core::{Database, scan_and_persist};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
+        let config = archivefs_core::Config {
+            source_folders: vec![root.clone()],
+            mount_root: dir.path().join("mounts"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let mut db = Database::open_or_create(dir.path().join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut db, &config, "test").unwrap();
+
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.reconcile.source_override = Some(ReconcileSource {
+            database: db.path().to_path_buf(),
+            roots: vec![root.clone()],
+        });
+        app.go(Route::LibraryFiles);
+        frame(&context, &mut app, [1280.0, 900.0]);
+        assert_eq!(app.reconcile.runs_started, 0);
+        click_text(&context, &mut app, [1280.0, 900.0], "Check library now");
+        assert_eq!(app.reconcile.runs_started, 1);
+        // Frames while it runs must not start a second one.
+        for _ in 0..400 {
+            app.poll(&context);
+            frame(&context, &mut app, [1280.0, 900.0]);
+            if app.reconcile.job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.reconcile.job.is_none(), "the run finished");
+        assert_eq!(app.reconcile.runs_started, 1, "exactly one run");
+        assert_eq!(
+            app.reconcile.hash_runs_started, 0,
+            "a check never hashes by itself"
+        );
+        assert!(app.reconcile.hashes.is_empty());
+        assert_eq!(
+            app.reconcile.view.clone().unwrap().summary.not_catalogued,
+            1
+        );
+    }
+
+    #[test]
+    fn returning_to_a_page_with_results_keeps_them_and_never_reruns() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = passive_app(&context, dir.path());
+        app.reconcile.view = Some(Arc::new(view_of(
+            &[],
+            &[file("/lib/a.bin", vec![])],
+            &[],
+            RootWalkState::Complete,
+            &[],
+        )));
+        for _ in 0..3 {
+            app.go(Route::LibraryFiles);
+            frame(&context, &mut app, [1280.0, 900.0]);
+            app.go(Route::Section(Section::Problems));
+            frame(&context, &mut app, [1280.0, 900.0]);
+        }
+        app.go(Route::LibraryFiles);
+        let strings = render(&context, &mut app);
+        assert_eq!(app.reconcile.runs_started, 0);
+        assert_eq!(reconcile_jobs(&app), 0);
+        assert!(shows(&strings, "Files not yet catalogued · 1"));
+        assert!(shows(&strings, "Check again"));
+        assert!(!shows(&strings, "Check library now"));
+    }
+
+    #[test]
+    fn check_again_is_an_explicit_fresh_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = passive_app(&context, dir.path());
+        app.reconcile.view = Some(Arc::new(view_of(
+            &[],
+            &[],
+            &[],
+            RootWalkState::Complete,
+            &[],
+        )));
+        app.go(Route::LibraryFiles);
+        click_text(&context, &mut app, [1280.0, 900.0], "Check again");
+        assert_eq!(app.reconcile.runs_started, 1);
+        assert_eq!(app.reconcile.hash_runs_started, 0);
+    }
+
+    #[test]
+    fn stop_still_works_and_a_stopped_check_returns_to_the_idle_state_honestly() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = passive_app(&context, dir.path());
+        let id = app
+            .activity
+            .queue("Checking library files", Route::LibraryFiles, true);
+        app.reconcile.job = Some(id);
+        app.go(Route::LibraryFiles);
+        let flag = app.job_cancel_flag(id);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        click_text(&context, &mut app, [1280.0, 900.0], "Stop");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "Stop signals the worker"
+        );
+        // The worker reports it stopped without an answer: idle again, no refresh.
+        app.reconcile_done(None);
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "The last check was stopped before it finished"
+        ));
+        assert!(shows(&strings, "Check library now"));
+        assert_eq!(
+            app.reconcile.runs_started, 0,
+            "stopping never restarts anything"
+        );
+    }
+
+    #[test]
+    fn hash_to_confirm_is_a_separate_explicit_action_from_the_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = egui::Context::default();
+        let mut app = passive_app(&context, dir.path());
+        app.reconcile.view = Some(Arc::new(view_of(
+            &[row(1, "/old/Weak.bin", vec![sha1(2)])],
+            &[file("/lib/weak.BIN", vec![])],
+            &[],
+            RootWalkState::Complete,
+            &[(1, "Weak")],
+        )));
+        app.go(Route::LibraryFiles);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Hash these 1 files to confirm"));
+        assert_eq!(
+            (app.reconcile.runs_started, app.reconcile.hash_runs_started),
+            (0, 0)
+        );
+        click_text(
+            &context,
+            &mut app,
+            [1280.0, 900.0],
+            "Hash these 1 files to confirm",
+        );
+        assert_eq!(app.reconcile.hash_runs_started, 1);
+        assert_eq!(
+            app.reconcile.runs_started, 0,
+            "hashing does not itself start a library walk"
+        );
     }
 }

@@ -415,6 +415,12 @@ pub(super) struct ReconcileState {
     pub hash_note: Option<HashNote>,
     /// Tests only: read this catalogue instead of the real one.
     pub source_override: Option<ReconcileSource>,
+    /// How many library checks / checksum runs were ever started. Opening the
+    /// page must leave both at zero: every run is an explicit click.
+    pub runs_started: usize,
+    pub hash_runs_started: usize,
+    /// The last check was stopped before it produced an answer.
+    pub last_stopped: bool,
     pub tab: Option<Tab>,
     pub page: BTreeMap<Tab, usize>,
     pub open_item: Option<(Tab, usize)>,
@@ -512,6 +518,7 @@ impl App {
             return;
         }
         self.reconcile.error = None;
+        self.reconcile.last_stopped = false;
         let source = match self
             .reconcile
             .source_override
@@ -529,6 +536,7 @@ impl App {
             .queue("Checking library files", Route::LibraryFiles, true);
         let cancel = self.job_cancel_flag(id);
         self.reconcile.job = Some(id);
+        self.reconcile.runs_started += 1;
         self.send(
             id,
             Command::ReconcileLibrary {
@@ -555,6 +563,7 @@ impl App {
         );
         let cancel = self.job_cancel_flag(id);
         self.reconcile.hash_job = Some(id);
+        self.reconcile.hash_runs_started += 1;
         self.send(
             id,
             Command::ReconcileHash {
@@ -569,10 +578,13 @@ impl App {
         self.reconcile.job = None;
         // A stopped check leaves the previous answer in place rather than a
         // partial one dressed up as complete.
-        if let Some(view) = view {
-            self.reconcile.view = Some(view);
-            self.reconcile.page.clear();
-            self.reconcile.open_item = None;
+        match view {
+            Some(view) => {
+                self.reconcile.view = Some(view);
+                self.reconcile.page.clear();
+                self.reconcile.open_item = None;
+            }
+            None => self.reconcile.last_stopped = true,
         }
     }
 
@@ -613,12 +625,8 @@ impl App {
     }
 
     pub(super) fn library_files_page(&mut self, ui: &mut egui::Ui) {
-        if self.reconcile.view.is_none()
-            && self.reconcile.job.is_none()
-            && self.reconcile.error.is_none()
-        {
-            self.start_reconcile();
-        }
+        // Opening this page is passive: it never walks the library, reads a file
+        // or refreshes a result on its own. Every run starts from a button.
         let view = self.reconcile.view.clone();
         let busy = self.reconcile.job.is_some();
         let hashing = self.reconcile.hash_job.is_some();
@@ -634,7 +642,9 @@ impl App {
                     {
                         flag.store(true, Ordering::Relaxed);
                     }
-                } else if ui.add_enabled(!hashing, egui::Button::new("Check again")).clicked() {
+                } else if view.is_some()
+                    && ui.add_enabled(!hashing, egui::Button::new("Check again")).clicked()
+                {
                     self.start_reconcile();
                 }
                 if ui.button("Back to Problems").clicked() {
@@ -645,8 +655,22 @@ impl App {
                 ui.colored_label(theme::WARNING, format!("The check could not finish. No files were changed. ({error})"));
             }
             let Some(view) = view else {
-                if !busy && self.reconcile.error.is_none() {
-                    ui.label("Nothing checked yet.");
+                if !busy {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.strong("Nothing has been checked yet");
+                        ui.label("Compare EmuWiz's catalogue with the files currently on disk. Nothing will be changed.");
+                        ui.label("This reads folder listings across your game folders, so on a large library it can take a while. You can stop it at any time.");
+                        if self.reconcile.last_stopped {
+                            ui.label("The last check was stopped before it finished, so there are no results from it.");
+                        }
+                        if ui
+                            .add_enabled(!hashing, egui::Button::new("Check library now"))
+                            .clicked()
+                        {
+                            self.start_reconcile();
+                        }
+                    });
                 }
                 return;
             };
