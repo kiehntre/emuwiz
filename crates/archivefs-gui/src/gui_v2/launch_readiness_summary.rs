@@ -346,7 +346,7 @@ fn project_plan(
         return with_details(
             base(
                 ReadinessPresentationState::Blocked,
-                "FBNeo cannot use this arcade layout",
+                "RetroArch cannot use this arcade layout",
                 &blocker.detail,
                 IdentitySummary::StrongLocal,
                 source_for(candidate),
@@ -912,7 +912,7 @@ mod tests {
     fn arcade_layout_blocker() -> LaunchBlocker {
         LaunchBlocker::new(
             LaunchBlockerKind::RetroArchArcadeSetNeedsArchive,
-            "FBNeo needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.",
+            "RetroArch needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.",
         )
     }
 
@@ -930,7 +930,7 @@ mod tests {
             ReadinessFreshness::Current,
         );
         assert_eq!(summary.status, ReadinessPresentationState::Blocked);
-        assert_eq!(summary.headline, "FBNeo cannot use this arcade layout");
+        assert_eq!(summary.headline, "RetroArch cannot use this arcade layout");
         assert!(summary.explanation.contains("extracted MAME set"));
         assert!(summary.explanation.contains("use MAME"));
         let text = format!("{} {}", summary.headline, summary.explanation).to_lowercase();

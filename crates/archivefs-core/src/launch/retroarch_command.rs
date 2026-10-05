@@ -787,6 +787,30 @@ mod tests {
     }
 
     #[test]
+    fn every_libretro_arcade_core_refuses_a_directory_as_content() {
+        // The planner passes exactly one file path as content, so no arcade
+        // core can load a directory; the blocker is not FBNeo-specific.
+        for stem in ["fbneo", "mame2003_plus", "mame"] {
+            let mut selected = fbneo_candidate(
+                "/mnt/arcade/19xx",
+                Some(LaunchContentKind::ExtractedArcadeSet),
+            );
+            selected.target = LaunchTarget::RetroArchCore {
+                profile: profile_ref(),
+                core_stem: stem.to_string(),
+                platform_id: "Arcade",
+            };
+            let report = report(vec!["/usr/bin/retroarch"], vec![core(stem, Some("Arcade"))]);
+            let plan = build_retroarch_command_plan(&arcade_identity(), &selected, &report);
+            assert!(plan.command.is_none(), "{stem}");
+            assert!(
+                has_blocker(&plan, LaunchBlockerKind::RetroArchArcadeSetNeedsArchive),
+                "{stem}"
+            );
+        }
+    }
+
+    #[test]
     fn fbneo_zip_and_7z_arcade_sets_still_plan_a_command() {
         for path in ["/mnt/arcade/19xx.zip", "/mnt/arcade/19xx.7z"] {
             let selected = fbneo_candidate(path, None);

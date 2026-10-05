@@ -257,8 +257,8 @@ fn content_blocker(content: &LaunchContentRef) -> Option<LaunchBlocker> {
     ))
 }
 
-/// Message shown when a RetroArch core is offered an extracted arcade set.
-pub(crate) const ARCADE_SET_NEEDS_ARCHIVE_MESSAGE: &str = "FBNeo needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.";
+/// Message shown when any RetroArch core (FBNeo, MAME libretro cores, ...) is offered an extracted arcade set.
+pub(crate) const ARCADE_SET_NEEDS_ARCHIVE_MESSAGE: &str = "RetroArch needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.";
 
 /// Blocks RetroArch cores on an extracted arcade set directory. Applies only
 /// to `LaunchContentKind::ExtractedArcadeSet`; other content is untouched.
