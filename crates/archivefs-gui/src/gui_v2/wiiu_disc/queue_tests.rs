@@ -109,6 +109,10 @@ fn every_state_and_refusal_has_plain_text_without_internals() {
             }
         }
     }
+    let (_, completed) = job_text(JobState::Completed, None);
+    assert!(completed.contains("logical disc stream"));
+    assert!(completed.contains("container layout"));
+    assert!(completed.contains("original file is kept"));
     let refusals = [
         WiiUConversionRefusal::WrongSourceFormat {
             expected: WiiUDiscFormat::Wud,

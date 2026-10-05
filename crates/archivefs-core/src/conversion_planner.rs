@@ -416,7 +416,9 @@ pub fn plan_chd_conversion(
 }
 
 pub fn classify_rvz_route() -> ConversionOperationClass {
-    ConversionOperationClass::LosslessRecompress
+    // A format name alone does not establish a reversible route. Require a
+    // concrete source mode and decoded-stream verifier before classification.
+    ConversionOperationClass::Unknown
 }
 
 pub fn classify_rom_converto_route(
@@ -599,11 +601,8 @@ mod tests {
     }
 
     #[test]
-    fn rvz_is_lossless_but_unavailable_tool_is_not_hidden() {
-        assert_eq!(
-            classify_rvz_route(),
-            ConversionOperationClass::LosslessRecompress
-        );
+    fn rvz_without_a_concrete_verified_route_is_not_classified_as_lossless() {
+        assert_eq!(classify_rvz_route(), ConversionOperationClass::Unknown);
         assert!(matches!(
             classify_rom_converto_route(false),
             Err(ConversionPlanError::ToolUnavailable(_))

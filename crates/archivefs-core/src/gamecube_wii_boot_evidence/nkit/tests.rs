@@ -162,6 +162,10 @@ fn mismatched_platform_recovery_metadata_refuses() {
 fn no_declared_recovery_object_is_not_proof_of_reversibility() {
     for wii in [false, true] {
         let preview = with_source(&fixture(wii), |p| preview_iso_recovery(p, None).unwrap());
+        assert_eq!(
+            preview.representation,
+            NkitRepresentationState::NkitV1HeaderRecognizedBodyUnverified
+        );
         assert_eq!(preview.recoverability, NkitRecoverability::Unknown);
         assert_eq!(preview.update_recovery, UpdateRecoveryEvidence::NotDeclared);
         assert!(!preview.blockers.is_empty());

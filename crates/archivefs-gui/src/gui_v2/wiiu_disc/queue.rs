@@ -41,10 +41,10 @@ pub(super) fn direction_headline(direction: WiiUConversionDirection) -> &'static
 fn direction_meaning(direction: WiiUConversionDirection) -> &'static str {
     match direction {
         WiiUConversionDirection::WudToWux => {
-            "Makes a compressed copy that takes less space. Your original file is not changed or deleted."
+            "Re-encodes the logical disc stream as WUX and verifies every logical byte against the WUD source. The physical container layout and file hash differ. Your original file is kept."
         }
         WiiUConversionDirection::WuxToWud => {
-            "Makes a full-size copy of this disc image. Your original file is not changed or deleted."
+            "Re-encodes the logical disc stream as WUD and verifies every logical byte against the WUX source. Unmapped WUX payload blocks are not copied. Your original file is kept."
         }
     }
 }
@@ -65,7 +65,7 @@ pub(super) fn job_text(
         ),
         JobState::Completed => (
             "Done",
-            "The new file was created and checked against the original.",
+            "The new file was created and its complete logical disc stream matched the source. The container layout and file hash may differ; the original file is kept.",
         ),
         JobState::Failed => match retry {
             Some(RetryDisposition::RequiresReview) => (
@@ -690,7 +690,7 @@ fn ready_card(ui: &mut egui::Ui, plan: &WiiUConversionPlan, action: &mut Option<
     {
         ui.label(format!("New file: up to {}", human_bytes(max)));
     }
-    ui.label("The new file is checked against the original when it finishes.");
+    ui.label("EmuWiz will compare every logical disc byte with the source. The output is a re-encoded container, so its physical layout and file hash differ.");
     if !plan.warnings.is_empty() {
         ui.label("This disc image has some unusual details. EmuWiz will still check the new file when it finishes.");
     }

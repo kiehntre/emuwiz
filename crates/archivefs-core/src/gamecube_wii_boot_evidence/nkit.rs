@@ -152,6 +152,14 @@ pub enum NkitRecoverability {
     DependenciesMissing,
 }
 
+/// What the bounded header inspection establishes about representation.
+/// Recognizing an NKit v1 header does not validate the rest of the image or
+/// prove that its original disc can be reconstructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NkitRepresentationState {
+    NkitV1HeaderRecognizedBodyUnverified,
+}
+
 /// Explicit, untrusted lookup metadata from the user's recovery inventory.
 /// Agreement with the source requirement does not validate the object.
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +191,7 @@ pub struct NkitRecoveryPreview {
     pub source: PathBuf,
     pub header: NkitHeaderObservation,
     pub update_recovery: UpdateRecoveryEvidence,
+    pub representation: NkitRepresentationState,
     pub recoverability: NkitRecoverability,
     pub blockers: Vec<&'static str>,
 }
@@ -238,6 +247,7 @@ pub fn preview_iso_recovery(
         source: source.to_path_buf(),
         header,
         update_recovery,
+        representation: NkitRepresentationState::NkitV1HeaderRecognizedBodyUnverified,
         recoverability,
         blockers,
     })

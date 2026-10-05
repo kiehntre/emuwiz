@@ -151,6 +151,10 @@ pub struct WiiUDiscStructure {
     pub sector_array_offset: Option<u64>,
     pub referenced_block_count: Option<u64>,
     pub repeated_block_count: Option<u64>,
+    /// Physical WUX payload blocks not referenced by its logical sector map.
+    /// This is `None` for WUD and older serialized inspections.
+    #[serde(default)]
+    pub unreferenced_payload_block_count: Option<u64>,
     pub wud_header: Option<WiiUHeaderEvidence>,
     pub retail_size_matches: bool,
     pub flags: Option<u32>,
@@ -222,6 +226,7 @@ fn inspect_into(path: &Path, report: &mut WiiUDiscInspection) -> Result<(), WiiU
         sector_array_offset: None,
         referenced_block_count: None,
         repeated_block_count: None,
+        unreferenced_payload_block_count: None,
         flags: None,
         parts: vec![WiiUDiscPart {
             path: path.into(),
@@ -252,6 +257,7 @@ fn inspect_into(path: &Path, report: &mut WiiUDiscInspection) -> Result<(), WiiU
         structure.sector_array_offset = Some(layout.data_offset);
         structure.referenced_block_count = Some(layout.unique);
         structure.repeated_block_count = Some(layout.table.len() as u64 - layout.unique);
+        structure.unreferenced_payload_block_count = Some(layout.stored - layout.unique);
         structure.flags = Some(0);
         digest.update(layout.metadata_sha256);
         read_wux_at(&mut file, &layout, 0, &mut wud_header)?;
@@ -400,6 +406,7 @@ pub(crate) struct WuxLayout {
     pub data_offset: u64,
     pub table: Vec<u32>,
     pub unique: u64,
+    pub stored: u64,
     metadata_sha256: [u8; 32],
 }
 pub(crate) fn checked_align(value: u64, alignment: u64) -> Option<u64> {
@@ -491,6 +498,7 @@ pub(crate) fn load_wux(file: &mut File, physical: u64) -> Result<WuxLayout, WiiU
         data_offset,
         table,
         unique,
+        stored,
         metadata_sha256: digest.finalize().into(),
     })
 }

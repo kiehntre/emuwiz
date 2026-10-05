@@ -287,6 +287,41 @@ fn wux_invalid_entries_are_not_sparse_sentinels() {
     // Index zero points at real stored data; a zero-filled disc ID is invalid.
     assert!(!inspect_wii_u_disc(&p).structural_complete);
 }
+
+#[test]
+fn wux_unreferenced_payload_is_reported_and_not_promised_in_wud_output() {
+    let d = tempdir().unwrap();
+    let p = d.path().join("source.wux");
+    let sector = WUD_SECTOR_SIZE as usize;
+    let mut stored = vec![vec![0x5a; sector]; 8];
+    let header = wud_header();
+    for (index, chunk) in header.chunks(sector).enumerate() {
+        stored[index][..chunk.len()].copy_from_slice(chunk);
+    }
+    container(
+        &p,
+        WUD_SECTOR_SIZE,
+        (8 * sector) as u64,
+        &[0, 1, 2, 3, 4, 5, 6, 6],
+        &stored,
+    );
+
+    let report = inspect_wii_u_disc(&p);
+    assert!(report.structural_complete, "{report:?}");
+    assert_eq!(
+        report
+            .structure
+            .as_ref()
+            .unwrap()
+            .unreferenced_payload_block_count,
+        Some(1)
+    );
+    let plan = plan_wiiu_conversion(&request(&p, &d.path().join("output.wud")));
+    assert!(plan.warnings.iter().any(|warning| {
+        warning.contains("1 physical payload block")
+            && warning.contains("mapped logical disc stream only")
+    }));
+}
 #[test]
 fn wux_impossible_sizes_overflow_table_limits_and_flags() {
     let d = tempdir().unwrap();

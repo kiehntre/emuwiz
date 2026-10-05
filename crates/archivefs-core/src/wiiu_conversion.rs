@@ -390,7 +390,17 @@ pub fn plan_wiiu_conversion(request: &WiiUConversionRequest) -> WiiUConversionPl
     let estimated_blocks = wux_creation
         .map(|l| l.logical_block_count)
         .or_else(|| report.structure.as_ref().and_then(|s| s.block_count));
-    let warnings = report.issues.iter().map(|i| format!("{i:?}")).collect();
+    let mut warnings: Vec<String> = report.issues.iter().map(|i| format!("{i:?}")).collect();
+    if let Some(unreferenced) = report
+        .structure
+        .as_ref()
+        .and_then(|s| s.unreferenced_payload_block_count)
+        .filter(|n| *n > 0)
+    {
+        warnings.push(format!(
+            "Source WUX contains {unreferenced} physical payload block(s) not referenced by its sector map; the WUD output will contain the mapped logical disc stream only. The source WUX remains unchanged."
+        ));
+    }
     WiiUConversionPlan {
         source: request.source.clone(),
         source_parts: source_parts(&report),
