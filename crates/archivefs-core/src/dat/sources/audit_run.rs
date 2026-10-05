@@ -783,6 +783,33 @@ pub fn run_dat_audit_with_cache(
     // promote one. See `dat::dependency::apply_dependency_state`.
     resolve_collection(&mut sets, &catalogue_games, &dependency_evidence);
 
+    // An exact whole-file checksum on a `.lha`/`.lzh` is strong evidence of
+    // which bytes the file holds, not proof that the package is safely
+    // understood. Same rule as the combined audit (`unaccounted_lha_paths`):
+    // when the bounded LHA pass does not account for the package, a
+    // hash-based match loses authority. The outer hashes stay in
+    // `known_hashes` and the reason stays visible in `archives` (completion and
+    // member statuses); nothing claims the contents were member-verified.
+    // `forcepacking="fileonly"` never opens members, so it has no pass to ask.
+    let mut report = report;
+    let unaccounted = unaccounted_lha_paths(&archives);
+    if !unaccounted.is_empty() {
+        for entry in &mut report.entries {
+            if unaccounted.contains(Path::new(&entry.local_path))
+                && matches!(
+                    entry.verdict,
+                    AuditVerdict::Exact { .. }
+                        | AuditVerdict::ExactMultipleCandidates { .. }
+                        | AuditVerdict::Probable { .. }
+                        | AuditVerdict::ProbableMultipleCandidates { .. }
+                )
+            {
+                entry.verdict = AuditVerdict::NoUsableEvidence;
+            }
+        }
+        report.summary = combined_summary(&report.entries);
+    }
+
     let content_matches = annotate_content_matches(&report, &known, &index, content_selection);
 
     // ---- 5. Annotate multi-candidate verdicts with the policy -------------
@@ -1102,14 +1129,7 @@ pub fn run_combined_dat_audit_with_cache(
     // pass establishes that the claimed package is actually a safe LHA.  A
     // failed pass remains visible in `archives`, but loses exact-match
     // authority in the flat report and rename planner.
-    let unsafe_exact_lha_paths: std::collections::BTreeSet<&Path> = archives
-        .iter()
-        .filter(|archive| {
-            archive.format == "lha"
-                && !matches!(archive.completion, ArchivePassCompletion::Complete)
-        })
-        .map(|archive| archive.archive_path.as_path())
-        .collect();
+    let unsafe_exact_lha_paths = unaccounted_lha_paths(&archives);
     if !unsafe_exact_lha_paths.is_empty() {
         for entry in &mut entries {
             if unsafe_exact_lha_paths.contains(Path::new(&entry.local_path)) {
@@ -1750,6 +1770,43 @@ pub(crate) fn safe_archive_member_name(name: &str) -> bool {
                 std::path::Component::Normal(_) | std::path::Component::CurDir
             )
         })
+}
+
+/// Whether the bounded LHA inspection accounts for the whole package.
+///
+/// "Exact archive bytes" and "safe, complete archive understanding" are
+/// separate facts. A DAT that records the whole `.lha` file makes the outer
+/// checksum strong evidence of *which bytes* these are, but it says nothing
+/// about whether EmuWiz can safely read the package. Authority for such a
+/// whole-file match is kept only when the pass finished against a stable outer
+/// file and no member is one the LHA policy refuses (link-like, special,
+/// unknown, corrupt, unsupported method, over a limit). Nested-archive members
+/// are not recursed into but are not unsafe either.
+///
+/// This is the single decision rule shared by the single-source and combined
+/// audits so the two cannot drift.
+fn lha_package_is_accounted_for(archive: &DatArchiveAudit) -> bool {
+    matches!(archive.completion, ArchivePassCompletion::Complete)
+        && archive.outer_identity.is_some()
+        && !archive.members.iter().any(|member| {
+            matches!(
+                member.evidence.status,
+                ArchiveMemberStatus::NotVerified { .. }
+                    | ArchiveMemberStatus::Corrupt { .. }
+                    | ArchiveMemberStatus::UnsupportedCodec { .. }
+                    | ArchiveMemberStatus::RefusedLimits { .. }
+            )
+        })
+}
+
+/// Archive paths whose LHA package is NOT accounted for, so a whole-file
+/// checksum match on them must not stay authoritative.
+fn unaccounted_lha_paths(archives: &[DatArchiveAudit]) -> std::collections::BTreeSet<&Path> {
+    archives
+        .iter()
+        .filter(|archive| archive.format == "lha" && !lha_package_is_accounted_for(archive))
+        .map(|archive| archive.archive_path.as_path())
+        .collect()
 }
 
 fn combined_summary(entries: &[AuditEntry]) -> AuditSummary {
@@ -3224,6 +3281,42 @@ game (
         )
         .unwrap();
         assert!(plan.proposals.is_empty());
+    }
+
+    #[test]
+    fn exact_outer_hash_cannot_promote_an_lha_whose_member_the_policy_refuses() {
+        use crate::dat::archive::lha_header::fixtures::{Entry, archive};
+        if !lha_available() {
+            return;
+        }
+        // The bounded pass completes, but the only member is a link disguised
+        // with a file-like method: the package is not safely accounted for.
+        let dir = tempfile::tempdir().unwrap();
+        let dat_path = dir.path().join("whdload.dat");
+        let path = dir.path().join("linked.lha");
+        let mut link = Entry::amiga_link("Game.rom", 0x61, "Other.rom").level(1);
+        link.method = *b"-lh0-";
+        link.payload = b"rom bytes".to_vec();
+        let bytes = archive(&[link]);
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(
+            &dat_path,
+            whdload_package_dat("Linked package", "linked.lha", &bytes),
+        )
+        .unwrap();
+        let outcome = run(vec![source(dat_path, "whdload-catalogue")], path);
+        assert!(matches!(
+            outcome.archives[0].completion,
+            ArchivePassCompletion::Complete
+        ));
+        assert!(matches!(
+            outcome.archives[0].members[0].evidence.status,
+            ArchiveMemberStatus::NotVerified { .. }
+        ));
+        assert!(matches!(
+            outcome.report.entries[0].verdict,
+            AuditVerdict::NoUsableEvidence
+        ));
     }
 
     #[test]

@@ -1075,3 +1075,348 @@ fn lha_row_stores_whole_file_evidence_only_never_member_projection() {
         Some("Whole Pkg")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Whole-file LHA authority. "Exact archive bytes" and "safe, complete archive
+// understanding" are separate facts: a DAT that lists the `.lha` file itself
+// gives an authoritative whole-file result only when the bounded LHA pass
+// accounts for the package (`audit_run::lha_package_is_accounted_for`).
+// ---------------------------------------------------------------------------
+
+use crate::dat::archive::lha_header::fixtures::{Entry, archive as lha_archive};
+use crate::dat::archive::{ArchiveMemberStatus, ArchivePassCompletion};
+use crate::dat::audit::AuditVerdict;
+
+struct WholeFile {
+    root: PathBuf,
+    source: PathBuf,
+    path: PathBuf,
+    db_path: PathBuf,
+    dat_path: PathBuf,
+    database: Database,
+}
+
+impl Drop for WholeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+impl WholeFile {
+    /// `name` holds `bytes`; the DAT lists exactly those bytes as one ROM.
+    fn new(name: &str, bytes: &[u8]) -> Self {
+        let root = tempfile::tempdir().unwrap().keep();
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let path = source.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let dat_path = root.join("fixture.dat");
+        std::fs::write(&dat_path, dat_xml(&[Dat::Full("Whole Pkg", name, bytes)])).unwrap();
+        let db_path = root.join("library.sqlite3");
+        let mut database = Database::open_or_create(&db_path).unwrap();
+        Fixture::scan(&mut database, &source, &root);
+        Self {
+            root,
+            source,
+            path,
+            db_path,
+            dat_path,
+            database,
+        }
+    }
+
+    fn audit(&self) -> DatAuditOutcome {
+        run_dat_audit_with_cache(
+            &DatAuditRequest {
+                source_id: SOURCE_ID.to_string(),
+                source_display_name: "No-Intro Test".to_string(),
+                dat_path: self.dat_path.clone(),
+                dat_kind: DatSourceKind::File,
+                scan_root: self.source.clone(),
+                limits: DatLimits::default(),
+                policy: None,
+                platform: None,
+            },
+            &TrustedRoots::none(),
+            &AtomicBool::new(false),
+            &|_| {},
+            AuditCacheConfig::Disabled,
+        )
+        .unwrap()
+    }
+
+    fn id(&self) -> i64 {
+        self.database
+            .find_archive_id_by_absolute_path(&self.path)
+            .unwrap()
+            .expect("catalogue row")
+    }
+
+    /// Audit + persist; the report verdict for the file and its stored row.
+    fn run(
+        &mut self,
+    ) -> (
+        DatAuditOutcome,
+        AuditVerdict,
+        Option<PersistedLibraryDatIdentity>,
+    ) {
+        let outcome = self.audit();
+        self.database
+            .persist_library_dat_identities_from_audit(&outcome)
+            .unwrap();
+        let verdict = outcome.report.entries[0].verdict.clone();
+        let row = self.row();
+        (outcome, verdict, row)
+    }
+
+    fn row(&self) -> Option<PersistedLibraryDatIdentity> {
+        self.database
+            .library_dat_identity_for_item(self.id(), SOURCE_ID)
+            .unwrap()
+    }
+
+    fn reload_row(&self) -> Option<PersistedLibraryDatIdentity> {
+        let database = Database::open_or_create(&self.db_path).unwrap();
+        let id = database
+            .find_archive_id_by_absolute_path(&self.path)
+            .unwrap()
+            .unwrap();
+        database
+            .library_dat_identity_for_item(id, SOURCE_ID)
+            .unwrap()
+    }
+}
+
+fn is_exact(verdict: &AuditVerdict) -> bool {
+    matches!(verdict, AuditVerdict::Exact { .. })
+}
+
+fn safe_lha() -> Vec<u8> {
+    lha_archive(&[Entry::unix("Game.rom", GAME, 0o100644).level(1)])
+}
+
+#[test]
+fn whole_file_exact_lha_and_lzh_stay_authoritative_when_the_package_is_accounted_for() {
+    if !external_readers_available() {
+        return;
+    }
+    for name in ["Pkg.lha", "Pkg.lzh", "PKG.LHA"] {
+        let mut wf = WholeFile::new(name, &safe_lha());
+        let (outcome, verdict, row) = wf.run();
+        assert!(is_exact(&verdict), "{name}: {verdict:?}");
+        assert!(matches!(
+            outcome.archives[0].completion,
+            ArchivePassCompletion::Complete
+        ));
+        let row = row.expect("whole-file record");
+        assert_eq!(
+            row.verification_state,
+            DatVerificationState::VerifiedSingleMatch {
+                algorithm: "SHA-1".to_string()
+            },
+            "{name}"
+        );
+        // Whole-file, never a member projection.
+        assert!(row.archive_member.is_none(), "{name}");
+        // Persist + reload: still authoritative.
+        let reloaded = wf.reload_row().expect("reloaded");
+        assert!(matches!(
+            reloaded.verification_state,
+            DatVerificationState::VerifiedSingleMatch { .. }
+        ));
+        assert!(reloaded.archive_member.is_none());
+    }
+}
+
+#[test]
+fn whole_file_exact_lha_is_not_authoritative_when_the_package_is_not_accounted_for() {
+    if !external_readers_available() {
+        return;
+    }
+    let good = safe_lha();
+    let mut link = Entry::amiga_link("Game.rom", 0x61, "Other.rom").level(1);
+    link.method = *b"-lh0-";
+    link.payload = GAME.to_vec();
+    let mut unknown_header = Entry::amiga("Game.rom", GAME).level(1);
+    unknown_header
+        .extra_extended
+        .push((0x62, b"future link kind".to_vec()));
+    let mut declared_crc = Entry::unix("Game.rom", GAME, 0o100644).level(1);
+    declared_crc.declared_crc = Some(0x1234);
+    let mut method = Entry::unix("Game.rom", GAME, 0o100644).level(1);
+    method.method = *b"-lz9-";
+    let mut tampered = good.clone();
+    let last = tampered.len() - 2;
+    tampered[last] ^= 0x55;
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        // Pass cannot start: malformed, truncated, unsupported, refused layouts.
+        ("truncated", good[..good.len() - 3].to_vec()),
+        ("truncated header", good[..12].to_vec()),
+        (
+            "level 3 (7-Zip cannot open)",
+            lha_archive(&[Entry::unix("Game.rom", GAME, 0o100644).level(3)]),
+        ),
+        (
+            "directory entry",
+            lha_archive(&[
+                Entry::directory("Game").level(1),
+                Entry::unix("Game/Game.rom", GAME, 0o100644).level(1),
+            ]),
+        ),
+        (
+            "duplicate path",
+            lha_archive(&[
+                Entry::file("Game.rom", GAME),
+                Entry::file("Game.rom", OTHER),
+            ]),
+        ),
+        ("unsupported method", lha_archive(&[method])),
+        // Pass completes but a member is one the LHA policy refuses.
+        ("amiga soft link disguised as a file", lha_archive(&[link])),
+        (
+            "unix symlink",
+            lha_archive(&[Entry::unix("Game.rom", GAME, 0o120777).level(1)]),
+        ),
+        (
+            "fifo",
+            lha_archive(&[Entry::unix("Game.rom", GAME, 0o010644).level(1)]),
+        ),
+        ("unknown extended header", lha_archive(&[unknown_header])),
+        (
+            "unsafe path",
+            lha_archive(&[Entry::unix("../Game.rom", GAME, 0o100644)]),
+        ),
+        ("payload CRC mismatch", tampered),
+        ("declared CRC mismatch", lha_archive(&[declared_crc])),
+    ];
+    for (label, bytes) in cases {
+        let mut wf = WholeFile::new("Pkg.lha", &bytes);
+        let (outcome, verdict, row) = wf.run();
+        // Evidence is not thrown away: the outer hashes stay as the baseline ...
+        let hashes = &outcome.known_hashes[&wf.path.display().to_string()];
+        assert_eq!(
+            hashes.sha1.as_deref(),
+            Some(sha1_hex(&bytes).as_str()),
+            "{label}"
+        );
+        // ... but the whole-file match is no longer authoritative.
+        assert!(!is_exact(&verdict), "{label}: {verdict:?}");
+        assert_eq!(verdict, AuditVerdict::NoUsableEvidence, "{label}");
+        assert!(!is_verified(&row), "{label}");
+        assert_no_member_identity(&row);
+        // The reason stays visible and the contents are not claimed member-verified.
+        let archive = &outcome.archives[0];
+        assert!(
+            !matches!(archive.completion, ArchivePassCompletion::Complete)
+                || archive.members.iter().any(|m| matches!(
+                    m.evidence.status,
+                    ArchiveMemberStatus::NotVerified { .. }
+                        | ArchiveMemberStatus::Corrupt { .. }
+                        | ArchiveMemberStatus::UnsupportedCodec { .. }
+                        | ArchiveMemberStatus::RefusedLimits { .. }
+                )),
+            "{label}: no visible reason"
+        );
+        // Reload does not turn it authoritative either.
+        assert!(!is_verified(&wf.reload_row()), "{label}");
+        // Archive bytes untouched, nothing extracted.
+        assert_eq!(std::fs::read(&wf.path).unwrap(), bytes, "{label}");
+        assert_eq!(std::fs::read_dir(&wf.source).unwrap().count(), 1, "{label}");
+        assert_eq!(outcome.report.summary.exact, 0, "{label}");
+    }
+}
+
+#[test]
+fn whole_file_lha_authority_follows_the_dat_revision_freshness_rules() {
+    if !external_readers_available() {
+        return;
+    }
+    let mut wf = WholeFile::new("Pkg.lha", &safe_lha());
+    let (outcome, _verdict, row) = wf.run();
+    assert!(is_verified(&row));
+    let id = wf.id();
+    let current = |outcome: &DatAuditOutcome| {
+        let hashes = &outcome.known_hashes[&wf.path.display().to_string()];
+        LibraryItemHashes {
+            size_bytes: hashes.size_bytes,
+            crc32: hashes.crc32.clone(),
+            md5: hashes.md5.clone(),
+            sha1: hashes.sha1.clone(),
+            sha256: hashes.sha256.clone(),
+        }
+    };
+    let summary = wf
+        .database
+        .library_dat_identity_summary_for_item(id, SOURCE_ID, Some(&current(&outcome)), None, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        summary.provenance_freshness,
+        DatProvenanceFreshness::Current
+    );
+    // A DAT revision bump makes it stale like any other identity.
+    wf.database
+        .mark_library_dat_identity_stale_for_source_revision(SOURCE_ID, Some("20250101"))
+        .unwrap();
+    let summary = wf
+        .database
+        .library_dat_identity_summary_for_item(id, SOURCE_ID, Some(&current(&outcome)), None, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(summary.provenance_freshness, DatProvenanceFreshness::Stale);
+    // Replacing the archive at the same path changes the baseline hash: stale.
+    std::fs::write(
+        &wf.path,
+        lha_archive(&[Entry::unix("Game.rom", b"different", 0o100644).level(1)]),
+    )
+    .unwrap();
+    let after = wf.audit();
+    assert_ne!(current(&after).sha1, current(&outcome).sha1);
+    let stale = wf
+        .database
+        .library_dat_identity_summary_for_item(id, SOURCE_ID, Some(&current(&after)), None, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.provenance_freshness, DatProvenanceFreshness::Stale);
+}
+
+#[test]
+fn whole_file_controls_for_zip_7z_and_loose_files_are_unchanged() {
+    // Loose file: exact whole-file stays authoritative.
+    let mut loose = WholeFile::new("Game.sfc", b"loose rom bytes");
+    let (_, verdict, row) = loose.run();
+    assert!(is_exact(&verdict));
+    assert!(is_verified(&row));
+    // ZIP and 7z outer files keep their existing whole-file behaviour.
+    for (name, writer) in [
+        ("Game.zip", Format::Zip as u8),
+        ("Game.7z", Format::SevenZ as u8),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(name);
+        let format = if writer == Format::Zip as u8 {
+            Format::Zip
+        } else {
+            Format::SevenZ
+        };
+        format.write(&path, &[("Game A.sfc", GAME)]);
+        let bytes = std::fs::read(&path).unwrap();
+        let mut wf = WholeFile::new(name, &bytes);
+        let (_, verdict, _) = wf.run();
+        assert!(is_exact(&verdict), "{name}: {verdict:?}");
+    }
+}
+
+/// Tripwire: LHA/LZH parent/member projection must not enter the production
+/// allow-list by accident. Enabling it is a separate, deliberate change.
+#[test]
+fn lha_must_not_enter_the_production_parent_projection_allow_list() {
+    let source = include_str!("../library_identity_projection.rs");
+    assert!(
+        source.contains(r#"matches!(archive.format.as_str(), "zip" | "7z" | "rar")"#),
+        "the parent-projection allow-list changed; LHA/LZH must stay excluded until the readiness matrix passes"
+    );
+    assert!(!source.contains(r#""zip" | "7z" | "rar" | "lha""#));
+    assert!(!source.contains(r#""lzh""#));
+}
