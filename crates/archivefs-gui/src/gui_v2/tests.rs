@@ -70,6 +70,7 @@ fn fixture(context: &egui::Context) -> App {
         text_was_focused: false,
         screenshots: false,
         check_platform: None,
+        activity_attention_only: false,
         verification: None,
         verification_job: None,
         duplicate_report: None,
@@ -7519,10 +7520,7 @@ fn review_identity_explains_each_failed_state_with_its_direct_next_action() {
     let mut app = review_app(&context, vec![(1, "Game", "SNES")]);
     let strings = render_review(&context, &mut app, 1);
     assert!(
-        shows(
-            &strings,
-            "has not been compared with identification data yet"
-        ),
+        shows(&strings, "This game is ready to verify"),
         "{strings:?}"
     );
     assert!(!shows(&strings, "Unknown"));
@@ -7770,8 +7768,10 @@ fn check_games_leads_with_what_verified_automatically_and_lists_only_the_rest() 
     app.check_platform = Some("SNES".into());
     app.router.current = Route::Section(Section::Check);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
-    assert!(shows(&strings, "1 verified automatically"), "{strings:?}");
-    assert!(shows(&strings, "1 could not be identified yet"));
+    assert!(shows(&strings, "1 verified"), "{strings:?}");
+    assert!(shows(&strings, "1 ready to verify (not checked yet)"));
+    assert!(shows(&strings, "Verify SNES games"), "a real next action");
+    assert!(!shows(&strings, "Can be matched"));
     assert!(shows(&strings, "Review 1 game"));
     assert!(
         shows(&strings, "Needs help") && !shows(&strings, "Good"),
@@ -7961,10 +7961,7 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     app.check_platform = Some(platform);
     app.router.current = Route::Section(Section::Check);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
-    assert!(
-        shows(&strings, &format!("{count} verified automatically")),
-        "{strings:?}"
-    );
+    assert!(shows(&strings, &format!("{count} verified")), "{strings:?}");
     // Launch: unchanged policy, but never a contradictory "not confirmed"
     use super::launch_readiness_summary::{ReadinessFreshness, note_catalogue_verified, project};
     let input = crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown;

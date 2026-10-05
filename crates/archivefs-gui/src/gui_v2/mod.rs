@@ -44,6 +44,8 @@ mod tape_tests;
 #[cfg(test)]
 mod tests;
 mod thumbnail;
+#[cfg(test)]
+mod verify_journey_tests;
 mod visual_pages;
 mod wiiu_disc;
 
@@ -278,6 +280,8 @@ pub(super) struct App {
     text_was_focused: bool,
     screenshots: bool,
     check_platform: Option<String>,
+    /// Activity is showing only the jobs that need attention.
+    activity_attention_only: bool,
     verification: Option<VerificationResult>,
     verification_job: Option<u64>,
     duplicate_report: Option<DuplicateReport>,
@@ -366,6 +370,7 @@ impl App {
             text_was_focused: false,
             screenshots: false,
             check_platform: None,
+            activity_attention_only: false,
             verification: None,
             verification_job: None,
             duplicate_report: None,
@@ -655,6 +660,11 @@ impl App {
             // Re-read what is recorded each time the review is opened, so a
             // check or setup done elsewhere is reflected on return.
             self.review.invalidate();
+        }
+        if !matches!(resolved, Route::PlatformCheck(_))
+            && let Some(workflows) = &mut self.native_workflows
+        {
+            workflows.leave_platform_check();
         }
         self.router.go(resolved);
         self.handoff_status = None;
@@ -1891,7 +1901,8 @@ impl eframe::App for App {
         if let Some(workflows) = &mut self.native_workflows {
             workflows.poll(ui.ctx(), &mut self.activity);
             if self.load_job.is_none() {
-                reload_library = workflows.take_source_library_reload();
+                reload_library =
+                    workflows.take_source_library_reload() | workflows.take_dat_identity_reload();
             }
             if !self.artwork.index_loading {
                 reload_artwork = workflows.take_artwork_reload();

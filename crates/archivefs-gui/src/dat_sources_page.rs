@@ -2142,6 +2142,15 @@ pub(crate) enum DatSourcesPageAction {
         key: TosecSelectionKey,
         enabled: bool,
     },
+    /// Enable or disable every group whose label matches `filter`, across the
+    /// whole pack. The filter is the same text the list is narrowed by, so a
+    /// rendering limit can never become an action limit. Selection only: it
+    /// does not stage and never touches a game file.
+    SetTosecSelectionMatching {
+        pack_id: String,
+        filter: String,
+        enabled: bool,
+    },
     ApplyTosecSelection {
         pack_id: String,
     },
@@ -3162,6 +3171,10 @@ pub(crate) struct DatSourcesPageState {
     /// Set when a current audit has had a chance to enrich the catalogue; the
     /// shell consumes it to reload Library metadata once.
     identity_enrichment_completed: bool,
+    /// Bumped each time an audit's results are saved, so a host with its own
+    /// library (GUI v2) can notice and reload without competing for the
+    /// one-shot flag above.
+    identity_enrichment_generation: u64,
     identity_enrichment: Option<Box<archivefs_core::PlatformIdentityEnrichmentSummary>>,
     /// Session-only review decisions, keyed by source path. Recording one
     /// never touches a file; nothing here persists them (deferral documented).
@@ -3399,6 +3412,7 @@ impl DatSourcesPageState {
             rename_plan_error: None,
             audit_generation: 0,
             identity_enrichment_completed: false,
+            identity_enrichment_generation: 0,
             identity_enrichment: None,
             review_decisions: BTreeMap::new(),
             transaction_dir,
@@ -3431,6 +3445,10 @@ impl DatSourcesPageState {
     pub(crate) fn with_database_path(mut self, database_path: Option<PathBuf>) -> Self {
         self.database_path = database_path.filter(|path| path.is_file());
         self
+    }
+
+    pub(crate) fn identity_enrichment_generation(&self) -> u64 {
+        self.identity_enrichment_generation
     }
 
     pub(crate) fn take_identity_enrichment_completed(&mut self) -> bool {
@@ -3939,6 +3957,9 @@ impl DatSourcesPageState {
                         self.audit_elapsed_seconds = Some(job.started_at.elapsed().as_secs());
                         self.audit = Some(outcome);
                         self.identity_enrichment_completed = self.database_path.is_some();
+                        if self.database_path.is_some() {
+                            self.identity_enrichment_generation += 1;
+                        }
                         self.identity_enrichment = enrichment;
                         self.audit_error = None;
                         match plan {
@@ -4190,6 +4211,11 @@ impl DatSourcesPageState {
                 key,
                 enabled,
             } => self.set_tosec_selection(&pack_id, key, enabled),
+            DatSourcesPageAction::SetTosecSelectionMatching {
+                pack_id,
+                filter,
+                enabled,
+            } => self.set_tosec_selection_matching(&pack_id, &filter, enabled),
             DatSourcesPageAction::ApplyTosecSelection { pack_id } => {
                 self.stage_tosec_selection(&pack_id);
             }
@@ -5387,6 +5413,49 @@ impl DatSourcesPageState {
         }
     }
 
+    /// Bulk selection over every group of the pack whose label matches
+    /// `filter`. One validated write; groups TOSEC support defers are never
+    /// enabled. Changes the pending selection only.
+    fn set_tosec_selection_matching(&mut self, pack_id: &str, filter: &str, enabled: bool) {
+        self.tosec_action_error = None;
+        if self.tosec_load_error.is_some() {
+            self.tosec_action_error = Some(
+                "Not changing TOSEC release packs: existing pack configuration could not be read."
+                    .to_string(),
+            );
+            return;
+        }
+        let mut next = self.tosec_packs.clone();
+        let Some(pack) = next.iter_mut().find(|pack| pack.pack_id == pack_id) else {
+            return;
+        };
+        let normalized = filter.trim().to_ascii_lowercase();
+        let mut groups: BTreeMap<TosecSelectionKey, bool> = BTreeMap::new();
+        for dat in &pack.dats {
+            let deferred = groups.entry(dat.selection_key()).or_insert(false);
+            *deferred |= tosec_dat_is_deferred(dat);
+        }
+        for (key, deferred) in groups {
+            if !tosec_group_label_matches(&key.label(), &normalized) {
+                continue;
+            }
+            if enabled {
+                if !deferred {
+                    pack.selections.insert(key);
+                }
+            } else {
+                pack.selections.remove(&key);
+            }
+        }
+        if next == self.tosec_packs {
+            return;
+        }
+        match save_tosec_packs(&self.tosec_packs_path, &next) {
+            Ok(()) => self.tosec_packs = next,
+            Err(error) => self.tosec_action_error = Some(error.to_string()),
+        }
+    }
+
     fn tosec_managed_store(&self) -> Result<TosecManagedSnapshotStore, String> {
         TosecManagedSnapshotStore::new(self.managed_root.join("tosec-snapshots"))
             .map_err(|error| error.to_string())
@@ -5461,6 +5530,11 @@ impl DatSourcesPageState {
         let Some(pack) = self.tosec_packs.iter().find(|pack| pack.pack_id == pack_id) else {
             return;
         };
+        if pack.selections.is_empty() {
+            // Expected state, not a failure: the screen disables the button and
+            // says "Select at least one DAT group first."
+            return;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -8112,6 +8186,9 @@ pub(crate) struct DatSourcesPageUi {
     /// Per-pack free-text group filter. It limits rendering only; persisted
     /// selection remains the typed System/Category/Media key.
     pub(crate) tosec_group_filter: BTreeMap<String, String>,
+    /// Zero-based page of the filtered group list, per pack.
+    pub(crate) tosec_group_page: BTreeMap<String, usize>,
+    pub(crate) tosec_bulk_confirm: Option<TosecBulkConfirm>,
     pub(crate) show_tosec_raw: BTreeSet<String>,
     /// Which diagnostic group's drill-down is open, as the group's stable id.
     /// One group expands at a time; expanding another collapses this one.
@@ -8161,6 +8238,8 @@ impl DatSourcesPageUi {
         self.confirm_rollback_managed = None;
         self.open_managed_technical = None;
         self.tosec_group_filter.clear();
+        self.tosec_group_page.clear();
+        self.tosec_bulk_confirm = None;
         self.show_tosec_raw.clear();
         self.open_diagnostic = None;
         self.plan_review_open = None;
@@ -10673,7 +10752,27 @@ fn tosec_dat_is_deferred(dat: &TosecPackDat) -> bool {
     upper.starts_with("TOSEC-ISO") || upper.starts_with("TOSEC-PIX")
 }
 
+/// Rows drawn per page. This bounds rendering only; paging and bulk actions
+/// reach every matching group.
 const MAX_TOSEC_GROUPS_RENDERED: usize = 200;
+
+/// The one group filter: shared by the list and by bulk selection so "matching"
+/// means the same thing in both.
+fn tosec_group_label_matches(label: &str, normalized_filter: &str) -> bool {
+    normalized_filter.is_empty() || label.to_ascii_lowercase().contains(normalized_filter)
+}
+
+/// A bulk Enable/Disable waiting for the person's confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TosecBulkConfirm {
+    pub(crate) pack_id: String,
+    pub(crate) filter: String,
+    pub(crate) enabled: bool,
+    pub(crate) groups: usize,
+}
+
+/// Bulk confirmation is skipped for a handful of groups.
+const TOSEC_BULK_CONFIRM_MIN: usize = 5;
 
 fn show_tosec_release_packs_section(
     ui: &mut egui::Ui,
@@ -10873,12 +10972,9 @@ fn show_tosec_release_packs_section(
                     .small(),
             );
             ui.label(
-                egui::RichText::new(format!(
-                    "{} DATs inventoried · {} selected · imported {}",
-                    pack.dat_count, pack.selected_dat_count, pack.imported_at
-                ))
-                .color(theme::muted(ui))
-                .small(),
+                egui::RichText::new(format!("Imported {}", pack.imported_at))
+                    .color(theme::muted(ui))
+                    .small(),
             );
             if pack.deferred_count > 0 {
                 ui.label(egui::RichText::new(format!("{} TOSEC-ISO / TOSEC-PIX catalogue(s) are visible but deferred and will not be registered.", pack.deferred_count)).color(widgets::StatusTone::Warning.color(ui)).small());
@@ -10902,21 +10998,135 @@ fn show_tosec_release_packs_section(
                     }
                 }
             });
-            let normalized_filter = filter.trim().to_ascii_lowercase();
+            let filter_text = filter.trim().to_string();
+            let normalized_filter = filter_text.to_ascii_lowercase();
             let matching: Vec<_> = pack
                 .groups
                 .iter()
-                .filter(|group| {
-                    normalized_filter.is_empty()
-                        || group
-                            .key
-                            .label()
-                            .to_ascii_lowercase()
-                            .contains(&normalized_filter)
-                })
+                .filter(|group| tosec_group_label_matches(&group.key.label(), &normalized_filter))
                 .collect();
-            let shown = matching.len().min(MAX_TOSEC_GROUPS_RENDERED);
-            for group in matching.iter().take(MAX_TOSEC_GROUPS_RENDERED) {
+            let can_edit =
+                !view.background_busy && pack.availability == PackAvailability::Available;
+            let enable_count = matching
+                .iter()
+                .filter(|group| !group.selected && group.deferred_count == 0)
+                .count();
+            let disable_count = matching.iter().filter(|group| group.selected).count();
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(if pack.selected_dat_count == 0 {
+                    format!(
+                        "{} DATs found · 0 selected. Choose which groups you want to use.",
+                        pack.dat_count
+                    )
+                } else {
+                    format!(
+                        "{} DATs found · {} selected",
+                        pack.dat_count, pack.selected_dat_count
+                    )
+                })
+                .strong(),
+            );
+            let scope = if normalized_filter.is_empty() {
+                "all".to_string()
+            } else {
+                format!("{} matching", matching.len())
+            };
+            ui.horizontal_wrapped(|ui| {
+                let enable_label = if normalized_filter.is_empty() {
+                    format!("Enable all {enable_count}")
+                } else {
+                    format!("Enable all {enable_count} matching")
+                };
+                let disable_label = if normalized_filter.is_empty() {
+                    format!("Disable all {disable_count}")
+                } else {
+                    format!("Disable all {disable_count} matching")
+                };
+                for (label, count, enabled) in [
+                    (enable_label, enable_count, true),
+                    (disable_label, disable_count, false),
+                ] {
+                    if widgets::action_button(
+                        ui,
+                        &label,
+                        widgets::ActionStyle::Secondary,
+                        can_edit && count > 0,
+                    )
+                    .clicked()
+                        && action.is_none()
+                    {
+                        if count < TOSEC_BULK_CONFIRM_MIN {
+                            action = Some(DatSourcesPageAction::SetTosecSelectionMatching {
+                                pack_id: pack.pack_id.clone(),
+                                filter: filter_text.clone(),
+                                enabled,
+                            });
+                        } else {
+                            ui_state.tosec_bulk_confirm = Some(TosecBulkConfirm {
+                                pack_id: pack.pack_id.clone(),
+                                filter: filter_text.clone(),
+                                enabled,
+                                groups: count,
+                            });
+                        }
+                    }
+                }
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "Bulk buttons act on {scope} groups, including ones not drawn on this page. They change only EmuWiz's DAT selection."
+                ))
+                .color(theme::muted(ui))
+                .small(),
+            );
+            let pending_confirm = ui_state
+                .tosec_bulk_confirm
+                .clone()
+                .filter(|confirm| confirm.pack_id == pack.pack_id);
+            if let Some(confirm) = pending_confirm {
+                widgets::card(ui, |ui| {
+                    let verb = if confirm.enabled { "Enable" } else { "Disable" };
+                    ui.strong(format!(
+                        "{verb} {} matching TOSEC group{}?",
+                        confirm.groups,
+                        if confirm.groups == 1 { "" } else { "s" }
+                    ));
+                    ui.label("This changes only EmuWiz's DAT selection. No game files will be modified, and nothing is staged until you press Stage.");
+                    ui.horizontal(|ui| {
+                        if widgets::action_button(
+                            ui,
+                            &format!("{verb} {} groups", confirm.groups),
+                            widgets::ActionStyle::Primary,
+                            can_edit,
+                        )
+                        .clicked()
+                            && action.is_none()
+                        {
+                            action = Some(DatSourcesPageAction::SetTosecSelectionMatching {
+                                pack_id: confirm.pack_id.clone(),
+                                filter: confirm.filter.clone(),
+                                enabled: confirm.enabled,
+                            });
+                            ui_state.tosec_bulk_confirm = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui_state.tosec_bulk_confirm = None;
+                        }
+                    });
+                });
+            }
+            // Paging bounds rendering only; every matching group stays reachable.
+            let pages = matching.len().div_ceil(MAX_TOSEC_GROUPS_RENDERED).max(1);
+            let page_slot = ui_state
+                .tosec_group_page
+                .entry(pack.pack_id.clone())
+                .or_default();
+            *page_slot = (*page_slot).min(pages - 1);
+            let page = *page_slot;
+            let start = page * MAX_TOSEC_GROUPS_RENDERED;
+            let end = (start + MAX_TOSEC_GROUPS_RENDERED).min(matching.len());
+            for group in matching.iter().skip(start).take(MAX_TOSEC_GROUPS_RENDERED) {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!(
                         "{} · {} DAT(s)",
@@ -10931,9 +11141,7 @@ fn show_tosec_release_packs_section(
                         );
                     }
                     let button = if group.selected { "Disable" } else { "Enable" };
-                    let toggle_enabled = !view.background_busy
-                        && pack.availability == PackAvailability::Available
-                        && (group.deferred_count == 0 || group.selected);
+                    let toggle_enabled = can_edit && (group.deferred_count == 0 || group.selected);
                     if group.deferred_count > 0 && !group.selected {
                         ui.label(
                             egui::RichText::new("Deferred by current TOSEC support")
@@ -10967,16 +11175,66 @@ fn show_tosec_release_packs_section(
                     );
                 }
             }
-            if matching.len() > shown {
-                ui.label(egui::RichText::new(format!("Showing {shown} of {} matching groups. Refine the filter to keep rendering bounded.", matching.len())).color(theme::muted(ui)).small());
+            if matching.len() > MAX_TOSEC_GROUPS_RENDERED {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Showing {}–{end} of {} matching groups",
+                            start + 1,
+                            matching.len()
+                        ))
+                        .color(theme::muted(ui))
+                        .small(),
+                    );
+                    if ui
+                        .add_enabled(page > 0, egui::Button::new("Previous 200"))
+                        .clicked()
+                    {
+                        ui_state
+                            .tosec_group_page
+                            .insert(pack.pack_id.clone(), page - 1);
+                    }
+                    if ui
+                        .add_enabled(page + 1 < pages, egui::Button::new("Show next 200"))
+                        .clicked()
+                    {
+                        ui_state
+                            .tosec_group_page
+                            .insert(pack.pack_id.clone(), page + 1);
+                    }
+                });
             }
             ui.add_space(4.0);
+            if view.tosec_managed.active_dat_count > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} DATs ready for verification",
+                        view.tosec_managed.active_dat_count
+                    ))
+                    .color(widgets::StatusTone::Success.color(ui))
+                    .small(),
+                );
+            }
+            if pack.selected_dat_count == 0 {
+                ui.label(
+                    egui::RichText::new("Select at least one DAT group first.")
+                        .color(theme::muted(ui))
+                        .small(),
+                );
+            }
             ui.horizontal(|ui| {
                 if widgets::action_button(
                     ui,
-                    "Stage selected DATs",
+                    if pack.selected_dat_count == 0 {
+                        "Stage selected DATs".to_string()
+                    } else {
+                        format!("Stage {} selected DATs", pack.selected_dat_count)
+                    }
+                    .as_str(),
                     widgets::ActionStyle::Primary,
-                    !view.background_busy && pack.availability == PackAvailability::Available,
+                    !view.background_busy
+                        && pack.availability == PackAvailability::Available
+                        && pack.selected_dat_count > 0,
                 )
                 .clicked()
                     && action.is_none()
@@ -12324,11 +12582,14 @@ fn show_dat_policy_section(
 ) -> Option<DatSourcesPageAction> {
     let mut action = None;
     ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(10.0);
     widgets::section_header(
         ui,
-        "DAT matching policy",
+        "Matching preferences (DAT matching policy)",
         Some(
-            "How EmuWiz prefers one verified candidate over another. Nothing here renames, \
+            "These preferences decide which verified candidate EmuWiz prefers when more than one \
+             valid match exists. They do not enable or disable DATs. Nothing here renames, \
              moves, deletes or rewrites a file.",
         ),
     );
@@ -12347,7 +12608,7 @@ fn show_dat_policy_section(
 
         // Scope selector: which platform the preferences and summary apply to.
         ui.horizontal(|ui| {
-            ui.label("Applies to:");
+            ui.label("Editing preferences for:");
             egui::ComboBox::from_id_salt("dat-policy-scope")
                 .selected_text(&view.scope_label)
                 .show_ui(ui, |ui| {
@@ -14573,6 +14834,16 @@ impl ArchiveFsApp {
     /// safe answers rather than an error the user cannot act on from this page.
     pub(crate) fn show_dat_sources_page(&mut self, ui: &mut egui::Ui) {
         self.show_dat_sources_page_mode(ui, false);
+    }
+
+    /// Land in the platform-first Check My Games flow already on `platform`.
+    pub(crate) fn open_platform_check(&mut self, platform: &str) {
+        let platform = archivefs_core::canonical_platform_for_alias(platform).unwrap_or(platform);
+        self.view = MainView::CheckGames;
+        self.sources_ui
+            .dat_sources_ui
+            .simple
+            .select_platform(platform);
     }
 
     /// Shares loading, background-job polling, action dispatch, and history

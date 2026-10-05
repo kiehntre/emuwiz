@@ -27,7 +27,12 @@ pub(super) struct CheckSummary {
     pub verified: usize,
     pub matched: usize,
     pub need_choice: usize,
-    pub unidentified: usize,
+    /// Ready to verify: data may exist, but nothing has been compared yet.
+    pub not_checked: usize,
+    /// No usable identification data is installed for this platform.
+    pub no_data: usize,
+    /// The data was searched (or the file could not be read) and nothing matched.
+    pub no_match: usize,
     /// The games that failed automatic verification, in library order.
     pub rows: Vec<(i64, &'static str)>,
 }
@@ -57,7 +62,9 @@ pub(super) fn summarize_platform(
             | ReviewState::NoSystem => {
                 summary.need_choice += 1;
             }
-            _ => summary.unidentified += 1,
+            ReviewState::NotCompared => summary.not_checked += 1,
+            ReviewState::NoData { .. } => summary.no_data += 1,
+            ReviewState::NoMatch(_) => summary.no_match += 1,
         }
         summary.rows.push((game.archive.id, review.list_label()));
     }

@@ -136,6 +136,17 @@ impl Job {
     }
 }
 
+/// The jobs Activity lists, newest first. With `attention_only`, just the ones
+/// that need attention; nothing is removed from the history either way.
+pub(super) fn visible_jobs(activity: &Activity, attention_only: bool) -> Vec<(&u64, &Job)> {
+    activity
+        .jobs
+        .iter()
+        .rev()
+        .filter(|(_, job)| !attention_only || job.phase == Phase::Failed)
+        .collect()
+}
+
 #[derive(Default)]
 pub(super) struct Activity {
     pub jobs: BTreeMap<u64, Job>,

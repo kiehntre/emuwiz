@@ -14,6 +14,25 @@ pub(crate) struct SimpleCheckUi {
     folders: BTreeMap<String, PathBuf>,
     declined: BTreeSet<String>,
     result_for: Option<(String, CatalogueRef, PathBuf)>,
+    /// A platform chosen by a caller (Check Games) rather than by a click here:
+    /// the first render opens setup if, and only if, the platform is not ready.
+    open_setup_if_not_ready: bool,
+}
+
+impl SimpleCheckUi {
+    /// Arrive already on `platform`, as if it had been chosen in the list.
+    pub(crate) fn select_platform(&mut self, platform: &str) {
+        if self.platform.as_deref() != Some(platform) {
+            self.platform = Some(platform.to_string());
+            self.setup = false;
+            self.result_for = None;
+        }
+        self.open_setup_if_not_ready = true;
+    }
+
+    pub(crate) fn platform(&self) -> Option<&str> {
+        self.platform.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +182,31 @@ fn status(choices: &[Choice], selected: Option<&CatalogueRef>, supported: bool) 
         Status::NeedsSetup
     } else {
         Status::NotSupported
+    }
+}
+
+/// One plain sentence about where this platform's verification data stands.
+fn state_guidance(
+    platform: &str,
+    status: Status,
+    has_choices: bool,
+    installed_unused: bool,
+) -> String {
+    match status {
+        Status::Ready => "Verification data is ready. You can now check these games.".to_string(),
+        Status::NeedsAttention if has_choices => {
+            format!("Choose which {platform} verification data to use.")
+        }
+        Status::NeedsAttention | Status::NeedsSetup if installed_unused => {
+            format!("{platform} verification data is installed but not enabled yet.")
+        }
+        Status::NeedsAttention => {
+            format!("{platform} verification data needs checking before it can be used.")
+        }
+        Status::NeedsSetup => format!("{platform} identification data is not set up yet."),
+        Status::NotSupported => {
+            format!("EmuWiz has no recommended identification data for {platform} yet.")
+        }
     }
 }
 
@@ -352,6 +396,17 @@ pub(super) fn show(
         .iter()
         .find(|row| row.platform == platform)
         .is_none_or(|row| !row.expected_sources.is_empty());
+    let installed_unused = view.rows.iter().any(|row| {
+        !row.enabled
+            && row
+                .platform_id
+                .as_deref()
+                .and_then(archivefs_core::canonical_platform_for_alias)
+                == Some(platform.as_str())
+    });
+    if std::mem::take(&mut state.open_setup_if_not_ready) {
+        state.setup = !ready && supported;
+    }
     ui.label(format!("Check My Games › {platform}"));
     if ui.button("← Back to platforms").clicked() {
         state.platform = None;
@@ -371,6 +426,12 @@ pub(super) fn show(
         if let Some(chosen) = chosen {
             ui.label(format!("Verification data: {}", chosen.label));
         }
+        ui.label(state_guidance(
+            &platform,
+            current,
+            !candidates.is_empty(),
+            installed_unused,
+        ));
         if inventory_pending {
             ui.label("Checking which verification data is available. Please wait before starting.");
         }

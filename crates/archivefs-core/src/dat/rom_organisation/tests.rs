@@ -1986,3 +1986,52 @@ fn a_cancelled_preview_yields_no_plan_and_changes_nothing_on_disk() {
     );
     assert!(!master.exists());
 }
+
+/// Real-library check (Atari 2600): the catalogue stores the canonical id with
+/// a `folder_alias` provenance. That persisted assignment must reach the
+/// planner as usable platform evidence, while a file with no catalogue row is
+/// refused even when its folder is literally named `atari2600` - a folder name
+/// is never identity on its own.
+#[test]
+fn persisted_canonical_atari2600_assignment_survives_into_the_plan_but_a_folder_name_does_not() {
+    use crate::platform::identity::resolve_platform_identity;
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("atari2600");
+    std::fs::create_dir_all(&library).unwrap();
+    let master = dir.path().join("roms");
+
+    // What `current_platform_identity_evidence` yields for source `folder_alias`.
+    let evidence = PlatformIdentityEvidence::canonical(
+        "Atari2600",
+        PlatformIdentitySource::Inference,
+        PlatformIdentityConfidence::Inferred,
+        1,
+        "persisted platform assignment from folder_alias",
+    )
+    .expect("the canonical id is accepted");
+    let catalogued = candidate(
+        &library,
+        "Combat (USA).bin",
+        resolve_platform_identity(1, [evidence]),
+    );
+    // No catalogue row -> no evidence at all -> Unknown, whatever the folder says.
+    let uncatalogued = candidate(
+        &library,
+        "Uncatalogued (USA).bin",
+        resolve_platform_identity(1, []),
+    );
+    let plan = plan_for(
+        &master,
+        OrganisationMode::RenameInPlace,
+        &[catalogued, uncatalogued],
+        1,
+    );
+    let reason = |index: usize| plan.entries[index].reason.clone().unwrap_or_default();
+    assert!(
+        !reason(0).contains("no platform identity"),
+        "canonical assignment lost: {}",
+        reason(0)
+    );
+    assert_eq!(plan.entries[1].status, OrganisationStatus::Blocked);
+    assert!(reason(1).contains("no platform identity could be resolved"));
+}

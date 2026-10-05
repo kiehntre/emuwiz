@@ -44,6 +44,12 @@ pub(super) struct NativeWorkflows {
     provider_job: Option<u64>,
     metadata_job: Option<u64>,
     dat_job: Option<u64>,
+    /// Last audit-save generation seen, and whether the library should be
+    /// re-read because a newer one landed.
+    dat_identity_seen: u64,
+    dat_identity_reload: bool,
+    /// The platform the Check My Games page was last aimed at from a route.
+    platform_check_applied: Option<String>,
     cheat_job: Option<u64>,
     source_library_reload: bool,
     artwork_reload: bool,
@@ -268,6 +274,9 @@ impl NativeWorkflows {
             provider_job: None,
             metadata_job: None,
             dat_job: None,
+            dat_identity_seen: 0,
+            dat_identity_reload: false,
+            platform_check_applied: None,
             cheat_job: None,
             source_library_reload: false,
             artwork_reload: false,
@@ -1462,6 +1471,39 @@ impl NativeWorkflows {
         std::mem::take(&mut self.source_library_reload)
     }
 
+    pub(super) fn take_dat_identity_reload(&mut self) -> bool {
+        std::mem::take(&mut self.dat_identity_reload)
+    }
+
+    /// Forget which platform the check page was aimed at, so the next arrival
+    /// from a route applies its platform afresh.
+    pub(super) fn leave_platform_check(&mut self) {
+        self.platform_check_applied = None;
+    }
+
+    /// The existing platform-first Check My Games flow, opened on `platform`.
+    /// Returns a route when the flow asks to leave (Advanced, View games).
+    pub(super) fn show_platform_check(
+        &mut self,
+        ui: &mut egui::Ui,
+        activity: &mut Activity,
+        platform: &str,
+    ) -> Option<Route> {
+        if self.platform_check_applied.as_deref() != Some(platform) {
+            self.app.open_platform_check(platform);
+            self.platform_check_applied = Some(platform.to_string());
+        }
+        self.app.view = crate::navigation::MainView::CheckGames;
+        app_polling::start_view_gated_work(&mut self.app, ui.ctx());
+        self.app.show_dat_sources_page(ui);
+        self.observe_dat_activity(activity);
+        match self.app.view {
+            crate::navigation::MainView::DatSources => Some(Route::Section(Section::Dat)),
+            crate::navigation::MainView::Library => Some(Route::Section(Section::Games)),
+            _ => None,
+        }
+    }
+
     pub(super) fn take_artwork_reload(&mut self) -> bool {
         std::mem::take(&mut self.artwork_reload)
     }
@@ -2195,10 +2237,15 @@ impl NativeWorkflows {
     }
 
     fn poll_dat_activity(&mut self, context: &egui::Context, activity: &mut Activity) {
-        if let Some(page) = self.app.sources_ui.dat_sources_page.as_mut()
-            && (page.poll() || page.is_busy())
-        {
-            context.request_repaint();
+        if let Some(page) = self.app.sources_ui.dat_sources_page.as_mut() {
+            if page.poll() || page.is_busy() {
+                context.request_repaint();
+            }
+            let generation = page.identity_enrichment_generation();
+            if generation != self.dat_identity_seen {
+                self.dat_identity_seen = generation;
+                self.dat_identity_reload = true;
+            }
         }
         self.observe_dat_activity(activity);
     }

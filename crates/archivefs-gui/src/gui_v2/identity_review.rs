@@ -247,7 +247,7 @@ impl Review {
         match &self.state {
             ReviewState::Verified(_) => "Verified",
             ReviewState::ReferenceMatched => "Matched to reference data",
-            ReviewState::NotCompared => "Can be matched",
+            ReviewState::NotCompared => "Ready to verify",
             ReviewState::Ambiguous { .. }
             | ReviewState::Conflict { .. }
             | ReviewState::NoSystem => "Needs your choice",
@@ -267,9 +267,7 @@ impl Review {
             ReviewState::NoData { .. } => {
                 "Identification data for this system is not installed yet"
             }
-            ReviewState::NotCompared => {
-                "This game has not been compared with identification data yet"
-            }
+            ReviewState::NotCompared => "This game is ready to verify",
             ReviewState::NoMatch(_) => "No trusted match was found for this file",
         }
     }

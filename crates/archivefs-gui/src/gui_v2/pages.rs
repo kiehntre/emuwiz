@@ -361,17 +361,23 @@ impl App {
                     ));
                 }
                 let failed = self.activity.failed();
-                if failed > 0 {
-                    ui.label(format!(
-                        "{failed} {} attention",
-                        if failed == 1 {
-                            "job needs"
-                        } else {
-                            "jobs need"
-                        }
-                    ));
+                if failed > 0
+                    && ui
+                        .button(format!(
+                            "{failed} {} attention",
+                            if failed == 1 {
+                                "job needs"
+                            } else {
+                                "jobs need"
+                            }
+                        ))
+                        .clicked()
+                {
+                    self.activity_attention_only = true;
+                    self.go(Route::Section(Section::Activity));
                 }
                 if ui.button("View Activity").clicked() {
+                    self.activity_attention_only = false;
                     self.go(Route::Section(Section::Activity));
                 }
             });
@@ -544,6 +550,7 @@ impl App {
                         Route::Section(Section::Mods) => self.mods_page(ui, None),
                         Route::Section(Section::Check) => self.check_games(ui, None),
                         Route::QuickRename => self.quick_rename(ui),
+                        Route::PlatformCheck(platform) => self.platform_check(ui, &platform),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
                         Route::Section(Section::Storage) => self.storage_page(ui),
                         Route::Section(Section::MultiDisc) => self.multi_disc_page(ui),
@@ -664,6 +671,7 @@ impl App {
                 section: Section::Advanced,
                 ..
             } => GuidancePage::ArchiveInspector,
+            Route::PlatformCheck(_) => GuidancePage::CheckGames,
             Route::Section(Section::Dat) | Route::QuickRename => GuidancePage::DatManagement,
             Route::Section(Section::Firmware) => GuidancePage::BiosFirmware,
             Route::Section(Section::Emulators) => GuidancePage::EmulatorSetup,
@@ -1397,6 +1405,20 @@ impl App {
             });
     }
 
+    /// The existing platform-first Check My Games flow, opened on `platform`.
+    fn platform_check(&mut self, ui: &mut egui::Ui, platform: &str) {
+        if ui.button("← Back to Check Games").clicked() {
+            self.check_platform = Some(platform.to_string());
+            self.go(Route::Section(Section::Check));
+        }
+        let workflows = self
+            .native_workflows
+            .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
+        if let Some(route) = workflows.show_platform_check(ui, &mut self.activity, platform) {
+            self.go(route);
+        }
+    }
+
     fn check_games(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         let platform = self.check_platform.clone();
         check_scroll(ui, platform.as_deref(), |ui| {
@@ -1449,13 +1471,40 @@ impl App {
         let summary = self.check_summary(&platform);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.strong(format!("{} verified automatically", super::job_card::count(summary.verified as u64)));
+            let count = |n: usize| super::job_card::count(n as u64);
+            ui.strong(format!("{} verified", count(summary.verified)));
             if summary.matched > 0 {
-                ui.label(format!("{} matched to reference data", super::job_card::count(summary.matched as u64)));
+                ui.label(format!("{} matched to reference data", count(summary.matched)));
             }
-            ui.label(format!("{} could not be identified yet", super::job_card::count(summary.unidentified as u64)));
-            ui.label(format!("{} need your choice", super::job_card::count(summary.need_choice as u64)));
-            ui.label("Games verify on their own when their exact fingerprint is in trusted identification data. Only the ones below need your help.");
+            for (n, text) in [
+                (summary.not_checked, "ready to verify (not checked yet)"),
+                (summary.no_data, "waiting for identification data"),
+                (summary.no_match, "no match found"),
+                (summary.need_choice, "need your choice"),
+            ] {
+                if n > 0 {
+                    ui.label(format!("{} {text}", count(n)));
+                }
+            }
+            ui.label("Games verify on their own when their exact fingerprint is in trusted identification data.");
+            // The next step, in plain words. Both land in the existing
+            // platform-first Check My Games flow, already on this platform.
+            if summary.not_checked > 0 {
+                if primary(ui, &format!("Verify {platform} games")) {
+                    self.go(Route::PlatformCheck(platform.clone()));
+                }
+            }
+            if summary.no_data > 0 {
+                let label = format!("Set up {platform} identification data");
+                let clicked = if summary.not_checked > 0 {
+                    ui.button(label).clicked()
+                } else {
+                    primary(ui, &label)
+                };
+                if clicked {
+                    self.go(Route::PlatformCheck(platform.clone()));
+                }
+            }
         });
         let help = summary.rows.len();
         if help == 0 {
@@ -3208,10 +3257,27 @@ impl App {
             self.go(Route::Section(Section::Games));
         }
         let mut destination = None;
+        if self.activity_attention_only {
+            let needing = self.activity.failed();
+            ui.horizontal(|ui| {
+                ui.strong(if needing == 0 {
+                    "No jobs need attention".to_string()
+                } else {
+                    format!(
+                        "Showing {needing} {} that need attention",
+                        if needing == 1 { "job" } else { "jobs" }
+                    )
+                });
+                if ui.button("Show all activity").clicked() {
+                    self.activity_attention_only = false;
+                }
+            });
+        }
+        let attention_only = self.activity_attention_only;
         egui::ScrollArea::vertical()
             .id_salt("v2_jobs")
             .show(ui, |ui| {
-                for (id, job) in self.activity.jobs.iter().rev() {
+                for (id, job) in super::activity::visible_jobs(&self.activity, attention_only) {
                     ui.push_id(id, |ui| {
                         egui::Frame::group(ui.style()).show(ui, |ui| {
                             ui.set_min_width(ui.available_width());

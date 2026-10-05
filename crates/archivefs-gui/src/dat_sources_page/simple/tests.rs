@@ -335,3 +335,79 @@ fn simple_identify_separates_arcade_and_software_list_readiness() {
             .any(|s| s == "MAME" || s.contains("0 installed software"))
     );
 }
+
+#[test]
+fn a_platform_chosen_by_the_caller_survives_into_setup_with_plain_guidance() {
+    for platform in [
+        "BBC Micro",
+        "Game Boy Advance",
+        "Amiga",
+        "Atari ST",
+        "ZX Spectrum",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let page = page(dir.path());
+        let view = page.view();
+        let mut state = DatSourcesPageUi::default();
+        state.simple.select_platform(platform);
+        assert_eq!(state.simple.platform(), Some(platform));
+        let lines = render(&view, &mut state);
+        // Still on the chosen platform: no chooser, no searching again.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("Check My Games › {platform}"))),
+            "{platform}: {lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("Choose a platform")));
+        assert_eq!(state.simple.platform(), Some(platform));
+    }
+}
+
+#[test]
+fn missing_identification_data_opens_setup_and_says_so_in_plain_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let page = page(dir.path());
+    let view = page.view();
+    let mut state = DatSourcesPageUi::default();
+    state.simple.select_platform("Game Boy Advance");
+    let lines = render(&view, &mut state);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("identification data is not set up yet"))
+    );
+    assert!(lines.iter().any(|l| l.contains("Set up Game Boy Advance")));
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("DAT registry") || l.contains("projection"))
+    );
+}
+
+#[test]
+fn ready_data_offers_verify_and_the_guidance_says_you_can_check_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut page = page(dir.path());
+    let path = dir.path().join("mame.xml");
+    std::fs::write(&path, MAME).unwrap();
+    let id = import(&mut page, &path);
+    page.apply(DatSourcesPageAction::SetPlatform {
+        id,
+        platform: Some("Arcade".into()),
+    });
+    finish(&mut page);
+    page.apply(DatSourcesPageAction::Save);
+    finish(&mut page);
+    let view = page.view();
+    let mut state = DatSourcesPageUi::default();
+    state.simple.select_platform("Arcade");
+    let lines = render(&view, &mut state);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("Verification data is ready. You can now check these games.")),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|l| l.contains("Verify Arcade Collection")));
+}

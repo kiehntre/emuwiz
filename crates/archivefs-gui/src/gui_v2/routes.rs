@@ -775,6 +775,9 @@ pub(super) enum Route {
     /// verify automatically, finished.
     ReviewIdentity(i64),
     QuickRename,
+    /// The platform-first Check My Games flow for one canonical platform, so
+    /// the destination already knows which platform the person came from.
+    PlatformCheck(String),
     Task {
         section: Section,
         game: i64,
@@ -791,6 +794,7 @@ impl Route {
             Self::Game(_) => Section::Games,
             Self::ReviewIdentity(_) => Section::Check,
             Self::QuickRename => Section::Dat,
+            Self::PlatformCheck(_) => Section::Check,
         }
     }
     pub fn game(&self) -> Option<i64> {
@@ -828,6 +832,9 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
     }
     if matches!(route, Route::QuickRename) {
         return vec!["DATs & Verification".into(), "Quick Rename".into()];
+    }
+    if let Route::PlatformCheck(platform) = route {
+        return vec!["Check Games".into(), platform.clone()];
     }
     if matches!(route, Route::ReviewIdentity(_)) {
         let mut labels = vec!["Games".to_string()];

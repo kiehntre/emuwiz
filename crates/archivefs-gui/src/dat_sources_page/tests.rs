@@ -33,6 +33,7 @@ use archivefs_core::safe_read::TrustedRoots;
 use super::*;
 
 mod save_results;
+mod tosec_bulk;
 
 #[test]
 fn local_dat_navigation_filters_by_name_platform_and_status() {
@@ -4130,7 +4131,7 @@ fn the_global_scope_is_used_by_default_and_the_scope_selector_is_offered() {
     );
     let mut ui_state = DatSourcesPageUi::default();
     let output = render(&view, &mut ui_state);
-    assert!(rendered_text_contains(&output, "Applies to:"));
+    assert!(rendered_text_contains(&output, "Editing preferences for:"));
     assert!(rendered_text_contains(&output, "All platforms"));
     assert!(rendered_text_contains(&output, "Editing: Global defaults"));
 }
@@ -6628,7 +6629,7 @@ fn tosec_group_rendering_never_draws_more_than_two_hundred_rows() {
     let output = render(&page.view(), &mut DatSourcesPageUi::default());
     assert!(rendered_text_contains(
         &output,
-        "Showing 200 of 205 matching groups"
+        "Showing 1–200 of 205 matching groups"
     ));
     // Counts only the per-group "<system> · 1 DAT(s)" rows (every synthetic
     // group here has exactly one DAT), not the unrelated page-level "N
