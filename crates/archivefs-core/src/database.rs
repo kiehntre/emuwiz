@@ -62,6 +62,7 @@ mod catalogue_health;
 #[path = "database/catalogue_health_tests.rs"]
 mod catalogue_health_tests;
 pub(crate) mod forget_missing;
+pub(crate) mod reconciliation;
 mod restore;
 #[cfg(test)]
 #[path = "database/topology_evidence_tests.rs"]

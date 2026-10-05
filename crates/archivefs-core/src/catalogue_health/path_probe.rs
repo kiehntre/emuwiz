@@ -295,7 +295,7 @@ impl BoundRoot {
     pub(crate) fn metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
         self.target(path, false)?.metadata()
     }
-    pub(super) fn read_file(&self, path: &Path, expected: &PathObservation) -> Option<File> {
+    pub(crate) fn read_file(&self, path: &Path, expected: &PathObservation) -> Option<File> {
         let file = self.target(path, true).ok()?;
         let current = observation(file.try_clone().map_err(io::Error::other), false);
         (current == *expected && self.current()).then_some(file)
