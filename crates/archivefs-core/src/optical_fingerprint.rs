@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::chd_identity::{ChdMetadataFact, ChdMetadataOutcome, observe_chd_identity_file};
 use crate::chd_logical_media::open_chd_track_logical_media_file;
 use crate::ingestion::cue_bin::{
-    CueDataTrackMode, CueError, CueLayout, data_track_from_layout, resolve_cue_layout,
+    CueDataTrackMode, CueError, CueLayout, CueTrackMode, data_track_from_layout, resolve_cue_layout,
 };
 use crate::logical_media::LogicalMedia;
 use crate::raw_cd_logical_media::{
@@ -118,11 +118,66 @@ fn hash_logical_media<M: LogicalMedia>(
     ))
 }
 
+/// Like [`fingerprint_cue_bin`], but refuses any layout whose declared facts
+/// the program-area hash does not cover. Use this wherever a match is treated
+/// as proof that two representations are the same disc (duplicate quarantine,
+/// CUE/BIN versus CHD verification); plain `fingerprint_cue_bin` remains the
+/// program-data identity.
+pub fn fingerprint_cue_bin_exact(
+    path: &Path,
+) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
+    let layout = resolve_cue_layout(path).map_err(OpticalFingerprintError::Cue)?;
+    if let Some(reason) = unrepresented_layout_fact(&layout) {
+        return Err(OpticalFingerprintError::UnsupportedCueLayout(reason));
+    }
+    fingerprint_cue_layout(&layout)
+}
+
 pub fn fingerprint_cue_bin(
     path: &Path,
 ) -> Result<CanonicalOpticalFingerprint, OpticalFingerprintError> {
     let layout = resolve_cue_layout(path).map_err(OpticalFingerprintError::Cue)?;
     fingerprint_cue_layout(&layout)
+}
+
+/// The program-area fingerprint hashes only the data track's INDEX 01 range. Any
+/// declared layout fact outside that range (stored INDEX 00 sectors, synthetic
+/// PREGAP/POSTGAP, extra indexes, audio content) is not covered by the hash,
+/// so a match would not prove the two representations hold the same disc.
+/// Returns the first such fact; callers must refuse rather than guess.
+pub(crate) fn unrepresented_layout_fact(layout: &CueLayout) -> Option<String> {
+    for track in &layout.tracks {
+        let number = track.number;
+        if matches!(track.mode, CueTrackMode::Audio) {
+            return Some(format!(
+                "track {number} is audio; audio content is not part of the data-track fingerprint"
+            ));
+        }
+        if let Some(index_00) = track.index_00 {
+            return Some(format!(
+                "track {number} has INDEX 00 at frame {}: pregap sectors stored in the image are outside the program-area fingerprint",
+                index_00.frames
+            ));
+        }
+        if let Some(pregap) = track.pregap {
+            return Some(format!(
+                "track {number} declares a synthetic PREGAP of {} frames that is not stored in the image and cannot be proven present in the other representation",
+                pregap.frames
+            ));
+        }
+        if track.postgap.is_some() {
+            return Some(format!("track {number} declares a POSTGAP"));
+        }
+        if !track.extra_indexes.is_empty() {
+            return Some(format!("track {number} has INDEX 02+ markers"));
+        }
+        if track.index_01.is_some_and(|index| index.frames != 0) {
+            return Some(format!(
+                "track {number} INDEX 01 is not at the start of its file and no INDEX 00 accounts for the leading sectors"
+            ));
+        }
+    }
+    None
 }
 
 /// Hash the program range from the same layout snapshot admitted by a caller.

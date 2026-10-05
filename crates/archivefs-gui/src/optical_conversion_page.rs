@@ -1249,6 +1249,16 @@ pub(crate) fn show_optical_conversion_page(
             });
             if !eligible && let Some(error) = &error {
                 ui.label(conversion_blocker_reason(error));
+                if let ChdConversionError::InvalidSource(reason) = error
+                    && let Some(detail) =
+                        archivefs_core::repair::optical_conversion::layout_preservation_detail(
+                            reason,
+                        )
+                {
+                    ui.label(format!(
+                        "Not preserved exactly: {detail} Conversion is blocked; nothing was changed."
+                    ));
+                }
                 if matches!(error, ChdConversionError::InvalidTarget(_)) {
                     ui.label(format!(
                         "Planned output: {}",
@@ -2490,6 +2500,27 @@ mod tests {
         ));
         assert!(!rendered_text_contains(&output, "InvalidSource"));
         assert!(rendered_text_contains(&output, "Technical details"));
+    }
+
+    #[test]
+    fn stored_pregap_refusal_is_explained_as_not_preserved_and_never_lossless() {
+        let mut state = OpticalConversionPageState::default();
+        state.candidates.push(Candidate {
+            path: PathBuf::from("/library/Pregap.cue"),
+            plan: None,
+            error: Some(ChdConversionError::InvalidSource(
+                "line 4 is outside the verified layout [layout preservation: Track 2 has 00:00:02 of source-backed pregap (INDEX 00); the converter does not carry it, so converting would drop it.]"
+                    .into(),
+            )),
+        });
+        let output = render(&mut state);
+        assert!(rendered_text_contains(&output, "Not preserved exactly"));
+        assert!(rendered_text_contains(
+            &output,
+            "source-backed pregap (INDEX 00)"
+        ));
+        assert!(rendered_text_contains(&output, "Conversion is blocked"));
+        assert!(!rendered_text_contains(&output, "Lossless"));
     }
 
     #[test]

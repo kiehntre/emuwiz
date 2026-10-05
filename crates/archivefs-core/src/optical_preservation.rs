@@ -12,7 +12,9 @@ use crate::chd_identity::{
 };
 use crate::dat::archive::chd::read_chd_v5_header;
 use crate::ingestion::cue_bin::{CueLayout, resolve_cue_layout_text};
-use crate::repair::optical_conversion::ChdConversionSourceMode;
+use crate::repair::optical_conversion::{
+    ChdConversionSourceMode, LAYOUT_PRESERVATION_DETAIL_MARKER,
+};
 
 pub(crate) const MAX_CONVERSION_CUE_BYTES: u64 = crate::ingestion::cue_bin::MAX_CUE_BYTES;
 
@@ -21,6 +23,56 @@ pub(crate) const MAX_CONVERSION_CUE_BYTES: u64 = crate::ingestion::cue_bin::MAX_
 /// can be admitted. In particular, even zero-length gap declarations are
 /// refused; no declaration is silently discarded or normalized.
 pub(crate) fn source_layout(
+    path: &Path,
+    source_mode: ChdConversionSourceMode,
+) -> Result<CueLayout, String> {
+    source_layout_gate(path, source_mode).map_err(|error| {
+        // The gate's own wording is deliberately generic. When the sheet is a
+        // real layout the converter cannot carry, say exactly what would be
+        // lost so the preview never implies a conversion is lossless.
+        match layout_preservation_detail(path) {
+            Some(detail) => format!("{error} {LAYOUT_PRESERVATION_DETAIL_MARKER}{detail}"),
+            None => error,
+        }
+    })
+}
+
+/// Best-effort, read-only explanation of why a sheet is outside the verified
+/// layout, using the INDEX 00 / PREGAP aware timeline. Distinguishes pregap
+/// sectors stored in the image, pregap requested by the sheet but absent from
+/// the image, and layouts that are ambiguous or invalid. Returns `None` when
+/// the sheet cannot be read or no specific fact is available.
+fn layout_preservation_detail(path: &Path) -> Option<String> {
+    use crate::ingestion::cue_timeline::build_timeline;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(MAX_CONVERSION_CUE_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_CONVERSION_CUE_BYTES {
+        return None;
+    }
+    let layout = resolve_cue_layout_text(path, &text).ok()?;
+    let detail = match build_timeline(&layout) {
+        Ok(timeline) => {
+            match crate::ingestion::cue_timeline::chd_conversion_preservation(&timeline) {
+                Ok(_) => return None,
+                Err(blockers) => blockers
+                    .iter()
+                    .map(|blocker| blocker.reason())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            }
+        }
+        Err(refusal) => {
+            format!("Layout is ambiguous or unsupported and was not guessed: {refusal}")
+        }
+    };
+    Some(format!("{detail}]"))
+}
+
+fn source_layout_gate(
     path: &Path,
     source_mode: ChdConversionSourceMode,
 ) -> Result<CueLayout, String> {

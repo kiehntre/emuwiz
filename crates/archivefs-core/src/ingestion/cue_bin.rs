@@ -303,7 +303,10 @@ pub(crate) fn resolve_cue_layout_text(
         if line.is_empty() || line.starts_with("REM") {
             continue;
         }
-        if line.len() >= 4 && line[..4].eq_ignore_ascii_case("FILE") {
+        if line
+            .get(..4)
+            .is_some_and(|head| head.eq_ignore_ascii_case("FILE"))
+        {
             finish(
                 &mut current_file,
                 file_ordinal.unwrap_or(0),
@@ -323,7 +326,10 @@ pub(crate) fn resolve_cue_layout_text(
             file_type = after.trim().to_ascii_uppercase();
             continue;
         }
-        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("TRACK") {
+        if line
+            .get(..5)
+            .is_some_and(|head| head.eq_ignore_ascii_case("TRACK"))
+        {
             finish(
                 &mut current_file,
                 file_ordinal.unwrap_or(0),
@@ -352,7 +358,10 @@ pub(crate) fn resolve_cue_layout_text(
             current_track = Some((number, mode, None, None, None, None));
             continue;
         }
-        if line.len() >= 6 && line[..6].eq_ignore_ascii_case("PREGAP") {
+        if line
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("PREGAP"))
+        {
             let timestamp = CueTimestamp::parse(line[6..].trim())?;
             let Some((_, _, _, _, pregap, _)) = current_track.as_mut() else {
                 return Err(CueError::Malformed("PREGAP has no TRACK".into()));
@@ -362,7 +371,10 @@ pub(crate) fn resolve_cue_layout_text(
             }
             continue;
         }
-        if line.len() >= 7 && line[..7].eq_ignore_ascii_case("POSTGAP") {
+        if line
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("POSTGAP"))
+        {
             let timestamp = CueTimestamp::parse(line[7..].trim())?;
             let Some((_, _, _, _, _, postgap)) = current_track.as_mut() else {
                 return Err(CueError::Malformed("POSTGAP has no TRACK".into()));
@@ -372,7 +384,10 @@ pub(crate) fn resolve_cue_layout_text(
             }
             continue;
         }
-        if line.len() >= 5 && line[..5].eq_ignore_ascii_case("INDEX") {
+        if line
+            .get(..5)
+            .is_some_and(|head| head.eq_ignore_ascii_case("INDEX"))
+        {
             let mut fields = line.split_whitespace();
             let _ = fields.next();
             let index = fields
@@ -542,7 +557,11 @@ pub fn resolve_cue_all_files_lenient(
     let mut outcomes = Vec::new();
     for raw_line in contents.lines() {
         let line = raw_line.trim();
-        if line.is_empty() || !(line.len() >= 4 && line[..4].eq_ignore_ascii_case("FILE")) {
+        if line.is_empty()
+            || !(line
+                .get(..4)
+                .is_some_and(|head| head.eq_ignore_ascii_case("FILE")))
+        {
             continue;
         }
         let rest = line[4..].trim_start();

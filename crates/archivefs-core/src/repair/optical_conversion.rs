@@ -47,6 +47,17 @@ pub const DISC_CONVERSION_STAGING_PREFIX: &str = ".emuwiz-chd-";
 /// single-source-of-truth literal the projection layer can match on.
 pub const DISC_CONVERSION_QUARANTINE_SUBDIR: &str = "optical-conversion";
 
+/// Marks the start of the specific, human-readable preservation reason that a
+/// refused layout carries (stored INDEX 00 pregap vs requested PREGAP vs
+/// ambiguous). It runs to the closing `]` at the end of the message.
+pub const LAYOUT_PRESERVATION_DETAIL_MARKER: &str = "[layout preservation: ";
+
+/// The specific preservation reason inside a refused-source message, if any.
+pub fn layout_preservation_detail(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once(LAYOUT_PRESERVATION_DETAIL_MARKER)?;
+    Some(rest.strip_suffix(']').unwrap_or(rest))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChdConversionSourceMode {
     KeepSource,

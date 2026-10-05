@@ -16,7 +16,8 @@ use crate::dat::sources::now_unix;
 use crate::ingestion::cue_bin::resolve_cue_layout;
 use crate::optical_fingerprint::{
     CanonicalOpticalFingerprint, OpticalDiscStructure, OpticalFingerprintComparison,
-    OpticalRepresentation, compare_optical_fingerprints, fingerprint_chd, fingerprint_cue_bin,
+    OpticalRepresentation, compare_optical_fingerprints, fingerprint_chd,
+    fingerprint_cue_bin_exact,
 };
 use crate::repair::exact_duplicate::hash_full_file_sha256;
 use crate::repair::execute::{
@@ -104,7 +105,7 @@ fn inspect_cue(
     path: &Path,
     trusted: &TrustedRoots,
 ) -> Result<OpticalEquivalentRepresentation, String> {
-    let fingerprint = fingerprint_cue_bin(path).map_err(|error| error.to_string())?;
+    let fingerprint = fingerprint_cue_bin_exact(path).map_err(|error| error.to_string())?;
     let layout = resolve_cue_layout(path).map_err(|error| error.to_string())?;
     let track = layout
         .supported_single_mode1_2048()
@@ -302,11 +303,12 @@ pub fn apply_optical_equivalent_group(
     journal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<RepairTransactionResult, RepairExecutionError> {
-    let fresh_cue = fingerprint_cue_bin(&group.cue_bin.fingerprint.source).map_err(|_error| {
-        RepairExecutionError::StaleSource {
-            source: group.cue_bin.fingerprint.source.clone(),
-        }
-    })?;
+    let fresh_cue =
+        fingerprint_cue_bin_exact(&group.cue_bin.fingerprint.source).map_err(|_error| {
+            RepairExecutionError::StaleSource {
+                source: group.cue_bin.fingerprint.source.clone(),
+            }
+        })?;
     let fresh_chd = fingerprint_chd(&group.chd.fingerprint.source).map_err(|_error| {
         RepairExecutionError::StaleSource {
             source: group.chd.fingerprint.source.clone(),

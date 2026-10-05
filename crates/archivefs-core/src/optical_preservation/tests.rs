@@ -740,3 +740,226 @@ fn benign_metadata_cannot_launder_unsafe_directives() {
         refused(&format!("{meta}{body}"), &[("data.bin", 2048 * 16)]);
     }
 }
+
+// ---- INDEX 00 / PREGAP preservation reasons surfaced to the conversion preview ----
+
+fn refusal_message(text: &str, files: &[(&str, usize)]) -> String {
+    refused(text, files);
+    let (dir, cue) = fixture(text, files);
+    let error = build_chd_conversion_plan(
+        &cue,
+        &dir.path().join("output.chd"),
+        ChdConversionSourceMode::KeepSource,
+        Some(&dir.path().join("converter-must-not-run")),
+    )
+    .unwrap_err();
+    let ChdConversionError::InvalidSource(message) = error else {
+        panic!("expected InvalidSource");
+    };
+    message
+}
+
+fn detail_of(text: &str, files: &[(&str, usize)]) -> String {
+    let message = refusal_message(text, files);
+    crate::repair::optical_conversion::layout_preservation_detail(&message)
+        .unwrap_or_else(|| panic!("no preservation detail in: {message}"))
+        .to_owned()
+}
+
+#[test]
+fn no_pregap_data_only_disc_is_admitted_and_carries_no_warning() {
+    let text = "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n";
+    let (_dir, cue) = fixture(text, &[("data.bin", 2048 * 16)]);
+    source_layout(&cue, ChdConversionSourceMode::KeepSource).unwrap();
+    assert_eq!(layout_preservation_detail(&cue), None);
+}
+
+#[test]
+fn stored_index_00_gap_is_named_as_dropped_source_data_whatever_its_length() {
+    // 1 second (75 frames): deliberately not the common two-second gap.
+    let detail = detail_of(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:01:00\n",
+        &[("data.bin", 2048 * 80)],
+    );
+    assert!(
+        detail.contains("source-backed pregap (INDEX 00)"),
+        "{detail}"
+    );
+    assert!(detail.contains("00:01:00"), "{detail}");
+    assert!(detail.contains("would drop it"), "{detail}");
+    // 7 frames: odd length, still reported exactly.
+    let detail = detail_of(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:07\n",
+        &[("data.bin", 2048 * 20)],
+    );
+    assert!(detail.contains("00:00:07"), "{detail}");
+}
+
+#[test]
+fn synthetic_pregap_is_reported_as_not_stored_and_distinct_from_index_00() {
+    let detail = detail_of(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nPREGAP 00:02:00\nINDEX 01 00:00:00\n",
+        &[("data.bin", 2048 * 16)],
+    );
+    assert!(detail.contains("synthetic PREGAP"), "{detail}");
+    assert!(!detail.contains("source-backed"), "{detail}");
+}
+
+#[test]
+fn index_00_plus_pregap_is_ambiguous_and_not_guessed() {
+    let detail = detail_of(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nPREGAP 00:02:00\nINDEX 00 00:00:00\nINDEX 01 00:00:02\n",
+        &[("data.bin", 2048 * 16)],
+    );
+    assert!(detail.contains("not guessed"), "{detail}");
+    assert!(detail.contains("ReviewRequired"), "{detail}");
+}
+
+#[test]
+fn mixed_mode_disc_names_every_blocker_it_would_lose() {
+    // Track 1 MODE1/2048 data, track 2 AUDIO with a stored INDEX 00 pregap, one BIN.
+    let detail = detail_of(
+        "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 00 00:00:16\nINDEX 01 00:00:18\n",
+        &[("disc.bin", 2048 * 16 + 2352 * 100)],
+    );
+    // Mixed sector sizes in one file are refused by the timeline, never guessed.
+    assert!(
+        detail.contains("not guessed") || detail.contains("source-backed pregap"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn raw_mixed_mode_names_stored_pregap_audio_and_multiple_tracks() {
+    let detail = detail_of(
+        "FILE \"disc.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 00 00:00:50\nINDEX 01 00:00:52\n",
+        &[("disc.bin", 2352 * 100)],
+    );
+    assert!(
+        detail.contains("Track 2 has 00:00:02 of source-backed pregap"),
+        "{detail}"
+    );
+    assert!(detail.contains("Track 2 is audio"), "{detail}");
+    assert!(detail.contains("Only a single-track disc"), "{detail}");
+}
+
+#[test]
+fn multiple_file_statements_are_named_and_pregap_stays_per_file() {
+    let detail = detail_of(
+        "FILE \"d.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"a.bin\" BINARY\nTRACK 02 AUDIO\nPREGAP 00:02:00\nINDEX 01 00:00:00\n",
+        &[("d.bin", 2352 * 20), ("a.bin", 2352 * 20)],
+    );
+    assert!(detail.contains("several FILEs"), "{detail}");
+    assert!(
+        detail.contains("Track 2 declares a synthetic PREGAP"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn malformed_ordering_and_index_00_without_index_01_are_refused_without_a_guess() {
+    // INDEX 00 after INDEX 01.
+    refused(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:04\nINDEX 00 00:00:08\n",
+        &[("data.bin", 2048 * 16)],
+    );
+    // INDEX 00 equal to INDEX 01 (zero-length pregap).
+    refused(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:04\nINDEX 01 00:00:04\n",
+        &[("data.bin", 2048 * 16)],
+    );
+    // INDEX 00 with no INDEX 01 at all.
+    refused(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\n",
+        &[("data.bin", 2048 * 16)],
+    );
+    // Track numbering out of order.
+    refused(
+        "FILE \"data.bin\" BINARY\nTRACK 02 MODE1/2048\nINDEX 01 00:00:00\nTRACK 01 AUDIO\nINDEX 01 00:00:08\n",
+        &[("data.bin", 2048 * 16)],
+    );
+}
+
+#[test]
+fn refusal_leaves_the_generic_gate_wording_and_adds_the_specific_reason() {
+    let message = refusal_message(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:02\n",
+        &[("data.bin", 2048 * 16)],
+    );
+    assert!(message.contains("outside the verified layout"), "{message}");
+    assert!(message.contains("layout preservation:"), "{message}");
+    assert!(message.ends_with(']'), "{message}");
+}
+
+#[test]
+fn exact_fingerprint_refuses_every_fact_the_program_hash_does_not_cover() {
+    use crate::optical_fingerprint::{fingerprint_cue_bin, fingerprint_cue_bin_exact};
+    let plain = "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n";
+    let (_dir, cue) = fixture(plain, &[("data.bin", 2048 * 16)]);
+    assert_eq!(
+        fingerprint_cue_bin(&cue).unwrap(),
+        fingerprint_cue_bin_exact(&cue).unwrap()
+    );
+    for (name, text, bytes, needle) in [
+        (
+            "stored",
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:02\n",
+            2048 * 16,
+            "INDEX 00",
+        ),
+        (
+            "synthetic",
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nPREGAP 00:02:00\nINDEX 01 00:00:00\n",
+            2048 * 16,
+            "synthetic PREGAP",
+        ),
+        (
+            "postgap",
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nPOSTGAP 00:02:00\n",
+            2048 * 16,
+            "POSTGAP",
+        ),
+        (
+            "offset",
+            "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:02\n",
+            2048 * 16,
+            "not at the start",
+        ),
+    ] {
+        let (_dir, cue) = fixture(text, &[("data.bin", bytes)]);
+        let error = fingerprint_cue_bin_exact(&cue).unwrap_err().to_string();
+        assert!(error.contains(needle), "{name}: {error}");
+    }
+    // The program-data identity is intentionally unchanged for stored pregap.
+    let (_dir, cue) = fixture(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:02\n",
+        &[("data.bin", 2048 * 16)],
+    );
+    assert!(fingerprint_cue_bin(&cue).is_ok());
+}
+
+#[test]
+fn exact_fingerprint_refuses_data_plus_audio_instead_of_ignoring_the_audio() {
+    use crate::optical_fingerprint::fingerprint_cue_bin_exact;
+    let (_dir, cue) = fixture(
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\nFILE \"a.bin\" BINARY\nTRACK 02 AUDIO\nINDEX 01 00:00:00\n",
+        &[("data.bin", 2352 * 16), ("a.bin", 2352 * 16)],
+    );
+    let error = fingerprint_cue_bin_exact(&cue).unwrap_err().to_string();
+    assert!(error.contains("audio"), "{error}");
+}
+
+#[test]
+fn non_ascii_directive_prefixes_are_refused_without_panicking() {
+    // A multi-byte character straddling a directive-prefix boundary must be a
+    // refusal, not a byte-slice panic, in both the gate and the detail path.
+    for text in [
+        "FILé \"data.bin\" BINARY\n",
+        "FILE \"data.bin\" BINARY\nTRAé 01 MODE1/2048\n",
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nPREGé 00:02:00\nINDEX 01 00:00:00\n",
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEé 01 00:00:00\n",
+        "FILE \"data.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nPOSTGé 00:02:00\n",
+    ] {
+        refused(text, &[("data.bin", 2048 * 16)]);
+    }
+}

@@ -26,7 +26,7 @@ use crate::dat::model::DatChecksum;
 use crate::logical_media::{LogicalMedia, LogicalMediaError};
 use crate::optical_fingerprint::{
     OpticalFingerprintComparison, compare_optical_fingerprints, fingerprint_chd,
-    fingerprint_cue_bin,
+    fingerprint_cue_bin_exact,
 };
 
 /// Fixed memory bound for logical hashing.  CHD hunks are separately bounded
@@ -430,12 +430,12 @@ fn hex(bytes: impl AsRef<[u8]>) -> String {
 
 /// Compare the existing strong single-track CUE/BIN and CHD logical views.
 /// Unsupported multi-track, pregap, audio and specialist layouts are refused
-/// by the existing fingerprint adapters rather than declared equivalent.
+/// by the exact fingerprint adapter rather than declared equivalent.
 pub fn compare_cue_bin_chd_logical(
     cue: &Path,
     chd: &Path,
 ) -> Result<TrackVerificationStatus, String> {
-    let left = fingerprint_cue_bin(cue).map_err(|error| error.to_string())?;
+    let left = fingerprint_cue_bin_exact(cue).map_err(|error| error.to_string())?;
     let right = fingerprint_chd(chd).map_err(|error| error.to_string())?;
     Ok(
         if compare_optical_fingerprints(&left, &right) == OpticalFingerprintComparison::Equivalent {

@@ -163,3 +163,57 @@ fn apply_quarantines_cue_and_bin_together_and_rolls_back() {
     assert!(cue.exists());
     assert!(bin.exists());
 }
+
+fn scan_single_track(cue_text: &str, bin_bytes: &[u8], chd_sectors: &[Vec<u8>]) -> usize {
+    let dir = tempdir().unwrap();
+    let cue = dir.path().join("disc.cue");
+    let bin = dir.path().join("track.bin");
+    let chd = dir.path().join("disc.chd");
+    std::fs::write(&bin, bin_bytes).unwrap();
+    std::fs::write(&cue, cue_text).unwrap();
+    std::fs::write(&chd, chd_for(chd_sectors)).unwrap();
+    let report = scan_optical_equivalent_duplicates(
+        &[cue, chd],
+        &TrustedRoots::from_paths([dir.path()]),
+        None,
+    );
+    report.groups.len()
+}
+
+#[test]
+fn stored_index_00_pregap_is_not_equivalent_to_a_program_only_chd() {
+    // BIN = 2 pregap sectors (0x22) + 2 program sectors (0x11); the CHD holds only the program.
+    let mut bin = vec![0x22u8; 2048 * 2];
+    bin.extend_from_slice(&[0x11u8; 2048 * 2]);
+    let groups = scan_single_track(
+        "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 00 00:00:00\nINDEX 01 00:00:02\n",
+        &bin,
+        &[sector(0x11), sector(0x11)],
+    );
+    assert_eq!(
+        groups, 0,
+        "stored pregap must block quarantine of the CUE/BIN"
+    );
+}
+
+#[test]
+fn requested_pregap_and_postgap_and_unaccounted_leading_sectors_block_equivalence() {
+    let program = [0x11u8; 2048 * 2];
+    let chd = [sector(0x11), sector(0x11)];
+    for text in [
+        "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2048\nPREGAP 00:02:00\nINDEX 01 00:00:00\n",
+        "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nPOSTGAP 00:02:00\n",
+        "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\nINDEX 02 00:00:01\n",
+    ] {
+        assert_eq!(scan_single_track(text, &program, &chd), 0, "{text}");
+    }
+    // Control: the same payload without any gap declaration still groups.
+    assert_eq!(
+        scan_single_track(
+            "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+            &program,
+            &chd
+        ),
+        1
+    );
+}
