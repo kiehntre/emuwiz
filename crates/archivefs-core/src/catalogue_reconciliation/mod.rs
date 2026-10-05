@@ -223,6 +223,7 @@ pub struct RowOutcome {
 pub struct FileOutcome {
     pub path: PathBuf,
     pub source_id: i64,
+    pub size: u64,
     pub state: FileState,
 }
 
@@ -540,6 +541,7 @@ pub fn reconcile_with_companions(
             .map(|(file, state)| FileOutcome {
                 path: file.path.clone(),
                 source_id: file.source_id,
+                size: file.size,
                 state,
             })
             .collect(),

@@ -60,6 +60,17 @@ impl Default for Preferences {
 }
 
 pub(super) enum Command {
+    ReconcileLibrary {
+        library: SharedLibrary,
+        hashes: Arc<super::library_reconciliation::Hashes>,
+        source: super::library_reconciliation::ReconcileSource,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
+    ReconcileHash {
+        roots: Vec<PathBuf>,
+        requests: Vec<PathBuf>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    },
     Load {
         scan: bool,
     },
@@ -202,6 +213,9 @@ pub(super) enum Payload {
     EquivalentScan(Box<super::equivalent_duplicates::EquivalentScan>),
     EquivalentApplied(Box<DuplicateRepairRecord>),
     StorageReview(Box<super::storage_review::StorageReview>),
+    /// `None`: the check was stopped, so there is no new answer.
+    Reconciliation(Option<Arc<super::library_reconciliation::View>>),
+    ReconciliationHashes(super::library_reconciliation::HashRun),
     MediaSetReview(Box<super::media_sets::MediaSetReview>),
     MissingPreview(Box<archivefs_core::catalogue_health::ForgetMissingPlan>),
     MissingApplied(Box<archivefs_core::catalogue_health::ForgetMissingResult>),
@@ -319,6 +333,24 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
         Command::MediaSetReview { library, key } => Ok(Payload::MediaSetReview(Box::new(
             super::media_sets::analyse(&library, key),
         ))),
+        Command::ReconcileLibrary {
+            library,
+            hashes,
+            source,
+            cancel,
+        } => super::library_reconciliation::run_reconcile(&library, &hashes, &source, &cancel),
+        Command::ReconcileHash {
+            roots,
+            requests,
+            cancel,
+        } => {
+            let mut send = |progress| {
+                let _ = answers.send(Event::Progress { id, progress });
+            };
+            Ok(Payload::ReconciliationHashes(
+                super::library_reconciliation::run_hashing(&roots, &requests, &cancel, &mut send),
+            ))
+        }
         Command::StorageReview { library } => Ok(Payload::StorageReview(Box::new(
             super::storage_review::analyse(&library),
         ))),

@@ -21,6 +21,8 @@ pub struct LibraryReconciliation {
     /// How completely each root was walked; a `Partial` root means the file
     /// list for it is a lower bound, never a proof of absence.
     pub roots: Vec<RootWalk>,
+    /// Display paths of the sources in `roots`, by source id.
+    pub root_paths: BTreeMap<i64, PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +168,7 @@ pub fn reconcile_library(
         LibraryReconciliation {
             report: reconcile_with_companions(&rows, &files, &links),
             roots: walk.roots,
+            root_paths: sources.iter().map(|s| (s.id, s.path.clone())).collect(),
         },
     )))
 }

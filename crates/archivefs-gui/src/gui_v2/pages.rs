@@ -551,6 +551,7 @@ impl App {
                         Route::Section(Section::Check) => self.check_games(ui, None),
                         Route::QuickRename => self.quick_rename(ui),
                         Route::PlatformCheck(platform) => self.platform_check(ui, &platform),
+                        Route::LibraryFiles => self.library_files_page(ui),
                         Route::Section(Section::Duplicates) => self.duplicates(ui),
                         Route::Section(Section::Storage) => self.storage_page(ui),
                         Route::Section(Section::MultiDisc) => self.multi_disc_page(ui),
@@ -672,6 +673,7 @@ impl App {
                 ..
             } => GuidancePage::ArchiveInspector,
             Route::PlatformCheck(_) => GuidancePage::CheckGames,
+            Route::LibraryFiles => GuidancePage::ProblemsRepair,
             Route::Section(Section::Dat) | Route::QuickRename => GuidancePage::DatManagement,
             Route::Section(Section::Firmware) => GuidancePage::BiosFirmware,
             Route::Section(Section::Emulators) => GuidancePage::EmulatorSetup,
@@ -1823,6 +1825,14 @@ impl App {
                 );
                 if !self.problem_query.is_empty() && ui.button("Clear").clicked() {
                     self.problem_query.clear();
+                }
+                ui.separator();
+                if ui
+                    .button("Check library files")
+                    .on_hover_text("Library files check: which files EmuWiz has never catalogued, and which entries point at files that are gone. Read-only: nothing is imported, moved or deleted.")
+                    .clicked()
+                {
+                    self.go(Route::LibraryFiles);
                 }
             });
             let problem_query = self.problem_query.trim().to_lowercase();

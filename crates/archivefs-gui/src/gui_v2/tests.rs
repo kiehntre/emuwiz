@@ -71,6 +71,7 @@ fn fixture(context: &egui::Context) -> App {
         screenshots: false,
         check_platform: None,
         activity_attention_only: false,
+        reconcile: Default::default(),
         verification: None,
         verification_job: None,
         duplicate_report: None,
@@ -7979,4 +7980,347 @@ fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_sti
     );
     let unresolved_summary = project(&input, ReadinessFreshness::Current);
     assert!(unresolved_summary.headline.contains("not confirmed"));
+}
+
+// ---- Library files check (read-only reconciliation) ---------------------------
+
+mod library_files_check {
+    use super::*;
+    use crate::gui_v2::library_reconciliation::{
+        HashNote, HashRun, PAGE_SIZE, ReconcileSource, Tab, View, tests::view_of,
+    };
+    use archivefs_core::catalogue_reconciliation::{
+        FileFacts, RowFacts, RowPresence, StrongHash, StrongHashAlgorithm, walk::RootWalkState,
+    };
+
+    fn sha1(n: u8) -> StrongHash {
+        StrongHash::new(StrongHashAlgorithm::Sha1, &format!("{n:02x}").repeat(20)).unwrap()
+    }
+    fn file(path: &str, hashes: Vec<StrongHash>) -> FileFacts {
+        FileFacts {
+            path: path.into(),
+            source_id: 1,
+            size: 4,
+            hashes,
+        }
+    }
+    fn row(id: i64, path: &str, hashes: Vec<StrongHash>) -> RowFacts {
+        RowFacts {
+            archive_id: id,
+            source_id: 1,
+            path: path.into(),
+            size: Some(4),
+            platform: Some("Atari2600".into()),
+            presence: RowPresence::Missing,
+            hashes,
+        }
+    }
+
+    /// An app on the page with `view` already loaded, so no worker ever starts.
+    fn page(context: &egui::Context, view: View) -> App {
+        let mut app = fixture(context);
+        app.reconcile.view = Some(Arc::new(view));
+        app.router.current = Route::LibraryFiles;
+        app
+    }
+    fn render(context: &egui::Context, app: &mut App) -> Vec<String> {
+        text(&frame(context, app, [1280.0, 1600.0]))
+    }
+
+    #[test]
+    fn all_zero_shows_the_success_note_and_a_disabled_hash_action() {
+        let context = egui::Context::default();
+        let mut app = page(
+            &context,
+            view_of(&[], &[], &[], RootWalkState::Complete, &[]),
+        );
+        let strings = render(&context, &mut app);
+        assert!(
+            shows(&strings, "Everything EmuWiz checked is accounted for."),
+            "{strings:?}"
+        );
+        assert!(shows(&strings, "Hash these 0 files to confirm"));
+        assert!(!app.reconcile.hash_enabled());
+        assert!(shows(
+            &strings,
+            "Nothing is added, relinked, renamed, moved or deleted here."
+        ));
+    }
+
+    #[test]
+    fn partial_coverage_is_stated_and_the_success_note_is_withheld() {
+        let context = egui::Context::default();
+        let mut app = page(
+            &context,
+            view_of(&[], &[], &[], RootWalkState::Unavailable, &[]),
+        );
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "Some library locations could not be fully checked."
+        ));
+        assert!(shows(
+            &strings,
+            "Some storage locations could not be checked."
+        ));
+        assert!(!shows(
+            &strings,
+            "Everything EmuWiz checked is accounted for."
+        ));
+    }
+
+    #[test]
+    fn uncatalogued_files_are_paged_and_the_true_total_is_kept() {
+        let context = egui::Context::default();
+        let files: Vec<_> = (0..5_000)
+            .map(|i| file(&format!("/lib/f{i:05}.bin"), vec![]))
+            .collect();
+        let mut app = page(
+            &context,
+            view_of(&[], &files, &[], RootWalkState::Complete, &[]),
+        );
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Showing 1–50 of 5000"), "{strings:?}");
+        let drawn = strings
+            .iter()
+            .filter(|s| s.starts_with("f0") && s.ends_with(".bin"))
+            .count();
+        assert!(drawn <= PAGE_SIZE, "{drawn} rows drawn at once");
+        assert!(shows(&strings, "Files not yet catalogued · 5000"));
+        // The last page is reachable, and an out-of-range page is clamped.
+        app.reconcile.page.insert(Tab::NotCatalogued, 999);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Showing 4951–5000 of 5000"));
+        assert!(shows(&strings, "f04950.bin"));
+        // No platform appears for an uncatalogued file.
+        assert!(!shows(&strings, "System on record"));
+    }
+
+    #[test]
+    fn an_empty_uncatalogued_tab_says_so_and_a_strong_match_offers_review_not_relink() {
+        let context = egui::Context::default();
+        let view = view_of(
+            &[row(1, "/old/Pitfall.bin", vec![sha1(3)])],
+            &[file("/lib/Pitfall (1982).bin", vec![sha1(3)])],
+            &[],
+            RootWalkState::Complete,
+            &[(1, "Pitfall")],
+        );
+        let mut app = page(&context, view);
+        app.reconcile.tab = Some(Tab::StrongMatches);
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "same file at a new location. Its stored checksum matches exactly."
+        ));
+        assert!(shows(&strings, "Review match"));
+        assert!(
+            !shows(&strings, "Relink")
+                && !shows(&strings, "Import")
+                && !shows(&strings, "Bring into catalogue")
+        );
+        app.reconcile.open_item = Some((Tab::StrongMatches, 0));
+        let strings = render(&context, &mut app);
+        assert!(shows(
+            &strings,
+            "Nothing has been changed, and relinking is not available yet."
+        ));
+        assert!(shows(&strings, "/lib/Pitfall (1982).bin"));
+        // The matched file is the only one on disk, so it is listed once as a possible new home.
+        app.reconcile.tab = Some(Tab::Missing);
+        assert!(shows(&render(&context, &mut app), "Nothing here."));
+    }
+
+    #[test]
+    fn the_uncatalogued_empty_state_uses_the_mr_wiz_wording() {
+        let context = egui::Context::default();
+        let view = view_of(
+            &[row(1, "/old/Gone.bin", vec![])],
+            &[],
+            &[],
+            RootWalkState::Complete,
+            &[(1, "Gone")],
+        );
+        let mut app = page(&context, view);
+        app.reconcile.tab = Some(Tab::NotCatalogued);
+        assert!(shows(
+            &render(&context, &mut app),
+            "No uncatalogued library files found."
+        ));
+    }
+
+    #[test]
+    fn the_hash_action_enables_only_when_something_needs_a_checksum() {
+        let context = egui::Context::default();
+        let view = view_of(
+            &[row(1, "/old/Weak.bin", vec![sha1(2)])],
+            &[
+                file("/lib/weak.BIN", vec![]),
+                file("/lib/other.bin", vec![]),
+            ],
+            &[],
+            RootWalkState::Complete,
+            &[(1, "Weak")],
+        );
+        let mut app = page(&context, view);
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Hash these 1 files to confirm"));
+        assert!(app.reconcile.hash_enabled());
+        assert!(shows(&strings, "only when you ask"));
+        // Nothing starts by itself: no job, no hashes.
+        assert!(app.reconcile.hash_job.is_none() && app.reconcile.hashes.is_empty());
+        assert_eq!(app.activity.jobs.len(), 0);
+    }
+
+    #[test]
+    fn a_stopped_hash_run_is_not_reported_as_success_and_does_not_refresh() {
+        let context = egui::Context::default();
+        let mut app = page(
+            &context,
+            view_of(&[], &[], &[], RootWalkState::Complete, &[]),
+        );
+        app.reconcile_hash_done(HashRun {
+            requested: 10,
+            cancelled: true,
+            ..HashRun::default()
+        });
+        assert_eq!(
+            app.reconcile.hash_note,
+            Some(HashNote::Stopped {
+                hashed: 0,
+                requested: 10
+            })
+        );
+        assert!(app.reconcile.job.is_none(), "no refresh was started");
+        let strings = render(&context, &mut app);
+        assert!(shows(&strings, "Stopped before finishing: 0 of 10"));
+        assert!(!shows(&strings, "results refreshed"));
+    }
+
+    #[test]
+    fn a_stopped_check_keeps_the_previous_answer_and_claims_nothing_new() {
+        let context = egui::Context::default();
+        let mut app = page(
+            &context,
+            view_of(
+                &[],
+                &[file("/lib/a.bin", vec![])],
+                &[],
+                RootWalkState::Complete,
+                &[],
+            ),
+        );
+        app.reconcile.job = Some(7);
+        app.reconcile_done(None);
+        assert!(app.reconcile.job.is_none());
+        let view = app.reconcile.view.clone().unwrap();
+        assert_eq!(
+            view.summary.not_catalogued, 1,
+            "the earlier result is untouched"
+        );
+        assert!(app.reconcile.error.is_none());
+    }
+
+    #[test]
+    fn finished_hashing_refreshes_from_a_temporary_catalogue_and_changes_nothing() {
+        use archivefs_core::{Database, scan_and_persist};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("lib");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("stray.xyz"), b"stray").unwrap();
+        let config = archivefs_core::Config {
+            source_folders: vec![root.clone()],
+            mount_root: dir.path().join("mounts"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let mut db = Database::open_or_create(dir.path().join("library.sqlite3")).unwrap();
+        scan_and_persist(&mut db, &config, "test").unwrap();
+        let archives_before = db.load_archives().unwrap();
+
+        let context = egui::Context::default();
+        let mut app = page(
+            &context,
+            view_of(&[], &[], &[], RootWalkState::Complete, &[]),
+        );
+        app.reconcile.source_override = Some(ReconcileSource {
+            database: db.path().to_path_buf(),
+            roots: vec![root.clone()],
+        });
+        let mut hashes = std::collections::BTreeMap::new();
+        hashes.insert(root.join("stray.xyz"), vec![sha1(9)]);
+        app.reconcile_hash_done(HashRun {
+            hashes,
+            requested: 1,
+            ..HashRun::default()
+        });
+        assert!(app.reconcile.job.is_some(), "completion starts a refresh");
+        assert_eq!(
+            app.reconcile.hash_note,
+            Some(HashNote::Done {
+                hashed: 1,
+                unreadable: 0,
+                over_budget: 0
+            })
+        );
+        for _ in 0..400 {
+            app.poll(&context);
+            if app.reconcile.job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.reconcile.job.is_none(), "the refresh finished");
+        assert!(app.reconcile.error.is_none(), "{:?}", app.reconcile.error);
+        let view = app.reconcile.view.clone().unwrap();
+        assert_eq!(view.summary.not_catalogued, 1);
+        // Read-only: nothing was catalogued, relinked or written.
+        assert_eq!(db.load_archives().unwrap(), archives_before);
+        assert_eq!(std::fs::read(root.join("stray.xyz")).unwrap(), b"stray");
+    }
+
+    #[test]
+    fn problems_entry_stays_reachable_and_works_at_compact_window_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        for size in [[1280.0, 720.0], [1024.0, 700.0], [720.0, 800.0]] {
+            let context = egui::Context::default();
+            let mut app = fixture(&context);
+            // Entering the page starts a check; point it at a catalogue that does
+            // not exist so no real catalogue is ever read.
+            app.reconcile.source_override = Some(ReconcileSource {
+                database: dir.path().join("absent.sqlite3"),
+                roots: vec![],
+            });
+            app.go(Route::Section(Section::Problems));
+            let output = frame(&context, &mut app, size);
+            let at = text_pos(&output, "Check library files")
+                .unwrap_or_else(|| panic!("entry not painted at {size:?}"))
+                + egui::vec2(8.0, 8.0);
+            for pressed in [true, false] {
+                frame_with(
+                    &context,
+                    &mut app,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(at),
+                        egui::Event::PointerButton {
+                            pos: at,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                );
+            }
+            assert_eq!(
+                app.router.current,
+                Route::LibraryFiles,
+                "clicking the entry at {size:?} opens the page"
+            );
+            // Entering the page never scans or hashes by itself beyond the
+            // read-only check, and never starts a checksum run.
+            assert!(app.reconcile.hash_job.is_none());
+            assert!(app.reconcile.hashes.is_empty());
+        }
+    }
 }

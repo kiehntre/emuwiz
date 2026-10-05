@@ -778,6 +778,8 @@ pub(super) enum Route {
     /// The platform-first Check My Games flow for one canonical platform, so
     /// the destination already knows which platform the person came from.
     PlatformCheck(String),
+    /// Read-only comparison of the files in the game folders with the catalogue.
+    LibraryFiles,
     Task {
         section: Section,
         game: i64,
@@ -795,6 +797,7 @@ impl Route {
             Self::ReviewIdentity(_) => Section::Check,
             Self::QuickRename => Section::Dat,
             Self::PlatformCheck(_) => Section::Check,
+            Self::LibraryFiles => Section::Problems,
         }
     }
     pub fn game(&self) -> Option<i64> {
@@ -832,6 +835,9 @@ pub(super) fn breadcrumb_labels(route: &Route, game_title: Option<&str>) -> Vec<
     }
     if matches!(route, Route::QuickRename) {
         return vec!["DATs & Verification".into(), "Quick Rename".into()];
+    }
+    if matches!(route, Route::LibraryFiles) {
+        return vec!["Problems & Repair".into(), "Library files check".into()];
     }
     if let Route::PlatformCheck(platform) = route {
         return vec!["Check Games".into(), platform.clone()];

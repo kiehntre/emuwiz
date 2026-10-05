@@ -21,6 +21,7 @@ mod launch_readiness_summary;
 mod legacy;
 pub(crate) mod library;
 mod library_failure;
+mod library_reconciliation;
 mod mame_collection_health;
 mod media_sets;
 mod media_sources;
@@ -331,6 +332,7 @@ pub(super) struct App {
     missing: missing_review::MissingReviewState,
     equiv: equivalent_duplicates::EquivalentState,
     storage: storage_review::StorageState,
+    reconcile: library_reconciliation::ReconcileState,
     multi: media_sets::MultiDiscState,
 }
 
@@ -419,6 +421,7 @@ impl App {
             missing: Default::default(),
             equiv: Default::default(),
             storage: Default::default(),
+            reconcile: Default::default(),
             multi: Default::default(),
         };
         let environment_job = app.activity.queue(
@@ -1567,6 +1570,8 @@ impl App {
                                 }
                                 Payload::MediaSetReview(review) => self.media_sets_done(*review),
                                 Payload::StorageReview(review) => self.storage_review_done(*review),
+                                Payload::Reconciliation(view) => self.reconcile_done(view),
+                                Payload::ReconciliationHashes(run) => self.reconcile_hash_done(run),
                                 Payload::MissingPreview(plan) => {
                                     self.missing.job = None;
                                     self.missing.plan = Some(plan);
@@ -1713,6 +1718,7 @@ impl App {
                             if self.storage.job == Some(id) {
                                 self.storage_review_failed();
                             }
+                            self.reconcile_failed(id, &error);
                             if self.multi.job == Some(id) {
                                 self.media_sets_failed();
                             }
