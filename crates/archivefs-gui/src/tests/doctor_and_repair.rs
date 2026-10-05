@@ -4051,8 +4051,16 @@ fn convert_discs_home_card_lands_on_the_first_class_disc_conversion_page() {
         rendered_text_contains(&output, "Disc Conversion"),
         "the optical conversion page's own heading must render immediately"
     );
-    assert!(rendered_text_contains(&output, "Source folder:"));
+    assert!(rendered_text_contains(
+        &output,
+        "Source folder: No folder selected"
+    ));
     assert!(!rendered_text_contains(&output, "Repair History"));
+    // Fresh entry is read-only: no inferred folder, scan, or conversion.
+    let page = app.optical_conversion_page.as_ref().unwrap();
+    assert!(page.source_root_draft.is_empty());
+    assert!(!page.has_scanned());
+    assert!(!page.has_candidates_or_result());
 }
 
 #[test]

@@ -410,6 +410,16 @@ impl OpticalConversionPageState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_scanned(&self) -> bool {
+        self.scanned
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_candidates_or_result(&self) -> bool {
+        !self.candidates.is_empty() || self.result.is_some() || self.transaction.is_some()
+    }
+
     fn scan(&mut self) {
         self.candidates.clear();
         self.selected = None;
@@ -1078,47 +1088,50 @@ pub(crate) fn show_optical_conversion_page(
         ui.add_space(theme::SECTION_GAP);
     }
 
-    if !state.source_root_draft.trim().is_empty()
-        || state.scanned
-        || state.selected_context.is_some()
-    {
-        widgets::card(ui, |ui| {
-            ui.heading("Source discovery");
-            ui.horizontal_wrapped(|ui| {
-                let source_folder = PathBuf::from(state.source_root_draft.trim());
-                let folder_label = source_folder
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("No folder selected");
-                ui.label(format!("Source folder: {folder_label}"));
-                if ui.button("Choose folder").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
-                {
-                    state.source_root_draft = path.display().to_string();
-                }
-                if ui.button("Find supported files").clicked() {
-                    state.scan();
-                }
-            });
-            widgets::technical_details(ui, ("conversion-source-folder",), |ui| {
-                ui.label("Source folder path:");
-                ui.add_sized(
-                    [ui.available_width().clamp(220.0, 520.0), 24.0],
-                    egui::TextEdit::singleline(&mut state.source_root_draft),
-                );
-            });
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("Scanning and previewing never modifies your files.")
-                        .small()
-                        .color(theme::muted(ui)),
+    // Always shown so a fresh entry has an explicit, visible source selector.
+    widgets::card(ui, |ui| {
+        ui.heading("Source discovery");
+        ui.horizontal_wrapped(|ui| {
+            let source_folder = PathBuf::from(state.source_root_draft.trim());
+            let folder_label = source_folder
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("No folder selected");
+            ui.label(format!("Source folder: {folder_label}"));
+            if ui.button("Choose folder").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                state.source_root_draft = path.display().to_string();
+            }
+            // Never scans on its own: needs a chosen folder and an explicit click.
+            if ui
+                .add_enabled(
+                    !state.source_root_draft.trim().is_empty(),
+                    egui::Button::new("Find supported files"),
                 )
-                .wrap(),
+                .clicked()
+            {
+                state.scan();
+            }
+        });
+        widgets::technical_details(ui, ("conversion-source-folder",), |ui| {
+            ui.label("Source folder path:");
+            ui.add_sized(
+                [ui.available_width().clamp(220.0, 520.0), 24.0],
+                egui::TextEdit::singleline(&mut state.source_root_draft),
             );
         });
-        ui.add_space(theme::SECTION_GAP);
-    }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("Scanning and previewing never modifies your files.")
+                    .small()
+                    .color(theme::muted(ui)),
+            )
+            .wrap(),
+        );
+    });
+    ui.add_space(theme::SECTION_GAP);
     widgets::card(ui, |ui| {
         ui.heading("Conversion safety");
         let mut quarantine = state.source_mode == ChdConversionSourceMode::QuarantineSource;
@@ -1900,6 +1913,83 @@ mod tests {
         ));
         assert!(rendered_text_contains(&output, "Why convert to CHD?"));
         assert!(rendered_text_contains(&output, "Choose source folder"));
+    }
+
+    /// First entry: the source selector is visible with no prior state, and
+    /// rendering never scans, infers a folder, or starts a conversion.
+    #[test]
+    fn fresh_entry_shows_empty_source_selector_without_scanning() {
+        let mut state = OpticalConversionPageState::default();
+        let output = render(&mut state);
+        assert!(rendered_text_contains(
+            &output,
+            "Source folder: No folder selected"
+        ));
+        assert!(rendered_text_contains(&output, "Choose folder"));
+        assert!(rendered_text_contains(&output, "Find supported files"));
+        assert!(state.source_root_draft.is_empty());
+        assert!(!state.scanned);
+        assert!(state.candidates.is_empty());
+        assert!(state.result.is_none() && state.transaction.is_none());
+    }
+
+    /// A remembered source is shown by name, and rendering it does not scan.
+    #[test]
+    fn remembered_source_is_shown_without_rescanning() {
+        let directory = tempfile::tempdir().unwrap();
+        source(directory.path());
+        let mut state = OpticalConversionPageState {
+            source_root_draft: directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let name = directory.path().file_name().unwrap().to_str().unwrap();
+        let output = render(&mut state);
+        assert!(rendered_text_contains(
+            &output,
+            &format!("Source folder: {name}")
+        ));
+        assert!(!state.scanned);
+        assert!(state.candidates.is_empty());
+    }
+
+    /// A selected game fills the source folder from its parent, previews
+    /// nothing until asked, and never scans.
+    #[test]
+    fn selected_context_shows_its_parent_folder_without_scanning() {
+        let directory = tempfile::tempdir().unwrap();
+        let cue = source(directory.path());
+        let mut state = OpticalConversionPageState::default();
+        state.set_selected_context(Some(SelectedConversionContext {
+            path: cue,
+            platform: None,
+        }));
+        let name = directory.path().file_name().unwrap().to_str().unwrap();
+        let output = render(&mut state);
+        assert!(rendered_text_contains(
+            &output,
+            &format!("Source folder: {name}")
+        ));
+        assert!(!state.scanned);
+        assert!(state.candidates.is_empty());
+        assert!(!state.previewed);
+    }
+
+    /// Returning to the page after a scan keeps the source and results.
+    #[test]
+    fn source_selector_persists_after_scanning() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ready_candidate_state(directory.path());
+        let name = directory.path().file_name().unwrap().to_str().unwrap();
+        let first = render(&mut state);
+        let second = render(&mut state);
+        for output in [&first, &second] {
+            assert!(rendered_text_contains(
+                output,
+                &format!("Source folder: {name}")
+            ));
+        }
+        assert_eq!(state.candidates.len(), 1);
+        assert!(state.result.is_none() && state.transaction.is_none());
     }
 
     /// 2. CUE/BIN is listed as supported today.
