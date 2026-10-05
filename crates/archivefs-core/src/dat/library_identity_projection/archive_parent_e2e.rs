@@ -229,6 +229,15 @@ impl Drop for Fixture {
     }
 }
 
+/// An LHA row may now exist and hold a negative whole-file record, but a member
+/// match must never become identity or member provenance.
+fn assert_no_member_identity(row: &Option<PersistedLibraryDatIdentity>) {
+    if let Some(row) = row {
+        assert!(!row.carries_identity(), "{:?}", row.verification_state);
+        assert!(row.archive_member.is_none());
+    }
+}
+
 fn is_verified(row: &Option<PersistedLibraryDatIdentity>) -> bool {
     matches!(
         row.as_ref().map(|row| &row.verification_state),
@@ -826,7 +835,7 @@ fn lha_unix_symlink_is_refused_as_authoritative_member_evidence() {
     assert!(member.verdict.is_none());
     assert!(member.matched_refs.is_empty());
     assert!(!is_verified(&row));
-    assert!(row.is_none(), "no parent row, no verified_single_match");
+    assert_no_member_identity(&row);
     assert_eq!(std::fs::read(&fx.archive).unwrap(), header);
     assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
 }
@@ -868,7 +877,7 @@ fn lha_amiga_links_are_never_authoritative_rom_evidence() {
             assert!(member.evidence.hashes.is_none());
             assert!(member.verdict.is_none());
             assert!(!is_verified(&row));
-            assert!(row.is_none());
+            assert_no_member_identity(&row);
             assert_eq!(std::fs::read(&fx.archive).unwrap(), bytes);
             assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
         }
@@ -883,4 +892,186 @@ fn external_readers_available() -> bool {
         eprintln!("RAR/LHA production audit proof skipped: capable optional 7-Zip unavailable");
     }
     available
+}
+
+// ---------------------------------------------------------------------------
+// LHA/LZH are catalogued library rows (one `ArchiveKind::Lha` each), but parent
+// identity projection stays DISABLED. Enabling it is a separate, deliberate step.
+// ---------------------------------------------------------------------------
+
+/// The projection of an otherwise perfect LHA audit: member exact, pass complete.
+fn parent_member_for(outcome: &DatAuditOutcome) -> Option<String> {
+    super::parent_representative_member(outcome, &outcome.archives[0])
+        .map(|member| member.evidence.member_name_display.clone())
+}
+
+#[test]
+fn lha_is_catalogued_but_parent_projection_stays_disabled() {
+    if !external_readers_available() {
+        return;
+    }
+    assert_eq!(
+        crate::archive_kind(Path::new("Game.lha")),
+        Some(crate::ArchiveKind::Lha)
+    );
+    assert_eq!(
+        crate::archive_kind(Path::new("Game.lzh")),
+        Some(crate::ArchiveKind::Lha)
+    );
+    let mut fx = Fixture::new(
+        Format::Lha,
+        &[("Game.rom", GAME)],
+        &[Dat::Full("Game A", "Game.rom", GAME)],
+    );
+    // The scan in `Fixture::new` now gives the LHA a library row.
+    assert!(
+        fx.database
+            .find_archive_id_by_absolute_path(&fx.archive)
+            .unwrap()
+            .is_some()
+    );
+    let (outcome, row) = fx.run();
+    // Member evidence is exact and the pass complete ...
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(crate::dat::audit::AuditVerdict::Exact { .. })
+    ));
+    assert!(outcome.archives[0].outer_identity.is_some());
+    // ... yet the gate (zip | 7z | rar) excludes it: no parent member, no identity.
+    assert_eq!(parent_member_for(&outcome), None);
+    assert!(!is_verified(&row));
+    assert_no_member_identity(&row);
+    // The same shape for ZIP is still projected (existing behaviour unchanged).
+    let mut zip = Fixture::new(
+        Format::Zip,
+        &[("Game A.sfc", GAME)],
+        &[Dat::Full("Game A (USA)", "Game A.sfc", GAME)],
+    );
+    let (zip_outcome, zip_row) = zip.run();
+    assert!(parent_member_for(&zip_outcome).is_some());
+    assert!(is_verified(&zip_row));
+}
+
+/// Temporary-library production probe: scan one `.lha` and one `.lzh`, reload
+/// the database, audit, persist. Each file has exactly one catalogue row that
+/// survives reload, and no verified identity is projected for either.
+#[test]
+fn lha_and_lzh_are_catalogued_reloaded_and_audited_without_projected_identity() {
+    if !external_readers_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let lha = source.join("Game.lha");
+    let lzh = source.join("Other.lzh");
+    write_lha(&lha, &[("Game.rom", GAME)]);
+    write_lha(&lzh, &[("Other.rom", OTHER)]);
+    let dat_path = root.path().join("fixture.dat");
+    std::fs::write(
+        &dat_path,
+        dat_xml(&[
+            Dat::Full("Game A", "Game.rom", GAME),
+            Dat::Full("Game B", "Other.rom", OTHER),
+        ]),
+    )
+    .unwrap();
+    let db_path = root.path().join("library.sqlite3");
+    {
+        let mut database = Database::open_or_create(&db_path).unwrap();
+        Fixture::scan(&mut database, &source, root.path());
+    }
+    // Reload from disk.
+    let mut database = Database::open_or_create(&db_path).unwrap();
+    let rows = database.load_archives().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.archive_kind == "lha"));
+    let ids: Vec<i64> = [&lha, &lzh]
+        .iter()
+        .map(|path| {
+            database
+                .find_archive_id_by_absolute_path(path)
+                .unwrap()
+                .expect("one row")
+        })
+        .collect();
+
+    let outcome = run_dat_audit_with_cache(
+        &DatAuditRequest {
+            source_id: SOURCE_ID.to_string(),
+            source_display_name: "No-Intro Test".to_string(),
+            dat_path,
+            dat_kind: DatSourceKind::File,
+            scan_root: source.clone(),
+            limits: DatLimits::default(),
+            policy: None,
+            platform: None,
+        },
+        &TrustedRoots::none(),
+        &AtomicBool::new(false),
+        &|_| {},
+        AuditCacheConfig::Disabled,
+    )
+    .unwrap();
+    assert_eq!(outcome.archives.len(), 2);
+    for archive in &outcome.archives {
+        assert_eq!(archive.format, "lha");
+        assert!(archive.outer_identity.is_some());
+        assert!(super::parent_representative_member(&outcome, archive).is_none());
+    }
+    database
+        .persist_library_dat_identities_from_audit(&outcome)
+        .unwrap();
+    for id in ids {
+        // A negative whole-file record may exist; no identity, no member provenance.
+        assert_no_member_identity(
+            &database
+                .library_dat_identity_for_item(id, SOURCE_ID)
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        database.load_archives().unwrap().len(),
+        2,
+        "no duplicate rows after audit"
+    );
+}
+
+/// Pins what a catalogued LHA row stores today, so any change is deliberate:
+/// a member-only DAT stores no identity and no member provenance, while a DAT
+/// that lists the `.lha` FILE itself is ordinary whole-file evidence (the existing
+/// loose-file path), recorded without any archive-member projection.
+#[test]
+fn lha_row_stores_whole_file_evidence_only_never_member_projection() {
+    if !external_readers_available() {
+        return;
+    }
+    let mut fx = Fixture::new(
+        Format::Lha,
+        &[("Game.rom", GAME)],
+        &[Dat::Full("Game A", "Game.rom", GAME)],
+    );
+    let (_, member_row) = fx.run();
+    assert!(matches!(
+        member_row.as_ref().map(|row| &row.verification_state),
+        Some(DatVerificationState::NoMatch)
+    ));
+    assert_no_member_identity(&member_row);
+
+    let bytes = std::fs::read(&fx.archive).unwrap();
+    std::fs::write(
+        &fx.dat_path,
+        dat_xml(&[Dat::Full("Whole Pkg", "Game.lha", &bytes)]),
+    )
+    .unwrap();
+    let (_, whole_row) = fx.run();
+    let whole_row = whole_row.expect("whole-file record");
+    assert!(
+        whole_row.archive_member.is_none(),
+        "whole-file, never a member projection"
+    );
+    assert_eq!(
+        whole_row.canonical.canonical_dat_name.as_deref(),
+        Some("Whole Pkg")
+    );
 }

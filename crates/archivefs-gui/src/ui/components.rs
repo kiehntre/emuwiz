@@ -1072,6 +1072,7 @@ pub(crate) fn archive_kind_name(kind: ArchiveKind) -> &'static str {
         ArchiveKind::Zip => "ZIP",
         ArchiveKind::SevenZip => "7z",
         ArchiveKind::Rar => "RAR",
+        ArchiveKind::Lha => "LHA",
         ArchiveKind::MegaDriveRom => "Mega Drive ROM",
         ArchiveKind::DirectGameImage => "Game image",
         ArchiveKind::ArcadeSetDirectory => "Arcade set",

@@ -219,6 +219,8 @@ pub mod screenscraper_enrichment;
 /// WHDLoad folders, extracted game folders), feeding the existing
 /// identity system rather than replacing it. See the module docs.
 pub mod ingestion;
+#[cfg(test)]
+mod lha_catalogue_tests;
 pub mod registry_parity;
 
 /// Provider-neutral DAT catalogue parsing and read-only audit.
@@ -4067,6 +4069,11 @@ pub enum ArchiveKind {
     Zip,
     SevenZip,
     Rar,
+    /// An LHA/LZH archive (`.lha` and `.lzh` are one format). It is catalogued
+    /// as a library row only: EmuWiz has no LHA mount backend, so it is never
+    /// a mount input, and a row implies neither verified identity nor
+    /// launchability. Member inspection stays on the bounded LHA reader.
+    Lha,
     /// A loose Mega Drive/Genesis ROM. It is catalogued but deliberately
     /// marked unsupported for EmuWiz's archive-mount backend.
     MegaDriveRom,
@@ -4085,6 +4092,7 @@ impl ArchiveKind {
             "zip" => Some(Self::Zip),
             "sevenzip" => Some(Self::SevenZip),
             "rar" => Some(Self::Rar),
+            "lha" => Some(Self::Lha),
             "megadrive_rom" => Some(Self::MegaDriveRom),
             "direct_game_image" => Some(Self::DirectGameImage),
             "arcade_set_directory" => Some(Self::ArcadeSetDirectory),
@@ -4097,6 +4105,7 @@ impl ArchiveKind {
             Self::Zip => "zip",
             Self::SevenZip => "sevenzip",
             Self::Rar => "rar",
+            Self::Lha => "lha",
             Self::MegaDriveRom => "megadrive_rom",
             Self::DirectGameImage => "direct_game_image",
             Self::ArcadeSetDirectory => "arcade_set_directory",
@@ -4111,7 +4120,7 @@ impl ArchiveKind {
     pub fn is_mount_input(self) -> bool {
         !matches!(
             self,
-            Self::MegaDriveRom | Self::DirectGameImage | Self::ArcadeSetDirectory
+            Self::Lha | Self::MegaDriveRom | Self::DirectGameImage | Self::ArcadeSetDirectory
         )
     }
 }
@@ -8127,6 +8136,12 @@ fn ensure_no_symlink_components(path: &Path) -> Result<()> {
 }
 
 fn validate_archive_for_mount(archive: &Archive) -> Result<()> {
+    if archive.kind == ArchiveKind::Lha {
+        return Err(ArchiveFsError::Mount(format!(
+            "LHA/LZH archives are catalogued for library discovery but EmuWiz has no LHA mount backend: {}",
+            archive.path.display()
+        )));
+    }
     if archive.kind == ArchiveKind::MegaDriveRom {
         return Err(ArchiveFsError::Mount(format!(
             "loose Mega Drive ROMs are catalogued for library discovery but are not archive mount inputs: {}",

@@ -504,6 +504,7 @@ fn is_compressed_archive(path: &Path) -> bool {
             archivefs_core::ArchiveKind::Zip
                 | archivefs_core::ArchiveKind::SevenZip
                 | archivefs_core::ArchiveKind::Rar
+                | archivefs_core::ArchiveKind::Lha
         )
     )
 }

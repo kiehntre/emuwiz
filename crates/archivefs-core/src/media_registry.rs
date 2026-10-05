@@ -69,6 +69,17 @@ pub const MEDIA_FORMATS: &[MediaFormat] = &[
         extension: "rar",
         kind: ArchiveKind::Rar,
     },
+    // `.lha`/`.lzh` are one format, so one kind. Registration is a cheap
+    // library row only: no members are read here, no mount backend exists,
+    // and a row grants no identity (see `ArchiveKind::Lha`).
+    MediaFormat {
+        extension: "lha",
+        kind: ArchiveKind::Lha,
+    },
+    MediaFormat {
+        extension: "lzh",
+        kind: ArchiveKind::Lha,
+    },
     // `.smd` (Super Magic Drive dump) is Mega Drive specific and needs no
     // corroboration, unlike `.md`/`.bin`/`.gen` - see
     // `crate::archive_kind_in_root` for the extensions that still require

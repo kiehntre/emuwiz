@@ -3419,6 +3419,7 @@ fn archive_kind_str(kind: ArchiveKind) -> &'static str {
         ArchiveKind::Zip => "zip",
         ArchiveKind::SevenZip => "sevenzip",
         ArchiveKind::Rar => "rar",
+        ArchiveKind::Lha => "lha",
         ArchiveKind::MegaDriveRom => "megadrive_rom",
         ArchiveKind::DirectGameImage => "direct_game_image",
         ArchiveKind::ArcadeSetDirectory => "arcade_set_directory",

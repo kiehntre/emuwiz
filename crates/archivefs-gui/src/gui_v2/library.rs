@@ -9,6 +9,7 @@ pub(super) fn media_kind_label(storage_name: &str) -> &'static str {
         Some(ArchiveKind::Zip) => "ZIP",
         Some(ArchiveKind::SevenZip) => "7z",
         Some(ArchiveKind::Rar) => "RAR",
+        Some(ArchiveKind::Lha) => "LHA",
         Some(ArchiveKind::MegaDriveRom) => "Mega Drive ROM",
         Some(ArchiveKind::DirectGameImage) => "Game image",
         Some(ArchiveKind::ArcadeSetDirectory) => "Arcade set",
