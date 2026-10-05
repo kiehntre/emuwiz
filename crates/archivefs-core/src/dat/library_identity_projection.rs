@@ -24,7 +24,7 @@
 //!
 //! # Archive members: projected to the parent only when unambiguous
 //!
-//! `report.entries` is the per-physical-file comparison, so a ZIP/7z row is
+//! `report.entries` is the per-physical-file comparison, so an archive row is
 //! normally judged by its *outer* hash and lands as `NotInDat` even when its
 //! one ROM member matches exactly. `project_archive_members_onto_parents`
 //! therefore lifts a member result onto the outer archive's row, failing
@@ -224,7 +224,7 @@ fn parent_representative_member<'a>(
 ) -> Option<&'a DatArchiveMemberAudit> {
     if !matches!(archive.completion, ArchivePassCompletion::Complete)
         || archive.outer_identity.is_none()
-        || !matches!(archive.format.as_str(), "zip" | "7z")
+        || !matches!(archive.format.as_str(), "zip" | "7z" | "rar")
     {
         return None;
     }

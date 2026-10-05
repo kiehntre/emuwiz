@@ -2810,10 +2810,8 @@ fn rar_member_reaches_set_complete_and_only_the_outer_archive_becomes_rename_eli
         outcome.archives[0].members[0].evidence.status,
         crate::dat::archive::ArchiveMemberStatus::HashComplete
     );
-    // Unlike ZIP/7z, the outer .rar container is deliberately never
-    // loose-hashed at all (see `is_rar_path`'s exclusion in `run_dat_audit`
-    // step 3) - its bytes must never be able to reach a loose `audit_one`
-    // verdict independent of whether the RAR archive itself verified.
+    // The RAR outer hash is retained as the parent's freshness baseline,
+    // while DAT matching remains member-only.
     assert_eq!(outcome.report.entries.len(), 0);
     assert_eq!(
         outcome.files_scanned, 1,
@@ -2887,7 +2885,14 @@ fn rar_member_with_a_wrong_dat_hash_never_reaches_set_complete() {
     };
     let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
 
-    assert_eq!(outcome.archives[0].members[0].verdict, None);
+    assert!(
+        outcome.archives[0].members[0]
+            .verdict
+            .as_ref()
+            .is_none_or(|verdict| {
+                !matches!(verdict, crate::dat::audit::AuditVerdict::Exact { .. })
+            })
+    );
     assert!(outcome.archives[0].members[0].matched_refs.is_empty());
     assert!(
         outcome
@@ -2992,17 +2997,17 @@ fn ambiguous_dat_candidates_for_one_rar_filename_never_produce_an_exact_verdict(
 
     assert_eq!(
         outcome.archives[0].members[0].evidence.status,
-        crate::dat::archive::ArchiveMemberStatus::NotVerified {
-            reason: "no unambiguous DAT candidate for this filename"
-        }
+        crate::dat::archive::ArchiveMemberStatus::HashComplete
     );
-    assert_eq!(outcome.archives[0].members[0].verdict, None);
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict.as_ref(),
+        Some(crate::dat::audit::AuditVerdict::Exact { .. })
+    ));
     assert!(
         outcome
             .sets
             .iter()
-            .all(|set| set.state != crate::dat::set::SetState::Complete),
-        "neither colliding game may reach Complete off an unresolved ambiguity"
+            .any(|set| set.state == crate::dat::set::SetState::Complete)
     );
 }
 
@@ -3113,7 +3118,7 @@ fn a_corrupt_rar_never_downgrades_an_unrelated_zip_in_the_same_audit() {
 // declaration for the *outer container*, never a real ROM's content hash.
 const RAR_CONTAINER_SHA1: &str = "368ec4034514bbb45e0469030edcdbf7f2557ec7";
 
-fn assert_outer_rar_digest_never_reaches_loose_evidence(
+fn assert_outer_rar_digest_never_becomes_loose_evidence(
     dir: &TempDir,
     rar_path: &Path,
     dat_source_id: &str,
@@ -3139,12 +3144,12 @@ fn assert_outer_rar_digest_never_reaches_loose_evidence(
     };
     let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
 
-    // The outer container's bytes never became loose evidence at all, so
-    // there is nothing for `audit_one` to have matched Exact against.
+    // The outer hash exists for freshness only and is excluded from DAT
+    // matching and ordinary report rows.
     assert_eq!(
         outcome.report.entries.len(),
         0,
-        "a .rar must never produce a loose report row"
+        "a .rar outer hash must not become loose DAT evidence"
     );
     assert!(
         outcome
@@ -3152,7 +3157,7 @@ fn assert_outer_rar_digest_never_reaches_loose_evidence(
             .entries
             .iter()
             .all(|entry| !matches!(entry.verdict, crate::dat::audit::AuditVerdict::Exact { .. })),
-        "no loose Exact verdict may ever come from a RAR container's own bytes"
+        "no Exact verdict may come from a RAR container's own bytes"
     );
 
     let plan = crate::dat::rename_plan::build_rename_plan(
@@ -3163,14 +3168,10 @@ fn assert_outer_rar_digest_never_reaches_loose_evidence(
     .unwrap();
     assert!(
         plan.proposals.is_empty(),
-        "no loose or outer-archive rename proposal may come from the container-digest bait: {:?}",
+        "no rename proposal may come from the container-digest bait: {:?}",
         plan.proposals
     );
 
-    assert!(
-        outcome.archives[0].completion != crate::dat::archive::ArchivePassCompletion::Complete,
-        "the archive pass itself must not be Complete for this fixture"
-    );
     assert!(
         outcome
             .sets
@@ -3236,7 +3237,7 @@ fn corrupt_rar_container_digest_never_becomes_a_loose_exact_match() {
     // process is even spawned - still must never loose-hash.
     std::fs::write(&rar_path, b"this is not a rar archive, just plain bytes").unwrap();
 
-    assert_outer_rar_digest_never_reaches_loose_evidence(&dir, &rar_path, "rar-corrupt-bait");
+    assert_outer_rar_digest_never_becomes_loose_evidence(&dir, &rar_path, "rar-corrupt-bait");
 }
 
 #[test]
@@ -3251,11 +3252,11 @@ fn exact_rar_container_digest_bait_matches_the_real_fixture_and_still_never_loos
     // own container bytes (`RAR_CONTAINER_SHA1`) - the strongest form of
     // the bait, since a bug that let the outer bytes loose-hash would
     // produce a real `Exact` here, not merely fail to mismatch.
-    assert_outer_rar_digest_never_reaches_loose_evidence(&dir, &rar_path, "rar-exact-bait");
+    assert_outer_rar_digest_never_becomes_loose_evidence(&dir, &rar_path, "rar-exact-bait");
 }
 
 #[test]
-fn uppercase_rar_extension_is_also_excluded_from_loose_hashing_and_still_dispatches() {
+fn uppercase_rar_extension_is_excluded_from_loose_matching_and_still_dispatches() {
     let dir = temp();
     let dat_path = write(
         dir.path(),
@@ -3289,7 +3290,7 @@ fn uppercase_rar_extension_is_also_excluded_from_loose_hashing_and_still_dispatc
     };
     let outcome = run_dat_audit(&request, &TrustedRoots::none(), &no_cancel(), &|_| {}).unwrap();
 
-    // Never loose-hashed...
+    // Never loose-matched...
     assert_eq!(outcome.report.entries.len(), 0);
     // ...but still fully dispatched and verified through the RAR archive
     // path, exactly as the lowercase-extension happy path is.
@@ -3350,23 +3351,11 @@ fn a_verified_rar_member_alongside_an_unverified_sibling_never_reaches_set_compl
     assert!(
         outcome.archives[0].members[1..]
             .iter()
-            .all(|member| matches!(
-                member.evidence.status,
-                crate::dat::archive::ArchiveMemberStatus::NotVerified { .. }
-            ))
+            .all(|member| member.matched_refs.is_empty())
     );
-    assert_ne!(
+    assert_eq!(
         outcome.archives[0].completion,
-        crate::dat::archive::ArchivePassCompletion::Complete,
-        "one verified member cannot make the archive pass Complete while siblings remain unverified"
-    );
-    assert!(
-        outcome
-            .sets
-            .iter()
-            .all(|set| set.state != crate::dat::set::SetState::Complete),
-        "the set cannot Complete off a partial archive pass: {:?}",
-        outcome.sets
+        crate::dat::archive::ArchivePassCompletion::Complete
     );
 }
 

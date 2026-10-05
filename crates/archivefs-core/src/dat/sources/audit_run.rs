@@ -708,7 +708,19 @@ pub fn run_dat_audit_with_cache(
         return Err(DatAuditError::Cancelled);
     }
     on_progress(DatAuditProgress::Comparing { files: known.len() });
-    let report = audit_files(&known, &index);
+    // RAR outer hashes are retained in `known_hashes` as the freshness
+    // baseline for safe member projection, but are never treated as loose
+    // DAT ROM evidence. This preserves the archive trust boundary.
+    let report_known = if effective_packing_policy == DatPackingPolicy::FileOnly {
+        known.clone()
+    } else {
+        known
+            .iter()
+            .filter(|evidence| !is_rar_path(Path::new(&evidence.filepath)))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let report = audit_files(&report_known, &index);
     // `forcepacking="fileonly"` (see `DatPackingPolicy::FileOnly`): the
     // archive file itself is the hashed DAT item, already matched above
     // through `known`/`report` (loose-file evidence already includes each
@@ -879,8 +891,8 @@ fn collect_loose_file_evidence(
                 return Err(DatAuditError::Cancelled);
             }
             let defer_container = is_chd_path(path)
-                || is_rar_path(path)
-                || (!include_archive_outers && (is_zip_path(path) || is_sevenz_path(path)));
+                || (!include_archive_outers
+                    && (is_zip_path(path) || is_sevenz_path(path) || is_rar_path(path)));
             if defer_container {
                 let file_name = file_name_of(path);
                 if !include_archive_outers {
@@ -1246,50 +1258,6 @@ fn no_intro_variant_for_catalogue(catalogue: &ParsedDat) -> Option<NoIntroVarian
         .then(|| NoIntroVariant::detect(&catalogue.source.name, &catalogue.source.description))
 }
 
-/// Builds the `index` [`RarArchiveSource::open`] needs to resolve each
-/// member's verification candidate, for a combined multi-catalogue audit.
-///
-/// `RarArchiveSource::open` pre-resolves one expected-hash candidate per
-/// member *by filename* up front (see `dat::archive::rar::candidate_hashes_for`,
-/// which calls only [`DatIndex::lookup_filename`]) - a member with no
-/// candidate is never hashed at all and reports `NotVerified`, never a
-/// fabricated match. A single-catalogue audit already has one natural index
-/// to pass; a combined audit has several. Opening (and hashing) the archive
-/// once per catalogue would be needlessly expensive and would not change
-/// correctness, so this merges every catalogue's `by_filename` entries into
-/// one index instead - only `by_filename` is populated, because that is the
-/// only lookup RAR's candidate resolution ever performs.
-///
-/// This cannot manufacture a false match: `candidate_hashes_for` already
-/// refuses to pick a candidate when a filename's matches disagree on
-/// checksums (see its own doc), so a filename that exists in two catalogues
-/// with *different* expected hashes for the same name still safely resolves
-/// to no candidate (`NotVerified`) exactly as it would be ambiguous within
-/// one oversized DAT file. A filename that agrees across every catalogue
-/// gets hashed, and the per-member exact-agreement merge below
-/// (`merge_combined_evidence`) then independently re-checks that computed
-/// hash against each catalogue's own index, unaffected by this merge.
-fn combined_rar_candidate_index(catalogues: &[LoadedCombinedCatalogue]) -> DatIndex {
-    let mut merged = DatIndex {
-        by_crc32: std::collections::HashMap::new(),
-        by_md5: std::collections::HashMap::new(),
-        by_sha1: std::collections::HashMap::new(),
-        by_sha256: std::collections::HashMap::new(),
-        by_filename: std::collections::HashMap::new(),
-        game_clone_of: std::collections::HashMap::new(),
-    };
-    for catalogue in catalogues {
-        for (filename, refs) in &catalogue.index.by_filename {
-            merged
-                .by_filename
-                .entry(filename.clone())
-                .or_default()
-                .extend(refs.iter().cloned());
-        }
-    }
-    merged
-}
-
 struct CombinedEvidenceResult {
     verdict: AuditVerdict,
     evidence: Vec<DatAuditEvidenceSource>,
@@ -1472,10 +1440,9 @@ fn combined_content_match(
 /// refusal rules (RAR4, solid, encrypted, multivolume, split members, SFX,
 /// symlinks/hardlinks, duplicate paths, alternate streams, zero-size
 /// members, malformed listing all still refuse inside `rar.rs` itself,
-/// completely untouched by this function). The one difference from the
-/// single-catalogue path is what `RarArchiveSource::open`'s `index`
-/// parameter is built from: see [`combined_rar_candidate_index`] for why a
-/// merged, filename-only index is safe here. LHA uses the optional,
+/// completely untouched by this function). RAR streams every bounded
+/// member; exact attribution is performed by each catalogue's ordinary
+/// checksum index. LHA uses the optional,
 /// fd-pinned local 7-Zip backend and is opened only when an exact whole-LHA
 /// catalogue record already matched, or when an enabled catalogue explicitly
 /// contains `.slave` records for the optional internal-evidence path. ZIP
@@ -1493,7 +1460,6 @@ fn audit_combined_archives(
     let mut run_budget = ArchiveRunBudget::new(MAX_ARCHIVE_RUN_LOGICAL_BYTES);
 
     let mut rar_provider: Option<Result<RarProvider, RarError>> = None;
-    let mut rar_candidate_index: Option<DatIndex> = None;
     let mut lha_provider: Option<Result<LhaProvider, LhaError>> = None;
     let may_match_lha_slave = catalogues
         .iter()
@@ -1519,9 +1485,6 @@ fn audit_combined_archives(
         if is_rar_path(path) && rar_provider.is_none() {
             rar_provider = Some(RarProvider::discover(RAR_DISCOVERY_TIMEOUT));
         }
-        if is_rar_path(path) && rar_candidate_index.is_none() {
-            rar_candidate_index = Some(combined_rar_candidate_index(catalogues));
-        }
         if is_lha_path(path) && lha_provider.is_none() {
             lha_provider = Some(LhaProvider::discover(LHA_DISCOVERY_TIMEOUT));
         }
@@ -1537,9 +1500,6 @@ fn audit_combined_archives(
                 Some(Ok(provider)) => RarArchiveSource::open(
                     path,
                     provider,
-                    rar_candidate_index
-                        .as_ref()
-                        .expect("rar_candidate_index is populated above whenever is_rar_path"),
                     ArchiveLimits::default(),
                     RAR_OPEN_TIMEOUT,
                     RAR_MEMBER_TIMEOUT,
@@ -1867,7 +1827,6 @@ fn open_archive_source(
     trusted: &TrustedRoots,
     limits: ArchiveLimits,
     cancel: &AtomicBool,
-    index: &DatIndex,
     rar_provider: Option<&Result<RarProvider, RarError>>,
     lha_provider: Option<&Result<LhaProvider, LhaError>>,
 ) -> Result<Box<dyn ArchiveMemberSource>, ArchiveMemberSourceError> {
@@ -1891,15 +1850,8 @@ fn open_archive_source(
                 });
             }
         };
-        RarArchiveSource::open(
-            path,
-            provider,
-            index,
-            limits,
-            RAR_OPEN_TIMEOUT,
-            RAR_MEMBER_TIMEOUT,
-        )
-        .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
+        RarArchiveSource::open(path, provider, limits, RAR_OPEN_TIMEOUT, RAR_MEMBER_TIMEOUT)
+            .map(|source| Box::new(source) as Box<dyn ArchiveMemberSource>)
     } else if is_lha_path(path) {
         let provider = match lha_provider {
             Some(Ok(provider)) => provider,
@@ -1977,7 +1929,6 @@ fn audit_archives(
             trusted,
             ArchiveLimits::default(),
             cancel,
-            index,
             rar_provider.as_ref(),
             lha_provider.as_ref(),
         ) {
@@ -3439,17 +3390,6 @@ game (
 mod rar_dispatch_tests {
     use super::*;
 
-    fn empty_index() -> DatIndex {
-        DatIndex {
-            by_crc32: std::collections::HashMap::new(),
-            by_md5: std::collections::HashMap::new(),
-            by_sha1: std::collections::HashMap::new(),
-            by_sha256: std::collections::HashMap::new(),
-            by_filename: std::collections::HashMap::new(),
-            game_clone_of: std::collections::HashMap::new(),
-        }
-    }
-
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
     }
@@ -3485,13 +3425,11 @@ mod rar_dispatch_tests {
         // provider at all and confirming the failure is the RAR-specific
         // "not probed" refusal, not a ZIP/7z parser error (which would mean
         // it fell through to the wrong branch).
-        let index = empty_index();
         let error = expect_error(open_archive_source(
             Path::new("/nonexistent/does-not-matter.rar"),
             &TrustedRoots::none(),
             ArchiveLimits::default(),
             &no_cancel(),
-            &index,
             None,
             None,
         ));
@@ -3510,14 +3448,12 @@ mod rar_dispatch_tests {
         // fail-closed shape `audit_archives` already turns into
         // `ArchivePassCompletion::Incomplete { SourceError }` for any format,
         // never `Complete`.
-        let index = empty_index();
         let discovery = Err(RarError::BackendNotFound);
         let error = expect_error(open_archive_source(
             Path::new("/nonexistent/does-not-matter.rar"),
             &TrustedRoots::none(),
             ArchiveLimits::default(),
             &no_cancel(),
-            &index,
             Some(&discovery),
             None,
         ));
@@ -3534,13 +3470,11 @@ mod rar_dispatch_tests {
         // resolves the provider *before* touching the filesystem for RAR,
         // exactly mirroring how ZIP/7z fail on a bad path only after their
         // own `open_bounded_read`.
-        let index = empty_index();
         let error = expect_error(open_archive_source(
             Path::new("/definitely/does/not/exist/anywhere.rar"),
             &TrustedRoots::none(),
             ArchiveLimits::default(),
             &no_cancel(),
-            &index,
             None,
             None,
         ));

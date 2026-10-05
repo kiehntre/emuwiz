@@ -217,10 +217,33 @@ impl RarSession {
         timeout: Duration,
     ) -> Result<RarReadResult, RarError> {
         expected.validate()?;
+        let result = self.read_member_hashes(stable_index, max_output, timeout)?;
+        if !expected.matches(&result.hashes) {
+            return Err(RarError::HashMismatch);
+        }
+        Ok(result)
+    }
+
+    /// Streams one listed member and returns its observed hashes only after
+    /// the backend exits successfully, the exact declared size is received,
+    /// the pinned archive relists identically, and the RAR CRC is accepted by
+    /// 7-Zip. These hashes are evidence, not a DAT verdict: callers must still
+    /// compare them with the authoritative DAT index.
+    pub fn read_member_hashes(
+        &self,
+        stable_index: usize,
+        max_output: u64,
+        timeout: Duration,
+    ) -> Result<RarReadResult, RarError> {
         let selected = self
             .members
             .get(stable_index)
             .ok_or(RarError::MemberNotFound { stable_index })?;
+        if !safe_member_path(&selected.path) {
+            return Err(RarError::UnsupportedArchive {
+                detail: format!("unsafe member path: {}", selected.path),
+            });
+        }
         if selected.size == 0 {
             return Err(RarError::ZeroSizedMember { stable_index });
         }
@@ -291,7 +314,7 @@ impl RarSession {
             received_len,
             selected.size,
             &hashes,
-            expected,
+            None,
         )?;
 
         Ok(RarReadResult {
@@ -832,9 +855,9 @@ fn parse_member_listing(output: &str) -> Result<Vec<RarMember>, RarError> {
                 required_property(&properties, required)?;
             }
             let path = required_property(&properties, "Path")?.to_string();
-            if path.is_empty() || path.chars().any(|character| character.is_ascii_control()) {
-                return Err(RarError::AmbiguousListing {
-                    detail: "empty or control-character-containing member path".to_string(),
+            if !safe_member_path(&path) {
+                return Err(RarError::UnsupportedArchive {
+                    detail: format!("unsafe member path: {path}"),
                 });
             }
             if marker(required_property(&properties, "Folder")?, "Folder")? {
@@ -895,6 +918,11 @@ fn validate_members(members: &[RarMember]) -> Result<(), RarError> {
         if !paths.insert(member.path.clone()) {
             return Err(RarError::DuplicatePath {
                 path: member.path.clone(),
+            });
+        }
+        if !safe_member_path(&member.path) {
+            return Err(RarError::UnsupportedArchive {
+                detail: format!("unsafe member path: {}", member.path),
             });
         }
         if member.encrypted {
@@ -995,7 +1023,7 @@ fn validate_extraction(
     received: u64,
     declared: u64,
     hashes: &ArchiveMemberHashes,
-    expected: &ExpectedMemberHashes,
+    expected: Option<&ExpectedMemberHashes>,
 ) -> Result<(), RarError> {
     if declared == 0 {
         return Err(RarError::ZeroSizedMember { stable_index });
@@ -1012,10 +1040,42 @@ fn validate_extraction(
     if received != declared {
         return Err(RarError::SizeMismatch { declared, received });
     }
-    if !expected.matches(hashes) {
+    if expected.is_some_and(|expected| !expected.matches(hashes)) {
         return Err(RarError::HashMismatch);
     }
     Ok(())
+}
+
+/// Accepts only member names whose normalized path stays inside the archive
+/// root. Backslashes are treated as separators for Windows paths even on
+/// Unix, and drive prefixes/absolute roots are refused on every platform.
+fn safe_member_path(path: &str) -> bool {
+    if path.is_empty() || path.chars().any(char::is_control) {
+        return false;
+    }
+    let normalized = path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return false;
+    }
+    let first = normalized.split('/').next().unwrap_or_default();
+    let bytes = first.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    let mut depth = 0_usize;
+    for component in normalized.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                let Some(parent) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = parent;
+            }
+            _ => depth += 1,
+        }
+    }
+    depth > 0
 }
 
 struct StreamingHashes {
@@ -1060,20 +1120,9 @@ fn hex(bytes: &[u8]) -> String {
 // `ArchiveMemberSource` bridge
 // ---------------------------------------------------------------------
 //
-// RAR's backend is architecturally different from the ZIP/7z readers this
-// trait was designed around: `RarSession::read_member` is a *verify* API
-// (it requires the expected strong hash up front and never returns bytes or
-// a hash unless they match) rather than a *decode* API (ZIP/7z hash every
-// member unconditionally, then match afterward). So a RAR member cannot be
-// blindly hashed the way `zip.rs`/`sevenz.rs` hash first and look up
-// second; instead the DAT candidate to verify against is chosen once, at
-// [`RarArchiveSource::open`], from a narrow filename-only lookup - never by
-// picking a filename match alone as identity (the actual verdict always
-// still comes from `read_member`'s strong-hash gate), and never by guessing
-// among conflicting candidates. A member with no unambiguous candidate, or
-// whose only candidate carries no strong hash, is left
-// [`ArchiveMemberStatus::NotVerified`] - `read_member` is never invoked
-// speculatively.
+// RAR members are streamed through the pinned reader and hashed before the
+// production DAT audit compares those observed hashes with the authoritative
+// index. Filenames never choose or authorize a RAR identity.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1082,19 +1131,15 @@ use super::{
     ArchiveMemberEvidence, ArchiveMemberSource, ArchiveMemberSourceError, ArchiveMemberStatus,
     ArchivePassCompletion, ArchivePassOutcome, ArchivePassStopReason, ArchiveRunBudget,
 };
-use crate::dat::index::DatIndex;
-use crate::dat::model::ChecksumAlgorithm;
+const NESTED_ARCHIVE_EXTENSIONS: &[&str] = &[
+    "zip", "7z", "rar", "lha", "lzh", "tar", "gz", "bz2", "xz", "zst",
+];
 
-const NESTED_ARCHIVE_EXTENSIONS: &[&str] = &["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst"];
-
-/// RAR source opened through a discovered [`RarProvider`], with per-member
-/// DAT verification candidates resolved once at open time.
+/// RAR source opened through a discovered [`RarProvider`]. Every member is
+/// streamed and hashed before the ordinary DAT audit evaluates its evidence.
 pub struct RarArchiveSource {
     session: RarSession,
     limits: ArchiveLimits,
-    /// Parallel to `session.members`, by `stable_index`: the one DAT
-    /// candidate (if any, unambiguous) to verify each member against.
-    candidates: Vec<Option<ExpectedMemberHashes>>,
     member_timeout: std::time::Duration,
 }
 
@@ -1111,13 +1156,11 @@ impl std::fmt::Debug for RarArchiveSource {
 impl RarArchiveSource {
     /// Opens `path` through the already-discovered `provider`, pinning it by
     /// fd for the session's whole lifetime (see [`RarProvider::open`]), and
-    /// resolves each listed member's DAT verification candidate up front
-    /// from `index` - a narrow, filename-only lookup, never trusted as
-    /// identity on its own.
+    /// DAT lookup happens after hashing; member names do not preselect
+    /// candidates.
     pub fn open(
         path: &Path,
         provider: &RarProvider,
-        index: &DatIndex,
         limits: ArchiveLimits,
         open_timeout: Duration,
         member_timeout: Duration,
@@ -1128,15 +1171,9 @@ impl RarArchiveSource {
                 reason: "member count",
             });
         }
-        let candidates = session
-            .members
-            .iter()
-            .map(|member| candidate_hashes_for(index, &member.path))
-            .collect();
         Ok(Self {
             session,
             limits,
-            candidates,
             member_timeout,
         })
     }
@@ -1171,8 +1208,8 @@ impl ArchiveMemberSource for RarArchiveSource {
 
     /// Completeness is coverage, not DAT attribution: a pass is `Complete`
     /// only when *every* member reached [`ArchiveMemberStatus::HashComplete`]:
-    /// a member that is empty, refused by a limit, left `NotVerified` for
-    /// lack of an unambiguous DAT candidate, or that failed verification, is
+    /// a member that is empty, refused by a limit, left `NotVerified` for an
+    /// unsafe path, or whose bytes cannot be read completely, is
     /// exactly as much "not fully accounted for" as a cancelled or
     /// backend-failed pass. This is deliberately stricter than ZIP/7z's own
     /// "independent members, per-member Corrupt" model: unlike a ZIP central
@@ -1198,6 +1235,7 @@ impl ArchiveMemberSource for RarArchiveSource {
         let total_members = self.session.members.len();
         let mut members = Vec::with_capacity(total_members);
         let mut completion = ArchivePassCompletion::Complete;
+        let mut archive_logical = 0_u64;
 
         for member in self.session.members.clone() {
             if cancel.load(Ordering::Relaxed) {
@@ -1224,18 +1262,30 @@ impl ArchiveMemberSource for RarArchiveSource {
                 completion = mark_incomplete_once(completion, member.stable_index, status);
                 continue;
             }
-            let Some(candidate) = self
-                .candidates
-                .get(member.stable_index)
-                .and_then(Option::as_ref)
-            else {
+            if !safe_member_path(&member.path) {
                 let status = ArchiveMemberStatus::NotVerified {
-                    reason: "no unambiguous DAT candidate for this filename",
+                    reason: "unsafe member path",
+                };
+                members.push(self.evidence(&member, status.clone(), None));
+                completion = mark_incomplete_once(completion, member.stable_index, status);
+                continue;
+            }
+            let Some(next_archive_logical) = archive_logical.checked_add(member.size) else {
+                let status = ArchiveMemberStatus::RefusedLimits {
+                    reason: "archive logical budget",
                 };
                 members.push(self.evidence(&member, status.clone(), None));
                 completion = mark_incomplete_once(completion, member.stable_index, status);
                 continue;
             };
+            if next_archive_logical > self.limits.max_archive_logical_bytes {
+                let status = ArchiveMemberStatus::RefusedLimits {
+                    reason: "archive logical budget",
+                };
+                members.push(self.evidence(&member, status.clone(), None));
+                completion = mark_incomplete_once(completion, member.stable_index, status);
+                continue;
+            }
             if !run_budget.try_charge(member.size) {
                 members.push(self.evidence(
                     &member,
@@ -1249,11 +1299,11 @@ impl ArchiveMemberSource for RarArchiveSource {
                 };
                 break;
             }
+            archive_logical = next_archive_logical;
 
-            match self.session.read_member(
+            match self.session.read_member_hashes(
                 member.stable_index,
                 member.size,
-                candidate,
                 self.member_timeout,
             ) {
                 Ok(result) => {
@@ -1269,8 +1319,7 @@ impl ArchiveMemberSource for RarArchiveSource {
                     // extraction child already exited 0 and every relist/
                     // selection consistency check already passed - so this
                     // can only mean this one member's own bytes disagreed
-                    // with either the declared size or the DAT candidate's
-                    // hash. Independent members remain worth examining, but
+                    // with the declared size. Independent members remain worth examining, but
                     // the pass itself can never be `Complete` once any
                     // member fails to verify - see this method's own doc.
                     let status = ArchiveMemberStatus::Corrupt {
@@ -1381,31 +1430,6 @@ fn rar_open_error(error: RarError) -> ArchiveMemberSourceError {
 /// filename matches whose checksums disagree, or a sole match with no
 /// strong hash at all (CRC32-only DAT entries are never a usable
 /// candidate - `ExpectedMemberHashes` structurally has no CRC32 field).
-fn candidate_hashes_for(index: &DatIndex, member_path: &str) -> Option<ExpectedMemberHashes> {
-    let candidates = index.lookup_filename(member_path);
-    let (first, rest) = candidates.split_first()?;
-    let expected = expected_hashes_from(first)?;
-    for other in rest {
-        if expected_hashes_from(other).as_ref() != Some(&expected) {
-            return None;
-        }
-    }
-    Some(expected)
-}
-
-fn expected_hashes_from(rom: &crate::dat::index::DatRomRef) -> Option<ExpectedMemberHashes> {
-    let mut hashes = ExpectedMemberHashes::default();
-    for checksum in &rom.checksums {
-        match checksum.algorithm {
-            ChecksumAlgorithm::Md5 => hashes.md5 = Some(checksum.value.clone()),
-            ChecksumAlgorithm::Sha1 => hashes.sha1 = Some(checksum.value.clone()),
-            ChecksumAlgorithm::Sha256 => hashes.sha256 = Some(checksum.value.clone()),
-            ChecksumAlgorithm::Crc32 => {}
-        }
-    }
-    hashes.validate().is_ok().then_some(hashes)
-}
-
 fn is_nested_name(path: &str) -> bool {
     let Some((_, extension)) = path.rsplit_once('.') else {
         return false;
@@ -1427,6 +1451,29 @@ mod tests {
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar")).join(name)
+    }
+
+    #[test]
+    fn member_paths_reject_unix_windows_and_normalized_traversal() {
+        for unsafe_name in [
+            "../escape.rom",
+            "/absolute.rom",
+            r"C:\\absolute.rom",
+            "D:relative.rom",
+            r"folder\\..\\..\\escape.rom",
+            "folder/../../escape.rom",
+            "../../../../escape.rom",
+        ] {
+            assert!(!safe_member_path(unsafe_name), "accepted {unsafe_name:?}");
+        }
+        assert!(safe_member_path("folder/../game.rom"));
+        assert!(safe_member_path("folder\\game.rom"));
+    }
+
+    #[test]
+    fn lha_and_lzh_are_nested_archive_names_case_insensitively() {
+        assert!(is_nested_name("nested.lha"));
+        assert!(is_nested_name("nested.LZH"));
     }
 
     fn provider() -> RarProvider {
@@ -2193,8 +2240,6 @@ mod tests {
             }
         }
 
-        /// A `DatIndex` with only `by_filename` populated - exactly the one
-        /// lookup `candidate_hashes_for` performs.
         fn index_by_filename(filename: &str, refs: Vec<DatRomRef>) -> DatIndex {
             DatIndex {
                 by_crc32: HashMap::new(),
@@ -2212,12 +2257,11 @@ mod tests {
         fn open_source(
             path: &Path,
             backend: &RarProvider,
-            index: &DatIndex,
+            _index: &DatIndex,
         ) -> Result<RarArchiveSource, ArchiveMemberSourceError> {
             RarArchiveSource::open(
                 path,
                 backend,
-                index,
                 ArchiveLimits::default(),
                 short_timeout(),
                 short_timeout(),
@@ -2232,11 +2276,7 @@ mod tests {
                 vec![rom_ref(
                     "Hello World",
                     "helloworld.txt",
-                    vec![
-                        DatChecksum::parse(ChecksumAlgorithm::Md5, HELLOWORLD_MD5).unwrap(),
-                        DatChecksum::parse(ChecksumAlgorithm::Sha1, HELLOWORLD_SHA1).unwrap(),
-                        DatChecksum::parse(ChecksumAlgorithm::Sha256, HELLOWORLD_SHA256).unwrap(),
-                    ],
+                    vec![DatChecksum::parse(ChecksumAlgorithm::Sha1, HELLOWORLD_SHA1).unwrap()],
                 )],
             );
             let mut source = open_source(
@@ -2263,7 +2303,7 @@ mod tests {
         }
 
         #[test]
-        fn ambiguous_filename_candidates_leave_the_member_unverified_and_poison_the_pass() {
+        fn conflicting_filename_hints_do_not_suppress_streamed_member_hashes() {
             let backend = provider();
             let index = index_by_filename(
                 "helloworld.txt",
@@ -2296,29 +2336,13 @@ mod tests {
             let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
 
             let member = &outcome.members[0];
-            assert!(
-                matches!(member.status, ArchiveMemberStatus::NotVerified { .. }),
-                "conflicting candidates must never be guessed between: {:?}",
-                member.status
-            );
-            assert!(member.hashes.is_none());
-            // A member left unverified is not "fully accounted for" -
-            // completeness is coverage, not DAT attribution (see
-            // `verify_all`'s own doc); the whole pass must reflect that.
-            assert!(
-                matches!(
-                    outcome.completion,
-                    ArchivePassCompletion::Incomplete {
-                        reason: ArchivePassStopReason::MemberRefused { .. }
-                    }
-                ),
-                "an unverified member must poison the pass, not leave it Complete: {:?}",
-                outcome.completion
-            );
+            assert_eq!(member.status, ArchiveMemberStatus::HashComplete);
+            assert_eq!(member.hashes.as_ref().unwrap().sha1, HELLOWORLD_SHA1);
+            assert_eq!(outcome.completion, ArchivePassCompletion::Complete);
         }
 
         #[test]
-        fn crc_only_candidate_is_never_a_usable_verification_target() {
+        fn crc_only_filename_hint_does_not_gate_member_hashing() {
             let backend = provider();
             let index = index_by_filename(
                 "helloworld.txt",
@@ -2338,21 +2362,12 @@ mod tests {
             let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
 
             let member = &outcome.members[0];
-            assert!(
-                matches!(member.status, ArchiveMemberStatus::NotVerified { .. }),
-                "a CRC32-only candidate must never gate `read_member`: {:?}",
-                member.status
-            );
-            assert!(matches!(
-                outcome.completion,
-                ArchivePassCompletion::Incomplete {
-                    reason: ArchivePassStopReason::MemberRefused { .. }
-                }
-            ));
+            assert_eq!(member.status, ArchiveMemberStatus::HashComplete);
+            assert_eq!(outcome.completion, ArchivePassCompletion::Complete);
         }
 
         #[test]
-        fn no_filename_candidate_leaves_the_member_unverified() {
+        fn no_filename_candidate_still_produces_authoritative_hashes() {
             let backend = provider();
             let index = index_by_filename(
                 "completely-unrelated.bin",
@@ -2371,20 +2386,16 @@ mod tests {
 
             let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
 
-            assert!(matches!(
-                outcome.members[0].status,
-                ArchiveMemberStatus::NotVerified { .. }
-            ));
-            assert!(matches!(
-                outcome.completion,
-                ArchivePassCompletion::Incomplete {
-                    reason: ArchivePassStopReason::MemberRefused { .. }
-                }
-            ));
+            assert_eq!(outcome.members[0].status, ArchiveMemberStatus::HashComplete);
+            assert_eq!(
+                outcome.members[0].hashes.as_ref().unwrap().sha1,
+                HELLOWORLD_SHA1
+            );
+            assert_eq!(outcome.completion, ArchivePassCompletion::Complete);
         }
 
         #[test]
-        fn wrong_strong_hash_candidate_fails_closed_as_corrupt_and_poisons_the_pass() {
+        fn wrong_strong_filename_hint_does_not_authorize_or_suppress_hashes() {
             let backend = provider();
             let index = index_by_filename(
                 "helloworld.txt",
@@ -2409,26 +2420,10 @@ mod tests {
 
             let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
 
-            // A single member's own content disagreeing with its one DAT
-            // candidate is content-local (`SizeMismatch`/`HashMismatch` are
-            // only reachable after the extraction child already exited 0
-            // and every relist/selection check already passed), so it is
-            // `Corrupt`, not an archive-wide abort - but it still means the
-            // member was never fully accounted for, so the pass itself can
-            // never be `Complete`.
             let member = &outcome.members[0];
-            assert!(matches!(member.status, ArchiveMemberStatus::Corrupt { .. }));
-            assert!(member.hashes.is_none());
-            assert!(
-                matches!(
-                    outcome.completion,
-                    ArchivePassCompletion::Incomplete {
-                        reason: ArchivePassStopReason::MemberRefused { .. }
-                    }
-                ),
-                "a content-mismatched member must still poison the pass: {:?}",
-                outcome.completion
-            );
+            assert_eq!(member.status, ArchiveMemberStatus::HashComplete);
+            assert_eq!(member.hashes.as_ref().unwrap().sha1, HELLOWORLD_SHA1);
+            assert_eq!(outcome.completion, ArchivePassCompletion::Complete);
         }
 
         #[test]
@@ -2707,11 +2702,9 @@ mod tests {
                 },
                 members,
             };
-            let candidates = session.members.iter().map(|_| None).collect();
             RarArchiveSource {
                 session,
                 limits: ArchiveLimits::default(),
-                candidates,
                 member_timeout: short_timeout(),
             }
         }
@@ -2750,18 +2743,9 @@ mod tests {
         #[test]
         fn a_member_over_the_declared_size_limit_never_lets_the_pass_complete() {
             let backend = provider();
-            let index = index_by_filename(
-                "helloworld.txt",
-                vec![rom_ref(
-                    "Hello World",
-                    "helloworld.txt",
-                    vec![DatChecksum::parse(ChecksumAlgorithm::Sha1, HELLOWORLD_SHA1).unwrap()],
-                )],
-            );
             let mut source = RarArchiveSource::open(
                 &fixture("test_read_format_rar5_stored.rar"),
                 &backend,
-                &index,
                 ArchiveLimits {
                     max_member_logical_bytes: 10, // the real member is 29 bytes
                     ..ArchiveLimits::default()
@@ -2802,21 +2786,10 @@ mod tests {
                     short_timeout(),
                 )
                 .unwrap();
-            let real_member = session.members[0].clone();
             session.members.push(synthetic_member(1, "phantom.bin", 4));
-            let index = index_by_filename(
-                "helloworld.txt",
-                vec![rom_ref(
-                    "Hello World",
-                    "helloworld.txt",
-                    vec![DatChecksum::parse(ChecksumAlgorithm::Sha1, HELLOWORLD_SHA1).unwrap()],
-                )],
-            );
-            let candidates = vec![candidate_hashes_for(&index, &real_member.path), None];
             let mut source = RarArchiveSource {
                 session,
                 limits: ArchiveLimits::default(),
-                candidates,
                 member_timeout: short_timeout(),
             };
 
@@ -2844,13 +2817,10 @@ mod tests {
         }
 
         #[test]
-        fn one_verified_member_alongside_an_unverified_sibling_never_completes() {
+        fn all_members_are_hashed_independently_of_dat_filename_hints() {
             let backend = provider();
-            // Only `test1.bin` gets a real, matching candidate; the other
-            // three genuinely exist in the archive but have no DAT
-            // declaration at all, so they are left `NotVerified` - none of
-            // this requires touching `session.members`, so `test1.bin`'s own
-            // `read_member` call is entirely real and unaffected.
+            // The index has one filename only; all four member streams are
+            // still hashed so the ordinary DAT resolver sees full evidence.
             let index = index_by_filename(
                 "test1.bin",
                 vec![rom_ref(
@@ -2880,29 +2850,13 @@ mod tests {
             let outcome = source.verify_all(&no_cancel(), &mut unlimited_budget());
 
             assert_eq!(outcome.members.len(), 4);
-            assert_eq!(
-                outcome.members[0].status,
-                ArchiveMemberStatus::HashComplete,
-                "test1.bin genuinely verified through a real, uncorrupted session"
-            );
             assert!(
-                outcome.members[1..]
+                outcome
+                    .members
                     .iter()
-                    .all(|member| matches!(member.status, ArchiveMemberStatus::NotVerified { .. })),
-                "{:?}",
-                outcome.members
+                    .all(|member| member.status == ArchiveMemberStatus::HashComplete)
             );
-            assert!(
-                matches!(
-                    outcome.completion,
-                    ArchivePassCompletion::Incomplete {
-                        reason: ArchivePassStopReason::MemberRefused { .. }
-                    }
-                ),
-                "one verified member cannot make a pass Complete while a sibling remains \
-                 unverified: {:?}",
-                outcome.completion
-            );
+            assert_eq!(outcome.completion, ArchivePassCompletion::Complete);
         }
     }
 }

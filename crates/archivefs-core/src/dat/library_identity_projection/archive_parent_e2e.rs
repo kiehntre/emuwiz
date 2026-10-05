@@ -37,6 +37,7 @@ fn sha1_hex(bytes: &[u8]) -> String {
 enum Dat<'a> {
     Full(&'a str, &'a str, &'a [u8]),
     CrcOnly(&'a str, &'a str, &'a [u8]),
+    FilenameOnly(&'a str, &'a str, usize),
 }
 
 fn crc32_hex(bytes: &[u8]) -> String {
@@ -57,6 +58,9 @@ fn dat_xml(entries: &[Dat<'_>]) -> String {
                 bytes.len(),
                 crc32_hex(bytes)
             ),
+            Dat::FilenameOnly(game, rom, size) => {
+                format!(r#"<game name="{game}"><rom name="{rom}" size="{size}"/></game>"#)
+            }
         })
         .collect();
     format!(
@@ -99,6 +103,7 @@ enum Format {
     SevenZ,
     Lha,
     Rar,
+    RarEncrypted,
 }
 
 impl Format {
@@ -108,6 +113,7 @@ impl Format {
             Self::SevenZ => "Game.7z",
             Self::Lha => "Game.lha",
             Self::Rar => "Game.rar",
+            Self::RarEncrypted => "Encrypted.rar",
         }
     }
     fn write(self, path: &Path, members: &[(&str, &[u8])]) {
@@ -115,10 +121,16 @@ impl Format {
             Self::Zip => write_zip(path, members),
             Self::SevenZ => write_7z(path, members),
             Self::Lha => write_lha(path, members),
-            Self::Rar => {
+            Self::Rar | Self::RarEncrypted => {
+                let fixture = if matches!(self, Self::RarEncrypted) {
+                    "test_read_format_rar5_encrypted.rar"
+                } else {
+                    "test_read_format_rar5_stored.rar"
+                };
                 std::fs::copy(
                     Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("tests/fixtures/rar/test_read_format_rar5_stored.rar"),
+                        .join("tests/fixtures/rar")
+                        .join(fixture),
                     path,
                 )
                 .unwrap();
@@ -244,6 +256,24 @@ fn assert_verified_parent(row: &PersistedLibraryDatIdentity, game: &str, rom: &s
     assert_eq!(member.algorithm, "SHA-1");
 }
 
+fn assert_verified_rar_parent(row: &PersistedLibraryDatIdentity, game: &str, rom: &str) {
+    assert_eq!(
+        row.verification_state,
+        DatVerificationState::VerifiedSingleMatch {
+            algorithm: "SHA-1".to_string()
+        }
+    );
+    assert_eq!(row.source.source_id, SOURCE_ID);
+    assert_eq!(row.source.source_revision.as_deref(), Some("20240501"));
+    assert_eq!(row.canonical.canonical_dat_name.as_deref(), Some(game));
+    assert_eq!(row.canonical.canonical_rom_name.as_deref(), Some(rom));
+    assert_eq!(row.hash_evidence.matched_value, Some(sha1_hex(RAR_BYTES)));
+    let member = row.archive_member.as_ref().expect("RAR member provenance");
+    assert_eq!(member.member_name, "helloworld.txt");
+    assert_eq!(member.archive_format, "rar");
+    assert_eq!(member.algorithm, "SHA-1");
+}
+
 // ---- one exact member --------------------------------------------------
 
 fn one_exact(format: Format) {
@@ -269,6 +299,118 @@ fn zip_one_exact_member_verifies_the_parent() {
 #[test]
 fn sevenz_one_exact_member_verifies_the_parent() {
     one_exact(Format::SevenZ);
+}
+
+const RAR_BYTES: &[u8] = b"hello libarchive test suite!\n";
+
+#[test]
+fn rar_exact_checksum_with_matching_name_verifies_parent() {
+    let mut fx = Fixture::new(
+        Format::Rar,
+        &[],
+        &[Dat::Full("RAR Game", "helloworld.txt", RAR_BYTES)],
+    );
+    let before = std::fs::read(&fx.archive).unwrap();
+    let (outcome, row) = fx.run();
+    let row = row.expect("RAR parent identity");
+    assert_verified_rar_parent(&row, "RAR Game", "helloworld.txt");
+    assert_eq!(
+        row.audited_hashes.sha1.as_deref(),
+        Some(sha1_hex(&before).as_str())
+    );
+    assert_eq!(std::fs::read(&fx.archive).unwrap(), before);
+    assert!(outcome.archives[0].outer_identity.is_some());
+}
+
+#[test]
+fn rar_exact_checksum_outranks_different_member_name() {
+    let mut fx = Fixture::new(
+        Format::Rar,
+        &[],
+        &[Dat::Full("RAR Game", "Different DAT Name.rom", RAR_BYTES)],
+    );
+    let (_, row) = fx.run();
+    assert_verified_rar_parent(
+        &row.expect("checksum is authoritative"),
+        "RAR Game",
+        "Different DAT Name.rom",
+    );
+}
+
+#[test]
+fn rar_filename_match_with_wrong_checksum_does_not_verify() {
+    let mut fx = Fixture::new(
+        Format::Rar,
+        &[],
+        &[Dat::Full("RAR Game", "helloworld.txt", b"different bytes")],
+    );
+    let (_, row) = fx.run();
+    assert!(!is_verified(&row));
+}
+
+#[test]
+fn rar_filename_only_dat_entry_does_not_verify() {
+    let mut fx = Fixture::new(
+        Format::Rar,
+        &[],
+        &[Dat::FilenameOnly(
+            "RAR Game",
+            "helloworld.txt",
+            RAR_BYTES.len(),
+        )],
+    );
+    let (_, row) = fx.run();
+    assert!(!is_verified(&row));
+}
+
+#[test]
+fn rar_probable_and_no_match_evidence_do_not_verify() {
+    for dat in [
+        Dat::CrcOnly("RAR Game", "helloworld.txt", RAR_BYTES),
+        Dat::Full("Other Game", "other.rom", b"unrelated"),
+    ] {
+        let mut fx = Fixture::new(Format::Rar, &[], &[dat]);
+        let (_, row) = fx.run();
+        assert!(!is_verified(&row));
+    }
+}
+
+#[test]
+fn rar_conflicting_exact_identities_do_not_verify() {
+    let mut fx = Fixture::new(
+        Format::Rar,
+        &[],
+        &[
+            Dat::Full("RAR Game A", "helloworld.txt", RAR_BYTES),
+            Dat::Full("RAR Game B", "helloworld.txt", RAR_BYTES),
+        ],
+    );
+    let (_, row) = fx.run();
+    assert!(!is_verified(&row));
+}
+
+#[test]
+fn rar_encrypted_member_never_verifies_parent() {
+    let mut fx = Fixture::new(
+        Format::RarEncrypted,
+        &[],
+        &[Dat::Full("RAR Game", "helloworld.txt", RAR_BYTES)],
+    );
+    let (_, row) = fx.run();
+    assert!(!is_verified(&row));
+}
+
+#[test]
+fn rar_corrupt_backend_read_never_verifies_parent() {
+    let mut fx = Fixture::new(
+        Format::Rar,
+        &[],
+        &[Dat::Full("RAR Game", "helloworld.txt", RAR_BYTES)],
+    );
+    std::fs::write(&fx.archive, b"not a RAR archive").unwrap();
+    Fixture::scan(&mut fx.database, &fx.source.clone(), &fx.root.clone());
+    let (_, row) = fx.run();
+    assert!(!is_verified(&row));
 }
 
 // ---- ancillary members -------------------------------------------------
@@ -412,18 +554,35 @@ fn nested_archive_member_is_not_verified() {
 // ---- freshness ----------------------------------------------------------
 
 fn changed_archive_is_stale(format: Format) {
-    let mut fx = Fixture::new(
-        format,
-        &[("Game A.sfc", GAME)],
-        &[Dat::Full("Game A (USA)", "Game A.sfc", GAME)],
-    );
+    let (members, dat) = if matches!(format, Format::Rar) {
+        (
+            &[][..],
+            vec![Dat::Full("RAR Game", "helloworld.txt", RAR_BYTES)],
+        )
+    } else {
+        (
+            &[(&"Game A.sfc"[..], GAME)][..],
+            vec![Dat::Full("Game A (USA)", "Game A.sfc", GAME)],
+        )
+    };
+    let mut fx = Fixture::new(format, members, &dat);
     let (first, row) = fx.run();
     let row = row.expect("verified");
     assert!(is_verified(&Some(row.clone())));
     let id = fx.archive_id();
 
     // Replace the container's contents; the library now knows new hashes.
-    format.write(&fx.archive, &[("Game A.sfc", b"tampered bytes")]);
+    if matches!(format, Format::Rar) {
+        let mut bytes = std::fs::read(&fx.archive).unwrap();
+        let offset = bytes
+            .windows(RAR_BYTES.len())
+            .position(|window| window == RAR_BYTES)
+            .unwrap();
+        bytes[offset] ^= 1;
+        std::fs::write(&fx.archive, bytes).unwrap();
+    } else {
+        format.write(&fx.archive, &[("Game A.sfc", b"tampered bytes")]);
+    }
     let after = fx.audit();
     let current = |outcome: &DatAuditOutcome| {
         let hashes = &outcome.known_hashes[&fx.archive.display().to_string()];
@@ -464,15 +623,17 @@ fn changed_archive_is_stale(format: Format) {
         .unwrap();
     assert_eq!(summary.provenance_freshness, DatProvenanceFreshness::Stale);
 
-    // Re-auditing the changed container replaces the old verified row.
-    fx.database
-        .persist_library_dat_identities_from_audit(&after)
-        .unwrap();
+    // A failed member re-read need not erase historical evidence, but the
+    // changed outer hash makes that stored verification stale at query time.
     let refreshed = fx
         .database
-        .library_dat_identity_for_item(id, SOURCE_ID)
+        .library_dat_identity_summary_for_item(id, SOURCE_ID, Some(&current(&after)), None, true)
+        .unwrap()
         .unwrap();
-    assert!(!is_verified(&refreshed));
+    assert_eq!(
+        refreshed.provenance_freshness,
+        DatProvenanceFreshness::Stale
+    );
 }
 
 #[test]
@@ -483,6 +644,11 @@ fn zip_changed_archive_does_not_stay_current() {
 #[test]
 fn sevenz_changed_archive_does_not_stay_current() {
     changed_archive_is_stale(Format::SevenZ);
+}
+
+#[test]
+fn rar_changed_archive_does_not_stay_current() {
+    changed_archive_is_stale(Format::Rar);
 }
 
 #[test]
@@ -538,7 +704,7 @@ fn write_lha(path: &Path, members: &[(&str, &[u8])]) {
 }
 
 #[test]
-fn rar_lha_baseline_production_audit_and_persistence() {
+fn rar_parent_projection_and_lha_disabled_production_baseline() {
     if !external_readers_available() {
         return;
     }
@@ -570,14 +736,19 @@ fn rar_lha_baseline_production_audit_and_persistence() {
             outcome.archives[0].members[0].verdict,
             Some(crate::dat::audit::AuditVerdict::Exact { .. })
         ));
-        assert!(!is_verified(&row));
+        if matches!(format, Format::Rar) {
+            assert_verified_rar_parent(row.as_ref().unwrap(), "Game A", name);
+            assert!(outcome.archives[0].outer_identity.is_some());
+        } else {
+            assert!(!is_verified(&row), "LHA projection remains disabled");
+        }
         assert_eq!(std::fs::read(&fx.archive).unwrap(), before);
         assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
     }
 }
 
 #[test]
-fn rar_filename_preselection_suppresses_an_authoritative_hash_match() {
+fn rar_checksum_match_with_different_name_reaches_parent_projection() {
     if !external_readers_available() {
         return;
     }
@@ -590,13 +761,16 @@ fn rar_filename_preselection_suppresses_an_authoritative_hash_match() {
     let (outcome, row) = fx.run();
     let member = &outcome.archives[0].members[0];
     assert_eq!(member.evidence.member_name_display, "helloworld.txt");
-    assert!(matches!(
+    assert_eq!(
         member.evidence.status,
-        crate::dat::archive::ArchiveMemberStatus::NotVerified { .. }
+        crate::dat::archive::ArchiveMemberStatus::HashComplete
+    );
+    assert!(member.evidence.hashes.is_some());
+    assert!(matches!(
+        member.verdict,
+        Some(crate::dat::audit::AuditVerdict::Exact { .. })
     ));
-    assert!(member.evidence.hashes.is_none());
-    assert!(member.verdict.is_none());
-    assert!(!is_verified(&row));
+    assert_verified_rar_parent(row.as_ref().unwrap(), "Game A", "renamed.rom");
 }
 
 #[test]
