@@ -874,6 +874,12 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
         matched,
         dat_verified,
     };
+    // A saved exact DAT match is verified: nobody confirms it.
+    for (archive_id, ecosystem) in database.library_dat_exact_matches().unwrap_or_default() {
+        if let Some(index) = library.by_id.get(&archive_id).copied() {
+            library.games[index].mark_dat_exact(ecosystem);
+        }
+    }
     for enrichment in database
         .load_screenscraper_enrichments()
         .map_err(|error| error.to_string())?

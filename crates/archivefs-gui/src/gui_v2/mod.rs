@@ -1,4 +1,6 @@
 //! Native EmuWiz GUI v2 presentation layer.
+#[cfg(test)]
+mod dat_exact_tests;
 mod activity;
 mod archive_inspector;
 mod artwork;

@@ -99,6 +99,9 @@ pub(super) struct Game {
     pub title: String,
     pub platform: String,
     pub identified: bool,
+    /// A saved DAT audit found exactly one exact hash match for this game.
+    /// The inner label is the DAT's ecosystem when the saved row records one.
+    pub dat_exact: Option<Option<&'static str>>,
     pub attention: bool,
     pub screenscraper:
         Option<archivefs_core::screenscraper_enrichment::PersistedScreenScraperEnrichment>,
@@ -126,6 +129,7 @@ impl Game {
             title,
             platform,
             identified,
+            dat_exact: None,
             attention,
             screenscraper: None,
             search,
@@ -141,7 +145,24 @@ impl Game {
         }
     }
 
+    /// Records a saved exact DAT match. It makes the game identified with no
+    /// confirmation step, whatever a scan-time report said.
+    pub fn mark_dat_exact(&mut self, ecosystem: Option<&'static str>) {
+        self.identified = true;
+        self.dat_exact = Some(ecosystem);
+    }
+
+    /// "Exact No-Intro match" (or "Exact DAT match" when the saved row does
+    /// not record which catalogue it came from).
+    pub fn dat_exact_label(&self) -> Option<String> {
+        self.dat_exact
+            .map(|ecosystem| format!("Exact {} match", ecosystem.unwrap_or("DAT")))
+    }
+
     pub fn identity_summary(&self) -> &'static str {
+        if self.dat_exact.is_some() {
+            return "Verified";
+        }
         let Some(report) = self.archive.identity_report.as_ref() else {
             return "Unknown";
         };

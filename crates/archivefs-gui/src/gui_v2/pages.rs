@@ -2451,7 +2451,11 @@ impl App {
             }
             ui.add_space(theme::SPACE_MD);
             ui.collapsing("Advanced details", |ui| {
-                ui.label(if game.identified { "Identified in the saved game list" } else { "Identity is not confirmed" });
+                ui.label(match game.dat_exact_label() {
+                    Some(label) => label,
+                    None if game.identified => "Identified in the saved game list".to_string(),
+                    None => "Identity is not confirmed".to_string(),
+                });
                 ui.monospace(format!("Source: {}", game.archive.relative_path.display()));
                 ui.monospace(format!("Media kind: {}", game.archive.archive_kind));
                 for old in library.historical_for(id) {

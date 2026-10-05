@@ -6645,29 +6645,45 @@ impl Database {
         library_dat_identity_for_item_conn(&self.connection, archive_id, dat_source_id)
     }
 
-    /// Library items whose current, non-stale DAT audit found exactly one
-    /// cryptographic-hash match. A pure read of rows an audit already wrote:
-    /// nothing is hashed, matched or inferred here, and a CRC-only
-    /// (`probable`), filename-only, ambiguous, conflicting or no-match row is
-    /// never included.
-    pub fn library_dat_verified_archive_ids(&self) -> Result<std::collections::HashSet<i64>> {
+    /// Archives whose current DAT identity is one exact hash match
+    /// (`verified_single_match`, not marked stale), with the DAT ecosystem's
+    /// display label when every such row agrees on one. A probable,
+    /// ambiguous, filename-only or no-match row never appears here.
+    pub fn library_dat_exact_matches(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, Option<&'static str>>> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT DISTINCT archive_id FROM library_dat_identities \
+                "SELECT archive_id, dat_ecosystem FROM library_dat_identities \
                  WHERE verification_state = 'verified_single_match' AND revision_marked_stale = 0",
             )
-            .map_err(|error| db_error("failed to prepare DAT-verified archive query", error))?;
+            .map_err(|error| db_error("failed to prepare exact DAT match query", error))?;
         let rows = statement
-            .query_map([], |row| row.get::<_, i64>(0))
-            .map_err(|error| db_error("failed to query DAT-verified archives", error))?;
-        let mut ids = std::collections::HashSet::new();
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .map_err(|error| db_error("failed to query exact DAT matches", error))?;
+        let mut matches = std::collections::HashMap::new();
         for row in rows {
-            ids.insert(
-                row.map_err(|error| db_error("failed to read DAT-verified archive", error))?,
-            );
+            let (archive_id, ecosystem) =
+                row.map_err(|error| db_error("failed to read exact DAT match", error))?;
+            let label = ecosystem
+                .and_then(|text| {
+                    serde_json::from_value::<crate::dat::model::DatEcosystem>(text.into()).ok()
+                })
+                .map(crate::dat::model::DatEcosystem::label);
+            // Two exact rows from different ecosystems: name neither.
+            matches
+                .entry(archive_id)
+                .and_modify(|seen: &mut Option<&'static str>| {
+                    if *seen != label {
+                        *seen = None;
+                    }
+                })
+                .or_insert(label);
         }
-        Ok(ids)
+        Ok(matches)
     }
 
     /// Persists per-library-item DAT identity rows from one completed,
@@ -17236,7 +17252,8 @@ mod tests {
                 "UPDATE library_dat_identities SET revision_marked_stale = 1 WHERE archive_id = ?1",
                 params![stale],
             ).unwrap();
-            let ids = database.library_dat_verified_archive_ids().unwrap();
+            let ids: std::collections::HashSet<i64> =
+                database.library_dat_exact_matches().unwrap().into_keys().collect();
             assert_eq!(ids, std::collections::HashSet::from([good]));
             database.close().unwrap();
             let _ = fs::remove_dir_all(&root);

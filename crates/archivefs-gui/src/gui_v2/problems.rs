@@ -667,6 +667,7 @@ pub(in crate::gui_v2) mod tests {
             title: title.into(),
             platform: "Arcade".into(),
             identified,
+            dat_exact: None,
             attention: missing,
             screenscraper: None,
             search: title.to_lowercase(),
