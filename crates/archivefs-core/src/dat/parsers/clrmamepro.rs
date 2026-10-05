@@ -33,6 +33,14 @@ use super::super::parser::{DiagnosticSeverity, ParseError, ParseOutcome, ParseWa
 use encoding_rs::WINDOWS_1252;
 
 pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
+    parse_clrmamepro_with_sink(path, limits, super::EntrySink::collect())
+}
+
+pub(super) fn parse_clrmamepro_with_sink(
+    path: &Path,
+    limits: DatLimits,
+    mut games: super::EntrySink<'_>,
+) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
@@ -69,7 +77,6 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
     let mut author: Option<String> = None;
     let mut clrmamepro_header: Vec<String> = Vec::new();
 
-    let mut games: Vec<DatGameEntry> = Vec::new();
     let mut in_clrmamepro = false;
     let mut in_game = false;
     let mut in_rom = false;
@@ -463,13 +470,16 @@ pub fn parse_clrmamepro(path: &Path, limits: DatLimits) -> Result<ParseOutcome, 
             Some(clrmamepro_header.join("\n"))
         },
         entry_count: games.len(),
-        rom_count: games.iter().map(|g| g.roms.len()).sum(),
+        rom_count: games.rom_count(),
         parse_warnings: warnings.iter().map(|w| w.to_string()).collect(),
         packing_policy: DatPackingPolicy::Standard,
     };
 
     Ok(ParseOutcome {
-        dat: ParsedDat { source, games },
+        dat: ParsedDat {
+            source,
+            games: games.into_games(),
+        },
         warnings,
     })
 }
@@ -706,7 +716,7 @@ fn emit_game(
     clone_of: &mut Option<String>,
     fidelity: &mut CurrentGameFidelity,
     roms: &mut Vec<DatRomEntry>,
-    games: &mut Vec<DatGameEntry>,
+    games: &mut super::EntrySink<'_>,
     limits: &DatLimits,
 ) -> Result<(), ParseError> {
     let fidelity = std::mem::take(fidelity);
@@ -759,7 +769,7 @@ fn emit_game(
             // NeedsReview by `dat::set` until this parser can prove complete
             // set-structure observation.
             unsupported_structure: true,
-        });
+        })?;
     }
     Ok(())
 }

@@ -37,6 +37,14 @@ use super::super::parser::{ParseError, ParseOutcome, ParseWarning};
 use super::super::trusted_dtd::{self, classify_doctype, describe_doctype_outcome};
 
 pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
+    parse_logiqx_with_sink(path, limits, super::EntrySink::collect())
+}
+
+pub(super) fn parse_logiqx_with_sink(
+    path: &Path,
+    limits: DatLimits,
+    mut games: super::EntrySink<'_>,
+) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
@@ -74,7 +82,6 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
     // the recognised values.
     let mut packing_policy = DatPackingPolicy::Standard;
 
-    let mut games: Vec<DatGameEntry> = Vec::new();
     let mut current_game_name: Option<String> = None;
     let mut current_game_desc: Option<String> = None;
     let mut current_game_year: Option<String> = None;
@@ -254,7 +261,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
                             &mut current_parts,
                             &mut current_part,
                             &mut games,
-                        );
+                        )?;
                         if games.len() >= limits.max_entries {
                             return Err(ParseError::EntryLimitExceeded {
                                 count: games.len(),
@@ -1166,7 +1173,7 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         &mut current_parts,
         &mut current_part,
         &mut games,
-    );
+    )?;
 
     let ecosystem = detect_logiqx_ecosystem(
         is_software_list,
@@ -1189,28 +1196,16 @@ pub fn parse_logiqx(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pars
         homepage,
         clrmamepro_header,
         entry_count: games.len(),
-        rom_count: games
-            .iter()
-            .map(|game| {
-                game.roms.len()
-                    + game
-                        .parts
-                        .iter()
-                        .map(|part| {
-                            part.data_areas
-                                .iter()
-                                .map(|area| area.roms.len())
-                                .sum::<usize>()
-                        })
-                        .sum::<usize>()
-            })
-            .sum(),
+        rom_count: games.rom_count(),
         parse_warnings: warnings.iter().map(|w| w.to_string()).collect(),
         packing_policy,
     };
 
     Ok(ParseOutcome {
-        dat: ParsedDat { source, games },
+        dat: ParsedDat {
+            source,
+            games: games.into_games(),
+        },
         warnings,
     })
 }
@@ -1403,8 +1398,8 @@ fn drop_current_game(
     bios_sets: &mut Vec<DatBiosSetEntry>,
     parts: &mut Vec<DatPartEntry>,
     current_part: &mut Option<DatPartEntry>,
-    games: &mut Vec<DatGameEntry>,
-) {
+    games: &mut super::EntrySink<'_>,
+) -> Result<(), ParseError> {
     // Taken unconditionally, not just on the `Some(name)` path below: this is
     // what resets the flag for the *next* game regardless of whether the
     // just-finished one ever got a name.
@@ -1440,7 +1435,7 @@ fn drop_current_game(
             mame_input: None,
             content_classification: DatContentClassification::unknown(),
             unsupported_structure: had_unsupported_structure,
-        });
+        })?;
     } else {
         year.take();
         manufacturer.take();
@@ -1456,6 +1451,7 @@ fn drop_current_game(
         bios_sets.clear();
         parts.clear();
     }
+    Ok(())
 }
 
 fn trimmed(text: &str) -> String {

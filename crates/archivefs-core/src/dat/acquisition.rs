@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::dat::limits::DatLimits;
 use crate::dat::model::DatEcosystem;
-use crate::dat::parsers::parse_dat_file;
+use crate::dat::parsers::visit_dat_file_raw;
 use crate::identity_source::managed_snapshot::{
     ActivationPreview, ActivationResult, HttpsManagedSourceTransport, ManagedSourceDescriptor,
     ManagedSourceKind, ManagedSourceMetadata, ManagedSourceReference, ManagedSourceStore,
@@ -215,14 +215,14 @@ struct ParsedDatSummary {
 }
 
 fn parse_staged_dat(path: &Path) -> Result<ParsedDatSummary> {
-    let parsed = parse_dat_file(path, DatLimits::default())
+    let parsed = visit_dat_file_raw(path, DatLimits::default(), &mut |_| Ok(()))
         .map_err(|error| ArchiveFsError::Config(error.to_string()))?;
-    let crate::dat::parser::ParseOutcome { dat, warnings } = parsed;
+    let crate::dat::parsers::DatStreamSummary { source, warnings } = parsed;
     Ok(ParsedDatSummary {
-        ecosystem: dat.source.ecosystem,
-        entry_count: dat.source.entry_count,
-        version: dat.source.version,
-        name: dat.source.name,
+        ecosystem: source.ecosystem,
+        entry_count: source.entry_count,
+        version: source.version,
+        name: source.name,
         warnings: warnings
             .into_iter()
             .map(|warning| warning.message)

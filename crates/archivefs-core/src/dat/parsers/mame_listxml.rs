@@ -19,6 +19,14 @@ use crate::dat::model::{
 use crate::dat::parser::{ParseError, ParseOutcome, ParseWarning};
 
 pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
+    parse_mame_listxml_with_sink(path, limits, super::EntrySink::collect())
+}
+
+pub(super) fn parse_mame_listxml_with_sink(
+    path: &Path,
+    limits: DatLimits,
+    mut games: super::EntrySink<'_>,
+) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
@@ -36,7 +44,6 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
     })?;
     let mut reader = Reader::from_reader(BufReader::with_capacity(64 * 1024, file));
     let mut warnings = Vec::new();
-    let mut games = Vec::new();
     let mut buf = Vec::new();
     let mut depth = 0usize;
     let mut in_machine = false;
@@ -102,7 +109,7 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
                     if let Some(game) =
                         Machine::from_attrs(&e, &mut warnings, limits.max_warnings).finish()
                     {
-                        games.push(game);
+                        games.push(game)?;
                     } else {
                         warn(
                             &mut warnings,
@@ -126,7 +133,7 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
                     in_machine = false;
                     if let Some(machine) = current.take() {
                         if let Some(game) = machine.finish() {
-                            games.push(game)
+                            games.push(game)?
                         } else {
                             warn(
                                 &mut warnings,
@@ -183,11 +190,11 @@ pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome
                 homepage: None,
                 clrmamepro_header: None,
                 entry_count: games.len(),
-                rom_count: games.iter().map(|g| g.roms.len()).sum(),
+                rom_count: games.rom_count(),
                 parse_warnings: warnings.into_iter().map(|w| w.to_string()).collect(),
                 packing_policy: DatPackingPolicy::Standard,
             },
-            games,
+            games: games.into_games(),
         },
         warnings: Vec::new(),
     })

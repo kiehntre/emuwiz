@@ -100,6 +100,18 @@ pub struct ExpectedDatInventoryProjection {
 }
 
 impl ExpectedDatInventoryProjection {
+    /// Save/restore only the records contributed by one provisional file.
+    pub(crate) fn checkpoint(&self) -> (usize, usize) {
+        (self.entries.len(), self.duplicate_names_skipped)
+    }
+
+    pub(crate) fn rollback_to(&mut self, checkpoint: (usize, usize)) {
+        for entry in self.entries.drain(checkpoint.0..) {
+            self.seen.remove(&entry.canonical_identity);
+        }
+        self.duplicate_names_skipped = checkpoint.1;
+    }
+
     /// Merges `games` into this projection, keeping every name already seen
     /// (across every DAT file already folded in) unique. Called once per
     /// file in a folder source, so a duplicate spanning two files in the

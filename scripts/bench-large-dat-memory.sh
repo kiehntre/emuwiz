@@ -8,7 +8,7 @@ dir=${DIR:-/tmp/emuwiz-largedat}
 sizes=("$@"); [ ${#sizes[@]} -gt 0 ] || sizes=(100000 500000 1000000)
 for n in "${sizes[@]}"; do
   [ -f "$dir/synthetic-$n.dat" ] || "$bin" gen "$dir" "$n" >/dev/null
-  for mode in parse persist index; do
+  for mode in parse stream persist index; do
     out=$( { /usr/bin/time -v "$bin" "$mode" "$dir" "$n"; } 2>&1 )
     rss=$(awk '/Maximum resident/{print $NF}' <<<"$out")
     wall=$(awk '/Elapsed \(wall/{print $NF}' <<<"$out")

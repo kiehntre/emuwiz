@@ -51,7 +51,7 @@ use super::{
 use crate::dat::limits::DatLimits;
 use crate::dat::model::{DatEcosystem, DatFormat};
 use crate::dat::parser::DiagnosticSeverity;
-use crate::dat::parsers::parse_dat_file;
+use crate::dat::parsers::visit_dat_file_raw;
 
 /// How many DAT files one folder source will take.
 ///
@@ -613,15 +613,16 @@ pub fn validate_dat_source(
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
-        let outcome = match parse_dat_file(path, limits) {
+        let checkpoint = expected.checkpoint();
+        let parsed = visit_dat_file_raw(path, limits, &mut |game| {
+            expected.extend_from(std::slice::from_ref(&game));
+            Ok(())
+        });
+        let outcome = match parsed {
             Ok(parsed) => {
-                let source = &parsed.dat.source;
+                let source = &parsed.source;
                 report.entry_count = report.entry_count.saturating_add(source.entry_count);
                 report.rom_count = report.rom_count.saturating_add(source.rom_count);
-                // The same parse already produced `parsed.dat.games` - this
-                // is a projection of it, never a second parse. See
-                // `crate::dat::expected_inventory`'s doc.
-                expected.extend_from(&parsed.dat.games);
                 let label = source.format.label().to_string();
                 if !formats.contains(&label) {
                     formats.push(label);
@@ -681,6 +682,7 @@ pub fn validate_dat_source(
                 }
             }
             Err(error) => {
+                expected.rollback_to(checkpoint);
                 failures += 1;
                 DatFileOutcome::Failed {
                     error: error.to_string(),

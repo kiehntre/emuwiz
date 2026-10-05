@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! dat_memory_bench gen    <dir> <records>   # write <dir>/synthetic-<records>.dat
+//! dat_memory_bench stream <dir> <records>  # visitor discards each record
 //! dat_memory_bench parse  <dir> <records>
 //! dat_memory_bench persist <dir> <records>  # validate_dat_source + replace_expected_dat_inventory
 //! dat_memory_bench index  <dir> <records>   # parse + DatIndex::build + lookups
@@ -20,7 +21,7 @@ use std::time::Instant;
 use archivefs_core::Database;
 use archivefs_core::dat::index::DatIndex;
 use archivefs_core::dat::limits::DatLimits;
-use archivefs_core::dat::parsers::parse_dat_file;
+use archivefs_core::dat::parsers::{parse_dat_file, visit_dat_file_raw};
 use archivefs_core::dat::sources::validation::validate_dat_source;
 use archivefs_core::dat::sources::{DatSourceEntry, DatSourceKind};
 
@@ -190,6 +191,18 @@ fn main() {
         "gen" => {
             gen_main(&dir, records);
             report("gen", t0);
+        }
+        "stream" => {
+            let mut count = 0usize;
+            let summary = visit_dat_file_raw(&dat_path(&dir, records), limits(), &mut |_| {
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(count, records);
+            assert_eq!(summary.source.entry_count, records);
+            println!("games={count}");
+            report("stream", t0);
         }
         "parse" => {
             let outcome = parse_dat_file(&dat_path(&dir, records), limits()).unwrap();

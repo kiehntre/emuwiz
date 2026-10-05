@@ -30,13 +30,54 @@ use super::parser::{ParseError, ParseOutcome};
 pub mod clrmamepro;
 pub mod logiqx;
 pub mod mame_listxml;
-
-use clrmamepro::parse_clrmamepro;
-use logiqx::parse_logiqx;
-use mame_listxml::parse_mame_listxml;
+mod sink;
+use sink::EntrySink;
 
 /// Sniffs the given file path and parses it with the appropriate parser.
 pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
+    let mut outcome = parse_with_sink(path, limits, EntrySink::collect())?;
+    super::classification::classify_catalogue(&mut outcome.dat);
+    Ok(outcome)
+}
+
+/// Final source metadata and diagnostics from incremental parsing.
+#[derive(Debug)]
+pub struct DatStreamSummary {
+    pub source: super::model::DatSource,
+    pub warnings: Vec<super::parser::ParseWarning>,
+}
+
+/// Visits entries in source order without retaining the catalogue.
+///
+/// Entries carry the same raw fields as the format-specific parsers. Content
+/// classification is not applied: it depends on final source metadata, which
+/// can appear after entries. Identity/matching callers should continue using
+/// `parse_dat_file`. This API is for projections and validation.
+///
+/// The visitor may report progress by counting entries, or return an error to
+/// stop parsing. Delivered entries are provisional until this function returns
+/// successfully; a malformed tail or visitor failure must not publish a partial
+/// generation. Truncation diagnostics retain each parser's existing semantics.
+/// Memory is the reader/event buffers, current entry and bounded diagnostics,
+/// plus anything the visitor chooses to retain. XML events and individual
+/// records can still be large; existing input and field limits apply.
+pub fn visit_dat_file_raw(
+    path: &Path,
+    limits: DatLimits,
+    visitor: &mut dyn FnMut(super::model::DatGameEntry) -> Result<(), ParseError>,
+) -> Result<DatStreamSummary, ParseError> {
+    let outcome = parse_with_sink(path, limits, EntrySink::visit(visitor))?;
+    Ok(DatStreamSummary {
+        source: outcome.dat.source,
+        warnings: outcome.warnings,
+    })
+}
+
+fn parse_with_sink(
+    path: &Path,
+    limits: DatLimits,
+    sink: EntrySink<'_>,
+) -> Result<ParseOutcome, ParseError> {
     let metadata = std::fs::metadata(path).map_err(|error| ParseError::Io {
         path: path.to_path_buf(),
         error,
@@ -50,8 +91,7 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
     let size = metadata.len();
     if size == 0 {
         // Empty file: try ClrMamePro (produces empty result), Logiqx would error.
-        let mut outcome = parse_clrmamepro(path, limits)?;
-        super::classification::classify_catalogue(&mut outcome.dat);
+        let outcome = clrmamepro::parse_clrmamepro_with_sink(path, limits, sink)?;
         return Ok(outcome);
     }
     if size > limits.max_file_size {
@@ -63,12 +103,13 @@ pub fn parse_dat_file(path: &Path, limits: DatLimits) -> Result<ParseOutcome, Pa
     }
 
     let detected = detect_format(path)?;
-    let mut outcome = match detected {
-        DatFormat::Logiqx if is_mame_listxml_root(path)? => parse_mame_listxml(path, limits),
-        DatFormat::Logiqx => parse_logiqx(path, limits),
-        DatFormat::ClrMamePro => parse_clrmamepro(path, limits),
+    let outcome = match detected {
+        DatFormat::Logiqx if is_mame_listxml_root(path)? => {
+            mame_listxml::parse_mame_listxml_with_sink(path, limits, sink)
+        }
+        DatFormat::Logiqx => logiqx::parse_logiqx_with_sink(path, limits, sink),
+        DatFormat::ClrMamePro => clrmamepro::parse_clrmamepro_with_sink(path, limits, sink),
     }?;
-    super::classification::classify_catalogue(&mut outcome.dat);
     Ok(outcome)
 }
 
