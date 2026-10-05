@@ -178,7 +178,7 @@ fn inspect_source(
 
     let slave_members: Vec<(String, u64)> = source
         .member_infos()
-        .filter(|member| is_slave_name(member.path))
+        .filter(|member| member.kind.is_regular() && is_slave_name(member.path))
         .map(|member| (member.path.to_string(), member.logical_size))
         .collect();
 

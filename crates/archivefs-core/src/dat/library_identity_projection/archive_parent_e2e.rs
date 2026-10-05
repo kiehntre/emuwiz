@@ -774,15 +774,16 @@ fn rar_checksum_match_with_different_name_reaches_parent_projection() {
 }
 
 #[test]
-fn lha_unix_symlink_is_indistinguishable_from_a_regular_exact_member() {
+fn lha_unix_symlink_is_refused_as_authoritative_member_evidence() {
     if !external_readers_available() {
         return;
     }
     // Level-0 Unix extended header: host U, minor version, mtime, mode,
     // uid, gid. LHA symlink names use "name|target". Independent read-only
     // libarchive inspection of this fixture reports S_IFLNK, target "target";
-    // 7-Zip 23.01 instead reports Folder=-, Host OS=MS-DOS, no link/type facts.
-    // Keep projection refused: the current provider cannot prove regularity.
+    // 7-Zip 23.01 instead reports Folder=-, Host OS=MS-DOS, no link/type facts
+    // and streams the link text. The raw-header classifier now proves the
+    // type, so the member must never become authoritative ROM evidence.
     let name = "Game.rom|target";
     let mut fx = Fixture::new(
         Format::Lha,
@@ -814,12 +815,18 @@ fn lha_unix_symlink_is_indistinguishable_from_a_regular_exact_member() {
             .unwrap(),
         row
     );
+    let member = &outcome.archives[0].members[0];
     assert!(matches!(
-        outcome.archives[0].members[0].verdict,
-        Some(crate::dat::audit::AuditVerdict::Exact { .. })
+        member.evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::NotVerified {
+            reason: "LHA symbolic-link member"
+        }
     ));
-    assert!(outcome.archives[0].members[0].evidence.hashes.is_some());
+    assert!(member.evidence.hashes.is_none());
+    assert!(member.verdict.is_none());
+    assert!(member.matched_refs.is_empty());
     assert!(!is_verified(&row));
+    assert!(row.is_none(), "no parent row, no verified_single_match");
     assert_eq!(std::fs::read(&fx.archive).unwrap(), header);
     assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
 }

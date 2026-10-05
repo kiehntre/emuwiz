@@ -27,6 +27,7 @@ pub mod chd;
 pub mod external_process;
 pub mod hash;
 pub mod lha;
+pub mod lha_header;
 pub mod limits;
 pub mod rar;
 pub mod sevenz;

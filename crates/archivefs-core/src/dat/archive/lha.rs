@@ -16,7 +16,7 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -29,6 +29,7 @@ use crate::identity_source::hashing::Crc32;
 use crate::safe_read::{TrustedRoots, open_bounded_read};
 
 use super::external_process::{ProcessError, ProcessLimits, run_supervised};
+use super::lha_header::{Crc16, LhaEntryKind, LhaRawEntry, scan_headers};
 use super::limits::ArchiveLimits;
 use super::{
     ArchiveMemberEvidence, ArchiveMemberHashes, ArchiveMemberSource, ArchiveMemberStatus,
@@ -118,12 +119,20 @@ impl LhaProvider {
                 detail: format!("7-Zip identified this as {archive_type}, not Lzh"),
             });
         }
-        let members = list_members(&self.executable, self.process_limits, &file, timeout)?;
-        if members.len() > limits.max_members {
+        let listing = list_members(&self.executable, self.process_limits, &file, timeout)?;
+        if listing.len() > limits.max_members {
             return Err(LhaError::RefusedLimits {
                 reason: "member count",
             });
         }
+        // The raw headers are authoritative for member type; 7-Zip supplies
+        // bytes.  Scanning is metadata-only (never reads member payloads).
+        let raw = scan_headers(&file, metadata.len(), limits.max_members).map_err(|error| {
+            LhaError::Corrupt {
+                detail: format!("LHA header scan refused the archive: {error}"),
+            }
+        })?;
+        let members = correlate(raw, listing)?;
         let mut paths = BTreeSet::new();
         for member in &members {
             if !paths.insert(member.path.clone()) {
@@ -152,6 +161,42 @@ struct LhaMember {
     logical_size: u64,
     packed_size: u64,
     method: String,
+    /// Member type proven by the raw LHA header and correlated with the
+    /// 7-Zip listing entry that will supply the bytes.
+    kind: LhaEntryKind,
+    /// The header's CRC-16 of the decoded bytes; the streamed payload must
+    /// reproduce it.
+    crc16: u16,
+}
+
+/// What a streamed member must reproduce: its declared size and the CRC-16
+/// from its raw header.
+#[derive(Debug, Clone, Copy)]
+struct MemberCheck {
+    declared_size: u64,
+    crc16: u16,
+}
+
+impl MemberCheck {
+    fn of(member: &LhaMember) -> Self {
+        Self {
+            declared_size: member.logical_size,
+            crc16: member.crc16,
+        }
+    }
+}
+
+/// One 7-Zip `-slt` member block.  Its `Folder`, `Size`, `Packed Size`,
+/// `Method` and `CRC` are the only facts compared with the raw header;
+/// 7-Zip exposes no member type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListedMember {
+    path: String,
+    is_folder: bool,
+    logical_size: u64,
+    packed_size: u64,
+    method: String,
+    crc: Option<u16>,
 }
 
 /// One fd-pinned, bounded LHA archive source.
@@ -221,6 +266,12 @@ impl ArchiveMemberSource for LhaArchiveSource {
                     },
                     None,
                 ));
+                continue;
+            }
+            // Only a header-proven regular file may reach checksum
+            // verification; links, specials and unproven types never do.
+            if let Some(reason) = member.kind.refusal_reason() {
+                members.push(evidence(ArchiveMemberStatus::NotVerified { reason }, None));
                 continue;
             }
             if nested {
@@ -298,7 +349,7 @@ impl ArchiveMemberSource for LhaArchiveSource {
                 self.process_limits,
                 &self.file,
                 &member.path,
-                member.logical_size,
+                MemberCheck::of(member),
                 self.timeout,
                 cancel,
             ) {
@@ -344,6 +395,8 @@ impl ArchiveMemberSource for LhaArchiveSource {
 pub struct LhaMemberInfo<'a> {
     pub path: &'a str,
     pub logical_size: u64,
+    /// Header-proven type; only [`LhaEntryKind::Regular`] may be read.
+    pub kind: &'a LhaEntryKind,
 }
 
 impl LhaArchiveSource {
@@ -364,6 +417,7 @@ impl LhaArchiveSource {
         self.members.iter().map(|member| LhaMemberInfo {
             path: &member.path,
             logical_size: member.logical_size,
+            kind: &member.kind,
         })
     }
 
@@ -394,6 +448,11 @@ impl LhaArchiveSource {
                 detail: format!("unsafe member path: {}", member.path),
             });
         }
+        if let Some(reason) = member.kind.refusal_reason() {
+            return Err(LhaError::Unsupported {
+                detail: format!("{reason}: {}", member.path),
+            });
+        }
         if member.logical_size > max_bytes {
             return Err(LhaError::RefusedLimits {
                 reason: "member size",
@@ -404,7 +463,7 @@ impl LhaArchiveSource {
             self.process_limits,
             &self.file,
             &member.path,
-            member.logical_size,
+            MemberCheck::of(member),
             self.timeout,
             cancel,
         )
@@ -473,8 +532,12 @@ fn list_members(
     limits: ProcessLimits,
     file: &File,
     timeout: Duration,
-) -> Result<Vec<LhaMember>, LhaError> {
+) -> Result<Vec<ListedMember>, LhaError> {
     let text = run_listing(executable, limits, file.as_raw_fd(), true, timeout)?;
+    parse_listing(&text)
+}
+
+fn parse_listing(text: &str) -> Result<Vec<ListedMember>, LhaError> {
     let mut blocks = Vec::new();
     let mut block = BTreeMap::new();
     for line in text.lines().chain(std::iter::once("")) {
@@ -500,19 +563,115 @@ fn list_members(
                     detail: "empty or control-character LHA member path".to_string(),
                 });
             }
-            if required(&properties, "Folder")? != "-" {
-                return Err(LhaError::Unsupported {
-                    detail: format!("directory member is refused: {path}"),
-                });
-            }
-            Ok(LhaMember {
+            let is_folder = match required(&properties, "Folder")? {
+                "-" => false,
+                "+" => true,
+                other => {
+                    return Err(LhaError::Listing {
+                        detail: format!("unrecognised Folder value {other:?}"),
+                    });
+                }
+            };
+            let crc = properties
+                .get("CRC")
+                .map(|value| {
+                    u16::from_str_radix(value, 16).map_err(|_| LhaError::Listing {
+                        detail: format!("CRC is not hexadecimal: {value:?}"),
+                    })
+                })
+                .transpose()?;
+            Ok(ListedMember {
                 path,
+                is_folder,
                 logical_size: parse_u64(required(&properties, "Size")?, "Size")?,
                 packed_size: parse_u64(required(&properties, "Packed Size")?, "Packed Size")?,
                 method: required(&properties, "Method")?.to_string(),
+                crc,
             })
         })
         .collect()
+}
+
+/// Joins the raw-header entries with 7-Zip's listing, one-to-one by position.
+/// Position alone is never trusted: every entry must also agree on size,
+/// packed size, method, CRC-16, folder-ness and (where both are provably the
+/// same text) name.  Any disagreement is a backend conflict and the whole
+/// archive is refused - nothing is "best effort".  A directory entry also
+/// refuses the archive, as it always has.
+fn correlate(
+    raw: Vec<LhaRawEntry>,
+    listing: Vec<ListedMember>,
+) -> Result<Vec<LhaMember>, LhaError> {
+    let conflict = |index: usize, what: &str| LhaError::Unsupported {
+        detail: format!("LHA header and 7-Zip listing disagree at member {index}: {what}"),
+    };
+    if raw.len() != listing.len() {
+        return Err(LhaError::Unsupported {
+            detail: format!(
+                "LHA header scan found {} members but 7-Zip listed {}",
+                raw.len(),
+                listing.len()
+            ),
+        });
+    }
+    let mut members = Vec::with_capacity(raw.len());
+    for (index, (entry, listed)) in raw.into_iter().zip(listing).enumerate() {
+        let raw_directory = matches!(entry.kind, LhaEntryKind::Directory);
+        if entry.original_size != listed.logical_size {
+            return Err(conflict(index, "size"));
+        }
+        if entry.packed_size != listed.packed_size {
+            return Err(conflict(index, "packed size"));
+        }
+        if entry.method_str() != listed.method {
+            return Err(conflict(index, "method"));
+        }
+        if raw_directory != listed.is_folder {
+            return Err(conflict(index, "directory flag"));
+        }
+        if raw_directory {
+            return Err(LhaError::Unsupported {
+                detail: format!("directory member is refused: {}", listed.path),
+            });
+        }
+        if listed.crc.is_some_and(|crc| crc != entry.crc16) {
+            return Err(conflict(index, "CRC"));
+        }
+        let mut kind = entry.kind.clone();
+        // Names are compared as UTF-8 only when the raw bytes are exactly
+        // valid UTF-8; an unprovable correspondence is never regular.
+        match entry.name_utf8() {
+            Some(name) if name == listed.path => {}
+            Some(name) if name.is_ascii() && listed.path.is_ascii() => {
+                return Err(conflict(index, "name"));
+            }
+            _ if kind.is_regular() => {
+                kind = LhaEntryKind::Unknown("member name not provably identical");
+            }
+            _ => {}
+        }
+        members.push(LhaMember {
+            path: listed.path,
+            logical_size: listed.logical_size,
+            packed_size: listed.packed_size,
+            method: listed.method,
+            kind,
+            crc16: entry.crc16,
+        });
+    }
+    Ok(members)
+}
+
+fn check_header_crc(computed: Crc16, expected: u16) -> Result<(), LhaError> {
+    let actual = computed.finish();
+    if actual != expected {
+        return Err(LhaError::Corrupt {
+            detail: format!(
+                "streamed bytes have CRC-16 {actual:04x}, header declares {expected:04x}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn hash_member(
@@ -520,14 +679,19 @@ fn hash_member(
     limits: ProcessLimits,
     file: &File,
     path: &str,
-    declared_size: u64,
+    expected: MemberCheck,
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<ArchiveMemberHashes, LhaError> {
+    let MemberCheck {
+        declared_size,
+        crc16: expected_crc16,
+    } = expected;
     let fd = file.as_raw_fd();
     let mut command = Command::new(executable);
     command.args(extract_args(fd, path));
     let mut hasher = StreamingHasher::new();
+    let mut header_crc = Crc16::default();
     let mut received = 0_u64;
     let outcome = run_supervised(
         command,
@@ -545,6 +709,7 @@ fn hash_member(
                 return Err("member output exceeds declared size".to_string());
             }
             hasher.update(chunk);
+            header_crc.update(chunk);
             Ok(())
         },
         Some(pin_fd_pre_exec(fd)),
@@ -568,6 +733,7 @@ fn hash_member(
             received,
         });
     }
+    check_header_crc(header_crc, expected_crc16)?;
     Ok(hasher.finish())
 }
 
@@ -583,14 +749,19 @@ fn read_member_bytes(
     limits: ProcessLimits,
     file: &File,
     path: &str,
-    declared_size: u64,
+    expected: MemberCheck,
     timeout: Duration,
     cancel: &AtomicBool,
 ) -> Result<Vec<u8>, LhaError> {
+    let MemberCheck {
+        declared_size,
+        crc16: expected_crc16,
+    } = expected;
     let fd = file.as_raw_fd();
     let mut command = Command::new(executable);
     command.args(extract_args(fd, path));
     let mut buffer = Vec::with_capacity(declared_size as usize);
+    let mut header_crc = Crc16::default();
     let mut received = 0_u64;
     let outcome = run_supervised(
         command,
@@ -608,6 +779,7 @@ fn read_member_bytes(
                 return Err("member output exceeds declared size".to_string());
             }
             buffer.extend_from_slice(chunk);
+            header_crc.update(chunk);
             Ok(())
         },
         Some(pin_fd_pre_exec(fd)),
@@ -631,6 +803,7 @@ fn read_member_bytes(
             received,
         });
     }
+    check_header_crc(header_crc, expected_crc16)?;
     Ok(buffer)
 }
 
@@ -779,9 +952,17 @@ fn safe_member_name(name: &str) -> bool {
     !name.contains('\\')
         && !name.contains('*')
         && !name.contains('?')
-        && Path::new(name)
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
+        && !name.contains('\0')
+        // Every `/` component must be a plain, non-empty name: no `.`/`..`,
+        // no empty segment, no Windows drive prefix (`C:`), and no absolute
+        // root.  `Path::components` alone silently drops `.` and empty
+        // segments and accepts `C:` on Unix.
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && !matches!(part.as_bytes(), [letter, b':', ..] if letter.is_ascii_alphabetic())
+        })
 }
 
 fn is_nested_name(name: &str) -> bool {
@@ -898,7 +1079,19 @@ mod tests {
 
     #[test]
     fn unsafe_member_paths_and_globs_are_not_extractable() {
-        for name in ["../Game.Slave", "/Game.Slave", "dir\\Game.Slave", "*.Slave"] {
+        for name in [
+            "../Game.Slave",
+            "/Game.Slave",
+            "dir\\Game.Slave",
+            "*.Slave",
+            "a/./b",
+            "a//b",
+            "a/",
+            "C:/x",
+            "z:x",
+            "a/C:/x",
+            "a/../b",
+        ] {
             assert!(!safe_member_name(name), "{name}");
         }
         assert!(safe_member_name("Game/Game.Slave"));
@@ -951,29 +1144,378 @@ mod tests {
         );
     }
 
-    fn parse_members_for_test(text: &str) -> Result<Vec<LhaMember>, LhaError> {
-        let mut blocks = Vec::new();
-        let mut block = BTreeMap::new();
-        for line in text.lines().chain(std::iter::once("")) {
-            if line.is_empty() {
-                if !block.is_empty() {
-                    blocks.push(std::mem::take(&mut block));
-                }
-                continue;
-            }
-            let (key, value) = property(line)?;
-            block.insert(key.to_string(), value.to_string());
-        }
-        blocks
-            .into_iter()
-            .map(|properties| {
-                Ok(LhaMember {
-                    path: required(&properties, "Path")?.to_string(),
-                    logical_size: parse_u64(required(&properties, "Size")?, "Size")?,
-                    packed_size: parse_u64(required(&properties, "Packed Size")?, "Packed Size")?,
-                    method: required(&properties, "Method")?.to_string(),
-                })
-            })
+    fn parse_members_for_test(text: &str) -> Result<Vec<ListedMember>, LhaError> {
+        parse_listing(text)
+    }
+
+    // ---- member-type safety: raw header authoritative, 7-Zip supplies bytes ----
+
+    use crate::dat::archive::lha_header::fixtures::{Entry, archive};
+
+    const ROM: &[u8] = b"synthetic rom-like payload \x00\x01\x02\xfe\xff";
+
+    fn provider() -> Option<LhaProvider> {
+        LhaProvider::discover(Duration::from_secs(10)).ok()
+    }
+
+    fn open_bytes(
+        provider: &LhaProvider,
+        bytes: &[u8],
+    ) -> (tempfile::TempDir, Result<LhaArchiveSource, LhaError>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fixture.lha");
+        std::fs::write(&path, bytes).unwrap();
+        let trusted = TrustedRoots::from_paths(std::iter::once(directory.path()));
+        let result = provider.open(
+            &path,
+            &trusted,
+            ArchiveLimits::default(),
+            Duration::from_secs(20),
+        );
+        (directory, result)
+    }
+
+    fn verify(source: &mut LhaArchiveSource) -> ArchivePassOutcome {
+        let cancel = AtomicBool::new(false);
+        source.verify_all(&cancel, &mut ArchiveRunBudget::new(1 << 30))
+    }
+
+    fn statuses(outcome: &ArchivePassOutcome) -> Vec<&ArchiveMemberStatus> {
+        outcome
+            .members
+            .iter()
+            .map(|member| &member.status)
             .collect()
+    }
+
+    #[test]
+    fn regular_members_verify_at_every_header_level_with_the_real_backend() {
+        let Some(provider) = provider() else { return };
+        // 7-Zip 23.01 cannot open level 3; that must be a clean refusal.
+        for level in 0..=3 {
+            for entry in [
+                Entry::file("Game.rom", ROM).level(level),
+                Entry::unix("Dir/Game.rom", ROM, 0o100644).level(level),
+            ] {
+                let (_dir, source) = open_bytes(&provider, &archive(&[entry]));
+                match source {
+                    Ok(mut source) => {
+                        let outcome = verify(&mut source);
+                        assert_eq!(
+                            statuses(&outcome),
+                            vec![&ArchiveMemberStatus::HashComplete],
+                            "level {level}"
+                        );
+                    }
+                    Err(error) => assert_eq!(level, 3, "unexpected refusal: {error:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn symlink_members_never_reach_checksum_verification_at_any_level() {
+        let Some(provider) = provider() else { return };
+        for level in 0..=2 {
+            let bytes = archive(&[
+                Entry::unix("Game.rom|target", b"target", 0o120777).level(level),
+                Entry::unix("Real.rom", ROM, 0o100644).level(level),
+            ]);
+            let (_dir, source) = open_bytes(&provider, &bytes);
+            let mut source = source.unwrap();
+            let outcome = verify(&mut source);
+            assert!(matches!(
+                outcome.members[0].status,
+                ArchiveMemberStatus::NotVerified {
+                    reason: "LHA symbolic-link member"
+                }
+            ));
+            assert!(outcome.members[0].hashes.is_none(), "level {level}");
+            // The sibling regular member is unaffected.
+            assert!(outcome.members[1].is_hash_complete(), "level {level}");
+            // read_member (WHDLoad inspection) refuses the link as well.
+            let cancel = AtomicBool::new(false);
+            assert!(matches!(
+                source.read_member("Game.rom|target", 1024, &cancel),
+                Err(LhaError::Unsupported { .. })
+            ));
+            assert!(source.read_member("Real.rom", 1024, &cancel).is_ok());
+        }
+    }
+
+    #[test]
+    fn special_and_unproven_members_are_refused_not_hashed() {
+        let Some(provider) = provider() else { return };
+        let mut unix_no_mode = Entry::file("NoMode.rom", ROM);
+        unix_no_mode.host = b'U';
+        let mut link_separator = Entry::file("a|b.rom", ROM);
+        link_separator.host = b'M';
+        let bytes = archive(&[
+            Entry::unix("Fifo", b"", 0o010644),
+            unix_no_mode,
+            link_separator,
+            Entry::unix("Real.rom", ROM, 0o100644),
+        ]);
+        let (_dir, source) = open_bytes(&provider, &bytes);
+        let outcome = verify(&mut source.unwrap());
+        let refused: Vec<_> = outcome
+            .members
+            .iter()
+            .map(|member| member.hashes.is_some())
+            .collect();
+        assert_eq!(refused, vec![false, false, false, true]);
+        assert!(matches!(
+            outcome.members[0].status,
+            ArchiveMemberStatus::NotVerified {
+                reason: "LHA special member"
+            }
+        ));
+        for index in [1, 2] {
+            assert!(matches!(
+                outcome.members[index].status,
+                ArchiveMemberStatus::NotVerified {
+                    reason: "LHA member type unproven"
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn directory_members_refuse_the_archive_as_before() {
+        let Some(provider) = provider() else { return };
+        for level in 0..=2 {
+            let bytes = archive(&[
+                Entry::directory("Game").level(level),
+                Entry::file("Game/x", ROM),
+            ]);
+            let (_dir, source) = open_bytes(&provider, &bytes);
+            assert!(
+                matches!(&source, Err(LhaError::Unsupported { detail }) if detail.contains("directory")),
+                "level {level}: {:?}",
+                source.err()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_traversal_and_absolute_names_stay_refused() {
+        let Some(provider) = provider() else { return };
+        let (_d, duplicate) = open_bytes(
+            &provider,
+            &archive(&[
+                Entry::file("Game.rom", ROM),
+                Entry::file("Game.rom", b"other bytes"),
+            ]),
+        );
+        assert!(matches!(duplicate, Err(LhaError::Unsupported { .. })));
+        for name in [
+            "../Game.rom",
+            "/Game.rom",
+            "a/../../Game.rom",
+            "C:/Game.rom",
+            "a\\..\\Game.rom",
+        ] {
+            let (_d, source) = open_bytes(&provider, &archive(&[Entry::unix(name, ROM, 0o100644)]));
+            // Either the backend/correlation refuses the archive or the
+            // member is NotVerified - never hashed, even though it is a
+            // regular file by header.
+            if let Ok(mut source) = source {
+                let outcome = verify(&mut source);
+                assert!(outcome.members.iter().all(|m| m.hashes.is_none()), "{name}");
+                let cancel = AtomicBool::new(false);
+                assert!(source.read_member(name, 1024, &cancel).is_err(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_names_are_correlated_or_refused_never_guessed() {
+        let Some(provider) = provider() else { return };
+        let bytes = archive(&[Entry::unix("Spiel/Größe-ゲーム.rom", ROM, 0o100644).level(1)]);
+        let (_dir, source) = open_bytes(&provider, &bytes);
+        if let Ok(mut source) = source {
+            let outcome = verify(&mut source);
+            // Hashed only if 7-Zip reproduced the exact UTF-8 name; any
+            // re-encoding downgrades the member to unproven.
+            let name = outcome.members[0].member_name_display.clone();
+            if name == "Spiel/Größe-ゲーム.rom" {
+                assert!(outcome.members[0].is_hash_complete());
+            } else {
+                assert!(outcome.members[0].hashes.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_and_malformed_archives_are_refused_at_open() {
+        let Some(provider) = provider() else { return };
+        let good = archive(&[Entry::unix("Game.rom", ROM, 0o100644).level(1)]);
+        for cut in [10, 25, good.len() - 3] {
+            let (_dir, source) = open_bytes(&provider, &good[..cut]);
+            assert!(source.is_err(), "cut {cut}");
+        }
+        let mut bad_chain = good.clone();
+        // Level-1 base header is 27 + name bytes; its last two bytes are the
+        // first extended-header size. The base checksum does not cover them
+        // at a different place, so recompute it.
+        let size_at = 27 + "Game.rom".len() - 2;
+        bad_chain[size_at..size_at + 2].copy_from_slice(&0xffff_u16.to_le_bytes());
+        bad_chain[1] = bad_chain[2..2 + bad_chain[0] as usize]
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        let (_dir, source) = open_bytes(&provider, &bad_chain);
+        assert!(source.is_err());
+    }
+
+    #[test]
+    fn crc_failures_are_corrupt_and_never_hashed() {
+        let Some(provider) = provider() else { return };
+        // Payload altered after the header CRC was computed.
+        let mut tampered = archive(&[Entry::file("Game.rom", ROM)]);
+        let last = tampered.len() - 2;
+        tampered[last] ^= 0x55;
+        let (_dir, source) = open_bytes(&provider, &tampered);
+        if let Ok(mut source) = source {
+            let outcome = verify(&mut source);
+            assert!(matches!(
+                outcome.members[0].status,
+                ArchiveMemberStatus::Corrupt { .. }
+            ));
+            assert!(outcome.members[0].hashes.is_none());
+        }
+        // A header declaring the wrong CRC for intact bytes.
+        let mut wrong = Entry::file("Game.rom", ROM);
+        wrong.declared_crc = Some(0x1234);
+        let (_dir, source) = open_bytes(&provider, &archive(&[wrong]));
+        if let Ok(mut source) = source {
+            assert!(verify(&mut source).members[0].hashes.is_none());
+        }
+    }
+
+    #[test]
+    fn unsupported_compression_methods_are_not_hashed() {
+        let Some(provider) = provider() else { return };
+        let mut entry = Entry::file("Game.rom", ROM);
+        entry.method = *b"-lz9-";
+        let (_dir, source) = open_bytes(&provider, &archive(&[entry]));
+        if let Ok(mut source) = source {
+            let outcome = verify(&mut source);
+            assert!(outcome.members[0].hashes.is_none());
+            assert!(!outcome.members[0].is_hash_complete());
+        }
+    }
+
+    #[test]
+    fn a_large_regular_member_streams_with_exact_hashes() {
+        let Some(provider) = provider() else { return };
+        let payload: Vec<u8> = (0..16 * 1024 * 1024_u32)
+            .map(|i| (i.wrapping_mul(31) >> 3) as u8)
+            .collect();
+        let (_dir, source) = open_bytes(
+            &provider,
+            &archive(&[Entry::unix("Big.rom", &payload, 0o100644).level(2)]),
+        );
+        let outcome = verify(&mut source.unwrap());
+        assert!(outcome.members[0].is_hash_complete());
+        let mut expected = StreamingHasher::new();
+        expected.update(&payload);
+        assert_eq!(outcome.members[0].hashes.as_ref(), Some(&expected.finish()));
+    }
+
+    // ---- backend disagreement: any conflict refuses, never "best effort" ----
+
+    fn raw_regular(name: &str) -> LhaRawEntry {
+        use crate::dat::archive::lha_header::{fixtures::Entry, scan_headers};
+        let bytes = archive(&[Entry::unix(name, ROM, 0o100644)]);
+        scan_headers(bytes.as_slice(), bytes.len() as u64, 8)
+            .unwrap()
+            .remove(0)
+    }
+
+    fn listed_like(entry: &LhaRawEntry) -> ListedMember {
+        ListedMember {
+            path: String::from_utf8(entry.name.clone()).unwrap(),
+            is_folder: false,
+            logical_size: entry.original_size,
+            packed_size: entry.packed_size,
+            method: entry.method_str(),
+            crc: Some(entry.crc16),
+        }
+    }
+
+    #[test]
+    fn a_consistent_listing_correlates_and_keeps_the_header_type() {
+        let raw = raw_regular("Game.rom");
+        let listed = listed_like(&raw);
+        let members = correlate(vec![raw], vec![listed]).unwrap();
+        assert_eq!(members[0].kind, LhaEntryKind::Regular);
+    }
+
+    #[test]
+    fn header_symlink_with_an_ordinary_looking_listing_stays_a_symlink() {
+        let mut raw = raw_regular("Game.rom|target");
+        raw.kind = LhaEntryKind::Symlink;
+        let listed = listed_like(&raw); // 7-Zip: Folder = -, plain file
+        let members = correlate(vec![raw], vec![listed]).unwrap();
+        assert_eq!(members[0].kind, LhaEntryKind::Symlink);
+        assert!(members[0].kind.refusal_reason().is_some());
+    }
+
+    #[test]
+    fn every_header_listing_disagreement_refuses_the_archive() {
+        let raw = raw_regular("Game.rom");
+        let base = listed_like(&raw);
+        #[allow(clippy::type_complexity)]
+        let mutations: Vec<(&str, Box<dyn Fn(&mut ListedMember)>)> = vec![
+            ("size", Box::new(|l| l.logical_size += 1)),
+            ("packed", Box::new(|l| l.packed_size += 1)),
+            ("method", Box::new(|l| l.method = "-lh5-".to_string())),
+            ("crc", Box::new(|l| l.crc = Some(l.crc.unwrap() ^ 1))),
+            ("folder", Box::new(|l| l.is_folder = true)),
+            ("name", Box::new(|l| l.path = "Other.rom".to_string())),
+        ];
+        for (what, mutate) in mutations {
+            let mut listed = base.clone();
+            mutate(&mut listed);
+            assert!(
+                correlate(vec![raw.clone()], vec![listed]).is_err(),
+                "{what} disagreement must refuse"
+            );
+        }
+        // Member-count disagreement, and reordering of distinct members.
+        assert!(correlate(vec![raw.clone()], vec![]).is_err());
+        assert!(correlate(vec![], vec![base.clone()]).is_err());
+        let other = raw_regular("Other.rom");
+        assert!(
+            correlate(
+                vec![raw.clone(), other.clone()],
+                vec![listed_like(&other), listed_like(&raw)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn non_ascii_name_disagreement_downgrades_the_member_instead_of_trusting_it() {
+        let raw = raw_regular("Größe.rom");
+        let mut listed = listed_like(&raw);
+        listed.path = "GrÃ¶Ãe.rom".to_string(); // 7-Zip re-encoded the name
+        let members = correlate(vec![raw], vec![listed]).unwrap();
+        assert!(matches!(members[0].kind, LhaEntryKind::Unknown(_)));
+    }
+
+    #[test]
+    fn listing_without_a_folder_flag_or_with_a_bad_crc_is_refused() {
+        assert!(parse_listing("Path = a\nSize = 1\nPacked Size = 1\nMethod = -lh0-\n").is_err());
+        assert!(
+            parse_listing("Path = a\nFolder = ?\nSize = 1\nPacked Size = 1\nMethod = -lh0-\n")
+                .is_err()
+        );
+        assert!(
+            parse_listing(
+                "Path = a\nFolder = -\nSize = 1\nPacked Size = 1\nCRC = zz\nMethod = -lh0-\n"
+            )
+            .is_err()
+        );
     }
 }
