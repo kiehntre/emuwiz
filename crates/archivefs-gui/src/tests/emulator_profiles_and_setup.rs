@@ -2989,8 +2989,28 @@ fn adapter_routing_is_platform_authoritative() {
         cheat_adapter_route(Some("PS3")),
         CheatEmulatorAdapter::Unsupported
     );
+    // PlayStation: DuckStation has a native cheat adapter and owns the platform-only
+    // route (see `cheat_route`), but this GUI workflow cannot apply it yet, so the
+    // platform-only route is Unsupported ("Native adapter available"), under every alias.
+    for platform in ["PSX", "PS1", "PlayStation", "Sony PlayStation"] {
+        assert_eq!(
+            cheat_adapter_route(Some(platform)),
+            CheatEmulatorAdapter::Unsupported,
+            "{platform}"
+        );
+    }
+    // RetroArch stays reachable for PlayStation, but only by explicit selection.
+    let explicit = archivefs_core::patch_manager::route_cheat_install(
+        &archivefs_core::patch_manager::CheatRouteRequest {
+            platform: Some("PlayStation".to_owned()),
+            selected: Some(archivefs_core::patch_manager::CheatRouteTarget::retroarch(
+                None,
+            )),
+            ..Default::default()
+        },
+    );
     assert_eq!(
-        cheat_adapter_route(Some("PSX")),
+        cheat_adapter_for_decision(&explicit),
         CheatEmulatorAdapter::RetroArch
     );
     assert_eq!(cheat_adapter_route(None), CheatEmulatorAdapter::Unsupported);

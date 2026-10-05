@@ -345,3 +345,155 @@ fn routing_is_deterministic_for_identical_input() {
     req.retroarch_cores.reverse();
     assert_eq!(route_cheat_install(&req), first);
 }
+
+/// Alias groups whose members must canonicalise to one id and route identically.
+const ALIAS_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "PSX",
+        &[
+            "PSX",
+            "ps1",
+            "PS1",
+            "PlayStation",
+            "Sony PlayStation",
+            "PlayStation 1",
+            "playstation1",
+        ],
+    ),
+    ("PS2", &["PS2", "PlayStation 2", "Sony PlayStation 2"]),
+    ("PSP", &["PSP", "PlayStation Portable", "Sony PSP"]),
+    ("Saturn", &["Saturn", "Sega Saturn"]),
+    ("Dreamcast", &["Dreamcast", "Sega Dreamcast"]),
+    (
+        "SNES",
+        &[
+            "SNES",
+            "Super Nintendo",
+            "Super Famicom",
+            "Super Nintendo Entertainment System",
+        ],
+    ),
+    (
+        "MegaDrive",
+        &[
+            "MegaDrive",
+            "Mega Drive",
+            "Genesis",
+            "Sega Genesis",
+            "Sega Mega Drive",
+        ],
+    ),
+];
+
+#[test]
+fn platform_aliases_canonicalise_and_route_identically() {
+    for (canonical, aliases) in ALIAS_GROUPS {
+        let expected = route_cheat_install(&request(canonical));
+        for alias in *aliases {
+            assert_eq!(canonical_cheat_platform(alias), Some(*canonical), "{alias}");
+            let decision = route_cheat_install(&request(alias));
+            assert_eq!(
+                decision.route().map(|r| &r.target),
+                expected.route().map(|r| &r.target),
+                "{alias}"
+            );
+            assert_eq!(
+                decision.route().map(|r| r.platform_id.as_str()),
+                Some(*canonical),
+                "{alias}"
+            );
+        }
+    }
+}
+
+#[test]
+fn playstation_platform_only_routing_goes_to_native_duckstation_not_retroarch() {
+    // DuckStation has a native cheat adapter (cheat_apply_support: Supported), so it owns the
+    // PlayStation fallback; RetroArch is an alternative the user must choose explicitly.
+    for alias in ["PSX", "ps1", "PlayStation", "Sony PlayStation"] {
+        let decision = route_cheat_install(&request(alias));
+        let route = routed(&decision);
+        assert_eq!(
+            route.target,
+            CheatRouteTarget::standalone("duckstation"),
+            "{alias}"
+        );
+        assert_eq!(route.basis, CheatRouteBasis::PlatformFallback, "{alias}");
+        assert!(
+            route
+                .alternatives
+                .contains(&CheatRouteTarget::retroarch(None)),
+            "{alias}"
+        );
+    }
+}
+
+#[test]
+fn explicit_retroarch_selection_for_playstation_is_honoured_under_every_alias() {
+    for alias in ["PSX", "PS1", "PlayStation"] {
+        let mut req = request(alias);
+        req.selected = Some(CheatRouteTarget::retroarch(None));
+        let decision = route_cheat_install(&req);
+        let route = routed(&decision);
+        assert_eq!(route.target, CheatRouteTarget::retroarch(None), "{alias}");
+        assert_eq!(route.basis, CheatRouteBasis::ExplicitSelection, "{alias}");
+    }
+}
+
+#[test]
+fn unsupported_or_unknown_platforms_stay_unrouted() {
+    for name in [
+        "",
+        "   ",
+        "Unknown",
+        "unknown",
+        "Not A Console",
+        "PlayStation 9",
+    ] {
+        assert!(
+            matches!(
+                route_cheat_install(&request(name)),
+                CheatRouteDecision::NoRoute { .. }
+            ),
+            "{name:?}"
+        );
+        assert_eq!(canonical_cheat_platform(name), None, "{name:?}");
+    }
+    assert!(matches!(
+        route_cheat_install(&CheatRouteRequest::default()),
+        CheatRouteDecision::NoRoute { platform_id: None }
+    ));
+}
+
+#[test]
+fn platform_authority_is_not_overridden_by_unrelated_emulator_state() {
+    let baseline = route_cheat_install(&request("PSX"));
+    let mut req = request("PSX");
+    // Emulators and defaults that belong to other platforms, and a scan that found no RetroArch.
+    req.installed_standalone = vec!["pcsx2".into(), "dolphin".into(), "xenia".into()];
+    req.configured_defaults = vec![
+        CheatRouteTarget::standalone("pcsx2"),
+        CheatRouteTarget::standalone("dolphin"),
+    ];
+    req.retroarch_installed = Some(false);
+    let decision = route_cheat_install(&req);
+    assert_eq!(routed(&decision).target, routed(&baseline).target);
+    assert_eq!(routed(&decision).basis, CheatRouteBasis::PlatformFallback);
+
+    // PS2 never turns into RetroArch, however many PSX/libretro cores are visible.
+    let mut ps2 = request("PS2");
+    ps2.retroarch_installed = Some(true);
+    ps2.retroarch_cores = vec!["pcsx_rearmed".into(), "mednafen_psx_hw".into()];
+    assert_eq!(
+        routed(&route_cheat_install(&ps2)).target,
+        CheatRouteTarget::standalone("pcsx2")
+    );
+
+    // Selecting a PS2 emulator for a PSX game is refused, not honoured.
+    let mut wrong = request("PSX");
+    wrong.selected = Some(CheatRouteTarget::standalone("pcsx2"));
+    assert!(matches!(
+        route_cheat_install(&wrong),
+        CheatRouteDecision::Refused { .. }
+    ));
+}
