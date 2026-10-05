@@ -167,8 +167,38 @@ pub enum RowState {
     Unknown { reason: UnprovableReason },
 }
 
+/// How a companion file is known to belong to its catalogued parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompanionBasis {
+    /// Named by a `FILE` line of the parent's CUE sheet, resolved by the
+    /// ingestion CUE resolver under its path-safety rules.
+    CueFileReference,
+    /// Named by a track line of the parent's GDI descriptor, resolved by the
+    /// ingestion GDI resolver.
+    GdiTrackReference,
+}
+
+/// Files a catalogued descriptor (CUE/GDI) intentionally references, as
+/// resolved by the existing ingestion resolvers. Built once per parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionLink {
+    pub parent_archive_id: i64,
+    pub basis: CompanionBasis,
+    pub files: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileState {
+    /// Exists with no row of its own, but a *present*, catalogued parent
+    /// descriptor deliberately references it. Not an uncatalogued candidate and
+    /// never a move target independently of its parent.
+    ReferencedCompanion {
+        parent_archive_id: i64,
+        basis: CompanionBasis,
+    },
+    /// Referenced by more than one catalogued parent: ownership is ambiguous,
+    /// so it is neither independent nor attributed to either.
+    ContendedCompanion { parent_archive_ids: Vec<i64> },
     /// A catalogue row records this exact path.
     Catalogued { archive_id: i64 },
     /// Exists, but EmuWiz has never catalogued it. No identity or platform is
@@ -203,6 +233,9 @@ pub struct ReconciliationCounts {
     pub catalogued_present: usize,
     /// Files with no catalogue row, including ones that are a move target.
     pub uncatalogued_files: usize,
+    /// Files with no row that a catalogued parent descriptor references.
+    pub referenced_companions: usize,
+    pub contended_companions: usize,
     pub missing: usize,
     pub strong_move_candidates: usize,
     pub ambiguous: usize,
@@ -276,6 +309,17 @@ fn hashes_disagree(hashes: &[StrongHash]) -> bool {
 /// the order of `rows` and `files`. Indexes make it linear apart from a bounded
 /// per-row candidate scan; there is no all-pairs comparison.
 pub fn reconcile(rows: &[RowFacts], files: &[FileFacts]) -> ReconciliationReport {
+    reconcile_with_companions(rows, files, &[])
+}
+
+/// As [`reconcile`], additionally excluding proven companions of catalogued,
+/// present parents from the uncatalogued population. A link whose parent is
+/// missing, unknown or not a row at all claims nothing.
+pub fn reconcile_with_companions(
+    rows: &[RowFacts],
+    files: &[FileFacts],
+    links: &[CompanionLink],
+) -> ReconciliationReport {
     let mut rows: Vec<&RowFacts> = rows.iter().collect();
     rows.sort_by_key(|row| row.archive_id);
     let mut files: Vec<&FileFacts> = files.iter().collect();
@@ -289,12 +333,46 @@ pub fn reconcile(rows: &[RowFacts], files: &[FileFacts]) -> ReconciliationReport
             .or_insert(row.archive_id);
     }
 
+    // One pass over the links builds the companion index; each descriptor was
+    // resolved once by the caller.
+    let present_parents: std::collections::HashSet<i64> = rows
+        .iter()
+        .filter(|row| row.presence == RowPresence::Present)
+        .map(|row| row.archive_id)
+        .collect();
+    let mut companions: HashMap<&Path, Vec<(i64, CompanionBasis)>> = HashMap::new();
+    for link in links
+        .iter()
+        .filter(|l| present_parents.contains(&l.parent_archive_id))
+    {
+        for path in &link.files {
+            let owners = companions.entry(path.as_path()).or_default();
+            if !owners.iter().any(|(id, _)| *id == link.parent_archive_id) {
+                owners.push((link.parent_archive_id, link.basis));
+            }
+        }
+    }
+
     let mut file_state: Vec<FileState> = Vec::with_capacity(files.len());
     let mut uncatalogued: Vec<usize> = Vec::new();
     for (index, file) in files.iter().enumerate() {
-        match row_by_path.get(file.path.as_path()) {
-            Some(&archive_id) => file_state.push(FileState::Catalogued { archive_id }),
-            None => {
+        if let Some(&archive_id) = row_by_path.get(file.path.as_path()) {
+            file_state.push(FileState::Catalogued { archive_id });
+            continue;
+        }
+        match companions.get(file.path.as_path()).map(Vec::as_slice) {
+            Some([(parent_archive_id, basis)]) => file_state.push(FileState::ReferencedCompanion {
+                parent_archive_id: *parent_archive_id,
+                basis: *basis,
+            }),
+            Some(owners) if owners.len() > 1 => {
+                let mut ids: Vec<i64> = owners.iter().map(|(id, _)| *id).collect();
+                ids.sort_unstable();
+                file_state.push(FileState::ContendedCompanion {
+                    parent_archive_ids: ids,
+                });
+            }
+            _ => {
                 file_state.push(FileState::Uncatalogued);
                 uncatalogued.push(index);
             }
@@ -444,10 +522,16 @@ pub fn reconcile(rows: &[RowFacts], files: &[FileFacts]) -> ReconciliationReport
             RowState::Unknown { .. } => counts.unknown += 1,
         }
     }
-    counts.uncatalogued_files = file_state
-        .iter()
-        .filter(|state| !matches!(state, FileState::Catalogued { .. }))
-        .count();
+    for state in &file_state {
+        match state {
+            FileState::Uncatalogued
+            | FileState::StrongMoveTarget { .. }
+            | FileState::ContendedMoveTarget { .. } => counts.uncatalogued_files += 1,
+            FileState::ReferencedCompanion { .. } => counts.referenced_companions += 1,
+            FileState::ContendedCompanion { .. } => counts.contended_companions += 1,
+            FileState::Catalogued { .. } => {}
+        }
+    }
     ReconciliationReport {
         rows: outcomes,
         files: files

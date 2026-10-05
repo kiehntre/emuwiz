@@ -4,8 +4,8 @@
 //! roots, and hands both to [`super::reconcile`].
 use super::walk::{MountOf, RootWalk, RootWalkState, WalkLimits, WalkRoot, walk_roots};
 use super::{
-    FileFacts, ReconciliationReport, RowFacts, RowPresence, StrongHash, UnprovableReason,
-    attach_hashes, reconcile,
+    CompanionBasis, CompanionLink, FileFacts, ReconciliationReport, RowFacts, RowPresence,
+    StrongHash, UnprovableReason, attach_hashes, reconcile_with_companions,
 };
 use crate::Result;
 use crate::catalogue_health::{BoundRoot, SourceRootBinding, observe_path};
@@ -159,9 +159,12 @@ pub fn reconcile_library(
         .collect();
     let mut files: Vec<FileFacts> = walk.files;
     attach_hashes(&mut files, supplied_hashes);
+    let Some(links) = companion_links(&rows, cancel) else {
+        return Ok(ReconciliationOutcome::Cancelled);
+    };
     Ok(ReconciliationOutcome::Complete(Box::new(
         LibraryReconciliation {
-            report: reconcile(&rows, &files),
+            report: reconcile_with_companions(&rows, &files, &links),
             roots: walk.roots,
         },
     )))
@@ -206,4 +209,61 @@ fn presence(
 
 fn path_under(path: &Path, prefix: &Path) -> bool {
     path.starts_with(prefix)
+}
+
+/// Resolves each *present* catalogued CUE/GDI descriptor once, through the
+/// existing ingestion resolvers (same bounded read, same path-safety rules: no
+/// absolute or `..` references, the canonical result must stay beneath the
+/// descriptor's own directory). References that are missing or unsafe resolve
+/// to nothing, so they are never accepted as companions. Only descriptors
+/// (<= 256 KiB) are read; no game content is. `None` when cancelled.
+fn companion_links(rows: &[RowFacts], cancel: &AtomicBool) -> Option<Vec<CompanionLink>> {
+    use crate::ingestion::{
+        cue_bin::resolve_cue_all_files_lenient, gdi::resolve_gdi_all_tracks_lenient,
+    };
+    use std::sync::atomic::Ordering;
+    let mut links = Vec::new();
+    for row in rows.iter().filter(|r| r.presence == RowPresence::Present) {
+        let extension = row.path.extension().map(|e| e.to_ascii_lowercase());
+        let (basis, resolved): (CompanionBasis, Vec<PathBuf>) = match extension.as_deref() {
+            Some(e) if e == "cue" => (
+                CompanionBasis::CueFileReference,
+                resolve_cue_all_files_lenient(&row.path)
+                    .map(|all| all.into_iter().flatten().collect())
+                    .unwrap_or_default(),
+            ),
+            Some(e) if e == "gdi" => (
+                CompanionBasis::GdiTrackReference,
+                resolve_gdi_all_tracks_lenient(&row.path)
+                    .map(|all| all.into_iter().flatten().collect())
+                    .unwrap_or_default(),
+            ),
+            _ => continue,
+        };
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        // The resolvers return canonical paths; walked files carry the
+        // configured-root spelling, so re-express each under the descriptor's
+        // own directory.
+        let Some(parent) = row.path.parent() else {
+            continue;
+        };
+        let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+            continue;
+        };
+        let files: Vec<PathBuf> = resolved
+            .iter()
+            .filter_map(|canonical| canonical.strip_prefix(&canonical_parent).ok())
+            .map(|relative| parent.join(relative))
+            .collect();
+        if !files.is_empty() {
+            links.push(CompanionLink {
+                parent_archive_id: row.archive_id,
+                basis,
+                files,
+            });
+        }
+    }
+    Some(links)
 }
