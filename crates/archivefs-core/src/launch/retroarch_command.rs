@@ -251,6 +251,12 @@ pub fn build_retroarch_command_plan(
             "content requires a mount that has not been performed, so no command can be produced",
         ));
     }
+    if let Some(blocker) =
+        crate::launch::planning::retroarch_arcade_layout_blocker(&candidate.content, core_stem)
+        && !blockers.contains(&blocker)
+    {
+        blockers.push(blocker);
+    }
     let content_path = match &candidate.content.resolved_path {
         Some(path) if !candidate.content.requires_mount => Some(path.clone()),
         _ => {
@@ -729,6 +735,97 @@ mod tests {
         assert!(has_blocker(
             &conflicting,
             LaunchBlockerKind::IdentityConflict
+        ));
+    }
+
+    fn fbneo_candidate(path: &str, kind: Option<LaunchContentKind>) -> LaunchCandidate {
+        let mut selected = candidate(Some(PathBuf::from(path)));
+        selected.target = LaunchTarget::RetroArchCore {
+            profile: profile_ref(),
+            core_stem: "fbneo".to_string(),
+            platform_id: "Arcade",
+        };
+        selected.content.kind = kind;
+        selected.content.container = Some(LaunchContainerKind::PlainFile);
+        selected
+    }
+
+    fn arcade_identity() -> CanonicalIdentityStatus {
+        CanonicalIdentityStatus::Resolved(ResolvedIdentity {
+            platform_id: "Arcade".to_string(),
+            game_key: "19xx".to_string(),
+        })
+    }
+
+    fn fbneo_report() -> RetroArchEnvironmentReport {
+        report(
+            vec!["/usr/bin/retroarch"],
+            vec![core("fbneo", Some("Arcade"))],
+        )
+    }
+
+    #[test]
+    fn extracted_arcade_set_directory_is_never_emitted_as_fbneo_content() {
+        let selected = fbneo_candidate(
+            "/mnt/arcade/19xx",
+            Some(LaunchContentKind::ExtractedArcadeSet),
+        );
+        let plan = build_retroarch_command_plan(&arcade_identity(), &selected, &fbneo_report());
+        assert!(plan.command.is_none());
+        assert!(has_blocker(
+            &plan,
+            LaunchBlockerKind::RetroArchArcadeSetNeedsArchive
+        ));
+        assert!(!has_blocker(&plan, LaunchBlockerKind::ContentNotResolved));
+        assert!(!has_blocker(
+            &plan,
+            LaunchBlockerKind::FbneoContentUnavailable
+        ));
+        let detail = &plan.blockers[0].detail;
+        assert!(detail.contains("extracted MAME set"));
+        assert!(!detail.contains("moved"));
+    }
+
+    #[test]
+    fn fbneo_zip_and_7z_arcade_sets_still_plan_a_command() {
+        for path in ["/mnt/arcade/19xx.zip", "/mnt/arcade/19xx.7z"] {
+            let selected = fbneo_candidate(path, None);
+            let plan = build_retroarch_command_plan(&arcade_identity(), &selected, &fbneo_report());
+            assert!(plan.blockers.is_empty(), "{path}: {:?}", plan.blockers);
+            let command = plan.command.expect("archived set plans a command");
+            assert_eq!(
+                command.arguments.last().unwrap(),
+                &std::ffi::OsString::from(path)
+            );
+        }
+    }
+
+    #[test]
+    fn loose_non_arcade_rom_is_unchanged_by_the_arcade_layout_policy() {
+        let mut selected = candidate(Some(PathBuf::from("/games/game.cue")));
+        selected.content.kind = Some(LaunchContentKind::OpticalDisc);
+        let plan = build_retroarch_command_plan(
+            &resolved(),
+            &selected,
+            &report(
+                vec!["/usr/bin/retroarch"],
+                vec![core("mednafen_psx", Some("PlayStation"))],
+            ),
+        );
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        assert!(plan.command.is_some());
+    }
+
+    #[test]
+    fn genuinely_missing_content_still_reports_the_missing_content_blocker() {
+        let mut selected = fbneo_candidate("/unused", None);
+        selected.content.resolved_path = None;
+        let plan = build_retroarch_command_plan(&arcade_identity(), &selected, &fbneo_report());
+        assert!(plan.command.is_none());
+        assert!(has_blocker(&plan, LaunchBlockerKind::ContentNotResolved));
+        assert!(!has_blocker(
+            &plan,
+            LaunchBlockerKind::RetroArchArcadeSetNeedsArchive
         ));
     }
 }

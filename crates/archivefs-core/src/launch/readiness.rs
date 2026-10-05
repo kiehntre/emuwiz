@@ -444,6 +444,10 @@ pub enum LaunchBlockerKind {
     FbneoEmulatorUnavailable,
     /// The selected FBNeo archive/content is missing or has drifted.
     FbneoContentUnavailable,
+    /// A RetroArch core was offered an extracted arcade set directory, which
+    /// libretro cores cannot load; they need an archived ROM set. The file has
+    /// not moved and nothing is missing.
+    RetroArchArcadeSetNeedsArchive,
     HatariCandidateRequired,
     HatariPlatformMismatch,
     HatariProfileUnavailable,

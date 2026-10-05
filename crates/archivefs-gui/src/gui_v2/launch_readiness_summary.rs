@@ -338,6 +338,26 @@ fn project_plan(
         );
     }
 
+    if let Some(blocker) = candidate
+        .blockers
+        .iter()
+        .find(|blocker| blocker.kind == LaunchBlockerKind::RetroArchArcadeSetNeedsArchive)
+    {
+        return with_details(
+            base(
+                ReadinessPresentationState::Blocked,
+                "FBNeo cannot use this arcade layout",
+                &blocker.detail,
+                IdentitySummary::StrongLocal,
+                source_for(candidate),
+                firmware_for(candidate),
+                emulator_for(candidate),
+                Some(ReadinessAction::ReviewProblem),
+            ),
+            details,
+        );
+    }
+
     if let Some(blocker) = candidate.blockers.first() {
         let needs_emulator = matches!(
             blocker.kind,
@@ -885,6 +905,69 @@ mod tests {
             )]),
             ReadinessFreshness::Current,
         );
+        assert_eq!(summary.status, ReadinessPresentationState::Ready);
+        assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
+    }
+
+    fn arcade_layout_blocker() -> LaunchBlocker {
+        LaunchBlocker::new(
+            LaunchBlockerKind::RetroArchArcadeSetNeedsArchive,
+            "FBNeo needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.",
+        )
+    }
+
+    #[test]
+    fn extracted_arcade_set_for_fbneo_is_blocked_without_a_missing_file_claim() {
+        let summary = project(
+            &plan(vec![candidate(
+                LaunchReadiness::Blocked,
+                FirmwareReadiness::NotRequired,
+                vec![arcade_layout_blocker()],
+                vec![],
+                CandidatePreference::Undetermined,
+                Some("/mnt/arcade/19xx"),
+            )]),
+            ReadinessFreshness::Current,
+        );
+        assert_eq!(summary.status, ReadinessPresentationState::Blocked);
+        assert_eq!(summary.headline, "FBNeo cannot use this arcade layout");
+        assert!(summary.explanation.contains("extracted MAME set"));
+        assert!(summary.explanation.contains("use MAME"));
+        let text = format!("{} {}", summary.headline, summary.explanation).to_lowercase();
+        assert!(!text.contains("no longer available") && !text.contains("moved"));
+        assert_ne!(
+            summary.status,
+            ReadinessPresentationState::SourceUnavailable
+        );
+    }
+
+    #[test]
+    fn ready_mame_stays_playable_beside_a_blocked_fbneo_candidate() {
+        let mut fbneo = candidate(
+            LaunchReadiness::Blocked,
+            FirmwareReadiness::NotRequired,
+            vec![arcade_layout_blocker()],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/arcade/19xx"),
+        );
+        fbneo.target = LaunchTarget::RetroArchCore {
+            profile: archivefs_core::emulator_environment::retroarch::ProfileRef {
+                profile_kind: archivefs_core::emulator_environment::retroarch::ProfileKind::Native,
+                scope: archivefs_core::emulator_environment::retroarch::ProfileScope::User,
+            },
+            core_stem: "fbneo".into(),
+            platform_id: "Arcade",
+        };
+        let mame = candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::Undetermined,
+            Some("/mnt/arcade/19xx"),
+        );
+        let summary = project(&plan(vec![mame, fbneo]), ReadinessFreshness::Current);
         assert_eq!(summary.status, ReadinessPresentationState::Ready);
         assert_eq!(summary.primary_action, Some(ReadinessAction::Play));
     }

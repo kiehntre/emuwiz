@@ -3228,4 +3228,97 @@ mod tests {
         );
         assert_eq!(first, second);
     }
+
+    fn retroarch_with_fbneo_core() -> RetroArchEnvironmentReport {
+        let mut report = retroarch_with_snes9x_core();
+        let core = &mut report.profiles[0].cores[0];
+        core.core_stem = "fbneo".to_string();
+        if let CoreInfoFinding::Found { system_name, .. } = &mut core.info {
+            *system_name = Some("Arcade".to_string());
+        }
+        report
+    }
+
+    fn extracted_arcade_set_content() -> LaunchContentRef {
+        LaunchContentRef {
+            kind: Some(LaunchContentKind::ExtractedArcadeSet),
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/mnt/arcade/19xx")),
+            requires_mount: false,
+            provenance: "extracted arcade set".to_string(),
+        }
+    }
+
+    #[test]
+    fn extracted_arcade_set_blocks_fbneo_while_standalone_mame_stays_ready() {
+        let identity = resolved("Arcade", "19xx");
+        let mame = StandaloneProfileInput {
+            adapter_id: "mame",
+            profile_id: "mame".to_string(),
+            profile_path: Some(PathBuf::from("/usr/bin/mame")),
+            eligible: true,
+            firmware: FirmwareReadiness::NotRequired,
+        };
+        let launch_plan = build_launch_plan(
+            &identity,
+            &extracted_arcade_set_content(),
+            &[mame],
+            &retroarch_with_fbneo_core(),
+            &[],
+        );
+        let fbneo = launch_plan
+            .candidates
+            .iter()
+            .find(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }))
+            .expect("fbneo candidate");
+        assert_eq!(fbneo.readiness, LaunchReadiness::Blocked);
+        assert!(
+            fbneo.blockers.iter().any(|blocker| {
+                blocker.kind == LaunchBlockerKind::RetroArchArcadeSetNeedsArchive
+            })
+        );
+        assert!(fbneo.blockers.iter().all(|blocker| {
+            blocker.kind != LaunchBlockerKind::ContentNotResolved
+                && blocker.kind != LaunchBlockerKind::FbneoContentUnavailable
+        }));
+        let mame = launch_plan
+            .candidates
+            .iter()
+            .find(|candidate| {
+                matches!(
+                    candidate.target,
+                    LaunchTarget::Standalone {
+                        adapter_id: "mame",
+                        ..
+                    }
+                )
+            })
+            .expect("mame candidate");
+        assert_eq!(mame.readiness, LaunchReadiness::Ready);
+        assert!(mame.blockers.is_empty());
+        assert_eq!(
+            mame.content.resolved_path,
+            Some(PathBuf::from("/mnt/arcade/19xx"))
+        );
+    }
+
+    #[test]
+    fn archived_arcade_set_content_is_not_blocked_for_fbneo() {
+        let identity = resolved("Arcade", "19xx");
+        let content = LaunchContentRef {
+            kind: None,
+            container: Some(LaunchContainerKind::PlainFile),
+            resolved_path: Some(PathBuf::from("/mnt/arcade/19xx.zip")),
+            requires_mount: false,
+            provenance: "archived arcade set".to_string(),
+        };
+        let launch_plan =
+            build_launch_plan(&identity, &content, &[], &retroarch_with_fbneo_core(), &[]);
+        let fbneo = launch_plan
+            .candidates
+            .iter()
+            .find(|candidate| matches!(candidate.target, LaunchTarget::RetroArchCore { .. }))
+            .expect("fbneo candidate");
+        assert_eq!(fbneo.readiness, LaunchReadiness::Ready);
+    }
 }

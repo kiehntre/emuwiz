@@ -78,6 +78,10 @@ pub enum LaunchContentKind {
     OpticalDisc,
     Cartridge,
     Executable,
+    /// An extracted MAME-style arcade set directory (`ArchiveKind::ArcadeSetDirectory`).
+    /// Standalone MAME resolves it through `-rompath`; libretro cores need an
+    /// archived ROM set instead.
+    ExtractedArcadeSet,
     Unknown,
 }
 
@@ -253,6 +257,23 @@ fn content_blocker(content: &LaunchContentRef) -> Option<LaunchBlocker> {
     ))
 }
 
+/// Message shown when a RetroArch core is offered an extracted arcade set.
+pub(crate) const ARCADE_SET_NEEDS_ARCHIVE_MESSAGE: &str = "FBNeo needs this arcade set as a ZIP or other supported archive. Your game is stored as an extracted MAME set, so use MAME for this copy.";
+
+/// Blocks RetroArch cores on an extracted arcade set directory. Applies only
+/// to `LaunchContentKind::ExtractedArcadeSet`; other content is untouched.
+pub(crate) fn retroarch_arcade_layout_blocker(
+    content: &LaunchContentRef,
+    _core_stem: &str,
+) -> Option<LaunchBlocker> {
+    (content.kind == Some(LaunchContentKind::ExtractedArcadeSet)).then(|| {
+        LaunchBlocker::new(
+            LaunchBlockerKind::RetroArchArcadeSetNeedsArchive,
+            ARCADE_SET_NEEDS_ARCHIVE_MESSAGE,
+        )
+    })
+}
+
 fn firmware_condition(
     firmware: FirmwareReadiness,
 ) -> (Option<LaunchBlocker>, Option<LaunchWarning>) {
@@ -391,6 +412,9 @@ fn build_retroarch_candidates(
             let mut blockers = Vec::new();
             let mut warnings = Vec::new();
             if let Some(blocker) = content_blocker(content) {
+                blockers.push(blocker);
+            }
+            if let Some(blocker) = retroarch_arcade_layout_blocker(content, &found.core_stem) {
                 blockers.push(blocker);
             }
             let firmware = retroarch_core_firmware_readiness(&found.info);

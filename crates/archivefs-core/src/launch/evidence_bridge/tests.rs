@@ -927,6 +927,25 @@ fn loose_mega_drive_rom_resolves_to_its_own_path_as_cartridge_content() {
     assert_eq!(content.kind, Some(LaunchContentKind::Cartridge));
 }
 
+#[test]
+fn extracted_arcade_set_directory_keeps_its_path_but_is_typed_as_an_extracted_set() {
+    let record = sample_record(
+        sample_archive("/library/arcade/19xx", ArchiveKind::ArcadeSetDirectory),
+        MountState::NotMountable,
+    );
+
+    let content = launch_content_ref_from_archive_record(&record, None);
+
+    // Path/container semantics are unchanged (standalone MAME relies on them).
+    assert_eq!(
+        content.resolved_path,
+        Some(PathBuf::from("/library/arcade/19xx"))
+    );
+    assert_eq!(content.container, Some(LaunchContainerKind::PlainFile));
+    assert!(!content.requires_mount);
+    assert_eq!(content.kind, Some(LaunchContentKind::ExtractedArcadeSet));
+}
+
 // --- archive container -> outer archive path is NOT used as runnable content
 
 #[test]
