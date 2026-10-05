@@ -97,6 +97,8 @@ fn write_7z(path: &Path, members: &[(&str, &[u8])]) {
 enum Format {
     Zip,
     SevenZ,
+    Lha,
+    Rar,
 }
 
 impl Format {
@@ -104,12 +106,23 @@ impl Format {
         match self {
             Self::Zip => "Game.zip",
             Self::SevenZ => "Game.7z",
+            Self::Lha => "Game.lha",
+            Self::Rar => "Game.rar",
         }
     }
     fn write(self, path: &Path, members: &[(&str, &[u8])]) {
         match self {
             Self::Zip => write_zip(path, members),
             Self::SevenZ => write_7z(path, members),
+            Self::Lha => write_lha(path, members),
+            Self::Rar => {
+                std::fs::copy(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/rar/test_read_format_rar5_stored.rar"),
+                    path,
+                )
+                .unwrap();
+            }
         }
     }
 }
@@ -187,8 +200,13 @@ impl Fixture {
             .unwrap();
         let row = self
             .database
-            .library_dat_identity_for_item(self.archive_id(), SOURCE_ID)
-            .unwrap();
+            .find_archive_id_by_absolute_path(&self.archive)
+            .unwrap()
+            .and_then(|id| {
+                self.database
+                    .library_dat_identity_for_item(id, SOURCE_ID)
+                    .unwrap()
+            });
         (outcome, row)
     }
 }
@@ -482,4 +500,162 @@ fn sevenz_conflicting_and_weak_members_are_not_verified() {
         !is_verified(&row),
         "exact + probable members stay unverified"
     );
+}
+
+// Stored level-0 fixture writer; no new production parser or extraction path.
+fn write_lha(path: &Path, members: &[(&str, &[u8])]) {
+    let mut archive = Vec::new();
+    for (name, payload) in members {
+        assert!(name.len() + 23 <= 255);
+        let mut crc = 0_u16;
+        for byte in *payload {
+            crc ^= u16::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xa001
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        let mut header = vec![(name.len() + 23) as u8, 0];
+        header.extend_from_slice(b"-lh0-");
+        header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        header.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&[0x20, 0, name.len() as u8]);
+        header.extend_from_slice(name.as_bytes());
+        header.extend_from_slice(&crc.to_le_bytes());
+        header.push(0);
+        header[1] = header[2..]
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(payload);
+    }
+    archive.push(0);
+    std::fs::write(path, archive).unwrap();
+}
+
+#[test]
+fn rar_lha_baseline_production_audit_and_persistence() {
+    if !external_readers_available() {
+        return;
+    }
+    // The checked-in stored RAR fixture contains these exact deterministic bytes.
+    let rar_bytes = b"hello libarchive test suite!\n";
+    for (format, name, bytes) in [
+        (Format::Rar, "helloworld.txt", rar_bytes.as_slice()),
+        (Format::Lha, "Game.rom", GAME),
+    ] {
+        let mut fx = Fixture::new(
+            format,
+            &[(name, bytes)],
+            &[Dat::Full("Game A", name, bytes)],
+        );
+        let before = std::fs::read(&fx.archive).unwrap();
+        let (outcome, row) = fx.run();
+        eprintln!(
+            "BASELINE {} outer={:?} member={:?} completion={:?} parent_id={:?} identity={:?}",
+            fx.archive.display(),
+            outcome.report.entries.first().map(|entry| &entry.verdict),
+            outcome.archives[0].members,
+            outcome.archives[0].completion,
+            fx.database
+                .find_archive_id_by_absolute_path(&fx.archive)
+                .unwrap(),
+            row
+        );
+        assert!(matches!(
+            outcome.archives[0].members[0].verdict,
+            Some(crate::dat::audit::AuditVerdict::Exact { .. })
+        ));
+        assert!(!is_verified(&row));
+        assert_eq!(std::fs::read(&fx.archive).unwrap(), before);
+        assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn rar_filename_preselection_suppresses_an_authoritative_hash_match() {
+    if !external_readers_available() {
+        return;
+    }
+    let bytes = b"hello libarchive test suite!\n";
+    let mut fx = Fixture::new(
+        Format::Rar,
+        &[],
+        &[Dat::Full("Game A", "renamed.rom", bytes)],
+    );
+    let (outcome, row) = fx.run();
+    let member = &outcome.archives[0].members[0];
+    assert_eq!(member.evidence.member_name_display, "helloworld.txt");
+    assert!(matches!(
+        member.evidence.status,
+        crate::dat::archive::ArchiveMemberStatus::NotVerified { .. }
+    ));
+    assert!(member.evidence.hashes.is_none());
+    assert!(member.verdict.is_none());
+    assert!(!is_verified(&row));
+}
+
+#[test]
+fn lha_unix_symlink_is_indistinguishable_from_a_regular_exact_member() {
+    if !external_readers_available() {
+        return;
+    }
+    // Level-0 Unix extended header: host U, minor version, mtime, mode,
+    // uid, gid. LHA symlink names use "name|target". Independent read-only
+    // libarchive inspection of this fixture reports S_IFLNK, target "target";
+    // 7-Zip 23.01 instead reports Folder=-, Host OS=MS-DOS, no link/type facts.
+    // Keep projection refused: the current provider cannot prove regularity.
+    let name = "Game.rom|target";
+    let mut fx = Fixture::new(
+        Format::Lha,
+        &[(name, GAME)],
+        &[Dat::Full("Game A", name, GAME)],
+    );
+    let bytes = std::fs::read(&fx.archive).unwrap();
+    let header_end = 2 + usize::from(bytes[0]);
+    let mut header = bytes[..header_end].to_vec();
+    *header.last_mut().unwrap() = b'U';
+    header.push(0); // Unix minor version
+    header.extend_from_slice(&0_u32.to_le_bytes());
+    header.extend_from_slice(&0o120777_u16.to_le_bytes());
+    header.extend_from_slice(&0_u16.to_le_bytes());
+    header.extend_from_slice(&0_u16.to_le_bytes());
+    header[0] = (header.len() - 2) as u8;
+    header[1] = header[2..]
+        .iter()
+        .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+    header.extend_from_slice(&bytes[header_end..]);
+    std::fs::write(&fx.archive, &header).unwrap();
+    let (outcome, row) = fx.run();
+    eprintln!(
+        "LHA SPECIAL ENTRY member={:?} completion={:?} parent_id={:?} identity={:?}",
+        outcome.archives[0].members,
+        outcome.archives[0].completion,
+        fx.database
+            .find_archive_id_by_absolute_path(&fx.archive)
+            .unwrap(),
+        row
+    );
+    assert!(matches!(
+        outcome.archives[0].members[0].verdict,
+        Some(crate::dat::audit::AuditVerdict::Exact { .. })
+    ));
+    assert!(outcome.archives[0].members[0].evidence.hashes.is_some());
+    assert!(!is_verified(&row));
+    assert_eq!(std::fs::read(&fx.archive).unwrap(), header);
+    assert_eq!(std::fs::read_dir(&fx.source).unwrap().count(), 1);
+}
+
+fn external_readers_available() -> bool {
+    let timeout = std::time::Duration::from_secs(10);
+    let available = crate::dat::archive::rar::RarProvider::discover(timeout).is_ok()
+        && crate::dat::archive::lha::LhaProvider::discover(timeout).is_ok();
+    if !available {
+        eprintln!("RAR/LHA production audit proof skipped: capable optional 7-Zip unavailable");
+    }
+    available
 }
