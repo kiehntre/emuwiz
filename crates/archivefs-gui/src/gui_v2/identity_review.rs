@@ -334,8 +334,8 @@ impl Review {
 
 /// The single place a game's identity state is decided. Pure: the same inputs
 /// give the same answer on every page. `dat` is the recorded DAT audit result
-/// for this game when it has been loaded; `ctx.dat_verified` carries the same
-/// verdict for the whole library.
+/// for this game when it has been loaded. A saved exact DAT match is also
+/// carried on the game itself (`Game::dat_exact`), set when the library loads.
 pub(super) fn review_for(game: &Game, ctx: &IdentityContext, dat: Option<&DatKnowledge>) -> Review {
     let platform = (game.platform != UNKNOWN_PLATFORM).then_some(game.platform.as_str());
     let facts = IdentityFacts {
@@ -350,9 +350,9 @@ pub(super) fn review_for(game: &Game, ctx: &IdentityContext, dat: Option<&DatKno
     let usable_dat = dat.filter(|knowledge| knowledge.trusted_source && !knowledge.stale);
 
     // 1. Verified: the file's own evidence, or one exact authoritative hash match.
-    let dat_verified = usable_dat
-        .is_some_and(|k| matches!(k.state, DatVerificationState::VerifiedSingleMatch { .. }))
-        || (dat.is_none() && ctx.dat_verified.contains(&game.archive.id));
+    let dat_verified = game.dat_exact.is_some()
+        || usable_dat
+            .is_some_and(|k| matches!(k.state, DatVerificationState::VerifiedSingleMatch { .. }));
     if class == IdentityAttention::Identified || dat_verified {
         let canonical = usable_dat
             .filter(|k| matches!(k.state, DatVerificationState::VerifiedSingleMatch { .. }));
@@ -364,8 +364,11 @@ pub(super) fn review_for(game: &Game, ctx: &IdentityContext, dat: Option<&DatKno
                 release: release_class(&title).or(apparent_release),
                 dump: DumpQuality::from_dat_name(&title),
                 region: canonical.and_then(|k| k.region.clone()),
-                source: canonical.map(|k| k.source_name.clone()),
-                by_file_evidence: class == IdentityAttention::Identified,
+                source: canonical
+                    .map(|k| k.source_name.clone())
+                    .or_else(|| game.dat_exact.flatten().map(str::to_string)),
+                by_file_evidence: class == IdentityAttention::Identified
+                    && game.dat_exact.is_none(),
                 title,
             }),
             apparent_release: None,

@@ -46,6 +46,9 @@ pub(crate) enum IdentitySummary {
     StrongLocal,
     LaunchableWithWarning,
     NeedsReview,
+    /// The saved catalogue holds an exact authoritative match, but launch
+    /// still needs the file's own identity evidence.
+    CatalogueVerified,
     Mismatch,
 }
 
@@ -748,11 +751,26 @@ fn show_attempt(ui: &mut egui::Ui, attempt: &Attempt) -> Option<ReadinessAction>
     clicked.then_some(fix)
 }
 
+/// A game whose saved exact DAT match already verified it must not be told its
+/// identity is "not confirmed". Launch is deliberately unchanged: it still
+/// requires the file's own identity evidence (and re-reads the file when it
+/// starts), so say exactly that instead of contradicting the verified status.
+pub(crate) fn note_catalogue_verified(summary: &mut GameReadinessSummary) {
+    if summary.status == ReadinessPresentationState::NeedsIdentityReview
+        && summary.identity == IdentitySummary::NeedsReview
+    {
+        summary.identity = IdentitySummary::CatalogueVerified;
+        summary.headline = "Verified. Launch also needs the file's own identity".into();
+        summary.explanation = "This game matched trusted identification data exactly. Before it plays, EmuWiz also reads the file's own identity data, and that could not be confirmed yet. The verification itself is fine; Review identity shows what is known.".into();
+    }
+}
+
 fn identity_label(identity: IdentitySummary) -> &'static str {
     match identity {
         IdentitySummary::StrongLocal => "Strong local identity",
         IdentitySummary::LaunchableWithWarning => "Launchable with warning",
         IdentitySummary::NeedsReview => "Needs review",
+        IdentitySummary::CatalogueVerified => "Verified · file identity still needed to launch",
         IdentitySummary::Mismatch => "Mismatch / blocked",
     }
 }

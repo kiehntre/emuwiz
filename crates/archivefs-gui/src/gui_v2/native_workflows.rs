@@ -465,6 +465,7 @@ impl NativeWorkflows {
         game_id: i64,
         path: &Path,
         catalogue_identity_report: Option<&archivefs_core::game_identity::GameIdentityReport>,
+        catalogue_verified: bool,
         activity: &mut Activity,
     ) -> Option<Route> {
         self.selected_game = Some(game_id);
@@ -479,6 +480,9 @@ impl NativeWorkflows {
         };
         self.observe_readiness_activity(activity);
         let mut summary = launch_readiness_summary::project(&input, freshness);
+        if catalogue_verified {
+            launch_readiness_summary::note_catalogue_verified(&mut summary);
+        }
         summary.attempt = self.launch_attempts.for_game(game_id).cloned();
         let action = launch_readiness_summary::show(ui, &summary);
         if action == Some(ReadinessAction::RecheckReadiness) {

@@ -2349,6 +2349,7 @@ impl App {
                             id,
                             &game.archive.absolute_path,
                             game.archive.identity_report.as_ref(),
+                            game.dat_exact.is_some(),
                             &mut self.activity,
                         )
                     };

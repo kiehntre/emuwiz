@@ -77,18 +77,19 @@ fn a_unique_exact_authoritative_match_is_verified_automatically_with_nothing_to_
 
 #[test]
 fn a_thousand_exact_matches_need_no_user_action() {
-    let mut context = ctx();
-    context.dat_verified = (1..=1000).collect();
+    // The saved-match join marks the game; the review state needs nothing more.
+    let context = ctx();
     let verified = (1..=1000)
         .filter(|id| {
-            review_for(&game(*id, &format!("g{id}.zip"), "SNES"), &context, None).is_verified()
+            let mut game = game(*id, &format!("g{id}.zip"), "SNES");
+            game.mark_dat_exact(Some("No-Intro"));
+            review_for(&game, &context, None).is_verified()
         })
         .count();
     assert_eq!(
         verified, 1000,
         "every exact match is verified with zero clicks"
     );
-    // and a game the audit did not match is not swept in
     assert!(!review_for(&game(5000, "other.zip", "SNES"), &context, None).is_verified());
 }
 

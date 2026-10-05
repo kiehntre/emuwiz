@@ -17201,65 +17201,6 @@ mod tests {
         }
 
         #[test]
-        fn only_a_current_single_hash_match_counts_as_dat_verified() {
-            let (root, mut database) = open("verified-ids");
-            let good = seed_archive(&database, "Good.nes");
-            let named = seed_archive(&database, "NamedOnly.nes");
-            let none = seed_archive(&database, "None.nes");
-            let stale = seed_archive(&database, "Stale.nes");
-            database
-                .persist_library_dat_identity(
-                    good,
-                    &verified(
-                        "no-intro-nes",
-                        DatEcosystem::NoIntro,
-                        Some("v1"),
-                        "Good (USA)",
-                        DatAuditCompleteness::Exhaustive,
-                    ),
-                )
-                .unwrap();
-            let mut filename_only = verified(
-                "no-intro-nes",
-                DatEcosystem::NoIntro,
-                Some("v1"),
-                "Named (USA)",
-                DatAuditCompleteness::Exhaustive,
-            );
-            filename_only.verification_state = DatVerificationState::FilenameOnlyNotVerified;
-            database
-                .persist_library_dat_identity(named, &filename_only)
-                .unwrap();
-            database
-                .persist_library_dat_identity(
-                    none,
-                    &no_match("no-intro-nes", DatAuditCompleteness::Exhaustive),
-                )
-                .unwrap();
-            database
-                .persist_library_dat_identity(
-                    stale,
-                    &verified(
-                        "no-intro-nes",
-                        DatEcosystem::NoIntro,
-                        Some("v1"),
-                        "Stale (USA)",
-                        DatAuditCompleteness::Exhaustive,
-                    ),
-                )
-                .unwrap();
-            database.connection.execute(
-                "UPDATE library_dat_identities SET revision_marked_stale = 1 WHERE archive_id = ?1",
-                params![stale],
-            ).unwrap();
-            let ids: std::collections::HashSet<i64> =
-                database.library_dat_exact_matches().unwrap().into_keys().collect();
-            assert_eq!(ids, std::collections::HashSet::from([good]));
-            database.close().unwrap();
-            let _ = fs::remove_dir_all(&root);
-        }
-
-        #[test]
         fn persist_and_reconstruct_a_verified_single_match() {
             let (root, mut database) = open("persist-verified");
             let archive_id = seed_archive(&database, "Zelda.nes");

@@ -7,7 +7,6 @@ use super::{
     activity::CancelPolicy,
     backend::Command,
     identity_review::{DatKnowledge, DumpQuality, Review, ReviewState, review_for},
-    job_card,
     library::Game,
     routes::{Route, Section},
 };

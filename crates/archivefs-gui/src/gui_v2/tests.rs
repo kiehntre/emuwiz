@@ -7766,10 +7766,7 @@ fn check_games_leads_with_what_verified_automatically_and_lists_only_the_rest() 
             (3, "Other", "NES"),
         ],
     );
-    Arc::make_mut(&mut app.library)
-        .identity_context
-        .dat_verified
-        .insert(1);
+    Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
     app.check_platform = Some("SNES".into());
     app.router.current = Route::Section(Section::Check);
     let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
@@ -7790,10 +7787,7 @@ fn one_game_has_one_identity_status_on_every_page() {
     for verified in [false, true] {
         let mut app = review_app(&context, vec![(1, "Amidar", "Atari2600")]);
         if verified {
-            Arc::make_mut(&mut app.library)
-                .identity_context
-                .dat_verified
-                .insert(1);
+            Arc::make_mut(&mut app.library).games[0].mark_dat_exact(Some("No-Intro"));
         } else {
             app.review.knowledge = Some(knowledge(S::NoMatch));
         }
@@ -7889,4 +7883,103 @@ fn setting_up_identification_data_carries_the_game_and_system_and_offers_the_way
 fn no_match_reasons_are_distinct_states() {
     assert_ne!(NoMatchReason::NotInData, NoMatchReason::WeakEvidenceOnly);
     assert_ne!(NoMatchReason::NotInData, NoMatchReason::NoUsableEvidence);
+}
+
+// --- one saved exact DAT match is verified everywhere --------------------------
+
+#[test]
+fn a_fresh_exact_dat_match_is_verified_on_every_page_and_launch_says_what_it_still_needs() {
+    use super::dat_exact_tests::{audit_and_save, fixture as dat_fixture, names};
+    let temp = dat_fixture(&names(5));
+    audit_and_save(&temp);
+    let library = super::backend::load_library(&temp.db).unwrap();
+    let verified = library
+        .games
+        .iter()
+        .find(|game| game.dat_exact.is_some())
+        .expect("a game verified by its saved exact match");
+    let unresolved = library
+        .games
+        .iter()
+        .find(|game| game.title == "unlisted.gbc")
+        .expect("an unlisted game");
+    let (vid, uid) = (verified.archive.id, unresolved.archive.id);
+    let platform = verified.platform.clone();
+    let count = library
+        .games
+        .iter()
+        .filter(|g| g.platform == platform && g.dat_exact.is_some())
+        .count();
+    assert!(verified.identified && !unresolved.identified);
+
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.library = Arc::new(library);
+    app.review.knowledge_for = Some(vid);
+    // the one state function
+    let review = app.identity_review_for(vid).unwrap();
+    assert!(review.is_verified() && review.list_label() == "Verified");
+    assert!(!app.identity_review_for(uid).unwrap().is_verified());
+    // Game Details
+    app.router.current = Route::Game(vid);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(shows(&strings, "Identity: Verified"), "{strings:?}");
+    // Review Identity: verified, nothing to confirm
+    app.router.current = Route::ReviewIdentity(vid);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, "Verified") && !shows(&strings, "Confirm"),
+        "{strings:?}"
+    );
+    // Problems: the selected game says verified; no identity finding for it
+    app.problem_summary = Some(Arc::new(ProblemSummary::from_library(&app.library, None)));
+    assert!(
+        !app.problem_summary
+            .as_ref()
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.category == super::problems::Category::Identity && p.game_id == Some(vid))
+    );
+    app.router.current = Route::Task {
+        section: Section::Problems,
+        game: vid,
+    };
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(shows(&strings, "Identity: Verified"), "{strings:?}");
+    // Mods & Cheats does not ask to identify a verified game
+    app.router.current = Route::Task {
+        section: Section::Mods,
+        game: vid,
+    };
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        !shows(&strings, "We need to identify this game"),
+        "{strings:?}"
+    );
+    // Check Games counts it
+    app.check_platform = Some(platform);
+    app.router.current = Route::Section(Section::Check);
+    let strings = text(&frame(&context, &mut app, [1280.0, 900.0]));
+    assert!(
+        shows(&strings, &format!("{count} verified automatically")),
+        "{strings:?}"
+    );
+    // Launch: unchanged policy, but never a contradictory "not confirmed"
+    use super::launch_readiness_summary::{ReadinessFreshness, note_catalogue_verified, project};
+    let input = crate::launch_readiness_page::LaunchReadinessInput::IdentityUnknown;
+    let mut for_verified = project(&input, ReadinessFreshness::Current);
+    note_catalogue_verified(&mut for_verified);
+    assert!(
+        for_verified.headline.starts_with("Verified."),
+        "{}",
+        for_verified.headline
+    );
+    assert!(for_verified.explanation.contains("file's own identity"));
+    assert!(
+        for_verified.primary_action.is_some(),
+        "still blocked, with a way forward"
+    );
+    let unresolved_summary = project(&input, ReadinessFreshness::Current);
+    assert!(unresolved_summary.headline.contains("not confirmed"));
 }

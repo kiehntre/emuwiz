@@ -864,15 +864,10 @@ pub(super) fn load_library(path: &Path) -> Result<Library, String> {
     .filter(|result| !result.stale)
     .filter_map(|result| result.archive_id)
     .collect();
-    // Games a recorded DAT audit already matched exactly: verified, nobody confirms them.
-    let dat_verified = database
-        .library_dat_verified_archive_ids()
-        .unwrap_or_default();
     let mut library = Library::with_history(archives, &renames, Some(&configured));
     library.identity_context = super::library::IdentityContext {
         inventory: crate::dat_catalogue_picker::reference_inventory(),
         matched,
-        dat_verified,
     };
     // A saved exact DAT match is verified: nobody confirms it.
     for (archive_id, ecosystem) in database.library_dat_exact_matches().unwrap_or_default() {

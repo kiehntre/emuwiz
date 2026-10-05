@@ -260,11 +260,7 @@ impl ProblemSummary {
                 )
             {
                 problems.push(file_problem(game));
-            } else if library
-                .identity_context
-                .dat_verified
-                .contains(&game.archive.id)
-            {
+            } else if game.dat_exact.is_some() {
                 // An exact authoritative DAT match is verified automatically.
             } else {
                 let facts = IdentityFacts {
@@ -919,7 +915,6 @@ pub(in crate::gui_v2) mod tests {
         library.identity_context = super::super::library::IdentityContext {
             inventory,
             matched: matched.iter().copied().collect(),
-            dat_verified: Default::default(),
         };
         ProblemSummary::from_library(&library, None)
     }

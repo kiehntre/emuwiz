@@ -149,8 +149,15 @@ pub(super) fn show_mods_page(
                 if selected_game.is_none() && ui.button("Choose a game").clicked() { destination = Some(Route::Section(Section::Games)); }
                 if let Some(game) = selected_game {
                     if selected_identity(Some(game)).is_none() {
-                        ui.label("We need to identify this game before cheats or mods can be matched safely.");
-                        if ui.button("Review identity").clicked() { destination = Some(Route::ReviewIdentity(game.archive.id)); }
+                        if game.dat_exact.is_some() {
+                            // Verified by its saved exact match, but mod/cheat matching keys on
+                            // the game's own identity data, which this file does not provide.
+                            ui.label("This game is verified. Matching its mods and cheats also needs the game's own identity data (such as a title ID), which EmuWiz could not read from this file.");
+                            if ui.button("View evidence").clicked() { destination = Some(Route::ReviewIdentity(game.archive.id)); }
+                        } else {
+                            ui.label("We need to identify this game before cheats or mods can be matched safely.");
+                            if ui.button("Review identity").clicked() { destination = Some(Route::ReviewIdentity(game.archive.id)); }
+                        }
                     }
                 }
                 if ui.button("Open History & Undo").clicked() { destination = Some(Route::Section(Section::History)); }

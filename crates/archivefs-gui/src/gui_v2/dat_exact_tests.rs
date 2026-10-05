@@ -24,16 +24,16 @@ fn hashes(path: &Path) -> archivefs_core::identity_source::hashing::LocalHashes 
     .unwrap()
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     _dir: tempfile::TempDir,
-    db: std::path::PathBuf,
+    pub(super) db: std::path::PathBuf,
     roms: std::path::PathBuf,
     dat: std::path::PathBuf,
 }
 
 /// `exact` names are DAT-listed with SHA-256; the extras cover every state
 /// that must not verify a game.
-fn fixture(exact: &[String]) -> Fixture {
+pub(super) fn fixture(exact: &[String]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let roms = dir.path().join("roms");
     std::fs::create_dir(&roms).unwrap();
@@ -111,7 +111,7 @@ fn fixture(exact: &[String]) -> Fixture {
     }
 }
 
-fn audit_and_save(fixture: &Fixture) {
+pub(super) fn audit_and_save(fixture: &Fixture) {
     let request = DatAuditRequest {
         source_id: SOURCE.into(),
         source_display_name: "No-Intro: Nintendo - Game Boy Color".into(),
@@ -136,7 +136,7 @@ fn audit_and_save(fixture: &Fixture) {
         .unwrap();
 }
 
-fn names(count: usize) -> Vec<String> {
+pub(super) fn names(count: usize) -> Vec<String> {
     // Beta/Demo/Proto/Sample entries are exact matches like any other.
     let tags = ["", " (Beta)", " (Demo)", " (Proto)", " (Sample)"];
     (0..count)
