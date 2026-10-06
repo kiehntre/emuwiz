@@ -103,19 +103,40 @@ impl AuditCacheConfig {
     }
 }
 
-/// Whether this process is a cargo-built test (or benchmark) binary: those
-/// live in a `deps` directory next to the build output, while the application,
-/// `cargo run` binaries and installed copies never do. Used only to keep tests
-/// away from the user's real audit cache.
+/// Whether `exe` has the shape of a cargo-built test (or benchmark) binary:
+/// `<target>/<profile>/deps/<crate>-<16 lowercase hex digits>` (an optional
+/// `.exe` is ignored). Both halves are required. The directory alone is not
+/// enough - an unrelated program installed under some folder that happens to
+/// be called `deps` must keep its normal cache - and the hash suffix alone is
+/// not enough either. `cargo run` binaries (`<target>/<profile>/<name>`),
+/// installed copies and release builds never match.
+fn is_cargo_test_binary_path(exe: &Path) -> bool {
+    let in_deps = exe
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|directory| directory == "deps");
+    let hashed_name = exe
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.rsplit_once('-'))
+        .is_some_and(|(crate_name, hash)| {
+            !crate_name.is_empty()
+                && hash.len() == 16
+                && hash
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        });
+    in_deps && hashed_name
+}
+
+/// Whether this process is such a binary. Used only to keep tests away from
+/// the user's real audit cache.
 fn running_as_cargo_test_binary() -> bool {
     static IS_TEST_BINARY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *IS_TEST_BINARY.get_or_init(|| {
         std::env::current_exe()
             .ok()
-            .as_deref()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .is_some_and(|directory| directory == "deps")
+            .is_some_and(|exe| is_cargo_test_binary_path(&exe))
     })
 }
 
@@ -932,5 +953,46 @@ mod tests {
         cache.insert(&file, "ed82cd11".into(), "m".repeat(32), "s".repeat(40));
         cache.save().unwrap();
         assert!(root.path().join(CACHE_FILE_NAME).is_file());
+    }
+
+    #[test]
+    fn test_binary_detection_matches_cargo_test_layouts_and_nothing_else() {
+        let yes = [
+            "/work/target/debug/deps/archivefs_core-207406efa7f10f78",
+            "/work/target/release/deps/archivefs_gui-84a5c293b3033299",
+            "/work/target/x86_64-unknown-linux-gnu/debug/deps/emuwiz_cli-dfb5f136e036aafd",
+            "/cache/emuwiz-targets/debug/deps/a-b-c_d-0123456789abcdef",
+            "C:/work/target/debug/deps/archivefs_core-207406efa7f10f78.exe",
+        ];
+        for path in yes {
+            assert!(is_cargo_test_binary_path(Path::new(path)), "{path}");
+        }
+        let no = [
+            // `cargo run` and installed/release binaries.
+            "/work/target/debug/emuwiz-v2",
+            "/work/target/release/emuwiz-v2",
+            "/work/target/debug/emuwiz",
+            "/usr/bin/emuwiz-v2",
+            "/home/user/.cargo/bin/emuwiz-v2",
+            "/tmp/.mount_EmuWizAbc/usr/bin/emuwiz-v2",
+            "/opt/EmuWiz/emuwiz-v2",
+            // An unrelated folder that is merely called `deps`.
+            "/opt/app/deps/emuwiz-v2",
+            "/opt/app/deps/emuwiz",
+            "/opt/app/deps/emuwiz-123",
+            "/opt/app/deps/emuwiz-0123456789abcdeg",
+            "/opt/app/deps/emuwiz-0123456789ABCDEF",
+            "/opt/app/deps/emuwiz-0123456789abcdef0",
+            "/opt/app/deps/-0123456789abcdef",
+            // The right name shape, but not in `deps`.
+            "/work/target/debug/archivefs_core-207406efa7f10f78",
+            "/work/target/debug/examples/demo-207406efa7f10f78",
+            "/opt/app/depsx/emuwiz-0123456789abcdef",
+            "/",
+            "",
+        ];
+        for path in no {
+            assert!(!is_cargo_test_binary_path(Path::new(path)), "{path:?}");
+        }
     }
 }
