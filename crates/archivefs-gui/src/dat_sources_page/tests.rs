@@ -9172,3 +9172,13 @@ mod dat_coverage_section {
         ));
     }
 }
+
+#[test]
+fn dat_sources_tests_never_reach_the_production_audit_cache() {
+    use archivefs_core::dat::sources::audit_cache::{AuditCacheConfig, AuditHashCache};
+    // The audit worker chooses its cache through one helper, which is Disabled in tests...
+    assert_eq!(audit_cache_config(), AuditCacheConfig::Disabled);
+    // ...and even a request for the default cache is refused in a test binary.
+    assert!(!AuditHashCache::from_config(&AuditCacheConfig::Default).is_enabled());
+    assert!(!AuditHashCache::load_default().is_enabled());
+}

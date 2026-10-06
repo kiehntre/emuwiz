@@ -6331,7 +6331,7 @@ impl DatSourcesPageState {
                 &|progress| {
                     send_progress(&report_sender, JobMessage::AuditProgress(progress));
                 },
-                archivefs_core::dat::sources::audit_cache::AuditCacheConfig::Default,
+                audit_cache_config(),
                 &targets,
             );
             let _ = match outcome {
@@ -6440,7 +6440,7 @@ impl DatSourcesPageState {
                 &|progress| {
                     send_progress(&report_sender, JobMessage::AuditProgress(progress));
                 },
-                archivefs_core::dat::sources::audit_cache::AuditCacheConfig::Default,
+                audit_cache_config(),
                 // Identify & Rename looks at games only: artwork and manuals
                 // beside them are counted, never hashed.
                 &archivefs_core::dat::sources::audit_targets::AuditTargets::FolderWalkGamesOnly,
@@ -7814,6 +7814,17 @@ fn describe(progress: &DatAuditProgress) -> String {
 
 /// Turns a core outcome into rows, without adding or merging any category. The
 /// in-memory outcome is the only input; nothing is re-scanned to build this.
+/// The audit cache the worker uses: the user's default, except in this
+/// crate's own tests, which must never read or write the real cache.
+fn audit_cache_config() -> archivefs_core::dat::sources::audit_cache::AuditCacheConfig {
+    use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
+    if cfg!(test) {
+        AuditCacheConfig::Disabled
+    } else {
+        AuditCacheConfig::Default
+    }
+}
+
 /// What the audit actually looked at, in plain words.
 fn population_note(outcome: &DatAuditOutcome) -> String {
     use archivefs_core::dat::sources::audit_targets::AuditPopulationBasis;

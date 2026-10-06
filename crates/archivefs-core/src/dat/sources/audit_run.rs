@@ -522,7 +522,7 @@ pub fn run_dat_audit(
         trusted,
         cancel,
         on_progress,
-        AuditCacheConfig::Default,
+        AuditCacheConfig::convenience_default(),
     )
 }
 
@@ -1093,7 +1093,7 @@ pub fn run_combined_dat_audit(
         trusted,
         cancel,
         on_progress,
-        AuditCacheConfig::Default,
+        AuditCacheConfig::convenience_default(),
     )
 }
 

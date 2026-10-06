@@ -54,6 +54,16 @@ use archivefs_core::repair::library::{
 use archivefs_core::repair::proposal::{RepairEvidenceKind, RepairProposalId};
 use archivefs_core::safe_read::TrustedRoots;
 
+/// The cache the repair commands use: the user's default, except in this
+/// crate's own tests, which must never touch the real cache.
+fn cli_audit_cache() -> AuditCacheConfig {
+    if cfg!(test) {
+        AuditCacheConfig::Disabled
+    } else {
+        AuditCacheConfig::Default
+    }
+}
+
 pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let Some(command) = args.first().cloned() else {
         return Err(
@@ -118,7 +128,7 @@ fn run_scan(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         scan_root: root.clone(),
         limits: DatLimits::default(),
         profile,
-        audit_cache: AuditCacheConfig::Default,
+        audit_cache: cli_audit_cache(),
     };
 
     eprintln!(
@@ -207,7 +217,7 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let options = RepairExecutionOptions {
         trusted,
         journal_dir,
-        audit_cache: AuditCacheConfig::Default,
+        audit_cache: cli_audit_cache(),
     };
     let cancel = std::sync::atomic::AtomicBool::new(false);
 
@@ -1970,5 +1980,16 @@ mod tests {
             std::fs::read(roms.join("redundant-copy.bin")).unwrap(),
             b"test"
         );
+    }
+
+    #[test]
+    fn repair_tests_never_reach_the_production_audit_cache() {
+        // The repair commands choose their cache through one helper...
+        assert_eq!(cli_audit_cache(), AuditCacheConfig::Disabled);
+        // ...and even a request for the default cache is refused in a test binary.
+        let cache = archivefs_core::dat::sources::audit_cache::AuditHashCache::from_config(
+            &AuditCacheConfig::Default,
+        );
+        assert!(!cache.is_enabled());
     }
 }
