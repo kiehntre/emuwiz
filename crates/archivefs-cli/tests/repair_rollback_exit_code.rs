@@ -14,9 +14,25 @@ const SHA1_TEST: &str = "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3";
 const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 const SHA1_XYZ: &str = "66b27417d37e024c46526c2f6d358a754fc552f3";
 
+/// One throwaway HOME shared by every spawned CLI in this test binary. The CLI
+/// is a production binary (not a cargo test binary), so it would otherwise read
+/// and write the user's real config, database and audit cache.
+fn throwaway_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| tempfile::tempdir().expect("a throwaway HOME"))
+        .path()
+}
+
 fn run_cli(args: &[&str]) -> Output {
+    let home = throwaway_home();
     Command::new(env!("CARGO_BIN_EXE_emuwiz-cli"))
         .args(args)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env_remove("EMUWIZ_DATA_HOME")
         .output()
         .expect("the CLI must run")
 }
