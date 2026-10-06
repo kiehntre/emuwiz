@@ -3481,6 +3481,7 @@ fn take_over_job(page: &mut DatSourcesPageState, latest: &str) -> SyncSender<Job
 /// dropped rather than presented.
 fn minimal_outcome() -> DatAuditOutcome {
     DatAuditOutcome {
+        population: Default::default(),
         source_id: "collection".to_string(),
         source_display_name: "collection.dat".to_string(),
         dat_path: "/tmp/collection.dat".to_string(),

@@ -83,6 +83,7 @@ fn romm(platform: &str) -> PlatformIdentityEvidence {
 
 fn dat_outcome(platform: Option<&str>, verdict: AuditVerdict) -> DatAuditOutcome {
     DatAuditOutcome {
+        population: Default::default(),
         source_id: "dat-1".to_string(),
         source_display_name: "No-Intro PSP".to_string(),
         dat_path: "/catalogues/psp.dat".to_string(),

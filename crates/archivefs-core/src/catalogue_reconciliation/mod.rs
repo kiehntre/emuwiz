@@ -621,6 +621,49 @@ fn weak_state<'a>(
     }
 }
 
+/// The files a catalogued CUE/GDI descriptor intentionally references, through
+/// the existing ingestion resolvers (same bounded read and path-safety rules:
+/// no absolute or `..` references, and the canonical result must stay beneath
+/// the descriptor's own directory). `None` when `descriptor` is not a CUE or
+/// GDI by extension. References that are missing or unsafe resolve to nothing.
+/// Paths are returned in the spelling of the descriptor's own directory, not
+/// canonicalised. Only the descriptor (at most 256 KiB) is read.
+pub fn descriptor_companions(descriptor: &Path) -> Option<(CompanionBasis, Vec<PathBuf>)> {
+    use crate::ingestion::{
+        cue_bin::resolve_cue_all_files_lenient, gdi::resolve_gdi_all_tracks_lenient,
+    };
+    let extension = descriptor.extension()?.to_ascii_lowercase();
+    let (basis, resolved): (CompanionBasis, Vec<PathBuf>) = if extension == "cue" {
+        (
+            CompanionBasis::CueFileReference,
+            resolve_cue_all_files_lenient(descriptor)
+                .map(|all| all.into_iter().flatten().collect())
+                .unwrap_or_default(),
+        )
+    } else if extension == "gdi" {
+        (
+            CompanionBasis::GdiTrackReference,
+            resolve_gdi_all_tracks_lenient(descriptor)
+                .map(|all| all.into_iter().flatten().collect())
+                .unwrap_or_default(),
+        )
+    } else {
+        return None;
+    };
+    let Some(parent) = descriptor.parent() else {
+        return Some((basis, Vec::new()));
+    };
+    let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+        return Some((basis, Vec::new()));
+    };
+    let files = resolved
+        .iter()
+        .filter_map(|canonical| canonical.strip_prefix(&canonical_parent).ok())
+        .map(|relative| parent.join(relative))
+        .collect();
+    Some((basis, files))
+}
+
 /// Convenience for adapters: fold explicit hash results into file facts.
 pub fn attach_hashes(files: &mut [FileFacts], hashes: &BTreeMap<PathBuf, Vec<StrongHash>>) {
     for file in files {

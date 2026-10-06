@@ -15461,6 +15461,7 @@ mod tests {
             .find(|archive| archive.id == archive_id)
             .unwrap();
         let outcome = DatAuditOutcome {
+            population: Default::default(),
             source_id: "psp-dat".to_string(),
             source_display_name: "No-Intro PSP".to_string(),
             dat_path: "/catalogues/psp.dat".to_string(),
@@ -15539,6 +15540,7 @@ mod tests {
             .find(|archive| archive.id == archive_id)
             .unwrap();
         let mut outcome = DatAuditOutcome {
+            population: Default::default(),
             source_id: "mame-arcade".to_string(),
             source_display_name: "MAME Arcade".to_string(),
             dat_path: "/catalogues/mame.dat".to_string(),
@@ -15675,6 +15677,7 @@ mod tests {
         use crate::dat::audit::{AuditReport, AuditSummary};
         use crate::dat::sources::audit_run::DatAuditOutcome;
         DatAuditOutcome {
+            population: Default::default(),
             source_id: source_id.to_string(),
             source_display_name: "No-Intro PSP".to_string(),
             dat_path: "/catalogues/psp.dat".to_string(),

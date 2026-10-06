@@ -7,6 +7,7 @@ const AUDITED_AT: &str = "2026-09-03T00:00:00Z";
 
 fn base_outcome() -> DatAuditOutcome {
     DatAuditOutcome {
+        population: Default::default(),
         source_id: "no-intro-nes".to_string(),
         source_display_name: "No-Intro - Nintendo Entertainment System".to_string(),
         dat_path: "/dats/nes.dat".to_string(),

@@ -46,6 +46,9 @@ pub const MAX_DISCOVERY_DEPTH: usize = 128;
 const KNOWN_NON_GAME_EXTENSIONS: &[&str] = &[
     // Images (box art, screenshots, fanart).
     "jpg", "jpeg", "png", "gif", "bmp", "webp", "tga", "ico",
+    // Manuals. Real collections carry thousands of PDF manuals beside the
+    // games; no content registry entry uses `pdf`.
+    "pdf",
     // Text/metadata sidecars. Note: "md" is deliberately excluded here - it
     // is a registered Sega Genesis/Mega Drive ROM extension in
     // `content_registry`, not a safe sidecar to filter (a real-world

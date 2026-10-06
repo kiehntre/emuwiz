@@ -79,7 +79,7 @@ use archivefs_core::dat::rename_plan::{
 };
 use archivefs_core::dat::sources::audit_run::{
     CombinedDatAuditRequest, CombinedDatAuditSource, DatAuditOutcome, DatAuditProgress,
-    DatAuditRequest, run_combined_dat_audit, run_dat_audit,
+    DatAuditRequest, run_combined_dat_audit_with_targets, run_dat_audit_with_targets,
 };
 use archivefs_core::dat::sources::{
     DatFileOutcome, DatHealthState, DatSourceEntry, DatSourceHealth, DatSourceKind,
@@ -1585,6 +1585,9 @@ pub(crate) struct AuditResultView {
     pub(crate) unreadable_catalogues: Vec<String>,
     pub(crate) truncated: bool,
     pub(crate) files_scanned: usize,
+    /// Plain-language statement of what population was checked and what was
+    /// deliberately not read (artwork, manuals, catalogue entries not on disk).
+    pub(crate) population_note: String,
     pub(crate) content_selection: ContentSelectionPolicy,
     pub(crate) content_summary: DatContentSummary,
     /// The Effective Policy Summary annotation, when the audit carried a
@@ -6316,9 +6319,21 @@ impl DatSourcesPageState {
         let database_path = self.database_path.clone();
         std::thread::spawn(move || {
             let report_sender = sender.clone();
-            let outcome = run_dat_audit(&request, &trusted, &worker_cancel, &|progress| {
-                send_progress(&report_sender, JobMessage::AuditProgress(progress));
-            });
+            let targets = audit_targets_for(
+                request.platform.as_deref(),
+                &request.scan_root,
+                database_path.as_deref(),
+            );
+            let outcome = run_dat_audit_with_targets(
+                &request,
+                &trusted,
+                &worker_cancel,
+                &|progress| {
+                    send_progress(&report_sender, JobMessage::AuditProgress(progress));
+                },
+                archivefs_core::dat::sources::audit_cache::AuditCacheConfig::Default,
+                &targets,
+            );
             let _ = match outcome {
                 Ok(outcome) => {
                     let (save_result, enrichment) = save_result::persist_audit(
@@ -6418,9 +6433,18 @@ impl DatSourcesPageState {
 
         std::thread::spawn(move || {
             let report_sender = sender.clone();
-            let outcome = run_combined_dat_audit(&request, &trusted, &worker_cancel, &|progress| {
-                send_progress(&report_sender, JobMessage::AuditProgress(progress));
-            });
+            let outcome = run_combined_dat_audit_with_targets(
+                &request,
+                &trusted,
+                &worker_cancel,
+                &|progress| {
+                    send_progress(&report_sender, JobMessage::AuditProgress(progress));
+                },
+                archivefs_core::dat::sources::audit_cache::AuditCacheConfig::Default,
+                // Identify & Rename looks at games only: artwork and manuals
+                // beside them are counted, never hashed.
+                &archivefs_core::dat::sources::audit_targets::AuditTargets::FolderWalkGamesOnly,
+            );
             let _ = match outcome {
                 Ok(outcome) => {
                     if sender
@@ -7790,6 +7814,95 @@ fn describe(progress: &DatAuditProgress) -> String {
 
 /// Turns a core outcome into rows, without adding or merging any category. The
 /// in-memory outcome is the only input; nothing is re-scanned to build this.
+/// What the audit actually looked at, in plain words.
+fn population_note(outcome: &DatAuditOutcome) -> String {
+    use archivefs_core::dat::sources::audit_targets::AuditPopulationBasis;
+    let population = &outcome.population;
+    match population.basis {
+        AuditPopulationBasis::Catalogue => {
+            let mut note = format!(
+                "Checked {} catalogued game{}.",
+                population.catalogue_rows,
+                if population.catalogue_rows == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            if population.companion_files > 0 {
+                note.push_str(&format!(
+                    " {} disc track file(s) named by catalogued disc images were included.",
+                    population.companion_files
+                ));
+            }
+            if population.catalogue_rows_unavailable > 0 {
+                note.push_str(&format!(
+                    " {} catalogue entr{} not on disk, so {} not checked.",
+                    population.catalogue_rows_unavailable,
+                    if population.catalogue_rows_unavailable == 1 {
+                        "y was"
+                    } else {
+                        "ies were"
+                    },
+                    if population.catalogue_rows_unavailable == 1 {
+                        "it was"
+                    } else {
+                        "they were"
+                    },
+                ));
+            }
+            note.push_str(" Artwork, manuals and other files beside the games were not read.");
+            note
+        }
+        AuditPopulationBasis::FolderWalk if population.support_files_skipped > 0 => format!(
+            "{} artwork, manual or metadata file(s) in the folder were not read.",
+            population.support_files_skipped
+        ),
+        AuditPopulationBasis::FolderWalk => String::new(),
+    }
+}
+
+/// The files a platform audit verifies: the catalogue's game units for that
+/// platform (or not yet assigned to any) inside the scan folder, never
+/// whatever else sits beside them.
+/// Falls back to the games-only folder walk (which still skips known support files) when
+/// no platform is assigned, for Arcade (whose sets and CHDs need the walk), or
+/// when the catalogue cannot be read.
+fn audit_targets_for(
+    platform: Option<&str>,
+    scan_root: &std::path::Path,
+    database_path: Option<&std::path::Path>,
+) -> archivefs_core::dat::sources::audit_targets::AuditTargets {
+    use archivefs_core::dat::sources::audit_targets::{AuditTargets, catalogue_audit_targets};
+    let (Some(platform), Some(database_path)) = (platform, database_path) else {
+        return AuditTargets::FolderWalkGamesOnly;
+    };
+    if platform == "Arcade" || !database_path.exists() {
+        return AuditTargets::FolderWalkGamesOnly;
+    }
+    let Ok(database) = archivefs_core::Database::open_read_only(database_path) else {
+        return AuditTargets::FolderWalkGamesOnly;
+    };
+    let Ok(archives) = database.load_archives() else {
+        return AuditTargets::FolderWalkGamesOnly;
+    };
+    // This platform's rows, plus rows with no platform yet: an exact match
+    // against this platform's DAT is how an unassigned game gets its platform
+    // established. Rows assigned to a *different* platform are not this
+    // platform's games and are left out.
+    let rows = archives
+        .into_iter()
+        .filter(|archive| match archive.platform.as_deref() {
+            None => true,
+            Some(assigned) if assigned.trim().is_empty() => true,
+            Some(assigned) => {
+                archivefs_core::canonical_platform_for_alias(assigned) == Some(platform)
+            }
+        })
+        .map(|archive| archive.absolute_path);
+    AuditTargets::Catalogue(catalogue_audit_targets(rows, scan_root))
+}
+
 fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditResultView {
     let summary = &outcome.report.summary;
     // Every category the core counts, each with the meaning the core documents
@@ -7955,6 +8068,7 @@ fn audit_view(outcome: &DatAuditOutcome, elapsed_seconds: Option<u64>) -> AuditR
         unreadable_catalogues: outcome.unreadable_catalogues.clone(),
         truncated: outcome.truncated,
         files_scanned: outcome.files_scanned,
+        population_note: population_note(outcome),
         content_selection: outcome.content.selection,
         content_summary: outcome.content.catalogue,
         policy: outcome.policy.as_ref().map(audit_policy_view),
@@ -14540,6 +14654,9 @@ fn show_audit_result(ui: &mut egui::Ui, audit: &AuditResultView) {
             ))
             .color(theme::muted(ui)),
         );
+        if !audit.population_note.is_empty() {
+            ui.label(egui::RichText::new(&audit.population_note).color(theme::muted(ui)));
+        }
         ui.label(
             egui::RichText::new(format!(
                 "Catalogue: {} ({} entries) from {}",

@@ -618,6 +618,9 @@ pub(super) fn show(
             ui.heading("Verification results");
             ui.label(format!("Last check: {} · {}", audit.source_display_name, audit.scan_root_short));
             ui.label(format!("{} files checked. Your game files were not changed.", audit.files_scanned));
+            if !audit.population_note.is_empty() {
+                ui.label(&audit.population_note);
+            }
             for category in &audit.categories {
                 let label = match category.label { "Exact" => "Verified matches", "Not in catalogue" => "Not recognised by this data", "Filename only" => "Name matched; contents not verified", other => other };
                 ui.label(format!("{label}: {}", category.count));

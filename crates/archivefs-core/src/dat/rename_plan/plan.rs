@@ -1116,6 +1116,7 @@ mod tests {
         truncated: bool,
     ) -> DatAuditOutcome {
         DatAuditOutcome {
+            population: Default::default(),
             source_id: "src".to_string(),
             source_display_name: "Source".to_string(),
             dat_path: "/tmp/x.dat".to_string(),

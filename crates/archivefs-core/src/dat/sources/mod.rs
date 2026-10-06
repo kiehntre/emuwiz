@@ -38,6 +38,7 @@
 
 pub mod audit_cache;
 pub mod audit_run;
+pub mod audit_targets;
 pub mod config;
 pub mod validation;
 

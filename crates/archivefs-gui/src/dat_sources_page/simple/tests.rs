@@ -411,3 +411,205 @@ fn ready_data_offers_verify_and_the_guidance_says_you_can_check_now() {
     );
     assert!(lines.iter().any(|l| l.contains("Verify Arcade Collection")));
 }
+
+// ---- the audit verifies the catalogue's game units, not the whole folder -----
+
+mod audit_population {
+    use super::*;
+    use archivefs_core::dat::sources::audit_targets::AuditTargets;
+    use archivefs_core::{Config, Database, scan_and_persist};
+
+    const ROM: &[u8] = b"abcd";
+    // sha1/crc32 of "abcd".
+    const DAT: &str = r#"<?xml version="1.0"?><datafile><header><name>Nintendo - Game Boy Advance</name></header><game name="Game"><rom name="game.gba" size="4" crc="ed82cd11" sha1="81fe8bfe87576c3ecb22426f8e57847382917acf"/></game></datafile>"#;
+
+    struct World {
+        dir: tempfile::TempDir,
+        folder: PathBuf,
+        db: PathBuf,
+    }
+
+    /// A library whose `gba` folder holds one catalogued game beside artwork,
+    /// manuals and an uncatalogued 3DS install, with a real (temporary) catalogue.
+    fn world(extra_games: usize) -> World {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("games");
+        let folder = source.join("gba");
+        std::fs::create_dir_all(folder.join("assets")).unwrap();
+        std::fs::write(folder.join("game.gba"), ROM).unwrap();
+        for i in 0..extra_games {
+            std::fs::write(folder.join(format!("extra{i}.gba")), format!("rom{i}")).unwrap();
+        }
+        for name in ["a.png", "a.jpg", "manual.pdf", "notes.txt"] {
+            std::fs::write(folder.join("assets").join(name), vec![9u8; 4096]).unwrap();
+        }
+        std::fs::write(folder.join("Castlevania.cia"), vec![8u8; 4096]).unwrap();
+        let config = Config {
+            source_folders: vec![source],
+            mount_root: dir.path().join("mounts"),
+            ratarmount_bin: "ratarmount".into(),
+            master_rom_root: None,
+        };
+        let db = dir.path().join("library.sqlite3");
+        let mut database = Database::open_or_create(&db).unwrap();
+        scan_and_persist(&mut database, &config, "test").unwrap();
+        World { dir, folder, db }
+    }
+
+    fn audit(world: &World) -> DatSourcesPageState {
+        let mut page = page(world.dir.path()).with_database_path(Some(world.db.clone()));
+        let dat = world.dir.path().join("gba.dat");
+        std::fs::write(&dat, DAT).unwrap();
+        let id = import(&mut page, &dat);
+        page.apply(DatSourcesPageAction::SetPlatform {
+            id: id.clone(),
+            platform: Some("Game Boy Advance".into()),
+        });
+        page.apply(DatSourcesPageAction::Save);
+        finish(&mut page);
+        page.apply(DatSourcesPageAction::Audit {
+            id,
+            scan_root: world.folder.clone(),
+        });
+        finish(&mut page);
+        page
+    }
+
+    #[test]
+    fn a_platform_audit_reads_only_the_catalogued_games() {
+        let w = world(2);
+        let page = audit(&w);
+        let view = page.view();
+        assert!(view.audit_error.is_none(), "{:?}", view.audit_error);
+        let result = view.audit.as_deref().expect("audit result");
+        // 3 catalogued .gba games: not the png/jpg/pdf/txt nor the .cia beside them.
+        assert_eq!(result.files_scanned, 3);
+        assert!(
+            result
+                .population_note
+                .contains("Checked 3 catalogued games"),
+            "{}",
+            result.population_note
+        );
+        assert!(
+            result
+                .population_note
+                .contains("Artwork, manuals and other files beside the games were not read")
+        );
+        let exact = result
+            .categories
+            .iter()
+            .find(|c| c.label == "Exact")
+            .map_or(0, |c| c.count);
+        assert_eq!(exact, 1, "the one ROM in the DAT still verifies exactly");
+    }
+
+    #[test]
+    fn the_result_page_states_what_was_checked() {
+        let w = world(0);
+        let mut page = audit(&w);
+        let view = page.view();
+        let mut state = DatSourcesPageUi::default();
+        state.simple.select_platform("Game Boy Advance");
+        // Mark this result as the one the simple page shows for the platform.
+        let lines = render(&view, &mut state);
+        // Rendering never starts work; the note is part of the stored result.
+        assert!(
+            view.audit
+                .as_deref()
+                .unwrap()
+                .population_note
+                .contains("Checked 1 catalogued game.")
+        );
+        let _ = (&mut page, lines);
+    }
+
+    #[test]
+    fn target_derivation_falls_back_to_the_folder_walk_only_where_it_must() {
+        let w = world(0);
+        // No platform, Arcade, or no catalogue: the games-only folder walk.
+        assert_eq!(
+            super::super::super::audit_targets_for(None, &w.folder, Some(&w.db)),
+            AuditTargets::FolderWalkGamesOnly
+        );
+        assert_eq!(
+            super::super::super::audit_targets_for(Some("Arcade"), &w.folder, Some(&w.db)),
+            AuditTargets::FolderWalkGamesOnly
+        );
+        assert_eq!(
+            super::super::super::audit_targets_for(Some("Game Boy Advance"), &w.folder, None),
+            AuditTargets::FolderWalkGamesOnly
+        );
+        // A platform with a catalogue uses exactly its rows.
+        let AuditTargets::Catalogue(targets) = super::super::super::audit_targets_for(
+            Some("Game Boy Advance"),
+            &w.folder,
+            Some(&w.db),
+        ) else {
+            panic!("a catalogued platform audits its catalogue rows");
+        };
+        assert_eq!(targets.files, vec![w.folder.join("game.gba")]);
+        assert_eq!(targets.catalogue_rows_unavailable, 0);
+        // A different platform has no rows here: an empty population, not a walk.
+        let AuditTargets::Catalogue(none) =
+            super::super::super::audit_targets_for(Some("SNES"), &w.folder, Some(&w.db))
+        else {
+            panic!("an assigned platform never silently becomes a folder walk");
+        };
+        assert!(none.files.is_empty());
+    }
+
+    #[test]
+    fn unassigned_rows_are_included_and_rows_of_another_platform_are_not() {
+        let w = world(2);
+        // One game loses its platform; another is assigned to a different system.
+        let connection = rusqlite::Connection::open(&w.db).unwrap();
+        connection
+            .execute(
+                "UPDATE platform_assignments SET is_current = 0 WHERE archive_id = \
+                 (SELECT id FROM archives WHERE file_name_cached = CAST('extra0.gba' AS BLOB))",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE platform_assignments SET platform = 'SNES' WHERE is_current = 1 AND archive_id = \
+                 (SELECT id FROM archives WHERE file_name_cached = CAST('extra1.gba' AS BLOB))",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let AuditTargets::Catalogue(targets) = super::super::super::audit_targets_for(
+            Some("Game Boy Advance"),
+            &w.folder,
+            Some(&w.db),
+        ) else {
+            panic!("catalogue targets");
+        };
+        let names: Vec<_> = targets
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["extra0.gba", "game.gba"], "{names:?}");
+    }
+
+    #[test]
+    fn a_stale_catalogue_row_is_reported_unavailable_not_dropped() {
+        let w = world(1);
+        std::fs::remove_file(w.folder.join("extra0.gba")).unwrap();
+        let page = audit(&w);
+        let note = page
+            .view()
+            .audit
+            .as_deref()
+            .unwrap()
+            .population_note
+            .clone();
+        assert!(note.contains("Checked 1 catalogued game."), "{note}");
+        assert!(
+            note.contains("1 catalogue entry was not on disk, so it was not checked"),
+            "{note}"
+        );
+    }
+}

@@ -46,6 +46,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::audit_cache::{AuditCacheConfig, AuditCacheMetrics, AuditHashCache};
+use super::audit_targets::{AuditPopulation, AuditPopulationBasis, AuditTargets};
 use super::{DatSourceKind, validation};
 use crate::dat::archive::lha::{LhaError, LhaProvider};
 use crate::dat::archive::limits::{ArchiveLimits, MAX_ARCHIVE_RUN_LOGICAL_BYTES};
@@ -276,6 +277,10 @@ pub struct DatAuditOutcome {
     pub catalogue_names: Vec<String>,
     pub catalogue_entries: usize,
     pub catalogue_roms: usize,
+    /// How the candidate files were chosen: a folder walk (with support files
+    /// skipped) or exactly the catalogue's game units. Lets a result say what
+    /// was and was not checked.
+    pub population: AuditPopulation,
     /// The first parsed DAT file's `<version>` header text, when present.
     /// This is the closest thing most DAT publishers (No-Intro, Redump, ...)
     /// have to a revision/snapshot identifier, so completion UI can say
@@ -528,6 +533,28 @@ pub fn run_dat_audit_with_cache(
     on_progress: &dyn Fn(DatAuditProgress),
     cache_config: AuditCacheConfig,
 ) -> Result<DatAuditOutcome, DatAuditError> {
+    run_dat_audit_with_targets(
+        request,
+        trusted,
+        cancel,
+        on_progress,
+        cache_config,
+        &AuditTargets::FolderWalk,
+    )
+}
+
+/// As [`run_dat_audit_with_cache`], but the caller chooses the candidate
+/// population: [`AuditTargets::FolderWalk`] walks the scan folder (skipping
+/// known support files), [`AuditTargets::Catalogue`] verifies exactly the
+/// supplied catalogue game units. See [`super::audit_targets`].
+pub fn run_dat_audit_with_targets(
+    request: &DatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+    cache_config: AuditCacheConfig,
+    targets: &AuditTargets,
+) -> Result<DatAuditOutcome, DatAuditError> {
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
     }
@@ -671,12 +698,14 @@ pub fn run_dat_audit_with_cache(
     let mut cache = AuditHashCache::from_config(&cache_config);
     let hashed = collect_loose_file_evidence(
         &request.scan_root,
+        targets,
         trusted,
         cancel,
         on_progress,
         true,
         &mut cache,
     )?;
+    let population = hashed.population;
     let scan = hashed.scan;
     let known = hashed.known;
     let unhashed = hashed.unhashed;
@@ -835,6 +864,7 @@ pub fn run_dat_audit_with_cache(
         catalogue_names,
         catalogue_entries,
         catalogue_roms,
+        population,
         catalogue_version,
         catalogue_author,
         catalogue_homepage,
@@ -880,6 +910,7 @@ pub fn run_dat_audit_with_cache(
 /// remain visible as unhashed, non-actionable report rows rather than
 /// disappearing from the result.
 struct HashedLocalScan {
+    population: super::audit_targets::AuditPopulation,
     scan: LocalScan,
     known: Vec<KnownFileEvidence>,
     unhashed: Vec<UnhashedFile>,
@@ -888,6 +919,7 @@ struct HashedLocalScan {
 
 fn collect_loose_file_evidence(
     scan_root: &Path,
+    targets: &AuditTargets,
     trusted: &TrustedRoots,
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
@@ -897,12 +929,51 @@ fn collect_loose_file_evidence(
     if cancelled(cancel) {
         return Err(DatAuditError::Cancelled);
     }
-    let scan = scan_local_files(scan_root, cancel, on_progress)?;
+    let (scan, population) = match targets {
+        AuditTargets::FolderWalk | AuditTargets::FolderWalkGamesOnly => {
+            let skip_support = matches!(targets, AuditTargets::FolderWalkGamesOnly);
+            let scan = scan_local_files(scan_root, cancel, on_progress, skip_support)?;
+            let population = AuditPopulation {
+                basis: AuditPopulationBasis::FolderWalk,
+                support_files_skipped: scan.support_files_skipped,
+                ..AuditPopulation::default()
+            };
+            (scan, population)
+        }
+        AuditTargets::Catalogue(catalogue) => {
+            on_progress(DatAuditProgress::Scanning {
+                files_found: catalogue.files.len(),
+                current_dir: None,
+            });
+            // The population is defined by the catalogue, so the "walk" is
+            // complete by construction and nothing was cut off by a ceiling.
+            let scan = LocalScan {
+                files: catalogue.files.clone(),
+                support_files_skipped: 0,
+                truncated: false,
+                scan_complete: true,
+            };
+            let population = AuditPopulation {
+                basis: AuditPopulationBasis::Catalogue,
+                catalogue_rows: catalogue.catalogue_rows,
+                catalogue_rows_unavailable: catalogue.catalogue_rows_unavailable,
+                companion_files: catalogue.companion_files,
+                support_files_skipped: 0,
+            };
+            (scan, population)
+        }
+    };
     if scan.files.is_empty() {
-        return Err(DatAuditError::NothingToAudit(format!(
-            "no files were found in {}",
-            scan_root.display()
-        )));
+        return Err(DatAuditError::NothingToAudit(match targets {
+            AuditTargets::FolderWalk | AuditTargets::FolderWalkGamesOnly => {
+                format!("no files were found in {}", scan_root.display())
+            }
+            AuditTargets::Catalogue(catalogue) => format!(
+                "no catalogued games for this platform are available in {} ({} catalogue entries are not on disk). Scan the folder first, or reconnect the drive.",
+                scan_root.display(),
+                catalogue.catalogue_rows_unavailable
+            ),
+        }));
     }
 
     let total = scan.files.len();
@@ -997,6 +1068,7 @@ fn collect_loose_file_evidence(
         }
     }
     Ok(HashedLocalScan {
+        population,
         scan,
         known,
         unhashed,
@@ -1031,6 +1103,26 @@ pub fn run_combined_dat_audit_with_cache(
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
     cache_config: AuditCacheConfig,
+) -> Result<DatAuditOutcome, DatAuditError> {
+    run_combined_dat_audit_with_targets(
+        request,
+        trusted,
+        cancel,
+        on_progress,
+        cache_config,
+        &AuditTargets::FolderWalk,
+    )
+}
+
+/// Combined-catalogue audit with a caller-chosen candidate population; see
+/// [`run_dat_audit_with_targets`].
+pub fn run_combined_dat_audit_with_targets(
+    request: &CombinedDatAuditRequest,
+    trusted: &TrustedRoots,
+    cancel: &AtomicBool,
+    on_progress: &dyn Fn(DatAuditProgress),
+    cache_config: AuditCacheConfig,
+    targets: &AuditTargets,
 ) -> Result<DatAuditOutcome, DatAuditError> {
     if request.sources.is_empty() {
         return Err(DatAuditError::NoCatalogue(
@@ -1070,6 +1162,7 @@ pub fn run_combined_dat_audit_with_cache(
     let mut cache = AuditHashCache::from_config(&cache_config);
     let hashed = collect_loose_file_evidence(
         &request.scan_root,
+        targets,
         trusted,
         cancel,
         on_progress,
@@ -1154,6 +1247,7 @@ pub fn run_combined_dat_audit_with_cache(
         catalogue_names,
         catalogue_entries,
         catalogue_roms,
+        population: hashed.population,
         // Several catalogues are merged here - no single header to report,
         // so completion UI correctly finds no revision context and does not
         // claim one.
@@ -2307,6 +2401,9 @@ fn matched_refs_for_verdict(
 
 struct LocalScan {
     files: Vec<PathBuf>,
+    /// Known support files (artwork, manuals, metadata) the walk did not take
+    /// as candidates. See [`super::audit_targets`].
+    support_files_skipped: usize,
     /// The scan hit a configured traversal ceiling (`MAX_SCAN_DEPTH` or
     /// `MAX_SCAN_ENTRIES_EXAMINED`) and stopped early by design. The file
     /// chunk size is not a scan ceiling.
@@ -2335,13 +2432,14 @@ fn scan_local_files(
     root: &Path,
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
+    skip_support: bool,
 ) -> Result<LocalScan, DatAuditError> {
     // Production always uses the real filesystem; only tests inject a
     // failure, and only for one directory they name, to prove the
     // bookkeeping below without depending on chmod (root bypasses
     // permission checks, so a chmod-based test behaves differently under
     // CI-as-root) or an unreproducible TOCTOU race against the real OS.
-    scan_local_files_impl(root, cancel, on_progress, &|_| false)
+    scan_local_files_impl(root, cancel, on_progress, &|_| false, skip_support)
 }
 
 fn scan_local_files_impl(
@@ -2349,6 +2447,7 @@ fn scan_local_files_impl(
     cancel: &AtomicBool,
     on_progress: &dyn Fn(DatAuditProgress),
     inject_read_dir_failure: &dyn Fn(&Path) -> bool,
+    skip_support: bool,
 ) -> Result<LocalScan, DatAuditError> {
     if !root.is_absolute() {
         return Err(DatAuditError::ScanPath(
@@ -2369,6 +2468,7 @@ fn scan_local_files_impl(
         });
         return Ok(LocalScan {
             files: vec![root.to_path_buf()],
+            support_files_skipped: 0,
             truncated: false,
             scan_complete: true,
         });
@@ -2381,6 +2481,7 @@ fn scan_local_files_impl(
     }
 
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut support_skipped = 0usize;
     let mut truncated = false;
     let mut scan_complete = true;
     let mut examined = 0usize;
@@ -2432,7 +2533,11 @@ fn scan_local_files_impl(
                     truncated = true;
                 }
             } else if file_type.is_file() || file_type.is_symlink() {
-                files.push(path);
+                if skip_support && super::audit_targets::is_support_file(&path) {
+                    support_skipped += 1;
+                } else {
+                    files.push(path);
+                }
             }
         }
 
@@ -2455,6 +2560,7 @@ fn scan_local_files_impl(
     files.sort();
     Ok(LocalScan {
         files,
+        support_files_skipped: support_skipped,
         truncated,
         scan_complete,
     })
@@ -2558,8 +2664,14 @@ mod local_scan_traversal_tests {
         std::fs::write(broken.join("hidden.rom"), b"test").unwrap();
 
         let cancel = AtomicBool::new(false);
-        let scan = scan_local_files_impl(dir.path(), &cancel, &no_progress, &|path| path == broken)
-            .unwrap();
+        let scan = scan_local_files_impl(
+            dir.path(),
+            &cancel,
+            &no_progress,
+            &|path| path == broken,
+            false,
+        )
+        .unwrap();
 
         assert!(
             !scan.scan_complete,
@@ -2585,7 +2697,8 @@ mod local_scan_traversal_tests {
         std::fs::write(dir.path().join("ordinary.rom"), b"test").unwrap();
 
         let cancel = AtomicBool::new(false);
-        let scan = scan_local_files_impl(dir.path(), &cancel, &no_progress, &|_| false).unwrap();
+        let scan =
+            scan_local_files_impl(dir.path(), &cancel, &no_progress, &|_| false, false).unwrap();
 
         assert!(scan.scan_complete);
         assert!(!scan.truncated);
@@ -2598,7 +2711,7 @@ mod local_scan_traversal_tests {
         std::fs::write(&file, b"test").unwrap();
 
         let cancel = AtomicBool::new(false);
-        let scan = scan_local_files_impl(&file, &cancel, &no_progress, &|_| false).unwrap();
+        let scan = scan_local_files_impl(&file, &cancel, &no_progress, &|_| false, false).unwrap();
 
         assert_eq!(scan.files, vec![file]);
         assert!(scan.scan_complete);

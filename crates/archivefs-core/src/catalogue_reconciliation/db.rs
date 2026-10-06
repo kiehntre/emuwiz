@@ -221,45 +221,15 @@ fn path_under(path: &Path, prefix: &Path) -> bool {
 /// to nothing, so they are never accepted as companions. Only descriptors
 /// (<= 256 KiB) are read; no game content is. `None` when cancelled.
 fn companion_links(rows: &[RowFacts], cancel: &AtomicBool) -> Option<Vec<CompanionLink>> {
-    use crate::ingestion::{
-        cue_bin::resolve_cue_all_files_lenient, gdi::resolve_gdi_all_tracks_lenient,
-    };
     use std::sync::atomic::Ordering;
     let mut links = Vec::new();
     for row in rows.iter().filter(|r| r.presence == RowPresence::Present) {
-        let extension = row.path.extension().map(|e| e.to_ascii_lowercase());
-        let (basis, resolved): (CompanionBasis, Vec<PathBuf>) = match extension.as_deref() {
-            Some(e) if e == "cue" => (
-                CompanionBasis::CueFileReference,
-                resolve_cue_all_files_lenient(&row.path)
-                    .map(|all| all.into_iter().flatten().collect())
-                    .unwrap_or_default(),
-            ),
-            Some(e) if e == "gdi" => (
-                CompanionBasis::GdiTrackReference,
-                resolve_gdi_all_tracks_lenient(&row.path)
-                    .map(|all| all.into_iter().flatten().collect())
-                    .unwrap_or_default(),
-            ),
-            _ => continue,
+        let Some((basis, files)) = super::descriptor_companions(&row.path) else {
+            continue;
         };
         if cancel.load(Ordering::Relaxed) {
             return None;
         }
-        // The resolvers return canonical paths; walked files carry the
-        // configured-root spelling, so re-express each under the descriptor's
-        // own directory.
-        let Some(parent) = row.path.parent() else {
-            continue;
-        };
-        let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
-            continue;
-        };
-        let files: Vec<PathBuf> = resolved
-            .iter()
-            .filter_map(|canonical| canonical.strip_prefix(&canonical_parent).ok())
-            .map(|relative| parent.join(relative))
-            .collect();
         if !files.is_empty() {
             links.push(CompanionLink {
                 parent_archive_id: row.archive_id,
