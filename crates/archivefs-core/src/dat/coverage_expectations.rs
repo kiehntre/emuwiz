@@ -141,6 +141,26 @@ pub enum PlatformCoverageState {
     UnknownPlatform,
 }
 
+/// The canonical platforms whose reviewed authoritative ecosystem is TOSEC
+/// alone. Every entry here must also have an exact TOSEC system projection in
+/// [`super::tosec_system_projection`]; a test keeps the two in lockstep.
+pub(crate) const TOSEC_PRIMARY_PLATFORMS: &[&str] = &[
+    "Amiga",
+    "Acorn Electron",
+    "Amstrad CPC",
+    "Apple II",
+    "AtariST",
+    "BBC Micro",
+    "Commodore 128",
+    "Commodore 64",
+    "VIC-20",
+    "ZX Spectrum",
+];
+
+fn tosec_primary_platform(platform: &str) -> bool {
+    TOSEC_PRIMARY_PLATFORMS.contains(&platform)
+}
+
 /// Resolves a canonical platform id or an exact registry alias to its expected
 /// authoritative evidence. Unknown text is never fuzzy-matched.
 pub fn expected_authoritative_coverage(platform_hint: Option<&str>) -> PlatformCoverageExpectation {
@@ -175,18 +195,19 @@ pub fn expected_authoritative_coverage(platform_hint: Option<&str>) -> PlatformC
         // These are the cartridge families for which the current codebase has
         // No-Intro import/identity support. The list is intentionally explicit
         // instead of treating every platform with a ROM extension as No-Intro.
-        "Atari2600" | "Atari5200" | "Atari7800" | "Atari 8-bit" | "Atari Lynx" | "ColecoVision"
-        | "GameGear" | "Game Boy" | "Game Boy Advance" | "Game Boy Color" | "MasterSystem"
-        | "MegaDrive" | "N64" | "NES" | "Nintendo DS" | "PC Engine" | "SNES" | "Sega 32X"
-        | "TurboGrafx-16" | "Virtual Boy" | "Watara Supervision" | "WonderSwan"
-        | "WonderSwan Color" => Some(PlatformCoverageExpectation::ExpectedAuthoritativeSource {
-            platform: platform.to_string(),
-            source: source(
-                ExpectedAuthoritativeSource::Dat(DatEcosystem::NoIntro),
-                CoverageSourceRole::Primary,
-                CoverageRationale::SupportedCartridgeDat,
-            ),
-        }),
+        "Atari2600" | "Atari5200" | "Atari7800" | "Atari Lynx" | "ColecoVision" | "GameGear"
+        | "Game Boy" | "Game Boy Advance" | "Game Boy Color" | "MasterSystem" | "MegaDrive"
+        | "N64" | "NES" | "Nintendo DS" | "PC Engine" | "SNES" | "Sega 32X" | "TurboGrafx-16"
+        | "Virtual Boy" | "Watara Supervision" | "WonderSwan" | "WonderSwan Color" => {
+            Some(PlatformCoverageExpectation::ExpectedAuthoritativeSource {
+                platform: platform.to_string(),
+                source: source(
+                    ExpectedAuthoritativeSource::Dat(DatEcosystem::NoIntro),
+                    CoverageSourceRole::Primary,
+                    CoverageRationale::SupportedCartridgeDat,
+                ),
+            })
+        }
 
         // These are the reviewed Redump game systems represented by the
         // current-main `RedumpGameSystem` table. Expectation is about the
@@ -231,17 +252,47 @@ pub fn expected_authoritative_coverage(platform_hint: Option<&str>) -> PlatformC
             ),
         }),
 
-        // Amiga is the narrow, explicit TOSEC classic-media slice present in
-        // the current architecture. TOSEC is not promoted to authority for
-        // every legacy computer platform by mere DAT availability.
-        "Amiga" => Some(PlatformCoverageExpectation::ExpectedAuthoritativeSource {
+        // Atari 8-bit keeps its existing No-Intro (cartridge) authority as the
+        // primary source. Its disk/executable media (ATR/ATX/XFD/XEX) are
+        // catalogued by TOSEC's "Atari 8bit" system, so TOSEC is retained as a
+        // secondary source rather than replacing No-Intro.
+        "Atari 8-bit" => Some(PlatformCoverageExpectation::MultipleCandidateSources {
             platform: platform.to_string(),
-            source: source(
-                ExpectedAuthoritativeSource::Dat(DatEcosystem::Tosec),
-                CoverageSourceRole::Primary,
-                CoverageRationale::ExplicitTosecClassicMediaSupport,
-            ),
+            sources: vec![
+                source(
+                    ExpectedAuthoritativeSource::Dat(DatEcosystem::NoIntro),
+                    CoverageSourceRole::Primary,
+                    CoverageRationale::SupportedCartridgeDat,
+                ),
+                source(
+                    ExpectedAuthoritativeSource::Dat(DatEcosystem::Tosec),
+                    CoverageSourceRole::Secondary,
+                    CoverageRationale::ExplicitTosecClassicMediaSupport,
+                ),
+            ],
+            rationale: CoverageRationale::MultipleSupportedEvidenceSources,
         }),
+
+        // Classic computer platforms whose disk/tape/cartridge-file media are
+        // catalogued by a TOSEC system group and verified through the shared
+        // exact-hash DAT path (see `docs/research/DAT_D01_...`). This list is
+        // reviewed one platform at a time: TOSEC DAT availability alone never
+        // adds a platform here, and a platform not listed (MSX, DOS/PC,
+        // Macintosh, Dragon/CoCo, Oric, Thomson, Japanese PCs ...) stays
+        // `NoKnownAuthoritativeSource` until it has its own review. The
+        // canonical platform must already be resolved from independent
+        // evidence; a TOSEC name never establishes it (BBC Micro and Acorn
+        // Electron stay separate entries for that reason).
+        _ if tosec_primary_platform(platform) => {
+            Some(PlatformCoverageExpectation::ExpectedAuthoritativeSource {
+                platform: platform.to_string(),
+                source: source(
+                    ExpectedAuthoritativeSource::Dat(DatEcosystem::Tosec),
+                    CoverageSourceRole::Primary,
+                    CoverageRationale::ExplicitTosecClassicMediaSupport,
+                ),
+            })
+        }
 
         _ => None,
     };
@@ -366,6 +417,209 @@ mod tests {
         );
     }
 
+    const REVIEWED_TOSEC_PLATFORMS: [&str; 10] = [
+        "Amiga",
+        "Acorn Electron",
+        "Amstrad CPC",
+        "Apple II",
+        "AtariST",
+        "BBC Micro",
+        "Commodore 128",
+        "Commodore 64",
+        "VIC-20",
+        "ZX Spectrum",
+    ];
+
+    #[test]
+    fn reviewed_classic_computer_platforms_expect_tosec_as_primary() {
+        for platform in REVIEWED_TOSEC_PLATFORMS {
+            let source = single_source(
+                Some(platform),
+                ExpectedAuthoritativeSource::Dat(DatEcosystem::Tosec),
+            );
+            assert_eq!(source.role, CoverageSourceRole::Primary, "{platform}");
+            assert_eq!(
+                source.rationale,
+                CoverageRationale::ExplicitTosecClassicMediaSupport
+            );
+        }
+    }
+
+    #[test]
+    fn classic_platform_aliases_resolve_to_the_same_expectation() {
+        for (alias, canonical) in [
+            ("c64", "Commodore 64"),
+            ("c128", "Commodore 128"),
+            ("vic20", "VIC-20"),
+            ("bbc", "BBC Micro"),
+            ("bbcmicro", "BBC Micro"),
+            ("elk", "Acorn Electron"),
+            ("cpc", "Amstrad CPC"),
+            ("atarist", "AtariST"),
+            ("speccy", "ZX Spectrum"),
+            ("apple2", "Apple II"),
+            ("atari800", "Atari 8-bit"),
+        ] {
+            assert_eq!(
+                expected_authoritative_coverage(Some(alias)),
+                expected_authoritative_coverage(Some(canonical)),
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn bbc_micro_and_acorn_electron_are_separate_explicit_expectations() {
+        let PlatformCoverageExpectation::ExpectedAuthoritativeSource { platform: bbc, .. } =
+            expected_authoritative_coverage(Some("BBC Micro"))
+        else {
+            panic!("BBC Micro expects one source");
+        };
+        let PlatformCoverageExpectation::ExpectedAuthoritativeSource {
+            platform: electron, ..
+        } = expected_authoritative_coverage(Some("Acorn Electron"))
+        else {
+            panic!("Acorn Electron expects one source");
+        };
+        assert_eq!(bbc, "BBC Micro");
+        assert_eq!(electron, "Acorn Electron");
+    }
+
+    #[test]
+    fn atari_8bit_keeps_no_intro_primary_and_adds_tosec_secondary() {
+        let PlatformCoverageExpectation::MultipleCandidateSources {
+            platform,
+            sources,
+            rationale,
+        } = expected_authoritative_coverage(Some("Atari 8-bit"))
+        else {
+            panic!("Atari 8-bit must retain No-Intro and add TOSEC");
+        };
+        assert_eq!(platform, "Atari 8-bit");
+        assert_eq!(
+            rationale,
+            CoverageRationale::MultipleSupportedEvidenceSources
+        );
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].role, CoverageSourceRole::Primary);
+        assert_eq!(
+            sources[0].source,
+            ExpectedAuthoritativeSource::Dat(DatEcosystem::NoIntro)
+        );
+        assert_eq!(sources[1].role, CoverageSourceRole::Secondary);
+        assert_eq!(
+            sources[1].source,
+            ExpectedAuthoritativeSource::Dat(DatEcosystem::Tosec)
+        );
+    }
+
+    #[test]
+    fn no_intro_cartridge_platforms_keep_exactly_one_no_intro_source() {
+        for platform in [
+            "Atari2600",
+            "Atari5200",
+            "Atari7800",
+            "Atari Lynx",
+            "ColecoVision",
+            "GameGear",
+            "Game Boy",
+            "Game Boy Advance",
+            "Game Boy Color",
+            "MasterSystem",
+            "MegaDrive",
+            "N64",
+            "NES",
+            "Nintendo DS",
+            "PC Engine",
+            "SNES",
+            "Sega 32X",
+            "TurboGrafx-16",
+            "Virtual Boy",
+            "Watara Supervision",
+            "WonderSwan",
+            "WonderSwan Color",
+        ] {
+            single_source(
+                Some(platform),
+                ExpectedAuthoritativeSource::Dat(DatEcosystem::NoIntro),
+            );
+        }
+    }
+
+    #[test]
+    fn unreviewed_classic_platforms_stay_fail_closed_despite_tosec_existing() {
+        // TOSEC publishes systems for several of these; availability is not
+        // authority, so each needs its own review before it can be mapped.
+        for platform in [
+            "MSX",
+            "MSX2",
+            "DOS",
+            "PC",
+            "Macintosh",
+            "Dragon / Tandy CoCo",
+            "Oric",
+            "Thomson MO",
+            "Thomson TO",
+            "Enterprise",
+            "Acorn Archimedes",
+            "NEC PC-8801",
+            "PC-98",
+            "NEC PC-9801",
+            "Sharp X68000",
+            "FM Towns",
+            "Commodore CDTV",
+            "AmigaCD32",
+        ] {
+            assert!(
+                matches!(
+                    expected_authoritative_coverage(Some(platform)),
+                    PlatformCoverageExpectation::NoKnownAuthoritativeSource { .. }
+                ),
+                "{platform}"
+            );
+        }
+    }
+
+    #[test]
+    fn tosec_names_and_unknown_text_never_become_a_platform() {
+        for text in [
+            "TOSEC",
+            "Commodore C64 - Games - [D64] (TOSEC-v2025-02-16_CM)",
+            "Commodore C64DTV",
+            "Acorn",
+        ] {
+            assert!(
+                matches!(
+                    expected_authoritative_coverage(Some(text)),
+                    PlatformCoverageExpectation::UnsupportedOrUnknown {
+                        kind: UnsupportedPlatformKind::Unknown,
+                        ..
+                    }
+                ),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classic_expectations_never_name_metadata_or_custom_sources_and_are_deterministic() {
+        for platform in REVIEWED_TOSEC_PLATFORMS.iter().chain(&["Atari 8-bit"]) {
+            let first = expected_authoritative_coverage(Some(platform));
+            let serialized = serde_json::to_string(&first).unwrap();
+            for forbidden in [
+                "screen_scraper",
+                "romm",
+                "generic_logiqx",
+                "generic_clr_mame_pro",
+            ] {
+                assert!(!serialized.contains(forbidden), "{platform}");
+            }
+            for _ in 0..16 {
+                assert_eq!(expected_authoritative_coverage(Some(platform)), first);
+            }
+        }
+    }
+
     #[test]
     fn aliases_resolve_to_the_same_canonical_expectation() {
         assert_eq!(
@@ -395,7 +649,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            expected_authoritative_coverage(Some("Amstrad CPC")),
+            expected_authoritative_coverage(Some("MSX")),
             PlatformCoverageExpectation::NoKnownAuthoritativeSource { .. }
         ));
     }

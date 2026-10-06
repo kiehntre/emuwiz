@@ -943,7 +943,7 @@ pub(in crate::gui_v2) mod tests {
     fn informational_identity_rows_do_not_count_as_attention() {
         let summary = identity_summary(
             vec![
-                platform_game(1, "Mystery", "Acorn Electron"),
+                platform_game(1, "Mystery", "MSX"),
                 platform_game(2, "Cool Demo (Homebrew)", "NES"),
                 platform_game(3, "pacman", "Arcade"),
             ],

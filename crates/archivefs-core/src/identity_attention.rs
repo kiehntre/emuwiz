@@ -356,8 +356,29 @@ mod tests {
     #[test]
     fn a_system_without_a_reference_source_is_information() {
         assert_eq!(
-            classify_identity(&facts(Some("ZX Spectrum"), "zxs/Game.tap"), None),
+            classify_identity(&facts(Some("MSX"), "msx/Game.rom"), None),
             IdentityAttention::Informational(InformationalReason::NoReferenceSource)
+        );
+    }
+
+    #[test]
+    fn a_reviewed_classic_computer_platform_asks_for_tosec_when_provably_missing() {
+        let game = facts(Some("ZX Spectrum"), "zxs/Game.tap");
+        assert_eq!(
+            classify_identity(&game, None),
+            IdentityAttention::ActionAvailable
+        );
+        assert_eq!(
+            classify_identity(&game, Some(&ReferenceInventory::default())),
+            IdentityAttention::SetupRequired(DatEcosystem::Tosec)
+        );
+        // Atari 8-bit keeps No-Intro as the first (primary) ecosystem.
+        assert_eq!(
+            classify_identity(
+                &facts(Some("Atari 8-bit"), "a8/Game.atr"),
+                Some(&ReferenceInventory::default())
+            ),
+            IdentityAttention::SetupRequired(DatEcosystem::NoIntro)
         );
     }
 
