@@ -11,6 +11,9 @@
 //! neither (PCSX2: executable only; Dolphin: configuration folder only;
 //! the rest: both).
 //!
+//! shadPS4 supplies executable evidence to the shared profile resolver; it
+//! does not add arbitrary configuration-root overrides to Doctor.
+//!
 //! Persistence follows the exact convention `main.rs`'s
 //! `retroarch_core_directory_override.txt` already established: one plain
 //! path per file, under the EmuWiz config directory
@@ -33,6 +36,7 @@ use archivefs_core::diagnostics::profiles::DiscoveredProfilesOverrides;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum OverridableEmulator {
     Mame,
+    ShadPs4,
     Pcsx2,
     Rpcs3,
     Ppsspp,
@@ -42,8 +46,9 @@ pub(crate) enum OverridableEmulator {
 }
 
 impl OverridableEmulator {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Mame,
+        Self::ShadPs4,
         Self::Pcsx2,
         Self::Rpcs3,
         Self::Ppsspp,
@@ -58,6 +63,7 @@ impl OverridableEmulator {
     pub(crate) fn adapter_id(self) -> &'static str {
         match self {
             Self::Mame => "mame",
+            Self::ShadPs4 => "shadps4",
             Self::Pcsx2 => "pcsx2",
             Self::Rpcs3 => "rpcs3",
             Self::Ppsspp => "ppsspp",
@@ -88,12 +94,13 @@ impl OverridableEmulator {
     /// which must come from an already-known configuration, never a blind
     /// user pick).
     pub(crate) fn supports_configuration_folder_override(self) -> bool {
-        !matches!(self, Self::Pcsx2)
+        !matches!(self, Self::Pcsx2 | Self::ShadPs4)
     }
 
     fn executable_override_file_name(self) -> Option<&'static str> {
         match self {
             Self::Mame => Some("mame_executable_override.txt"),
+            Self::ShadPs4 => Some("shadps4_executable_override.txt"),
             Self::Pcsx2 => Some("pcsx2_executable_override.txt"),
             Self::Rpcs3 => Some("rpcs3_executable_override.txt"),
             Self::Ppsspp => Some("ppsspp_executable_override.txt"),
@@ -105,7 +112,7 @@ impl OverridableEmulator {
 
     fn configuration_folder_override_file_name(self) -> Option<&'static str> {
         match self {
-            Self::Mame => None,
+            Self::Mame | Self::ShadPs4 => None,
             Self::Pcsx2 => None,
             Self::Rpcs3 => Some("rpcs3_configuration_folder_override.txt"),
             Self::Ppsspp => Some("ppsspp_configuration_folder_override.txt"),
@@ -121,6 +128,7 @@ impl OverridableEmulator {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EmulatorPathOverrides {
     pub(crate) mame_executable: Option<PathBuf>,
+    pub(crate) shadps4_executable: Option<PathBuf>,
     pub(crate) pcsx2_executable: Option<PathBuf>,
     pub(crate) rpcs3_executable: Option<PathBuf>,
     pub(crate) rpcs3_configuration_folder: Option<PathBuf>,
@@ -134,6 +142,9 @@ pub(crate) struct EmulatorPathOverrides {
 }
 
 impl EmulatorPathOverrides {
+    pub(crate) fn refresh_shadps4_from_disk(&mut self) {
+        self.shadps4_executable = load_executable_override(OverridableEmulator::ShadPs4);
+    }
     pub(crate) fn load() -> Self {
         let mut overrides = Self::default();
         for emulator in OverridableEmulator::ALL {
@@ -150,6 +161,7 @@ impl EmulatorPathOverrides {
     pub(crate) fn executable(&self, emulator: OverridableEmulator) -> Option<&Path> {
         match emulator {
             OverridableEmulator::Mame => self.mame_executable.as_deref(),
+            OverridableEmulator::ShadPs4 => self.shadps4_executable.as_deref(),
             OverridableEmulator::Pcsx2 => self.pcsx2_executable.as_deref(),
             OverridableEmulator::Rpcs3 => self.rpcs3_executable.as_deref(),
             OverridableEmulator::Ppsspp => self.ppsspp_executable.as_deref(),
@@ -161,7 +173,7 @@ impl EmulatorPathOverrides {
 
     pub(crate) fn configuration_folder(&self, emulator: OverridableEmulator) -> Option<&Path> {
         match emulator {
-            OverridableEmulator::Mame => None,
+            OverridableEmulator::Mame | OverridableEmulator::ShadPs4 => None,
             OverridableEmulator::Pcsx2 => None,
             OverridableEmulator::Rpcs3 => self.rpcs3_configuration_folder.as_deref(),
             OverridableEmulator::Ppsspp => self.ppsspp_configuration_folder.as_deref(),
@@ -174,6 +186,7 @@ impl EmulatorPathOverrides {
     fn set_executable_in_memory(&mut self, emulator: OverridableEmulator, value: Option<PathBuf>) {
         match emulator {
             OverridableEmulator::Mame => self.mame_executable = value,
+            OverridableEmulator::ShadPs4 => self.shadps4_executable = value,
             OverridableEmulator::Pcsx2 => self.pcsx2_executable = value,
             OverridableEmulator::Rpcs3 => self.rpcs3_executable = value,
             OverridableEmulator::Ppsspp => self.ppsspp_executable = value,
@@ -189,7 +202,7 @@ impl EmulatorPathOverrides {
         value: Option<PathBuf>,
     ) {
         match emulator {
-            OverridableEmulator::Mame => {}
+            OverridableEmulator::Mame | OverridableEmulator::ShadPs4 => {}
             OverridableEmulator::Pcsx2 => {}
             OverridableEmulator::Rpcs3 => self.rpcs3_configuration_folder = value,
             OverridableEmulator::Ppsspp => self.ppsspp_configuration_folder = value,

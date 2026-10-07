@@ -131,6 +131,7 @@ fn adapter_name(adapter_id: &str) -> &'static str {
         "pcsx2" => "PCSX2",
         "ppsspp" => "PPSSPP",
         "rpcs3" => "RPCS3",
+        "shadps4" => "shadPS4",
         "vita3k" => "Vita3K",
         "azahar" => "Azahar",
         "xemu" => "xemu",
@@ -195,6 +196,16 @@ fn candidate_from_mapping(
     findings: Option<&[Finding]>,
 ) -> EmulatorSetupCandidate {
     let name = adapter_name(adapter_id);
+    if adapter_id == "shadps4" {
+        return EmulatorSetupCandidate {
+            platform_id: mapping.platform_id,
+            adapter_id,
+            name,
+            state: CandidateState::NotChecked,
+            reason: "Choose a core executable here, then open a PS4 game's Launch details. The shared AUTO/PREFERRED/FORCED resolver selects its installation/profile; game compatibility remains unverified.".into(),
+            evidence: Vec::new(),
+        };
+    }
     let Some(findings) = findings else {
         return EmulatorSetupCandidate {
             platform_id: mapping.platform_id,
@@ -847,6 +858,25 @@ mod tests {
                 .iter()
                 .any(|c| c.platform_id == "Amiga" && c.adapter_id == "fsuae")
         );
+    }
+
+    #[test]
+    fn ps4_setup_uses_shared_registration_and_does_not_claim_compatibility() {
+        let candidates = build_candidates(None, RetroArchSetupStatus::NotChecked, None, "");
+        let candidate = candidates
+            .iter()
+            .find(|candidate| candidate.platform_id == "PS4" && candidate.adapter_id == "shadps4")
+            .unwrap();
+        assert_eq!(candidate.name, "shadPS4");
+        assert_eq!(candidate.state, CandidateState::NotChecked);
+        assert!(candidate.reason.contains("AUTO/PREFERRED/FORCED"));
+        assert!(
+            candidate
+                .reason
+                .contains("compatibility remains unverified")
+        );
+        assert!(OverridableEmulator::ShadPs4.supports_executable_override());
+        assert!(!OverridableEmulator::ShadPs4.supports_configuration_folder_override());
     }
 
     #[test]

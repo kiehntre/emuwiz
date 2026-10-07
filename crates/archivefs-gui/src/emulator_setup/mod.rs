@@ -22,6 +22,8 @@
 
 mod controller;
 pub(crate) mod profile_resolution;
+#[cfg(target_os = "linux")]
+pub(crate) mod shadps4;
 mod state;
 
 #[allow(unused_imports)]

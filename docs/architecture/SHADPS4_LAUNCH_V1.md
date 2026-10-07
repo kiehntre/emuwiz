@@ -1,7 +1,7 @@
 # shadPS4 native PS4 launch adapter V1
 
 Base: 6d22a2b0d333eb9055278f701632f0a40850c261. Linux backend only;
-no PS5 platform, GUI redesign, downloading, installation or configuration writer.
+no PS5 platform, GUI redesign, downloading, installation or emulator-configuration writer.
 
 ## Upstream contract checked on 2026-10-07
 
@@ -92,17 +92,43 @@ As with the shared path-based spawn infrastructure, the final check and exec are
 not atomic. V1 does not hash the entire game tree, isolate runtime game writes,
 validate all settings, verify sysmodule contents or claim the game boots.
 
-## Exact GUI follow-up
+## GUI V1 completion
 
-Backend seams are complete; no GUI files were changed. Integrate discovered
-profiles into `crates/archivefs-gui/src/emulator_setup/controller.rs`, then add the
-sealed shadPS4 plan/request/process route in `launch_readiness_page.rs`
-(`StandaloneLaunchRequest`, preview selection/authorization and tracked launch
-state). Native-v2 consumes that existing state through `selected_game_readiness.rs`.
-AppImage explicit-selection evidence and dependency warnings need to be surfaced
-there; do not replace them with filename-based automatic eligibility.
+Backend promoted on 8061b04c53713d684cbfe5ba757821fbab54e1d0, replayed
+onto the generic Auto-Resolver base adbb161d. GUI completion is a separate
+candidate and does not change the backend's game identity or launch rules.
 
-Deferred: GUI wiring, portable version metadata with trustworthy provenance,
-Flatpak/macOS/Windows backends, host/FUSE/Vulkan checks, broader SELF variants,
-package/installed-ID/archive launching, exhaustive dependencies and stop support
-in the common supervisor. Existing provider/download machinery is untouched.
+Emulator Setup derives the PS4/shadPS4 row from the shared platform map and
+uses existing executable-override persistence. Open a verified PS4 game and
+its Launch details to inspect the executable/profile/config pair, TITLE_ID,
+separate CONTENT_ID, exact game root/eboot.bin and structured argv. Selection
+uses the promoted resolver's AUTO/PREFERRED/FORCED modes and atomic selection
+persistence. Overrides are discovery evidence, not a second selection engine.
+AppImages require explicit consent; discovery/filename evidence never supplies
+publisher authentication. Preferred bypasses and forced refusals remain visible.
+
+The focused `emulator_setup/shadps4.rs` GUI controller retains one background
+worker and a single latest selection. Its generation-tagged, one-slot reply
+cannot publish a preview for another game. Metadata drift invalidates visible
+previews and triggers a fresh inspection; Recheck refreshes discovery/config
+precedence and dependency observations. Metadata-preserving edits cannot be
+noticed without reading bytes: every authorized launch therefore re-resolves
+the exact pair and uses the backend's SHA-256/source/config preflight before
+spawn. No filesystem scan or hashing occurs in rendering. The GUI then uses
+`StandaloneLaunchRequest`, existing watched-process state and normal polling;
+it adds no shell, detached wrapper, Stop/Kill control or compatibility promise.
+
+shadPS4 always remains ReadyWithWarnings when a sealed plan exists. Only this
+adapter's bound request can cross that warning state into launch; other GUI
+adapter policies are unchanged. Unsupported package/archive/image inputs,
+missing configuration, unverified/mismatched SFO identity and stale bindings
+have typed refusals. Global Doctor checks do not guess shadPS4 readiness or run
+a version probe; the existing inventory probe explicitly refuses shadPS4.
+Only EmuWiz's override/selection files are written by explicit UI controls;
+inspection and tests do not write emulator configuration or game files.
+
+Deferred: trusted version metadata, Flatpak/macOS/Windows backends, host/FUSE/
+Vulkan checks, broader SELF variants, package/installed-ID/archive launching,
+exhaustive game-specific dependencies and stop support in the common supervisor.
+Existing provider/download machinery is unchanged except exhaustive enum wiring;
+no new network or download action is introduced.

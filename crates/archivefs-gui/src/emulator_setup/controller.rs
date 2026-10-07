@@ -232,6 +232,12 @@ impl ArchiveFsApp {
                 self.emulator_readiness
                     .emulator_setup_overrides
                     .set_executable(emulator, Some(path));
+                #[cfg(target_os = "linux")]
+                if emulator == crate::emulator_setup_overrides::OverridableEmulator::ShadPs4 {
+                    self.emulator_readiness.shadps4.lock().unwrap().invalidate();
+                    context.request_repaint();
+                    return;
+                }
                 self.start_doctor_scan(context.clone());
             }
             Some(emulator_setup_page::EmulatorSetupAction::SetConfigurationFolderOverride(
@@ -247,6 +253,12 @@ impl ArchiveFsApp {
                 self.emulator_readiness
                     .emulator_setup_overrides
                     .set_executable(emulator, None);
+                #[cfg(target_os = "linux")]
+                if emulator == crate::emulator_setup_overrides::OverridableEmulator::ShadPs4 {
+                    self.emulator_readiness.shadps4.lock().unwrap().invalidate();
+                    context.request_repaint();
+                    return;
+                }
                 self.start_doctor_scan(context.clone());
             }
             Some(emulator_setup_page::EmulatorSetupAction::ResetConfigurationFolderOverride(
@@ -272,6 +284,9 @@ impl ArchiveFsApp {
     /// candidate grid and shown separately instead. See "ES-DE INTEGRATION
     /// VISIBILITY + SETUP FIX V1".
     pub(crate) fn show_emulator_setup_page(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        self.emulator_readiness
+            .emulator_setup_overrides
+            .refresh_shadps4_from_disk();
         // One-shot navigation hint: `take()` here means the first frame
         // after a repair-action navigation may scroll the relevant card
         // into view, and every later frame (and any manual scroll) is left
@@ -1644,6 +1659,22 @@ impl ArchiveFsApp {
                 profile_id: profile.profile_id.clone(),
             })
             .collect();
+        #[cfg(target_os = "linux")]
+        let shadps4_context = if matches!(&identity_status,
+            archivefs_core::launch::CanonicalIdentityStatus::Resolved(identity) if identity.platform_id == "PS4")
+        {
+            focused.map(|path| {
+                crate::emulator_setup::shadps4::Controller::snapshot(
+                    &self.emulator_readiness.shadps4,
+                    crate::emulator_setup::shadps4::Selection {
+                        path: path.to_path_buf(),
+                        identity: identity_status.clone(),
+                    },
+                )
+            })
+        } else {
+            None
+        };
         let mut plan = archivefs_core::launch::build_launch_plan(
             &identity_status,
             &content,
@@ -1652,6 +1683,16 @@ impl ArchiveFsApp {
             &remembered,
         );
         launch_readiness_page::apply_mame_strict_preflight(&mut plan);
+        #[cfg(target_os = "linux")]
+        if let Some(snapshot) = &shadps4_context {
+            snapshot.apply(&mut plan, &content);
+        }
+        #[cfg(target_os = "linux")]
+        let standalone_scans_complete = shadps4_context
+            .as_ref()
+            .map_or(standalone_scans_complete, |snapshot| {
+                snapshot.inspection.is_some() || snapshot.error.is_some()
+            });
         LaunchReadinessInput::Plan {
             plan,
             retroarch: match &self.emulator_readiness.retroarch_profiles {
@@ -1672,6 +1713,8 @@ impl ArchiveFsApp {
             xemu: xemu_context,
             xenia: xenia_context,
             amiga_whdload: amiga_whdload_context,
+            #[cfg(target_os = "linux")]
+            shadps4: shadps4_context,
         }
     }
 

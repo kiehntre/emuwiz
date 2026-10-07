@@ -15,6 +15,12 @@ use crate::{
 };
 
 pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context) {
+    #[cfg(target_os = "linux")]
+    app.emulator_readiness
+        .shadps4
+        .lock()
+        .unwrap()
+        .set_repaint_context(context);
     app.reconcile_library_tab();
     app.reconcile_problems_repair_tab();
     app.reconcile_sources_tab();
