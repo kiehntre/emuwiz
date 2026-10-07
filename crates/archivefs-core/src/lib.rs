@@ -73,6 +73,8 @@ pub mod evidence_resolution;
 /// already selected launch candidate. Explains; never decides or mutates.
 pub mod game_firmware_readiness;
 pub mod game_profile_planner;
+/// Provider-neutral homebrew project, release and artifact metadata types.
+pub mod homebrew_artifact;
 pub mod identity_attention;
 pub mod job_progress;
 /// Typed library presentation visibility, separate from source ownership and
