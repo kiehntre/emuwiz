@@ -72,7 +72,7 @@ fn default_managed_root(name: &str) -> Result<PathBuf, SharedApplyFailure> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FaultPoint {
+pub(super) enum FaultPoint {
     BackupWrite,
     TemporaryWrite,
     Flush,
@@ -98,7 +98,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn inject_fault(point: Option<FaultPoint>) {
+pub(super) fn inject_fault(point: Option<FaultPoint>) {
     INJECTED_FAULT.with(|fault| fault.set(point));
     INJECTED_AFTER.with(|fault| fault.set(None));
 }

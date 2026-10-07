@@ -97,11 +97,6 @@ fn apply(world: &World, plan: &DuckStationNativePlan, id: &str) -> DuckStationNa
         .unwrap_or_else(|failure| panic!("apply failed: {failure:?}"))
 }
 
-fn is_root() -> bool {
-    // SAFETY: geteuid has no preconditions.
-    unsafe { libc::geteuid() == 0 }
-}
-
 // ---- identity routing -------------------------------------------------------
 
 #[test]
@@ -794,57 +789,371 @@ fn a_new_file_appearing_after_preview_is_also_a_change() {
     assert!(!world.ini().exists());
 }
 
-#[test]
-fn a_failure_while_publishing_the_second_file_rolls_the_first_back() {
-    if is_root() {
-        return; // permission-based fault injection does not apply to root
+// ---- deterministic fault injection ------------------------------------------------
+//
+// Failures come from the shared transaction layer's own test-only fault points
+// and from `#[cfg(test)]` hooks in the apply path, never from file permissions,
+// so they behave the same for every user including root.
+
+use super::super::shared_transaction::{FaultPoint, inject_fault};
+
+/// Clears every injected fault when a test ends, pass or fail.
+struct Faults;
+
+impl Faults {
+    fn shared(point: FaultPoint) -> Self {
+        inject_fault(Some(point));
+        Self
     }
-    use std::os::unix::fs::PermissionsExt;
+
+    fn hook(fault: TestFault) -> Self {
+        set_test_fault(Some(fault));
+        Self
+    }
+}
+
+impl Drop for Faults {
+    fn drop(&mut self) {
+        inject_fault(None);
+        set_test_fault(None);
+    }
+}
+
+fn names(folder: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(folder)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+fn receipt_files(world: &World) -> Vec<String> {
+    names(&world.dir.path().join("history"))
+        .into_iter()
+        .filter(|name| name.ends_with(".receipt.json"))
+        .collect()
+}
+
+fn pending_operations(world: &World) -> usize {
+    crate::patch_manager::discover_pending_operations(&world.dir.path().join("history")).len()
+}
+
+/// A world holding both files in a known original state.
+fn world_with_originals() -> World {
     let world = World::new();
     World::write(&world.cht(), EXISTING_CHT);
-    fs::create_dir_all(world.game_settings()).unwrap();
-    let plan = plan_duckstation_native(&world.request(add("Infinite Health", "30123456 00000063")))
-        .unwrap();
-    let cht_before = sha(&world.cht());
-    // The INI folder becomes read-only after the preview.
-    fs::set_permissions(world.game_settings(), fs::Permissions::from_mode(0o555)).unwrap();
-    let result = apply_duckstation_native_plan(&plan, &world.options("op-half"));
-    fs::set_permissions(world.game_settings(), fs::Permissions::from_mode(0o755)).unwrap();
+    World::write(&world.ini(), EXISTING_INI);
+    world
+}
+
+#[test]
+fn a_failure_during_the_first_publication_changes_nothing_and_leaves_no_debris() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let (cht_names, ini_names) = (names(&world.cheats()), names(&world.game_settings()));
+    let (cht_before, ini_before) = (sha(&world.cht()), sha(&world.ini()));
+    let result = {
+        let _faults = Faults::shared(FaultPoint::Rename);
+        apply_duckstation_native_plan(&plan, &world.options("op-first"))
+    };
+    match result {
+        Err(DuckStationNativeApplyFailure::PublishFailedRolledBack { stage, .. }) => {
+            assert_eq!(stage, "publish cheat file");
+        }
+        other => panic!("expected a clean rolled-back failure, got {other:?}"),
+    }
+    assert_eq!(
+        (sha(&world.cht()), sha(&world.ini())),
+        (cht_before, ini_before)
+    );
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+    // No temporary files or journals left behind, and no success receipt.
+    assert_eq!(names(&world.cheats()), cht_names);
+    assert_eq!(names(&world.game_settings()), ini_names);
+    assert!(receipt_files(&world).is_empty());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn a_first_publication_failure_on_fresh_files_creates_nothing() {
+    let world = World::new();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let result = {
+        let _faults = Faults::shared(FaultPoint::Rename);
+        apply_duckstation_native_plan(&plan, &world.options("op-fresh-first"))
+    };
+    assert!(
+        matches!(
+            result,
+            Err(DuckStationNativeApplyFailure::PublishFailedRolledBack { .. })
+        ),
+        "{result:?}"
+    );
+    assert!(!world.cht().exists() && !world.ini().exists());
+    assert!(receipt_files(&world).is_empty());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn an_unsafe_second_destination_is_refused_before_the_first_file_is_published() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    // After the preview, the settings folder is swapped for a symlink.
+    let real = world.dir.path().join("elsewhere");
+    fs::rename(world.game_settings(), &real).unwrap();
+    std::os::unix::fs::symlink(&real, world.game_settings()).unwrap();
+    let error = apply_duckstation_native_plan(&plan, &world.options("op-unsafe")).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            DuckStationNativeApplyFailure::Refused(
+                DuckStationNativeRefusal::ExistingFileChanged { .. }
+            )
+        ),
+        "{error:?}"
+    );
+    // Both shared plans are built and checked before anything is published.
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&real.join("SLUS-00067.ini")), EXISTING_INI);
+    assert!(receipt_files(&world).is_empty());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn a_failure_after_the_cht_but_before_the_ini_restores_the_cht_exactly() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let cht_names = names(&world.cheats());
+    // Someone edits the INI after the .cht is published and before the INI is.
+    let concurrent = "[Main]\nSetting = 2\n";
+    let result = {
+        let _faults = Faults::hook(TestFault::MutateAfterFirstPublish {
+            path: world.ini(),
+            content: concurrent.to_string(),
+        });
+        apply_duckstation_native_plan(&plan, &world.options("op-second"))
+    };
     match result {
         Err(DuckStationNativeApplyFailure::PublishFailedRolledBack { stage, .. }) => {
             assert_eq!(stage, "publish settings file");
         }
-        other => panic!("expected a rolled-back failure, got {other:?}"),
+        other => panic!("expected a clean rolled-back failure, got {other:?}"),
     }
-    // The .cht is exactly as before; no INI was created; no success receipt exists.
-    assert_eq!(sha(&world.cht()), cht_before);
-    assert!(!world.ini().exists());
+    // The .cht is byte-identical to the original; the INI is exactly what the
+    // concurrent editor left (we never wrote it) and enables nothing of ours.
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), concurrent);
+    assert_eq!(names(&world.cheats()), cht_names);
+    assert!(receipt_files(&world).is_empty());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn a_failure_after_a_fresh_cht_publication_removes_it_again() {
+    let world = World::new();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let result = {
+        let _faults = Faults::hook(TestFault::MutateAfterFirstPublish {
+            path: world.ini(),
+            content: "[Main]\nSetting = 2\n".to_string(),
+        });
+        // The INI does not exist yet, so the hook creates it, which the shared
+        // executor must treat as a destination that changed since the preview.
+        fs::create_dir_all(world.game_settings()).unwrap();
+        apply_duckstation_native_plan(&plan, &world.options("op-fresh-second"))
+    };
     assert!(
-        !world
-            .dir
-            .path()
-            .join("history/duckstation-native-op-half.receipt.json")
-            .exists()
+        matches!(
+            result,
+            Err(DuckStationNativeApplyFailure::PublishFailedRolledBack { .. })
+        ),
+        "{result:?}"
+    );
+    assert!(
+        !world.cht().exists(),
+        "the published .cht must be removed again"
+    );
+    assert!(receipt_files(&world).is_empty());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn a_verification_failure_after_both_publications_rolls_both_files_back() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let result = {
+        let _faults = Faults::hook(TestFault::ForceVerifyFailure);
+        apply_duckstation_native_plan(&plan, &world.options("op-verify"))
+    };
+    match result {
+        Err(DuckStationNativeApplyFailure::PublishFailedRolledBack { stage, detail }) => {
+            assert_eq!(stage, "verify published files");
+            assert!(detail.contains("injected verification failure"), "{detail}");
+        }
+        other => panic!("expected a clean rolled-back failure, got {other:?}"),
+    }
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+    assert!(receipt_files(&world).is_empty());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn a_file_changed_after_publication_is_reported_not_overwritten_and_never_a_success() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let result = {
+        let _faults = Faults::hook(TestFault::TamperAfterPublish {
+            path: world.ini(),
+            content: "[Cheats]\nEnable = Tampered\n".to_string(),
+        });
+        apply_duckstation_native_plan(&plan, &world.options("op-tamper"))
+    };
+    match result {
+        Err(DuckStationNativeApplyFailure::RollbackIncomplete { stage, detail }) => {
+            assert_eq!(stage, "verify published files");
+            assert!(detail.contains("rollback"), "{detail}");
+        }
+        other => panic!("expected an explicit incomplete rollback, got {other:?}"),
+    }
+    // The other person's change is never clobbered; the .cht we published is
+    // still rolled back, so the INI cannot enable a cheat that is now missing.
+    assert_eq!(text(&world.ini()), "[Cheats]\nEnable = Tampered\n");
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert!(receipt_files(&world).is_empty());
+}
+
+#[test]
+fn a_receipt_failure_rolls_both_files_back_and_is_never_a_success() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let result = {
+        let _faults = Faults::hook(TestFault::FailReceiptWrite);
+        apply_duckstation_native_plan(&plan, &world.options("op-receipt"))
+    };
+    match result {
+        Err(DuckStationNativeApplyFailure::PublishFailedRolledBack { stage, .. }) => {
+            assert_eq!(stage, "write receipt");
+        }
+        other => panic!("expected a clean rolled-back failure, got {other:?}"),
+    }
+    assert_eq!(text(&world.cht()), EXISTING_CHT);
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+    assert!(receipt_files(&world).is_empty());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn the_receipt_exists_only_when_both_files_were_published_and_verified() {
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    let receipt = apply(&world, &plan, "op-both");
+    assert_eq!(
+        receipt_files(&world),
+        ["duckstation-native-op-both.receipt.json"]
+    );
+    assert!(receipt.cht.is_some() && receipt.game_ini.is_some());
+    assert_eq!(pending_operations(&world), 0);
+}
+
+#[test]
+fn a_destination_changed_after_preview_is_refused_for_either_file() {
+    // The .cht changes.
+    let world = world_with_originals();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    World::write(&world.cht(), "[Other]\n30123456 00000009\n");
+    let error = apply_duckstation_native_plan(&plan, &world.options("op-cht-drift")).unwrap_err();
+    assert_eq!(
+        error,
+        DuckStationNativeApplyFailure::Refused(
+            DuckStationNativeRefusal::DestinationChangedAfterPreview { path: world.cht() }
+        )
+    );
+    assert_eq!(text(&world.ini()), EXISTING_INI);
+    assert!(receipt_files(&world).is_empty());
+}
+
+#[test]
+fn undo_is_refused_when_either_published_file_changed_since_apply() {
+    for changed in ["cht", "ini"] {
+        let world = world_with_originals();
+        let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+        let receipt = apply(&world, &plan, "op-undo-either");
+        let target = if changed == "cht" {
+            world.cht()
+        } else {
+            world.ini()
+        };
+        let edited = format!("{}\n; user edit\n", text(&target));
+        World::write(&target, &edited);
+        let options = world.options("undo-either");
+        assert!(
+            !preview_duckstation_native_undo(&receipt, &options.backup_root).available,
+            "{changed}"
+        );
+        assert!(
+            undo_duckstation_native(&receipt, &options).is_err(),
+            "{changed}"
+        );
+        // Neither file is touched by the refused undo.
+        assert_eq!(text(&target), edited, "{changed}");
+    }
+}
+
+#[test]
+fn an_acknowledged_database_risk_is_recorded_and_the_ini_setting_is_never_changed_silently() {
+    let world = World::new();
+    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
+    assert!(
+        plan.preview
+            .warnings
+            .contains(&DuckStationNativeWarning::DatabaseShadowingAcknowledged)
+    );
+    let receipt = apply(&world, &plan, "op-ack");
+    assert!(
+        receipt
+            .warnings
+            .contains(&DuckStationNativeWarning::DatabaseShadowingAcknowledged)
+    );
+    let loaded = read_duckstation_native_receipt(receipt.receipt_path.as_ref().unwrap()).unwrap();
+    assert_eq!(loaded.warnings, receipt.warnings);
+    // EmuWiz wrote enablement only; the database setting is untouched.
+    assert!(!text(&world.ini()).contains("LoadCheatsFromDatabase"));
+
+    // Without acknowledgement the default stays closed.
+    let mut request = world.request(add("B", "30123457 00000002"));
+    request.acknowledge_database_shadowing = false;
+    assert_eq!(
+        plan_duckstation_native(&request).unwrap_err(),
+        DuckStationNativeRefusal::DatabaseShadowingUnknown
     );
 }
 
 #[test]
-fn a_failure_while_publishing_the_first_file_leaves_both_untouched() {
-    if is_root() {
-        return;
-    }
-    use std::os::unix::fs::PermissionsExt;
+fn an_existing_a0_line_is_preserved_and_never_emitted_as_a_write() {
     let world = World::new();
-    World::write(&world.ini(), EXISTING_INI);
-    fs::create_dir_all(world.cheats()).unwrap();
-    let plan = plan_duckstation_native(&world.request(add("A", "30123456 00000001"))).unwrap();
-    let ini_before = sha(&world.ini());
-    fs::set_permissions(world.cheats(), fs::Permissions::from_mode(0o555)).unwrap();
-    let result = apply_duckstation_native_plan(&plan, &world.options("op-first-fails"));
-    fs::set_permissions(world.cheats(), fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(sha(&world.ini()), ini_before);
-    assert!(!world.cht().exists());
+    World::write(&world.cht(), EXISTING_CHT);
+    let plan = plan_duckstation_native(&world.request(add("New", "90123456 DEADBEEF"))).unwrap();
+    apply(&world, &plan, "op-a0");
+    let after = text(&world.cht());
+    assert!(
+        after.contains("A0123456 00000001\n"),
+        "existing unsupported line kept"
+    );
+    assert!(after.contains("90123456 DEADBEEF\n"));
+    // A newly requested A0 line is refused rather than written as a write.
+    let error =
+        plan_duckstation_native(&world.request(add("Bad", "A0123456 DEADBEEF"))).unwrap_err();
+    assert!(matches!(
+        error,
+        DuckStationNativeRefusal::UnsupportedCheatCode { .. }
+    ));
 }
 
 #[test]

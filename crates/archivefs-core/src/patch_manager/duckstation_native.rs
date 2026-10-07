@@ -1642,6 +1642,10 @@ pub struct DuckStationNativeReceipt {
     pub cheats_removed: Vec<String>,
     pub cht: Option<DuckStationNativeFileReceipt>,
     pub game_ini: Option<DuckStationNativeFileReceipt>,
+    /// The preview's warnings, so an acknowledged database-shadowing risk is on
+    /// the record with the change it applied to.
+    #[serde(default)]
+    pub warnings: Vec<DuckStationNativeWarning>,
     /// Where this receipt was written (not part of the stored JSON's meaning).
     #[serde(default)]
     pub receipt_path: Option<PathBuf>,
@@ -1657,6 +1661,38 @@ pub enum DuckStationNativeApplyFailure {
     /// A step failed and the rollback could not be completed. The files may
     /// disagree and need attention.
     RollbackIncomplete { stage: &'static str, detail: String },
+}
+
+/// Deterministic, test-only failure points for the apply path. They exist only
+/// in test builds; a normal build has no way to trigger them.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum TestFault {
+    /// Rewrite `path` with `content` after the `.cht` is published and before
+    /// the INI is, as a concurrent editor would.
+    MutateAfterFirstPublish { path: PathBuf, content: String },
+    /// Rewrite `path` with `content` after both files are published and
+    /// before they are verified.
+    TamperAfterPublish { path: PathBuf, content: String },
+    /// Make post-publication verification fail without touching any file.
+    ForceVerifyFailure,
+    /// Make the receipt write fail.
+    FailReceiptWrite,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FAULT: std::cell::RefCell<Option<TestFault>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_test_fault(fault: Option<TestFault>) {
+    TEST_FAULT.with(|slot| *slot.borrow_mut() = fault);
+}
+
+#[cfg(test)]
+fn test_fault() -> Option<TestFault> {
+    TEST_FAULT.with(|slot| slot.borrow().clone())
 }
 
 fn read_bytes_if_exists(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -1753,6 +1789,16 @@ fn roll_back(
     }
 }
 
+/// Whether the destination now holds exactly the bytes this operation would
+/// have written (and that differ from what was there before).
+fn holds_our_output(file: &FilePlan) -> bool {
+    file.before_sha256.as_deref() != Some(file.after_sha256.as_str())
+        && matches!(
+            read_bytes_if_exists(&file.destination),
+            Ok(Some(current)) if sha256_hex(&current) == file.after_sha256
+        )
+}
+
 fn restored(file: &FilePlan) -> bool {
     match read_bytes_if_exists(&file.destination) {
         Ok(current) => current.as_deref().map(sha256_hex) == file.before_sha256,
@@ -1786,6 +1832,7 @@ pub fn apply_duckstation_native_plan(
         cheats_removed: preview.cheats_removed.clone(),
         cht: None,
         game_ini: None,
+        warnings: preview.warnings.clone(),
         receipt_path: None,
     };
     if preview.no_op {
@@ -1863,6 +1910,9 @@ pub fn apply_duckstation_native_plan(
     // PUBLISH: .cht first (inert without the INI), then the INI.
     let mut published: Vec<(&FilePlan, PathBuf, String)> = Vec::new();
     let mut failure: Option<(&'static str, String)> = None;
+    // The file whose publication itself failed. It was never published by this
+    // operation, so rollback only has to prove it does not hold our output.
+    let mut failed_file: Option<&FilePlan> = None;
     if let (Some(file), Some(shared)) = (&plan.cht, &shared_cht) {
         let operation_id = format!("{}-cht", options.operation_id);
         let (status, journal, detail) = publish(file, shared, options, operation_id.clone());
@@ -1877,6 +1927,10 @@ pub fn apply_duckstation_native_plan(
                     journal_path: journal.clone(),
                 });
                 published.push((file, journal, operation_id));
+                #[cfg(test)]
+                if let Some(TestFault::MutateAfterFirstPublish { path, content }) = test_fault() {
+                    let _ = fs::write(path, content);
+                }
             }
             (_, journal) => {
                 // A partial first publication is rolled back by the shared layer
@@ -1891,6 +1945,7 @@ pub fn apply_duckstation_native_plan(
                         format!("{operation_id}-rollback"),
                     );
                 }
+                failed_file = Some(file);
                 failure = Some(("publish cheat file", format!("status {status:?}: {detail}")));
             }
         }
@@ -1930,9 +1985,19 @@ pub fn apply_duckstation_native_plan(
             }
         }
     }
+    #[cfg(test)]
+    if failure.is_none()
+        && let Some(TestFault::TamperAfterPublish { path, content }) = test_fault()
+    {
+        let _ = fs::write(path, content);
+    }
     // VERIFY PUBLISHED OUTPUT.
     if failure.is_none() {
         let verify = || -> Result<(), String> {
+            #[cfg(test)]
+            if test_fault() == Some(TestFault::ForceVerifyFailure) {
+                return Err("injected verification failure".into());
+            }
             let cht = read_bytes_if_exists(&plan.cht_destination)?;
             let ini = read_bytes_if_exists(&plan.ini_destination)?;
             if preview.cht_will_change && cht.as_deref() != Some(plan.cht_final.as_slice()) {
@@ -1976,10 +2041,12 @@ pub fn apply_duckstation_native_plan(
             incomplete = Some(error);
         }
     }
-    let all_restored = [&plan.cht, &plan.ini]
-        .into_iter()
-        .flatten()
-        .all(|file| restored(file));
+    // Every file this operation published must be back to its previous content;
+    // the file whose publication failed was never ours, so it only must not hold
+    // our output (someone else may have legitimately changed it meanwhile).
+    let published_restored = published.iter().all(|(file, _, _)| restored(file));
+    let failed_clean = failed_file.is_none_or(|file| !holds_our_output(file));
+    let all_restored = published_restored && failed_clean;
     match (incomplete, all_restored) {
         (None, true) => Err(PublishFailedRolledBack { stage, detail }),
         (error, _) => Err(RollbackIncomplete {
@@ -1996,6 +2063,10 @@ fn write_receipt(
     receipt: &mut DuckStationNativeReceipt,
     options: &DuckStationNativeApplyOptions,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    if test_fault() == Some(TestFault::FailReceiptWrite) {
+        return Err("injected receipt failure".into());
+    }
     fs::create_dir_all(&options.history_root).map_err(|error| error.to_string())?;
     let path = options.history_root.join(format!(
         "duckstation-native-{}.receipt.json",
