@@ -157,6 +157,10 @@ pub enum DiscoveredStandaloneProfile<'a> {
         binding: &'a ScummVmNativeLaunchBinding,
         eligible: bool,
     },
+    #[cfg(target_os = "linux")]
+    ShadPs4 {
+        profile: &'a super::shadps4_profile::ShadPs4Profile,
+    },
     Vita3k {
         profile: &'a crate::patch_manager::Vita3kProfile,
     },
@@ -699,6 +703,13 @@ fn project_standalone_profiles(input: &LaunchPlanResults<'_>) -> Vec<StandaloneP
                 eligible: *eligible,
                 firmware: FirmwareReadiness::NotRequired,
             }),
+            #[cfg(target_os = "linux")]
+            DiscoveredStandaloneProfile::ShadPs4 { profile }
+                if matches!(&input.identity, CanonicalIdentityStatus::Resolved(identity)
+                    if identity.platform_id == "PS4") =>
+            {
+                Some(profile.launch_profile_input())
+            }
             DiscoveredStandaloneProfile::Vita3k { profile }
                 if matches!(input.identity, CanonicalIdentityStatus::Resolved(identity)
                     if identity.platform_id == "PlayStation Vita") =>

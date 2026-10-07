@@ -76,10 +76,8 @@ pub(crate) fn is_identity_conferring(kind: IdentityKind) -> bool {
             | IdentityKind::Ps2Serial
             | IdentityKind::PspDiscId
             | IdentityKind::Ps3TitleId
-            // PS4 title/content IDs are verified identity in the report, but
-            // are intentionally not wired into the launch identity bridge
-            // yet - that is PS4 Launch Phase 2. Adding them here now would
-            // imply a launch path that does not exist.
+            | IdentityKind::Ps4TitleId
+            | IdentityKind::Ps4ContentId
             | IdentityKind::SaturnProductNumber
             | IdentityKind::DreamcastProductCode
             | IdentityKind::SegaCdProductCode
@@ -147,6 +145,7 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         IdentityPlatform::PlayStation2 => Some("PS2"),
         IdentityPlatform::Psp => Some("PSP"),
         IdentityPlatform::PlayStation3 => Some("PS3"),
+        IdentityPlatform::PlayStation4 => Some("PS4"),
         IdentityPlatform::Saturn => Some("Saturn"),
         IdentityPlatform::Dreamcast => Some("Dreamcast"),
         IdentityPlatform::SegaCd => Some("Sega CD"),
@@ -181,10 +180,8 @@ fn launch_platform_id(platform: IdentityPlatform) -> Option<&'static str> {
         // `report.platform` was never determined at all - there is no
         // platform id to hand `ResolvedIdentity` without inventing one.
         // Modern Nintendo platforms are catalogue foundations only; no
-        // launch identity kind exists for them yet. PS4 has bounded
-        // PARAM.SFO identity but no launch support in this phase.
-        IdentityPlatform::PlayStation4
-        | IdentityPlatform::PokemonMini
+        // launch identity kind exists for them yet.
+        IdentityPlatform::PokemonMini
         | IdentityPlatform::WataraSupervision
         | IdentityPlatform::Enterprise
         | IdentityPlatform::WiiU
@@ -243,6 +240,12 @@ fn resolved_identity_for_platform(
                 disc_id.to_string(),
                 vec![VerifiedIdentityFact::PspDiscId(disc_id.to_string())],
             ))
+        }
+        IdentityPlatform::PlayStation4 => {
+            // TITLE_ID remains the game key; CONTENT_ID stays a separate fact
+            // in the source report/typed shadPS4 binding. No filename fallback.
+            let title_id = find_value(resolved, IdentityKind::Ps4TitleId)?;
+            Some((platform_id, title_id.to_string(), Vec::new()))
         }
         IdentityPlatform::PlayStation3 => {
             let title_id = find_value(resolved, IdentityKind::Ps3TitleId)?;
@@ -405,12 +408,7 @@ fn resolved_identity_for_platform(
         IdentityPlatform::NeoGeoCd => None,
         // These catalogue platforms have no structural identity parser or
         // launch identity kind yet, so they remain deliberately unresolved.
-        // PS4 does have a structural identity parser (bounded PARAM.SFO),
-        // but no launch bridge in this phase - `launch_platform_id`
-        // already returned `None` above, so this arm is only for
-        // exhaustiveness.
-        IdentityPlatform::PlayStation4
-        | IdentityPlatform::PokemonMini
+        IdentityPlatform::PokemonMini
         | IdentityPlatform::WataraSupervision
         | IdentityPlatform::Enterprise
         | IdentityPlatform::WiiU

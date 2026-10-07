@@ -153,6 +153,12 @@ pub mod sameboy_command;
 pub mod sameboy_execution;
 pub mod scummvm_command;
 pub mod scummvm_execution;
+#[cfg(target_os = "linux")]
+pub mod shadps4;
+#[cfg(target_os = "linux")]
+pub mod shadps4_input;
+#[cfg(target_os = "linux")]
+pub mod shadps4_profile;
 pub mod snes9x_command;
 pub mod snes9x_execution;
 pub mod stella_command;

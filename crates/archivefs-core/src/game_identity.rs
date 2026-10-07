@@ -7474,17 +7474,19 @@ mod tests {
                 .iter()
                 .any(|w| w == "PS4 PARAM.SFO APP_VER: 01.02")
         );
-        // Phase 1 is identity only: the report carries verified PS4
-        // identity, but the launch bridge deliberately does not resolve a
-        // launchable canonical identity or emit any VerifiedIdentityFact
-        // for PS4 yet (there is no PS4 launch platform id or fact variant -
-        // that is Phase 2). It must not conflict, either.
+        // The PS4 launch bridge now carries the already-verified title ID;
+        // source identity/content-ID interpretation is unchanged.
         let (status, facts) =
             crate::launch::evidence_bridge::canonical_identity_from_game_report(&report);
-        assert!(matches!(
+        assert_eq!(
             status,
-            crate::launch::planning::CanonicalIdentityStatus::Unknown
-        ));
+            crate::launch::planning::CanonicalIdentityStatus::Resolved(
+                crate::launch::planning::ResolvedIdentity {
+                    platform_id: "PS4".into(),
+                    game_key: "CUSA00001".into(),
+                }
+            )
+        );
         assert!(facts.is_empty());
     }
 

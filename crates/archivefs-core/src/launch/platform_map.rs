@@ -111,6 +111,12 @@ pub const LAUNCH_COMPATIBILITY: &[LaunchCompatibility] = &[
         confidence: MappingConfidence::Exact,
     },
     LaunchCompatibility {
+        platform_id: "PS4",
+        standalone_adapters: &["shadps4"],
+        retroarch_core_hints: &[],
+        confidence: MappingConfidence::Exact,
+    },
+    LaunchCompatibility {
         platform_id: "PS3",
         standalone_adapters: &["rpcs3"],
         retroarch_core_hints: &[],
