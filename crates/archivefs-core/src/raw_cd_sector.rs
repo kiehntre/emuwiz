@@ -1,4 +1,4 @@
-//! Shared, pure, read-only CD/CD-XA raw-sector layout: sync pattern, mode
+//! Shared CD/CD-XA raw-sector layout and pure Mode 1 regeneration: sync pattern, mode
 //! byte, and the Mode 1 / Mode 2 Form 1 -> 2048-byte user-data extraction
 //! every raw-sector-backed [`crate::logical_media::LogicalMedia`] adapter in
 //! this crate needs.
@@ -31,10 +31,10 @@
 //!                                  0x02 = Mode 2
 //! -- Mode 1 --
 //! [16..2064]   user data    2048 bytes
-//! [2064..2072] EDC/spare
-//! [2072..2076] EDC
-//! [2076..2248] ECC (P+Q parity)
-//! [2248..2352] (unused in Mode 1 - reserved)
+//! [2064..2068] EDC
+//! [2068..2076] reserved (zero)
+//! [2076..2248] ECC P parity
+//! [2248..2352] ECC Q parity
 //! -- Mode 2 (CD-XA) --
 //! [16..24]     subheader    8 bytes  (submode duplicated at [18] and [22])
 //! [24..2072]   user data    2048 bytes  (Form 1 only - see below)
@@ -67,6 +67,8 @@
 //! - Subchannel/subcode data (P-W, typically an extra 96 bytes per sector in
 //!   some raw dump conventions) - out of scope; every adapter built on this
 //!   module reads only the leading [`RAW_SECTOR_BYTES`] of each unit.
+
+pub mod mode1;
 
 /// The size of one raw CD sector, verified against MAME's `cdrom.h`
 /// (`MAX_SECTOR_DATA = 2352`).

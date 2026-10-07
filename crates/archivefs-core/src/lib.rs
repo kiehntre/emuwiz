@@ -367,6 +367,7 @@ pub mod playstation_boot_evidence;
 /// [`content_evidence`] facts, never a platform.
 pub mod dreamcast_boot_evidence;
 pub mod dreamcast_dcp_apply;
+pub mod dreamcast_extent_patch;
 /// Read-only Dreamcast DCP/package inspection and fail-closed patch readiness.
 pub mod dreamcast_patch_readiness;
 mod optical_patch_tree;

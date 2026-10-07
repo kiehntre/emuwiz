@@ -440,17 +440,34 @@ pub fn inspect(journal: &Path) -> io::Result<TreePatchState> {
 /// and the entire verified tree are rechecked. Existing destinations always
 /// refuse, including empty directories and dangling symlinks.
 pub fn publish(journal: &Path) -> io::Result<()> {
+    publish_checked(journal, || Ok(()))
+}
+
+// Deterministic publication failure at the actual transaction boundary, after
+// validation and before rename. Production always uses the infallible hook.
+fn publish_checked(
+    journal: &Path,
+    before_rename: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
     let (_lease, receipt) = load(journal)?;
     receipt.plan.revalidate()?;
     if state(&receipt)? != TreePatchState::Staged {
         return Err(refuse("tree is not staged"));
     }
+    before_rename()?;
     rename_noreplace(&receipt.staging, &receipt.plan.destination).map_err(io::Error::other)?;
     File::open(receipt.staging.parent().unwrap())?.sync_all()?;
     if state(&receipt)? != TreePatchState::Published {
         return Err(refuse("publication verification failed; recovery required"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn fail_publication_before_rename(journal: &Path) -> io::Result<()> {
+    publish_checked(journal, || {
+        Err(refuse("injected publication failure before rename"))
+    })
 }
 
 /// Non-destructive undo: retains the complete verified tree at its original

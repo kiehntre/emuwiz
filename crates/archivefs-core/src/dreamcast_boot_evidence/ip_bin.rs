@@ -722,6 +722,35 @@ pub fn preview_ip_bin_edits(
     {
         return Err(refuse("incomplete or inconsistent IP.BIN source evidence"));
     }
+    let (expected, changes) = edit_ip_bin_inspection(&source.inspection, edits)?;
+    Ok(IpBinPreview {
+        source: evidence,
+        original: source.inspection.clone(),
+        expected_sha256: digest(expected.ip_bin.as_ref().unwrap().raw_bytes()),
+        expected,
+        changes,
+    })
+}
+
+/// Embedded boot sectors use the same edit policy without manufacturing file
+/// evidence. Their enclosing GDI transaction owns source and output bindings.
+pub(crate) fn edit_ip_bin_inspection(
+    original: &IpBinInspection,
+    edits: &[IpBinEdit],
+) -> io::Result<(IpBinInspection, Vec<IpBinFieldChange>)> {
+    if !matches!(
+        original.status,
+        IpBinStatus::Valid | IpBinStatus::SuspiciousButParseable
+    ) {
+        return Err(refuse("complete parseable IP.BIN required"));
+    }
+    let ip = original
+        .ip_bin
+        .as_ref()
+        .ok_or_else(|| refuse("parsed IP.BIN required"))?;
+    if ip.raw_bytes.len() != IP_BIN_BYTES {
+        return Err(refuse("complete IP.BIN required"));
+    }
     let mut bytes = ip.raw_bytes.clone();
     let mut changes = Vec::new();
     let mut fields = BTreeSet::new();
@@ -843,13 +872,7 @@ pub fn preview_ip_bin_edits(
             expected.issues
         )));
     }
-    Ok(IpBinPreview {
-        source: evidence,
-        original: source.inspection.clone(),
-        expected,
-        changes,
-        expected_sha256: digest(&bytes),
-    })
+    Ok((expected, changes))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
