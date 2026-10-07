@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# cargo-iso: run cargo with a target directory unique to THIS git worktree.
+#
+#   scripts/cargo-iso test -p archivefs-gui --lib
+#   scripts/cargo-iso --low-debug check --workspace --all-targets
+#   scripts/cargo-iso --print-target       # read-only: show the target and free space
+#
+# Why: many worktrees sharing one CARGO_TARGET_DIR let concurrent builds corrupt
+# each other's results and filled the disk. Every worktree builds into
+#
+#   $EMUWIZ_TARGET_ROOT/<worktree-name>-<first 12 hex of sha256(canonical worktree path)>
+#
+# (root defaults to ~/.cache/emuwiz-cargo-targets).
+#
+# What this wrapper does:
+#   * computes that directory from the canonical (physical) worktree path;
+#   * sets CARGO_TARGET_DIR to it, overriding any inherited value, and unsets
+#     CARGO_BUILD_TARGET_DIR so nothing else can redirect the build;
+#   * refuses to build into the legacy shared target, or to accept a
+#     --target-dir that points into it;
+#   * refuses to build when the build disk has less than EMUWIZ_MIN_FREE_GB free;
+#   * passes every cargo argument through unchanged and exits with cargo's status.
+#
+# What it never does: delete, clean or prune anything.
+#
+# Options (before the cargo arguments):
+#   --print-target   print worktree, target and free space; run nothing, create nothing
+#   --low-debug      build without debug info (about 4x smaller target); also set by
+#                    EMUWIZ_CARGO_LOW_DEBUG=1
+#   --help           this text
+#
+# Environment (all optional):
+#   EMUWIZ_TARGET_ROOT       parent of all per-worktree targets
+#   EMUWIZ_MIN_FREE_GB       minimum free GiB on the build disk (default 8)
+#   EMUWIZ_CARGO_LOW_DEBUG   1 = same as --low-debug
+#   EMUWIZ_CARGO             cargo executable to run (default: cargo)
+#
+# Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
+# 4 not enough free disk. Anything else is cargo's own exit status.
+set -euo pipefail
+
+usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+
+print_only=0
+low_debug="${EMUWIZ_CARGO_LOW_DEBUG:-0}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --print-target) print_only=1; shift ;;
+    --low-debug) low_debug=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+if [ "$print_only" -eq 0 ] && [ $# -eq 0 ]; then
+  echo "cargo-iso: no cargo command given (try --help)" >&2
+  exit 2
+fi
+
+min_free_gb="${EMUWIZ_MIN_FREE_GB:-8}"
+case "$min_free_gb" in
+  ''|*[!0-9]*) echo "cargo-iso: EMUWIZ_MIN_FREE_GB must be a whole number, got '$min_free_gb'" >&2; exit 2 ;;
+esac
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "cargo-iso: not inside a git worktree" >&2
+  exit 2
+}
+top=$(cd "$top" && pwd -P)
+
+home="${HOME:?cargo-iso: HOME is not set}"
+root="${EMUWIZ_TARGET_ROOT:-$home/.cache/emuwiz-cargo-targets}"
+legacy=$(realpath -m "$home/.cache/emuwiz-cargo-target")
+
+# True when $1 is the legacy shared target or anything inside it.
+is_legacy() {
+  local p
+  p=$(realpath -m "$1")
+  [ "$p" = "$legacy" ] || [[ "$p" == "$legacy"/* ]]
+}
+
+if is_legacy "$root"; then
+  echo "cargo-iso: refusing EMUWIZ_TARGET_ROOT inside the legacy shared target: $root" >&2
+  exit 3
+fi
+
+# A readable name that cannot contain path separators or odd characters.
+name=$(printf %s "$(basename "$top")" | tr -c 'A-Za-z0-9._-' '_')
+hash=$(printf %s "$top" | sha256sum | cut -c1-12)
+target="$root/$name-$hash"
+
+if is_legacy "$target"; then
+  echo "cargo-iso: refusing the legacy shared target: $target" >&2
+  exit 3
+fi
+
+# Free space on the filesystem that will hold the target (nearest existing ancestor,
+# so --print-target never has to create anything).
+probe="$target"
+while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do probe=$(dirname "$probe"); done
+free_kb=$(df --output=avail -k "$probe" | tail -1 | tr -d ' ')
+free_gb=$(( free_kb / 1024 / 1024 ))
+
+if [ "$print_only" -eq 1 ]; then
+  echo "worktree: $top"
+  echo "target:   $target"
+  echo "free:     ${free_gb} GiB (minimum ${min_free_gb} GiB)"
+  if [ -n "${CARGO_TARGET_DIR:-}" ] && [ "$(realpath -m "$CARGO_TARGET_DIR")" != "$(realpath -m "$target")" ]; then
+    echo "inherited CARGO_TARGET_DIR=$CARGO_TARGET_DIR is overridden by this wrapper"
+  fi
+  exit 0
+fi
+
+# An explicit --target-dir can still point cargo at the legacy target; refuse that.
+prev=""
+for arg in "$@"; do
+  [ "$arg" = "--" ] && break
+  value=""
+  case "$arg" in
+    --target-dir=*) value="${arg#--target-dir=}" ;;
+    *) [ "$prev" = "--target-dir" ] && value="$arg" ;;
+  esac
+  if [ -n "$value" ] && is_legacy "$value"; then
+    echo "cargo-iso: refusing --target-dir inside the legacy shared target: $value" >&2
+    exit 3
+  fi
+  prev="$arg"
+done
+
+if [ "$free_gb" -lt "$min_free_gb" ]; then
+  echo "cargo-iso: only ${free_gb} GiB free on the build disk (minimum ${min_free_gb} GiB)." >&2
+  echo "           Free space first. Nothing was built and nothing was deleted." >&2
+  echo "           (Check with: scripts/cargo-iso --print-target)" >&2
+  exit 4
+fi
+
+if [ -n "${CARGO_TARGET_DIR:-}" ] && is_legacy "$CARGO_TARGET_DIR"; then
+  echo "cargo-iso: note: inherited CARGO_TARGET_DIR points at the legacy shared target; overriding it with $target" >&2
+fi
+
+mkdir -p "$target"
+export CARGO_TARGET_DIR="$target"
+unset CARGO_BUILD_TARGET_DIR
+if [ "$low_debug" = "1" ]; then
+  export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+fi
+exec "${EMUWIZ_CARGO:-cargo}" "$@"

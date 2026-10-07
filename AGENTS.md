@@ -56,6 +56,43 @@ Use targeted `rustfmt` for touched Rust files. Do not run `cargo fmt --all` in
 write mode during a focused task unless explicitly requested. `cargo fmt --all
 -- --check` is suitable for validation. Avoid unrelated formatting churn.
 
+## Cargo builds: one target directory per worktree
+
+Run every Cargo command through `scripts/cargo-iso`, for example:
+
+```sh
+scripts/cargo-iso check --workspace --all-targets
+scripts/cargo-iso test -p archivefs-gui --lib gui_v2::history_view
+scripts/cargo-iso --low-debug test -p archivefs-gui --lib   # smaller target
+scripts/cargo-iso --print-target                            # read-only: target + free disk
+```
+
+The wrapper builds into `~/.cache/emuwiz-cargo-targets/<worktree>-<12-hex path hash>`,
+one directory per worktree, so concurrent worktrees can never corrupt each other's
+build results or share a cache by accident. It passes all Cargo arguments and the exit
+code through unchanged. It never cleans or deletes anything.
+
+Rules:
+
+- Do not run bare `cargo build/check/test/clippy` in a worktree, and never export a
+  shared `CARGO_TARGET_DIR` or `build.target-dir`. Two worktrees must not share a target.
+- Never use the legacy shared target `~/.cache/emuwiz-cargo-target`. The wrapper
+  refuses it (including through `--target-dir`).
+- Never run `cargo clean` on, or delete, a target directory that is not yours. Another
+  agent may be using it.
+- The wrapper refuses to build when less than 8 GiB is free (`EMUWIZ_MIN_FREE_GB`).
+  Free space first; do not lower the threshold to force a build on a full disk.
+- Release scripts (`scripts/build-release.sh`, `scripts/compare-release-builds.sh`) manage
+  their own target explicitly and are not affected.
+
+Shells that still carry the old shared target: some long-lived shells and agent
+sessions started before this change inherited
+`CARGO_TARGET_DIR=~/.cache/emuwiz-cargo-target` from `~/.bashrc`. `scripts/cargo-iso`
+overrides it (and prints a one-line note), so using the wrapper is always safe. Bare
+`cargo` in such a shell would still use the shared target, so do not use it. In an
+interactive shell you can also run `unset CARGO_TARGET_DIR`. Once the global defaults are
+removed (a separate, coordinated step), new shells no longer carry it.
+
 ## Temporary files
 
 Use `tempfile::TempDir`, `/tmp/emuwiz-<task>...`, or a deliberate checked-in
