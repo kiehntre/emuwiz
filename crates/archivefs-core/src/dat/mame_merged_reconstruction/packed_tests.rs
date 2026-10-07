@@ -871,3 +871,228 @@ fn real_mame_bytes_stage_from_a_scratch_zip() {
     }
     assert!(proved > 0, "no real set was fully present");
 }
+
+// ---- receipt provenance and the remaining failure matrix ----------------------------
+
+fn provenance_of(
+    transaction: &crate::dat::rename_apply::model::RenameTransaction,
+) -> serde_json::Value {
+    transaction
+        .unknown
+        .get(MAME_RECONSTRUCTION_PROVENANCE_KEY)
+        .cloned()
+        .expect("the receipt carries source provenance")
+}
+
+#[test]
+fn the_receipt_records_where_every_member_came_from_and_what_was_actually_staged() {
+    let lab = Lab::new();
+    let one = lab.zip("one.zip", &[("x/a.bin", b"alpha"), ("b.bin", b"bravo")]);
+    let plan = lab.plan(&[
+        Member {
+            target: "a.bin",
+            bytes: b"alpha",
+            from: From::Zip(&one, "x/a.bin"),
+        },
+        Member {
+            target: "b.bin",
+            bytes: b"bravo",
+            from: From::Zip(&one, "b.bin"),
+        },
+        Member {
+            target: "c.bin",
+            bytes: b"charlie",
+            from: From::Loose,
+        },
+    ]);
+    let outcome =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    let provenance = provenance_of(&outcome.transaction);
+    assert_eq!(provenance["dat_sha256"], "digest");
+    assert_eq!(provenance["parent"], "parent");
+    let members = provenance["members"].as_array().unwrap();
+    assert_eq!(members.len(), 3);
+    let by_name = |name: &str| {
+        members
+            .iter()
+            .find(|member| member["target_name"] == name)
+            .unwrap_or_else(|| panic!("no provenance for {name}"))
+    };
+    // A packed member names its archive AND the entry inside it.
+    let alpha = by_name("a.bin");
+    assert_eq!(alpha["packed"], true);
+    assert_eq!(alpha["source_archive"], one.display().to_string());
+    assert_eq!(alpha["source_member"], "x/a.bin");
+    // A loose member is recorded as such.
+    assert_eq!(by_name("c.bin")["packed"], false);
+    // Expected and actually staged hashes are both recorded, and agree.
+    for member in members {
+        assert_eq!(member["expected"]["sha1"], member["staged"]["sha1"]);
+        assert_eq!(member["expected"]["crc32"], member["staged"]["crc32"]);
+        assert_eq!(
+            member["expected"]["size_bytes"],
+            member["staged"]["size_bytes"]
+        );
+        assert_eq!(member["owner_set"], "parent");
+        assert!(
+            member["ownership"]["basis"]
+                .as_str()
+                .unwrap()
+                .contains("checksum"),
+            "ownership is by checksum, never by filename"
+        );
+        assert_eq!(
+            member["ownership"]["observed_sha1"],
+            member["expected"]["sha1"]
+        );
+    }
+    assert_eq!(alpha["staged"]["sha1"], sha1_hex(b"alpha"));
+    // The same provenance survives a reload from the journal directory, which
+    // is how the history list shows a receipt after a restart.
+    let (reloaded, problems) = crate::dat::rename_apply::list_journals(&lab.journal());
+    assert!(problems.is_empty(), "{problems:?}");
+    let reloaded = reloaded
+        .into_iter()
+        .find(|transaction| transaction.transaction_id == outcome.transaction.transaction_id)
+        .expect("the receipt is in the journal directory");
+    assert_eq!(provenance_of(&reloaded), provenance);
+}
+
+#[test]
+fn a_source_archive_that_disappears_after_the_preview_is_refused_and_nothing_is_staged() {
+    let lab = Lab::new();
+    let zip = lab.zip("source.zip", &[("a", b"AAA")]);
+    let plan = lab.plan(&[Member {
+        target: "a",
+        bytes: b"AAA",
+        from: From::Zip(&zip, "a"),
+    }]);
+    std::fs::remove_file(&zip).unwrap();
+    let error = lab.stage(&plan).unwrap_err();
+    assert!(
+        error.contains("changed since the preview") || error.contains("refused"),
+        "{error}"
+    );
+    lab.nothing_was_staged_or_published(&plan);
+}
+
+#[test]
+fn unrelated_entries_in_a_source_archive_are_never_decoded() {
+    let lab = Lab::new();
+    let zip = lab.zip(
+        "source.zip",
+        &[("wanted", b"good bytes"), ("decoy", b"decoy bytes!")],
+    );
+    // Corrupt the decoy's stored data. If staging decoded or hashed the whole
+    // archive it would trip over this; only the requested entry may be read.
+    patch(&zip, |bytes| {
+        let at = position(bytes, b"decoy bytes!");
+        bytes[at] ^= 0xff;
+    });
+    // Guard: a whole-archive verification really would notice the damage.
+    let whole = read_zip_evidence(&zip).unwrap();
+    assert!(
+        whole.iter().any(|member| !matches!(
+            member.status,
+            crate::dat::archive::ArchiveMemberStatus::HashComplete
+        )),
+        "the decoy corruption must be detectable, or this test proves nothing"
+    );
+    let plan = lab.plan(&[Member {
+        target: "wanted",
+        bytes: b"good bytes",
+        from: From::Zip(&zip, "wanted"),
+    }]);
+    let staged = lab.stage(&plan).unwrap();
+    assert_eq!(
+        read_back(&staged),
+        [("wanted".to_string(), b"good bytes".to_vec())].into(),
+        "only the requested member was extracted"
+    );
+}
+
+#[test]
+fn a_reconstruction_that_fails_verification_after_extraction_leaves_nothing_behind() {
+    let lab = Lab::new();
+    let zip = lab.zip("source.zip", &[("a", b"AAA"), ("b", b"BBB")]);
+    let mut plan = lab.plan(&[
+        Member {
+            target: "a",
+            bytes: b"AAA",
+            from: From::Zip(&zip, "a"),
+        },
+        Member {
+            target: "b",
+            bytes: b"BBB",
+            from: From::Zip(&zip, "b"),
+        },
+    ]);
+    // A requirement with no source: every member extracts fine, but the staged
+    // set cannot be the complete reviewed set, so verification must refuse it.
+    plan.required_members.push(ReconstructionMemberRequirement {
+        owner_set: "parent".into(),
+        member_name: "unsourced".into(),
+        size_bytes: Some(3),
+        sha1: Some(sha1_hex(b"???")),
+        crc32: Some(crc32_hex(b"???")),
+    });
+    let error = lab.stage(&plan).unwrap_err();
+    assert!(
+        error.contains("inventory") || error.contains("mismatch"),
+        "{error}"
+    );
+    lab.nothing_was_staged_or_published(&plan);
+}
+
+#[test]
+fn a_packed_source_changed_between_review_and_apply_is_refused_without_replanning() {
+    let lab = Lab::new();
+    let zip = lab.zip("source.zip", &[("a", b"AAA")]);
+    let plan = lab.plan(&[Member {
+        target: "a",
+        bytes: b"AAA",
+        from: From::Zip(&zip, "a"),
+    }]);
+    let reviewed = review_reconstruction_publication(&plan, None).unwrap();
+    // The archive is replaced after the review. Apply must not rescan, replan
+    // or quietly use the new contents.
+    std::fs::remove_file(&zip).unwrap();
+    lab.zip("source.zip", &[("a", b"AAA"), ("extra", b"more")]);
+    let error = reviewed
+        .apply(&lab.stage_root(), &lab.journal())
+        .unwrap_err();
+    assert!(
+        error.contains("stale") || error.contains("review again"),
+        "{error}"
+    );
+    lab.nothing_was_staged_or_published(&plan);
+}
+
+#[test]
+fn a_second_packed_member_failing_leaves_the_first_unpublished_and_the_source_intact() {
+    let lab = Lab::new();
+    let zip = lab.zip("source.zip", &[("a", b"AAA"), ("b", b"BBB")]);
+    let before = std::fs::read(&zip).unwrap();
+    let mut plan = lab.plan(&[
+        Member {
+            target: "a",
+            bytes: b"AAA",
+            from: From::Zip(&zip, "a"),
+        },
+        Member {
+            target: "b",
+            bytes: b"BBB",
+            from: From::Zip(&zip, "b"),
+        },
+    ]);
+    // The second source claims an entry the archive does not hold.
+    plan.sources[1].current_name = "not-in-the-archive".into();
+    let error =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap_err();
+    assert!(
+        error.contains("not-in-the-archive") || error.contains("refused"),
+        "{error}"
+    );
+    lab.nothing_was_staged_or_published(&plan);
+    assert_eq!(std::fs::read(&zip).unwrap(), before);
+}

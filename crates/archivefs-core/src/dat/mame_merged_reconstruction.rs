@@ -586,15 +586,28 @@ pub fn build_merged_reconstruction_plan(
             ));
         }
     }
-    if plan.sources.iter().any(|source| {
-        !source.archive_path.is_dir()
-            && !source
-                .archive_path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
-    }) {
-        plan.reasons
-            .push("source is neither an extracted set directory nor a ZIP archive".into());
+    let unsupported_sources: BTreeSet<String> = plan
+        .sources
+        .iter()
+        .filter(|source| {
+            !source.archive_path.is_dir()
+                && !source
+                    .archive_path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+        })
+        .map(|source| source.archive_path.display().to_string())
+        .collect();
+    if !unsupported_sources.is_empty() {
+        // Only extracted folders and ZIP archives can supply members; a member
+        // inside another archive type is not extracted by this workflow.
+        plan.reasons.push(format!(
+            "source is neither an extracted set directory nor a ZIP archive: {}",
+            unsupported_sources
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if !plan.missing_members.is_empty() {
         plan.reasons.push("required ROM members are missing".into());
@@ -992,7 +1005,83 @@ pub fn verify_staged_output(
     plan: &MameMergedReconstructionPlan,
     staged: &Path,
 ) -> Result<(), String> {
-    verify_members(plan, &read_zip_evidence(staged)?)
+    verified_staged_members(plan, staged).map(|_| ())
+}
+
+/// [`verify_staged_output`], returning the staged members' own evidence so the
+/// receipt can record the hashes that were actually staged (not just the ones
+/// that were expected).
+fn verified_staged_members(
+    plan: &MameMergedReconstructionPlan,
+    staged: &Path,
+) -> Result<Vec<crate::dat::archive::ArchiveMemberEvidence>, String> {
+    let members = read_zip_evidence(staged)?;
+    verify_members(plan, &members)?;
+    Ok(members)
+}
+
+/// Journal key under which a reconstruction's source provenance is recorded.
+pub const MAME_RECONSTRUCTION_PROVENANCE_KEY: &str = "mame_reconstruction_provenance";
+
+/// What a receipt must be able to say about every staged member: where it came
+/// from (archive and member, or a loose file), what the DAT required, what was
+/// actually staged, and the checksum-based basis on which the member was
+/// accepted as owned. Filenames are recorded, never used as the basis.
+fn reconstruction_provenance(
+    plan: &MameMergedReconstructionPlan,
+    staged: &[crate::dat::archive::ArchiveMemberEvidence],
+) -> Result<serde_json::Value, String> {
+    let mut members = Vec::with_capacity(plan.sources.len());
+    for source in &plan.sources {
+        let requirement = plan
+            .required_members
+            .iter()
+            .find(|requirement| requirement.member_name == source.target_name)
+            .ok_or_else(|| format!("no reviewed requirement for {}", source.target_name))?;
+        let actual = staged
+            .iter()
+            .find(|member| member.member_name_display == source.target_name)
+            .ok_or_else(|| format!("staged output has no member {}", source.target_name))?;
+        let hashes = actual
+            .hashes
+            .as_ref()
+            .ok_or_else(|| format!("staged member {} has no hashes", source.target_name))?;
+        let packed = !source.archive_path.is_dir();
+        members.push(serde_json::json!({
+            "target_name": source.target_name,
+            "owner_set": requirement.owner_set,
+            "packed": packed,
+            "source_archive": source.archive_path.display().to_string(),
+            "source_member": if packed {
+                source.current_name.clone()
+            } else {
+                source.member_path.display().to_string()
+            },
+            "expected": {
+                "size_bytes": requirement.size_bytes,
+                "sha1": requirement.sha1,
+                "crc32": requirement.crc32,
+            },
+            "staged": {
+                "size_bytes": actual.logical_size,
+                "sha1": hashes.sha1,
+                "crc32": hashes.crc32,
+            },
+            "ownership": {
+                "basis": "checksum match against persisted MAME join evidence",
+                "observed_sha1": source.observed_sha1,
+                "observed_crc32": source.observed_crc32,
+            },
+        }));
+    }
+    Ok(serde_json::json!({
+        "schema": 1,
+        "dat_version": plan.dat_version,
+        "dat_sha256": plan.dat_sha256,
+        "parent": plan.parent,
+        "destination": plan.destination.display().to_string(),
+        "members": members,
+    }))
 }
 
 /// Publishes a verified staged output through the shared journaled rename
@@ -1028,7 +1117,8 @@ fn publish_staged(
     use std::sync::atomic::AtomicBool;
 
     let identity = capture_identity(staged).map_err(|e| e.to_string())?;
-    verify_staged_output(plan, staged)?;
+    let staged_members = verified_staged_members(plan, staged)?;
+    let provenance = reconstruction_provenance(plan, &staged_members)?;
     let after = capture_identity(staged).map_err(|e| e.to_string())?;
     if !crate::dat::rename_apply::identity::identity_matches(&identity, &after) {
         return Err("staged reconstruction changed during verification".into());
@@ -1089,6 +1179,9 @@ fn publish_staged(
         "mame_parent".into(),
         serde_json::Value::String(plan.parent.clone()),
     );
+    transaction
+        .unknown
+        .insert(MAME_RECONSTRUCTION_PROVENANCE_KEY.into(), provenance);
     let mut approved = BTreeSet::new();
     approved.insert(source_key);
     let cancel = AtomicBool::new(false);
@@ -1247,6 +1340,30 @@ mod tests {
             dat_path: "fixture".into(),
             audited_at: "now".into(),
         }
+    }
+    #[test]
+    fn a_member_in_an_unsupported_archive_type_blocks_the_plan_and_names_the_archive() {
+        let root = std::env::temp_dir().join(format!("emuwiz-merged-7z-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let parsed = dat(vec![
+            game("parent", None, &[("a", "a")]),
+            game("clone", Some("parent"), &[("c", "c")]),
+        ]);
+        let archive = PathBuf::from("/roms/parent.7z");
+        let joins = vec![
+            (archive.clone(), join("parent", "digest", &[("a", "a")])),
+            (root.join("clone"), join("clone", "digest", &[("c", "c")])),
+        ];
+        let plan =
+            build_merged_reconstruction_plan(&root, &parsed, &joins, "parent", "digest").unwrap();
+        assert!(plan.blocked());
+        let reason = plan
+            .reasons
+            .iter()
+            .find(|reason| reason.contains("neither an extracted set directory nor a ZIP"))
+            .expect("the unsupported-source reason is present");
+        assert!(reason.contains("/roms/parent.7z"), "{reason}");
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn complete_family_is_deterministic_and_ready() {
