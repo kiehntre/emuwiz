@@ -4,6 +4,9 @@
 //! directory. Generic restore apply is intentionally limited to explicitly
 //! bound, single-file native saves.
 
+/// Identity-bound directory Replace restore is exposed through
+/// [`tree_restore::safety`]. Its built-in quiescence provider fails closed until
+/// a trustworthy system-level observer is supplied by the backend.
 pub mod tree_restore;
 
 use serde::{Deserialize, Serialize};

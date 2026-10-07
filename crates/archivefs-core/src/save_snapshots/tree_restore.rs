@@ -18,8 +18,9 @@
 //! post-state and status. A failure at any publish point rolls the destination
 //! back to its exact previous state; if that rollback cannot finish, the
 //! journal, staging and preserved material are kept and the transaction is
-//! `RecoveryRequired` (never silently half-restored). Anything not listed by
-//! the snapshot is never touched.
+//! `RecoveryRequired` (never silently half-restored). The public safety entry
+//! point uses Replace semantics, preserving removed objects for verified undo.
+//! The internal merge planner remains a transaction implementation detail.
 //!
 //! Undo verifies the current destination against the journal's post-state
 //! first and refuses (changing nothing) if a save was modified since.
@@ -42,6 +43,8 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+pub mod safety;
 
 static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(0);
 
@@ -116,6 +119,17 @@ pub enum TreeRestoreRefusal {
     CrossFilesystem,
     DestinationChanged,
     TransactionInProgress,
+    MissingBinding,
+    AmbiguousIdentity,
+    WrongGameIdentity,
+    WrongEmulator,
+    WrongProfile,
+    WrongArtifactType,
+    ManifestChanged,
+    ManifestTooLarge,
+    SnapshotDestinationOverlap,
+    InsufficientSpace { required: u64, available: u64 },
+    SpaceUnknown,
 }
 
 /// Inspectable restore plan. Building it writes nothing.
@@ -133,6 +147,7 @@ pub struct TreeRestorePlan {
     pub untouched_files: Vec<PathBuf>,
     pub quiescence: SaveQuiescenceRequirement,
     pub refusals: Vec<TreeRestoreRefusal>,
+    pub(crate) safety: Option<safety::SafetyRecord>,
 }
 
 impl TreeRestorePlan {
@@ -177,6 +192,8 @@ pub struct TreeRestoreJournal {
     /// Set once an undo has begun, so recovery finishes it as an undo.
     #[serde(default)]
     pub undo_requested: bool,
+    #[serde(default)]
+    pub(crate) safety: Option<safety::SafetyRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,7 +225,7 @@ pub enum TreeRestoreError {
         cause: String,
     },
     /// Rollback itself could not finish. Journal, staging and preserved
-    /// material are kept; run [`recover_tree_restore`].
+    /// material are kept; run [`safety::recover_directory_restore`].
     RecoveryRequired {
         journal_path: PathBuf,
         detail: String,
@@ -262,6 +279,13 @@ pub(crate) enum Phase {
     Stage(usize),
     Publish(usize),
     Rollback(usize),
+    Verify,
+    Receipt,
+    BeforePublish,
+    BeforeUndo,
+    BeforeRecovery,
+    Replace(usize),
+    Journal(TreeRestoreStatus),
 }
 
 type Hook<'a> = &'a dyn Fn(Phase) -> io::Result<()>;
@@ -302,13 +326,7 @@ fn io_err(path: &Path, error: impl ToString) -> TreeRestoreError {
 
 fn manifest_sha256(snapshot: &SaveSnapshot) -> String {
     let mut digest = Sha256::new();
-    for artifact in &snapshot.manifest.artifacts {
-        digest.update(artifact.relative_path.as_os_str().as_encoded_bytes());
-        digest.update([0]);
-        digest.update(artifact.size_bytes.to_le_bytes());
-        digest.update(artifact.sha256.as_bytes());
-        digest.update([0]);
-    }
+    digest.update(serde_json::to_vec(&snapshot.manifest).expect("manifest serialization"));
     digest
         .finalize()
         .iter()
@@ -330,6 +348,13 @@ fn valid_relative(path: &Path) -> bool {
 /// Every regular file below `root` (relative paths), plus whether anything
 /// other than files and directories was met. Never follows symlinks.
 fn walk_tree(root: &Path) -> io::Result<(BTreeMap<PathBuf, Kind>, usize)> {
+    walk_tree_with_limit(root, MAX_SNAPSHOT_FILES * 4)
+}
+
+fn walk_tree_with_limit(
+    root: &Path,
+    maximum: usize,
+) -> io::Result<(BTreeMap<PathBuf, Kind>, usize)> {
     let mut found = BTreeMap::new();
     let mut other = 0;
     let mut stack = vec![root.to_path_buf()];
@@ -338,6 +363,11 @@ fn walk_tree(root: &Path) -> io::Result<(BTreeMap<PathBuf, Kind>, usize)> {
             let entry = entry?;
             let path = entry.path();
             let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            // Internal preservation/staging adds up to four components to a
+            // valid save path. The safety fingerprint separately bounds live trees.
+            if relative.components().count() > MAX_SNAPSHOT_DEPTH + 4 {
+                return Err(io::Error::other("tree exceeds path depth bound"));
+            }
             match kind_of(&path)? {
                 Some(Kind::Dir) => {
                     found.insert(relative, Kind::Dir);
@@ -351,7 +381,7 @@ fn walk_tree(root: &Path) -> io::Result<(BTreeMap<PathBuf, Kind>, usize)> {
                     found.insert(relative, Kind::Other);
                 }
             }
-            if found.len() > MAX_SNAPSHOT_FILES * 4 {
+            if found.len() > maximum {
                 return Err(io::Error::other("destination tree is too large to plan"));
             }
         }
@@ -381,7 +411,7 @@ fn tree_files(root: &Path) -> Result<Vec<TreeFile>, String> {
 
 /// Build the restore plan. Reads the snapshot and the destination; writes
 /// nothing.
-pub fn plan_tree_restore(
+pub(crate) fn plan_tree_restore(
     snapshot: &SaveSnapshot,
     destination_root: &Path,
     quiescence: SaveQuiescenceRequirement,
@@ -398,6 +428,7 @@ pub fn plan_tree_restore(
         untouched_files: Vec::new(),
         quiescence,
         refusals: Vec::new(),
+        safety: None,
     };
 
     match quiescence {
@@ -629,7 +660,18 @@ pub fn plan_tree_restore(
 
 fn persist_journal(journal: &TreeRestoreJournal) -> Result<(), TreeRestoreError> {
     let bytes = serde_json::to_vec_pretty(journal).map_err(|e| io_err(&journal.journal_path, e))?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(io_err(
+            &journal.journal_path,
+            "journal exceeds bounded reader limit",
+        ));
+    }
     let partial = journal.journal_path.with_extension("json.partial");
+    if !super::safe_existing_parent(journal.journal_path.parent().unwrap())
+        || matches!(kind_of(&partial), Ok(Some(Kind::Other | Kind::Dir)))
+    {
+        return Err(io_err(&partial, "unsafe journal staging path"));
+    }
     write_file(&partial, &bytes)?;
     fs::rename(&partial, &journal.journal_path).map_err(|e| io_err(&journal.journal_path, e))?;
     if let Some(parent) = journal.journal_path.parent() {
@@ -640,7 +682,8 @@ fn persist_journal(journal: &TreeRestoreJournal) -> Result<(), TreeRestoreError>
 
 /// Reads a transaction journal (survives process restarts).
 pub fn load_tree_restore_journal(path: &Path) -> Result<TreeRestoreJournal, TreeRestoreError> {
-    let bytes = fs::read(path).map_err(|e| io_err(path, e))?;
+    let bytes =
+        safety::read_bounded_regular(path, 16 * 1024 * 1024).map_err(|e| io_err(path, e))?;
     serde_json::from_slice(&bytes).map_err(|e| io_err(path, e))
 }
 
@@ -743,7 +786,8 @@ fn file_matches(path: &Path, sha256: &str) -> bool {
 }
 
 /// Restore a snapshot into `plan.destination_root` as one transaction.
-pub fn apply_tree_restore(
+#[cfg(test)]
+fn apply_tree_restore(
     snapshot: &SaveSnapshot,
     plan: &TreeRestorePlan,
     options: &TreeRestoreOptions,
@@ -761,7 +805,10 @@ pub(crate) fn apply_with_hook(
         return Err(TreeRestoreError::Refused(plan.refusals.clone()));
     }
     // The plan must still describe reality (and the snapshot must be intact).
-    let current = plan_tree_restore(snapshot, &plan.destination_root, plan.quiescence);
+    let mut current = plan_tree_restore(snapshot, &plan.destination_root, plan.quiescence);
+    if let Some(record) = &plan.safety {
+        safety::augment_plan(&mut current, record.binding.clone());
+    }
     if !current.ready() {
         return Err(TreeRestoreError::Refused(current.refusals));
     }
@@ -799,11 +846,13 @@ pub(crate) fn apply_with_hook(
         finished_unix_seconds: None,
         detail: None,
         undo_requested: false,
+        safety: plan.safety.clone(),
     };
 
     // ---- stage (nothing live is touched) ----------------------------------
     let staged = (|| -> Result<(), TreeRestoreError> {
         fs::create_dir(&work_dir).map_err(|e| io_err(&work_dir, e))?;
+        hook(Phase::Journal(journal.status)).map_err(|e| io_err(&journal.journal_path, e))?;
         persist_journal(&journal)?;
         let files_root = snapshot.storage_path.join("files");
         for (index, entry) in journal.entries.iter().enumerate() {
@@ -827,12 +876,49 @@ pub(crate) fn apply_with_hook(
         return Err(error);
     }
     journal.status = TreeRestoreStatus::Staged;
-    persist_journal(&journal)?;
+    if let Err(error) = hook(Phase::Journal(journal.status))
+        .map_err(|e| io_err(&journal.journal_path, e))
+        .and_then(|()| persist_journal(&journal))
+    {
+        return Err(TreeRestoreError::RecoveryRequired {
+            journal_path: journal.journal_path.clone(),
+            detail: error.to_string(),
+        });
+    }
 
     // ---- publish ------------------------------------------------------------
+    if let Err(error) = hook(Phase::BeforePublish) {
+        // Publication has not started. Do not run rollback against user changes
+        // made during staging: no destination object belongs to us yet.
+        journal.status = TreeRestoreStatus::RolledBack;
+        journal.detail = Some(format!(
+            "refused before publication; destination untouched: {error}"
+        ));
+        journal.finished_unix_seconds = Some(options.now_unix_seconds);
+        if let Err(failure) = persist_journal(&journal) {
+            return Err(TreeRestoreError::RecoveryRequired {
+                journal_path: journal.journal_path.clone(),
+                detail: failure.to_string(),
+            });
+        }
+        let _ = fs::remove_dir_all(&work_dir);
+        release_lock(&lock_path);
+        return Err(io_err(&root, error));
+    }
     journal.status = TreeRestoreStatus::Publishing;
-    persist_journal(&journal)?;
-    if let Err(cause) = publish(&journal, hook).and_then(|()| verify_published(&journal)) {
+    if let Err(error) = hook(Phase::Journal(journal.status))
+        .map_err(|e| io_err(&journal.journal_path, e))
+        .and_then(|()| persist_journal(&journal))
+    {
+        return Err(TreeRestoreError::RecoveryRequired {
+            journal_path: journal.journal_path.clone(),
+            detail: error.to_string(),
+        });
+    }
+    if let Err(cause) = publish(&journal, hook).and_then(|()| {
+        hook(Phase::Verify).map_err(|e| e.to_string())?;
+        verify_published(&journal)
+    }) {
         return Err(roll_back(
             &mut journal,
             cause,
@@ -844,7 +930,15 @@ pub(crate) fn apply_with_hook(
     let _ = fs::remove_dir_all(work_dir.join("stage"));
     journal.status = TreeRestoreStatus::Published;
     journal.finished_unix_seconds = Some(options.now_unix_seconds);
-    persist_journal(&journal)?;
+    if let Err(error) = hook(Phase::Receipt)
+        .map_err(|e| io_err(&journal.journal_path, e))
+        .and_then(|()| persist_journal(&journal))
+    {
+        return Err(TreeRestoreError::RecoveryRequired {
+            journal_path: journal.journal_path.clone(),
+            detail: format!("verified publication needs durable receipt/recovery: {error}"),
+        });
+    }
     release_lock(&lock_path);
     Ok(journal)
 }
@@ -864,6 +958,14 @@ fn publish(journal: &TreeRestoreJournal, hook: Hook<'_>) -> Result<(), String> {
         next(&mut step)?;
         fs::create_dir(root).map_err(|e| err(root, e))?;
     }
+    if let Some(record) = &journal.safety {
+        for path in &record.removed {
+            next(&mut step)?;
+            let keep = work.join("preserved/removed").join(path);
+            make_parent(&keep).map_err(|e| err(&keep, e))?;
+            fs::rename(root.join(path), &keep).map_err(|e| err(&keep, e))?;
+        }
+    }
     for displaced in &journal.displaced_files {
         next(&mut step)?;
         let from = rel(root, &displaced.relative_path);
@@ -878,7 +980,7 @@ fn publish(journal: &TreeRestoreJournal, hook: Hook<'_>) -> Result<(), String> {
         let path = rel(root, dir);
         fs::create_dir(&path).map_err(|e| err(&path, e))?;
     }
-    for entry in &journal.entries {
+    for (index, entry) in journal.entries.iter().enumerate() {
         next(&mut step)?;
         let dest = rel(root, &entry.relative_path);
         let staged = work.join("stage").join(&entry.relative_path);
@@ -904,12 +1006,14 @@ fn publish(journal: &TreeRestoreJournal, hook: Hook<'_>) -> Result<(), String> {
                         dest.display()
                     ));
                 }
+                hook(Phase::Replace(index)).map_err(|e| e.to_string())?;
                 fs::rename(&staged, &dest).map_err(|e| err(&dest, e))?;
             }
             EntryAction::ReplaceDirectoryWithFile => {
                 let keep = work.join("preserved/dirs").join(&entry.relative_path);
                 make_parent(&keep).map_err(|e| err(&keep, e))?;
                 fs::rename(&dest, &keep).map_err(|e| err(&dest, e))?;
+                hook(Phase::Replace(index)).map_err(|e| e.to_string())?;
                 publish_new(&staged, &dest).map_err(|e| err(&dest, e))?;
             }
         }
@@ -929,6 +1033,11 @@ fn publish_new(staged: &Path, dest: &Path) -> io::Result<()> {
 }
 
 fn verify_published(journal: &TreeRestoreJournal) -> Result<(), String> {
+    if let Some(record) = &journal.safety {
+        if safety::fingerprint(&journal.destination_root)? != record.target {
+            return Err("published tree does not equal reviewed target".into());
+        }
+    }
     for entry in &journal.entries {
         let path = rel(&journal.destination_root, &entry.relative_path);
         if !file_matches(&path, &entry.sha256) {
@@ -957,11 +1066,16 @@ fn roll_back(
     let _ = persist_journal(journal);
     match rollback_state(journal, hook) {
         Ok(()) => {
-            let _ = fs::remove_dir_all(&journal.work_dir);
             journal.status = done;
             journal.detail = Some(cause.clone());
             journal.finished_unix_seconds = Some(now);
-            let _ = persist_journal(journal);
+            if let Err(error) = persist_journal(journal) {
+                return TreeRestoreError::RecoveryRequired {
+                    journal_path: journal.journal_path.clone(),
+                    detail: format!("preimage restored but completion journal failed: {error}"),
+                };
+            }
+            let _ = fs::remove_dir_all(&journal.work_dir);
             release_lock(&journal.lock_path);
             TreeRestoreError::RolledBack {
                 journal_path: journal.journal_path.clone(),
@@ -1095,6 +1209,25 @@ fn rollback_state(journal: &TreeRestoreJournal, hook: Hook<'_>) -> Result<(), St
             _ => problems.push(format!("{label}: original file could not be restored")),
         }
     }
+    if let Some(record) = &journal.safety {
+        for path in record.removed.iter().rev() {
+            let keep = work.join("preserved/removed").join(path);
+            let dest = root.join(path);
+            if kind_of(&keep).map_err(|e| e.to_string())?.is_some() {
+                if kind_of(&dest).map_err(|e| e.to_string())?.is_some() {
+                    problems.push(format!(
+                        "{}: refuses to overwrite changed object",
+                        path.display()
+                    ));
+                } else {
+                    attempt!(
+                        "removed object",
+                        fs::rename(&keep, &dest).map_err(|e| e.to_string())
+                    );
+                }
+            }
+        }
+    }
     if !journal.root_previously_existed
         && kind_of(root).map_err(|e| e.to_string())? == Some(Kind::Dir)
     {
@@ -1104,6 +1237,11 @@ fn rollback_state(journal: &TreeRestoreJournal, hook: Hook<'_>) -> Result<(), St
         );
     }
     sync_dir(root);
+    if let Some(record) = &journal.safety {
+        if safety::fingerprint(root)? != record.before {
+            problems.push("preimage verification failed".into());
+        }
+    }
     if problems.is_empty() {
         Ok(())
     } else {
@@ -1117,7 +1255,8 @@ fn rollback_state(journal: &TreeRestoreJournal, hook: Hook<'_>) -> Result<(), St
 
 /// Undo a published transaction. Refuses, changing nothing, if any restored
 /// path was modified since, or if the preserved originals are missing.
-pub fn undo_tree_restore(
+#[cfg(test)]
+fn undo_tree_restore(
     journal_path: &Path,
     quiescence: SaveQuiescenceRequirement,
     now_unix_seconds: u64,
@@ -1152,12 +1291,20 @@ pub(crate) fn undo_with_hook(
     }
     let conflicts = undo_conflicts(&journal);
     if !conflicts.is_empty() {
+        journal.detail = Some(format!("undo refused: {conflicts:?}"));
+        persist_journal(&journal)?;
         return Err(TreeRestoreError::UndoConflict {
             journal_path: journal.journal_path.clone(),
             conflicts,
         });
     }
     acquire_lock(&journal.lock_path, &journal.transaction_id)?;
+    if let Err(error) = hook(Phase::BeforeUndo) {
+        release_lock(&journal.lock_path);
+        journal.detail = Some(format!("undo refused immediately before mutation: {error}"));
+        persist_journal(&journal)?;
+        return Err(io_err(journal_path, error));
+    }
     journal.status = TreeRestoreStatus::Undoing;
     journal.undo_requested = true;
     if let Err(error) = persist_journal(&journal) {
@@ -1179,6 +1326,22 @@ pub(crate) fn undo_with_hook(
 fn undo_conflicts(journal: &TreeRestoreJournal) -> Vec<TreeConflict> {
     let root = &journal.destination_root;
     let mut conflicts = Vec::new();
+    if let Some(record) = &journal.safety {
+        if safety::fingerprint(root).ok().as_ref() != Some(&record.target) {
+            conflicts.push(TreeConflict {
+                path: root.clone(),
+                expected: "complete restored tree unchanged".into(),
+                found: "destination changed".into(),
+            });
+        }
+        if let Err(detail) = safety::verify_preserved(journal, record) {
+            conflicts.push(TreeConflict {
+                path: journal.work_dir.clone(),
+                expected: "complete preimage intact".into(),
+                found: detail,
+            });
+        }
+    }
     let mut conflict = |path: &Path, expected: &str, found: String| {
         conflicts.push(TreeConflict {
             path: path.to_path_buf(),
@@ -1276,7 +1439,8 @@ fn undo_conflicts(journal: &TreeRestoreJournal) -> Vec<TreeConflict> {
 
 /// Finish or roll back a transaction left behind by a crash or by a failed
 /// rollback. Idempotent; inspects real on-disk state.
-pub fn recover_tree_restore(
+#[cfg(test)]
+fn recover_tree_restore(
     journal_path: &Path,
     now_unix_seconds: u64,
 ) -> Result<TreeRestoreJournal, TreeRestoreError> {
@@ -1289,13 +1453,39 @@ pub(crate) fn recover_with_hook(
     hook: Hook<'_>,
 ) -> Result<TreeRestoreJournal, TreeRestoreError> {
     let mut journal = load_tree_restore_journal(journal_path)?;
+    if matches!(
+        journal.status,
+        TreeRestoreStatus::Planned | TreeRestoreStatus::Staged
+    ) {
+        hook(Phase::BeforeRecovery).map_err(|e| io_err(journal_path, e))?;
+        journal.status = TreeRestoreStatus::RolledBack;
+        journal.detail =
+            Some("recovered staging; publication had not begun; destination untouched".into());
+        journal.finished_unix_seconds = Some(now);
+        persist_journal(&journal)?;
+        let _ = fs::remove_dir_all(&journal.work_dir);
+        release_lock(&journal.lock_path);
+        return Ok(journal);
+    }
     let done = match journal.status {
         TreeRestoreStatus::Published
         | TreeRestoreStatus::RolledBack
-        | TreeRestoreStatus::Undone => return Ok(journal),
+        | TreeRestoreStatus::Undone => {
+            // A crash can occur after a durable completion record but before
+            // releasing the lock. Only remove a lock still owned by this receipt.
+            if safety::read_bounded_regular(&journal.lock_path, 1024)
+                .ok()
+                .as_deref()
+                == Some(journal.transaction_id.as_bytes())
+            {
+                release_lock(&journal.lock_path);
+            }
+            return Ok(journal);
+        }
         _ if journal.undo_requested => TreeRestoreStatus::Undone,
         _ => TreeRestoreStatus::RolledBack,
     };
+    hook(Phase::BeforeRecovery).map_err(|e| io_err(journal_path, e))?;
     let cause = journal
         .detail
         .clone()
