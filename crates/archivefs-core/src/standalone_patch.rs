@@ -918,13 +918,36 @@ fn apply_xdelta3(
             "xdelta staging path is unavailable or unsafe".into(),
         ));
     }
+    run_xdelta3_decode(&tool, base_path, patch_path, &stage)?;
+    let safe_stage = fs::symlink_metadata(&stage)
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+    let output = if safe_stage {
+        fs::read(&stage).map_err(|error| StandalonePatchError::Io(error.to_string()))
+    } else {
+        Err(StandalonePatchError::UnsafeOutput(
+            "xdelta produced an unsafe staging object".into(),
+        ))
+    };
+    let _ = fs::remove_file(&stage);
+    output
+}
+
+/// One supervised `xdelta3 -d -s <base> <patch> <output>` run; structured argv,
+/// no shell. `output` must not exist (xdelta3 refuses to overwrite) and is
+/// removed again if the run fails. Shared by the standalone and DCP appliers.
+pub(crate) fn run_xdelta3_decode(
+    tool: &Path,
+    base_path: &Path,
+    patch_path: &Path,
+    stage: &Path,
+) -> Result<(), StandalonePatchError> {
     let mut command = Command::new(tool);
     command
         .arg("-d")
         .arg("-s")
         .arg(base_path)
         .arg(patch_path)
-        .arg(&stage);
+        .arg(stage);
     // xdelta3 writes the decoded result to the staging path, so its stdout
     // carries only incidental diagnostics; anything beyond the cap is a
     // misbehaving tool rather than data we need.
@@ -939,12 +962,12 @@ fn apply_xdelta3(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
-            let _ = fs::remove_file(&stage);
+            let _ = fs::remove_file(stage);
             return Err(xdelta_process_error(error));
         }
     };
     if !outcome.status.success() {
-        let _ = fs::remove_file(&stage);
+        let _ = fs::remove_file(stage);
         return Err(StandalonePatchError::Malformed(format!(
             "xdelta3 exited with {}",
             outcome
@@ -953,17 +976,32 @@ fn apply_xdelta3(
                 .map_or_else(|| "no exit code".into(), |code| code.to_string())
         )));
     }
-    let safe_stage = fs::symlink_metadata(&stage)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
-    let output = if safe_stage {
-        fs::read(&stage).map_err(|error| StandalonePatchError::Io(error.to_string()))
-    } else {
-        Err(StandalonePatchError::UnsafeOutput(
-            "xdelta produced an unsafe staging object".into(),
-        ))
-    };
-    let _ = fs::remove_file(&stage);
-    output
+    Ok(())
+}
+
+/// The `xdelta3` this process would use, if a safe one is on `PATH`.
+pub(crate) fn locate_xdelta3() -> Option<PathBuf> {
+    find_xdelta3()
+}
+
+/// Best-effort tool identity (`xdelta3 -V` banner's first line), supervised.
+pub(crate) fn xdelta3_version(tool: &Path) -> Option<String> {
+    let mut command = Command::new(tool);
+    command.arg("-V");
+    let outcome = run_supervised(
+        command,
+        XDELTA_PROCESS_LIMITS,
+        Duration::from_secs(10),
+        XDELTA_STDOUT_LIMIT,
+        |_chunk| Ok(()),
+        None,
+    )
+    .ok()?;
+    String::from_utf8_lossy(&outcome.stderr)
+        .lines()
+        .next()
+        .map(|line| line.trim().chars().take(200).collect())
+        .filter(|line: &String| !line.is_empty())
 }
 
 /// Maps a supervised-run failure onto this module's own error vocabulary.

@@ -15,7 +15,7 @@ pub(crate) fn ip_bin() -> Vec<u8> {
     b[96..108].copy_from_slice(b"1ST_READ.BIN");
     b
 }
-fn package(path: &Path, members: &[(&str, &[u8])]) {
+pub(crate) fn package(path: &Path, members: &[(&str, &[u8])]) {
     let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
     for (name, bytes) in members {
         zip.start_file(*name, zip::write::SimpleFileOptions::default())
@@ -39,7 +39,7 @@ pub(crate) fn fixture() -> (tempfile::TempDir, DreamcastDcpPlan, PathBuf) {
     let plan = review_dreamcast_dcp(&source, &patch, &destination, &binding).unwrap();
     (temp, plan, destination)
 }
-fn binding(source: &Path, patch: &Path) -> DreamcastDcpBinding {
+pub(crate) fn binding(source: &Path, patch: &Path) -> DreamcastDcpBinding {
     DreamcastDcpBinding {
         source_tree_sha256: source_tree_sha256(source).unwrap(),
         package_sha256: inspect_dreamcast_dcp(patch).unwrap().package_sha256,
