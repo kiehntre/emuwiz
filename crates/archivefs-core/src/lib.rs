@@ -76,6 +76,8 @@ pub mod game_firmware_readiness;
 pub mod game_profile_planner;
 /// Provider-neutral homebrew project, release and artifact metadata types.
 pub mod homebrew_artifact;
+/// GitHub Releases provider for already-known homebrew repositories.
+pub mod homebrew_github;
 pub mod identity_attention;
 pub mod job_progress;
 /// Typed library presentation visibility, separate from source ownership and
