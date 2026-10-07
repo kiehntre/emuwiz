@@ -734,15 +734,18 @@ impl DreamcastDcpPlan {
         )?;
         if let Some(receipt) = self.delta_receipt() {
             // Written only after the whole transaction staged and verified, so
-            // a failed run never leaves a success receipt behind.
-            let path = prepared.journal_path.with_extension("dcp-delta.json");
-            let bytes = serde_json::to_vec_pretty(&receipt).map_err(refuse)?;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
-            io::Write::write_all(&mut file, &bytes)?;
-            file.sync_all()?;
+            // a failed run never leaves a success receipt behind. It is
+            // written BEFORE any publication (publish is a separate, later
+            // call), and the receipt is required provenance: if it cannot be
+            // written, the staged transaction is made unpublishable.
+            let sidecar = prepared.journal_path.with_extension("dcp-delta.json");
+            if let Err(error) = write_receipt_sidecar(&sidecar, &receipt) {
+                return Err(discard_unreceipted_transaction(
+                    &prepared.journal_path,
+                    &sidecar,
+                    &error,
+                ));
+            }
         }
         Ok(prepared)
     }
@@ -780,10 +783,73 @@ impl DreamcastDcpPlan {
     }
 }
 
+/// Writes the delta receipt atomically: a complete temporary file is synced and
+/// then moved into place without replacing anything, so a reader never sees a
+/// partial receipt and an existing receipt is never overwritten.
+fn write_receipt_sidecar(sidecar: &Path, receipt: &DreamcastDeltaReceipt) -> io::Result<()> {
+    let bytes = serde_json::to_vec_pretty(receipt).map_err(refuse)?;
+    #[cfg(test)]
+    if xdelta_tests::fault(xdelta_tests::Fault::ReceiptWrite) {
+        return Err(io::Error::other("injected receipt write failure"));
+    }
+    let mut partial_name = sidecar
+        .file_name()
+        .ok_or_else(|| refuse("receipt path has no name"))?
+        .to_os_string();
+    partial_name.push(".partial");
+    let partial = sidecar.with_file_name(partial_name);
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        io::Write::write_all(&mut file, &bytes)?;
+        file.sync_all()?;
+        crate::dat::rename_apply::noclobber::rename_noreplace(&partial, sidecar)
+            .map_err(io::Error::other)?;
+        if let Some(parent) = sidecar.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&partial);
+    }
+    result
+}
+
+/// The receipt could not be written, so the staged transaction lacks required
+/// provenance. Nothing was published (publication is a later, separate call).
+/// The journal is removed so the retained, unpublished staged tree cannot be
+/// published by anyone holding the journal; the tree itself is left in place,
+/// as for every other pre-publication failure.
+fn discard_unreceipted_transaction(journal: &Path, sidecar: &Path, cause: &io::Error) -> io::Error {
+    let staging = journal.with_extension("");
+    let _ = fs::remove_file(sidecar);
+    #[cfg(test)]
+    let removal = if xdelta_tests::fault(xdelta_tests::Fault::JournalRemoval) {
+        Err(io::Error::other("injected journal removal failure"))
+    } else {
+        fs::remove_file(journal)
+    };
+    #[cfg(not(test))]
+    let removal = fs::remove_file(journal);
+    match removal {
+        Ok(()) => refuse(&format!(
+            "the delta receipt could not be written ({cause}); nothing was published and the source and destination are unchanged. The staged tree at {} was left unpublished and its journal was removed, so it cannot be published without its receipt; run the patch again",
+            staging.display()
+        )),
+        Err(removal_error) => refuse(&format!(
+            "the delta receipt could not be written ({cause}) and the journal {} could not be removed ({removal_error}); nothing was published, but that staged transaction has NO receipt - do not publish it; delete it and run the patch again",
+            journal.display()
+        )),
+    }
+}
+
 #[cfg(test)]
 #[path = "dreamcast_dcp_apply_tests.rs"]
 pub(crate) mod tests;
 
 #[cfg(test)]
 #[path = "dreamcast_dcp_xdelta_tests.rs"]
-mod xdelta_tests;
+pub(crate) mod xdelta_tests;

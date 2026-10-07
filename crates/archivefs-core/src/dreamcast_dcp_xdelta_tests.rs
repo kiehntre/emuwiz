@@ -389,3 +389,142 @@ fn publication_collision_after_delta_staging_never_clobbers_and_undo_is_exact() 
     assert_eq!(fs::read(world.destination.join("owner")).unwrap(), b"keep");
     assert!(!world.destination.join("a.bin").exists());
 }
+
+/// Test-only failure seams for the receipt write path. Thread-local, so tests
+/// running in parallel never affect each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    ReceiptWrite,
+    JournalRemoval,
+}
+thread_local! {
+    static FAULTS: std::cell::RefCell<Vec<Fault>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+pub(crate) fn fault(which: Fault) -> bool {
+    FAULTS.with(|faults| faults.borrow().contains(&which))
+}
+struct Faulted;
+impl Faulted {
+    fn inject(which: &[Fault]) -> Self {
+        FAULTS.with(|faults| *faults.borrow_mut() = which.to_vec());
+        Self
+    }
+}
+impl Drop for Faulted {
+    fn drop(&mut self) {
+        FAULTS.with(|faults| faults.borrow_mut().clear());
+    }
+}
+
+fn leftovers(world: &World, journal: &Path) -> Vec<String> {
+    // Anything receipt-shaped left beside the staged tree.
+    let parent = world.destination.parent().unwrap();
+    let _ = journal;
+    let mut names: Vec<String> = fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("dcp-delta"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn receipt_write_failure_aborts_before_publication_and_makes_the_staged_tree_unpublishable() {
+    let world = World::new(&[("a.bin.xdelta", VCDIFF)]);
+    let tool = good_tool(&world.tool_dir());
+    let before = world.source_snapshot();
+    let plan = world.review(Some(&tool)).unwrap();
+    let error = {
+        let _fault = Faulted::inject(&[Fault::ReceiptWrite]);
+        plan.prepare().unwrap_err()
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("delta receipt could not be written"),
+        "{message}"
+    );
+    assert!(message.contains("nothing was published"), "{message}");
+    assert!(
+        message.contains("cannot be published without its receipt"),
+        "{message}"
+    );
+    // Not published; source untouched.
+    assert!(!world.destination.exists());
+    assert_eq!(world.source_snapshot(), before);
+    // No journal remains, so the retained staged tree cannot be published.
+    let parent = world.destination.parent().unwrap();
+    let journals: Vec<_> = fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.starts_with(".emuwiz-patch-tree-") && name.ends_with(".json")
+        })
+        .collect();
+    assert!(journals.is_empty(), "a journal survived: {journals:?}");
+    // No receipt, partial or otherwise.
+    assert!(leftovers(&world, Path::new("")).is_empty());
+    // The unpublished staging tree is retained (the shared failure convention).
+    let staged: Vec<_> = fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".emuwiz-patch-tree-")
+        })
+        .collect();
+    assert_eq!(staged.len(), 1, "the unpublished staged tree is retained");
+}
+
+#[test]
+fn after_a_receipt_failure_a_retry_is_a_clean_complete_transaction() {
+    let world = World::new(&[("a.bin.xdelta", VCDIFF)]);
+    let tool = good_tool(&world.tool_dir());
+    let before = world.source_snapshot();
+    let plan = world.review(Some(&tool)).unwrap();
+    {
+        let _fault = Faulted::inject(&[Fault::ReceiptWrite]);
+        assert!(plan.prepare().is_err());
+    }
+    // Explicit recovery: run the same patch again.
+    let prepared = plan.prepare().unwrap();
+    let sidecar = prepared.journal_path.with_extension("dcp-delta.json");
+    assert!(sidecar.is_file(), "the retry produced its receipt");
+    assert!(
+        !sidecar
+            .with_file_name(format!(
+                "{}.partial",
+                sidecar.file_name().unwrap().to_string_lossy()
+            ))
+            .exists()
+    );
+    publish(&prepared.journal_path).unwrap();
+    assert_eq!(
+        fs::read(world.destination.join("a.bin")).unwrap(),
+        b"DELTA:base a"
+    );
+    undo(&prepared.journal_path).unwrap();
+    assert!(!world.destination.exists());
+    assert_eq!(world.source_snapshot(), before);
+}
+
+#[test]
+fn if_the_journal_cannot_be_removed_the_error_says_the_staged_tree_has_no_receipt() {
+    let world = World::new(&[("a.bin.xdelta", VCDIFF)]);
+    let tool = good_tool(&world.tool_dir());
+    let plan = world.review(Some(&tool)).unwrap();
+    let error = {
+        let _fault = Faulted::inject(&[Fault::ReceiptWrite, Fault::JournalRemoval]);
+        plan.prepare().unwrap_err()
+    };
+    let message = error.to_string();
+    assert!(message.contains("NO receipt"), "{message}");
+    assert!(message.contains("do not publish it"), "{message}");
+    // Still nothing published, and no receipt file was invented.
+    assert!(!world.destination.exists());
+    assert!(leftovers(&world, Path::new("")).is_empty());
+}
