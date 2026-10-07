@@ -97,6 +97,7 @@ fn fixture(context: &egui::Context) -> App {
         organisation: super::organisation::OrganisationState::default(),
         canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::default(),
         canonical_organisation_job: None,
+        history_view: Default::default(),
         canonical_organisation_generation: 0,
         canonical_organisation_history: Vec::new(),
         mods: super::mods::ModsPageState::default(),
@@ -1700,7 +1701,11 @@ fn gui_v2_history_can_project_a_playing_library_transaction() {
             created_at_unix: 1,
             source_scan_root: "/tmp/playing-library".into(),
             state: archivefs_core::dat::rename_apply::model::TransactionState::Applied,
-            entries: Vec::new(),
+            entries: vec![crate::gui_v2::history_view::tests::item(
+                "/tmp/library/game.gba",
+                "/tmp/playing-library/game.gba",
+                archivefs_core::dat::rename_apply::model::EntryState::Applied,
+            )],
             created_directories: Vec::new(),
             recovery_resolution: None,
             recovery_resolved_at_unix: None,
@@ -1708,9 +1713,14 @@ fn gui_v2_history_can_project_a_playing_library_transaction() {
         },
     );
     app.router.current = Route::Section(Section::History);
+    let _ = frame(&context, &mut app, [1280.0, 820.0]);
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
-    assert!(strings.iter().any(|value| value == "Built Playing Library"));
-    assert!(strings.iter().any(|value| value == "Ready to undo"));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Built a Playing Library (1 link)")
+    );
+    assert!(strings.iter().any(|value| value.contains("Undo available")));
 }
 
 #[test]
@@ -2058,11 +2068,7 @@ fn gui_v2_history_has_a_truthful_empty_state() {
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::History);
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
-    assert!(
-        strings
-            .iter()
-            .any(|value| value.contains("No repair history yet"))
-    );
+    assert!(strings.iter().any(|value| value.contains("No history yet")));
     assert!(
         !strings
             .iter()
@@ -8562,3 +8568,340 @@ mod library_files_check {
 
 #[path = "manual_viewer/app_tests.rs"]
 mod manual_viewer_app_tests;
+
+// ------------------------------------------------------ History & Undo page
+
+mod history_page {
+    use super::*;
+    use crate::gui_v2::history_view::tests::{item, tx};
+    use crate::gui_v2::history_view::{PAGE_SIZE, StatusFilter};
+    use archivefs_core::dat::rename_apply::model::{
+        EntryState, RenameTransaction, TransactionState,
+    };
+
+    fn renames(
+        count: usize,
+        state: EntryState,
+    ) -> Vec<archivefs_core::dat::rename_apply::model::TransactionEntry> {
+        (0..count)
+            .map(|n| {
+                item(
+                    &format!("/library/old{n}.gba"),
+                    &format!("/library/New {n}.gba"),
+                    state,
+                )
+            })
+            .collect()
+    }
+
+    fn page_text(app: &mut App) -> String {
+        let context = egui::Context::default();
+        app.router.current = Route::Section(Section::History);
+        // Two frames: the first builds the cached model, the second paints it.
+        let _ = frame(&context, app, [1280.0, 900.0]);
+        text(&frame(&context, app, [1280.0, 900.0])).join("\n")
+    }
+
+    fn app_with(org: Vec<RenameTransaction>) -> App {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.canonical_organisation_history = org;
+        app
+    }
+
+    #[test]
+    fn empty_causes_render_their_own_distinct_messages() {
+        let mut app = app_with(Vec::new());
+        assert!(page_text(&mut app).contains("No history yet"));
+
+        let mut app = app_with(vec![tx(
+            "u",
+            TransactionState::RolledBack,
+            renames(1, EntryState::RolledBack),
+        )]);
+        app.history_view.status = StatusFilter::UndoAvailable;
+        assert!(page_text(&mut app).contains("No undoable operations"));
+        app.history_view.status = StatusFilter::Failed;
+        assert!(page_text(&mut app).contains("No failed operations"));
+        app.history_view.status = StatusFilter::All;
+        app.history_view.search = "zzz".into();
+        assert!(page_text(&mut app).contains("No entries match these filters"));
+
+        let mut app = app_with(vec![tx(
+            "d",
+            TransactionState::Applied,
+            renames(1, EntryState::Applied),
+        )]);
+        app.router.current = Route::Task {
+            section: Section::History,
+            game: 7,
+        };
+        let context = egui::Context::default();
+        let _ = frame(&context, &mut app, [1280.0, 900.0]);
+        let shown = text(&frame(&context, &mut app, [1280.0, 900.0])).join("\n");
+        assert!(shown.contains("No history for this game"));
+        assert!(
+            shown.contains("Show all history"),
+            "All History stays reachable"
+        );
+    }
+
+    #[test]
+    fn rows_read_in_plain_words_with_one_clear_action() {
+        let mut app = app_with(vec![
+            tx(
+                "done",
+                TransactionState::Applied,
+                renames(12, EntryState::Applied),
+            ),
+            tx(
+                "bad",
+                TransactionState::ApplyFailed,
+                renames(2, EntryState::ApplyFailed),
+            ),
+            tx(
+                "undone",
+                TransactionState::RolledBack,
+                renames(3, EntryState::RolledBack),
+            ),
+        ]);
+        let shown = page_text(&mut app);
+        for expected in [
+            "Renamed 12 files",
+            "Completed",
+            "Undo available",
+            "Preview undo",
+            "Failed",
+            "Nothing was changed, so there is nothing to undo.",
+            "No file was changed",
+            "Already undone",
+            "Undone",
+            "2023-11-14 22:13 UTC",
+            "Advanced details",
+        ] {
+            assert!(
+                shown.contains(expected),
+                "page is missing {expected:?}\n{shown}"
+            );
+        }
+        // The raw id is not the headline; it lives under Advanced only.
+        assert_eq!(
+            shown.matches("Preview undo").count(),
+            1,
+            "only the undoable row offers it"
+        );
+        assert!(!shown.contains("Force"), "there is no force undo");
+    }
+
+    #[test]
+    fn historical_results_are_never_presented_as_current_state() {
+        let mut app = app_with(vec![
+            tx(
+                "done",
+                TransactionState::Applied,
+                renames(2, EntryState::Applied),
+            ),
+            tx(
+                "bad",
+                TransactionState::ApplyFailed,
+                renames(2, EntryState::ApplyFailed),
+            ),
+        ]);
+        let failed_before = app.activity.failed();
+        let route_before = app.router.current.clone();
+        let shown = page_text(&mut app).to_lowercase();
+        assert!(shown.contains("history, not the current state of your files"));
+        for current_claim in [
+            "healthy",
+            "currently valid",
+            "still verified",
+            "is verified",
+            "incompatible",
+            "blocked",
+            "blocker",
+        ] {
+            assert!(
+                !shown.contains(current_claim),
+                "history must not claim {current_claim:?}"
+            );
+        }
+        // A historical failure creates no current problem or job failure.
+        assert_eq!(app.activity.failed(), failed_before);
+        assert_eq!(app.problem_summary.is_none(), true);
+        assert_eq!(app.router.current, Route::Section(Section::History));
+        let _ = route_before;
+    }
+
+    #[test]
+    fn a_previewed_changed_output_shows_why_undo_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("New.gba");
+        std::fs::write(&destination, b"original").unwrap();
+        let meta = std::fs::metadata(&destination).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let mut entry = item(
+            &dir.path().join("old.gba").to_string_lossy(),
+            &destination.to_string_lossy(),
+            EntryState::Applied,
+        );
+        entry.identity.size_bytes = meta.len();
+        entry.identity.modified_unix = meta.mtime();
+        entry.identity.ino = meta.ino();
+        entry.identity.dev = meta.dev();
+        let mut app = app_with(vec![tx("t", TransactionState::Applied, vec![entry])]);
+        // Press "Preview undo" the way the page does, on an unchanged output.
+        let _ = page_text(&mut app);
+        let id = "t".to_string();
+        let model = app
+            .history_view
+            .entries
+            .iter()
+            .find(|e| e.transaction_id == id)
+            .unwrap()
+            .clone();
+        app.history_view.previews.insert(
+            id.clone(),
+            crate::gui_v2::history_view::check_undo_safety(&model),
+        );
+        let shown = page_text(&mut app);
+        assert!(shown.contains("Undo preview - nothing has been changed"));
+        assert!(shown.contains("Original operation: Renamed 1 file"));
+        assert!(shown.contains("Undo would: Put 1 file back at the original name or location."));
+        assert!(shown.contains("Journal receipt t"));
+        assert!(shown.contains("looked unchanged"));
+        // The output changes; the next preview refuses and says so.
+        std::fs::write(&destination, b"edited later, longer").unwrap();
+        app.history_view
+            .previews
+            .insert(id, crate::gui_v2::history_view::check_undo_safety(&model));
+        let shown = page_text(&mut app);
+        assert!(shown.contains("Undo unavailable"));
+        assert!(shown.contains("Undo is unavailable because the output has changed."));
+        assert!(shown.contains("Blocked: The output has changed since the operation"));
+    }
+
+    #[test]
+    fn painting_the_page_mutates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("New.gba");
+        std::fs::write(&destination, b"keep me").unwrap();
+        let journal_dir = dir.path().join("journal");
+        std::fs::create_dir(&journal_dir).unwrap();
+        let mut transaction = tx(
+            "paint",
+            TransactionState::Applied,
+            vec![item(
+                &dir.path().join("old.gba").to_string_lossy(),
+                &destination.to_string_lossy(),
+                EntryState::Applied,
+            )],
+        );
+        transaction.source_scan_root = dir.path().to_string_lossy().into_owned();
+        let before = transaction.clone();
+        let mut app = app_with(vec![transaction]);
+        let listing = |path: &std::path::Path| {
+            let mut names: Vec<_> = std::fs::read_dir(path)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let files_before = listing(dir.path());
+        for _ in 0..4 {
+            let _ = page_text(&mut app);
+        }
+        assert_eq!(
+            listing(dir.path()),
+            files_before,
+            "no file was created, moved or removed"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep me");
+        assert_eq!(
+            listing(&journal_dir),
+            Vec::<String>::new(),
+            "no journal was written"
+        );
+        assert_eq!(
+            app.canonical_organisation_history,
+            vec![before],
+            "history is untouched"
+        );
+        assert!(
+            app.history_view.previews.is_empty(),
+            "no preview ran by itself"
+        );
+        assert!(app.undo_job.is_none() && app.undo_confirm.is_none());
+        assert!(
+            !app.activity.jobs.values().any(|job| job.active()),
+            "painting queued no job"
+        );
+    }
+
+    #[test]
+    fn a_large_history_paints_a_bounded_page_and_offers_show_more() {
+        let org: Vec<_> = (0..400)
+            .map(|n| {
+                tx(
+                    &format!("tx-{n}"),
+                    TransactionState::Applied,
+                    renames(1, EntryState::Applied),
+                )
+            })
+            .collect();
+        let mut app = app_with(org);
+        let context = egui::Context::default();
+        app.router.current = Route::Section(Section::History);
+        // A tall screen so every painted row is on screen; egui skips the
+        // text of rows scrolled out of view.
+        let _ = frame(&context, &mut app, [1280.0, 40000.0]);
+        let shown = text(&frame(&context, &mut app, [1280.0, 40000.0])).join("\n");
+        assert_eq!(shown.matches("Preview undo").count(), PAGE_SIZE);
+        assert!(shown.contains(&format!("Showing {PAGE_SIZE} of 400.")));
+        assert!(shown.contains("Show more"));
+        assert_eq!(
+            app.history_view.entries.len(),
+            400,
+            "the model is built once and cached"
+        );
+    }
+
+    #[test]
+    fn game_context_scopes_to_exact_receipts_and_all_history_is_one_click_away() {
+        let mut app = app_with(vec![
+            tx(
+                "mine",
+                TransactionState::Applied,
+                renames(1, EntryState::Applied),
+            ),
+            tx(
+                "theirs",
+                TransactionState::Applied,
+                vec![item("/x/a.gba", "/x/b.gba", EntryState::Applied)],
+            ),
+        ]);
+        app.library = Arc::new(Library::new(vec![{
+            let mut archive = archive(1, "Mario Kart", Some("Game Boy Advance"));
+            archive.absolute_path = "/library/New 0.gba".into();
+            archive
+        }]));
+        let context = egui::Context::default();
+        app.router.current = Route::Task {
+            section: Section::History,
+            game: 1,
+        };
+        let _ = frame(&context, &mut app, [1280.0, 900.0]);
+        let scoped = text(&frame(&context, &mut app, [1280.0, 900.0])).join("\n");
+        assert!(scoped.contains("Showing only history recorded for Mario Kart"));
+        assert!(scoped.contains("Show all history"));
+        assert!(scoped.contains("Game: Mario Kart"));
+        assert!(
+            !scoped.contains("b.gba"),
+            "an unrelated receipt is not game history"
+        );
+        // All History: the same model, nothing hidden.
+        let all = page_text(&mut app);
+        assert!(all.contains("Renamed 1 file"));
+        assert_eq!(all.matches("Preview undo").count(), 2);
+    }
+}

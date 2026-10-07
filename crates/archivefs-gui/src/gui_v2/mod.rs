@@ -13,6 +13,7 @@ mod environment;
 mod equivalent_duplicates;
 mod guidance;
 mod hackhash;
+mod history_view;
 mod identity_review;
 mod identity_review_page;
 mod imagery;
@@ -321,6 +322,7 @@ pub(super) struct App {
     organisation: organisation::OrganisationState,
     canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState,
     canonical_organisation_job: Option<CanonicalOrganisationJob>,
+    history_view: history_view::HistoryViewState,
     canonical_organisation_generation: u64,
     canonical_organisation_history:
         Vec<archivefs_core::dat::rename_apply::model::RenameTransaction>,
@@ -412,6 +414,7 @@ impl App {
             organisation: organisation::OrganisationState::default(),
             canonical_organisation: crate::rom_organisation_page::RomOrganisationPageState::load(),
             canonical_organisation_job: None,
+            history_view: Default::default(),
             canonical_organisation_generation: 0,
             canonical_organisation_history: Vec::new(),
             mods: ModsPageState::default(),

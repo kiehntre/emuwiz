@@ -20,7 +20,6 @@ use crate::ui::{
     components::{StatusTone, page_hero},
     theme,
 };
-use archivefs_core::dat::rename_apply::model::TransactionState;
 use eframe::egui::{self, Color32, RichText};
 
 pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
@@ -568,7 +567,11 @@ impl App {
                         Route::Game(id) => self.game_detail(ui, id),
                         Route::ReviewIdentity(id) => self.review_identity(ui, id),
                         Route::Section(Section::Activity) => self.activities(ui),
-                        Route::Section(Section::History) => self.history(ui),
+                        Route::Section(Section::History)
+                        | Route::Task {
+                            section: Section::History,
+                            ..
+                        } => self.history(ui),
                         Route::Section(Section::Settings) => self.settings(ui),
                         Route::Section(Section::Advanced) => self.advanced(ui),
                         Route::Section(
@@ -656,7 +659,11 @@ impl App {
             Route::Section(Section::Check) => GuidancePage::CheckGames,
             Route::Section(Section::Setup) => GuidancePage::Setup,
             Route::Section(Section::Activity) => GuidancePage::Activity,
-            Route::Section(Section::History) => GuidancePage::History,
+            Route::Section(Section::History)
+            | Route::Task {
+                section: Section::History,
+                ..
+            } => GuidancePage::History,
             Route::Section(Section::Saves) => GuidancePage::Saves,
             Route::Section(Section::Converter) => GuidancePage::Converter,
             Route::Section(Section::Artwork) => GuidancePage::Artwork,
@@ -2122,197 +2129,6 @@ impl App {
                 if primary(ui, "Apply quarantine") { self.apply_duplicate_preview(); }
                 if ui.button("Cancel").clicked() { self.repair_confirm = false; }
             });
-        }
-    }
-
-    fn history(&mut self, ui: &mut egui::Ui) {
-        ui.label("Previous repairs and playing-library builds are shown from the durable transaction journal. Browsing history changes nothing.");
-        let has_cheat_history = self
-            .native_workflows
-            .as_ref()
-            .is_some_and(super::native_workflows::NativeWorkflows::has_cheat_history);
-        if self.repair_history.is_empty()
-            && self.playing_library_history.is_empty()
-            && self.canonical_organisation_history.is_empty()
-            && self.organisation.mame_history.is_empty()
-            && !has_cheat_history
-        {
-            empty_state(
-                ui,
-                &mut self.imagery,
-                EmptyArt::Mascot,
-                "No repair history yet",
-                "When a supported repair completes, its receipt and undo status will appear here.",
-                None,
-            );
-            return;
-        }
-        let mut open_build = false;
-        let open_cheats = self
-            .native_workflows
-            .as_ref()
-            .is_some_and(|workflows| workflows.show_cheat_history(ui));
-        if !self.playing_library_history.is_empty() {
-            ui.heading("Playing libraries");
-            for transaction in self.playing_library_history.iter().rev() {
-                // Each history card needs its own id scope: without it, the
-                // identical "Advanced Details" header on every card resolves
-                // to one shared persistent open/closed state (see
-                // saves_states.rs's record_card for the same class of bug).
-                ui.push_id(&transaction.transaction_id, |ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.heading("Built Playing Library");
-                        ui.label(format!(
-                            "{} · {} link(s)",
-                            transaction.transaction_id,
-                            transaction.entries.len()
-                        ));
-                        ui.label(format!("Destination: {}", transaction.source_scan_root));
-                        match transaction.state {
-                            TransactionState::Applied => {
-                                ui.strong("Ready to undo");
-                                if ui.button("Open Build Library to preview undo").clicked() {
-                                    open_build = true;
-                                }
-                            }
-                            TransactionState::RolledBack => {
-                                ui.label("Already undone");
-                            }
-                            _ => {
-                                ui.label("Needs review — the transaction did not finish normally.");
-                            }
-                        }
-                        ui.collapsing("Advanced Details", |ui| {
-                            ui.label(
-                            "Shared journaled link transaction from the Playing Library planner.",
-                        );
-                        });
-                    });
-                });
-            }
-        }
-        if !self.canonical_organisation_history.is_empty() {
-            ui.heading("Organised verified games");
-            for transaction in self.canonical_organisation_history.iter().rev() {
-                ui.push_id(&transaction.transaction_id, |ui| {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        ui.heading("Organised verified games");
-                        ui.label(format!(
-                            "{} · {} item(s)",
-                            transaction.transaction_id,
-                            transaction.entries.len()
-                        ));
-                        ui.label(format!("Source: {}", transaction.source_scan_root));
-                        ui.label(match transaction.state {
-                            TransactionState::Applied => "Undo available from Organisation",
-                            TransactionState::RolledBack => "Already undone",
-                            _ => "Needs review — recovery state is recorded in the journal",
-                        });
-                        ui.collapsing("Advanced Details", |ui| {
-                            ui.label(format!("State: {}", transaction.state.label()));
-                        });
-                    });
-                });
-            }
-        }
-        if !self.organisation.mame_history.is_empty() {
-            ui.heading("MAME reconstructions");
-            for transaction in self.organisation.mame_history.iter().rev() {
-                ui.push_id(&transaction.transaction_id, |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.heading("MAME merged reconstruction");
-                    ui.label(format!(
-                        "{} · {} · {} output",
-                        transaction.transaction_id,
-                        transaction.state.label(),
-                        transaction.entries.len()
-                    ));
-                    if let Some(entry) = transaction.entries.first() {
-                        ui.label(format!("Destination: {}", entry.destination_path.display()));
-                    }
-                    ui.label(format!("Recorded: {}", transaction.created_at_unix));
-                    ui.label(match transaction.state {
-                        TransactionState::Applied => "Verified publication complete; undo is available from Organisation.",
-                        TransactionState::RolledBack => "Already undone; the source archives were untouched.",
-                        _ => "Needs review — recovery state is recorded in the shared journal.",
-                    });
-                    ui.collapsing("Advanced Details", |ui| {
-                        ui.label("Shared reconstruction journal; source archives are never rollback targets.");
-                        ui.label(format!("State: {}", transaction.state.label()));
-                    });
-                });
-                });
-            }
-        }
-        let mut undo = None;
-        egui::ScrollArea::vertical()
-            .id_salt("v2_repair_history")
-            .show(ui, |ui| {
-                for (index, record) in self.repair_history.iter().enumerate().rev() {
-                    ui.push_id(&record.transaction.transaction_id, |ui| {
-                        egui::Frame::group(ui.style()).show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            ui.heading("Duplicate quarantine");
-                            ui.label(format!(
-                                "Transaction {} · {} · {} file(s)",
-                                record.transaction.transaction_id,
-                                record.transaction.state.label(),
-                                record.transaction.entries.len()
-                            ));
-                            ui.label(format!(
-                                "Affected folder: {}",
-                                record.trusted_root.display()
-                            ));
-                            match record.transaction.state {
-                                TransactionState::Applied => {
-                                    ui.strong("Ready to undo");
-                                    if primary(ui, "Preview undo") {
-                                        undo = Some(index);
-                                    }
-                                }
-                                TransactionState::RolledBack => {
-                                    ui.label("Already undone");
-                                }
-                                TransactionState::RollbackFailed => {
-                                    ui.label("Undo is not available — the rollback needs review.");
-                                }
-                                _ => {
-                                    ui.label(
-                                        "Needs review — the transaction did not finish normally.",
-                                    );
-                                }
-                            }
-                            ui.collapsing("Advanced Details", |ui| {
-                                ui.monospace(format!("Journal: {}", record.journal_dir.display()));
-                            });
-                        });
-                    });
-                }
-            });
-        if let Some(index) = undo {
-            self.undo_confirm = Some(index);
-        }
-        if let Some(index) = self.undo_confirm
-            && let Some(transaction_id) = self
-                .repair_history
-                .get(index)
-                .map(|record| record.transaction.transaction_id.clone())
-        {
-            egui::Window::new("Confirm undo").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
-                    ui.label("EmuWiz will revalidate the quarantined files and restore them to their original paths. If anything changed unexpectedly, it will refuse safely.");
-                    if primary(ui, "Undo this repair") { self.undo_history_entry(index); }
-                    if ui.button("Cancel").clicked() { self.undo_confirm = None; }
-                    ui.collapsing("Advanced Details", |ui| { ui.monospace(format!("Transaction: {transaction_id}")); });
-                });
-        }
-        if open_build {
-            self.go(Route::Section(Section::Build));
-        }
-        if open_cheats {
-            self.go(Route::Section(Section::Mods));
         }
     }
 
