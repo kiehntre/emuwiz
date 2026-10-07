@@ -171,25 +171,6 @@ fn find_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egu
         .find_map(|clipped| find_in_shape(&clipped.shape, needle))
 }
 
-fn find_last_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
-    fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
-        match shape {
-            egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
-                .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
-            egui::Shape::Vec(nested) => nested
-                .iter()
-                .rev()
-                .find_map(|shape| find_in_shape(shape, needle)),
-            _ => None,
-        }
-    }
-    output
-        .shapes
-        .iter()
-        .rev()
-        .find_map(|clipped| find_in_shape(&clipped.shape, needle))
-}
-
 fn click_event(pos: egui::Pos2) -> Vec<egui::Event> {
     vec![
         egui::Event::PointerMoved(pos),
@@ -232,27 +213,6 @@ fn click_text(
     // egui applies the click during this frame, but the newly expanded
     // widget is emitted on the next frame. Return that settled frame so
     // assertions inspect the same state a real event loop would display.
-    let (settled, _) = render(ctx, state, base_input());
-    (settled, action)
-}
-
-fn click_last_text(
-    ctx: &egui::Context,
-    state: &mut PlayingLibraryPageState,
-    needle: &str,
-) -> (egui::FullOutput, Option<PlayingLibraryPageAction>) {
-    let (before, _) = render(ctx, state, base_input());
-    let pos = find_last_exact_text_center(&before, needle)
-        .unwrap_or_else(|| panic!("expected to find rendered text {needle:?} to click"));
-    let (_, action) = render(
-        ctx,
-        state,
-        egui::RawInput {
-            screen_rect: Some(screen()),
-            events: click_event(pos),
-            ..Default::default()
-        },
-    );
     let (settled, _) = render(ctx, state, base_input());
     (settled, action)
 }
@@ -542,11 +502,14 @@ fn the_page_shows_a_plain_winner_explanation_and_why_the_loser_lost_with_technic
     let (expanded, _) = render(&ctx, &mut state, base_input());
     let _ = output;
 
-    assert!(rendered_text_contains(&expanded, "Selected because:"));
+    assert!(rendered_text_contains(
+        &expanded,
+        "EmuWiz prefers this release:"
+    ));
     assert!(rendered_text_contains(&expanded, "Not selected:"));
     assert!(rendered_text_contains(
         &expanded,
-        "Sonic (USA) - not selected because:"
+        "Not selected: Sonic (USA)"
     ));
     // The plain-English evidence line is always visible...
     assert!(
@@ -564,7 +527,7 @@ fn the_page_shows_a_plain_winner_explanation_and_why_the_loser_lost_with_technic
         "CandidateEvidenceSummary {"
     ));
 
-    let (with_technical_detail, _) = click_last_text(&ctx, &mut state, "Technical details");
+    let (with_technical_detail, _) = click_text(&ctx, &mut state, "Technical details");
     assert!(rendered_text_contains(
         &with_technical_detail,
         "CandidateEvidenceSummary {"
@@ -941,7 +904,18 @@ fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
     assert_eq!(std::fs::read_link(&link).unwrap(), original);
     assert_eq!(std::fs::read(&original).unwrap(), b"test");
     let ctx = egui::Context::default();
-    let (applied_output, _) = render(&ctx, &mut state, base_input());
+    // This is a receipt/transaction assertion, not a viewport-accessibility test.
+    // The review summary and asynchronously loaded catalogue can push the
+    // profile receipt below the old 1600px fixture. Render the complete profile
+    // content while keeping every transaction and message assertion intact.
+    let receipt_input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1000.0, 2600.0),
+        )),
+        ..Default::default()
+    };
+    let (applied_output, _) = render(&ctx, &mut state, receipt_input());
     assert!(rendered_text_contains(
         &applied_output,
         "RomM library created: 1 link(s)"
@@ -950,7 +924,11 @@ fn romm_apply_requires_verified_visibility_then_applies_and_rolls_back() {
     state.rollback_romm_last();
     assert!(!link.exists());
     assert_eq!(std::fs::read(&original).unwrap(), b"test");
-    let (rolled_back_output, _) = render(&ctx, &mut state, base_input());
+    assert_eq!(
+        state.romm_applied.as_ref().unwrap().state,
+        TransactionState::RolledBack
+    );
+    let (rolled_back_output, _) = render(&ctx, &mut state, receipt_input());
     assert!(rendered_text_contains(
         &rolled_back_output,
         "RomM library rolled back; no generated links remain."
@@ -1121,7 +1099,7 @@ fn preview_is_disabled_until_every_required_field_is_filled_then_becomes_clickab
 
     // Nothing filled in yet: clicking where the button is must not produce
     // an action, and the disabled hint must be visible.
-    let (output, action) = click_text(&ctx, &mut state, "Preview 1G1R Library");
+    let (output, action) = click_text(&ctx, &mut state, "Preview playing library");
     assert!(action.is_none(), "a disabled button must never click");
     assert!(rendered_text_contains(
         &output,
@@ -1132,7 +1110,7 @@ fn preview_is_disabled_until_every_required_field_is_filled_then_becomes_clickab
     type_into_field(&ctx, &mut state, SOURCE_ROOT_FIELD_ID, "/tmp/roms");
     type_into_field(&ctx, &mut state, DESTINATION_ROOT_FIELD_ID, "/tmp/playing");
 
-    let (output, action) = click_text(&ctx, &mut state, "Preview 1G1R Library");
+    let (output, action) = click_text(&ctx, &mut state, "Preview playing library");
     assert!(
         !rendered_text_contains(
             &output,
@@ -1541,4 +1519,395 @@ mod esde {
         assert!(!friendly.contains("MAX_GAMELIST_BYTES"));
         assert!(friendly.contains("large") || friendly.contains("too large"));
     }
+}
+
+/// These exercise the presentation against the existing planner/matcher, with
+/// disposable files only. Filters and paint must not alter the reviewed plan.
+mod organisation_usability {
+    use super::*;
+    use crate::playing_library_page::presentation::{ROW_LIMIT, ReviewCounts};
+
+    fn review_frame(
+        ctx: &egui::Context,
+        state: &PlayingLibraryPageState,
+        input: egui::RawInput,
+    ) -> egui::FullOutput {
+        let mut action = None;
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show_preview_summary(ui, state.plan().unwrap(), state, &mut action);
+            });
+        });
+        assert!(action.is_none());
+        output
+    }
+
+    fn preview_output(state: &PlayingLibraryPageState) -> egui::FullOutput {
+        review_frame(&egui::Context::default(), state, base_input())
+    }
+
+    fn two_releases(fixture: &Fixture, preference: &str) -> PlayingLibraryPageState {
+        let source = fixture.path("roms");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("europe.bin"), b"test").unwrap();
+        std::fs::write(source.join("usa.bin"), b"abc").unwrap();
+        let dat = write_dat(
+            fixture,
+            "regions.dat",
+            &format!(
+                r#"<datafile><header><name>One</name></header>
+<game name="Sonic (Europe)"><rom name="europe.bin" size="4" sha1="{SHA1_TEST}"/></game>
+<game name="Sonic (USA)" cloneof="Sonic (Europe)"><rom name="usa.bin" size="3" sha1="{SHA1_ABC}"/></game></datafile>"#
+            ),
+        );
+        let mut state = base_state(fixture);
+        state.source_root_draft = source.display().to_string();
+        state.destination_root_draft = fixture.path("playing").display().to_string();
+        state.dat_path_draft = dat.display().to_string();
+        state.preferred_regions_draft = preference.into();
+        state.preview();
+        state
+    }
+
+    #[test]
+    fn source_preservation_and_link_type_visible_without_advanced() {
+        let f = Fixture::new("organisation-source");
+        let (s, _, _) = preview_a_single_election(&f);
+        let output = preview_output(&s);
+        assert!(rendered_text_contains(
+            &output,
+            "original ROMs remain unchanged"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "links to originals, not copies"
+        ));
+        assert!(rendered_text_contains(&output, "Undo is available"));
+    }
+
+    #[test]
+    fn preferred_release_shows_existing_region_reason_normally() {
+        let f = Fixture::new("organisation-regions");
+        let s = two_releases(&f, "Europe, USA");
+        let output = preview_output(&s);
+        let step = &s.plan().unwrap().elected_games[0].explanation.steps[0];
+        assert!(step.contains("Europe"));
+        assert!(rendered_text_contains(&output, step));
+        assert!(s.selected_family().is_none());
+    }
+
+    #[test]
+    fn filename_only_is_needs_review_and_never_selected() {
+        let f = Fixture::new("organisation-filename");
+        let (mut s, original, _) = preview_a_single_election(&f);
+        std::fs::write(&original, b"wrong bytes").unwrap();
+        s.preview();
+        assert!(s.plan().unwrap().elected_games.is_empty());
+        assert_eq!(s.review_paths, vec![original]);
+        let output = preview_output(&s);
+        assert!(rendered_text_contains(&output, "Needs review"));
+        assert!(rendered_text_contains(
+            &output,
+            "No verified games eligible"
+        ));
+    }
+
+    #[test]
+    fn tied_verified_releases_need_review_in_normal_view() {
+        let f = Fixture::new("organisation-tie");
+        let s = two_releases(&f, "");
+        assert_eq!(s.plan().unwrap().unresolved_groups.len(), 1);
+        let output = preview_output(&s);
+        assert!(rendered_text_contains(
+            &output,
+            "not strong enough to choose automatically"
+        ));
+    }
+
+    #[test]
+    fn counts_include_alternatives_and_stay_whole_under_filters() {
+        let f = Fixture::new("organisation-counts");
+        let mut s = two_releases(&f, "Europe, USA");
+        let before = ReviewCounts::from_state(s.plan().unwrap(), &s);
+        assert_eq!(before.selected, 1);
+        assert_eq!(before.excluded, 1);
+        s.preview_filter = PreviewFilter::Excluded;
+        assert_eq!(ReviewCounts::from_state(s.plan().unwrap(), &s), before);
+        let output = preview_output(&s);
+        assert!(rendered_text_contains(
+            &output,
+            "Selected: 1 · Excluded releases: 1"
+        ));
+        assert!(rendered_text_contains(
+            &output,
+            "Sonic (USA) · Excluded alternative"
+        ));
+        assert!(!rendered_text_contains(
+            &output,
+            "Sonic (Europe) · Selected"
+        ));
+    }
+
+    #[test]
+    fn filters_only_change_presentation_and_not_input_fingerprint() {
+        let f = Fixture::new("organisation-filter");
+        let (mut s, _, _) = preview_a_single_election(&f);
+        let fingerprint = s.input_fingerprint();
+        let plan = s.plan().unwrap().clone();
+        s.preview_filter = PreviewFilter::NeedsReview;
+        preview_output(&s);
+        assert_eq!(s.input_fingerprint(), fingerprint);
+        assert_eq!(s.plan().unwrap(), &plan);
+        assert!(s.selected_family().is_none());
+    }
+
+    #[test]
+    fn filtered_empty_and_no_conflicts_have_distinct_messages() {
+        let f = Fixture::new("organisation-empty-filter");
+        let (mut s, _, _) = preview_a_single_election(&f);
+        s.preview_filter = PreviewFilter::NeedsReview;
+        assert!(rendered_text_contains(
+            &preview_output(&s),
+            "Filters hide all results"
+        ));
+        s.preview_filter = PreviewFilter::Conflicts;
+        let output = preview_output(&s);
+        assert!(rendered_text_contains(&output, "No conflicts found"));
+        assert!(!rendered_text_contains(&output, "Filters hide all results"));
+    }
+
+    #[test]
+    fn empty_source_is_distinct_from_no_eligible_identity() {
+        let f = Fixture::new("organisation-empty-source");
+        let (mut s, original, _) = preview_a_single_election(&f);
+        std::fs::remove_file(original).unwrap();
+        s.preview();
+        assert_eq!(s.source_files_examined, 0);
+        assert!(rendered_text_contains(
+            &preview_output(&s),
+            "No games available to organise"
+        ));
+    }
+
+    #[test]
+    fn destination_and_preview_precede_apply() {
+        let f = Fixture::new("organisation-before-apply");
+        let (mut s, _, dest) = preview_a_single_election(&f);
+        let ctx = egui::Context::default();
+        let (output, action) = render(&ctx, &mut s, base_input());
+        assert!(action.is_none());
+        assert!(rendered_text_contains(&output, &dest.display().to_string()));
+        let preview = find_exact_text_center(&output, "Preview summary").unwrap();
+        let apply = find_exact_text_center(&output, "Apply output profile").unwrap();
+        assert!(preview.y < apply.y);
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn preview_only_has_explicit_reason_and_no_apply() {
+        let f = Fixture::new("organisation-preview-only");
+        let (mut s, _, _) = preview_a_single_election(&f);
+        s.output_projection = None;
+        let (output, action) = render(&egui::Context::default(), &mut s, base_input());
+        assert!(action.is_none());
+        assert!(rendered_text_contains(&output, "This plan is preview-only"));
+        assert!(!rendered_text_contains(&output, "Apply output profile"));
+    }
+
+    #[test]
+    fn destination_conflict_shows_refusal_without_force_apply() {
+        let f = Fixture::new("organisation-conflict");
+        let (mut s, _, _) = preview_a_single_election(&f);
+        let conflict = archivefs_core::playing_library::DestinationConflict {
+            destination_basename: "same.bin".into(),
+            contenders: vec!["A".into(), "B".into()],
+            destinations: vec![f.path("playing/same.bin")],
+        };
+        s.plan.as_mut().unwrap().conflicts.push(conflict.clone());
+        s.output_projection
+            .as_mut()
+            .unwrap()
+            .conflicts
+            .push(conflict);
+        let (output, action) = render(&egui::Context::default(), &mut s, base_input());
+        assert!(action.is_none());
+        assert!(rendered_text_contains(
+            &output,
+            "Apply unavailable: the destination has conflicts"
+        ));
+        assert!(!rendered_text_contains(&output, "Apply output profile"));
+    }
+
+    #[test]
+    fn current_counts_ignore_prior_receipts() {
+        let f = Fixture::new("organisation-current");
+        let (mut s, _, _) = preview_a_single_election(&f);
+        s.request_apply();
+        s.confirm_apply();
+        assert!(s.applied().is_some());
+        s.preview();
+        s.plan.as_mut().unwrap().elected_games.clear();
+        assert_eq!(ReviewCounts::from_state(s.plan().unwrap(), &s).selected, 0);
+        let (output, _) = render(&egui::Context::default(), &mut s, base_input());
+        assert!(rendered_text_contains(
+            &output,
+            "this receipt is not current collection evidence"
+        ));
+    }
+
+    #[test]
+    fn advanced_retains_source_output_and_identity_evidence() {
+        let f = Fixture::new("organisation-advanced");
+        let (s, original, _) = preview_a_single_election(&f);
+        let ctx = egui::Context::default();
+        let closed = review_frame(&ctx, &s, base_input());
+        assert!(!rendered_text_contains(
+            &closed,
+            &original.display().to_string()
+        ));
+        // Exercise the real disclosure click in the feature-owned preview.
+        // The full page also contains asynchronous catalogue-picker disclosures
+        // with the same visible label; they are not this test's target.
+        let position = find_exact_text_center(&closed, "Technical details").unwrap();
+        review_frame(
+            &ctx,
+            &s,
+            egui::RawInput {
+                events: click_event(position),
+                ..base_input()
+            },
+        );
+        let open = review_frame(&ctx, &s, base_input());
+        assert!(rendered_text_contains(
+            &open,
+            &original.display().to_string()
+        ));
+        assert!(rendered_text_contains(&open, "DAT entry: Sonic (Europe)"));
+        assert!(rendered_text_contains(&open, "CandidateEvidenceSummary"));
+        assert!(rendered_text_contains(&open, "→ Output:"));
+    }
+
+    #[test]
+    fn large_preview_is_bounded_but_counts_are_complete() {
+        let f = Fixture::new("organisation-large");
+        let (mut s, _, _) = preview_a_single_election(&f);
+        let template = s.plan().unwrap().elected_games[0].clone();
+        s.plan.as_mut().unwrap().elected_games = (0..ROW_LIMIT + 20)
+            .map(|i| {
+                let mut game = template.clone();
+                game.dat_entry_name = format!("Game {i:04}");
+                game
+            })
+            .collect();
+        let output = preview_output(&s);
+        assert!(rendered_text_contains(&output, "Selected: 220"));
+        assert!(rendered_text_contains(
+            &output,
+            "Showing review items 1–200 of 220"
+        ));
+        assert!(!rendered_text_contains(&output, "Game 0200"));
+        s.preview_page = 1;
+        let next = preview_output(&s);
+        assert!(rendered_text_contains(&next, "Game 0200"));
+        assert!(!rendered_text_contains(&next, "Game 0000"));
+        assert!(rendered_text_contains(&next, "Selected: 220"));
+        assert!(rendered_text_contains(
+            &next,
+            "Showing review items 201–220 of 220"
+        ));
+    }
+
+    #[test]
+    fn paint_only_never_creates_output_or_changes_selection_or_plan() {
+        let f = Fixture::new("organisation-paint");
+        let (mut s, original, dest) = preview_a_single_election(&f);
+        let plan = s.plan().unwrap().clone();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let (_, action) = render(&ctx, &mut s, base_input());
+            assert!(action.is_none());
+        }
+        assert_eq!(s.plan().unwrap(), &plan);
+        assert!(s.selected_family().is_none());
+        assert!(!dest.exists());
+        assert_eq!(std::fs::read(original).unwrap(), b"test");
+    }
+
+    #[test]
+    fn repeated_playing_library_buttons_select_their_semantic_game_id() {
+        let f = Fixture::new("organisation-row-ids");
+        let (mut s, _, _) = preview_a_single_election(&f);
+        let mut second = s.plan().unwrap().elected_games[0].clone();
+        second.dat_entry_name = "Second game".into();
+        s.plan.as_mut().unwrap().elected_games.push(second);
+        let ctx = egui::Context::default();
+        let (_, action) = click_last_text(&ctx, &mut s, "Why this one?");
+        assert!(
+            matches!(action, Some(PlayingLibraryPageAction::SelectFamily(Some(ref family))) if family == "Second game")
+        );
+        // Row order is not part of the widget identity.
+        assert_ne!(
+            egui::Id::new(("playing-family", "Second game")),
+            egui::Id::new(("playing-family", "Sonic (Europe)"))
+        );
+    }
+
+    #[test]
+    fn companion_files_are_not_counted_as_unknown_identity() {
+        let main: PathBuf = "/synthetic/disc.cue".into();
+        let companion: PathBuf = "/synthetic/disc.bin".into();
+        let unknown: PathBuf = "/synthetic/unknown.bin".into();
+        let outcome = archivefs_core::playing_library::matching::MatchOutcome {
+            matches: vec![archivefs_core::playing_library::DatArchiveMatch {
+                archive_path: main.clone(),
+                dat_entry_index: 0,
+                companion_paths: vec![companion.clone()],
+            }],
+            rejected_launchers: vec![],
+        };
+        assert_eq!(
+            presentation::unrepresented_paths(&[main, companion, unknown.clone()], &outcome),
+            vec![unknown]
+        );
+    }
+}
+
+fn find_last_exact_text_center(output: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
+    fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text_shape) => (text_shape.galley.text() == needle)
+                .then(|| text_shape.pos + text_shape.galley.size() / 2.0),
+            egui::Shape::Vec(nested) => nested
+                .iter()
+                .rev()
+                .find_map(|shape| find_in_shape(shape, needle)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .rev()
+        .find_map(|clipped| find_in_shape(&clipped.shape, needle))
+}
+
+fn click_last_text(
+    ctx: &egui::Context,
+    state: &mut PlayingLibraryPageState,
+    needle: &str,
+) -> (egui::FullOutput, Option<PlayingLibraryPageAction>) {
+    let (before, _) = render(ctx, state, base_input());
+    let pos = find_last_exact_text_center(&before, needle)
+        .unwrap_or_else(|| panic!("expected to find rendered text {needle:?} to click"));
+    let (_, action) = render(
+        ctx,
+        state,
+        egui::RawInput {
+            screen_rect: Some(screen()),
+            events: click_event(pos),
+            ..Default::default()
+        },
+    );
+    let (settled, _) = render(ctx, state, base_input());
+    (settled, action)
 }

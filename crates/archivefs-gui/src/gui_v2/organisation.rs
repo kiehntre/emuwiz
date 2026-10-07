@@ -817,6 +817,28 @@ fn sub_view_heading(ui: &mut egui::Ui, kind: CardKind, label: &str) {
     });
 }
 
+/// Normal-mode review destinations use the existing canonical routes.
+const REVIEW_TASKS: [(&str, &str, &str, Section); 3] = [
+    (
+        "Duplicates",
+        "Review matching contents and the copy to keep. Detection never deletes files automatically.",
+        "Review duplicates",
+        Section::Duplicates,
+    ),
+    (
+        "Collection Review",
+        "Review uncertain identities, conflicts and problems before choosing an action.",
+        "Review collection",
+        Section::Problems,
+    ),
+    (
+        "MAME organisation",
+        "Use the MAME workflow to check sets and shared parent files. Generic file organisation cannot replace MAME set checks.",
+        "Open MAME",
+        Section::Mame,
+    ),
+];
+
 impl App {
     pub(super) fn organisation_page(&mut self, ui: &mut egui::Ui) {
         let mut selected = None;
@@ -877,65 +899,45 @@ impl App {
                         }
                         ui.add_space(theme::SPACE_SM);
                     }
-                    ui.label("Pick one job. Anything that changes files shows a preview first.");
-                    ui.horizontal_wrapped(|ui| {
-                        if primary(ui, "Rename verified games") {
-                            selected = Some(None);
-                        }
-                        if primary(ui, "Build a clean playing library") {
+                    ui.label("Review your collection, understand the recommendation, then preview before applying.");
+                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                        ui.heading("Playing Library");
+                        if primary(ui, "Preview Playing Library") {
                             selected = Some(Some(PlayingLibraryDestination::Generic));
                         }
-                        if ui.button("Fix my MAME library").clicked() {
-                            self.organisation.view = OrganisationView::MameNormalizer;
-                        }
-                        if primary(ui, "Analyse MAME collection") {
-                            self.organisation.view = OrganisationView::MameNormalizer;
-                        }
-                        if ui.button("Repair problems").clicked() {
-                            self.go(Route::Section(Section::Problems));
-                        }
+                        ui.label("A clean play-focused view made from your existing verified games.");
+                        ui.label("Reads originals · Creates separate linked output · Originals preserved · Preview required · Undo available for supported operations");
                     });
-                    ui.label("Advanced organisation options, with more preferences and history, are further down.");
-                    ui.label("Source untouched until you confirm a preview.");
-                    for card in ACTIONS {
-                        widgets::workflow_card(ui, card.kind.accent(), |ui| {
-                            ui.horizontal(|ui| {
-                                motif_plate(ui, 56.0, card.kind);
-                                ui.add_space(theme::SPACE_SM);
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        RichText::new(card.title)
-                                            .size(theme::SECTION_TITLE_SIZE)
-                                            .strong(),
-                                    );
-                                    ui.label(card.description);
-                                    ui.label(RichText::new(card.semantics).strong().color(card.kind.accent()));
-                                    ui.label(
-                                        RichText::new("Ready when its required source, destination and verification data are available.")
-                                            .color(theme::muted(ui)),
-                                    );
-                                    ui.add_space(theme::SPACE_XS);
-                                    if primary(ui, card.title) {
-                                        selected = Some(card.destination);
-                                    }
-                                });
-                            });
-                        });
-                        ui.add_space(theme::SPACE_SM);
-                    }
-                    widgets::workflow_card(ui, theme::TEAL, |ui| {
-                        ui.horizontal(|ui| {
-                            motif_plate(ui, 56.0, CardKind::VerifiedGames);
-                            ui.add_space(theme::SPACE_SM);
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new("Fix my MAME library").size(theme::SECTION_TITLE_SIZE).strong());
-                                ui.label("Check MAME set names, the files inside each set, shared parent files and dump quality before fixing anything.");
-                                ui.label(RichText::new("Preview required · Evidence must be sufficient · Recovery remains available").strong().color(theme::TEAL));
-                                if primary(ui, "Analyse MAME collection") {
-                                    self.organisation.view = OrganisationView::MameNormalizer;
+                    ui.add_space(theme::SPACE_SM);
+                    for (title, explanation, button, section) in REVIEW_TASKS {
+                        ui.push_id(("organisation-task", section), |ui| {
+                            widgets::card(ui, |ui| {
+                                ui.heading(title);
+                                ui.label(explanation);
+                                if ui.button(button).clicked() {
+                                    self.go(Route::Section(section));
                                 }
                             });
                         });
+                    }
+                    ui.collapsing("Other output destinations and verified-file naming", |ui| {
+                        for card in ACTIONS {
+                            ui.push_id(card.title, |ui| {
+                                widgets::workflow_card(ui, card.kind.accent(), |ui| {
+                                    ui.horizontal(|ui| {
+                                        motif_plate(ui, 40.0, card.kind);
+                                        ui.vertical(|ui| {
+                                            ui.strong(card.title);
+                                            ui.label(card.description);
+                                            ui.label(card.semantics);
+                                            if ui.button(card.title).clicked() {
+                                                selected = Some(card.destination);
+                                            }
+                                        });
+                                    });
+                                });
+                            });
+                        }
                     });
                     ui.add_space(theme::SPACE_SM);
                     ui.collapsing("Advanced organisation options", |ui| {
@@ -1015,9 +1017,7 @@ impl App {
                     });
                     self.organisation.ensure_mame_history_loaded();
                     super::mame_collection_health::show(ui);
-                    if ui.button("Build a MAME Playing Library").clicked() {
-                        selected = Some(Some(PlayingLibraryDestination::Generic));
-                    }
+                    ui.label("MAME sets stay in the canonical MAME workflow; generic Playing Library organisation is not offered here.");
                     show_mame_normalizer(ui, &mut self.organisation);
                 }
             });
@@ -1132,6 +1132,32 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn organisation_usability_mame_uses_canonical_route_and_warns_about_generic_sets() {
+        let task = REVIEW_TASKS
+            .iter()
+            .find(|task| task.0 == "MAME organisation")
+            .unwrap();
+        assert_eq!(task.3, Section::Mame);
+        assert_eq!(task.2, "Open MAME");
+        assert!(
+            task.1
+                .contains("Generic file organisation cannot replace MAME set checks")
+        );
+        assert!(!REVIEW_TASKS.iter().any(|task| task.3 == Section::Build));
+    }
+
+    #[test]
+    fn organisation_usability_review_tasks_reuse_duplicates_and_problem_routes() {
+        assert_eq!(REVIEW_TASKS[0].3, Section::Duplicates);
+        assert_eq!(REVIEW_TASKS[1].3, Section::Problems);
+        assert!(
+            REVIEW_TASKS[0]
+                .1
+                .contains("never deletes files automatically")
+        );
+    }
 
     #[test]
     fn landing_has_exactly_the_five_backed_normal_actions() {

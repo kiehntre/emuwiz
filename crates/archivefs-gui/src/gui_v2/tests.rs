@@ -318,12 +318,12 @@ fn gui_v2_organisation_landing_uses_user_intents() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Build);
-    let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
+    let strings = text(&frame(&context, &mut app, [1280.0, 1800.0]));
     for expected in [
-        "Rename verified games",
-        "Build a clean playing library",
-        "Fix my MAME library",
-        "Analyse MAME collection",
+        "Preview Playing Library",
+        "Review duplicates",
+        "Review collection",
+        "Open MAME",
     ] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
@@ -1348,12 +1348,13 @@ fn gui_v2_organisation_is_a_native_plain_english_workflow() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Build);
-    let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+    let strings = text(&frame(&context, &mut app, [1280.0, 1800.0]));
     for expected in [
         "Choose what you want to organise",
-        "Rename verified games",
-        "Build a clean playing library",
-        "Fix my MAME library",
+        "Preview Playing Library",
+        "Review duplicates",
+        "Review collection",
+        "Open MAME",
     ] {
         assert!(strings.iter().any(|value| value == expected), "{expected}");
     }
@@ -1365,7 +1366,7 @@ fn gui_v2_organisation_is_a_native_plain_english_workflow() {
     assert!(
         strings
             .iter()
-            .any(|value| value.contains("Source untouched"))
+            .any(|value| value.contains("Originals preserved"))
     );
 }
 
@@ -1375,7 +1376,7 @@ fn gui_v2_organisation_advanced_options_stay_native() {
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Build);
     let strings = text(&frame(&context, &mut app, [1280.0, 1800.0]));
-    for expected in ["Advanced organisation options", "Fix my MAME library"] {
+    for expected in ["Advanced organisation options", "Open MAME"] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
             "{expected}"
@@ -1386,6 +1387,27 @@ fn gui_v2_organisation_advanced_options_stay_native() {
             .iter()
             .any(|value| value.contains("Legacy / Advanced interface"))
     );
+    click_label(
+        &context,
+        &mut app,
+        [1280.0, 1800.0],
+        "Advanced organisation options",
+    );
+    click_label(
+        &context,
+        &mut app,
+        [1280.0, 2200.0],
+        "Open 1G1R preferences",
+    );
+    assert_eq!(app.router.current, Route::Section(Section::Build));
+    assert_eq!(
+        app.organisation.view,
+        super::organisation::OrganisationView::PlayingLibrary
+    );
+    assert_eq!(
+        app.playing_library.destination,
+        crate::playing_library_page::PlayingLibraryDestination::Generic
+    );
 }
 
 #[test]
@@ -1395,7 +1417,7 @@ fn gui_v2_organisation_sidebar_title_and_all_normal_flows_are_reachable() {
     for (destination, expected) in [
         (
             crate::playing_library_page::PlayingLibraryDestination::Generic,
-            "Generic Library",
+            "Playing Library",
         ),
         (
             crate::playing_library_page::PlayingLibraryDestination::Romm,
@@ -1443,6 +1465,7 @@ fn gui_v2_verified_game_flow_explains_move_rename_link_and_keeps_advanced_escape
 #[test]
 fn gui_v2_organisation_landing_remains_usable_at_supported_viewports() {
     for size in [
+        [1024.0, 600.0],
         [1280.0, 720.0],
         [1366.0, 768.0],
         [1920.0, 1080.0],
@@ -1451,13 +1474,15 @@ fn gui_v2_organisation_landing_remains_usable_at_supported_viewports() {
         let context = egui::Context::default();
         let mut app = fixture(&context);
         app.router.current = Route::Section(Section::Build);
-        let strings = text(&frame(&context, &mut app, size));
+        frame(&context, &mut app, size);
+        let output = frame(&context, &mut app, size);
+        let strings = text(&output);
         assert!(
             strings.iter().any(|value| value == "Organisation"),
             "{size:?}"
         );
         assert!(
-            strings.iter().any(|value| value == "Rename verified games"),
+            organisation_label_is_visible(&output, "Preview Playing Library"),
             "{size:?}"
         );
     }
@@ -1484,17 +1509,8 @@ fn gui_v2_organisation_flow_survives_navigation_away_and_back() {
     );
 }
 
-/// The first-use / empty-state explainer: source stays intact, a preview
-/// always comes first, and destination/output is separate - shown while the
-/// primary action cards remain fully visible and reachable.
-///
-/// Uses a tall [1280.0, 1800.0] viewport, similar in spirit to
-/// `gui_v2_organisation_is_a_native_plain_english_workflow`'s 820px fixture:
-/// this harness renders a single `egui::Context::run` frame, so - exactly
-/// like a real (multi-frame, scrollable) session's first paint - content
-/// past the first frame's laid-out height is not yet drawn. The extra
-/// height accounts for the new hero and contextual guidance pushing the five
-/// cards further down than the previous plain-list layout.
+/// Review guidance and the primary action stay visible; other backed actions
+/// remain available through an explicit disclosure.
 #[test]
 fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actions() {
     let context = egui::Context::default();
@@ -1507,8 +1523,20 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
             .any(|value| value.contains("preview before anything happens")
                 || value.contains("Nothing changes until"))
     );
-    // All five action cards must still be present and clickable alongside
-    // the contextual guidance - it must never bury the primary actions.
+    assert!(
+        strings
+            .iter()
+            .any(|value| value == "Preview Playing Library")
+    );
+    assert!(!strings.iter().any(|value| value == "Rename verified games"));
+    let mut strings = text(&click_label(
+        &context,
+        &mut app,
+        [1280.0, 1800.0],
+        "Other output destinations and verified-file naming",
+    ));
+    strings.extend(text(&scroll_page(&context, &mut app, [1280.0, 1800.0])));
+    // All five existing backed actions remain accessible after expansion and scrolling.
     for title in [
         "Rename verified games",
         "Build a clean playing library",
@@ -1523,7 +1551,7 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
     assert!(
         strings_after
             .iter()
-            .any(|value| value == "Rename verified games")
+            .any(|value| value == "Prepare for RetroDECK")
     );
 }
 
@@ -1532,54 +1560,141 @@ fn gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actio
 /// RomM, ES-DE and RetroDECK must each be selectable independently.
 #[test]
 fn gui_v2_organisation_each_target_card_routes_to_its_own_destination() {
-    let context = egui::Context::default();
-    for (title, expected_destination) in [
-        (
-            "Build a clean playing library",
-            crate::playing_library_page::PlayingLibraryDestination::Generic,
-        ),
-        (
-            "Organise for RomM",
-            crate::playing_library_page::PlayingLibraryDestination::Romm,
-        ),
-        (
-            "Export to ES-DE",
-            crate::playing_library_page::PlayingLibraryDestination::EsDe,
-        ),
-        (
-            "Prepare for RetroDECK",
-            crate::playing_library_page::PlayingLibraryDestination::RetroDeck,
-        ),
+    use crate::playing_library_page::PlayingLibraryDestination as Destination;
+    for (title, destination) in [
+        ("Preview Playing Library", Some(Destination::Generic)),
+        ("Rename verified games", None),
+        ("Build a clean playing library", Some(Destination::Generic)),
+        ("Organise for RomM", Some(Destination::Romm)),
+        ("Export to ES-DE", Some(Destination::EsDe)),
+        ("Prepare for RetroDECK", Some(Destination::RetroDeck)),
     ] {
-        // Selecting a destination and entering its Playing Library flow is
-        // exactly the same routing the card's own click handler performs
-        // (`super::organisation::organisation_page`); this asserts the
-        // per-target flow it leads to renders correctly for each target,
-        // matching the un-restyled routing behaviour.
+        let context = egui::Context::default();
         let mut app = fixture(&context);
+        let size = [1280.0, 2200.0];
         app.router.current = Route::Section(Section::Build);
-        app.playing_library.set_destination(expected_destination);
-        app.organisation.view = super::organisation::OrganisationView::PlayingLibrary;
-        let strings = text(&frame(&context, &mut app, [1280.0, 720.0]));
-        assert!(
-            strings.iter().any(|value| value == "← Organisation"),
-            "{title}: back control must remain reachable"
+        if title != "Preview Playing Library" {
+            click_label(
+                &context,
+                &mut app,
+                size,
+                "Other output destinations and verified-file naming",
+            );
+        }
+        // Cards repeat their title as a heading. Click the last matching text,
+        // which belongs to the actual action button, rather than its heading.
+        let output = frame(&context, &mut app, size);
+        assert!(organisation_label_is_visible(&output, title), "{title}");
+        let point = text_bounds(&output, title).last().unwrap().center();
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(size[0], size[1]),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |context| app.show(context),
+            );
+        }
+        assert_eq!(
+            app.router.current,
+            Route::Section(Section::Build),
+            "{title}"
         );
-        assert_eq!(app.playing_library.destination, expected_destination);
+        match destination {
+            Some(destination) => {
+                assert_eq!(
+                    app.organisation.view,
+                    super::organisation::OrganisationView::PlayingLibrary,
+                    "{title}"
+                );
+                assert_eq!(app.playing_library.destination, destination, "{title}");
+            }
+            None => assert_eq!(
+                app.organisation.view,
+                super::organisation::OrganisationView::VerifiedGames,
+                "{title}"
+            ),
+        }
+        assert!(
+            organisation_label_is_visible(&frame(&context, &mut app, size), "← Organisation"),
+            "{title}"
+        );
+        click_label(&context, &mut app, size, "← Organisation");
+        assert_eq!(
+            app.organisation.view,
+            super::organisation::OrganisationView::Landing,
+            "{title}"
+        );
     }
 }
 
-/// The Organisation page must remain fully usable at the accessibility
-/// floor (1280x720): the hero, the plain-English explainer and the first
-/// action card render without the motif artwork crowding out its own text
-/// or button - and the page uses a vertical `ScrollArea` (unchanged by this
-/// pass), so the remaining cards stay reachable by scrolling exactly as the
-/// destination card grid already was before this visual pass. (This
-/// single-frame harness cannot itself simulate a scroll gesture; the full
-/// five-card set rendering correctly is covered by
-/// `gui_v2_organisation_landing_shows_the_plain_english_explainer_alongside_actions`
-/// at a taller fixture height, following this test file's existing
-/// convention for viewport-height-sensitive assertions.)
+fn organisation_label_is_visible(output: &egui::FullOutput, label: &str) -> bool {
+    fn contains(shape: &egui::Shape, clip: egui::Rect, label: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text) => {
+                text.galley.text() == label
+                    && clip.contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().any(|shape| contains(shape, clip, label)),
+            _ => false,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .any(|shape| contains(&shape.shape, shape.clip_rect, label))
+}
+
+#[test]
+fn gui_v2_organisation_review_tasks_route_without_starting_an_operation() {
+    for (label, destination) in [
+        ("Review duplicates", Section::Duplicates),
+        ("Review collection", Section::Problems),
+        ("Open MAME", Section::Mame),
+    ] {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(Section::Build);
+        click_label(&context, &mut app, [1280.0, 1800.0], label);
+        assert_eq!(app.router.current, Route::Section(destination), "{label}");
+        assert!(app.playing_library_job.is_none());
+        assert!(app.canonical_organisation_job.is_none());
+        assert!(!app.organisation.mame_publish_pending);
+        app.back();
+        assert_eq!(app.router.current, Route::Section(Section::Build));
+    }
+}
+
+#[test]
+fn gui_v2_organisation_mame_sets_do_not_offer_generic_library_output() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::MameWorkflow);
+    let strings = text(&frame(&context, &mut app, [1280.0, 1800.0]));
+    assert!(
+        strings
+            .iter()
+            .any(|value| value.contains("MAME sets stay in the canonical MAME workflow"))
+    );
+    assert!(!strings.iter().any(
+        |value| value == "Preview Playing Library" || value == "Build a clean playing library"
+    ));
+    assert!(app.playing_library_job.is_none());
+}
+
+/// The primary task remains visible at 1280x720; secondary tasks are scrollable.
 #[test]
 fn gui_v2_organisation_landing_is_reachable_at_narrow_1280x720() {
     let context = egui::Context::default();
@@ -1589,7 +1704,7 @@ fn gui_v2_organisation_landing_is_reachable_at_narrow_1280x720() {
     for expected in [
         "Choose what you want to organise",
         "Nothing changes until you preview and confirm",
-        "Rename verified games",
+        "Preview Playing Library",
     ] {
         assert!(
             strings.iter().any(|value| value.contains(expected)),
@@ -3632,11 +3747,7 @@ fn gui_v2_primary_action_is_visible_without_scrolling() {
                 "Problems & Repair",
             ]
         } else if section == Section::Build {
-            vec![
-                "Rename verified games",
-                "Build a clean playing library",
-                "Organisation",
-            ]
+            vec!["Preview Playing Library"]
         } else if section == Section::Sources {
             vec!["Add source"]
         } else if section == Section::Dat {

@@ -15,6 +15,9 @@
 //! apply path in this app already uses; there is no second filesystem
 //! engine anywhere in this file.
 
+mod presentation;
+
+use presentation::PreviewFilter;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -105,6 +108,11 @@ pub(crate) struct PlayingLibraryPageState {
     /// The elected family currently shown in "Why this one?", identified by
     /// its own `dat_entry_name` (unique per election within one plan).
     selected_family: Option<String>,
+    /// Presentation only: observations of the existing read-only matcher.
+    review_paths: Vec<PathBuf>,
+    source_files_examined: usize,
+    preview_filter: PreviewFilter,
+    preview_page: usize,
     pending_apply: Option<usize>,
     confirm_text: String,
     applied: Option<RenameTransaction>,
@@ -190,6 +198,10 @@ impl Default for PlayingLibraryPageState {
             plan_generation: 0,
             error: None,
             selected_family: None,
+            review_paths: Vec::new(),
+            source_files_examined: 0,
+            preview_filter: PreviewFilter::All,
+            preview_page: 0,
             pending_apply: None,
             confirm_text: String::new(),
             applied: None,
@@ -473,6 +485,9 @@ impl PlayingLibraryPageState {
         self.romm_visibility_verified = false;
         self.error = None;
         self.selected_family = None;
+        self.review_paths.clear();
+        self.preview_page = 0;
+        self.source_files_examined = 0;
         self.plan_generation += 1;
 
         let source_root = PathBuf::from(self.source_root_draft.trim());
@@ -516,6 +531,9 @@ impl PlayingLibraryPageState {
             &trusted,
             &AtomicBool::new(false),
         );
+
+        self.source_files_examined = candidates.len();
+        self.review_paths = presentation::unrepresented_paths(&candidates, &outcome_matches);
 
         let request = resolved.playing_library_request(
             outcome_matches.matches,
@@ -587,6 +605,9 @@ impl PlayingLibraryPageState {
             &trusted,
             &AtomicBool::new(false),
         );
+        self.source_files_examined = candidates.len();
+        self.review_paths = presentation::unrepresented_paths(&candidates, &outcome_matches);
+
         let request = archivefs_core::playing_library::PlayingLibraryRequest {
             dat: &outcome.dat,
             matches: outcome_matches.matches,
@@ -1379,7 +1400,7 @@ pub(crate) fn show_playing_library_page_with_busy(
             if simple {
                 "Your playing library"
             } else {
-                "Generic Library"
+                "Playing Library"
             }
         }
         PlayingLibraryDestination::Romm => "RomM Library",
@@ -1567,7 +1588,7 @@ pub(crate) fn show_playing_library_page_with_busy(
         if simple {
             "Preview playing library"
         } else {
-            "Preview 1G1R Library"
+            "Preview playing library"
         },
         widgets::ActionStyle::Primary,
         ready && !async_busy,
@@ -1606,13 +1627,63 @@ pub(crate) fn show_playing_library_page_with_busy(
         }
     }
 
-    if let Some(plan) = state.plan().cloned() {
+    if state.plan().is_some() {
         ui.add_space(10.0);
-        widgets::section_header(ui, "Apply", Some("Review the plan before creating links."));
+        widgets::section_header(
+            ui,
+            "Review Playing Library",
+            Some("Preview reads only. Original ROMs will remain unchanged."),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for filter in PreviewFilter::ALL {
+                if ui
+                    .selectable_value(&mut state.preview_filter, filter, filter.label())
+                    .changed()
+                {
+                    state.preview_page = 0;
+                }
+            }
+        });
+        let total = state
+            .plan()
+            .map(|plan| {
+                presentation::ReviewCounts::from_state(plan, state).visible(state.preview_filter)
+            })
+            .unwrap_or(0);
+        let pages = total.div_ceil(presentation::ROW_LIMIT).max(1);
+        let page = state.preview_page.min(pages - 1);
+        if pages > 1 {
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(page > 0, egui::Button::new("Previous review page"))
+                    .clicked()
+                {
+                    state.preview_page = page - 1;
+                }
+                ui.label(format!("Review page {} of {pages}", page + 1));
+                if ui
+                    .add_enabled(page + 1 < pages, egui::Button::new("Next review page"))
+                    .clicked()
+                {
+                    state.preview_page = page + 1;
+                }
+            });
+        }
+        if let Some(plan) = state.plan() {
+            show_preview_summary(ui, plan, state, &mut action);
+        }
+        widgets::section_header(
+            ui,
+            "Create reviewed output",
+            Some(
+                "Creates separate links · Originals preserved · Review and confirm before Apply · Undo available",
+            ),
+        );
         if let Some(projection) = state.output_projection.clone() {
             show_output_projection_summary(ui, &projection, state, &mut action);
+        } else {
+            ui.label("This plan is preview-only until an output profile preview and its required checks are complete. Apply is not available yet.");
         }
-        show_preview_summary(ui, &plan, state, &mut action);
         ui.add_space(10.0);
         if matches!(state.destination, PlayingLibraryDestination::Romm) {
             show_romm_projection_summary(ui, state, &mut action);
@@ -1633,7 +1704,7 @@ pub(crate) fn show_playing_library_page_with_busy(
         widgets::card(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!(
-                    "Playing library created: {} link(s)",
+                    "Last operation created {} link(s) — this receipt is not current collection evidence",
                     transaction.applied_count()
                 ))
                 .strong(),
@@ -1770,6 +1841,20 @@ fn show_output_projection_summary(
                 for path in &projection.sample_paths {
                     ui.label(path.display().to_string());
                 }
+            });
+        }
+        if !projection.conflicts.is_empty() {
+            ui.colored_label(theme::WARNING, "Apply unavailable: the destination has conflicts. Review them; no force overwrite is offered.");
+            widgets::technical_details(ui, "playing_library_destination_conflicts", |ui| {
+                for conflict in projection.conflicts.iter().take(presentation::ROW_LIMIT) {
+                    ui.label(format!("{conflict:?}"));
+                }
+            });
+        } else if projection.operation_count == 0 {
+            ui.label(if projection.already_correct > 0 {
+                "Playing Library already up to date for the reviewed entries. No links need creating."
+            } else {
+                "Apply unavailable: no eligible output operations in this preview."
             });
         }
         let pending = match projection.profile {
@@ -2209,132 +2294,7 @@ fn show_preview_summary(
     state: &PlayingLibraryPageState,
     action: &mut Option<PlayingLibraryPageAction>,
 ) {
-    widgets::card(ui, |ui| {
-        ui.label(egui::RichText::new("Preview summary").strong());
-        ui.horizontal_wrapped(|ui| {
-            widgets::status_badge(
-                ui,
-                format!("{} verified releases", plan.archives_examined),
-                widgets::StatusTone::Info,
-            );
-            widgets::status_badge(
-                ui,
-                format!("{} game families", plan.families_examined),
-                widgets::StatusTone::Info,
-            );
-            widgets::status_badge(
-                ui,
-                format!("{} selected for playing library", plan.elected_games.len()),
-                widgets::StatusTone::Success,
-            );
-            widgets::status_badge(
-                ui,
-                format!("{} unresolved", plan.unresolved_groups.len()),
-                if plan.unresolved_groups.is_empty() {
-                    widgets::StatusTone::Success
-                } else {
-                    widgets::StatusTone::Warning
-                },
-            );
-            widgets::status_badge(
-                ui,
-                format!("{} conflicts", plan.conflicts.len()),
-                if plan.conflicts.is_empty() {
-                    widgets::StatusTone::Success
-                } else {
-                    widgets::StatusTone::Blocked
-                },
-            );
-        });
-
-        ui.add_space(6.0);
-        if plan.elected_games.is_empty() {
-            ui.label(
-                egui::RichText::new(
-                    "Nothing can be created yet - resolve the unresolved groups below, or \
-                     relax a preference.",
-                )
-                .color(theme::muted(ui)),
-            );
-        } else if !plan.conflicts.is_empty() {
-            ui.label(
-                egui::RichText::new(
-                    "Destination name conflicts must be resolved before creating the library.",
-                )
-                .color(theme::WARNING),
-            );
-        }
-
-        if !plan.unresolved_groups.is_empty() {
-            widgets::technical_details(ui, ("playing_library_unresolved", "unresolved"), |ui| {
-                for group in &plan.unresolved_groups {
-                    ui.label(format!(
-                        "{}: {}",
-                        group.family_root_name,
-                        group.tied_candidates.join(", ")
-                    ));
-                }
-            });
-        }
-
-        ui.add_space(8.0);
-        for elected in &plan.elected_games {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(&elected.dat_entry_name);
-                let selected = state.selected_family() == Some(elected.dat_entry_name.as_str());
-                let label = if selected { "Hide" } else { "Why this one?" };
-                if widgets::action_button(ui, label, widgets::ActionStyle::Quiet, true).clicked() {
-                    *action = Some(PlayingLibraryPageAction::SelectFamily(if selected {
-                        None
-                    } else {
-                        Some(elected.dat_entry_name.clone())
-                    }));
-                }
-            });
-            if state.selected_family() == Some(elected.dat_entry_name.as_str()) {
-                ui.label(egui::RichText::new("Selected because:").strong());
-                if elected.explanation.steps.is_empty() {
-                    ui.label("- the only eligible release of this game");
-                }
-                for step in &elected.explanation.steps {
-                    ui.label(format!("- {step}"));
-                }
-                ui.label(evidence_summary_line(&elected.explanation.winner_evidence));
-
-                if !elected.explanation.rejected.is_empty() {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Not selected:").strong());
-                    for rejected in &elected.explanation.rejected {
-                        ui.label(format!(
-                            "{} - not selected because:",
-                            rejected.dat_entry_name
-                        ));
-                        for reason in &rejected.reasons {
-                            ui.label(format!("  - {reason}"));
-                        }
-                        ui.label(format!("  {}", evidence_summary_line(&rejected.evidence)));
-                    }
-                }
-
-                widgets::technical_details(
-                    ui,
-                    (
-                        "playing_library_election_evidence",
-                        elected.dat_entry_name.as_str(),
-                    ),
-                    |ui| {
-                        ui.label(format!("winner: {:?}", elected.explanation.winner_evidence));
-                        for rejected in &elected.explanation.rejected {
-                            ui.label(format!(
-                                "{}: {:?}",
-                                rejected.dat_entry_name, rejected.evidence
-                            ));
-                        }
-                    },
-                );
-            }
-        }
-    });
+    presentation::show_preview(ui, plan, state, action);
 }
 
 /// The "Publish to ES-DE" section: choose a platform, preview, confirm,

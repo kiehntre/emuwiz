@@ -66,6 +66,8 @@ pub(super) struct EquivalentState {
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct GroupView {
     pub title: String,
+    pub identity: String,
+    pub preference_reason: &'static str,
     pub keep: Vec<String>,
     pub quarantine: Vec<String>,
     pub saves_bytes: u64,
@@ -91,7 +93,9 @@ pub(super) fn optical_view(group: &OpticalEquivalentGroup) -> GroupView {
     let cue_bytes: u64 = group.cue_bin.files.iter().map(|f| f.size_bytes).sum();
     GroupView {
         title: stem(&group.preferred),
-        keep: vec![format!("{} (kept)", name(&group.preferred))],
+        identity: group.canonical_sha256.clone(),
+        preference_reason: "The existing disc review prefers CHD after proving it matches the CUE/BIN contents.",
+        keep: vec![format!("{} (recommended)", name(&group.preferred))],
         quarantine: group
             .quarantine_candidates
             .iter()
@@ -117,7 +121,9 @@ pub(super) fn optical_view(group: &OpticalEquivalentGroup) -> GroupView {
 pub(super) fn n64_view(group: &N64EquivalentGroup) -> GroupView {
     GroupView {
         title: stem(&group.preferred),
-        keep: vec![format!("{} (kept)", name(&group.preferred))],
+        identity: group.canonical_sha256.clone(),
+        preference_reason: "The existing N64 review prefers z64, then v64, then n64; equal formats use source-path order after content verification.",
+        keep: vec![format!("{} (recommended)", name(&group.preferred))],
         quarantine: group
             .quarantine_candidates
             .iter()
@@ -156,6 +162,54 @@ pub(super) fn bytes(n: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GroupAction {
+    Preview,
+    Confirm,
+    Cancel,
+}
+
+/// Rendering emits an intent only on a click; the existing controller handles it.
+fn show_group(ui: &mut egui::Ui, view: &GroupView, selected: bool) -> Option<GroupAction> {
+    let mut action = None;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(RichText::new(&view.title).strong());
+                    ui.label("Verified matching contents. Review the preferred copy before any move; nothing is deleted automatically.");
+                    for line in &view.keep { ui.colored_label(theme::SUCCESS, format!("Preferred copy: {line}")); }
+                    ui.label(view.preference_reason);
+                    ui.label(format!("Other copies: {}", view.quarantine.iter().take(super::library_reconciliation::PAGE_SIZE).cloned().collect::<Vec<_>>().join(", ")));
+                    ui.collapsing("Details", |ui| {
+                        for line in view.detail.iter().take(super::library_reconciliation::PAGE_SIZE) {
+                            ui.small(line);
+                        }
+                    });
+                    if selected {
+                        ui.label("Preview reads only. Apply moves the reviewed redundant files into recoverable quarantine; the preferred copy stays unchanged. Undo available.");
+                        for line in &view.keep {
+                            ui.colored_label(theme::SUCCESS, format!("Keep: {line}"));
+                        }
+                        for line in view.quarantine.iter().take(super::library_reconciliation::PAGE_SIZE) {
+                            ui.colored_label(theme::WARNING, format!("Move to quarantine: {line}"));
+                        }
+                        ui.label(format!("Redundant copies contain {}. Quarantine is recoverable; nothing is deleted and disk space is not freed.", bytes(view.saves_bytes)));
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add(egui::Button::new(RichText::new(format!("Move {} file(s) to quarantine…", view.quarantine.len())).strong()).fill(theme::PRIMARY_ACTION))
+                                .clicked()
+                            {
+                                action = Some(GroupAction::Confirm);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                action = Some(GroupAction::Cancel);
+                            }
+                        });
+                    } else if ui.button("Preview").clicked() {
+                        action = Some(GroupAction::Preview);
+                    }
+                });
+    action
 }
 
 // ---- worker side ---------------------------------------------------------
@@ -464,52 +518,47 @@ impl App {
         } else {
             let total: u64 = views.iter().map(|v| v.saves_bytes).sum();
             ui.label(format!(
-                "{examined} file(s) examined · {} group(s) · about {} could be freed.",
+                "{examined} file(s) examined · {} group(s) · {} in redundant copies. Quarantine preserves these bytes; it does not free disk space.",
                 views.len(),
                 bytes(total)
             ));
         }
-        for (index, view) in views.iter().enumerate() {
+        for (index, view) in views
+            .iter()
+            .enumerate()
+            .take(super::library_reconciliation::PAGE_SIZE)
+        {
             let selected = self.equiv.selected == Some((kind, index));
-            ui.push_id(("equivalent-group", kind as u8, index), |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new(&view.title).strong());
-                    ui.label("These are the same game stored more than once. EmuWiz verified the contents match; you only need one copy.");
-                    ui.collapsing("Details", |ui| {
-                        for line in &view.detail {
-                            ui.small(line);
-                        }
-                    });
-                    if selected {
-                        for line in &view.keep {
-                            ui.colored_label(theme::SUCCESS, format!("Keep: {line}"));
-                        }
-                        for line in &view.quarantine {
-                            ui.colored_label(theme::WARNING, format!("Move to quarantine: {line}"));
-                        }
-                        ui.label(format!("Frees about {}. Quarantine is recoverable; nothing is deleted.", bytes(view.saves_bytes)));
-                        ui.horizontal_wrapped(|ui| {
-                            if ui
-                                .add(egui::Button::new(RichText::new(format!("Move {} file(s) to quarantine…", view.quarantine.len())).strong()).fill(theme::PRIMARY_ACTION))
-                                .clicked()
-                            {
-                                self.equiv.confirm = true;
-                            }
-                            if ui.button("Cancel").clicked() {
-                                self.equiv.selected = None;
-                            }
-                        });
-                    } else if ui.button("Preview").clicked() {
+            ui.push_id(
+                ("equivalent-group", kind as u8, &view.identity),
+                |ui| match show_group(ui, view, selected) {
+                    Some(GroupAction::Preview) => {
                         self.equiv.selected = Some((kind, index));
                         self.equiv.confirm = false;
                     }
-                });
-            });
+                    Some(GroupAction::Confirm) => self.equiv.confirm = true,
+                    Some(GroupAction::Cancel) => self.equiv.selected = None,
+                    None => {}
+                },
+            );
+        }
+        if views.len() > super::library_reconciliation::PAGE_SIZE {
+            ui.label(format!(
+                "Showing the first {} groups; totals include all groups.",
+                super::library_reconciliation::PAGE_SIZE
+            ));
         }
         if !excluded.is_empty() {
+            ui.label(format!(
+                "Needs review: {} candidates. No automatic choice or move is offered.",
+                excluded.len()
+            ));
             ui.collapsing(format!("Couldn't decide ({})", excluded.len()), |ui| {
                 ui.label("EmuWiz could not prove these match, so no action is offered.");
-                for (path, reason) in excluded {
+                for (path, reason) in excluded
+                    .iter()
+                    .take(super::library_reconciliation::PAGE_SIZE)
+                {
                     ui.small(format!("{} — {reason}", path.display()));
                 }
             });
@@ -807,5 +856,121 @@ mod tests {
         assert!(apply_in(vec![root.clone()], temp.path().join("j"), &group).is_err());
         assert!(root.join("Synthetic Match.cue").exists());
         assert!(root.join("Synthetic Match.chd").exists());
+    }
+}
+
+#[cfg(test)]
+mod organisation_usability {
+    use super::*;
+
+    fn texts(shape: &egui::Shape, output: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => {
+                output.push_str(text.galley.text());
+                output.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    texts(shape, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn render_group(view: &GroupView, selected: bool) -> (String, Option<GroupAction>) {
+        let ctx = egui::Context::default();
+        let mut action = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.push_id(
+                        (
+                            "equivalent-group",
+                            EquivalentKind::N64 as u8,
+                            &view.identity,
+                        ),
+                        |ui| {
+                            action = show_group(ui, view, selected);
+                        },
+                    );
+                });
+            },
+        );
+        let mut text = String::new();
+        for shape in output.shapes {
+            texts(&shape.shape, &mut text);
+        }
+        (text, action)
+    }
+    fn view() -> GroupView {
+        GroupView {
+            title: "Game".into(),
+            identity: "canonical-fingerprint".into(),
+            preference_reason: "Existing review prefers the verified z64 representation.",
+            keep: vec!["Game.z64".into()],
+            quarantine: vec!["Game.v64".into()],
+            saves_bytes: 1234,
+            detail: vec!["fingerprint evidence".into()],
+        }
+    }
+
+    #[test]
+    fn preferred_copy_and_existing_reason_visible_before_preview() {
+        let (text, action) = render_group(&view(), false);
+        assert!(text.contains("Preferred copy: Game.z64"));
+        assert!(text.contains("prefers the verified z64"));
+        assert!(text.contains("Other copies: Game.v64"));
+        assert!(text.contains("Preview"));
+        assert!(!text.contains("Move 1 file(s) to quarantine"));
+        assert!(action.is_none());
+    }
+    #[test]
+    fn quarantine_bytes_are_not_claimed_as_freed_disk_space() {
+        let (text, _) = render_group(&view(), true);
+        assert!(text.contains("disk space is not freed"));
+        assert!(!text.contains("Frees about"));
+        assert!(!text.contains("could be freed"));
+    }
+    #[test]
+    fn painting_review_never_requests_a_destructive_action() {
+        for selected in [false, true] {
+            let (_, action) = render_group(&view(), selected);
+            assert!(action.is_none());
+        }
+    }
+    #[test]
+    fn repeated_labels_use_content_identity_independent_of_position() {
+        let view = view();
+        let id = egui::Id::new((
+            "equivalent-group",
+            EquivalentKind::N64 as u8,
+            &view.identity,
+        ));
+        let mut renamed = view;
+        renamed.title = "Other display label".into();
+        assert_eq!(
+            id,
+            egui::Id::new((
+                "equivalent-group",
+                EquivalentKind::N64 as u8,
+                &renamed.identity
+            ))
+        );
+        renamed.identity = "different-content".into();
+        assert_ne!(
+            id,
+            egui::Id::new((
+                "equivalent-group",
+                EquivalentKind::N64 as u8,
+                &renamed.identity
+            ))
+        );
     }
 }
