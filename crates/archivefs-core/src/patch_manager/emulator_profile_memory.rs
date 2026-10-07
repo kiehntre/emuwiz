@@ -188,7 +188,7 @@ fn parse_remembered_profiles(contents: &str) -> Result<Vec<RememberedEmulatorPro
     Ok(profiles)
 }
 
-fn unquote(value: &str, line_number: usize) -> Result<String> {
+pub(crate) fn unquote(value: &str, line_number: usize) -> Result<String> {
     if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
         return Err(ArchiveFsError::Config(format!(
             "line {line_number} expected a quoted string, found '{value}'"
@@ -213,7 +213,7 @@ fn render_remembered_profiles(profiles: &[RememberedEmulatorProfile]) -> String 
     out
 }
 
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 

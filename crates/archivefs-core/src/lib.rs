@@ -65,6 +65,7 @@ pub mod emulator_download;
 pub mod emulator_inventory;
 /// Provider-neutral, read-only emulator installation lifecycle projection.
 pub mod emulator_lifecycle;
+pub mod emulator_profile_resolver;
 pub mod emulator_update;
 /// Deterministic, read-only reconciliation of existing identity, topology and
 /// readiness evidence. This derived layer never mutates the catalogue.

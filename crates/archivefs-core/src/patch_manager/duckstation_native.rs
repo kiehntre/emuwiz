@@ -217,6 +217,35 @@ pub struct DuckStationNativeRequest {
     pub acknowledge_database_shadowing: bool,
 }
 
+impl DuckStationNativeRequest {
+    /// Builds a request for the profile the resolver chose. The cheat planner
+    /// takes its profile from the resolver, never from "the first eligible
+    /// profile": only a resolved DuckStation profile can be turned into a
+    /// request, and the planner still re-validates the folders itself.
+    pub fn for_resolved_profile(
+        profile: &crate::emulator_profile_resolver::ResolvedEmulatorProfile,
+        selected_game: PathBuf,
+        verified_serials: Vec<String>,
+        disc_topology: DuckStationDiscTopology,
+        operation: DuckStationNativeOperation,
+        acknowledge_database_shadowing: bool,
+    ) -> Result<Self, DuckStationNativeRefusal> {
+        if profile.emulator != crate::emulator_inventory::InventoryEmulator::DuckStation {
+            return Err(DuckStationNativeRefusal::InvalidDuckStationProfile {
+                reason: "the resolved profile is not a DuckStation profile".into(),
+            });
+        }
+        Ok(Self {
+            profile_root: profile.profile_root.clone(),
+            selected_game,
+            verified_serials,
+            disc_topology,
+            operation,
+            acknowledge_database_shadowing,
+        })
+    }
+}
+
 /// Resolved destinations, with whether each came from `settings.ini`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DuckStationFolders {
@@ -446,7 +475,7 @@ fn falsy(value: &str) -> bool {
 
 /// The single value of `key` in `section`, or an error when it is repeated with
 /// different values.
-fn ini_value(text: &str, section: &str, key: &str) -> Result<Option<String>, String> {
+pub(crate) fn ini_value(text: &str, section: &str, key: &str) -> Result<Option<String>, String> {
     let mut current = false;
     let mut found: Option<String> = None;
     for line in split_lines(text) {

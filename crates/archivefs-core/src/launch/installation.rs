@@ -26,7 +26,7 @@ const MAX_GRANTS: usize = 16;
 /// How an installation is launched. The executable (or the `flatpak` binary)
 /// is carried separately by the adapter's binding so existing executable
 /// drift checks keep working unchanged.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum LaunchInstallation {
     /// Plain executable. The adapter's own argv is used byte for byte.
     #[default]

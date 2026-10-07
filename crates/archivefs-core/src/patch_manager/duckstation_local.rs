@@ -620,6 +620,13 @@ fn validate_profile(
     }
 }
 
+/// Every DuckStation executable discovery knows, for the profile resolver.
+pub(crate) fn discover_duckstation_executables(
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> Vec<DuckStationExecutable> {
+    discover_executables(roots)
+}
+
 fn discover_executables(roots: &DuckStationProfileDiscoveryRoots) -> Vec<DuckStationExecutable> {
     let mut candidates = roots.explicit_executables.clone();
     for directory in [
@@ -1635,7 +1642,9 @@ pub fn resolve_duckstation_native_launch_binding(
 /// `Core::SetDataRoot()` resolves to for a non-portable install - see the
 /// module's own "Native launch binding" doc comment for the exact proven
 /// rule this mirrors.
-fn expected_duckstation_native_root(roots: &DuckStationProfileDiscoveryRoots) -> PathBuf {
+pub(crate) fn expected_duckstation_native_root(
+    roots: &DuckStationProfileDiscoveryRoots,
+) -> PathBuf {
     if roots.xdg_config_home_explicit {
         roots.xdg_config_home.join("duckstation")
     } else {
