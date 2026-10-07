@@ -144,11 +144,20 @@ fn destination_path(root: &Path, identity: &DuckStationIdentity) -> Option<PathB
     Some(root.join("cheats").join(filename))
 }
 
-fn direct_code(raw: &str) -> Option<CheatOperation> {
+/// Normalises the direct memory-write instructions DuckStation's Gameshark
+/// parser executes, verified against upstream `cheats_private.h`
+/// (`InstructionCode`): `0x30` = ConstantWrite8, `0x80` = ConstantWrite16 and
+/// `0x90` = ExtConstantWrite32. `0xA0` is **ExtCompareEqual32**, a conditional
+/// instruction, not a write - it, and every other opcode, stays raw and
+/// unsupported. The second word is a hex number of 1-8 digits, as upstream
+/// parses it (`80123456 03E7` is valid), and 8/16-bit writes use only the low
+/// 8/16 bits of it.
+pub(super) fn direct_code(raw: &str) -> Option<CheatOperation> {
     let fields: Vec<_> = raw.split_whitespace().collect();
     if fields.len() != 2
         || fields[0].len() != 8
-        || fields[1].len() != 8
+        || fields[1].is_empty()
+        || fields[1].len() > 8
         || !fields
             .iter()
             .all(|field| field.chars().all(|c| c.is_ascii_hexdigit()))
@@ -167,7 +176,7 @@ fn direct_code(raw: &str) -> Option<CheatOperation> {
             address,
             value: (value & 0xffff) as u16,
         }),
-        0xa0 => Some(CheatOperation::Write32 { address, value }),
+        0x90 => Some(CheatOperation::Write32 { address, value }),
         _ => None,
     }
 }
@@ -356,74 +365,19 @@ pub fn remove_duckstation_cheat(file: &mut DuckStationCheatFile, name: &str) -> 
 }
 
 /// Updates DuckStation's per-game `[Cheats] Enable` list without touching the
-/// global enablement setting. Unknown settings and comments are preserved.
+/// global enablement setting. Unknown settings and comments are preserved, and
+/// enabling creates a missing `[Cheats]` section and `EnableCheats` key.
 pub fn update_duckstation_enablement(
     input: &str,
     cheat_name: &str,
     operation: DuckStationEnablement,
 ) -> Result<Vec<u8>, String> {
-    if input.len() > DUCKSTATION_CHEAT_MAX_BYTES {
-        return Err("DuckStation settings file exceeds the bounded size".into());
-    }
-    if cheat_name.trim().is_empty() || cheat_name.contains(['\r', '\n']) {
-        return Err("cheat name is not a valid settings value".into());
-    }
-    let mut output = String::new();
-    let mut in_cheats = false;
-    let mut saw_enable = false;
-    let mut saw_enable_cheats = false;
-    let mut inserted = false;
-    for raw_line in input.lines() {
-        let line = raw_line.trim_end_matches('\r');
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if in_cheats && matches!(operation, DuckStationEnablement::Enable) && !inserted {
-                output.push_str("Enable = ");
-                output.push_str(cheat_name);
-                output.push('\n');
-                inserted = true;
-            }
-            in_cheats = trimmed[1..trimmed.len() - 1].trim() == "Cheats";
-        }
-        if in_cheats && trimmed.starts_with("EnableCheats") {
-            saw_enable_cheats = true;
-            if matches!(operation, DuckStationEnablement::Enable) {
-                output.push_str("EnableCheats = true\n");
-                continue;
-            }
-        }
-        if in_cheats && trimmed.starts_with("Enable") && trimmed.contains('=') {
-            let value = trimmed
-                .split_once('=')
-                .map(|(_, value)| value.trim())
-                .unwrap_or_default();
-            if value == cheat_name {
-                saw_enable = true;
-                if matches!(operation, DuckStationEnablement::Disable) {
-                    continue;
-                }
-                inserted = true;
-            }
-        }
-        output.push_str(line);
-        output.push('\n');
-    }
-    if in_cheats && matches!(operation, DuckStationEnablement::Enable) && !inserted {
-        output.push_str("Enable = ");
-        output.push_str(cheat_name);
-        output.push('\n');
-    }
-    if matches!(operation, DuckStationEnablement::Enable) && !saw_enable_cheats {
-        let marker = "[Cheats]\n";
-        if let Some(index) = output.find(marker) {
-            let insert_at = index + marker.len();
-            output.insert_str(insert_at, "EnableCheats = true\n");
-        }
-    }
-    if matches!(operation, DuckStationEnablement::Disable) && !saw_enable {
-        return Ok(input.as_bytes().to_vec());
-    }
-    Ok(output.into_bytes())
+    super::duckstation_native::update_game_ini_text(
+        input,
+        cheat_name,
+        matches!(operation, DuckStationEnablement::Enable),
+    )
+    .map(String::into_bytes)
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -710,5 +664,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Keep"]
         );
+    }
+    #[test]
+    fn opcode_0x90_is_the_32_bit_write_and_0xa0_is_a_compare_not_a_write() {
+        // Upstream DuckStation: 0x90 ExtConstantWrite32, 0xA0 ExtCompareEqual32.
+        assert_eq!(
+            direct_code("90123456 DEADBEEF"),
+            Some(CheatOperation::Write32 {
+                address: 0x8012_3456,
+                value: 0xDEAD_BEEF
+            })
+        );
+        assert_eq!(direct_code("A0123456 DEADBEEF"), None);
+        assert_eq!(direct_code("a0123456 deadbeef"), None);
+        // Other conditional / unrelated opcodes are not writes either.
+        for opcode in [
+            "A1", "A2", "A3", "A4", "A5", "D0", "E0", "C0", "50", "60", "91",
+        ] {
+            assert_eq!(
+                direct_code(&format!("{opcode}123456 00000001")),
+                None,
+                "{opcode}"
+            );
+        }
+        assert_eq!(
+            direct_code("30123456 00000163"),
+            Some(CheatOperation::Write8 {
+                address: 0x8012_3456,
+                value: 0x63
+            })
+        );
+        assert_eq!(
+            direct_code("80123456 12345678"),
+            Some(CheatOperation::Write16 {
+                address: 0x8012_3456,
+                value: 0x5678
+            })
+        );
+    }
+
+    #[test]
+    fn short_second_words_parse_as_upstream_does_and_malformed_lines_stay_unsupported() {
+        assert_eq!(
+            direct_code("80123456 03E7"),
+            Some(CheatOperation::Write16 {
+                address: 0x8012_3456,
+                value: 0x03E7
+            })
+        );
+        assert!(direct_code("30123456 0").is_some());
+        for bad in [
+            "30123456",
+            "30123456 123456789",
+            "3012345 00000001",
+            "30123456 0000000G",
+            "30123456 00000001 00000002",
+            "",
+        ] {
+            assert_eq!(direct_code(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_old_0xa0_line_is_preserved_verbatim_as_an_unsupported_code() {
+        let text = "[Old]\nType = Gameshark\nA0123456 00000001\n";
+        let parsed = parse_duckstation_cheat_file(text, "SLUS-00067", None);
+        let code = &parsed.file.entries[0].codes[0];
+        assert_eq!(code.raw, "A0123456 00000001");
+        assert!(!code.supported && code.normalized.is_none());
+        assert!(
+            parsed
+                .file
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, DuckStationCheatParseIssue::UnsupportedCode(_)))
+        );
+        let rendered = String::from_utf8(render_duckstation_cheat_file(&parsed.file)).unwrap();
+        assert!(rendered.contains("A0123456 00000001"));
     }
 }

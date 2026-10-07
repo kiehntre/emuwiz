@@ -75,6 +75,7 @@ mod dolphin_onframe_source;
 mod dolphin_texture_mod;
 mod dolphin_texture_pack;
 mod duckstation_cheat;
+mod duckstation_native;
 mod duckstation_firmware;
 mod duckstation_local;
 mod emulator_profile_memory;
@@ -562,6 +563,16 @@ pub use duckstation_cheat::{
     apply_duckstation_cheat_plan, build_duckstation_cheat_apply_plan,
     duckstation_loadability_facts, merge_duckstation_cheat, parse_duckstation_cheat_file,
     remove_duckstation_cheat, render_duckstation_cheat_file, update_duckstation_enablement,
+};
+pub use duckstation_native::{
+    DuckStationDiscTopology, DuckStationFolders, DuckStationNativeApplyFailure,
+    DuckStationNativeApplyOptions, DuckStationNativeCheat, DuckStationNativeFileReceipt,
+    DuckStationNativeOperation, DuckStationNativePlan, DuckStationNativePreview,
+    DuckStationNativeReceipt, DuckStationNativeRefusal, DuckStationNativeRequest,
+    DuckStationNativeUndoPreview, DuckStationNativeWarning, EnableCheatsChange,
+    apply_duckstation_native_plan, duckstation_native_section_digest, plan_duckstation_native,
+    preview_duckstation_native_undo, read_duckstation_native_receipt,
+    resolve_duckstation_folders, undo_duckstation_native,
 };
 pub use duckstation_firmware::{
     DuckStationBiosVerificationOutcome, DuckStationGameInspectionWithFirmware, DuckStationRegion,
