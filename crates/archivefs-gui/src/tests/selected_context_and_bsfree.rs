@@ -3222,6 +3222,27 @@ fn a_long_mount_path_does_not_push_the_selected_archive_panel_past_the_viewport(
 }
 
 #[test]
+fn gamer_view_frames_never_scan_the_real_es_de_folder_or_refresh_loaded_covers() {
+    // A real ES-DE scan finishing at an arbitrary frame calls
+    // `identity_refreshed`, which demotes every Ready cover to Revalidating.
+    // That made the cover/layout tests below flake, and only on a machine with
+    // real ES-DE data. Frames in a test build must not start it.
+    let (mut app, ctx, _) = featured_panel_frame(1920.0, 1080.0, "Featured Game");
+    let generation = app.artwork_media.gamer_covers.generation();
+    app.artwork_media.gamer_covers.absorb(
+        &ctx,
+        cover_reply(generation, &featured_path_for_app(&app, 0), "101"),
+    );
+    run_frames(&mut app, &ctx, 1920.0, 1080.0, 20);
+    assert!(matches!(
+        app.artwork_media.es_de_media.state(),
+        crate::es_de_media_state::EsDeProviderState::NotStarted
+    ));
+    assert_eq!(app.artwork_media.gamer_covers.generation(), generation);
+    assert!(cover_texture_id(&app, &featured_path_for_app(&app, 0)).is_some());
+}
+
+#[test]
 fn the_stage_puts_the_artwork_beside_the_title_and_the_actions() {
     // The structural redesign's layout contract, stated relationally rather
     // than in pixels: on a wide window the artwork is a prominent plate to

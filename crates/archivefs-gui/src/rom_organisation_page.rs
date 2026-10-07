@@ -82,6 +82,11 @@ pub(crate) struct RomOrganisationPageState {
     /// "preferences keep disappearing" footgun never recurs. Cleared on every
     /// successful save / load.
     approval_persistence_warning: Option<String>,
+    /// Injected location of the approval sidecar. `None` means the normal
+    /// EmuWiz data directory in a production build; a test build with no
+    /// injected path performs no approval I/O at all, so a test can never read
+    /// or write the user's real approvals.
+    approvals_file: Option<PathBuf>,
     /// Whether "Build Playing Library" is showing instead of the ordinary
     /// organisation flow above. A page-local view toggle, not a separate
     /// `OrganisationMode` - the playing-library planner is a genuinely
@@ -193,6 +198,7 @@ impl Default for RomOrganisationPageState {
             confirm_text: String::new(),
             pending_preview: false,
             approval_persistence_warning: None,
+            approvals_file: None,
             showing_playing_library: false,
             playing_library: crate::playing_library_page::PlayingLibraryPageState::load(),
         }
@@ -250,7 +256,7 @@ impl RomOrganisationPageState {
                 .cloned()
                 .collect();
         }
-        match load_persisted_approved_set() {
+        match load_persisted_approved_set(None) {
             Ok(Some(set)) => state.approved = set,
             Ok(None) => {}
             Err(reason) => {
@@ -610,6 +616,23 @@ fn approval_persistence_path() -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot resolve persistence path: {e}"))
 }
 
+/// The sidecar file this state may touch. An injected path always wins. With
+/// none injected a production build uses the real data directory; a test build
+/// returns `None`, which disables approval persistence entirely.
+fn resolve_approvals_file(injected: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    if let Some(path) = injected {
+        return Ok(Some(path.to_path_buf()));
+    }
+    #[cfg(test)]
+    {
+        Ok(None)
+    }
+    #[cfg(not(test))]
+    {
+        approval_persistence_path().map(Some)
+    }
+}
+
 /// Loads the last persisted approval set if the sidecar exists and is
 /// readable.
 ///
@@ -620,8 +643,12 @@ fn approval_persistence_path() -> Result<PathBuf, String> {
 ///   malformed JSON, unknown version, symlinked sidecar, etc.
 ///   The caller surfaces the reason via `approval_persistence_warning`
 ///   but never treats it as "approve everything".
-fn load_persisted_approved_set() -> Result<Option<BTreeSet<String>>, String> {
-    let path = approval_persistence_path()?;
+fn load_persisted_approved_set(
+    injected: Option<&Path>,
+) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(path) = resolve_approvals_file(injected)? else {
+        return Ok(None);
+    };
 
     // ----- Reject symlinked sidecars ----------------------------------
     let meta = match std::fs::symlink_metadata(&path) {
@@ -667,8 +694,10 @@ impl RomOrganisationPageState {
     fn persist_approved_set(&mut self) {
         self.approval_persistence_warning = None;
 
-        let path = match approval_persistence_path() {
-            Ok(p) => p,
+        let path = match resolve_approvals_file(self.approvals_file.as_deref()) {
+            Ok(Some(p)) => p,
+            // Test build with no injected path: persistence is disabled.
+            Ok(None) => return,
             Err(reason) => {
                 self.approval_persistence_warning = Some(reason);
                 return;
@@ -2345,16 +2374,106 @@ mod tests {
         );
     }
 
+    impl RomOrganisationPageState {
+        fn with_approvals_file(mut self, path: PathBuf) -> Self {
+            self.approvals_file = Some(path);
+            self
+        }
+    }
+
     #[test]
     fn persist_clears_the_warning_on_success() {
-        let mut state = RomOrganisationPageState::default();
+        let (_guard, dir) = temp_data_dir();
+        let file = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let mut state = RomOrganisationPageState::default().with_approvals_file(file.clone());
         state.approved.insert("/roms/game.iso".to_string());
         state.approval_persistence_warning = Some("previous failure".to_string());
         state.persist_approved_set();
-        assert!(
-            state.approval_persistence_warning.as_deref() != Some("previous failure"),
-            "stale warning must be cleared"
+        assert!(state.approval_persistence_warning.is_none());
+        assert_eq!(
+            load_persisted_approved_set(Some(&file)).unwrap(),
+            Some(BTreeSet::from(["/roms/game.iso".to_string()]))
         );
+    }
+
+    /// A snapshot of the user's real approval sidecar, read-only.
+    fn real_sidecar_snapshot() -> Option<(Vec<u8>, std::time::SystemTime)> {
+        let path = approval_persistence_path().ok()?;
+        let bytes = std::fs::read(&path).ok()?;
+        let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+        Some((bytes, modified))
+    }
+
+    #[test]
+    fn a_state_without_an_injected_path_never_touches_the_real_user_data() {
+        let before = real_sidecar_snapshot();
+        let real_exists = approval_persistence_path().is_ok_and(|path| path.exists());
+        let mut state = RomOrganisationPageState::default();
+        state
+            .approved
+            .insert("/roms/synthetic-isolation-probe.iso".into());
+        state.persist_approved_set();
+        // No warning either: persistence is simply disabled in a test build.
+        assert!(state.approval_persistence_warning.is_none());
+        assert_eq!(real_sidecar_snapshot(), before);
+        assert_eq!(
+            approval_persistence_path().is_ok_and(|path| path.exists()),
+            real_exists,
+            "the real sidecar must not be created"
+        );
+        // And the real sidecar's contents never leak into a test's state.
+        let loaded = RomOrganisationPageState::load();
+        assert!(loaded.approved.is_empty());
+        assert!(
+            !loaded
+                .approved
+                .contains("/roms/synthetic-isolation-probe.iso")
+        );
+        assert_eq!(load_persisted_approved_set(None).unwrap(), None);
+    }
+
+    #[test]
+    fn synthetic_approvals_stay_inside_the_injected_directory() {
+        let (_guard, dir) = temp_data_dir();
+        let file = dir.join(APPROVAL_PERSISTENCE_FILENAME);
+        let mut state = RomOrganisationPageState::default().with_approvals_file(file.clone());
+        state.approved.insert("/roms/a.iso".into());
+        state.persist_approved_set();
+        let written: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(written, vec![file], "only the injected sidecar exists");
+    }
+
+    #[test]
+    fn parallel_states_do_not_share_approval_state() {
+        let (_guard, dir) = temp_data_dir();
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let file = dir.join(format!("approvals-{index}.json"));
+                std::thread::spawn(move || {
+                    let mut state =
+                        RomOrganisationPageState::default().with_approvals_file(file.clone());
+                    for round in 0..20 {
+                        state.approved.insert(format!("/roms/{index}-{round}.iso"));
+                        state.persist_approved_set();
+                        assert!(state.approval_persistence_warning.is_none());
+                    }
+                    (index, file)
+                })
+            })
+            .collect();
+        for handle in handles {
+            let (index, file) = handle.join().unwrap();
+            let loaded = load_persisted_approved_set(Some(&file)).unwrap().unwrap();
+            assert_eq!(loaded.len(), 20);
+            assert!(
+                loaded
+                    .iter()
+                    .all(|path| path.starts_with(&format!("/roms/{index}-")))
+            );
+        }
     }
 
     #[test]

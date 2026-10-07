@@ -21,6 +21,10 @@ pub(crate) struct EsDeMediaState {
     snapshot: Option<EsDeProviderCollection>,
     receiver: Option<Receiver<Result<EsDeProviderCollection, String>>>,
     generation: u64,
+    /// When set, `start` never reads the user's `~/ES-DE`. Test builds default
+    /// to this so a frame can never start a real scan whose completion lands
+    /// at an arbitrary frame and refreshes every loaded cover under the test.
+    disabled: bool,
 }
 
 impl Default for EsDeMediaState {
@@ -30,6 +34,7 @@ impl Default for EsDeMediaState {
             snapshot: None,
             receiver: None,
             generation: 0,
+            disabled: cfg!(test),
         }
     }
 }
@@ -42,7 +47,7 @@ impl EsDeMediaState {
     }
 
     pub(crate) fn start(&mut self, repaint: eframe::egui::Context) {
-        if !matches!(self.state, EsDeProviderState::NotStarted) {
+        if !matches!(self.state, EsDeProviderState::NotStarted) || self.disabled {
             return;
         }
         let Some(home) = std::env::var_os("HOME") else {
@@ -155,6 +160,7 @@ mod tests {
             snapshot: Some(snapshot),
             receiver: None,
             generation: 7,
+            disabled: true,
         };
         state.state = EsDeProviderState::Loading;
         assert_eq!(state.snapshot().map(|value| value.generation), Some(7));
@@ -175,11 +181,22 @@ mod tests {
             snapshot: None,
             receiver: Some(old_receiver),
             generation: 2,
+            disabled: true,
         };
         state.receiver = Some(current_receiver);
         assert!(old_sender.send(Ok(old)).is_err());
         current_sender.send(Ok(current)).unwrap();
         assert!(state.poll());
         assert_eq!(state.snapshot().map(|value| value.generation), Some(2));
+    }
+
+    #[test]
+    fn a_test_build_never_starts_a_scan_of_the_users_es_de_folder() {
+        let mut state = EsDeMediaState::default();
+        state.start(eframe::egui::Context::default());
+        state.refresh(eframe::egui::Context::default());
+        assert!(matches!(state.state(), EsDeProviderState::NotStarted));
+        assert!(!state.poll());
+        assert_eq!(state.generation(), 0);
     }
 }
