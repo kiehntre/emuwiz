@@ -189,3 +189,8 @@ sevenz-rust2 = { version = "0.21.4", default-features = false, features = [
 # --release` (no test targets) never links any codec this crate does not
 # itself need.
 zip = { version = "8.6", features = ["deflate", "aes-crypto"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# PDF rasterization runs only in an independently resource-limited process.
+# MIT/Apache-2.0; no native PDF engine or embedded actions/scripts.
+hayro = { version = "=0.8.0", default-features = false, features = ["embed-fonts", "embed-cmaps"] }

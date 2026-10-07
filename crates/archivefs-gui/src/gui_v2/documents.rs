@@ -199,6 +199,7 @@ impl DocumentUnavailableReason {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct GameDocument {
+    pub(crate) document_id: Option<archivefs_core::manual_document::ManualDocumentId>,
     pub(crate) path: PathBuf,
     pub(crate) format: GameDocumentFormat,
     pub(crate) kind: GameDocumentKind,
@@ -235,9 +236,18 @@ impl GameDocument {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct DocumentReadingState {
+    pub(crate) document_id: Option<archivefs_core::manual_document::ManualDocumentId>,
+    pub(crate) fit_mode: Option<DocumentFitMode>,
     pub(crate) last_page: Option<usize>,
     pub(crate) zoom_percent: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum DocumentFitMode {
+    Page,
+    Width,
 }
 
 #[allow(dead_code)]
@@ -434,7 +444,7 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                 continue;
             }
             let format = GameDocumentFormat::from_path(&canonical);
-            let (page_count, viewer, format, readiness, refusal_reason) =
+            let (page_count, viewer, format, readiness, refusal_reason, document_id) =
                 inspect_capability(&canonical, format);
             let title = path
                 .file_stem()
@@ -443,6 +453,7 @@ pub(crate) fn discover_documents(request: DocumentDiscoveryRequest<'_>) -> Vec<G
                 .replace(['_', '-'], " ");
             let association_reason = association.label().to_string();
             candidates.entry(canonical.clone()).or_insert(GameDocument {
+                document_id,
                 path: canonical,
                 format,
                 kind: infer_kind(&title),
@@ -530,6 +541,7 @@ fn inspect_capability(
     GameDocumentFormat,
     Option<ManualReadiness>,
     Option<String>,
+    Option<archivefs_core::manual_document::ManualDocumentId>,
 ) {
     match inspect_manual(path, &ManualLimits::default()) {
         Ok(inspection) => {
@@ -549,6 +561,7 @@ fn inspect_capability(
                 format,
                 Some(inspection.readiness),
                 reason,
+                Some(inspection.id),
             )
         }
         Err(error) => (
@@ -561,6 +574,7 @@ fn inspect_capability(
             GameDocumentFormat::Unknown,
             None,
             Some(error.user_message().to_string()),
+            None,
         ),
     }
 }
@@ -597,6 +611,25 @@ fn external_handler_available() -> bool {
         return true;
     }
     handler_on_path(std::env::var_os("PATH").as_deref(), opener_program_name())
+}
+
+pub(super) fn validate_external_document(
+    path: &Path,
+    expected: &archivefs_core::manual_document::ManualDocumentId,
+) -> Result<(), String> {
+    if !path.is_absolute() || path != expected.path {
+        return Err("The selected document path does not match its inspected identity.".into());
+    }
+    expected
+        .check_path()
+        .map_err(|error| error.user_message().to_owned())
+}
+
+pub(super) fn external_capability(
+    path: &Path,
+    format: GameDocumentFormat,
+) -> DocumentOpenCapability {
+    document_open_capability_with(path, format, external_handler_available())
 }
 
 /// General open-capability projection: applies to any externally-opened
@@ -665,7 +698,8 @@ pub(crate) fn project_romm_manual_document(
         return Err(DocumentUnavailableReason::NoLongerAvailable);
     }
     let format = GameDocumentFormat::from_path(&path);
-    let (page_count, viewer, format, readiness, refusal_reason) = inspect_capability(&path, format);
+    let (page_count, viewer, format, readiness, refusal_reason, document_id) =
+        inspect_capability(&path, format);
     let association = match request.verified_identity {
         Some(identity) => {
             GameDocumentAssociation::ExactGameIdentity(ExactIdentityEvidence::from(identity))
@@ -682,6 +716,7 @@ pub(crate) fn project_romm_manual_document(
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     Ok(GameDocument {
+        document_id,
         kind: infer_kind(&title),
         title,
         platform: Some(request.platform.to_string()),
@@ -740,6 +775,7 @@ pub(crate) fn resolve_strongest_document(
     Ok(first)
 }
 
+#[cfg(test)]
 pub(crate) fn safe_resume_page(
     state: Option<&DocumentReadingState>,
     page_count: Option<usize>,
@@ -958,6 +994,7 @@ mod tests {
         let state = DocumentReadingState {
             last_page: Some(9),
             zoom_percent: None,
+            ..Default::default()
         };
         assert_eq!(safe_resume_page(Some(&state), Some(8)), None);
         assert_eq!(safe_resume_page(Some(&state), Some(9)), Some(9));
@@ -1167,6 +1204,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let evidence = identity();
         let one = GameDocument {
+            document_id: None,
             path: dir.path().join("a.pdf"),
             format: GameDocumentFormat::Pdf,
             kind: GameDocumentKind::Manual,
@@ -1306,6 +1344,7 @@ mod tests {
             DocumentReadingState {
                 last_page: Some(3),
                 zoom_percent: None,
+                ..Default::default()
             },
         );
         assert_eq!(

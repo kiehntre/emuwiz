@@ -114,6 +114,7 @@ fn fixture(context: &egui::Context) -> App {
         hackhash: super::hackhash::HackHashPageState::default(),
         romm_library: super::romm_library::RommBrowserState::default(),
         romm_library_job: None,
+        manual_viewer: super::manual_viewer::ManualViewer::default(),
         document_preferences: super::documents::DocumentPreferences::default(),
         document_cache: None,
         setup_portability: super::setup_portability::SetupPortabilityState::default(),
@@ -8558,3 +8559,6 @@ mod library_files_check {
         );
     }
 }
+
+#[path = "manual_viewer/app_tests.rs"]
+mod manual_viewer_app_tests;

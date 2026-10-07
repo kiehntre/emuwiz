@@ -146,7 +146,10 @@ pub(super) enum Command {
         receipt: PathBuf,
     },
     OpenFolder(PathBuf),
-    OpenDocument(PathBuf),
+    OpenDocument {
+        path: PathBuf,
+        expected: archivefs_core::manual_document::ManualDocumentId,
+    },
     Save(Preferences),
     Restore,
     PlayingLibraryPreview {
@@ -732,12 +735,8 @@ fn execute(id: u64, command: Command, answers: &Sender<Event>) -> Result<Payload
             crate::open_folder_in_file_manager(folder).map_err(|error| error.to_string())?;
             Ok(Payload::Done)
         }
-        Command::OpenDocument(path) => {
-            let metadata = fs::metadata(&path)
-                .map_err(|error| format!("The document is unavailable: {error}"))?;
-            if !metadata.is_file() || !path.is_absolute() {
-                return Err("The document path is not a regular absolute file.".into());
-            }
+        Command::OpenDocument { path, expected } => {
+            super::documents::validate_external_document(&path, &expected)?;
             archivefs_core::identity_source::romm::manual::DesktopManualOpener
                 .open(&path)
                 .map_err(|error| error.to_string())?;

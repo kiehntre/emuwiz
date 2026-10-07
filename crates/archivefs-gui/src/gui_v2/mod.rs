@@ -23,6 +23,7 @@ pub(crate) mod library;
 mod library_failure;
 mod library_reconciliation;
 mod mame_collection_health;
+mod manual_viewer;
 mod media_sets;
 mod media_sources;
 mod missing_review;
@@ -74,6 +75,18 @@ pub const GUI_GENERATION: &str = "native-v2";
 
 /// Run the native EmuWiz GUI v2 application.
 pub fn run() -> eframe::Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == archivefs_core::manual_document::pdf_render::HELPER_ARGUMENT)
+    {
+        std::process::exit(
+            if archivefs_core::manual_document::pdf_render::run_helper().is_ok() {
+                0
+            } else {
+                1
+            },
+        );
+    }
     crate::init_logging();
     let args: Vec<_> = std::env::args_os().collect();
     if args.iter().any(|arg| arg == "--version") {
@@ -326,6 +339,7 @@ pub(super) struct App {
     hackhash: hackhash::HackHashPageState,
     romm_library: romm_library::RommBrowserState,
     romm_library_job: Option<u64>,
+    manual_viewer: manual_viewer::ManualViewer,
     document_preferences: documents::DocumentPreferences,
     document_cache: Option<(i64, std::path::PathBuf, Vec<documents::GameDocument>)>,
     setup_portability: setup_portability::SetupPortabilityState,
@@ -415,6 +429,7 @@ impl App {
             hackhash: hackhash::HackHashPageState::new(),
             romm_library: romm_library::RommBrowserState::default(),
             romm_library_job: None,
+            manual_viewer: manual_viewer::ManualViewer::default(),
             document_preferences: documents::DocumentPreferences::default(),
             document_cache: None,
             setup_portability: setup_portability::SetupPortabilityState::default(),

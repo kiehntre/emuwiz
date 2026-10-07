@@ -11,8 +11,8 @@
 //!   checked arithmetic, and refused before memory or disk can be exhausted.
 //! * CBZ pages are read on demand, one member at a time; nothing is extracted.
 //! * PDF is inspected structurally (page count, metadata, encryption, active
-//!   content flags). There is no PDF renderer in the workspace, so rendering is
-//!   an explicit capability gap ([`ManualReadiness::InspectOnly`]).
+//!   content flags). Inspection alone is [`ManualReadiness::InspectOnly`];
+//!   the separately isolated [`pdf_render`] backend renders on supported hosts.
 //! * CBR is recognised by signature but reported as unsupported: reading RAR
 //!   needs a decompressor that is not a dependency, and no unsupervised tool is
 //!   spawned.
@@ -20,6 +20,7 @@
 mod detect;
 mod order;
 mod pdf;
+pub mod pdf_render;
 mod viewer_state;
 mod zip_pages;
 
@@ -314,7 +315,7 @@ impl ManualViewerError {
 /// What is missing for a format that is recognised but cannot be shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManualCapabilityGap {
-    /// No PDF page renderer is a workspace dependency.
+    /// This structural/content reader cannot rasterize PDF pages itself.
     PdfRenderer,
     /// No RAR reader/decompressor is a workspace dependency, and no tool is
     /// spawned without a supervised EmuWiz execution primitive.
@@ -326,7 +327,7 @@ impl ManualCapabilityGap {
     pub const fn detail(self) -> &'static str {
         match self {
             Self::PdfRenderer => {
-                "rendering PDF pages needs a PDF rendering library, which is not a dependency of this workspace"
+                "PDF rasterization uses the separate resource-limited rendering backend"
             }
             Self::RarReader => {
                 "reading RAR archives needs a RAR decompressor (a vetted crate or a supervised unrar tool), which is not available"
@@ -355,7 +356,7 @@ impl ManualReadiness {
 
 /// Identity of the exact file that was inspected, used to detect it changing
 /// before a later read and as the viewer's document identity.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ManualDocumentId {
     pub path: PathBuf,
     pub len: u64,
@@ -381,6 +382,26 @@ impl ManualDocumentId {
             #[cfg(not(unix))]
             device_inode: None,
         }
+    }
+
+    /// Check the current regular source path against this metadata fingerprint.
+    /// This detects ordinary replacements/changes; it is not a content hash.
+    pub fn check_path(&self) -> Result<(), ManualViewerError> {
+        let (file, metadata) = open_regular(&self.path)?;
+        let path_metadata =
+            fs::symlink_metadata(&self.path).map_err(|e| ManualViewerError::Io(e.to_string()))?;
+        if !path_metadata.is_file()
+            || !self.still_matches(&metadata)
+            || !self.still_matches(&path_metadata)
+            || !self.still_matches(
+                &file
+                    .metadata()
+                    .map_err(|e| ManualViewerError::Io(e.to_string()))?,
+            )
+        {
+            return Err(ManualViewerError::SourceChanged);
+        }
+        Ok(())
     }
 
     fn still_matches(&self, metadata: &fs::Metadata) -> bool {
@@ -568,6 +589,11 @@ impl ManualDocument {
     #[must_use]
     pub fn id(&self) -> &ManualDocumentId {
         &self.inspection.id
+    }
+
+    /// Revalidate the inspected source without interpreting its contents.
+    pub fn check_unchanged(&self) -> Result<(), ManualViewerError> {
+        self.id().check_path()
     }
 
     /// Walk a PDF's page tree on demand, checking every subtree's declared

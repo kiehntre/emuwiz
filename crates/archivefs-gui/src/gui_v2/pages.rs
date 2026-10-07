@@ -297,6 +297,9 @@ impl App {
         }
     }
     pub(super) fn show(&mut self, context: &egui::Context) {
+        if self.show_manual_viewer(context) {
+            return;
+        }
         let modal_open = self.confirm_scan
             || self.repair_confirm
             || self.undo_confirm.is_some()
@@ -2712,48 +2715,9 @@ impl App {
                         ui.label("Needs review · this document is nearby or its filename resembles the game; ownership is not confirmed.");
                     }
                 }
-                if let Some(page) = super::documents::safe_resume_page(
-                    self.document_preferences.reading.get(&document.path),
-                    document.page_count,
-                ) {
-                    ui.label(format!("Resume at page {page}"));
-                }
-                if let Some(page_count) = document.page_count {
-                    let mut resume_page = self
-                        .document_preferences
-                        .reading
-                        .get(&document.path)
-                        .and_then(|state| state.last_page)
-                        .unwrap_or(1)
-                        .min(page_count);
-                    ui.horizontal(|ui| {
-                        ui.label("Resume page");
-                        if ui
-                            .add(egui::DragValue::new(&mut resume_page).range(1..=page_count))
-                            .changed()
-                        {
-                            let zoom_percent = self
-                                .document_preferences
-                                .reading
-                                .get(&document.path)
-                                .and_then(|state| state.zoom_percent);
-                            self.document_preferences.reading.insert(
-                                document.path.clone(),
-                                super::documents::DocumentReadingState {
-                                    last_page: Some(resume_page),
-                                    zoom_percent,
-                                },
-                            );
-                            self.preferences_dirty = Some(std::time::Instant::now());
-                        }
-                    });
-                }
+                ui.weak(super::manual_viewer::capability_text(document.readiness));
                 ui.horizontal_wrapped(|ui| {
-                    let can_open = document.viewer == super::documents::DocumentOpenCapability::Supported;
-                    if ui.add_enabled(can_open, egui::Button::new("Open")).clicked() {
-                        let job = self.activity.queue("Opening local document", Route::Game(game_id), false);
-                        self.send(job, Command::OpenDocument(document.path.clone()));
-                    }
+                    self.manual_document_actions(ui, game_id, &document);
                     if document.association != super::documents::GameDocumentAssociation::Explicit
                         && ui.button("Associate").clicked()
                     {
@@ -2782,7 +2746,7 @@ impl App {
                     ui.monospace(format!("Path: {}", document.path.display()));
                     ui.label(format!("File size: {} bytes", document.file_size));
                     ui.label(format!("Association confidence: {}", document.association.label()));
-                    ui.label("Opening a document uses your desktop viewer; the source file is read-only to EmuWiz.");
+                    ui.label("Documents are read-only. Internal reading and external opening do not change the source file.");
                 });
                 });
             });
