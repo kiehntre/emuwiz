@@ -715,3 +715,119 @@ fn inspection_without_matching_evidence_never_reports_verified() {
     );
     fs::remove_dir_all(&fixture.root).unwrap();
 }
+
+// --- profile settings parsing and relative BIOS folders ------------------------------------------
+
+#[test]
+fn a_logging_bios_flag_is_not_a_bios_filename() {
+    // Every real DuckStation settings.ini has `[Logging] BIOS = true`.
+    let fixture = build_fixture(
+        "logging-bios",
+        "[Logging]\nBIOS = true\n[BIOS]\nSearchDirectory = bios\n",
+    );
+    let inspection = inspection_for(&fixture, "SLUS-12345");
+    assert_eq!(
+        inspection.bios.configured_path, None,
+        "{:?}",
+        inspection.bios
+    );
+    assert_eq!(
+        inspection
+            .global_config
+            .settings
+            .unknown
+            .get("logging.bios")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(inspection.global_config.settings.bios_filename.is_none());
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn the_legacy_bare_bios_filename_alias_still_works_in_its_own_section() {
+    let fixture = build_fixture("legacy-bios", "[BIOS]\nBIOS = scph1001.bin\n");
+    let inspection = inspection_for(&fixture, "SLUS-12345");
+    assert_eq!(
+        inspection.global_config.settings.bios_filename.as_deref(),
+        Some("scph1001.bin")
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn a_relative_search_directory_is_resolved_against_the_profile_root() {
+    let fixture = build_fixture(
+        "relative-search",
+        "[BIOS]\nBIOSFilename=my-bios.bin\nSearchDirectory=custom-bios\n",
+    );
+    let bios_dir = fixture.profile.configuration_path.join("custom-bios");
+    write_bios(&bios_dir, "my-bios.bin", BIOS_BYTES);
+    let inspection = inspection_for(&fixture, "SLUS-12345");
+    let evidence = vec![record_for("fixture", BIOS_BYTES)];
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &evidence);
+    let DuckStationBiosVerificationOutcome::Verified(verified) = outcome else {
+        panic!("expected Verified, got {outcome:?}");
+    };
+    assert_eq!(verified.path, bios_dir.join("my-bios.bin"));
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn a_relative_search_directory_does_not_depend_on_the_working_directory() {
+    // The folder exists only beside the profile root, not under the test's cwd.
+    let fixture = build_fixture(
+        "relative-cwd",
+        "[BIOS]\nBIOSFilename=missing-here.bin\nSearchDirectory=bios\n",
+    );
+    let inspection = inspection_for(&fixture, "SLUS-12345");
+    let outcome = resolve_duckstation_bios(&fixture.profile, &inspection, &[]);
+    // Missing - but looked up under the profile's own bios folder.
+    assert!(
+        matches!(outcome, DuckStationBiosVerificationOutcome::Missing),
+        "{outcome:?}"
+    );
+    fs::remove_dir_all(&fixture.root).unwrap();
+}
+
+#[test]
+fn an_absolute_search_directory_is_used_as_is() {
+    let fixture = build_fixture("absolute-search", "");
+    let elsewhere = fixture.root.join("elsewhere-bios");
+    write_bios(&elsewhere, "my-bios.bin", BIOS_BYTES);
+    write_global(
+        &fixture.profile.configuration_path,
+        &format!(
+            "[BIOS]\nBIOSFilename=my-bios.bin\nSearchDirectory={}\n",
+            elsewhere.display()
+        ),
+    );
+    let fixture = Fixture {
+        profile: discover_duckstation_profiles(&DuckStationProfileDiscoveryRoots {
+            home: fixture.root.join("home"),
+            xdg_config_home: fixture.root.join("home"),
+            xdg_data_home: fixture.root.join("data"),
+            xdg_config_home_explicit: false,
+            explicit_configuration_roots: vec![fixture.profile.configuration_path.clone()],
+            portable_configuration_roots: Vec::new(),
+            explicit_executables: Vec::new(),
+            known_version_outputs: BTreeMap::new(),
+            appimage_directory: None,
+            path_override: Some(Vec::new()),
+        })
+        .profiles
+        .into_iter()
+        .find(|profile| profile.eligible)
+        .unwrap(),
+        root: fixture.root,
+    };
+    let inspection = inspection_for(&fixture, "SLUS-12345");
+    let evidence = vec![record_for("fixture", BIOS_BYTES)];
+    let DuckStationBiosVerificationOutcome::Verified(verified) =
+        resolve_duckstation_bios(&fixture.profile, &inspection, &evidence)
+    else {
+        panic!("expected Verified");
+    };
+    assert_eq!(verified.path, elsewhere.join("my-bios.bin"));
+    fs::remove_dir_all(&fixture.root).unwrap();
+}

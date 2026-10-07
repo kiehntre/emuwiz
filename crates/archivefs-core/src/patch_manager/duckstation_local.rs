@@ -896,7 +896,11 @@ fn apply_setting(settings: &mut DuckStationSettings, section: &str, key: &str, v
         "biosdirectory" | "bios_directory" | "bios_path" => {
             settings.bios_directory = Some(value.to_string())
         }
-        "biosfilename" | "bios_filename" | "bios" => {
+        "biosfilename" | "bios_filename" => settings.bios_filename = Some(value.to_string()),
+        // A bare `BIOS` key is only a legacy filename alias in a section that
+        // can hold one. DuckStation's own `[Logging] BIOS = true` is a log
+        // category flag and must never be read as a BIOS file called `true`.
+        "bios" if matches!(section, "" | "bios" | "main") => {
             settings.bios_filename = Some(value.to_string())
         }
         "memorycardmode" | "memory_card_mode" => {

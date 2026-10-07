@@ -237,7 +237,7 @@ fn configured_bios_directory(
     profile: &DuckStationProfile,
     settings: &DuckStationSettings,
 ) -> PathBuf {
-    settings
+    let configured = settings
         .bios_directory
         .as_deref()
         .filter(|value| !value.is_empty())
@@ -248,8 +248,14 @@ fn configured_bios_directory(
                 .map(String::as_str)
                 .filter(|value| !value.is_empty())
         })
-        .map(PathBuf::from)
-        .unwrap_or_else(|| profile.bios_path.clone())
+        .map(PathBuf::from);
+    match configured {
+        // DuckStation joins a relative folder to its data root, never to the
+        // process working directory.
+        Some(directory) if directory.is_relative() => profile.configuration_path.join(directory),
+        Some(directory) => directory,
+        None => profile.bios_path.clone(),
+    }
 }
 
 /// One config's generic single-BIOS selection (`[BIOS] BIOSFilename`),
