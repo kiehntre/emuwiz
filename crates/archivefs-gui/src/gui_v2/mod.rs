@@ -1577,6 +1577,7 @@ impl App {
                                     organisations,
                                     mame_reconstructions,
                                 } => {
+                                    self.history_view.built_for = None;
                                     self.repair_history = duplicates;
                                     self.playing_library_history = playing_libraries;
                                     self.canonical_organisation_history = organisations;

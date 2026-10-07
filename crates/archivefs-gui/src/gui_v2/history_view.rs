@@ -653,6 +653,19 @@ impl StatusFilter {
     }
 }
 
+/// Keeps the immutable catalogue snapshot alive without dumping the library.
+#[derive(Clone)]
+struct LibrarySnapshot(std::sync::Arc<Library>);
+
+impl std::fmt::Debug for LibrarySnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LibrarySnapshot")
+            .field(&std::sync::Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
 /// Presentation state only. Nothing here is written to any journal.
 #[derive(Clone, Debug, Default)]
 pub(super) struct HistoryViewState {
@@ -663,6 +676,8 @@ pub(super) struct HistoryViewState {
     /// Cached model and the cheap fingerprint it was built from.
     pub entries: Vec<HistoryEntry>,
     pub built_for: Option<u64>,
+    /// Retain the snapshot so allocation reuse cannot disguise a library reload.
+    built_library: Option<LibrarySnapshot>,
     /// Safety previews the person asked for, by transaction id.
     pub previews: BTreeMap<String, UndoPreview>,
     pub confirm_undo: Option<String>,
@@ -954,6 +969,13 @@ pub(super) fn fingerprint(sources: &HistorySources<'_>, library_games: usize) ->
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     library_games.hash(&mut hasher);
+    (
+        sources.quarantine.len(),
+        sources.playing_library.len(),
+        sources.organisation.len(),
+        sources.mame.len(),
+    )
+        .hash(&mut hasher);
     let mut add = |transaction: &RenameTransaction| {
         transaction.transaction_id.hash(&mut hasher);
         std::mem::discriminant(&transaction.state).hash(&mut hasher);
@@ -1130,21 +1152,51 @@ impl super::App {
             mame: &self.organisation.mame_history,
         };
         let key = fingerprint(&sources, self.library.games.len());
-        if self.history_view.built_for == Some(key) {
+        if self.history_view.built_for == Some(key)
+            && self
+                .history_view
+                .built_library
+                .as_ref()
+                .is_some_and(|snapshot| std::sync::Arc::ptr_eq(&snapshot.0, &self.library))
+        {
             return;
         }
         let entries = build_entries(&sources, Some(&self.library));
-        self.history_view.entries = entries;
+        let previous = std::mem::replace(&mut self.history_view.entries, entries);
+        self.history_view.built_library = Some(LibrarySnapshot(self.library.clone()));
         self.history_view.built_for = Some(key);
-        let known: HashSet<&str> = self
+        let previous: HashMap<_, _> = previous
+            .iter()
+            .map(|entry| {
+                (
+                    (entry.source, entry.transaction_id.as_str()),
+                    &entry.transaction,
+                )
+            })
+            .collect();
+        let valid: HashSet<&str> = self
             .history_view
             .entries
             .iter()
+            .filter(|entry| matches!(entry.undo, UndoStatus::Available))
+            .filter(|entry| {
+                previous
+                    .get(&(entry.source, entry.transaction_id.as_str()))
+                    .is_some_and(|old| *old == &entry.transaction)
+            })
             .map(|entry| entry.transaction_id.as_str())
             .collect();
         self.history_view
             .previews
-            .retain(|id, _| known.contains(id.as_str()));
+            .retain(|id, _| valid.contains(id.as_str()));
+        if self
+            .history_view
+            .confirm_undo
+            .as_ref()
+            .is_some_and(|id| !valid.contains(id.as_str()))
+        {
+            self.history_view.confirm_undo = None;
+        }
     }
 }
 
@@ -1331,10 +1383,11 @@ fn show_preview(
                 ui.label(format!("Blocked: {}", blocker.describe()));
             }
         }
+        ui.label("This preview checks recorded metadata, link targets or presence only. The owning workflow repeats its full verification before undo changes any files.");
         for warning in &preview.warnings {
             ui.label(format!("Note: {warning}"));
         }
-        if preview.safe() {
+        if preview.safe() && matches!(entry.undo, UndoStatus::Available) {
             match entry.source {
                 Source::DuplicateQuarantine => {
                     if ui.button(RichText::new("Undo").strong()).clicked() {

@@ -8610,6 +8610,84 @@ mod history_page {
     }
 
     #[test]
+    fn a_same_count_library_reload_rebuilds_exact_game_associations() {
+        let mut app = app_with(vec![tx(
+            "reload",
+            TransactionState::Applied,
+            renames(1, EntryState::Applied),
+        )]);
+        let make_library = |path: &str| {
+            let mut record = archive(7, "Recorded game", Some("Game Boy Advance"));
+            record.absolute_path = path.into();
+            Arc::new(Library::new(vec![record]))
+        };
+        app.library = make_library("/library/New 0.gba");
+        page_text(&mut app);
+        assert_eq!(app.history_view.entries[0].games.len(), 1);
+        app.library = make_library("/unrelated/other.gba");
+        page_text(&mut app);
+        assert!(app.history_view.entries[0].games.is_empty());
+    }
+
+    #[test]
+    fn rolled_back_receipts_clear_cached_previews_and_confirmation() {
+        let mut app = app_with(vec![tx(
+            "undone-preview",
+            TransactionState::Applied,
+            renames(1, EntryState::Applied),
+        )]);
+        page_text(&mut app);
+        let model = app.history_view.entries[0].clone();
+        app.history_view.previews.insert(
+            model.transaction_id.clone(),
+            crate::gui_v2::history_view::UndoPreview {
+                operation: model.summary,
+                target: None,
+                will_change: vec![],
+                receipt: "synthetic receipt".into(),
+                checked: 1,
+                not_checked: 0,
+                blockers: vec![],
+                warnings: vec![],
+            },
+        );
+        app.history_view.confirm_undo = Some("undone-preview".into());
+        app.canonical_organisation_history[0].state = TransactionState::RolledBack;
+        let shown = page_text(&mut app);
+        assert!(shown.contains("Already undone"));
+        assert!(!shown.contains("Undo preview - nothing has been changed"));
+        assert!(app.history_view.previews.is_empty());
+        assert!(app.history_view.confirm_undo.is_none());
+    }
+
+    #[test]
+    fn a_reloaded_receipt_refreshes_same_id_state_and_length() {
+        let mut app = app_with(vec![tx(
+            "same-receipt",
+            TransactionState::ApplyFailed,
+            renames(1, EntryState::ApplyFailed),
+        )]);
+        page_text(&mut app);
+        let mut replacement = app.canonical_organisation_history[0].clone();
+        replacement.entries[0].failure_reason = Some("New recorded refusal".into());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.backend.rx = receiver;
+        sender
+            .send(backend::Event::Finished {
+                id: 91,
+                outcome: Ok(backend::Payload::RepairHistory {
+                    duplicates: vec![],
+                    playing_libraries: vec![],
+                    organisations: vec![replacement],
+                    mame_reconstructions: vec![],
+                }),
+            })
+            .unwrap();
+        app.poll(&egui::Context::default());
+        assert!(page_text(&mut app).contains("New recorded refusal"));
+    }
+
+    #[test]
     fn empty_causes_render_their_own_distinct_messages() {
         let mut app = app_with(Vec::new());
         assert!(page_text(&mut app).contains("No history yet"));
