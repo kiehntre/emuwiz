@@ -2874,9 +2874,11 @@ fn quote_config_string(value: &str) -> String {
 /// the existing 0666/umask creation policy without changing process-wide umask.
 ///
 /// Observed staging-name substitution refuses publication and cleanup. This is
-/// still pathname-based replacement: it does not pin parent directories, lock
-/// competing writers, or eliminate hostile same-UID check/use races. Parent
-/// directory sync is best effort, so success is not universal crash durability.
+/// parent-bound: entry checks, create, rename and unlink use one directory fd.
+/// Observed parent rebinding refuses publication; if detected after rename, an
+/// error explicitly reports publication in the pinned original directory.
+/// This does not lock writers or eliminate hostile same-UID leaf check/use
+/// races. Directory sync is best effort, not universal crash durability.
 pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
     atomic_text::write(path, contents)
 }

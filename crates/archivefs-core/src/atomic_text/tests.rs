@@ -1,6 +1,9 @@
 //! Synthetic Unix fixtures. Hooks inject scheduling and syscall failures only
 //! in the unit-test build; exclusive creation still uses the real allocator.
 
+mod parent_boundary;
+mod pinned_parent;
+
 use super::{Event, write};
 use std::cell::{Cell, RefCell};
 use std::fs;
