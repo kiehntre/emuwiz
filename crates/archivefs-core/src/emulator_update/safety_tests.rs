@@ -397,7 +397,9 @@ fn safety_legacy_journals_have_conservative_ordering_compatibility() {
     }
     fs::write(j.record_path().unwrap(), serde_json::to_vec(&old).unwrap()).unwrap();
     let records = discover_update_records(&f.installation.installation_root);
-    assert_eq!(actionable_undo(&records, &j.target_path), Some(j.clone()));
+    // Policy: ownership evidence is required to execute Undo, so a legacy record
+    // is never offered (it was offered on content equality alone before).
+    assert_eq!(actionable_undo(&records, &j.target_path), None);
     let mut duplicate = records[0].clone();
     duplicate.path = duplicate.path.with_extension("duplicate");
     let mut many = records;

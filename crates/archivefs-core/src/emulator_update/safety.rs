@@ -1,5 +1,5 @@
 //! Filesystem capabilities for the existing single-executable updater.
-//! Locks are persistent directory entries; only the kernel releases ownership.
+//! The installation lock is a kernel flock on the directory inode itself.
 //! Recovery never unlinks a journal-supplied executable or staging pathname.
 use super::*;
 use crate::catalogue_health::SourceRootBinding;
@@ -50,7 +50,19 @@ fn absolute(path: &Path) -> Result<(), UpdateExecutionError> {
 fn supported_lock_storage(kind: libc::c_long, flags: libc::c_long) -> bool {
     matches!(kind as u64, 0xef53 | 0x9123_683e | 0x0102_1994) && flags & 0x4000_0000 == 0
 }
+#[cfg(test)]
+thread_local! {
+    /// Deterministic seam: pretend the installation lives on storage whose
+    /// locking/aliasing semantics are not verified.
+    pub(super) static STORAGE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 fn check_lock_storage(parent: &File) -> Result<(), UpdateExecutionError> {
+    #[cfg(test)]
+    if STORAGE_UNSUPPORTED.with(|flag| flag.get()) {
+        return Err(bad(
+            "updates require verified case-sensitive local ext-family, Btrfs or tmpfs storage; other filesystems require review",
+        ));
+    }
     let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: writable statfs storage and a live directory descriptor.
     if unsafe { libc::fstatfs(parent.as_raw_fd(), info.as_mut_ptr()) } != 0 {
@@ -172,61 +184,95 @@ pub(super) fn move_entry(source: &Path, destination: &Path) -> Result<(), Update
     a.sync().and_then(|_| b.sync()).map_err(|e| UpdateExecutionError::NeedsReconciliation(format!("entry moved but directory durability is uncertain ({e}); inspect/recover the recorded operation")))
 }
 
+/// Exclusion for one installation directory, held by the kernel.
+///
+/// The lock is an advisory `flock` on the **pinned installation directory's own
+/// inode**, not on a file that lives in it. There is therefore no lock pathname
+/// that another process (or a mistake) could rename, replace or unlink to make
+/// a second operation believe it holds exclusive ownership: every opener of the
+/// directory inode, through any path, conflicts. The kernel drops the lock when
+/// the holder's descriptor closes, including on process death.
+///
+/// Guarantees, honestly bounded:
+/// * two operations on the SAME directory inode exclude each other;
+/// * replacing or renaming the directory itself does not transfer the lock - the
+///   new directory is a different inode, its journals/executables are different
+///   entries, and `check()` makes the holder stop because the path no longer
+///   names the locked inode;
+/// * hard-linked executable aliases in other directories are NOT covered by this
+///   lock; they are refused outright (`require_single_link`);
+/// * network, FUSE and case-folding storage is refused (`check_lock_storage`).
 pub(super) struct TargetLock {
-    _file: File,
-    slot: Slot,
-    identity: (u64, u64),
+    directory: File,
     parent_path: PathBuf,
 }
 impl TargetLock {
     pub(super) fn check(&self) -> Result<(), UpdateExecutionError> {
-        let current_parent = pin_directory(&self.parent_path)?
+        let current = pin_directory(&self.parent_path)?
             .metadata()
             .map_err(io_err)?;
-        let pinned_parent = self.slot.parent.metadata().map_err(io_err)?;
-        if (current_parent.dev(), current_parent.ino())
-            != (pinned_parent.dev(), pinned_parent.ino())
-        {
-            return Err(bad("locked target directory was replaced"));
-        }
-        let now = fs::symlink_metadata(self.slot.path()).map_err(io_err)?;
-        if !now.is_file() || (now.dev(), now.ino()) != self.identity {
+        let held = self.directory.metadata().map_err(io_err)?;
+        if (current.dev(), current.ino()) != (held.dev(), held.ino()) {
             return Err(UpdateExecutionError::Concurrent(
-                "the kernel lock's directory entry changed; nothing further may be mutated".into(),
+                "the locked installation directory was replaced; nothing further may be mutated"
+                    .into(),
             ));
         }
         Ok(())
     }
 }
-// File closure releases flock, including on process death. Never unlink a lock:
-// unlinking lets a second process lock a different inode under the same name.
-pub(super) fn acquire(target: &Path) -> Result<TargetLock, UpdateExecutionError> {
-    let name = target
-        .file_name()
-        .ok_or_else(|| bad("target has no filename"))?;
-    let hash = Sha256::digest(name.as_bytes());
-    let key: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    let slot = Slot::open(&target.with_file_name(format!(".emuwiz-update-lock-{key}")))?;
-    check_lock_storage(&slot.parent)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(slot.path())
-        .map_err(io_err)?;
-    let m = file.metadata().map_err(io_err)?;
-    if !m.is_file() || m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
-        return Err(bad("unsafe lock ownership or kind"));
+/// Refuses unsupported storage with no observable side effect. Callable before
+/// any directory is created.
+pub(super) fn require_supported_storage(directory: &Path) -> Result<(), UpdateExecutionError> {
+    check_lock_storage(&pin_directory(directory)?)
+}
+/// Executables with several names cannot be excluded by any per-directory lock,
+/// and moving one name leaves the others pointing at the same bytes. Refuse.
+pub(super) fn require_single_link(path: &Path) -> Result<(), UpdateExecutionError> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() && m.nlink() > 1 => Err(UpdateExecutionError::UnsafeTarget(format!(
+            "{} has {} hard links; an executable with several names cannot be updated or restored safely, so nothing was changed",
+            path.display(),
+            m.nlink()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(e)),
     }
-    // SAFETY: the descriptor is live; nonblocking exclusive advisory flock.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+}
+pub(super) fn acquire(target: &Path) -> Result<TargetLock, UpdateExecutionError> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| bad("target has no directory"))?;
+    let directory = pin_directory(parent)?;
+    check_lock_storage(&directory)?;
+    let m = directory.metadata().map_err(io_err)?;
+    if m.uid() != unsafe { libc::geteuid() } || m.mode() & 0o022 != 0 {
+        return Err(bad("installation directory is not privately owned"));
+    }
+    // flock belongs to the open file description. A multi-threaded process that
+    // forks (to spawn any helper) holds a CLOEXEC copy of every descriptor until
+    // its exec, so a lock that was just released can stay held for that short
+    // window. A bounded wait absorbs it; a genuinely live holder still ends in
+    // `Concurrent`, and the wait grants nothing the kernel has not released.
+    let started = std::time::Instant::now();
+    let failure = loop {
+        // SAFETY: the descriptor is live; nonblocking exclusive advisory flock.
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break None;
+        }
         let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock
+            || started.elapsed() >= std::time::Duration::from_millis(300)
+        {
+            break Some(error);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    if let Some(error) = failure {
         return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
             UpdateExecutionError::Concurrent(
-                "the installation target is locked by a live Apply, Undo or recovery operation"
+                "the installation directory is locked by a live Apply, Undo or recovery operation"
                     .into(),
             )
         } else {
@@ -234,10 +280,8 @@ pub(super) fn acquire(target: &Path) -> Result<TargetLock, UpdateExecutionError>
         });
     }
     let guard = TargetLock {
-        _file: file,
-        slot,
-        identity: (m.dev(), m.ino()),
-        parent_path: target.parent().unwrap().into(),
+        directory,
+        parent_path: parent.into(),
     };
     guard.check()?;
     Ok(guard)

@@ -202,3 +202,162 @@ fn terminal_disk_conflict_is_visible_after_restart_and_not_offered_as_undo() {
     assert!(page.records[0].needs_attention());
     assert!(actionable_undo(&page.records, &j.target_path).is_none());
 }
+
+fn rendered(page: &mut EmulatorInventoryPageState) -> String {
+    fn text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(t) => {
+                out.push_str(t.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| text(s, out)),
+            _ => {}
+        }
+    }
+    let ctx = egui::Context::default();
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| page.show(ui, false));
+    });
+    let mut out = String::new();
+    for shape in &output.shapes {
+        text(&shape.shape, &mut out);
+    }
+    out
+}
+
+#[test]
+fn undo_that_stops_after_the_executable_moved_requires_recovery_and_drops_the_stale_offer() {
+    let root = tempfile::tempdir().unwrap();
+    let (install, _, journal) = gui_fixture_update(root.path());
+    let mut page = EmulatorInventoryPageState::default();
+    let inventory = EmulatorInventory {
+        installations: vec![install.clone()],
+        ..Default::default()
+    };
+    page.refresh_with_inventory(inventory.clone(), vec![]);
+    page.review_undo_for(&install.executable_path);
+    assert_eq!(page.review_journal.as_ref(), Some(&journal));
+    page.rollback_confirmation = "ROLL BACK DOLPHIN".into();
+    // The emulator becomes unverifiable AFTER the published executable moved.
+    let calls = std::cell::Cell::new(0);
+    page.rollback_review_with(|| {
+        calls.set(calls.get() + 1);
+        if calls.get() >= 3 {
+            QuiescenceEvidence::Unknown
+        } else {
+            QuiescenceEvidence::Stopped
+        }
+    });
+    let message = page.error.clone().unwrap();
+    assert!(message.contains("RECOVERY REQUIRED"), "{message}");
+    assert!(message.contains("already moved"), "{message}");
+    assert!(
+        !message.contains("No executable was replaced"),
+        "a partial operation must not claim nothing changed: {message}"
+    );
+    // Stale snapshots and confirmations are gone; saved state was re-read.
+    assert!(page.review_journal.is_none() && page.review.is_none());
+    assert!(page.rollback_confirmation.is_empty() && page.confirmation.is_empty());
+    assert!(!journal.target_path.exists());
+    assert_eq!(page.records.len(), 1);
+    assert!(page.records[0].needs_attention());
+    assert!(actionable_undo(&page.records, &journal.target_path).is_none());
+    let shown = rendered(&mut page);
+    assert!(shown.contains("Recover (conservative)"), "{shown}");
+    assert!(!shown.contains("Review Undo"), "{shown}");
+
+    // Restart (a fresh page) shows the same obligation; recovery completes once
+    // and a repeat is a harmless no-op.
+    let record = journal.record_path().unwrap();
+    let mut restarted = EmulatorInventoryPageState::default();
+    restarted.refresh_with_inventory(inventory, vec![root.path().into()]);
+    assert!(restarted.records[0].needs_attention());
+    restarted.recover_record_with(&record, || QuiescenceEvidence::Stopped);
+    assert!(restarted.error.is_none(), "{:?}", restarted.error);
+    assert_eq!(
+        std::fs::read(&journal.target_path).unwrap(),
+        b"new emulator"
+    );
+    assert!(!restarted.records[0].needs_attention());
+    let saved = std::fs::read(&record).unwrap();
+    restarted.recover_record_with(&record, || QuiescenceEvidence::Stopped);
+    assert!(restarted.error.is_none());
+    assert_eq!(std::fs::read(&record).unwrap(), saved);
+    assert!(actionable_undo(&restarted.records, &journal.target_path).is_some());
+}
+
+#[test]
+fn legacy_records_show_no_undo_control_and_say_why() {
+    let root = tempfile::tempdir().unwrap();
+    let (install, _, journal) = gui_fixture_update(root.path());
+    let mut old = serde_json::to_value(&journal).unwrap();
+    for key in [
+        "sequence",
+        "root_binding",
+        "target_parent_binding",
+        "original_identity",
+        "staged_identity",
+    ] {
+        old.as_object_mut().unwrap().remove(key);
+    }
+    std::fs::write(
+        journal.record_path().unwrap(),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    let mut page = EmulatorInventoryPageState::default();
+    page.refresh_with_inventory(
+        EmulatorInventory {
+            installations: vec![install.clone()],
+            ..Default::default()
+        },
+        vec![],
+    );
+    assert!(actionable_undo(&page.records, &install.executable_path).is_none());
+    page.review_undo_for(&install.executable_path);
+    assert!(page.review_journal.is_none());
+    let shown = rendered(&mut page);
+    assert!(!shown.contains("Review Undo"), "{shown}");
+    assert!(shown.contains("Undo unavailable"), "{shown}");
+    assert_eq!(
+        std::fs::read(&install.executable_path).unwrap(),
+        b"new emulator"
+    );
+}
+
+#[test]
+fn unknown_process_visibility_is_labelled_differently_from_a_running_emulator() {
+    assert_ne!(
+        eligibility_label(UpdateExecutionEligibility::QuiescenceUnknown),
+        eligibility_label(UpdateExecutionEligibility::RunningBlocked)
+    );
+    assert!(
+        eligibility_label(UpdateExecutionEligibility::QuiescenceUnknown).contains("cannot verify")
+    );
+    use archivefs_core::emulator_inventory::BuildChannel;
+    use archivefs_core::emulator_update::UpdateMetadataSource;
+    let root = tempfile::tempdir().unwrap();
+    let (install, update, _) = gui_fixture_update(root.path());
+    let artifact = UpdateArtifact {
+        version: "2.0".into(),
+        channel: BuildChannel::Stable,
+        url: "https://example.invalid/synthetic".into(),
+        sha256: Some("09bd991b6e746a27e5b2305e09b52553dd10a6becc9dfc054566a8d5b09daedf".into()),
+        source: UpdateMetadataSource::OfficialReleaseApi,
+        provenance: "synthetic".into(),
+    };
+    let label = |evidence| {
+        eligibility_label(
+            plan_staged_update(&install, &update, artifact.clone(), evidence).eligibility,
+        )
+    };
+    assert_eq!(
+        label(QuiescenceEvidence::Running),
+        "Blocked: emulator is running"
+    );
+    assert!(label(QuiescenceEvidence::Unknown).contains("cannot verify"));
+    assert_ne!(
+        label(QuiescenceEvidence::Unknown),
+        label(QuiescenceEvidence::Running)
+    );
+}

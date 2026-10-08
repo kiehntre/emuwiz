@@ -164,15 +164,56 @@ impl EmulatorInventoryPageState {
                 self.review_journal = actionable_undo(&self.records, &journal.target_path);
             }
             Err(error) => {
+                // A failure may have followed a real change on disk: reload the
+                // saved evidence and drop every snapshot that could authorise a
+                // later action, then report from the fresh state.
+                let root = review.installation.installation_root.clone();
+                self.reload_after_failed_operation(&root);
                 self.feedback = None;
                 self.error = Some(update_error_message(&error));
-                self.review = None;
-                self.confirmation.clear();
             }
         }
     }
 
+    /// After any failed Apply/Undo: re-read the durable records for the affected
+    /// installation, and discard the review, the Undo snapshot and both typed
+    /// confirmations so nothing stale can authorise a different action.
+    fn reload_after_failed_operation(&mut self, root: &std::path::Path) {
+        let mut roots: Vec<std::path::PathBuf> = self
+            .records
+            .iter()
+            .filter_map(|e| {
+                e.path
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .map(std::path::Path::to_path_buf)
+            })
+            .collect();
+        roots.push(root.to_path_buf());
+        roots.sort();
+        roots.dedup();
+        let inventory = self.inventory.clone().unwrap_or_default();
+        self.refresh_with_inventory(inventory, roots);
+        self.review = None;
+        self.review_journal = None;
+        self.confirmation.clear();
+        self.rollback_confirmation.clear();
+    }
+
     fn rollback_review(&mut self) {
+        let Some(journal) = self.review_journal.clone() else {
+            return;
+        };
+        let tracked = self.tracked_running;
+        let probed_record = journal.clone();
+        let evidence = move || {
+            QuiescenceEvidence::from_tracked_flag(tracked)
+                .combine(emulator_update::probe_update_quiescence(&probed_record))
+        };
+        self.rollback_review_with(evidence);
+    }
+
+    fn rollback_review_with(&mut self, evidence: impl FnMut() -> QuiescenceEvidence) {
         let Some(journal) = self.review_journal.clone() else {
             return;
         };
@@ -181,12 +222,6 @@ impl EmulatorInventoryPageState {
             self.error = Some(format!("Type {expected} exactly to confirm rollback."));
             return;
         }
-        let tracked = self.tracked_running;
-        let probed_record = journal.clone();
-        let evidence = move || {
-            QuiescenceEvidence::from_tracked_flag(tracked)
-                .combine(emulator_update::probe_update_quiescence(&probed_record))
-        };
         match rollback_staged_update(&journal, evidence) {
             Ok(restored) => {
                 let kept = restored
@@ -205,6 +240,12 @@ impl EmulatorInventoryPageState {
                 self.update_report = None;
             }
             Err(error) => {
+                let root = journal
+                    .target_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_default();
+                self.reload_after_failed_operation(&root);
                 self.feedback = None;
                 self.error = Some(update_error_message(&error));
             }
@@ -375,6 +416,19 @@ impl EmulatorInventoryPageState {
                         self.review_undo_for(&target);
                     }
                 });
+            } else if self.records.iter().any(|e| {
+                !e.superseded
+                    && e.journal.as_ref().is_ok_and(|j| {
+                        j.target_path == target
+                            && j.state == emulator_update::UpdateTransactionState::Published
+                            && !j.has_ownership_evidence()
+                    })
+            }) {
+                // Offering a control that cannot run would be untruthful.
+                ui.label(format!(
+                    "Undo unavailable for {}: this update record predates executable ownership receipts, so EmuWiz cannot prove which files are its own. Review it manually.",
+                    target.display()
+                ));
             }
         }
     }
@@ -583,7 +637,7 @@ fn update_artifact(
 fn update_error_message(error: &UpdateExecutionError) -> String {
     let state = match error {
         UpdateExecutionError::NeedsReconciliation(_) | UpdateExecutionError::Record(_) => {
-            "The operation may be partly applied; see the interrupted-update records below."
+            "RECOVERY REQUIRED: the operation may be partly applied. Use \"Recover (conservative)\" in the interrupted-update records below; no executable was deleted."
         }
         _ => "No executable was replaced or removed by this attempt.",
     };
@@ -608,6 +662,9 @@ fn eligibility_label(eligibility: UpdateExecutionEligibility) -> &'static str {
     match eligibility {
         UpdateExecutionEligibility::Ready => "Ready to update",
         UpdateExecutionEligibility::RunningBlocked => "Blocked: emulator is running",
+        UpdateExecutionEligibility::QuiescenceUnknown => {
+            "Blocked: cannot verify the emulator is stopped (some processes cannot be inspected)"
+        }
         UpdateExecutionEligibility::UnsupportedInstallType => {
             "Blocked: installation type is not managed by EmuWiz"
         }

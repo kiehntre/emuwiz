@@ -80,6 +80,9 @@ pub struct UpdateReport {
 pub enum UpdateExecutionEligibility {
     Ready,
     RunningBlocked,
+    /// Whether the emulator is running could not be established (for example
+    /// processes EmuWiz may not inspect). Distinct from a running emulator.
+    QuiescenceUnknown,
     UnsupportedInstallType,
     VersionUnknown,
     StaleMetadata,
@@ -195,6 +198,9 @@ pub enum UpdateExecutionError {
     Concurrent(String),
     /// The durable operation record is missing, corrupt or inconsistent.
     Record(String),
+    /// The executable itself is unsafe to mutate (for example several hard
+    /// links). Refused before anything was changed.
+    UnsafeTarget(String),
 }
 
 impl std::fmt::Display for UpdateExecutionError {
@@ -215,6 +221,7 @@ impl std::fmt::Display for UpdateExecutionError {
             ),
             Self::Concurrent(message) => write!(f, "another update is in progress: {message}"),
             Self::Record(message) => write!(f, "operation record problem: {message}"),
+            Self::UnsafeTarget(message) => write!(f, "update refused: {message}"),
         }
     }
 }
@@ -361,9 +368,11 @@ pub fn plan_staged_update(
         Ok(Observed::Hash(hash)) => hash,
         _ => String::new(),
     };
-    let eligibility = if quiescence != QuiescenceEvidence::Stopped {
-        // Unknown is not stopped.
+    let eligibility = if quiescence == QuiescenceEvidence::Running {
         UpdateExecutionEligibility::RunningBlocked
+    } else if quiescence == QuiescenceEvidence::Unknown {
+        // Unknown is not stopped, but it is not "running" either.
+        UpdateExecutionEligibility::QuiescenceUnknown
     } else if !matches!(
         installation.installation_type,
         InstallationType::AppImage | InstallationType::Portable | InstallationType::Managed
@@ -382,6 +391,7 @@ pub fn plan_staged_update(
     } else if target_sha256.is_empty()
         || artifact.url.is_empty()
         || !artifact.url.starts_with("https://")
+        || safety::require_single_link(&installation.executable_path).is_err()
     {
         UpdateExecutionEligibility::InvalidTarget
     } else if verification == UpdateVerificationLevel::Unverified {
@@ -558,6 +568,17 @@ fn crashed(state: UpdateTransactionState) -> Result<(), UpdateExecutionError> {
 }
 
 impl UpdateJournal {
+    /// Everything needed to prove, rather than guess, that the files on disk are
+    /// the ones this transaction handled. Records written before these receipts
+    /// existed lack them; hash equality alone never establishes ownership, so
+    /// such records are never executed or offered as Undo.
+    pub fn has_ownership_evidence(&self) -> bool {
+        self.sequence.is_some()
+            && self.root_binding.is_some()
+            && self.target_parent_binding.is_some()
+            && self.original_identity.is_some()
+            && self.staged_identity.is_some()
+    }
     fn directory(&self) -> Result<&Path, UpdateExecutionError> {
         self.rollback_path
             .parent()
@@ -611,6 +632,37 @@ fn acquire_lock(
     _transaction_id: &str,
 ) -> Result<safety::TargetLock, UpdateExecutionError> {
     safety::acquire(target)
+}
+
+/// An operation stopped after it had already moved an executable. Say so,
+/// keep the durable record in its in-flight state with the cause attached, and
+/// require recovery - never "nothing changed".
+fn partial_failure(
+    journal: &mut UpdateJournal,
+    operation: &str,
+    cause: &UpdateExecutionError,
+) -> UpdateExecutionError {
+    let message = format!(
+        "{operation} had already moved an executable when it stopped ({cause}); the operation is only partly applied and recovery is required. No executable was deleted."
+    );
+    journal.failure = Some(message.clone());
+    let _ = persist_journal(journal);
+    UpdateExecutionError::NeedsReconciliation(message)
+}
+
+/// A terminal state is recorded only when the files on disk agree with every
+/// recorded identity. Contradictory evidence stays recoverable/review-required.
+fn persist_verified_terminal(journal: &UpdateJournal) -> Result<(), UpdateExecutionError> {
+    if !terminal_consistent(journal)? {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "the resulting state contradicts the recorded executable identities; it was not recorded as complete and all evidence was preserved".into(),
+        ));
+    }
+    persist_journal(journal).map_err(|e| {
+        UpdateExecutionError::NeedsReconciliation(format!(
+            "the files are as recorded but the durable record could not be saved: {e}"
+        ))
+    })
 }
 
 fn mark_failed(journal: &mut UpdateJournal, state: UpdateTransactionState, why: &str) {
@@ -782,6 +834,9 @@ where
             "reviewed backup path is not derived from the installation and transaction".into(),
         ));
     }
+    // Refusals that need no filesystem change come BEFORE the first one.
+    safety::require_supported_storage(&paths.root)?;
+    safety::require_single_link(&plan.target_path)?;
     use std::os::unix::fs::DirBuilderExt;
     match fs::DirBuilder::new().mode(0o700).create(&paths.directory) {
         Ok(()) => sync_directory(&paths.root)?,
@@ -933,6 +988,9 @@ where
     }
     lock.check()?;
     paths.check()?;
+    if let Err(error) = safety::require_single_link(&plan.target_path) {
+        return Err(fail_before_publication(&mut journal, &staging, error));
+    }
     // Durable intent BEFORE replacing anything.
     journal.state = UpdateTransactionState::Applying;
     if let Err(error) = persist_journal(&journal) {
@@ -994,8 +1052,9 @@ where
         ));
     }
     crashed(UpdateTransactionState::BackupMoved)?;
-    lock.check()?;
-    paths.check()?;
+    if let Err(cause) = lock.check().and_then(|_| paths.check()) {
+        return Err(partial_failure(&mut journal, "Update", &cause));
+    }
     // Download ownership and bytes must still match immediately before publication.
     if !matches_file(&staging, &journal.published_sha256, journal.staged_identity)? {
         return Err(compensate(
@@ -1041,6 +1100,16 @@ where
     }
     journal.state = UpdateTransactionState::Published;
     journal.staged_path = None;
+    if !terminal_consistent(&journal).unwrap_or(false) {
+        let message = "the published state contradicts the recorded identities (target, backup or leftovers); it was not recorded as complete".to_string();
+        journal.state = UpdateTransactionState::BackupMoved;
+        mark_failed(
+            &mut journal,
+            UpdateTransactionState::NeedsReconciliation,
+            &message,
+        );
+        return Err(UpdateExecutionError::NeedsReconciliation(message));
+    }
     if let Err(error) = persist_journal(&journal) {
         // Published on disk, but the final record is missing.  The earlier
         // BackupMoved record plus the matching hashes let recovery finish.
@@ -1064,6 +1133,12 @@ where
 {
     let record = journal.record_path()?;
     let paths = safety::Paths::journal(&record, journal)?;
+    if !journal.has_ownership_evidence() {
+        return Err(UpdateExecutionError::Record(
+            "this record predates executable ownership receipts; Undo is refused because file contents alone cannot prove which executables are EmuWiz's. Nothing was changed"
+                .into(),
+        ));
+    }
     require_stopped(quiescence())?;
     let lock = acquire_lock(&paths.directory, &paths.target, &journal.transaction_id)?;
     let recorded = load_journal(&record)?;
@@ -1133,6 +1208,8 @@ where
     require_stopped(quiescence())?;
     lock.check()?;
     paths.check()?;
+    safety::require_single_link(&journal.target_path)?;
+    safety::require_single_link(&journal.rollback_path)?;
     // Durable intent before any executable bytes move.
     journal.state = UpdateTransactionState::Undoing;
     journal.displaced_path = Some(displaced.clone());
@@ -1177,18 +1254,28 @@ where
             };
         }
     }
-    lock.check()?;
-    paths.check()?;
-    require_stopped(quiescence())?;
-    if !matches_file(
+    // From here the published executable is already parked. Any stop is a
+    // partial operation: say so, keep the Undoing record, require recovery.
+    if let Err(cause) = lock
+        .check()
+        .and_then(|_| paths.check())
+        .and_then(|_| require_stopped(quiescence()))
+    {
+        return Err(partial_failure(&mut journal, "Undo", &cause));
+    }
+    match matches_file(
         &journal.rollback_path,
         &journal.original_sha256,
         journal.original_identity,
-    )? {
-        return Err(UpdateExecutionError::NeedsReconciliation(
-            "backup changed immediately before Undo restoration; all executables were preserved"
-                .into(),
-        ));
+    ) {
+        Ok(true) => {}
+        other => {
+            let cause = UpdateExecutionError::NeedsReconciliation(match other {
+                Ok(_) => "the backup changed immediately before Undo restoration".into(),
+                Err(error) => error.to_string(),
+            });
+            return Err(partial_failure(&mut journal, "Undo", &cause));
+        }
     }
     if let Err(error) = move_noreplace(&journal.rollback_path, &journal.target_path) {
         if matches!(error, UpdateExecutionError::NeedsReconciliation(_)) {
@@ -1215,11 +1302,19 @@ where
         &journal.original_sha256,
         journal.original_identity,
     )? {
-        return Err(UpdateExecutionError::NeedsReconciliation(
+        let cause = UpdateExecutionError::NeedsReconciliation(
             "restored file does not match the recorded original".into(),
-        ));
+        );
+        return Err(partial_failure(&mut journal, "Undo", &cause));
     }
     journal.state = UpdateTransactionState::RolledBack;
+    if !terminal_consistent(&journal).unwrap_or(false) {
+        journal.state = UpdateTransactionState::Undoing;
+        let cause = UpdateExecutionError::NeedsReconciliation(
+            "the restored state contradicts the recorded identities".into(),
+        );
+        return Err(partial_failure(&mut journal, "Undo", &cause));
+    }
     if let Err(error) = persist_journal(&journal) {
         return Err(UpdateExecutionError::NeedsReconciliation(format!(
             "the previous executable was restored but the record could not be saved ({error}); run recovery"
@@ -1421,8 +1516,13 @@ fn latest_record(records: &[UpdateRecordEntry], target: &Path) -> Option<UpdateJ
     Some(selected.clone())
 }
 pub fn actionable_undo(records: &[UpdateRecordEntry], target: &Path) -> Option<UpdateJournal> {
+    // A control is offered only when Undo can actually run: the latest record,
+    // Published, consistent with disk, and carrying the ownership receipts Undo
+    // requires (legacy records without them are review-only).
     latest_record(records, target).filter(|j| {
-        j.state == UpdateTransactionState::Published && terminal_consistent(j).ok() == Some(true)
+        j.state == UpdateTransactionState::Published
+            && j.has_ownership_evidence()
+            && terminal_consistent(j).ok() == Some(true)
     })
 }
 
@@ -1536,6 +1636,11 @@ where
             "record requires explicit manual review; no evidence was discarded".into(),
         ));
     }
+    if !journal.has_ownership_evidence() {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "this record predates executable ownership receipts; recovery will not move files on content equality alone. Review it manually; nothing was changed".into(),
+        ));
+    }
     require_stopped(quiescence())?;
     let target = observe(&paths.target)?;
     let backup = observe(&paths.backup)?;
@@ -1574,7 +1679,7 @@ where
                 }
                 journal.state = S::Published;
                 journal.staged_path = None;
-                persist_journal(&journal)?;
+                persist_verified_terminal(&journal)?;
                 return Ok(journal);
             } else if !(target == original
                 && backup == Observed::Missing
@@ -1591,11 +1696,7 @@ where
             }
             journal.state = S::Failed;
             journal.failure=Some("interrupted update reconciled; the original is at its install path and temporary output was preserved".into());
-            persist_journal(&journal).map_err(|e| {
-                UpdateExecutionError::NeedsReconciliation(format!(
-                    "original is preserved/restored but the durable record could not be saved: {e}"
-                ))
-            })?;
+            persist_verified_terminal(&journal)?;
             Ok(journal)
         }
         S::Undoing => {
@@ -1618,6 +1719,15 @@ where
                 journal.state = S::Published;
                 journal.displaced_path = None;
             } else if target == Observed::Missing && backup == original && displaced == published {
+                // Content equality is not ownership: the backup must be the
+                // exact recorded inode before anything moves.
+                if !matches_file(
+                    &paths.backup,
+                    &journal.original_sha256,
+                    journal.original_identity,
+                )? {
+                    return Err(refuse());
+                }
                 restore_verified(
                     &journal,
                     &paths,
@@ -1646,11 +1756,7 @@ where
             } else {
                 return Err(refuse());
             }
-            persist_journal(&journal).map_err(|e| {
-                UpdateExecutionError::NeedsReconciliation(format!(
-                    "recovery bytes were preserved but its record could not be saved: {e}"
-                ))
-            })?;
+            persist_verified_terminal(&journal)?;
             Ok(journal)
         }
         _ => Err(refuse()),
@@ -1668,6 +1774,7 @@ fn restore_verified<Q: FnMut() -> QuiescenceEvidence>(
     lock.check()?;
     paths.check()?;
     require_stopped(quiescence())?;
+    safety::require_single_link(source)?;
     if !matches_file(source, hash, identity)? || observe(&paths.target)? != Observed::Missing {
         return Err(UpdateExecutionError::NeedsReconciliation(
             "recovery source changed or a new executable appeared; both were preserved".into(),
@@ -2556,7 +2663,8 @@ mod tests {
                 QuiescenceEvidence::Unknown
             )
             .eligibility,
-            UpdateExecutionEligibility::RunningBlocked
+            // Unknown is not stopped, and it is not "running" either.
+            UpdateExecutionEligibility::QuiescenceUnknown
         );
         let journal = fresh_run(&f).unwrap();
         assert_eq!(
@@ -2996,4 +3104,5 @@ mod tests {
         );
     }
     include!("emulator_update/safety_tests.rs");
+    include!("emulator_update/closure_tests.rs");
 }
