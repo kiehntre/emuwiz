@@ -1,11 +1,10 @@
 //! Explicit, bounded archive packing and unpacking.
 //!
-//! ZIP uses EmuWiz's existing central-directory inspector.  7Z and RAR use
-//! list-first, staged extraction through explicitly detected system tools.
+//! ZIP inspection remains available; ZIP Apply is blocked for preservation safety.
+//! 7Z and RAR use list-first, staged extraction through detected system tools.
 
 use serde::Serialize;
-use std::fs::{self, File};
-use std::io;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -519,39 +518,6 @@ fn looks_like_multipart_archive(path: &Path) -> bool {
             .chars()
             .all(|ch| ch.is_ascii_digit())
 }
-fn confined(root: &Path, relative: &Path) -> Result<PathBuf, ArchiveEligibility> {
-    let target = root.join(relative);
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        if let Component::Normal(value) = component {
-            current.push(value);
-            if current.exists()
-                && fs::symlink_metadata(&current)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(true)
-            {
-                return Err(ArchiveEligibility::UnsafeEntry);
-            }
-        }
-    }
-    Ok(target)
-}
-fn walk_bytes(root: &Path) -> Result<u64, String> {
-    let mut total = 0;
-    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
-        let p = entry.map_err(|e| e.to_string())?.path();
-        let m = fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
-        if m.is_dir() {
-            total += walk_bytes(&p)?
-        } else if m.is_file() {
-            total += m.len()
-        } else {
-            return Err("special file detected".into());
-        }
-    }
-    Ok(total)
-}
-
 fn collect_tree(root: &Path) -> Result<(std::collections::BTreeSet<String>, u64), String> {
     fn visit(
         root: &Path,
@@ -684,148 +650,18 @@ pub fn extract_archive(plan: &ArchivePlan) -> Result<ArchiveOperationResult, Str
     }
 }
 
-pub fn extract_zip(plan: &ArchivePlan) -> Result<ArchiveOperationResult, String> {
-    if plan.format != ArchiveFormat::Zip || plan.eligibility != ArchiveEligibility::Ready {
-        return Err("archive plan is not executable".into());
-    }
-    if plan.destination.exists() {
-        return Err("destination already exists; refusing overwrite".into());
-    }
-    let parent = plan
-        .destination
-        .parent()
-        .ok_or("destination has no parent")?;
-    if !parent.is_dir() {
-        return Err("destination parent is not a directory".into());
-    }
-    let stage = parent.join(format!(".emuwiz-archive-stage-{}", std::process::id()));
-    fs::create_dir(&stage).map_err(|e| e.to_string())?;
-    let result = (|| {
-        let mut archive =
-            zip::ZipArchive::new(File::open(&plan.source).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-        for index in 0..archive.len() {
-            let mut member = archive.by_index(index).map_err(|e| e.to_string())?;
-            let relative =
-                validate_member_path(member.name()).map_err(|e| format!("unsafe member: {e:?}"))?;
-            if let Some(mode) = member.unix_mode()
-                && mode & 0o170000 == 0o120000
-            {
-                return Err("archive symlink member is unsupported".into());
-            }
-            let target =
-                confined(&stage, &relative).map_err(|e| format!("unsafe destination: {e:?}"))?;
-            if member.is_dir() {
-                fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-            } else {
-                if let Some(p) = target.parent() {
-                    fs::create_dir_all(p).map_err(|e| e.to_string())?;
-                }
-                let mut output = File::create(&target).map_err(|e| e.to_string())?;
-                io::copy(&mut member, &mut output).map_err(|e| e.to_string())?;
-            }
-        }
-        fs::rename(&stage, &plan.destination).map_err(|e| e.to_string())?;
-        let output_bytes = walk_bytes(&plan.destination)?;
-        Ok(ArchiveOperationResult {
-            operation: ArchiveOperation::ExtractArchive,
-            format: ArchiveFormat::Zip,
-            source: plan.source.clone(),
-            destination: plan.destination.clone(),
-            member_count: plan.entries.len(),
-            source_bytes: plan.compressed_bytes.unwrap_or(0),
-            output_bytes,
-            expanded_bytes: plan.expanded_bytes,
-            verification: "ZIP reopened and staged paths verified".into(),
-            warnings: Vec::new(),
-        })
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&stage);
-    }
-    result
+/// ZIP-only preservation gate; the legacy String error API is kept compatible.
+/// No plan validation, filesystem access, staging or cleanup occurs here.
+pub fn extract_zip(_plan: &ArchivePlan) -> Result<ArchiveOperationResult, String> {
+    Err(crate::zip_converter::ZipError::ApplyUnavailable.to_string())
 }
-fn add_zip_tree(
-    root: &Path,
-    current: &Path,
-    writer: &mut zip::ZipWriter<File>,
-    entries: &mut Vec<String>,
-) -> Result<(), String> {
-    let mut children = fs::read_dir(current)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    children.sort_by_key(|e| e.file_name());
-    for child in children {
-        let path = child.path();
-        let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
-        let name = rel.to_string_lossy().replace('\\', "/");
-        let safe = validate_member_path(&name).map_err(|e| format!("unsafe source path: {e:?}"))?;
-        let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-        if meta.file_type().is_symlink() {
-            return Err("source symlink is unsupported".into());
-        }
-        if meta.is_dir() {
-            writer
-                .add_directory(
-                    format!("{}/", safe.display()),
-                    zip::write::SimpleFileOptions::default(),
-                )
-                .map_err(|e| e.to_string())?;
-            add_zip_tree(root, &path, writer, entries)?;
-        } else if meta.is_file() {
-            writer
-                .start_file(
-                    safe.to_string_lossy(),
-                    zip::write::SimpleFileOptions::default(),
-                )
-                .map_err(|e| e.to_string())?;
-            let mut input = File::open(&path).map_err(|e| e.to_string())?;
-            io::copy(&mut input, writer).map_err(|e| e.to_string())?;
-            entries.push(name);
-        } else {
-            return Err("special source file is unsupported".into());
-        }
-    }
-    Ok(())
-}
+
+/// ZIP-only preservation gate; sources and destinations are never inspected.
 pub fn create_zip(
-    source_root: &Path,
-    destination: &Path,
+    _source_root: &Path,
+    _destination: &Path,
 ) -> Result<ArchiveOperationResult, String> {
-    if !source_root.is_dir() || destination.exists() {
-        return Err("source must be a directory and destination must be new".into());
-    }
-    let parent = destination.parent().ok_or("destination has no parent")?;
-    if !parent.is_dir() {
-        return Err("destination parent is not a directory".into());
-    }
-    let stage = parent.join(format!(".emuwiz-archive-stage-{}.zip", std::process::id()));
-    let file = File::create(&stage).map_err(|e| e.to_string())?;
-    let mut writer = zip::ZipWriter::new(file);
-    let mut entries = Vec::new();
-    add_zip_tree(source_root, source_root, &mut writer, &mut entries)?;
-    writer.finish().map_err(|e| e.to_string())?;
-    let verified = crate::inspect_archive(&stage).map_err(|e| e.to_string())?;
-    if verified.total_entries_in_archive != entries.len() {
-        let _ = fs::remove_file(&stage);
-        return Err("created archive verification count mismatch".into());
-    }
-    fs::rename(&stage, destination).map_err(|e| e.to_string())?;
-    let bytes = walk_bytes(source_root)?;
-    let output = fs::metadata(destination).map_err(|e| e.to_string())?.len();
-    Ok(ArchiveOperationResult {
-        operation: ArchiveOperation::CreateArchive,
-        format: ArchiveFormat::Zip,
-        source: source_root.into(),
-        destination: destination.into(),
-        member_count: entries.len(),
-        source_bytes: bytes,
-        output_bytes: output,
-        expanded_bytes: bytes,
-        verification: "ZIP reopened and member list verified".into(),
-        warnings: vec!["Sources remain untouched.".into()],
-    })
+    Err(crate::zip_converter::ZipError::ApplyUnavailable.to_string())
 }
 
 #[cfg(test)]
