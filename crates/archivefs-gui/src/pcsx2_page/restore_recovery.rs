@@ -13,6 +13,11 @@ struct History {
     messages: Vec<String>,
 }
 impl History {
+    /// Undo and interrupted-restore checks depend on the discovered set, so they
+    /// are offered only when that set is known to be complete.
+    fn incomplete(&self) -> bool {
+        !self.problems.is_empty()
+    }
     fn discover(dir: &Path) -> Self {
         let mut history = Self::default();
         history.refresh(dir);
@@ -75,10 +80,11 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
         {
             history.refresh(dir);
         }
-        if history
-            .rows
-            .iter()
-            .any(|row| row.needs_recovery && row.error.is_none())
+        if !history.incomplete()
+            && history
+                .rows
+                .iter()
+                .any(|row| row.needs_recovery && row.error.is_none())
             && widgets::action_button(
                 ui,
                 "Check interrupted restores",
@@ -105,12 +111,14 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
             history.refresh(dir);
         }
     });
-    if !history.problems.is_empty() {
+    let incomplete = history.incomplete();
+    if incomplete {
         ui.label("Warning: the restore record list below is INCOMPLETE. Do not treat it as the full recovery inventory; interrupted or failed restores may not be shown.");
         for problem in &history.problems {
             ui.label(format!("  - {problem}"));
         }
-        ui.label("Fix the cause (permissions, damaged folder or too many records), then press Refresh records. Nothing was deleted or changed.");
+        ui.label("Undo and the interrupted-restore check are withheld until the list is complete, because they act on this list. Nothing was deleted or changed.");
+        ui.label("To continue, fix the cause (permissions or a damaged folder), or, if older records were omitted, move older restore records out of the folder yourself (EmuWiz never deletes them), then press Refresh records.");
     }
     for row in &history.rows {
         if row.undo_available || row.needs_attention || row.needs_recovery {
@@ -122,7 +130,9 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
                 if let Some(card) = &row.card_path {
                     widgets::path_value(ui, "Card", card);
                 }
-                if widgets::action_button(
+                if incomplete {
+                    ui.label("Undo is withheld for this record while the list is INCOMPLETE.");
+                } else if widgets::action_button(
                     ui,
                     "Review Undo",
                     widgets::ActionStyle::Secondary,
@@ -164,6 +174,12 @@ pub(super) fn process_gate(card: &Path, save: &str) -> Result<(), Ps2PsuRestoreE
     Ok(())
 }
 
+/// True while the cached discovery is known to be incomplete.
+fn undo_withheld(ui: &egui::Ui) -> bool {
+    ui.data(|data| data.get_temp::<History>(history_id()))
+        .is_some_and(|history| history.incomplete())
+}
+
 pub(super) fn confirm_undo(
     ui: &mut egui::Ui,
     path: &Path,
@@ -177,6 +193,12 @@ pub(super) fn confirm_undo(
         }
     };
     ui.heading("Review Undo from restore record");
+    // An already-open review must not outlive a discovery that became
+    // incomplete: the same list-dependent gate applies to this control.
+    let incomplete = undo_withheld(ui);
+    if incomplete {
+        ui.label("Undo is withheld: the restore record list is INCOMPLETE. Fix the cause and press Refresh records first. The card was not changed.");
+    }
     widgets::path_value(ui, "Card", &journal.card_path);
     widgets::path_value(ui, "Verified backup", &journal.backup_path);
     ui.label(format!("Save: {}", journal.save_display_name));
@@ -185,9 +207,10 @@ pub(super) fn confirm_undo(
         ui,
         "Confirm Undo",
         widgets::ActionStyle::Secondary,
-        advanced_mode && journal.phase == Ps2RestorePhase::Published,
+        advanced_mode && !incomplete && journal.phase == Ps2RestorePhase::Published,
     )
     .clicked()
+        && !incomplete
     {
         let provider = ProcScanQuiescence::new();
         let report = provider.report(&ps2_card_binding(

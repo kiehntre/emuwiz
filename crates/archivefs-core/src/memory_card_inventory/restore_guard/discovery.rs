@@ -26,8 +26,9 @@ pub enum Ps2DiscoveryProblem {
     ListingFailed { kind: ErrorKind, detail: String },
     /// Enumeration stopped on an error; entries after it were not seen.
     EnumerationInterrupted { detail: String },
-    /// More journals matched than [`PS2_DISCOVERY_LIMIT`]; the lexically
-    /// smallest names are listed, `omitted` further records are not.
+    /// More journals matched than [`PS2_DISCOVERY_LIMIT`]; the newest names
+    /// (the greatest in journal-name order, which starts with a fixed-width
+    /// hexadecimal timestamp) are listed, `omitted` older records are not.
     Truncated { limit: usize, omitted: usize },
 }
 
@@ -45,7 +46,7 @@ impl std::fmt::Display for Ps2DiscoveryProblem {
             }
             Self::Truncated { limit, omitted } => write!(
                 f,
-                "only the first {limit} restore records are shown; {omitted} more exist"
+                "only the newest {limit} restore records are shown; {omitted} older records are not shown"
             ),
         }
     }
@@ -81,11 +82,13 @@ fn is_journal_name(name: &std::ffi::OsStr) -> bool {
     bytes.starts_with(JOURNAL_PREFIX.as_bytes()) && bytes.ends_with(b".json")
 }
 
-/// Smallest `PS2_DISCOVERY_LIMIT` journal paths in name order, in bounded
-/// memory. Anything that makes the answer uncertain is pushed to `problems`.
+/// The newest `PS2_DISCOVERY_LIMIT` journal paths (greatest in name order),
+/// returned oldest-first, in bounded memory. Only names are compared; no journal
+/// body is read to choose them. Anything that makes the answer uncertain is
+/// pushed to `problems`.
 fn list_candidates(dir: &Path, problems: &mut Vec<Ps2DiscoveryProblem>) -> Vec<PathBuf> {
     match fs::read_dir(dir) {
-        Ok(entries) => collect_smallest(
+        Ok(entries) => collect_newest(
             dir,
             entries.map(|entry| entry.map(|entry| entry.path())),
             problems,
@@ -106,21 +109,22 @@ fn list_candidates(dir: &Path, problems: &mut Vec<Ps2DiscoveryProblem>) -> Vec<P
     }
 }
 
-fn collect_smallest(
+fn collect_newest(
     dir: &Path,
     entries: impl Iterator<Item = std::io::Result<PathBuf>>,
     problems: &mut Vec<Ps2DiscoveryProblem>,
 ) -> Vec<PathBuf> {
-    let mut smallest = BTreeSet::new();
+    let mut newest = BTreeSet::new();
     let mut matched = 0usize;
     for entry in entries {
         match entry {
             Ok(path) => {
                 if path.file_name().is_some_and(is_journal_name) {
                     matched += 1;
-                    smallest.insert(path);
-                    if smallest.len() > PS2_DISCOVERY_LIMIT {
-                        smallest.pop_last();
+                    newest.insert(path);
+                    // Evict the oldest name so memory stays at limit + 1 paths.
+                    if newest.len() > PS2_DISCOVERY_LIMIT {
+                        newest.pop_first();
                     }
                 }
             }
@@ -138,7 +142,7 @@ fn collect_smallest(
             omitted: matched - PS2_DISCOVERY_LIMIT,
         });
     }
-    smallest.into_iter().collect()
+    newest.into_iter().collect()
 }
 
 fn summarize(path: PathBuf) -> Ps2RestoreJournalSummary {
@@ -171,8 +175,9 @@ fn summarize(path: PathBuf) -> Ps2RestoreJournalSummary {
     }
 }
 
-/// Restart discovery: every restore journal in `journal_dir` (up to
-/// [`PS2_DISCOVERY_LIMIT`], in name order), including corrupt ones. Read-only.
+/// Restart discovery: every restore journal in `journal_dir` (the newest
+/// [`PS2_DISCOVERY_LIMIT`] if there are more, oldest-first), including corrupt
+/// ones. Read-only.
 /// A directory that does not exist is a complete, empty result; any other
 /// failure to list it is a [`Ps2DiscoveryProblem`].
 #[must_use]

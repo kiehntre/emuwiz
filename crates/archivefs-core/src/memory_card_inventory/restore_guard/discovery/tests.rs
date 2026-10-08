@@ -102,7 +102,7 @@ fn an_enumeration_error_midway_is_reported_and_partial_records_are_not_complete(
         Err(std::io::Error::from_raw_os_error(5)),
         Ok(PathBuf::from("/synthetic").join(name(0))),
     ];
-    let listed = collect_smallest(Path::new("/synthetic"), entries.into_iter(), &mut problems);
+    let listed = collect_newest(Path::new("/synthetic"), entries.into_iter(), &mut problems);
     assert_eq!(
         listed,
         [
@@ -115,41 +115,77 @@ fn an_enumeration_error_midway_is_reported_and_partial_records_are_not_complete(
     );
 }
 
-#[test]
-fn exactly_1024_records_are_complete_and_sorted() {
-    let (_root, journals) = dir_with(PS2_DISCOVERY_LIMIT);
-    let found = discover_ps2_restore_journals(&journals);
-    assert_eq!(found.len(), 1024);
-    assert!(found.is_complete(), "{:?}", found.problems);
-    assert!(found.windows(2).all(|pair| pair[0].path < pair[1].path));
+fn file_names(found: &[Ps2RestoreJournalSummary]) -> Vec<String> {
+    found
+        .iter()
+        .map(|r| r.path.file_name().unwrap().to_str().unwrap().to_owned())
+        .collect()
 }
 
 #[test]
-fn record_1025_is_reported_as_truncation_and_the_listed_set_is_deterministic() {
-    let (_root, journals) = dir_with(PS2_DISCOVERY_LIMIT + 1);
-    let first = discover_ps2_restore_journals(&journals);
-    let second = discover_ps2_restore_journals(&journals);
-    assert_eq!(first, second);
-    assert_eq!(first.len(), 1024);
-    assert!(!first.is_complete());
-    assert_eq!(
-        first.problems,
-        [Ps2DiscoveryProblem::Truncated {
-            limit: 1024,
-            omitted: 1
-        }]
-    );
-    // The smallest names are listed, whatever order the filesystem returns.
-    assert_eq!(
-        first[0].path.file_name().unwrap().to_str().unwrap(),
-        name(0)
-    );
-    assert_eq!(
-        first[1023].path.file_name().unwrap().to_str().unwrap(),
-        name(1023)
-    );
-    assert!(first.iter().all(|r| !r.path.ends_with(name(1024))));
-    assert!(first.problems[0].to_string().contains("1 more"));
+fn exactly_1023_and_1024_records_are_all_listed_and_complete() {
+    for count in [PS2_DISCOVERY_LIMIT - 1, PS2_DISCOVERY_LIMIT] {
+        let (_root, journals) = dir_with(count);
+        let found = discover_ps2_restore_journals(&journals);
+        assert_eq!(found.len(), count);
+        assert!(found.is_complete(), "{count}: {:?}", found.problems);
+        assert_eq!(file_names(&found), (0..count).map(name).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn over_the_bound_the_newest_1024_are_kept_and_the_omitted_count_is_exact() {
+    for (count, omitted) in [(1025, 1), (1026, 2), (3000, 3000 - 1024)] {
+        let (_root, journals) = dir_with(count);
+        let first = discover_ps2_restore_journals(&journals);
+        let second = discover_ps2_restore_journals(&journals);
+        assert_eq!(first, second, "{count}: repeated runs must agree");
+        assert_eq!(first.len(), 1024, "{count}");
+        assert!(!first.is_complete());
+        assert_eq!(
+            first.problems,
+            [Ps2DiscoveryProblem::Truncated {
+                limit: 1024,
+                omitted
+            }],
+            "{count}"
+        );
+        // The newest names (greatest) are kept, oldest-first; the oldest are omitted.
+        assert_eq!(
+            file_names(&first),
+            (omitted..count).map(name).collect::<Vec<_>>(),
+            "{count}"
+        );
+        assert!(first.windows(2).all(|pair| pair[0].path < pair[1].path));
+        let text = first.problems[0].to_string();
+        assert!(text.contains("newest 1024"), "{text}");
+        assert!(text.contains(&format!("{omitted} older records")), "{text}");
+    }
+}
+
+#[test]
+fn creation_order_never_changes_the_retained_set_or_its_order() {
+    let count = 2000;
+    let mut orders: Vec<Vec<usize>> = Vec::new();
+    // Ascending, descending and a fixed pseudo-random permutation (multiplier
+    // coprime with the count), so no timing or RNG is involved.
+    orders.push((0..count).collect());
+    orders.push((0..count).rev().collect());
+    orders.push((0..count).map(|i| (i * 7919) % count).collect());
+    let expected: Vec<String> = (count - 1024..count).map(name).collect();
+    for order in orders {
+        let root = tempfile::tempdir().unwrap();
+        let journals = root.path().join("journals");
+        fs::create_dir(&journals).unwrap();
+        for i in &order {
+            fs::write(journals.join(name(*i)), b"corrupt synthetic journal").unwrap();
+        }
+        for _ in 0..2 {
+            let found = discover_ps2_restore_journals(&journals);
+            assert_eq!(file_names(&found), expected);
+            assert!(!found.is_complete());
+        }
+    }
 }
 
 #[test]
@@ -158,9 +194,10 @@ fn truncation_counts_every_omitted_record_in_bounded_memory() {
     let entries = (0..50_000)
         .rev()
         .map(|i| Ok(PathBuf::from("/s").join(name(i))));
-    let listed = collect_smallest(Path::new("/s"), entries, &mut problems);
+    let listed = collect_newest(Path::new("/s"), entries, &mut problems);
     assert_eq!(listed.len(), 1024);
-    assert_eq!(listed[0], PathBuf::from("/s").join(name(0)));
+    assert_eq!(listed[0], PathBuf::from("/s").join(name(50_000 - 1024)));
+    assert_eq!(listed[1023], PathBuf::from("/s").join(name(49_999)));
     assert_eq!(
         problems,
         [Ps2DiscoveryProblem::Truncated {
@@ -168,6 +205,26 @@ fn truncation_counts_every_omitted_record_in_bounded_memory() {
             omitted: 50_000 - 1024
         }]
     );
+}
+
+#[test]
+fn a_hundred_thousand_names_stay_bounded_and_exact() {
+    // Names only: nothing is read from disk, and the working set never exceeds
+    // the bound plus one path.
+    let mut problems = Vec::new();
+    let started = std::time::Instant::now();
+    let entries = (0..100_000).map(|i| Ok(PathBuf::from("/s").join(name((i * 7919) % 100_000))));
+    let listed = collect_newest(Path::new("/s"), entries, &mut problems);
+    assert_eq!(listed.len(), 1024);
+    assert_eq!(listed[0], PathBuf::from("/s").join(name(100_000 - 1024)));
+    assert_eq!(
+        problems,
+        [Ps2DiscoveryProblem::Truncated {
+            limit: 1024,
+            omitted: 100_000 - 1024
+        }]
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
 }
 
 #[test]
@@ -220,6 +277,12 @@ fn batch_recovery_reports_truncation_and_judges_only_listed_records() {
     let run = recover_all_interrupted_ps2_restores(&journals, 1);
     assert_eq!(run.outcomes.len(), 1024);
     assert!(run.outcomes.iter().all(|(_, outcome)| outcome.is_err()));
+    // The newest records are the ones judged.
+    assert!(
+        run.outcomes
+            .iter()
+            .all(|(path, _)| !path.ends_with(name(0)))
+    );
     assert_eq!(
         run.problems,
         [Ps2DiscoveryProblem::Truncated {
@@ -228,7 +291,7 @@ fn batch_recovery_reports_truncation_and_judges_only_listed_records() {
         }]
     );
     assert!(
-        journals.join(name(1024)).exists(),
-        "an omitted record is left untouched"
+        journals.join(name(0)).exists(),
+        "an omitted (oldest) record is left untouched"
     );
 }
