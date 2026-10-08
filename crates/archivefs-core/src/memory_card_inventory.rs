@@ -618,6 +618,7 @@ pub enum Ps2PsuRestoreError {
     EmulatorRunning,
     /// Whether an emulator is using the card could not be established.
     EmulatorStateUnknown,
+    UnsupportedAtomicExchange,
     /// Cards that store spare/ECC bytes (528-byte pages) are not written: the
     /// writer does not regenerate ECC, so a restore would leave stale ECC.
     UnsupportedRepresentation(String),
@@ -667,6 +668,10 @@ impl std::fmt::Display for Ps2PsuRestoreError {
             Self::EmulatorRunning => write!(
                 formatter,
                 "a PS2 emulator is running or has the memory card open"
+            ),
+            Self::UnsupportedAtomicExchange => write!(
+                formatter,
+                "this filesystem cannot atomically exchange card files; restore and undo are refused without overwriting the card"
             ),
             Self::EmulatorStateUnknown => write!(
                 formatter,
@@ -894,6 +899,58 @@ fn restore_occupied_clusters(
     occupied
 }
 
+fn restore_free_clusters(
+    bytes: &[u8],
+    geometry: &Ps2Geometry,
+    inventory: &Ps2MemoryCardInventory,
+    replacing: Option<&Ps2SaveDirectory>,
+) -> Result<Vec<u32>, Ps2PsuRestoreError> {
+    // All required tables must be distinct metadata clusters, never aliases
+    // of the indirect tables or data area. Otherwise one FAT write could
+    // silently change a second chain's allocation entry.
+    let entries = ps2_cluster_bytes(geometry) / 4;
+    let available = geometry.alloc_end.saturating_sub(geometry.alloc_offset) as usize;
+    let tables = available.div_ceil(entries);
+    let mut indirect = HashSet::new();
+    for slot in 0..tables.div_ceil(entries) {
+        let address = le_u32(bytes, 0x50 + slot * 4)
+            .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("Missing indirect FAT table".into()))?;
+        if !indirect.insert(address) {
+            return Err(Ps2PsuRestoreError::InvalidPlan(
+                "Aliased indirect FAT tables".into(),
+            ));
+        }
+    }
+    let mut addresses = HashSet::new();
+    for table in 0..tables {
+        let (address, _) = ps2_fat_location(bytes, geometry, (table * entries) as u32)
+            .map_err(|warning| Ps2PsuRestoreError::InvalidPlan(warning.message))?;
+        if indirect.contains(&address) || !addresses.insert(address) {
+            return Err(Ps2PsuRestoreError::InvalidPlan(
+                "Aliased FAT metadata tables".into(),
+            ));
+        }
+    }
+    let occupied = restore_occupied_clusters(inventory, replacing);
+    let mut reclaimed = HashSet::new();
+    if let Some(save) = replacing {
+        restore_chain_set(&mut reclaimed, &save.chain_health);
+        for file in &save.files {
+            restore_chain_set(&mut reclaimed, &file.chain_health);
+        }
+    }
+    let mut free = Vec::new();
+    for cluster in 0..geometry.alloc_end.saturating_sub(geometry.alloc_offset) {
+        let raw = ps2_fat_raw(bytes, geometry, cluster)
+            .map_err(|warning| Ps2PsuRestoreError::InvalidPlan(warning.message))?;
+        if !occupied.contains(&cluster) && (raw & 0x8000_0000 == 0 || reclaimed.contains(&cluster))
+        {
+            free.push(cluster);
+        }
+    }
+    Ok(free)
+}
+
 fn restore_write_logical_cluster(
     bytes: &mut [u8],
     geometry: &Ps2Geometry,
@@ -932,21 +989,12 @@ fn restore_set_fat(
             "FAT update is outside allocation area".into(),
         ));
     }
-    let entries_per_cluster = ps2_cluster_bytes(geometry) / 4;
-    let indirect_index = relative as usize / entries_per_cluster;
-    let indirect_slot = indirect_index / entries_per_cluster;
-    let ifc_offset = 0x50usize + indirect_slot * 4;
-    let ifc_cluster = le_u32(bytes, ifc_offset)
-        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT index is unavailable".into()))?;
-    let fat_cluster = ps2_logical_cluster(bytes, geometry, ifc_cluster)
-        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT cluster is unavailable".into()))?;
-    let fat_offset = (relative as usize % entries_per_cluster) * 4;
-    let _ = fat_cluster
-        .get(fat_offset..fat_offset + 4)
-        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT entry is unavailable".into()))?;
-    let mut updated = fat_cluster;
+    let (fat_address, fat_offset) = ps2_fat_location(bytes, geometry, relative)
+        .map_err(|warning| Ps2PsuRestoreError::InvalidPlan(warning.message))?;
+    let mut updated = ps2_logical_cluster(bytes, geometry, fat_address)
+        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("FAT cluster unavailable".into()))?;
     updated[fat_offset..fat_offset + 4].copy_from_slice(&value.to_le_bytes());
-    restore_write_logical_cluster(bytes, geometry, ifc_cluster, &updated)
+    restore_write_logical_cluster(bytes, geometry, fat_address, &updated)
 }
 
 fn restore_set_entry(
@@ -988,63 +1036,10 @@ fn restore_link_chain(
     for (index, &cluster) in chain.iter().enumerate() {
         let value = chain
             .get(index + 1)
-            .map_or(0x7fff_ffff, |next| 0x8000_0000 | *next);
+            .map_or(0xffff_ffff, |next| 0x8000_0000 | *next);
         restore_set_fat(bytes, geometry, cluster, value)?;
     }
     Ok(())
-}
-
-fn restore_write_card_atomically(path: &Path, bytes: &[u8]) -> Result<(), Ps2PsuRestoreError> {
-    validate_restore_path(path, None)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("card has no parent".into()))?;
-    let permissions = fs::metadata(path).map_err(restore_error)?.permissions();
-    let temporary = create_restore_temporary(parent)?;
-    let staged = (|| {
-        fs::write(&temporary, bytes).map_err(restore_error)?;
-        // Keep the card's mode: a restore must not change who can read or write it.
-        fs::set_permissions(&temporary, permissions).map_err(restore_error)?;
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(restore_error)?;
-        file.sync_all().map_err(restore_error)
-    })();
-    if let Err(error) = staged {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(restore_error(error));
-    }
-    // Make the rename itself durable.
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(restore_error)
-}
-
-fn create_restore_temporary(parent: &Path) -> Result<PathBuf, Ps2PsuRestoreError> {
-    for number in 0..32u32 {
-        let path = parent.join(format!(
-            ".emuwiz-ps2-restore-{}-{number}.tmp",
-            std::process::id()
-        ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => return Ok(path),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(restore_error(error)),
-        }
-    }
-    Err(Ps2PsuRestoreError::Io(
-        "could not allocate an owned restore temporary".into(),
-    ))
 }
 
 /// Page writes in this module update the 512 data bytes of a page only. A card
@@ -1101,8 +1096,8 @@ pub fn plan_ps2_psu_restore(
     if existing.is_some() && !replace_existing {
         return Err(Ps2PsuRestoreError::ExistingSave(root_entry.display_name));
     }
-    let occupied = restore_occupied_clusters(inventory, existing);
-    let available = geometry.alloc_end.saturating_sub(geometry.alloc_offset);
+    let card_bytes =
+        read_source_card(&card.path).map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
     let records = parsed.files.len() + 2;
     let cluster_bytes = ps2_cluster_bytes(&geometry) as u64;
     let directory_clusters =
@@ -1117,15 +1112,14 @@ pub fn plan_ps2_psu_restore(
     let root_needs_cluster =
         existing.is_none() && inventory.root_entries.len() as u64 >= root_capacity;
     let required_clusters = directory_clusters + file_clusters + u64::from(root_needs_cluster);
-    let free_clusters = (available as u64).saturating_sub(occupied.len() as u64);
+    let free_clusters =
+        restore_free_clusters(&card_bytes, &geometry, inventory, existing)?.len() as u64;
     if required_clusters > free_clusters {
         return Err(Ps2PsuRestoreError::InsufficientSpace {
             required: required_clusters as u32,
             available: free_clusters as u32,
         });
     }
-    let card_bytes =
-        read_source_card(&card.path).map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
     Ok(Ps2PsuRestorePlan {
         source_card_path: card.path.clone(),
         source_psu_path: source_psu.to_path_buf(),
@@ -1161,11 +1155,7 @@ pub(crate) fn build_restored_card(
             .iter()
             .find(|save| save.entry.raw_entry_offset == offset)
     });
-    let occupied = restore_occupied_clusters(inventory, replacing);
-    let available = plan
-        .geometry
-        .alloc_end
-        .saturating_sub(plan.geometry.alloc_offset);
+
     let cluster_bytes = ps2_cluster_bytes(&plan.geometry) as u64;
     let records = plan.parsed.files.len() + 2;
     let directory_clusters =
@@ -1181,9 +1171,7 @@ pub(crate) fn build_restored_card(
     let root_needs_cluster =
         plan.existing_entry_offset.is_none() && inventory.root_entries.len() >= root_capacity;
     let needed = directory_clusters + file_clusters + usize::from(root_needs_cluster);
-    let free = (0..available)
-        .filter(|cluster| !occupied.contains(cluster))
-        .collect::<Vec<_>>();
+    let free = restore_free_clusters(original, &plan.geometry, inventory, replacing)?;
     if free.len() < needed {
         return Err(Ps2PsuRestoreError::InsufficientSpace {
             required: needed as u32,
@@ -1206,11 +1194,11 @@ pub(crate) fn build_restored_card(
     }
     if let Some(old) = replacing {
         for &cluster in &old.chain_health.clusters {
-            restore_set_fat(&mut bytes, &plan.geometry, cluster, 0xffff_ffff)?;
+            restore_set_fat(&mut bytes, &plan.geometry, cluster, 0x7fff_ffff)?;
         }
         for file in &old.files {
             for &cluster in &file.chain_health.clusters {
-                restore_set_fat(&mut bytes, &plan.geometry, cluster, 0xffff_ffff)?;
+                restore_set_fat(&mut bytes, &plan.geometry, cluster, 0x7fff_ffff)?;
             }
         }
     }
@@ -1219,7 +1207,7 @@ pub(crate) fn build_restored_card(
             Ps2PsuRestoreError::InvalidPlan("root directory chain is empty".into())
         })?;
         restore_set_fat(&mut bytes, &plan.geometry, last, 0x8000_0000 | extra)?;
-        restore_set_fat(&mut bytes, &plan.geometry, extra, 0x7fff_ffff)?;
+        restore_set_fat(&mut bytes, &plan.geometry, extra, 0xffff_ffff)?;
     }
     restore_link_chain(&mut bytes, &plan.geometry, &directory_chain)?;
     for chain in &file_chains {
@@ -1327,87 +1315,16 @@ pub(crate) fn build_restored_card(
     Ok(bytes)
 }
 
-/// Unguarded primitive: no emulator-quiescence check, no durable journal and no
-/// pre-publication recheck. Production code must use
+/// Permanently blocked compatibility entry point. Production code must use
 /// [`restore_guard::apply_ps2_psu_restore_guarded`].
 #[deprecated(note = "use restore_guard::apply_ps2_psu_restore_guarded")]
 pub fn apply_ps2_psu_restore(
     plan: &Ps2PsuRestorePlan,
 ) -> Result<Ps2PsuRestoreResult, Ps2PsuRestoreError> {
-    validate_source_path(&plan.source_card_path)
-        .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
-    validate_backup_path(&plan.backup_path, &plan.source_card_path)?;
-    let source_psu_bytes = fs::read(&plan.source_psu_path).map_err(restore_error)?;
-    if sha256_hex(&source_psu_bytes) != plan.source_psu_sha256 {
-        return Err(Ps2PsuRestoreError::SourceChanged);
-    }
-    let original = read_source_card(&plan.source_card_path)
-        .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
-    if sha256_hex(&original) != plan.target_card_sha256
-        || original.len() as u64 != plan.target_card_size_bytes
-    {
-        return Err(Ps2PsuRestoreError::CardChanged);
-    }
-    let backup_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&plan.backup_path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                Ps2PsuRestoreError::BackupExists(plan.backup_path.clone())
-            } else {
-                restore_error(error)
-            }
-        })?;
-    let mut backup_file = backup_file;
-    let backup_write = (|| {
-        backup_file.write_all(&original).map_err(restore_error)?;
-        backup_file.sync_all().map_err(restore_error)
-    })();
-    drop(backup_file);
-    if let Err(error) = backup_write {
-        let _ = fs::remove_file(&plan.backup_path);
-        return Err(error);
-    }
-    let backup = fs::read(&plan.backup_path).map_err(restore_error)?;
-    let backup_sha256 = sha256_hex(&backup);
-    if backup.len() != original.len() || backup_sha256 != plan.target_card_sha256 {
-        let _ = fs::remove_file(&plan.backup_path);
-        return Err(Ps2PsuRestoreError::BackupVerificationFailed);
-    }
-
-    let result = (|| {
-        let bytes = build_restored_card(plan, &original)?;
-        restore_write_card_atomically(&plan.source_card_path, &bytes)?;
-        let after = inspect_memory_card(&plan.source_card_path).map_err(Ps2PsuRestoreError::Io)?;
-        if after.card_size_bytes != plan.target_card_size_bytes
-            || after.health != MemoryCardHealth::Healthy
-            || !restore_contains_expected(&after, plan)
-        {
-            restore_write_card_atomically(&plan.source_card_path, &original)?;
-            return Err(Ps2PsuRestoreError::VerificationFailed(
-                "card structure or restored save did not match the reviewed package".into(),
-            ));
-        }
-        Ok(Ps2PsuRestoreResult {
-            source_card_path: plan.source_card_path.clone(),
-            source_psu_path: plan.source_psu_path.clone(),
-            backup_path: plan.backup_path.clone(),
-            backup_sha256,
-            original_card_sha256: plan.target_card_sha256.clone(),
-            post_restore_card_sha256: sha256_hex(&bytes),
-            card_size_bytes: bytes.len() as u64,
-            save_display_name: plan.save_display_name.clone(),
-            file_count: plan.file_count,
-        })
-    })();
-    if result.is_err()
-        && sha256_hex(&read_source_card(&plan.source_card_path).unwrap_or_default())
-            != plan.target_card_sha256
-    {
-        let _ = restore_write_card_atomically(&plan.source_card_path, &original);
-    }
-    result
+    let _ = plan;
+    Err(Ps2PsuRestoreError::RecoveryRequired(
+        "Legacy unguarded restore is blocked; use the guarded journaled API.".into(),
+    ))
 }
 
 fn restore_contains_expected(card: &MemoryCardInventory, plan: &Ps2PsuRestorePlan) -> bool {
@@ -1470,36 +1387,13 @@ fn read_file_chain_bytes(
     (remaining == 0).then_some(output)
 }
 
-/// Unguarded primitive; see [`restore_guard::undo_ps2_psu_restore_guarded`].
+/// Permanently blocked compatibility entry point; see [`restore_guard::undo_ps2_psu_restore_guarded`].
 #[deprecated(note = "use restore_guard::undo_ps2_psu_restore_guarded")]
 pub fn undo_ps2_psu_restore(result: &Ps2PsuRestoreResult) -> Result<(), Ps2PsuRestoreError> {
-    validate_source_path(&result.source_card_path)
-        .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
-    validate_restore_parent(&result.backup_path)?;
-    let current = read_source_card(&result.source_card_path)
-        .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
-    if sha256_hex(&current) != result.post_restore_card_sha256 {
-        return Err(Ps2PsuRestoreError::StaleUndo);
-    }
-    let backup_metadata = fs::symlink_metadata(&result.backup_path).map_err(restore_error)?;
-    if !backup_metadata.file_type().is_file() || backup_metadata.file_type().is_symlink() {
-        return Err(Ps2PsuRestoreError::BackupVerificationFailed);
-    }
-    let backup = fs::read(&result.backup_path).map_err(restore_error)?;
-    if sha256_hex(&backup) != result.original_card_sha256
-        || sha256_hex(&backup) != result.backup_sha256
-    {
-        return Err(Ps2PsuRestoreError::BackupVerificationFailed);
-    }
-    restore_write_card_atomically(&result.source_card_path, &backup)?;
-    let restored = read_source_card(&result.source_card_path)
-        .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
-    if sha256_hex(&restored) != result.original_card_sha256 {
-        return Err(Ps2PsuRestoreError::VerificationFailed(
-            "undo did not restore the original card bytes".into(),
-        ));
-    }
-    Ok(())
+    let _ = result;
+    Err(Ps2PsuRestoreError::RecoveryRequired(
+        "Legacy unguarded undo is blocked; use the guarded journaled API.".into(),
+    ))
 }
 
 fn psu_error(error: Ps2FileExportError) -> Ps2PsuExportError {
@@ -2226,66 +2120,58 @@ fn ps2_relative_cluster(
     ps2_logical_cluster(bytes, geometry, absolute)
 }
 
+fn ps2_fat_location(
+    bytes: &[u8],
+    geometry: &Ps2Geometry,
+    relative: u32,
+) -> Result<(u32, usize), Ps2InventoryWarning> {
+    let bad = || {
+        ps2_warning(
+            Ps2CorruptionKind::InvalidFatReference,
+            "invalid indirect FAT address",
+        )
+    };
+    let entries = ps2_cluster_bytes(geometry) / 4;
+    if entries == 0 || relative >= geometry.alloc_end.saturating_sub(geometry.alloc_offset) {
+        return Err(bad());
+    }
+    let table = relative as usize / entries;
+    let slot = table / entries;
+    if slot >= 32 {
+        return Err(bad());
+    }
+    let indirect_address = le_u32(bytes, 0x50 + slot * 4).ok_or_else(bad)?;
+    if indirect_address == 0 || indirect_address >= geometry.alloc_offset {
+        return Err(bad());
+    }
+    let indirect = ps2_logical_cluster(bytes, geometry, indirect_address).ok_or_else(bad)?;
+    let fat_address = le_u32(&indirect, (table % entries) * 4).ok_or_else(bad)?;
+    if fat_address == 0 || fat_address == indirect_address || fat_address >= geometry.alloc_offset {
+        return Err(bad());
+    }
+    Ok((fat_address, (relative as usize % entries) * 4))
+}
+
+fn ps2_fat_raw(
+    bytes: &[u8],
+    geometry: &Ps2Geometry,
+    relative: u32,
+) -> Result<u32, Ps2InventoryWarning> {
+    let (address, offset) = ps2_fat_location(bytes, geometry, relative)?;
+    let cluster = ps2_logical_cluster(bytes, geometry, address)
+        .ok_or_else(|| ps2_warning(Ps2CorruptionKind::TruncatedCard, "FAT cluster unavailable"))?;
+    le_u32(&cluster, offset)
+        .ok_or_else(|| ps2_warning(Ps2CorruptionKind::TruncatedCard, "FAT entry unavailable"))
+}
+
 fn ps2_fat_next(
     bytes: &[u8],
     geometry: &Ps2Geometry,
     relative_cluster: u32,
 ) -> Result<Option<u32>, Ps2InventoryWarning> {
     let available = geometry.alloc_end.saturating_sub(geometry.alloc_offset);
-    if relative_cluster >= available {
-        return Err(ps2_warning(
-            Ps2CorruptionKind::ClusterOutOfRange,
-            format!("relative cluster {relative_cluster} is outside the allocation area"),
-        ));
-    }
-    let entries_per_cluster = ps2_cluster_bytes(geometry) / 4;
-    if entries_per_cluster == 0 {
-        return Err(ps2_warning(
-            Ps2CorruptionKind::InvalidFatReference,
-            "PS2 cluster has no room for FAT entries",
-        ));
-    }
-    let indirect_index = relative_cluster as usize / entries_per_cluster;
-    let indirect_slot = indirect_index / entries_per_cluster;
-    let ifc_offset = 0x50usize
-        .checked_add(indirect_slot.checked_mul(4).ok_or_else(|| {
-            ps2_warning(
-                Ps2CorruptionKind::InvalidFatReference,
-                "IFC slot arithmetic overflowed",
-            )
-        })?)
-        .ok_or_else(|| {
-            ps2_warning(
-                Ps2CorruptionKind::InvalidFatReference,
-                "IFC offset arithmetic overflowed",
-            )
-        })?;
-    let ifc_cluster = le_u32(bytes, ifc_offset).ok_or_else(|| {
-        ps2_warning(
-            Ps2CorruptionKind::TruncatedCard,
-            "IFC entry is outside the card",
-        )
-    })?;
-    let fat_cluster_index = relative_cluster as usize % entries_per_cluster;
-    let fat_cluster = ps2_logical_cluster(bytes, geometry, ifc_cluster).ok_or_else(|| {
-        ps2_warning(
-            Ps2CorruptionKind::ClusterOutOfRange,
-            format!("IFC points to unavailable FAT cluster {ifc_cluster}"),
-        )
-    })?;
-    let fat_offset = fat_cluster_index.checked_mul(4).ok_or_else(|| {
-        ps2_warning(
-            Ps2CorruptionKind::InvalidFatReference,
-            "FAT entry arithmetic overflowed",
-        )
-    })?;
-    let raw = le_u32(&fat_cluster, fat_offset).ok_or_else(|| {
-        ps2_warning(
-            Ps2CorruptionKind::TruncatedCard,
-            "FAT entry is outside the card",
-        )
-    })?;
-    if raw == 0x7fff_ffff || raw == 0xffff_ffff {
+    let raw = ps2_fat_raw(bytes, geometry, relative_cluster)?;
+    if raw == 0xffff_ffff {
         return Ok(None);
     }
     if raw & 0x8000_0000 == 0 {
@@ -2826,6 +2712,16 @@ pub(crate) mod tests {
         assert!(inv.entries.is_empty());
     }
 
+    struct TestClosed;
+    impl crate::save_snapshots::tree_restore::safety::QuiescenceProvider for TestClosed {
+        fn observe(
+            &self,
+            _: &crate::save_snapshots::tree_restore::safety::DirectorySaveBinding,
+        ) -> crate::save_snapshots::tree_restore::safety::EmulatorQuiescence {
+            crate::save_snapshots::tree_restore::safety::EmulatorQuiescence::Closed
+        }
+    }
+
     pub(crate) fn ps2_fixture(page_stride: usize) -> Vec<u8> {
         let clusters = 8192usize;
         let pages_per_cluster = 2usize;
@@ -2841,7 +2737,12 @@ pub(crate) mod tests {
         card[0x3c..0x40].copy_from_slice(&(0u32).to_le_bytes());
         card[0x40..0x44].copy_from_slice(&(1023u32).to_le_bytes());
         card[0x44..0x48].copy_from_slice(&(1022u32).to_le_bytes());
-        card[0x50..0x54].copy_from_slice(&8u32.to_le_bytes());
+        card[0x50..0x54].copy_from_slice(&7u32.to_le_bytes());
+        // Actual two-level layout: superblock -> IFC cluster 7 -> FAT tables 8..39.
+        for table in 0..32usize {
+            let offset = 7 * pages_per_cluster * page_stride + table * 4;
+            card[offset..offset + 4].copy_from_slice(&(8u32 + table as u32).to_le_bytes());
+        }
         let fat_cluster_offset = 8 * pages_per_cluster * page_stride;
         card[fat_cluster_offset..fat_cluster_offset + 4]
             .copy_from_slice(&0xffff_ffffu32.to_le_bytes());
@@ -2850,7 +2751,7 @@ pub(crate) mod tests {
 
     pub(crate) fn ps2_inventory_fixture() -> Vec<u8> {
         let mut card = ps2_fixture(PS2_PAGE_DATA_BYTES);
-        card[0x50..0x54].copy_from_slice(&8u32.to_le_bytes());
+        card[0x50..0x54].copy_from_slice(&7u32.to_le_bytes());
         card[8 * 1024..8 * 1024 + 4].copy_from_slice(&0x8000_0009u32.to_le_bytes());
         for relative in [3usize, 4, 9] {
             let offset = 8 * 1024 + relative * 4;
@@ -3268,7 +3169,16 @@ pub(crate) mod tests {
         let plan = plan_ps2_psu_restore(&card, &source_psu, &backup, true).unwrap();
         assert!(plan.existing_save);
         assert_eq!(plan.required_clusters, 3);
-        let result = apply_ps2_psu_restore(&plan).unwrap();
+        let guarded = restore_guard::apply_ps2_psu_restore_guarded(
+            &plan,
+            &TestClosed,
+            &restore_guard::Ps2RestoreGuardOptions {
+                journal_dir: dir.path().to_path_buf(),
+                unix_seconds: 1,
+            },
+        )
+        .unwrap();
+        let result = guarded.result;
         assert_eq!(result.original_card_sha256, sha256_hex(&before));
         assert_eq!(result.card_size_bytes, before.len() as u64);
         assert_eq!(fs::read(&card_path).unwrap().len(), before.len());
@@ -3277,7 +3187,7 @@ pub(crate) mod tests {
             result.backup_sha256
         );
         assert_ne!(result.post_restore_card_sha256, result.original_card_sha256);
-        undo_ps2_psu_restore(&result).unwrap();
+        restore_guard::undo_ps2_psu_restore_guarded(&guarded.journal_path, &TestClosed, 2).unwrap();
         assert_eq!(fs::read(&card_path).unwrap(), before);
     }
 
@@ -3345,7 +3255,15 @@ pub(crate) mod tests {
 
         let backup = dir.path().join("before-restore.card");
         let plan = plan_ps2_psu_restore(&card, &source_psu, &backup, true).unwrap();
-        let result = apply_ps2_psu_restore(&plan).unwrap();
+        let guarded = restore_guard::apply_ps2_psu_restore_guarded(
+            &plan,
+            &TestClosed,
+            &restore_guard::Ps2RestoreGuardOptions {
+                journal_dir: dir.path().to_path_buf(),
+                unix_seconds: 1,
+            },
+        )
+        .unwrap();
         fs::OpenOptions::new()
             .append(true)
             .open(&card_path)
@@ -3353,7 +3271,7 @@ pub(crate) mod tests {
             .write_all(b"changed")
             .unwrap();
         assert!(matches!(
-            undo_ps2_psu_restore(&result),
+            restore_guard::undo_ps2_psu_restore_guarded(&guarded.journal_path, &TestClosed, 2),
             Err(Ps2PsuRestoreError::StaleUndo)
         ));
     }

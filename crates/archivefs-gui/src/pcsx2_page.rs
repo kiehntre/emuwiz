@@ -1,8 +1,7 @@
-//! PCSX2 GUI Integration Batch H2: a read-only "PCSX2" section - environment
-//! health plus, only when the caller already has an authoritative verified
-//! PS2 serial (and, separately, an authoritative verified executable CRC),
-//! a mapping of local PCSX2 per-game config/patch/cheat/texture/memory-card/
-//! save-state state for the selected title.
+//! PCSX2 environment and verified per-game status, with explicit guarded PS2
+//! PSU restore/Undo actions in Save Vault. Per-game config, patch, cheat,
+//! texture, memory-card and save-state mappings require an authoritative
+//! verified PS2 serial and, separately, an authoritative executable CRC.
 //!
 //! # PCSX2 is not an identity authority
 //!
@@ -21,15 +20,18 @@
 //! card, or save-state ownership is ever shown for an unresolved,
 //! ambiguous, or conflicting selection.
 //!
-//! # No mutation
+//! # Explicit mutation boundary
 //!
 //! This module never starts PCSX2, edits a config file, enables a patch or
-//! cheat, installs a texture pack, or touches a memory card/save state.
+//! cheat, or installs a texture pack. Card writes require an explicit reviewed
+//! restore or Undo through the guarded, journaled core APIs.
 //! Loading is always an explicit action, off the UI thread, following the
 //! same generation-guarded background-load convention this crate already
 //! uses elsewhere (`thread::spawn` + `mpsc::channel` + a stale-result
 //! generation check) - see the RPCS3 panel (`rpcs3_page.rs`) for the
 //! identical pattern this module mirrors.
+
+mod restore_recovery;
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -657,6 +659,7 @@ enum PsuRestoreDialogState {
     },
     Confirm(Box<Ps2PsuRestorePlan>),
     Success(Box<Ps2GuardedRestore>),
+    UndoConfirm(PathBuf),
     Undone,
     Refused(String),
 }
@@ -968,6 +971,7 @@ fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
         Ps2PsuRestoreError::StaleUndo => {
             "Undo refused because the memory card changed after the restore.".into()
         }
+        Ps2PsuRestoreError::UnsupportedAtomicExchange => "This filesystem cannot safely exchange card files. Restore and Undo are blocked; the card was not changed.".into(),
         Ps2PsuRestoreError::SourceChanged => {
             "The PSU file changed since preview; inspect it again before restoring.".into()
         }
@@ -986,7 +990,7 @@ fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
             "A PS2 emulator is running or has this memory card open. Close it completely, then try again. The card was not changed.".into()
         }
         Ps2PsuRestoreError::EmulatorStateUnknown => {
-            "EmuWiz could not confirm that no PS2 emulator is using this card, so it did not change it. Close PCSX2 completely and try again.".into()
+            "EmuWiz could not inspect every live process, so it did not change the card. Close the emulator and inaccessible processes or correct /proc permissions, then retry.".into()
         }
         Ps2PsuRestoreError::UnsupportedRepresentation(detail) => format!(
             "This card image cannot be restored safely: {detail}. The card was not changed."
@@ -999,63 +1003,12 @@ fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
             backup_path,
             ..
         } => format!(
-            "The restore failed AND putting the card back also failed ({detail}). Your verified backup is safe at {} - restore it manually before using this card.",
+            "The restore failed AND putting the card back also failed ({detail}). Preserve the card and all displaced files. The backup remains at {}. Obtain independent recovery review before using this card.",
             backup_path.display()
         ),
         Ps2PsuRestoreError::RecoveryRequired(detail) => {
             format!("This needs attention before it can continue: {detail}")
         }
-    }
-}
-
-/// Warns about interrupted restores found on disk and lets the user have them
-/// judged. Judging only reads the card and updates the restore record; it never
-/// writes the card.
-fn show_interrupted_restore_notice(ui: &mut egui::Ui) {
-    let Ok(dir) = default_ps2_restore_journal_dir() else {
-        return;
-    };
-    let pending: Vec<_> = discover_ps2_restore_journals(&dir)
-        .into_iter()
-        .filter(|summary| summary.needs_recovery || summary.needs_attention)
-        .collect();
-    let note_id = egui::Id::new("ps2_restore_interrupted_note");
-    if pending.is_empty() {
-        return;
-    }
-    ui.colored_label(
-        egui::Color32::from_rgb(200, 140, 0),
-        format!(
-            "{} earlier PS2 restore(s) did not finish cleanly. Check them before restoring again.",
-            pending.len()
-        ),
-    );
-    if pending.iter().any(|summary| summary.needs_recovery)
-        && widgets::action_button(
-            ui,
-            "Check interrupted restores",
-            widgets::ActionStyle::Secondary,
-            true,
-        )
-        .clicked()
-    {
-        let text = recover_all_interrupted_ps2_restores(&dir, unix_now())
-            .into_iter()
-            .map(|(_, outcome)| match outcome {
-                Ok(outcome) => format!("{outcome:?}"),
-                Err(error) => psu_restore_error_message(&error),
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        ui.data_mut(|data| data.insert_temp(note_id, text));
-    }
-    if let Some(text) = ui.data_mut(|data| data.get_temp::<String>(note_id)) {
-        ui.label(text);
-    }
-    if pending.iter().any(|summary| {
-        summary.phase.is_some_and(Ps2RestorePhase::needs_attention) || summary.error.is_some()
-    }) {
-        ui.label("At least one restore needs a person to look at it. Your verified backups are not deleted.");
     }
 }
 
@@ -1071,12 +1024,6 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
         .collapsible(false)
         .resizable(false)
         .show(ui.ctx(), |ui| {
-            if matches!(
-                &state,
-                PsuRestoreDialogState::Conflict { .. } | PsuRestoreDialogState::Confirm(_)
-            ) {
-                show_interrupted_restore_notice(ui);
-            }
             match &state {
             PsuRestoreDialogState::Conflict {
                 card,
@@ -1118,7 +1065,7 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 }
                 ui.horizontal(|ui| {
                     if widgets::action_button(ui, "Create backup and restore", widgets::ActionStyle::Primary, true).clicked() {
-                        match default_ps2_restore_guard_options().and_then(|options| {
+                        match restore_recovery::process_gate(&plan.source_card_path, &plan.save_display_name).and_then(|()| default_ps2_restore_guard_options()).and_then(|options| {
                             apply_ps2_psu_restore_guarded(plan, &ProcScanQuiescence::new(), &options)
                         }) {
                             Ok(done) => next_state = Some(PsuRestoreDialogState::Success(Box::new(done))),
@@ -1140,15 +1087,16 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 ui.label("The card was re-opened and the restored save was found.");
                 ui.horizontal(|ui| {
                     if widgets::action_button(ui, "Undo last restore", widgets::ActionStyle::Secondary, true).clicked() {
-                        match undo_ps2_psu_restore_guarded(&done.journal_path, &ProcScanQuiescence::new(), unix_now()) {
-                            Ok(()) => next_state = Some(PsuRestoreDialogState::Undone),
-                            Err(error) => next_state = Some(PsuRestoreDialogState::Refused(psu_restore_error_message(&error))),
-                        }
+                        next_state = Some(PsuRestoreDialogState::UndoConfirm(done.journal_path.clone()));
                     }
                     if widgets::action_button(ui, "Close", widgets::ActionStyle::Quiet, true).clicked() {
                         close = true;
                     }
                 });
+            }
+            PsuRestoreDialogState::UndoConfirm(path) => {
+                next_state = restore_recovery::confirm_undo(ui, path, advanced_mode);
+                if widgets::action_button(ui, "Cancel", widgets::ActionStyle::Quiet, true).clicked() { close = true; }
             }
             PsuRestoreDialogState::Undone => {
                 ui.heading("Restore undone");
@@ -1167,6 +1115,9 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
             }
             }
         });
+    if next_state.is_some() {
+        restore_recovery::invalidate(ui);
+    }
     if close {
         ui.data_mut(|data| data.remove::<PsuRestoreDialogState>(id));
     } else {
@@ -1189,8 +1140,10 @@ fn show_memory_card_contents(
             "Inspect, export, and explicitly restore complete PS2 saves as PSU files. Restore always previews the change, creates a verified backup, and re-checks the card after writing.",
         ),
     );
+    restore_recovery::show(ui, advanced_mode);
     if memory_cards.is_empty() {
         ui.label("No readable memory card was found for this PCSX2 profile.");
+        show_psu_restore_dialog(ui, advanced_mode);
         return;
     }
     for (card_index, card) in memory_cards.iter().enumerate() {

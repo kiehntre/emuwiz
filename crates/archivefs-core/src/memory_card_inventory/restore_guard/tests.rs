@@ -2,7 +2,7 @@
 //! disposable synthetic file in a temporary directory; no real memory card,
 //! save or emulator profile is ever read or written.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::os::unix::fs::PermissionsExt;
 
@@ -651,6 +651,7 @@ fn a_verified_round_trip_restores_and_undoes_exactly_and_keeps_the_card_mode() {
         [
             Ps2RestorePhase::Intent,
             Ps2RestorePhase::BackupVerified,
+            Ps2RestorePhase::BackupVerified,
             Ps2RestorePhase::Staged,
             Ps2RestorePhase::Publishing,
             Ps2RestorePhase::Published,
@@ -817,18 +818,6 @@ fn the_writer_does_not_touch_spare_bytes_which_is_why_ecc_cards_are_refused() {
     }
 }
 
-// ----------------------------------------------------------- legacy primitive
-
-#[test]
-#[allow(deprecated)]
-fn the_unguarded_primitive_still_round_trips_for_existing_callers() {
-    let world = World::new();
-    let plan = world.plan();
-    let result = apply_ps2_psu_restore(&plan).unwrap();
-    undo_ps2_psu_restore(&result).unwrap();
-    assert_eq!(world.card_bytes(), world.original);
-}
-
 // ----------------------------------------------------------------- detector
 
 fn fake_proc(entries: &[(&str, &str, &str, Option<&Path>)]) -> tempfile::TempDir {
@@ -866,7 +855,7 @@ fn the_proc_detector_distinguishes_closed_running_and_unknown() {
     for (comm, cmdline) in [
         ("pcsx2-qt", "/opt/pcsx2-qt"),
         ("PCSX2", "x"),
-        ("bwrap", "flatpak run net.pcsx2.PCSX2"),
+        ("bwrap", "flatpak\0run\0net.pcsx2.PCSX2\0"),
         ("AetherSX2", "x"),
     ] {
         let running = fake_proc(&[("200", comm, cmdline, None)]);
@@ -930,11 +919,9 @@ fn the_detector_drives_a_real_refusal_end_to_end() {
 fn hooks_observe_every_phase_in_order() {
     let world = World::new();
     let seen = RefCell::new(Vec::new());
-    let count = Cell::new(0);
     world
         .apply_hooked(&CLOSED, &|step| {
             seen.borrow_mut().push(step);
-            count.set(count.get() + 1);
             Ok(())
         })
         .unwrap();
@@ -942,7 +929,9 @@ fn hooks_observe_every_phase_in_order() {
         *seen.borrow(),
         [
             Ps2RestoreStep::AfterIntent,
+            Ps2RestoreStep::BeforeBackupCreate,
             Ps2RestoreStep::AfterBackup,
+            Ps2RestoreStep::BeforeStageCreate,
             Ps2RestoreStep::AfterStaged,
             Ps2RestoreStep::BeforeRename,
             Ps2RestoreStep::AfterRename,
@@ -981,3 +970,6 @@ fn an_undo_target_replaced_at_the_last_instant_is_swapped_back_untouched() {
         "nothing changed, so the (now stale) undo is simply refused"
     );
 }
+
+#[path = "review_regressions.rs"]
+mod review_regressions;

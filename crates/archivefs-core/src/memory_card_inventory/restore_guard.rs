@@ -1,6 +1,6 @@
-//! Guarded PS2 PSU restore: the existing executor in the parent module computes
-//! and writes the card; this module wraps it with the guarantees the Save Vault
-//! directory restore already has.
+//! Guarded PS2 PSU restore: the parent module computes the candidate image.
+//! This module owns card publication, Undo, durable journals and recovery,
+//! using the Save Vault quiescence contract.
 //!
 //! * **Quiescence.** Mutation is refused unless the Save Vault policy
 //!   ([`QuiescenceProvider`]) reports `Closed`. `Running` and `Unknown` refuse,
@@ -9,9 +9,9 @@
 //!   fsync) before the first mutation and at every phase change, so an
 //!   interrupted restore can be found and judged after a restart.
 //! * **Recheck before publication.** The live card must still be the reviewed
-//!   file (identity and SHA-256). After the rename, the old inode that was
-//!   pinned before staging is read again: if an external edit slipped into the
-//!   last moment, that newest pre-publication content is put back, not lost.
+//!   file (identity and SHA-256). Publication uses atomic exchange exclusively;
+//!   the displaced inode is verified, and a foreign replacement is preserved.
+//!   Unsupported filesystems refuse apply and undo without overwriting.
 //! * **Backup.** The verified backup is created with `create_new`, fsynced and
 //!   never deleted by this module.
 //! * **Undo** is bound to the applied card (path, device/inode, size, mtime and
@@ -19,11 +19,15 @@
 //! * **Rollback failures are reported**, never swallowed.
 //! * **No ECC guessing.** Cards with spare/ECC bytes are refused at planning.
 //!
-//! Remaining limitation: the pinned-inode check detects, but cannot prevent, an
-//! external in-place write that lands between the final recheck and the rename;
-//! it is repaired by restoring the newest content.
+//! External writers do not cooperate with our directory lock. Any detected
+//! uncertainty retains the displaced image and backup for manual inspection.
 
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+mod exchange;
+mod ownership;
+mod proc_scan;
+pub use proc_scan::{ProcScanQuiescence, ProcScanReport};
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -141,6 +145,8 @@ pub struct Ps2RestoreJournal {
     pub post_sha256: Option<String>,
     /// Identity of the card file right after publication (what undo is bound to).
     pub post_identity: Option<FileIdentity>,
+    #[serde(default)]
+    pub undo_identity: Option<FileIdentity>,
     pub save_display_name: String,
     pub file_count: usize,
     pub detail: Option<String>,
@@ -165,28 +171,15 @@ fn persist_journal(path: &Path, journal: &Ps2RestoreJournal) -> Result<(), Ps2Ps
     let parent = path
         .parent()
         .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("journal has no directory".into()))?;
-    let temporary = parent.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("journal")
-    ));
-    let write = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)?;
-        fs::File::open(parent)?.sync_all()
-    })();
-    write.map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        restore_error(error)
-    })
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(restore_error)?;
+    temporary.write_all(&bytes).map_err(restore_error)?;
+    temporary.as_file().sync_all().map_err(restore_error)?;
+    temporary
+        .persist(path)
+        .map_err(|error| restore_error(error.error))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(restore_error)
 }
 
 /// Load and verify a journal. A bad checksum, truncation, wrong version or
@@ -238,6 +231,7 @@ pub struct Ps2RestoreJournalSummary {
     pub needs_attention: bool,
     /// A completed restore whose undo is still available.
     pub undo_available: bool,
+    pub detail: Option<String>,
 }
 
 /// Restart discovery: every restore journal in `journal_dir`, including corrupt
@@ -269,6 +263,7 @@ pub fn discover_ps2_restore_journals(journal_dir: &Path) -> Vec<Ps2RestoreJourna
                 needs_recovery: journal.phase.needs_recovery(),
                 needs_attention: journal.phase.needs_attention(),
                 undo_available: journal.phase == Ps2RestorePhase::Published,
+                detail: journal.detail.clone(),
                 path,
             },
             Err(error) => Ps2RestoreJournalSummary {
@@ -280,6 +275,7 @@ pub fn discover_ps2_restore_journals(journal_dir: &Path) -> Vec<Ps2RestoreJourna
                 needs_recovery: true,
                 needs_attention: true,
                 undo_available: false,
+                detail: None,
             },
         })
         .collect()
@@ -308,100 +304,6 @@ fn check_quiescence(state: EmulatorQuiescence) -> Result<(), Ps2PsuRestoreError>
     }
 }
 
-/// Linux `/proc` observation of PS2 emulators.
-///
-/// `Running` when any process is named like a known PS2 emulator or holds the
-/// card file open. `Closed` only when the whole `/proc` listing was read
-/// without error and neither condition was found. Any unreadable process of the
-/// current user, or an unreadable `/proc`, is `Unknown`.
-///
-/// Limits (stated, not hidden): processes of *other* users cannot be inspected
-/// for open descriptors, so only their command line is considered; this is not
-/// a kernel-level file lock, so something can still open the card after the
-/// observation.
-pub struct ProcScanQuiescence {
-    proc_root: PathBuf,
-}
-
-impl ProcScanQuiescence {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            proc_root: PathBuf::from("/proc"),
-        }
-    }
-
-    /// Scan a different proc-like tree (tests).
-    #[must_use]
-    pub fn with_root(proc_root: PathBuf) -> Self {
-        Self { proc_root }
-    }
-}
-
-impl Default for ProcScanQuiescence {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl QuiescenceProvider for ProcScanQuiescence {
-    fn observe(&self, binding: &DirectorySaveBinding) -> EmulatorQuiescence {
-        let card = PathBuf::from(&binding.profile);
-        let canonical = fs::canonicalize(&card).ok();
-        let Ok(entries) = fs::read_dir(&self.proc_root) else {
-            return EmulatorQuiescence::Unknown;
-        };
-        // SAFETY: geteuid has no preconditions.
-        let me = unsafe { libc::geteuid() };
-        let mut unknown = false;
-        for entry in entries {
-            let Ok(entry) = entry else {
-                unknown = true;
-                continue;
-            };
-            let name = entry.file_name();
-            if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
-                continue;
-            }
-            let dir = entry.path();
-            let owner = fs::metadata(&dir).map(|m| m.uid()).ok();
-            for leaf in ["comm", "cmdline"] {
-                match fs::read(dir.join(leaf)) {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-                        if PS2_EMULATOR_PROCESS_NAMES.iter().any(|n| text.contains(n)) {
-                            return EmulatorQuiescence::Running;
-                        }
-                    }
-                    // The process exited while we were scanning.
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(_) => unknown = true,
-                }
-            }
-            match fs::read_dir(dir.join("fd")) {
-                Ok(fds) => {
-                    for fd in fds.flatten() {
-                        if let Ok(target) = fs::read_link(fd.path())
-                            && (target == card || canonical.as_ref() == Some(&target))
-                        {
-                            return EmulatorQuiescence::Running;
-                        }
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                // Another user's process: its descriptors are not ours to see.
-                Err(_) if owner.is_some_and(|uid| uid != me) => {}
-                Err(_) => unknown = true,
-            }
-        }
-        if unknown {
-            EmulatorQuiescence::Unknown
-        } else {
-            EmulatorQuiescence::Closed
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Guarded apply
 // ---------------------------------------------------------------------------
@@ -424,6 +326,8 @@ pub struct Ps2GuardedRestore {
 pub enum Ps2RestoreStep {
     AfterIntent,
     AfterBackup,
+    BeforeBackupCreate,
+    BeforeStageCreate,
     AfterStaged,
     BeforeRename,
     AfterRename,
@@ -465,8 +369,19 @@ fn step(hook: Hook<'_>, which: Ps2RestoreStep) -> Result<(), Fail> {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXCHANGE_ERRORS: std::cell::RefCell<std::collections::VecDeque<i32>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
 /// Atomically swap two paths (`renameat2(RENAME_EXCHANGE)`).
 fn rename_exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = EXCHANGE_ERRORS.with(|errors| errors.borrow_mut().pop_front()) {
+        if errno != 0 {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+    }
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let a = CString::new(a.as_os_str().as_bytes())
@@ -508,6 +423,9 @@ fn remove_owned_temp(journal: &Ps2RestoreJournal) {
     let Some(staged) = &journal.staged_path else {
         return;
     };
+    if staged == &journal.card_path || staged == &journal.backup_path {
+        return;
+    }
     if !staged
         .file_name()
         .and_then(|n| n.to_str())
@@ -519,8 +437,46 @@ fn remove_owned_temp(journal: &Ps2RestoreJournal) {
         return;
     };
     let sha = sha256_hex(&bytes);
-    if Some(sha.as_str()) == journal.staged_sha256.as_deref() || sha == journal.original_sha256 {
+    let identity = path_identity(staged).ok();
+    if identity.is_some()
+        && (identity == path_identity(&journal.card_path).ok()
+            || identity == path_identity(&journal.backup_path).ok())
+    {
+        return;
+    }
+    if (Some(sha.as_str()) == journal.staged_sha256.as_deref()
+        && identity.is_some()
+        && identity == journal.post_identity)
+        || (sha == journal.original_sha256 && identity == Some(journal.original_identity))
+    {
         let _ = fs::remove_file(staged);
+    }
+}
+
+fn clean_undo_temp(journal: &Ps2RestoreJournal) {
+    let Some(parent) = journal.card_path.parent() else {
+        return;
+    };
+    let temp = undo_temp_path(parent, &journal.operation_id);
+    if temp == journal.card_path || temp == journal.backup_path {
+        return;
+    }
+    let identity = path_identity(&temp).ok();
+    if identity.is_some()
+        && (identity == path_identity(&journal.card_path).ok()
+            || identity == path_identity(&journal.backup_path).ok())
+    {
+        return;
+    }
+    if identity.is_some()
+        && fs::read(&temp).is_ok_and(|bytes| {
+            let sha = sha256_hex(&bytes);
+            (identity == journal.undo_identity && sha == journal.original_sha256)
+                || (identity == journal.post_identity
+                    && Some(sha.as_str()) == journal.post_sha256.as_deref())
+        })
+    {
+        let _ = fs::remove_file(temp);
     }
 }
 
@@ -548,8 +504,7 @@ struct Run<'a> {
     journal: Ps2RestoreJournal,
     journal_path: PathBuf,
     seconds: u64,
-    /// Pinned read-only descriptor on the card inode that was reviewed.
-    pinned: fs::File,
+
     original: Vec<u8>,
     renamed: bool,
     quiescence: &'a dyn QuiescenceProvider,
@@ -601,6 +556,7 @@ pub(crate) fn apply_with_hook(
         .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     validate_backup_path(&plan.backup_path, &plan.source_card_path)?;
     restore_require_data_only_pages(&plan.geometry)?;
+    let _operation_lock = ownership::lock(&plan.source_card_path)?;
     let binding = ps2_card_binding(&plan.source_card_path, &plan.save_display_name);
     check_quiescence(quiescence.observe(&binding))?;
     let psu = fs::read(&plan.source_psu_path).map_err(restore_error)?;
@@ -608,7 +564,7 @@ pub(crate) fn apply_with_hook(
         return Err(Ps2PsuRestoreError::SourceChanged);
     }
     let mut pinned = fs::File::open(&plan.source_card_path).map_err(restore_error)?;
-    let pinned_identity = identity_of(&pinned.metadata().map_err(restore_error)?);
+    let pinned_identity = identity_of(&ownership::validate(&pinned)?);
     if path_identity(&plan.source_card_path)? != pinned_identity {
         return Err(Ps2PsuRestoreError::CardChanged);
     }
@@ -644,6 +600,7 @@ pub(crate) fn apply_with_hook(
         staged_sha256: None,
         post_sha256: None,
         post_identity: None,
+        undo_identity: None,
         save_display_name: plan.save_display_name.clone(),
         file_count: plan.file_count,
         detail: None,
@@ -655,7 +612,6 @@ pub(crate) fn apply_with_hook(
         journal,
         journal_path,
         seconds: options.unix_seconds,
-        pinned,
         original,
         renamed: false,
         quiescence,
@@ -679,10 +635,12 @@ fn execute(
 ) -> Result<Ps2PsuRestoreResult, Fail> {
     step(hook, Ps2RestoreStep::AfterIntent)?;
 
-    // Backup: create_new, fsync, re-read, verify. Never removed afterwards.
+    step(hook, Ps2RestoreStep::BeforeBackupCreate)?;
+    // Backup path is already durable in Intent. Partial backups are retained and flagged.
     let mut backup = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(&plan.backup_path)
         .map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -696,7 +654,6 @@ fn execute(
         .and_then(|()| backup.sync_all());
     drop(backup);
     if let Err(error) = written {
-        let _ = fs::remove_file(&plan.backup_path);
         return Err(restore_error(error).into());
     }
     if let Some(parent) = plan.backup_path.parent() {
@@ -707,7 +664,6 @@ fn execute(
     let backup_bytes = fs::read(&plan.backup_path).map_err(restore_error)?;
     let backup_sha256 = sha256_hex(&backup_bytes);
     if backup_bytes.len() != run.original.len() || backup_sha256 != run.journal.original_sha256 {
-        let _ = fs::remove_file(&plan.backup_path);
         return Err(Ps2PsuRestoreError::BackupVerificationFailed.into());
     }
     run.journal.backup_sha256 = Some(backup_sha256.clone());
@@ -723,20 +679,26 @@ fn execute(
         .parent()
         .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("card has no parent".into()))?;
     let staged_path = card_dir.join(format!("{STAGE_PREFIX}{}.tmp", run.journal.operation_id));
+    if staged_path == plan.source_card_path || staged_path == plan.backup_path {
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "Staging path collides with the card or backup; publication refused".into(),
+        )
+        .into());
+    }
     run.journal.staged_path = Some(staged_path.clone());
     run.journal.staged_sha256 = Some(staged_sha256.clone());
     run.journal.post_sha256 = Some(staged_sha256.clone());
+    run.set_phase(Ps2RestorePhase::BackupVerified)?;
+    step(hook, Ps2RestoreStep::BeforeStageCreate)?;
     {
-        let permissions = fs::metadata(&plan.source_card_path)
-            .map_err(restore_error)?
-            .permissions();
+        let permissions = fs::metadata(&plan.source_card_path).map_err(restore_error)?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&staged_path)
             .map_err(restore_error)?;
         file.write_all(&staged_bytes).map_err(restore_error)?;
-        fs::set_permissions(&staged_path, permissions).map_err(restore_error)?;
+        ownership::preserve(&file, &permissions)?;
         file.sync_all().map_err(restore_error)?;
     }
     let inspected = inspect_memory_card(&staged_path).map_err(Ps2PsuRestoreError::Io)?;
@@ -749,11 +711,13 @@ fn execute(
         )
         .into());
     }
+    run.journal.post_identity = Some(path_identity(&staged_path)?);
     run.set_phase(Ps2RestorePhase::Staged)?;
     step(hook, Ps2RestoreStep::AfterStaged)?;
 
     // Publication gate: journal the intent to publish, then recheck everything
     // one more time, immediately before the rename.
+    run.journal.post_identity = Some(path_identity(&staged_path)?);
     run.set_phase(Ps2RestorePhase::Publishing)?;
     run.quiet()?;
     if sha256_hex(&fs::read(&plan.source_psu_path).map_err(restore_error)?)
@@ -765,66 +729,28 @@ fn execute(
     run.card_is_reviewed()?;
     step(hook, Ps2RestoreStep::BeforeRename)?;
 
-    run.renamed = true;
-    let exchanged = match rename_exchange(&staged_path, &plan.source_card_path) {
-        Ok(()) => true,
-        Err(error) if exchange_unsupported(&error) => {
-            // Filesystem without RENAME_EXCHANGE: plain atomic rename, with the
-            // weaker pinned-inode detection below.
-            fs::rename(&staged_path, &plan.source_card_path).map_err(|error| {
-                run.renamed = false;
-                restore_error(error)
-            })?;
-            false
-        }
-        Err(error) => {
-            run.renamed = false;
-            return Err(restore_error(error).into());
-        }
-    };
+    exchange::publish(
+        &staged_path,
+        &plan.source_card_path,
+        run.journal.original_identity,
+        &run.journal.original_sha256,
+        &staged_sha256,
+        &mut run.renamed,
+        hook,
+        Some(Ps2RestoreStep::AfterRename),
+    )?;
     fs::File::open(card_dir)
         .and_then(|directory| directory.sync_all())
         .map_err(restore_error)?;
-    step(hook, Ps2RestoreStep::AfterRename)?;
-
-    if exchanged {
-        // The staged path now holds whatever the card path held at the instant
-        // of the exchange. It must be exactly the reviewed inode with the
-        // reviewed bytes; otherwise swap it back untouched and refuse.
-        let displaced = fs::read(&staged_path).map_err(restore_error)?;
-        let displaced_identity = path_identity(&staged_path)?;
-        let same_inode = displaced_identity.device == run.journal.original_identity.device
-            && displaced_identity.inode == run.journal.original_identity.inode;
-        if !same_inode || sha256_hex(&displaced) != run.journal.original_sha256 {
-            rename_exchange(&staged_path, &plan.source_card_path).map_err(|error| {
-                // Could not swap back: unwind will write the newest content.
-                run.original = displaced.clone();
-                restore_error(error)
-            })?;
-            run.renamed = false;
-            return Err(Ps2PsuRestoreError::CardChanged.into());
-        }
-        fs::remove_file(&staged_path).map_err(restore_error)?;
-    } else {
-        // The inode we replaced must still hold exactly the reviewed bytes. If
-        // an external writer got in after the last recheck, its content is
-        // restored by `unwind` (the newest pre-publication state).
-        let mut old = Vec::new();
-        run.pinned.seek(SeekFrom::Start(0)).map_err(restore_error)?;
-        (&mut run.pinned)
-            .take(PS2_MAX_CARD_BYTES as u64 + 1)
-            .read_to_end(&mut old)
-            .map_err(restore_error)?;
-        if sha256_hex(&old) != run.journal.original_sha256 {
-            run.original = old;
-            return Err(Ps2PsuRestoreError::CardChanged.into());
-        }
-    }
 
     let live = read_source_card(&plan.source_card_path)
         .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
     let after = inspect_memory_card(&plan.source_card_path).map_err(Ps2PsuRestoreError::Io)?;
-    if sha256_hex(&live) != staged_sha256
+    if path_identity(&plan.source_card_path)?
+        != run.journal.post_identity.ok_or_else(|| {
+            Ps2PsuRestoreError::RecoveryRequired("Missing publication identity".into())
+        })?
+        || sha256_hex(&live) != staged_sha256
         || after.card_size_bytes != plan.target_card_size_bytes
         || after.health != MemoryCardHealth::Healthy
         || !restore_contains_expected(&after, plan)
@@ -836,6 +762,7 @@ fn execute(
     }
     run.journal.post_identity = Some(path_identity(&plan.source_card_path)?);
     run.set_phase(Ps2RestorePhase::Published)?;
+    remove_owned_temp(&run.journal);
     Ok(Ps2PsuRestoreResult {
         source_card_path: plan.source_card_path.clone(),
         source_psu_path: plan.source_psu_path.clone(),
@@ -856,45 +783,60 @@ fn unwind(
     cause: Ps2PsuRestoreError,
     hook: Hook<'_>,
 ) -> Ps2PsuRestoreError {
-    remove_owned_temp(&run.journal);
     let note = |run: &mut Run<'_>, phase, text: String| {
         run.journal.detail = Some(text);
         run.set_phase(phase)
     };
     if !run.renamed {
         // Never published: the card was not written.
-        let _ = note(run, Ps2RestorePhase::Abandoned, cause.to_string());
+        remove_owned_temp(&run.journal);
+        let incomplete = run
+            .journal
+            .staged_path
+            .as_ref()
+            .is_some_and(|path| path.exists())
+            || (run.journal.backup_path.exists() && run.journal.backup_sha256.is_none());
+        let phase = if incomplete {
+            Ps2RestorePhase::NeedsAttention
+        } else {
+            Ps2RestorePhase::Abandoned
+        };
+        if let Err(error) = note(run, phase, cause.to_string()) {
+            return Ps2PsuRestoreError::RecoveryRequired(format!(
+                "{cause}; journal update failed: {error}. Journal retained at {}",
+                run.journal_path.display()
+            ));
+        }
         return cause;
     }
-    // Published but not accepted: put the pre-restore content back.
-    let target = run.original.clone();
-    let target_sha = sha256_hex(&target);
-    let rollback = (|| -> Result<(), String> {
-        hook(Ps2RestoreStep::BeforeRollbackWrite).map_err(|e| e.to_string())?;
-        restore_write_card_atomically(&plan.source_card_path, &target)
-            .map_err(|e| e.to_string())?;
-        let live = read_source_card(&plan.source_card_path).map_err(|e| e.to_string())?;
-        if sha256_hex(&live) == target_sha {
-            Ok(())
-        } else {
-            Err("card did not read back as the pre-restore content".into())
-        }
-    })();
+    // A failed exchange reversal must never be retried by an unconditional write.
+    let rollback = if matches!(cause, Ps2PsuRestoreError::RecoveryRequired(_)) {
+        Err(cause.to_string())
+    } else {
+        exchange::rollback(run, hook)
+    };
     match rollback {
         Ok(()) => {
-            let _ = note(
+            if let Err(error) = note(
                 run,
                 Ps2RestorePhase::RolledBack,
                 format!("{cause}; the card was returned to its pre-restore content"),
-            );
+            ) {
+                return Ps2PsuRestoreError::RecoveryRequired(format!(
+                    "{cause}; rollback completed but journal update failed: {error}. Journal: {}",
+                    run.journal_path.display()
+                ));
+            }
             cause
         }
-        Err(detail) => {
-            let _ = note(
+        Err(mut detail) => {
+            if let Err(error) = note(
                 run,
                 Ps2RestorePhase::RollbackFailed,
                 format!("{cause}; rollback failed: {detail}"),
-            );
+            ) {
+                detail.push_str(&format!("; journal update failed: {error}"));
+            }
             Ps2PsuRestoreError::RollbackFailed {
                 detail,
                 backup_path: plan.backup_path.clone(),
@@ -926,6 +868,15 @@ pub(crate) fn undo_with_hook(
     hook: Hook<'_>,
 ) -> Result<(), Ps2PsuRestoreError> {
     let journal = load_ps2_restore_journal(journal_path)?;
+    let _operation_lock = ownership::lock(&journal.card_path)?;
+    let locked_card = journal.card_path.clone();
+    let journal = load_ps2_restore_journal(journal_path)?;
+    if journal.card_path != locked_card {
+        return Err(Ps2PsuRestoreError::JournalCorrupt(
+            "Journal binding changed while acquiring the operation lock".into(),
+        ));
+    }
+
     if journal.phase != Ps2RestorePhase::Published {
         return Err(match journal.phase {
             Ps2RestorePhase::Undone => Ps2PsuRestoreError::StaleUndo,
@@ -947,7 +898,7 @@ pub(crate) fn undo_with_hook(
     validate_source_path(&journal.card_path)
         .map_err(|error| Ps2PsuRestoreError::InvalidPlan(error.to_string()))?;
     let mut pinned = fs::File::open(&journal.card_path).map_err(restore_error)?;
-    let identity = identity_of(&pinned.metadata().map_err(restore_error)?);
+    let identity = identity_of(&ownership::validate(&pinned)?);
     if identity != post_identity || path_identity(&journal.card_path)? != post_identity {
         return Err(Ps2PsuRestoreError::StaleUndo);
     }
@@ -975,13 +926,19 @@ pub(crate) fn undo_with_hook(
         journal.history.push((phase, unix_seconds));
         persist_journal(journal_path, journal)
     };
-    set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
     let card_dir = journal
         .card_path
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| Ps2PsuRestoreError::InvalidPlan("card has no parent".into()))?;
     let undo_temp = undo_temp_path(&card_dir, &journal.operation_id);
+    if undo_temp == journal.card_path || undo_temp == journal.backup_path {
+        return Err(Ps2PsuRestoreError::InvalidPlan(
+            "Undo staging path collides with the card or backup; Undo refused".into(),
+        ));
+    }
+    set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
+    let mut undo_published = false;
     let result = (|| -> Result<(), Fail> {
         check_quiescence(quiescence.observe(&journal.binding))?;
         if path_identity(&journal.card_path)? != post_identity {
@@ -993,9 +950,7 @@ pub(crate) fn undo_with_hook(
             return Err(Ps2PsuRestoreError::StaleUndo.into());
         }
         // Stage the original next to the card (mode preserved), then swap it in.
-        let permissions = fs::metadata(&journal.card_path)
-            .map_err(restore_error)?
-            .permissions();
+        let permissions = fs::metadata(&journal.card_path).map_err(restore_error)?;
         {
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -1003,55 +958,35 @@ pub(crate) fn undo_with_hook(
                 .open(&undo_temp)
                 .map_err(restore_error)?;
             file.write_all(&backup).map_err(restore_error)?;
-            fs::set_permissions(&undo_temp, permissions).map_err(restore_error)?;
+            ownership::preserve(&file, &permissions)?;
             file.sync_all().map_err(restore_error)?;
         }
+        journal.undo_identity = Some(path_identity(&undo_temp)?);
+        set(&mut journal, Ps2RestorePhase::UndoIntent, None)?;
         step(hook, Ps2RestoreStep::BeforeUndoRename)?;
-        match rename_exchange(&undo_temp, &journal.card_path) {
-            Ok(()) => {
-                fs::File::open(&card_dir)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(restore_error)?;
-                step(hook, Ps2RestoreStep::AfterUndoRename)?;
-                // The displaced file must be the applied card, byte for byte;
-                // anything else (replaced or edited at the last instant) is
-                // swapped straight back and the undo is refused.
-                let displaced = fs::read(&undo_temp).map_err(restore_error)?;
-                let displaced_identity = path_identity(&undo_temp)?;
-                if displaced_identity.device != post_identity.device
-                    || displaced_identity.inode != post_identity.inode
-                    || sha256_hex(&displaced) != post_sha
-                {
-                    rename_exchange(&undo_temp, &journal.card_path).map_err(restore_error)?;
-                    let _ = fs::remove_file(&undo_temp);
-                    return Err(Ps2PsuRestoreError::StaleUndo.into());
-                }
-                fs::remove_file(&undo_temp).map_err(restore_error)?;
+        match exchange::publish(
+            &undo_temp,
+            &journal.card_path,
+            post_identity,
+            &post_sha,
+            &journal.original_sha256,
+            &mut undo_published,
+            hook,
+            Some(Ps2RestoreStep::AfterUndoRename),
+        ) {
+            Err(Fail::Error(Ps2PsuRestoreError::CardChanged)) => {
+                return Err(Ps2PsuRestoreError::StaleUndo.into());
             }
-            Err(error) if exchange_unsupported(&error) => {
-                let _ = fs::remove_file(&undo_temp);
-                restore_write_card_atomically(&journal.card_path, &backup)?;
-                step(hook, Ps2RestoreStep::AfterUndoRename)?;
-                // Weaker path: detect an in-place write through the pinned inode.
-                let mut old = Vec::new();
-                pinned.seek(SeekFrom::Start(0)).map_err(restore_error)?;
-                (&mut pinned)
-                    .take(PS2_MAX_CARD_BYTES as u64 + 1)
-                    .read_to_end(&mut old)
-                    .map_err(restore_error)?;
-                if sha256_hex(&old) != post_sha {
-                    restore_write_card_atomically(&journal.card_path, &old)?;
-                    return Err(Ps2PsuRestoreError::StaleUndo.into());
-                }
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&undo_temp);
-                return Err(restore_error(error).into());
-            }
+            other => other?,
         }
+        fs::File::open(&card_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(restore_error)?;
         let restored = read_source_card(&journal.card_path)
             .map_err(|e| Ps2PsuRestoreError::Io(e.to_string()))?;
-        if sha256_hex(&restored) != journal.original_sha256 {
+        if path_identity(&journal.card_path).ok() != journal.undo_identity
+            || sha256_hex(&restored) != journal.original_sha256
+        {
             return Err(Ps2PsuRestoreError::VerificationFailed(
                 "undo did not restore the original card bytes".into(),
             )
@@ -1060,25 +995,30 @@ pub(crate) fn undo_with_hook(
         Ok(())
     })();
     match result {
-        Ok(()) => set(&mut journal, Ps2RestorePhase::Undone, None),
+        Ok(()) => {
+            set(&mut journal, Ps2RestorePhase::Undone, None)?;
+            fs::remove_file(&undo_temp).map_err(restore_error)
+        }
         #[cfg(test)]
         Err(Fail::Crash) => Err(Ps2PsuRestoreError::Io(SIMULATED_CRASH.into())),
         Err(Fail::Error(error)) => {
-            // Our own undo temp (original image or displaced applied card) goes.
-            if let Ok(bytes) = fs::read(&undo_temp) {
-                let sha = sha256_hex(&bytes);
-                if sha == journal.original_sha256 || sha == post_sha {
-                    let _ = fs::remove_file(&undo_temp);
-                }
+            if !undo_published {
+                clean_undo_temp(&journal);
             }
             // A stale-undo refusal means the card was left exactly as found (a late
             // foreign file, if any, was swapped back untouched): not a failure.
-            if error == Ps2PsuRestoreError::StaleUndo {
-                let _ = set(
+            if !undo_published {
+                set(
                     &mut journal,
-                    Ps2RestorePhase::Published,
-                    Some(format!("undo refused: {error}")),
-                );
+                    if undo_temp.exists() {
+                        Ps2RestorePhase::NeedsAttention
+                    } else {
+                        Ps2RestorePhase::Published
+                    },
+                    Some(format!(
+                        "undo refused: {error}; inspect retained staging artifacts if present"
+                    )),
+                )?;
                 return Err(error);
             }
             // Is the card still the applied restore (nothing changed), or did
@@ -1087,19 +1027,24 @@ pub(crate) fn undo_with_hook(
                 .ok()
                 .map(|b| sha256_hex(&b));
             if live.as_deref() == Some(post_sha.as_str()) {
-                let _ = set(
+                set(
                     &mut journal,
                     Ps2RestorePhase::Published,
                     Some(format!("undo refused: {error}")),
-                );
+                )?;
                 Err(error)
             } else {
-                let detail = format!("{error}; the card may not match either state");
-                let _ = set(
+                let mut detail = format!(
+                    "{error}; the card may not match either state. Displaced file retained at {}",
+                    undo_temp.display()
+                );
+                if let Err(journal_error) = set(
                     &mut journal,
                     Ps2RestorePhase::UndoFailed,
                     Some(detail.clone()),
-                );
+                ) {
+                    detail.push_str(&format!("; journal update failed: {journal_error}"));
+                }
                 Err(Ps2PsuRestoreError::RollbackFailed {
                     detail,
                     backup_path: journal.backup_path.clone(),
@@ -1153,6 +1098,28 @@ pub fn recover_ps2_psu_restore(
             Ps2RecoveryOutcome::NothingToDo(phase)
         });
     }
+    let _operation_lock = ownership::lock(&journal.card_path)?;
+    let locked_card = journal.card_path.clone();
+    journal = load_ps2_restore_journal(journal_path)?;
+    if journal.card_path != locked_card {
+        return Err(Ps2PsuRestoreError::JournalCorrupt(
+            "Journal binding changed while acquiring the operation lock".into(),
+        ));
+    }
+    let phase = journal.phase;
+    if !phase.needs_recovery() {
+        return Ok(if phase.needs_attention() {
+            Ps2RecoveryOutcome::NeedsAttention(
+                journal
+                    .detail
+                    .clone()
+                    .unwrap_or_else(|| "Manual inspection required".into()),
+            )
+        } else {
+            Ps2RecoveryOutcome::NothingToDo(phase)
+        });
+    }
+
     let live_sha = read_source_card(&journal.card_path)
         .ok()
         .map(|bytes| sha256_hex(&bytes));
@@ -1164,13 +1131,57 @@ pub fn recover_ps2_psu_restore(
             journal.history.push((phase, unix_seconds));
             persist_journal(journal_path, journal)
         };
+    // A crash during creation must leave discoverable, explicit partial artifacts.
+    for (path, expected, kind) in [
+        (
+            Some(journal.backup_path.clone()),
+            Some(journal.original_sha256.clone()),
+            "backup",
+        ),
+        (
+            journal.staged_path.clone(),
+            journal.staged_sha256.clone(),
+            "staged image",
+        ),
+    ] {
+        if let Some(path) = path
+            && path.exists()
+        {
+            let valid = path_identity(&path).is_ok()
+                && fs::read(&path).is_ok_and(|bytes| {
+                    let sha = sha256_hex(&bytes);
+                    Some(sha.as_str()) == expected.as_deref()
+                        || (kind == "staged image" && sha == journal.original_sha256)
+                });
+            if !valid {
+                let detail = format!(
+                    "Incomplete or changed {kind} retained at {}. Preserve it and the card for independent inspection.",
+                    path.display()
+                );
+                finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
+                return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
+            }
+        }
+    }
     let live = live_sha.as_deref();
     let original = Some(journal.original_sha256.as_str());
     let post = journal.post_sha256.as_deref();
     match phase {
         Ps2RestorePhase::Intent | Ps2RestorePhase::BackupVerified | Ps2RestorePhase::Staged => {
-            if live == original {
+            if live == original
+                && path_identity(&journal.card_path).ok() == Some(journal.original_identity)
+            {
                 remove_staged(&journal);
+                if let Some(path) = &journal.staged_path
+                    && path.exists()
+                {
+                    let detail = format!(
+                        "Staged artifact identity or cleanup could not be verified. File retained at {}. The live card was not written by recovery.",
+                        path.display()
+                    );
+                    finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
+                    return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
+                }
                 finish(
                     &mut journal,
                     Ps2RestorePhase::Abandoned,
@@ -1184,8 +1195,20 @@ pub fn recover_ps2_psu_restore(
             }
         }
         Ps2RestorePhase::Publishing => {
-            if live == original {
+            if live == original
+                && path_identity(&journal.card_path).ok() == Some(journal.original_identity)
+            {
                 remove_staged(&journal);
+                if let Some(path) = &journal.staged_path
+                    && path.exists()
+                {
+                    let detail = format!(
+                        "Staged artifact identity or cleanup could not be verified. File retained at {}. The live card was not written by recovery.",
+                        path.display()
+                    );
+                    finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
+                    return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
+                }
                 finish(
                     &mut journal,
                     Ps2RestorePhase::Abandoned,
@@ -1193,6 +1216,17 @@ pub fn recover_ps2_psu_restore(
                 )?;
                 Ok(Ps2RecoveryOutcome::NotPublished)
             } else if live.is_some() && live == post {
+                if journal.staged_path.as_ref().is_some_and(|path| {
+                    path.exists() && path_identity(path).ok() != Some(journal.original_identity)
+                }) || journal.post_identity != path_identity(&journal.card_path).ok()
+                    || fs::read(&journal.backup_path)
+                        .ok()
+                        .is_none_or(|bytes| sha256_hex(&bytes) != journal.original_sha256)
+                {
+                    let detail = "Publication identity or backup could not be verified; all artifacts were retained.".to_string();
+                    finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
+                    return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
+                }
                 let inspected =
                     inspect_memory_card(&journal.card_path).map_err(Ps2PsuRestoreError::Io)?;
                 if inspected.health != MemoryCardHealth::Healthy {
@@ -1220,21 +1254,35 @@ pub fn recover_ps2_psu_restore(
         Ps2RestorePhase::UndoIntent => {
             if let Some(parent) = journal.card_path.parent() {
                 let temp = undo_temp_path(parent, &journal.operation_id);
-                if let Ok(bytes) = fs::read(&temp) {
-                    let sha = sha256_hex(&bytes);
-                    if sha == journal.original_sha256 || Some(sha.as_str()) == post {
-                        let _ = fs::remove_file(&temp);
-                    }
+                if temp.exists()
+                    && fs::read(&temp).is_ok_and(|bytes| {
+                        let sha = sha256_hex(&bytes);
+                        sha != journal.original_sha256 && Some(sha.as_str()) != post
+                    })
+                {
+                    let detail = format!(
+                        "Incomplete undo image retained at {}. Manual inspection required.",
+                        temp.display()
+                    );
+                    finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
+                    return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
                 }
             }
-            if live.is_some() && live == post {
+            if live.is_some()
+                && live == post
+                && path_identity(&journal.card_path).ok() == journal.post_identity
+            {
+                clean_undo_temp(&journal);
                 finish(
                     &mut journal,
                     Ps2RestorePhase::Published,
                     "interrupted undo had not changed the card; undo is available again",
                 )?;
                 Ok(Ps2RecoveryOutcome::UndoNotApplied)
-            } else if live == original {
+            } else if live == original
+                && path_identity(&journal.card_path).ok() == journal.undo_identity
+            {
+                clean_undo_temp(&journal);
                 finish(&mut journal, Ps2RestorePhase::Undone, "undo had completed")?;
                 Ok(Ps2RecoveryOutcome::UndoCompleted)
             } else {
@@ -1251,18 +1299,19 @@ pub fn recover_ps2_psu_restore(
 // Application defaults
 // ---------------------------------------------------------------------------
 
-/// The per-user journal directory (created if missing).
+/// Resolve the journal directory without creating it (read-only viewing).
 pub fn default_ps2_restore_journal_dir() -> Result<PathBuf, Ps2PsuRestoreError> {
     let dir = crate::app_dirs::data_path("ps2-restore-journals")
         .map_err(|error| Ps2PsuRestoreError::Io(error.to_string()))?;
-    fs::create_dir_all(&dir).map_err(restore_error)?;
     Ok(dir)
 }
 
 /// Guard options for "now" with the default journal directory.
 pub fn default_ps2_restore_guard_options() -> Result<Ps2RestoreGuardOptions, Ps2PsuRestoreError> {
+    let journal_dir = default_ps2_restore_journal_dir()?;
+    fs::create_dir_all(&journal_dir).map_err(restore_error)?;
     Ok(Ps2RestoreGuardOptions {
-        journal_dir: default_ps2_restore_journal_dir()?,
+        journal_dir,
         unix_seconds: unix_now(),
     })
 }
@@ -1282,7 +1331,7 @@ pub fn recover_all_interrupted_ps2_restores(
 ) -> Vec<(PathBuf, Result<Ps2RecoveryOutcome, Ps2PsuRestoreError>)> {
     discover_ps2_restore_journals(journal_dir)
         .into_iter()
-        .filter(|summary| summary.needs_recovery && summary.error.is_none())
+        .filter(|summary| summary.needs_recovery)
         .map(|summary| {
             let outcome = recover_ps2_psu_restore(&summary.path, unix_seconds);
             (summary.path, outcome)
