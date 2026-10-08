@@ -394,7 +394,7 @@ fn corrupt_journal_is_reported_by_batch_recovery_without_card_io() {
     let world = World::new();
     let path = world.journals.join("ps2-psu-restore-corrupt.json");
     fs::write(&path, b"corrupt synthetic journal").unwrap();
-    let outcomes = recover_all_interrupted_ps2_restores(&world.journals, 2);
+    let outcomes = recover_all_interrupted_ps2_restores(&world.journals, 2).outcomes;
     assert_eq!(outcomes.len(), 1);
     assert!(matches!(
         outcomes[0].1,

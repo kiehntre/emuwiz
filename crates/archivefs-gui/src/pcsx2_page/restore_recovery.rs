@@ -1,13 +1,28 @@
 //! Explicit refresh and restart Undo; discovery never creates a data directory.
 use super::*;
 use archivefs_core::memory_card_inventory::restore_guard::{
-    Ps2RecoveryOutcome, Ps2RestoreJournalSummary, load_ps2_restore_journal, ps2_card_binding,
+    Ps2DiscoveryProblem, Ps2RecoveryOutcome, Ps2RestoreJournalSummary, load_ps2_restore_journal,
+    ps2_card_binding,
 };
 
 #[derive(Clone, Default)]
 struct History {
     rows: Vec<Ps2RestoreJournalSummary>,
+    /// Why `rows` may not be the whole inventory; empty only when it is.
+    problems: Vec<Ps2DiscoveryProblem>,
     messages: Vec<String>,
+}
+impl History {
+    fn discover(dir: &Path) -> Self {
+        let mut history = Self::default();
+        history.refresh(dir);
+        history
+    }
+    fn refresh(&mut self, dir: &Path) {
+        let found = discover_ps2_restore_journals(dir);
+        self.rows = found.records;
+        self.problems = found.problems;
+    }
 }
 fn history_id() -> egui::Id {
     egui::Id::new("ps2_restore_history_cache")
@@ -36,8 +51,15 @@ fn outcome_message(outcome: &Ps2RecoveryOutcome) -> String {
 }
 
 pub(super) fn show(ui: &mut egui::Ui, advanced_mode: bool) {
-    let Ok(dir) = default_ps2_restore_journal_dir() else {
-        return;
+    let dir = match default_ps2_restore_journal_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            ui.label(format!(
+                "PS2 restore records cannot be located, so interrupted restores may be hidden: {}",
+                psu_restore_error_message(&error)
+            ));
+            return;
+        }
     };
     show_in(ui, advanced_mode, &dir);
 }
@@ -45,16 +67,13 @@ pub(super) fn show(ui: &mut egui::Ui, advanced_mode: bool) {
 fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
     let mut history = ui
         .data_mut(|data| data.get_temp::<History>(history_id()))
-        .unwrap_or_else(|| History {
-            rows: discover_ps2_restore_journals(dir),
-            messages: Vec::new(),
-        });
+        .unwrap_or_else(|| History::discover(dir));
     ui.horizontal(|ui| {
         ui.label("PS2 restore records");
         if widgets::action_button(ui, "Refresh records", widgets::ActionStyle::Secondary, true)
             .clicked()
         {
-            history.rows = discover_ps2_restore_journals(dir);
+            history.refresh(dir);
         }
         if history
             .rows
@@ -68,7 +87,9 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
             )
             .clicked()
         {
-            history.messages = recover_all_interrupted_ps2_restores(dir, unix_now())
+            let run = recover_all_interrupted_ps2_restores(dir, unix_now());
+            history.messages = run
+                .outcomes
                 .into_iter()
                 .map(|(path, outcome)| {
                     format!(
@@ -81,9 +102,16 @@ fn show_in(ui: &mut egui::Ui, advanced_mode: bool, dir: &Path) {
                     )
                 })
                 .collect();
-            history.rows = discover_ps2_restore_journals(dir);
+            history.refresh(dir);
         }
     });
+    if !history.problems.is_empty() {
+        ui.label("Warning: the restore record list below is INCOMPLETE. Do not treat it as the full recovery inventory; interrupted or failed restores may not be shown.");
+        for problem in &history.problems {
+            ui.label(format!("  - {problem}"));
+        }
+        ui.label("Fix the cause (permissions, damaged folder or too many records), then press Refresh records. Nothing was deleted or changed.");
+    }
     for row in &history.rows {
         if row.undo_available || row.needs_attention || row.needs_recovery {
             widgets::path_value(ui, "Restore record", &row.path);
@@ -431,3 +459,6 @@ mod restart_tests {
         assert!(!missing.exists());
     }
 }
+
+#[cfg(test)]
+mod discovery_tests;

@@ -24,10 +24,15 @@
 
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
+mod discovery;
 mod exchange;
 mod ownership;
 mod proc_scan;
 mod recovery_evidence;
+pub use discovery::{
+    PS2_DISCOVERY_LIMIT, Ps2DiscoveryProblem, Ps2RecoveryRun, Ps2RestoreDiscovery,
+    discover_ps2_restore_journals, recover_all_interrupted_ps2_restores,
+};
 pub use proc_scan::{ProcScanQuiescence, ProcScanReport};
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -233,56 +238,6 @@ pub struct Ps2RestoreJournalSummary {
     /// A completed restore whose undo is still available.
     pub undo_available: bool,
     pub detail: Option<String>,
-}
-
-/// Restart discovery: every restore journal in `journal_dir`, including corrupt
-/// ones. Read-only.
-#[must_use]
-pub fn discover_ps2_restore_journals(journal_dir: &Path) -> Vec<Ps2RestoreJournalSummary> {
-    let Ok(entries) = fs::read_dir(journal_dir) else {
-        return Vec::new();
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(JOURNAL_PREFIX) && name.ends_with(".json"))
-        })
-        .take(1024)
-        .collect();
-    paths.sort();
-    paths
-        .into_iter()
-        .map(|path| match load_ps2_restore_journal(&path) {
-            Ok(journal) => {
-                let evidence_problem = recovery_evidence::problem(&journal);
-                Ps2RestoreJournalSummary {
-                    operation_id: Some(journal.operation_id.clone()),
-                    phase: Some(journal.phase),
-                    card_path: Some(journal.card_path.clone()),
-                    error: None,
-                    needs_recovery: journal.phase.needs_recovery(),
-                    needs_attention: journal.phase.needs_attention() || evidence_problem.is_some(),
-                    undo_available: journal.phase == Ps2RestorePhase::Published,
-                    detail: evidence_problem.or_else(|| journal.detail.clone()),
-                    path,
-                }
-            }
-            Err(error) => Ps2RestoreJournalSummary {
-                path,
-                operation_id: None,
-                phase: None,
-                card_path: None,
-                error: Some(error.to_string()),
-                needs_recovery: true,
-                needs_attention: true,
-                undo_available: false,
-                detail: None,
-            },
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,22 +1268,6 @@ pub fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
-}
-
-/// Judge every interrupted operation in `journal_dir` (see
-/// [`recover_ps2_psu_restore`]); never writes a card.
-pub fn recover_all_interrupted_ps2_restores(
-    journal_dir: &Path,
-    unix_seconds: u64,
-) -> Vec<(PathBuf, Result<Ps2RecoveryOutcome, Ps2PsuRestoreError>)> {
-    discover_ps2_restore_journals(journal_dir)
-        .into_iter()
-        .filter(|summary| summary.needs_recovery)
-        .map(|summary| {
-            let outcome = recover_ps2_psu_restore(&summary.path, unix_seconds);
-            (summary.path, outcome)
-        })
-        .collect()
 }
 
 #[cfg(test)]
