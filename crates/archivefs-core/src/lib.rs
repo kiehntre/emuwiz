@@ -48,6 +48,7 @@ pub mod arcade_mame_compatibility;
 pub mod arcade_recommendation;
 /// Bounded Atari 8-bit standard cassette WAV evidence.
 pub mod atari_tape;
+mod atomic_text;
 pub mod attention;
 /// Bounded BBC Micro/Acorn standard cassette WAV evidence.
 pub mod bbc_tape;
@@ -2867,124 +2868,21 @@ fn quote_config_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Writes `contents` to `path` durably: a same-directory temp file, whose
-/// contents are flushed to stable storage before it is published, then an
-/// atomic `fs::rename`, then a best-effort sync of the parent directory.
+/// Replaces a regular text file using exclusively created, owned staging.
+/// Writes, mode preservation and file sync use the retained staging handle.
+/// Required mode preservation errors refuse before publication. New files use
+/// the existing 0666/umask creation policy without changing process-wide umask.
 ///
-/// # Why the syncs, and not just the rename
-///
-/// The rename alone is atomic on any POSIX filesystem, so a reader always
-/// sees either the old complete file or the new one - never a splice of
-/// both. That is not the same as durable. Without
-/// [`File::sync_all`] on the temp file, a crash can order the rename ahead
-/// of the data, publishing a file that is *present, named correctly and
-/// empty or truncated*. For a preferences file that is worse than losing
-/// the edit: an empty `cheat_sources.toml` still parses, as "no overrides",
-/// so every stored preference is silently discarded rather than visibly
-/// lost. Syncing the directory afterwards makes the rename itself survive
-/// the same crash.
-///
-/// Directory sync is best-effort by platform: filesystems that do not give
-/// directory handles `fsync` semantics report an error here, and that is
-/// not a failure of the write - the data is already durable and published,
-/// so the error is discarded rather than propagated.
-///
-/// # Permissions
-///
-/// When `path` already exists its permissions are copied onto the
-/// replacement before the rename, so writing a config that a user had
-/// tightened to `0600` does not silently widen it to the process umask's
-/// default.
-///
-/// These writes happen only on an explicit user action (saving settings or
-/// preferences), never in a hot loop, so the cost of two syncs is not a
-/// throughput concern.
+/// Observed staging-name substitution refuses publication and cleanup. This is
+/// still pathname-based replacement: it does not pin parent directories, lock
+/// competing writers, or eliminate hostile same-UID check/use races. Parent
+/// directory sync is best effort, so success is not universal crash durability.
 pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
-    static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    let parent = path.parent().ok_or_else(|| {
-        ArchiveFsError::Config(format!("config path has no parent: {}", path.display()))
-    })?;
-    // Never publish over a symlink. `fs::rename` would replace the symlink
-    // itself, which is not equivalent to safely updating the intended target.
-    // Existing callers that create a new file still retain that behaviour;
-    // existing paths must be regular files.
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(ArchiveFsError::Config(format!(
-                "refusing to overwrite symlinked config path: {}",
-                path.display()
-            )));
-        }
-        if !metadata.is_file() {
-            return Err(ArchiveFsError::Config(format!(
-                "refusing to overwrite config path that is not a regular file: {}",
-                path.display()
-            )));
-        }
-    }
-    fs::create_dir_all(parent)
-        .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
-
-    let temp_path = parent.join(format!(
-        ".archivefs-config-write-{}-{}.tmp",
-        std::process::id(),
-        TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-
-    // Scoped so the handle is closed before the rename: on Windows a rename
-    // over an open file fails, and there is nothing to gain from holding it.
-    let write_result = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&temp_path)?;
-        file.write_all(contents.as_bytes())?;
-        file.flush()?;
-        file.sync_all()
-    })();
-    if let Err(source) = write_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(ArchiveFsError::io(temp_path, source));
-    }
-
-    // Carry the existing file's mode across. Failure to read it is not fatal:
-    // the write still has to happen, just with default permissions.
-    if let Ok(existing) = fs::metadata(path) {
-        let _ = fs::set_permissions(&temp_path, existing.permissions());
-    }
-
-    // Re-check after preparing the replacement so a path that became a
-    // symlink during the operation still fails closed rather than replacing
-    // that link.
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            let _ = fs::remove_file(&temp_path);
-            return Err(ArchiveFsError::Config(format!(
-                "refusing to overwrite config path that is not a regular file: {}",
-                path.display()
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            let _ = fs::remove_file(&temp_path);
-            return Err(ArchiveFsError::io(path.to_path_buf(), source));
-        }
-    }
-
-    fs::rename(&temp_path, path).map_err(|source| {
-        let _ = fs::remove_file(&temp_path);
-        ArchiveFsError::io(path.to_path_buf(), source)
-    })?;
-
-    sync_directory_best_effort(parent);
-    Ok(())
+    atomic_text::write(path, contents)
 }
-
-/// Flushes a directory entry change (a rename) to stable storage.
-///
-/// Best-effort on purpose - see [`atomic_write_text`]. Opening a directory
-/// for reading and syncing it is the POSIX idiom; platforms and filesystems
-/// that do not support it fail here, and the caller's write is still
-/// complete and durable, so the error is deliberately dropped.
+/// Attempts to sync a directory entry change. Failure is deliberately ignored
+/// for the existing API's compatibility; it does not establish durable rename
+/// publication on filesystems where directory synchronization fails.
 fn sync_directory_best_effort(dir: &Path) {
     if let Ok(handle) = fs::File::open(dir) {
         let _ = handle.sync_all();
