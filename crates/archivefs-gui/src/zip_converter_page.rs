@@ -1,10 +1,10 @@
-//! Small Converter surface for verified ZIP creation and extraction.
+//! Read-only ZIP previews while Apply is blocked for preservation safety.
 
 use std::path::PathBuf;
 
 use archivefs_core::zip_converter::{
-    ZipOperationResult, ZipPreview, compress_verified, extract_verified, preview_compress,
-    preview_extract,
+    ZipError, ZipOperationResult, ZipPreview, compress_verified, extract_verified,
+    preview_compress, preview_extract,
 };
 use eframe::egui;
 
@@ -110,6 +110,7 @@ impl ZipConverterPageState {
 
     fn execute(&mut self) {
         self.error = None;
+        self.result = None;
         let source = PathBuf::from(self.source.trim());
         let destination = PathBuf::from(self.destination.trim());
         let result = match self.mode {
@@ -125,7 +126,7 @@ impl ZipConverterPageState {
 
 pub(crate) fn show(ui: &mut egui::Ui, state: &mut ZipConverterPageState) {
     ui.heading("ZIP Converter");
-    ui.label("Create or unpack ZIP files with safe paths and verification.");
+    ui.label(ZipError::ApplyUnavailable.to_string());
     ui.horizontal(|ui| {
         if ui
             .selectable_label(state.mode == ZipMode::Compress, "Compress")
@@ -172,7 +173,9 @@ pub(crate) fn show(ui: &mut egui::Ui, state: &mut ZipConverterPageState) {
     }
     if let Some(preview) = &state.preview {
         ui.separator();
-        ui.label("Review the output before creating it. The source is unchanged and existing destinations are refused.");
+        ui.label(
+            "Read-only preview: inspect member names and sizes. No output is created or extracted.",
+        );
         ui.label(format!(
             "{} files · {} bytes",
             preview
@@ -195,28 +198,22 @@ pub(crate) fn show(ui: &mut egui::Ui, state: &mut ZipConverterPageState) {
                     ));
                 }
                 if preview.entries.len() > 200 {
-                    ui.label("Preview truncated; all entries are still verified.");
+                    ui.label("Preview truncated; all entries were inspected and validated.");
                 }
             });
         if ui
-            .button(if state.mode == ZipMode::Compress {
-                "Create ZIP"
-            } else {
-                "Extract ZIP"
-            })
+            .add_enabled(
+                false,
+                egui::Button::new(if state.mode == ZipMode::Compress {
+                    "Create ZIP (temporarily unavailable)"
+                } else {
+                    "Extract ZIP (temporarily unavailable)"
+                }),
+            )
             .clicked()
         {
             state.execute();
         }
-    }
-    if let Some(result) = &state.result {
-        ui.colored_label(egui::Color32::from_rgb(90, 190, 110), "Verified");
-        ui.label(if state.mode == ZipMode::Compress {
-            "ZIP created and verified."
-        } else {
-            "ZIP extracted and verified."
-        });
-        ui.label(&result.verification);
     }
     if let Some(error) = &state.error {
         let collision = error.contains("Destination already exists");
@@ -282,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn zip_preview_explains_copy_safety_before_create() {
+    fn zip_preview_explains_apply_is_unavailable() {
         let mut state = ZipConverterPageState {
             source: "games/source".into(),
             destination: "out.zip".into(),
@@ -299,10 +296,12 @@ mod tests {
             egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
         });
         let text = rendered_text(&output);
-        assert!(text.contains("Review the output before creating it"));
-        assert!(text.contains("source is unchanged"));
+        assert!(text.contains("Read-only preview"));
+        assert!(text.contains("preservation safety"));
+        assert!(text.contains("No output is created or extracted"));
         assert!(text.contains("Destination: out.zip"));
-        assert!(text.contains("Create ZIP"));
+        assert!(text.contains("Create ZIP (temporarily unavailable)"));
+        assert!(!text.contains("ZIP created and verified"));
         assert!(state.result.is_none());
     }
 
@@ -321,5 +320,86 @@ mod tests {
         assert!(text.contains("EmuWiz will not replace it"));
         assert!(!text.contains("Force"));
         assert!(state.result.is_none());
+    }
+
+    #[test]
+    fn every_gui_execution_mode_reports_refusal_and_clears_stale_success() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        let destination = root.path().join("output");
+        std::fs::write(&source, b"synthetic source").unwrap();
+        for mode in [ZipMode::Compress, ZipMode::Extract] {
+            let mut state = ZipConverterPageState {
+                mode,
+                source: source.display().to_string(),
+                destination: destination.display().to_string(),
+                result: Some(ZipOperationResult {
+                    source: source.clone(),
+                    destination: destination.clone(),
+                    files: 1,
+                    total_size: 16,
+                    verification: "stale success".into(),
+                }),
+                ..Default::default()
+            };
+            state.execute();
+            assert_eq!(
+                state.error.as_deref(),
+                Some(ZipError::ApplyUnavailable.to_string().as_str())
+            );
+            assert!(state.result.is_none());
+            let context = egui::Context::default();
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+            });
+            let text = rendered_text(&output);
+            assert!(text.contains("temporarily unavailable"));
+            assert!(text.contains("No output was created or extracted"));
+            assert!(!text.contains("created and verified"));
+            assert!(!text.contains("extracted and verified"));
+            assert!(!text.contains("stale success"));
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read(&source).unwrap(), b"synthetic source");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn gui_preview_still_inspects_valid_compression_and_extraction_sources() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source.bin");
+        let archive = root.path().join("source.zip");
+        std::fs::write(&source, b"synthetic source").unwrap();
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        writer
+            .start_file("game.bin", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"synthetic game").unwrap();
+        writer.finish().unwrap();
+        for (mode, source, name) in [
+            (ZipMode::Compress, &source, "source.bin"),
+            (ZipMode::Extract, &archive, "game.bin"),
+        ] {
+            let mut state = ZipConverterPageState {
+                mode,
+                source: source.display().to_string(),
+                destination: root.path().join("output").display().to_string(),
+                ..Default::default()
+            };
+            state.preview();
+            assert!(state.error.is_none(), "{:?}", state.error);
+            assert_eq!(state.preview.as_ref().unwrap().entries[0].name, name);
+            assert!(state.result.is_none());
+            let context = egui::Context::default();
+            let output = context.run(egui::RawInput::default(), |context| {
+                egui::CentralPanel::default().show(context, |ui| show(ui, &mut state));
+            });
+            let text = rendered_text(&output);
+            assert!(text.contains("temporarily unavailable"));
+            assert!(text.contains(name));
+            assert!(!root.path().join("output").exists());
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
     }
 }

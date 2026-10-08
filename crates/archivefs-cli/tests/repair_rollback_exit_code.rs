@@ -7,6 +7,8 @@
 //! script depends on - is exercised, not just the `Result` `run()` returns
 //! internally.
 
+archivefs_core::install_test_environment!();
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 

@@ -1,6 +1,8 @@
 //! Offline end-to-end Wii GameHacking installation through the existing
 //! Dolphin GameSettings transaction, semantic verification and Undo path.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

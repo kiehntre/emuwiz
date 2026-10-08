@@ -2213,3 +2213,23 @@ fn empty_catalogue_stats() -> CatalogueStats {
         archives_unknown_platform: 0,
     }
 }
+
+#[test]
+fn gui_tests_run_in_the_private_test_environment() {
+    let Some(root) = archivefs_core::test_environment::isolated_root() else {
+        assert_eq!(
+            std::env::var("EMUWIZ_TEST_REAL_ENVIRONMENT").as_deref(),
+            Ok("1"),
+            "isolation was not installed in the GUI test binary"
+        );
+        return;
+    };
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    assert!(home.starts_with(root), "{home:?} escapes {root:?}");
+    // The settings the GUI persists land in the private tree.
+    assert!(
+        archivefs_core::app_dirs::config_dir()
+            .unwrap()
+            .starts_with(root)
+    );
+}

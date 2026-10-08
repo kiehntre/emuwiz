@@ -131,3 +131,98 @@ scripts/check-working-tree-scope.sh --baseline-file /tmp/emuwiz-task.txt \
 
 If a required file is already dirty, do not work around the ownership boundary
 by overwriting it. Stop and report the exact path and overlap.
+
+## Automatic repair and security policy
+
+This policy applies equally to Claude Code and Codex. Automatic production
+repairs apply to implementation tasks within their approved scope; they do not
+authorise edits during read-only research or independent review. All existing
+ownership, file-scope, Git, filesystem safety, testing and release requirements
+remain in force. Task-specific restrictions still apply.
+
+### Automatic defect repair
+
+Investigate and repair bugs discovered within the assigned implementation scope.
+When an error, failed test or security defect appears:
+
+1. Determine the root cause.
+2. Reproduce the failure using synthetic fixtures and capture pre-fix evidence.
+3. Add a regression test that fails before the correction.
+4. Implement the smallest safe correction.
+5. Rerun the affected tests.
+6. Continue until the defect is resolved or a genuine blocker is reached,
+   subject to the attempt limit below.
+
+Ordinary compilation errors and routine test failures do not require owner
+permission to investigate, correct or retest within scope. Unrelated defects
+must be reported rather than silently repaired outside the file-scope contract.
+
+### Security and preservation first
+
+Prioritise unexpected file deletion or overwriting, filesystem identity and
+symlink races, database corruption and backup integrity, save-game preservation,
+incorrect Undo or recovery results, stale user approvals, credential exposure,
+unsafe temporary files, and misleading success messages.
+
+Never weaken a security check just to make tests pass. Never remove a failing
+test without a justified replacement that preserves its safety coverage.
+Keep credentials out of fixtures, logs, command lines and reports. If safe
+operation cannot be demonstrated, fail closed rather than claim success.
+
+### Avoid endless repair loops
+
+Allow at most three focused implementation attempts per defect. Track each
+focused correction and its affected retest as one attempt. If the defect remains,
+reconsider the underlying architecture instead of stacking additional checks or
+resetting the count by renaming the defect.
+
+Document the evidence, unresolved root-cause questions and design options. If
+the design requires a substantial change, request owner approval before that
+change. Do not keep rewriting unrelated code or exceed the approved scope.
+
+### Independent review stays independent
+
+When explicitly assigned a READ-ONLY INDEPENDENT REVIEW, do not modify the
+candidate or perform production repairs. Reproduce suspected defects using
+isolated fixtures or a separate harness, subject to the review's restrictions.
+Report exact evidence and source locations, return PASS, PASS WITH CONDITIONS
+or FAIL, and recommend the smallest safe correction.
+
+The implementation owner, not the reviewer, performs production repairs.
+Security-sensitive fixes require independent re-review of the exact final
+commit; approval of an earlier version does not cover subsequent changes.
+
+### Ownership and isolation
+
+Before editing, check current Git state and active file ownership in addition
+to the existing worktree and file-scope checks. Never overwrite another agent's
+dirty work, and respect existing worktree boundaries.
+
+Use `scripts/cargo-iso` for Cargo operations and private HOME/XDG/TMP/application
+roots for tests. Never test destructive operations on real user data, including
+libraries, databases, saves, profiles, installations or approval files. Use an
+existing appropriately owned worktree when suitable; create an isolated worktree
+only when needed. Do not create duplicate Cargo caches for the same worktree or
+unnecessary build caches for documentation-only work.
+
+### Automatic completion
+
+Within the approved implementation scope, continue through:
+
+Implementation → Tests → Repair → Retest → Local commit → Report.
+
+Stop only for genuine safety, ownership, scope, evidence or architectural
+blockers, including an unresolved defect requiring architectural reconsideration
+after the attempt limit. Explain the blocker and the evidence or decision needed
+to proceed. Read-only assignments retain their own review/report completion path.
+
+Never push, merge, release or enable dangerous operations without explicit
+permission. A local candidate commit is not permission to promote or publish it.
+
+### Reporting
+
+At completion, report the defects discovered, root causes, repairs implemented,
+new regression tests, final test results, remaining limitations, exact local
+commit SHA, and whether independent review is required. Distinguish independently
+executed validation from reported or proposed tests. If blocked, state what
+remains unresolved and do not claim completion.

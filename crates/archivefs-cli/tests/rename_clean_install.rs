@@ -5,6 +5,8 @@
 //! exercised end to end. No real user data is ever touched: every test
 //! builds its own temporary home and removes it afterwards.
 
+archivefs_core::install_test_environment!();
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

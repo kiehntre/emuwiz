@@ -4495,6 +4495,14 @@ mod tests {
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
+        // The override attaches to a PCSX2 profile discovery found. That used
+        // to be whatever PCSX2 profile the machine running the test happened
+        // to have, so the test failed anywhere PCSX2 was not configured.
+        // Create one in the private test home instead.
+        let home = crate::test_environment::private_home_for_fixtures();
+        fs::create_dir_all(home.join(".config/PCSX2/inis")).unwrap();
+        fs::write(home.join(".config/PCSX2/inis/PCSX2.ini"), "[UI]\n").unwrap();
+
         let overrides = DiscoveredProfilesOverrides {
             pcsx2_executable: Some(executable.clone()),
             ..Default::default()

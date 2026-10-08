@@ -3,6 +3,8 @@
 //! pipeline via `local_cheat_install_pcsx2`'s bridge, with no new write
 //! engine and no new safety behavior introduced along the way.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

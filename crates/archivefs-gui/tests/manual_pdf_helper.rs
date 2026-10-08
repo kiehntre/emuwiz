@@ -1,5 +1,7 @@
 //! Exercises the shipped launcher before any GUI/config/database bootstrap.
 #![cfg(target_os = "linux")]
+archivefs_core::install_test_environment!();
+
 use archivefs_core::manual_document::{ManualDocument, ManualLimits, pdf_render::HELPER_ARGUMENT};
 use std::{
     fs,

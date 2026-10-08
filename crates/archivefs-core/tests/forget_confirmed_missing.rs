@@ -1,4 +1,6 @@
 //! Synthetic temp databases only. Every refusal must leave rows and files untouched.
+archivefs_core::install_test_environment!();
+
 use archivefs_core::catalogue_health::{FORGET_PLAN_STALE, MissingClassification as C};
 use archivefs_core::{Archive, Config, Database, scan_and_persist};
 use rusqlite::Connection;

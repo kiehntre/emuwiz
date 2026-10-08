@@ -1,10 +1,10 @@
-//! Durable journal persistence for rename transactions.
+//! Atomic text journal persistence for rename transactions.
 //!
-//! A journal is the source of truth for a rename batch: it is written,
-//! durably, **before** the first mutation, and updated durably after every
-//! state transition, so a process crash can never lose the record of what was
-//! renamed and what was not. Recovery on startup reads these journals; it never
-//! resumes anything automatically.
+//! A journal is the source of truth for a rename batch: it is written before
+//! the first mutation and updated after state transitions. The shared publisher
+//! syncs the owned staging file and atomically replaces the journal, but parent
+//! directory sync is best effort: success does not certify universal power-loss
+//! durability. Recovery reads these journals; it never resumes automatically.
 //!
 //! # Format and privacy
 //!
@@ -69,8 +69,9 @@ pub fn journal_path(dir: &Path, transaction_id: &str) -> Option<PathBuf> {
     journal_file_name(transaction_id).map(|name| dir.join(name))
 }
 
-/// Writes (or rewrites) a transaction journal durably: temp file in the same
-/// directory, `sync_all`, atomic rename into place, parent-directory sync.
+/// Writes (or rewrites) a transaction journal through owned exclusive staging,
+/// file `sync_all`, atomic replacement and best-effort parent-directory sync.
+/// This is not a universal durable-commit or cross-process exclusion guarantee.
 pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), ArchiveFsError> {
     let name = journal_file_name(&transaction.transaction_id).ok_or_else(|| {
         ArchiveFsError::Config(format!(

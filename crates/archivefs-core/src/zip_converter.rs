@@ -1,17 +1,15 @@
-//! Verified ZIP creation and extraction for the Converter page.
+//! Read-only ZIP previews with Apply temporarily blocked for preservation safety.
 //!
-//! This is deliberately separate from the read-only archive inspector and from
-//! the external 7z/RAR workflow.  A successful operation is the only path that
-//! publishes its result: all work is performed in a private sibling temporary
-//! path and the result is reopened and checked before the final rename.
+//! Named staging and pathname publication do not establish ownership against
+//! concurrent substitution. Both public Apply APIs refuse unconditionally before
+//! inspecting paths or creating objects. Re-enablement requires independent
+//! safety review; previews and unrelated archive workflows remain available.
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
-use tempfile::{Builder, TempDir};
-use zip::write::SimpleFileOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZipPreviewEntry {
@@ -41,6 +39,8 @@ type SourceEntry = (bool, PathBuf, u64, [u8; 32]);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZipError {
+    /// Temporary preservation gate, returned before any Apply filesystem access.
+    ApplyUnavailable,
     SourceMissing,
     SourceSymlink,
     UnsupportedSource,
@@ -58,6 +58,10 @@ pub enum ZipError {
 impl std::fmt::Display for ZipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ApplyUnavailable => write!(
+                f,
+                "ZIP Apply is temporarily unavailable for preservation safety: staging ownership and atomic destination no-clobber publication are not established. No output was created or extracted. Read-only preview remains available."
+            ),
             Self::SourceMissing => write!(f, "The source could not be found."),
             Self::SourceSymlink => write!(f, "Symbolic-link sources are not supported."),
             Self::UnsupportedSource => write!(f, "Choose a regular file or folder."),
@@ -231,96 +235,13 @@ pub fn preview_compress(source: &Path, destination: &Path) -> Result<ZipPreview,
     Ok(preview_from_manifest(source, destination, &manifest))
 }
 
+/// Temporarily unavailable: refuses before inspecting source or destination.
+/// The historical name is retained for API compatibility, not a success claim.
 pub fn compress_verified(
-    source: &Path,
-    destination: &Path,
+    _source: &Path,
+    _destination: &Path,
 ) -> Result<ZipOperationResult, ZipError> {
-    let manifest = collect_source(source)?;
-    ensure_new_destination(destination)?;
-    let parent = destination
-        .parent()
-        .ok_or(ZipError::DestinationParentMissing)?;
-    let temporary = Builder::new()
-        .prefix(".emuwiz-zip-")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .map_err(io_error)?;
-    let temporary_path = temporary.path().to_path_buf();
-    let mut writer = zip::ZipWriter::new(temporary.reopen().map_err(io_error)?);
-    for (name, (directory, path, _, _)) in &manifest {
-        if *directory {
-            writer
-                .add_directory(format!("{name}/"), SimpleFileOptions::default())
-                .map_err(|_| ZipError::Io("could not create ZIP entry".into()))?;
-        } else {
-            writer
-                .start_file(name, SimpleFileOptions::default())
-                .map_err(|_| ZipError::Io("could not create ZIP entry".into()))?;
-            let mut input = File::open(path).map_err(io_error)?;
-            io::copy(&mut input, &mut writer).map_err(io_error)?;
-        }
-    }
-    writer
-        .finish()
-        .map_err(|_| ZipError::Io("could not finish ZIP".into()))?;
-    let mut archive = zip::ZipArchive::new(File::open(&temporary_path).map_err(io_error)?)
-        .map_err(|_| ZipError::CorruptZip)?;
-    let mut seen = BTreeSet::new();
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|_| ZipError::CorruptZip)?;
-        let safe = validate_name(entry.name())?;
-        let name = safe.to_string_lossy().into_owned();
-        if !seen.insert(name.clone()) {
-            return Err(ZipError::DuplicatePath);
-        }
-        let Some((directory, _, expected_size, expected_hash)) = manifest.get(&name) else {
-            return Err(ZipError::VerificationFailed(format!(
-                "unexpected member {name}"
-            )));
-        };
-        if *directory != entry.is_dir() {
-            return Err(ZipError::VerificationFailed(format!(
-                "type mismatch for {name}"
-            )));
-        }
-        if !*directory {
-            let mut hasher = Sha256::new();
-            let mut size = 0u64;
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let count = entry.read(&mut buffer).map_err(|_| ZipError::CorruptZip)?;
-                if count == 0 {
-                    break;
-                }
-                size += count as u64;
-                hasher.update(&buffer[..count]);
-            }
-            let actual: [u8; 32] = hasher.finalize().into();
-            if size != *expected_size || actual != *expected_hash {
-                return Err(ZipError::VerificationFailed(format!(
-                    "content mismatch for {name}"
-                )));
-            }
-        }
-    }
-    if seen.len() != manifest.len() {
-        return Err(ZipError::VerificationFailed(
-            "a source entry was not published".into(),
-        ));
-    }
-    drop(archive);
-    ensure_new_destination(destination)?;
-    fs::rename(&temporary_path, destination).map_err(io_error)?;
-    Ok(ZipOperationResult {
-        source: source.to_path_buf(),
-        destination: destination.to_path_buf(),
-        files: manifest
-            .values()
-            .filter(|(directory, _, _, _)| !directory)
-            .count(),
-        total_size: manifest.values().map(|(_, _, size, _)| *size).sum(),
-        verification: "ZIP reopened; every member name, size, and SHA-256 verified".into(),
-    })
+    Err(ZipError::ApplyUnavailable)
 }
 
 #[derive(Clone)]
@@ -406,53 +327,13 @@ pub fn preview_extract(source: &Path, destination: &Path) -> Result<ZipPreview, 
     })
 }
 
-pub fn extract_verified(source: &Path, destination: &Path) -> Result<ZipOperationResult, ZipError> {
-    let manifest = read_extract_manifest(source)?;
-    ensure_new_destination(destination)?;
-    let parent = destination
-        .parent()
-        .ok_or(ZipError::DestinationParentMissing)?;
-    let stage = TempDir::with_prefix_in(".emuwiz-zip-extract-", parent).map_err(io_error)?;
-    let mut archive = zip::ZipArchive::new(File::open(source).map_err(|_| ZipError::CorruptZip)?)
-        .map_err(|_| ZipError::CorruptZip)?;
-    for entry in &manifest {
-        let target = stage.path().join(&entry.name);
-        if entry.directory {
-            fs::create_dir_all(&target).map_err(io_error)?;
-            continue;
-        }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(io_error)?;
-        }
-        let index = (0..archive.len())
-            .find(|index| {
-                archive
-                    .by_index(*index)
-                    .map(|item| item.name() == entry.name)
-                    .unwrap_or(false)
-            })
-            .ok_or(ZipError::CorruptZip)?;
-        let mut input = archive.by_index(index).map_err(|_| ZipError::CorruptZip)?;
-        let mut output = File::create(&target).map_err(io_error)?;
-        io::copy(&mut input, &mut output).map_err(io_error)?;
-        let (size, hash) = digest_file(&target)?;
-        if size != entry.size || hash != entry.hash {
-            return Err(ZipError::VerificationFailed(format!(
-                "extracted content mismatch for {}",
-                entry.name
-            )));
-        }
-    }
-    ensure_new_destination(destination)?;
-    fs::rename(stage.path(), destination).map_err(io_error)?;
-    Ok(ZipOperationResult {
-        source: source.to_path_buf(),
-        destination: destination.to_path_buf(),
-        files: manifest.iter().filter(|entry| !entry.directory).count(),
-        total_size: manifest.iter().map(|entry| entry.size).sum(),
-        verification: "ZIP members were read, extracted to a private folder, and hash-verified"
-            .into(),
-    })
+/// Temporarily unavailable: refuses before inspecting source or destination.
+/// No staging, publication, capability probe or abandoned-object cleanup runs.
+pub fn extract_verified(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<ZipOperationResult, ZipError> {
+    Err(ZipError::ApplyUnavailable)
 }
 
 #[cfg(test)]
@@ -460,6 +341,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::tempdir;
+    use zip::write::SimpleFileOptions;
 
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let file = File::create(path).unwrap();
@@ -474,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Temporarily superseded by the P0 ZIP Apply safety gate; retain for independently reviewed re-enablement"]
     fn single_file_round_trip_is_hash_verified() {
         let root = tempdir().unwrap();
         let source = root.path().join("game.bin");
@@ -520,7 +403,7 @@ mod tests {
         ] {
             let zip = root.path().join(format!("{}.zip", name.replace('/', "_")));
             write_zip(&zip, &[(name, b"bad")]);
-            let result = extract_verified(&zip, &root.path().join(format!("out-{}", name.len())));
+            let result = preview_extract(&zip, &root.path().join(format!("out-{}", name.len())));
             assert_eq!(result.unwrap_err(), expected);
         }
     }
@@ -533,20 +416,20 @@ mod tests {
         fs::write(&source, b"source").unwrap();
         fs::write(&zip, b"keep me").unwrap();
         assert_eq!(
-            compress_verified(&source, &zip).unwrap_err(),
+            preview_compress(&source, &zip).unwrap_err(),
             ZipError::DestinationAlreadyExists
         );
         assert_eq!(fs::read(&zip).unwrap(), b"keep me");
     }
 
     #[test]
-    fn corrupt_zip_and_duplicate_conflict_publish_nothing() {
+    fn corrupt_zip_and_duplicate_conflict_previews_create_nothing() {
         let root = tempdir().unwrap();
         let corrupt = root.path().join("corrupt.zip");
         fs::write(&corrupt, b"not a zip").unwrap();
         let output = root.path().join("output");
         assert_eq!(
-            extract_verified(&corrupt, &output).unwrap_err(),
+            preview_extract(&corrupt, &output).unwrap_err(),
             ZipError::CorruptZip
         );
         assert!(!output.exists());
@@ -566,7 +449,7 @@ mod tests {
         writer.finish().unwrap();
         let output = root.path().join("duplicate-output");
         assert_eq!(
-            extract_verified(&duplicate, &output).unwrap_err(),
+            preview_extract(&duplicate, &output).unwrap_err(),
             ZipError::DuplicatePath
         );
         assert!(!output.exists());

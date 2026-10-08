@@ -1,8 +1,6 @@
-//! Read-only, channel-aware update availability checks for E1 installations.
-//!
-//! Metadata is the only remote material involved.  No release asset is ever
-//! requested.  The provider boundary keeps tests entirely local and makes
-//! network failure an ordinary `Offline`/`LatestUnknown` result.
+//! Channel-aware update discovery and explicitly reviewed portable updates.
+//! Executable moves use hash/identity evidence, no-clobber publication, durable
+//! journals and shared kernel locks. Backup and displaced images are retained.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -11,6 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod process_probe;
+mod safety;
+pub use safety::FileIdentity;
 
 use crate::emulator_inventory::{
     BuildChannel, EmulatorInstallation, InstallationType, InventoryEmulator, SaveStateRisk,
@@ -78,6 +80,9 @@ pub struct UpdateReport {
 pub enum UpdateExecutionEligibility {
     Ready,
     RunningBlocked,
+    /// Whether the emulator is running could not be established (for example
+    /// processes EmuWiz may not inspect). Distinct from a running emulator.
+    QuiescenceUnknown,
     UnsupportedInstallType,
     VersionUnknown,
     StaleMetadata,
@@ -103,6 +108,12 @@ pub enum UpdateTransactionState {
     RolledBack,
     NeedsReconciliation,
     Stale,
+    /// Durable intent recorded; the executable has not moved yet.
+    Applying,
+    /// The old executable is preserved at the backup path; not yet published.
+    BackupMoved,
+    /// An undo is in flight (intent recorded before bytes move).
+    Undoing,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,6 +160,24 @@ pub struct UpdateJournal {
     pub staged_path: Option<PathBuf>,
     pub state: UpdateTransactionState,
     pub failure: Option<String>,
+    /// SHA-256 of the executable that was reviewed and replaced.
+    pub original_sha256: String,
+    /// SHA-256 of the verified artifact that was published.
+    pub published_sha256: String,
+    /// Where an undo parked the published executable (never deleted).
+    pub displaced_path: Option<PathBuf>,
+    /// Monotonic per-target creation order, assigned while holding its lock.
+    /// Missing on legacy records; ambiguous legacy histories require review.
+    #[serde(default)]
+    pub sequence: Option<u64>,
+    #[serde(default)]
+    pub root_binding: Option<crate::catalogue_health::SourceRootBinding>,
+    #[serde(default)]
+    pub original_identity: Option<FileIdentity>,
+    #[serde(default)]
+    pub target_parent_binding: Option<crate::catalogue_health::SourceRootBinding>,
+    #[serde(default)]
+    pub staged_identity: Option<FileIdentity>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -159,6 +188,19 @@ pub enum UpdateExecutionError {
     Verification(String),
     Io(String),
     NeedsReconciliation(String),
+    /// The published executable no longer matches the recorded update.
+    TargetChanged(String),
+    /// The preserved original no longer matches the recorded original.
+    BackupChanged(String),
+    /// Running state could not be established; unknown is not stopped.
+    QuiescenceUnknown,
+    /// Another update or an unrecovered interrupted one holds the lock.
+    Concurrent(String),
+    /// The durable operation record is missing, corrupt or inconsistent.
+    Record(String),
+    /// The executable itself is unsafe to mutate (for example several hard
+    /// links). Refused before anything was changed.
+    UnsafeTarget(String),
 }
 
 impl std::fmt::Display for UpdateExecutionError {
@@ -172,6 +214,14 @@ impl std::fmt::Display for UpdateExecutionError {
             Self::NeedsReconciliation(message) => {
                 write!(f, "update needs reconciliation: {message}")
             }
+            Self::TargetChanged(message) => write!(f, "undo refused, executable changed: {message}"),
+            Self::BackupChanged(message) => write!(f, "undo refused, backup changed: {message}"),
+            Self::QuiescenceUnknown => f.write_str(
+                "could not establish that the emulator is stopped; unknown is not treated as stopped",
+            ),
+            Self::Concurrent(message) => write!(f, "another update is in progress: {message}"),
+            Self::Record(message) => write!(f, "operation record problem: {message}"),
+            Self::UnsafeTarget(message) => write!(f, "update refused: {message}"),
         }
     }
 }
@@ -179,14 +229,14 @@ impl std::fmt::Display for UpdateExecutionError {
 impl std::error::Error for UpdateExecutionError {}
 
 pub trait UpdateDownloader {
-    fn download(&mut self, url: &str, destination: &Path) -> Result<(), UpdateExecutionError>;
+    fn download(&mut self, url: &str, destination: &mut File) -> Result<(), UpdateExecutionError>;
 }
 
 #[derive(Default)]
 pub struct HttpsUpdateDownloader;
 
 impl UpdateDownloader for HttpsUpdateDownloader {
-    fn download(&mut self, url: &str, destination: &Path) -> Result<(), UpdateExecutionError> {
+    fn download(&mut self, url: &str, destination: &mut File) -> Result<(), UpdateExecutionError> {
         if !url.starts_with("https://") {
             return Err(UpdateExecutionError::Download(
                 "only HTTPS sources are allowed".into(),
@@ -209,13 +259,9 @@ impl UpdateDownloader for HttpsUpdateDownloader {
                 response.status()
             )));
         }
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .map_err(|error| UpdateExecutionError::Io(error.to_string()))?;
+        let output = destination;
         let mut limited = response.body_mut().as_reader().take(MAX_UPDATE_BYTES + 1);
-        let copied = std::io::copy(&mut limited, &mut output)
+        let copied = std::io::copy(&mut limited, output)
             .map_err(|error| UpdateExecutionError::Download(error.to_string()))?;
         if copied > MAX_UPDATE_BYTES {
             return Err(UpdateExecutionError::Download(
@@ -251,11 +297,66 @@ fn update_transaction_id(path: &Path, version: &str) -> String {
         .to_string()
 }
 
+/// Evidence that the emulator is not using the executable.  Only `Stopped`
+/// permits a replacement or an undo; `Unknown` is deliberately NOT treated
+/// as stopped.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub enum QuiescenceEvidence {
+    Stopped,
+    Running,
+    Unknown,
+}
+
+impl QuiescenceEvidence {
+    /// Combines two independent observations: any `Running` wins, then any
+    /// `Unknown`; `Stopped` only when both say so.
+    pub fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Running, _) | (_, Self::Running) => Self::Running,
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            _ => Self::Stopped,
+        }
+    }
+
+    pub fn from_tracked_flag(running: bool) -> Self {
+        if running {
+            Self::Running
+        } else {
+            Self::Stopped
+        }
+    }
+}
+
+/// Fail-closed process evidence. A process may start after the last probe;
+/// the advisory update lock cannot prevent external emulator launches.
+pub fn probe_executable_quiescence(executable: &Path) -> QuiescenceEvidence {
+    probe_executable_quiescence_at(executable, Path::new("/proc"))
+}
+/// Synthetic proc root support; reads exe identity, argv[0] and necessary stat
+/// evidence only. Environments are never inspected.
+pub fn probe_executable_quiescence_at(executable: &Path, proc_root: &Path) -> QuiescenceEvidence {
+    process_probe::normal(executable, proc_root)
+}
+/// Recovery can inspect a missing install path using its hash-proven backup.
+pub fn probe_update_quiescence(journal: &UpdateJournal) -> QuiescenceEvidence {
+    process_probe::recorded(journal, Path::new("/proc"))
+}
+
+fn require_stopped(evidence: QuiescenceEvidence) -> Result<(), UpdateExecutionError> {
+    match evidence {
+        QuiescenceEvidence::Stopped => Ok(()),
+        QuiescenceEvidence::Running => Err(UpdateExecutionError::Ineligible(
+            UpdateExecutionEligibility::RunningBlocked,
+        )),
+        QuiescenceEvidence::Unknown => Err(UpdateExecutionError::QuiescenceUnknown),
+    }
+}
+
 pub fn plan_staged_update(
     installation: &EmulatorInstallation,
     update: &UpdateResult,
     artifact: UpdateArtifact,
-    emulator_running: bool,
+    quiescence: QuiescenceEvidence,
 ) -> UpdateExecutionPlan {
     let installed_version = installation.version.clone().unwrap_or_default();
     let verification = if artifact.sha256.is_some() {
@@ -263,9 +364,15 @@ pub fn plan_staged_update(
     } else {
         UpdateVerificationLevel::Unverified
     };
-    let target_sha256 = hash_file(&installation.executable_path).unwrap_or_default();
-    let eligibility = if emulator_running {
+    let target_sha256 = match observe(&installation.executable_path) {
+        Ok(Observed::Hash(hash)) => hash,
+        _ => String::new(),
+    };
+    let eligibility = if quiescence == QuiescenceEvidence::Running {
         UpdateExecutionEligibility::RunningBlocked
+    } else if quiescence == QuiescenceEvidence::Unknown {
+        // Unknown is not stopped, but it is not "running" either.
+        UpdateExecutionEligibility::QuiescenceUnknown
     } else if !matches!(
         installation.installation_type,
         InstallationType::AppImage | InstallationType::Portable | InstallationType::Managed
@@ -282,9 +389,9 @@ pub fn plan_staged_update(
     {
         UpdateExecutionEligibility::StaleMetadata
     } else if target_sha256.is_empty()
-        || !installation.executable_path.is_file()
         || artifact.url.is_empty()
         || !artifact.url.starts_with("https://")
+        || safety::require_single_link(&installation.executable_path).is_err()
     {
         UpdateExecutionEligibility::InvalidTarget
     } else if verification == UpdateVerificationLevel::Unverified {
@@ -292,26 +399,33 @@ pub fn plan_staged_update(
     } else {
         UpdateExecutionEligibility::Ready
     };
+    let transaction_id = update_transaction_id(&installation.executable_path, &artifact.version);
     let rollback_path = installation
         .installation_root
-        .join(".emuwiz-update-rollback")
+        .join(ROLLBACK_DIR)
         .join(format!(
-            "{}-{}",
+            "{}-{}-{}",
             installation.emulator.label(),
-            installed_version
+            installed_version,
+            transaction_id
         ));
-    UpdateExecutionPlan { transaction_id: update_transaction_id(&installation.executable_path, &artifact.version), emulator: installation.emulator, installation_type: installation.installation_type, target_path: installation.executable_path.clone(), target_sha256, installed_version, installed_channel: installation.channel, new_version: artifact.version.clone(), new_channel: artifact.channel, artifact, verification, rollback_path, eligibility, save_state_warning: update.save_state_warning, warning: (verification == UpdateVerificationLevel::Unverified).then_some("No published checksum/signature was supplied; execution is not safe to claim verified.".into()) }
+    UpdateExecutionPlan { transaction_id, emulator: installation.emulator, installation_type: installation.installation_type, target_path: installation.executable_path.clone(), target_sha256, installed_version, installed_channel: installation.channel, new_version: artifact.version.clone(), new_channel: artifact.channel, artifact, verification, rollback_path, eligibility, save_state_warning: update.save_state_warning, warning: (verification == UpdateVerificationLevel::Unverified).then_some("No published checksum/signature was supplied; execution is not safe to claim verified.".into()) }
 }
 
-fn hash_file(path: &Path) -> Result<String, UpdateExecutionError> {
-    let mut file = File::open(path).map_err(|error| UpdateExecutionError::Io(error.to_string()))?;
+pub const ROLLBACK_DIR: &str = ".emuwiz-update-rollback";
+
+fn io_err(error: impl std::fmt::Display) -> UpdateExecutionError {
+    UpdateExecutionError::Io(error.to_string())
+}
+
+fn hash_reader(file: &mut File) -> Result<String, UpdateExecutionError> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).map_err(io_err)?;
     let mut hasher = Sha256::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| UpdateExecutionError::Io(error.to_string()))?;
+        let count = file.read(&mut buffer).map_err(io_err)?;
         if count == 0 {
             break;
         }
@@ -326,24 +440,363 @@ fn hash_file(path: &Path) -> Result<String, UpdateExecutionError> {
     Ok(hasher
         .finalize()
         .iter()
-        .map(|byte| format!("{byte:02x}"))
+        .map(|b| format!("{b:02x}"))
         .collect())
+}
+fn hash_file(path: &Path) -> Result<String, UpdateExecutionError> {
+    use std::os::unix::fs::MetadataExt;
+    let slot = safety::Slot::open(path)?;
+    let mut file = slot.read()?;
+    let before = file.metadata().map_err(io_err)?;
+    if !before.is_file() {
+        return Err(io_err("not a regular executable"));
+    }
+    let hash = hash_reader(&mut file)?;
+    let after = file.metadata().map_err(io_err)?;
+    let entry = fs::symlink_metadata(slot.path()).map_err(io_err)?;
+    let stamp = |m: &fs::Metadata| {
+        (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    };
+    if stamp(&before) != stamp(&after) || stamp(&entry) != stamp(&after) {
+        return Err(UpdateExecutionError::Stale);
+    }
+    Ok(hash)
+}
+fn file_identity(path: &Path) -> Result<FileIdentity, UpdateExecutionError> {
+    FileIdentity::of(&safety::Slot::open(path)?.read()?)
+}
+fn matches_file(
+    path: &Path,
+    hash: &str,
+    identity: Option<FileIdentity>,
+) -> Result<bool, UpdateExecutionError> {
+    Ok(observe(path)? == Observed::Hash(hash.into())
+        && identity.is_none_or(|id| file_identity(path).ok() == Some(id)))
+}
+
+/// What is currently at a path, judged by exact content and kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Observed {
+    Missing,
+    /// A symlink, directory or other non-regular entry.
+    NotRegular,
+    Hash(String),
+}
+
+fn observe(path: &Path) -> Result<Observed, UpdateExecutionError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Observed::Missing),
+        Err(error) => Err(io_err(error)),
+        Ok(metadata) if !metadata.is_file() => Ok(Observed::NotRegular),
+        Ok(_) => hash_file(path).map(Observed::Hash),
+    }
+}
+
+fn describe(observed: &Observed) -> String {
+    match observed {
+        Observed::Missing => "is missing".into(),
+        Observed::NotRegular => "is no longer a regular file".into(),
+        Observed::Hash(hash) => format!("now has SHA-256 {}", &hash[..hash.len().min(12)]),
+    }
 }
 
 fn sync_directory(path: &Path) -> Result<(), UpdateExecutionError> {
-    File::open(path)
-        .map_err(|error| UpdateExecutionError::Io(error.to_string()))?
-        .sync_all()
-        .map_err(|error| UpdateExecutionError::Io(error.to_string()))
+    File::open(path).map_err(io_err)?.sync_all().map_err(io_err)
 }
 
-pub fn execute_staged_update<D: UpdateDownloader>(
+/// Atomic no-clobber move: the destination is never overwritten.
+fn move_noreplace(source: &Path, destination: &Path) -> Result<(), UpdateExecutionError> {
+    safety::move_entry(source, destination)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum Fault {
+    FailPersist(UpdateTransactionState),
+    Crash(UpdateTransactionState),
+    FailPublishRename,
+    FailRestoreRename,
+    CrashBoundary(MutationBoundary),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationBoundary {
+    StageCreated,
+    OriginalMoved,
+    PublishedMoved,
+    UndoDisplaced,
+    UndoRestored,
+    RecoveryMoved,
+}
+fn crashed_boundary(boundary: MutationBoundary) -> Result<(), UpdateExecutionError> {
+    if fault_hit(Fault::CrashBoundary(boundary)) {
+        Err(io_err("simulated crash at mutation boundary"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAULT: std::cell::RefCell<Vec<Fault>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn fault_hit(fault: Fault) -> bool {
+    FAULT.with(|cell| cell.borrow().contains(&fault))
+}
+
+#[cfg(not(test))]
+fn fault_hit(_fault: Fault) -> bool {
+    false
+}
+
+fn crashed(state: UpdateTransactionState) -> Result<(), UpdateExecutionError> {
+    if fault_hit(Fault::Crash(state)) {
+        Err(UpdateExecutionError::Io("simulated process crash".into()))
+    } else {
+        Ok(())
+    }
+}
+
+impl UpdateJournal {
+    /// Everything needed to prove, rather than guess, that the files on disk are
+    /// the ones this transaction handled. Records written before these receipts
+    /// existed lack them; hash equality alone never establishes ownership, so
+    /// such records are never executed or offered as Undo.
+    pub fn has_ownership_evidence(&self) -> bool {
+        self.sequence.is_some()
+            && self.root_binding.is_some()
+            && self.target_parent_binding.is_some()
+            && self.original_identity.is_some()
+            && self.staged_identity.is_some()
+    }
+    fn directory(&self) -> Result<&Path, UpdateExecutionError> {
+        self.rollback_path
+            .parent()
+            .ok_or_else(|| io_err("rollback path has no parent directory"))
+    }
+
+    pub fn record_path(&self) -> Result<PathBuf, UpdateExecutionError> {
+        Ok(record_path(self.directory()?, &self.transaction_id))
+    }
+}
+
+fn record_path(directory: &Path, transaction_id: &str) -> PathBuf {
+    directory.join(format!("{transaction_id}.journal.json"))
+}
+
+/// Durably records the journal (temp file, fsync, atomic rename of our own
+/// record, directory fsync).  Called BEFORE each irreversible step.
+fn persist_journal(journal: &UpdateJournal) -> Result<(), UpdateExecutionError> {
+    if fault_hit(Fault::FailPersist(journal.state)) {
+        return Err(io_err("injected record persistence failure"));
+    }
+    safety::persist(journal)
+}
+
+fn load_journal(path: &Path) -> Result<UpdateJournal, UpdateExecutionError> {
+    let slot = safety::Slot::open(path).map_err(|e| UpdateExecutionError::Record(e.to_string()))?;
+    let file = slot
+        .read()
+        .map_err(|e| UpdateExecutionError::Record(e.to_string()))?;
+    let metadata = file.metadata().map_err(io_err)?;
+    if !metadata.is_file() || metadata.len() > MAX_METADATA_BYTES as u64 {
+        return Err(UpdateExecutionError::Record(
+            "record is not a bounded regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_METADATA_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_err)?;
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(UpdateExecutionError::Record(
+            "record exceeds size limit".into(),
+        ));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| UpdateExecutionError::Record(format!("{} is corrupt: {e}", path.display())))
+}
+fn acquire_lock(
+    _directory: &Path,
+    target: &Path,
+    _transaction_id: &str,
+) -> Result<safety::TargetLock, UpdateExecutionError> {
+    safety::acquire(target)
+}
+
+/// An operation stopped after it had already moved an executable. Say so,
+/// keep the durable record in its in-flight state with the cause attached, and
+/// require recovery - never "nothing changed".
+fn partial_failure(
+    journal: &mut UpdateJournal,
+    operation: &str,
+    cause: &UpdateExecutionError,
+) -> UpdateExecutionError {
+    let message = format!(
+        "{operation} had already moved an executable when it stopped ({cause}); the operation is only partly applied and recovery is required. No executable was deleted."
+    );
+    journal.failure = Some(message.clone());
+    let _ = persist_journal(journal);
+    UpdateExecutionError::NeedsReconciliation(message)
+}
+
+/// A terminal state is recorded only when the files on disk agree with every
+/// recorded identity. Contradictory evidence stays recoverable/review-required.
+fn persist_verified_terminal(journal: &UpdateJournal) -> Result<(), UpdateExecutionError> {
+    if !terminal_consistent(journal)? {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "the resulting state contradicts the recorded executable identities; it was not recorded as complete and all evidence was preserved".into(),
+        ));
+    }
+    persist_journal(journal).map_err(|e| {
+        UpdateExecutionError::NeedsReconciliation(format!(
+            "the files are as recorded but the durable record could not be saved: {e}"
+        ))
+    })
+}
+
+fn mark_failed(journal: &mut UpdateJournal, state: UpdateTransactionState, why: &str) {
+    journal.state = state;
+    journal.failure = Some(why.to_string());
+    // Best effort: the failure is already being reported to the caller.
+    let _ = persist_journal(journal);
+}
+
+/// Failure BEFORE publication: nothing at the target was changed (or was
+/// fully restored).  The staging file is ours (txid-named, create_new).
+fn fail_before_publication(
+    journal: &mut UpdateJournal,
+    staging: &Path,
+    error: UpdateExecutionError,
+) -> UpdateExecutionError {
+    if let Err(problem) = retain_staging(journal, staging) {
+        mark_failed(
+            journal,
+            UpdateTransactionState::NeedsReconciliation,
+            &problem.to_string(),
+        );
+        return problem;
+    }
+    mark_failed(journal, UpdateTransactionState::Failed, &error.to_string());
+    error
+}
+
+/// Retain positively identified scratch output. Unknown/replaced files stay
+/// exactly where they are; no executable or temporary file is ever unlinked.
+fn retain_staging(journal: &mut UpdateJournal, staging: &Path) -> Result<(), UpdateExecutionError> {
+    let paths = safety::Paths::journal(&journal.record_path()?, journal)?;
+    if observe(staging)? == Observed::Missing {
+        if journal.staged_identity.is_some()
+            && file_identity(&paths.retained).ok() == journal.staged_identity
+        {
+            journal.staged_path = Some(paths.retained.clone());
+        } else if observe(&paths.retained)? == Observed::Missing {
+            journal.staged_path = None;
+        } else {
+            return Err(UpdateExecutionError::NeedsReconciliation(
+                "retained staging has contradictory ownership; evidence preserved".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if journal.staged_identity.is_none() || file_identity(staging).ok() != journal.staged_identity {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "staging ownership changed; the file and evidence were preserved".into(),
+        ));
+    }
+    if staging == paths.retained {
+        return Ok(());
+    }
+    move_noreplace(staging, &paths.retained)?;
+    journal.staged_path = Some(paths.retained.clone());
+    if file_identity(&paths.retained).ok() != journal.staged_identity {
+        let _ = move_noreplace(&paths.retained, staging);
+        journal.staged_path = Some(staging.into());
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "staging changed during retention; all bytes were preserved".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Failure AFTER the old executable moved but before the new one was
+/// published: put the user's file back without overwriting anything.
+fn compensate<Q: FnMut() -> QuiescenceEvidence>(
+    journal: &mut UpdateJournal,
+    staging: &Path,
+    cause: UpdateExecutionError,
+    paths: &safety::Paths,
+    lock: &safety::TargetLock,
+    quiescence: &mut Q,
+) -> UpdateExecutionError {
+    let checked = lock
+        .check()
+        .and_then(|_| paths.check())
+        .and_then(|_| require_stopped(quiescence()));
+    let restored = if let Err(error) = checked {
+        Err(error)
+    } else if matches_file(
+        &journal.rollback_path,
+        &journal.original_sha256,
+        journal.original_identity,
+    )
+    .ok()
+        != Some(true)
+    {
+        Err(UpdateExecutionError::NeedsReconciliation(
+            "preserved original changed before compensation; it was not moved".into(),
+        ))
+    } else if fault_hit(Fault::FailRestoreRename) {
+        Err(io_err("injected restore failure"))
+    } else {
+        move_noreplace(&journal.rollback_path, &journal.target_path)
+    };
+    match restored {
+        Ok(()) if matches!(observe(&journal.target_path), Ok(Observed::Hash(ref h)) if *h == journal.original_sha256) =>
+        {
+            let _ = journal.target_path.parent().map(sync_directory);
+            fail_before_publication(journal, staging, cause)
+        }
+        other => {
+            let detail = match other {
+                Ok(()) => "restored file did not match the original".to_string(),
+                Err(error) => error.to_string(),
+            };
+            let message = format!(
+                "{cause}; restoring the previous executable failed ({detail}); it is preserved at {}",
+                journal.rollback_path.display()
+            );
+            mark_failed(
+                journal,
+                UpdateTransactionState::NeedsReconciliation,
+                &message,
+            );
+            UpdateExecutionError::NeedsReconciliation(message)
+        }
+    }
+}
+
+pub fn execute_staged_update<D, Q>(
     plan: &UpdateExecutionPlan,
     installation: &EmulatorInstallation,
     update: &UpdateResult,
-    emulator_running: bool,
+    mut quiescence: Q,
     downloader: &mut D,
-) -> Result<UpdateJournal, UpdateExecutionError> {
+) -> Result<UpdateJournal, UpdateExecutionError>
+where
+    D: UpdateDownloader,
+    Q: FnMut() -> QuiescenceEvidence,
+{
     if plan.eligibility != UpdateExecutionEligibility::Ready {
         return Err(UpdateExecutionError::Ineligible(plan.eligibility));
     }
@@ -352,7 +805,9 @@ pub fn execute_staged_update<D: UpdateDownloader>(
             UpdateExecutionEligibility::VerificationUnavailable,
         ));
     }
-    if emulator_running
+    require_stopped(quiescence())?;
+    if installation.emulator != plan.emulator
+        || update.executable_path != plan.target_path
         || installation.executable_path != plan.target_path
         || installation.installation_type != plan.installation_type
         || installation.version.as_deref() != Some(plan.installed_version.as_str())
@@ -363,20 +818,79 @@ pub fn execute_staged_update<D: UpdateDownloader>(
     {
         return Err(UpdateExecutionError::Stale);
     }
-    let metadata = fs::symlink_metadata(&plan.target_path)
-        .map_err(|error| UpdateExecutionError::Io(error.to_string()))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if observe(&plan.target_path)? != Observed::Hash(plan.target_sha256.clone()) {
         return Err(UpdateExecutionError::Stale);
     }
-    if hash_file(&plan.target_path)? != plan.target_sha256 {
-        return Err(UpdateExecutionError::Stale);
+    let paths = safety::Paths::new(
+        &installation.installation_root,
+        &plan.target_path,
+        &plan.transaction_id,
+        plan.emulator,
+        &plan.installed_version,
+        &plan.new_version,
+    )?;
+    if plan.rollback_path != paths.backup {
+        return Err(UpdateExecutionError::Record(
+            "reviewed backup path is not derived from the installation and transaction".into(),
+        ));
     }
-    let staging = plan
-        .target_path
-        .with_file_name(format!(".emuwiz-update-staging-{}", plan.transaction_id));
+    // Refusals that need no filesystem change come BEFORE the first one.
+    safety::require_supported_storage(&paths.root)?;
+    safety::require_single_link(&plan.target_path)?;
+    use std::os::unix::fs::DirBuilderExt;
+    match fs::DirBuilder::new().mode(0o700).create(&paths.directory) {
+        Ok(()) => sync_directory(&paths.root)?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(io_err(e)),
+    }
+    paths.check()?;
+    let directory = paths.directory.as_path();
+    let lock = acquire_lock(directory, &paths.target, &plan.transaction_id)?;
+    lock.check()?;
+    paths.check()?;
+    // Incomplete prior transactions must be reconciled explicitly. A released
+    // kernel lock proves exclusion, not that their filesystem state is safe.
+    let prior = discover_update_records(&paths.root);
+    if prior.iter().any(|e| {
+        e.journal.as_ref().is_err()
+            || (e
+                .journal
+                .as_ref()
+                .is_ok_and(|j| j.target_path == paths.target)
+                && e.needs_attention())
+    }) {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "an earlier installation transaction requires explicit review/recovery".into(),
+        ));
+    }
+    if fs::symlink_metadata(record_path(&paths.directory, &plan.transaction_id)).is_ok() {
+        return Err(UpdateExecutionError::Record("this reviewed transaction already has a durable record; create a new preview before retrying".into()));
+    }
+    remember_installation_root(&paths.root)?;
+    let result = apply_update(plan, &paths, &lock, &mut quiescence, downloader);
+    result
+}
+
+fn apply_update<D, Q>(
+    plan: &UpdateExecutionPlan,
+    paths: &safety::Paths,
+    lock: &safety::TargetLock,
+    quiescence: &mut Q,
+    downloader: &mut D,
+) -> Result<UpdateJournal, UpdateExecutionError>
+where
+    D: UpdateDownloader,
+    Q: FnMut() -> QuiescenceEvidence,
+{
+    let staging = paths.staging.clone();
     if fs::symlink_metadata(&staging).is_ok() {
         return Err(UpdateExecutionError::NeedsReconciliation(
             "staging path already exists".into(),
+        ));
+    }
+    if fs::symlink_metadata(&plan.rollback_path).is_ok() {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "backup path already exists; it is never overwritten".into(),
         ));
     }
     let mut journal = UpdateJournal {
@@ -391,81 +905,895 @@ pub fn execute_staged_update<D: UpdateDownloader>(
         provenance: plan.artifact.provenance.clone(),
         verification: plan.verification,
         staged_path: Some(staging.clone()),
-        state: UpdateTransactionState::Downloading,
+        state: UpdateTransactionState::Planned,
         failure: None,
+        original_sha256: plan.target_sha256.clone(),
+        published_sha256: plan.artifact.sha256.clone().unwrap_or_default(),
+        displaced_path: None,
+        sequence: Some(next_sequence(&paths.root, &paths.target)?),
+        root_binding: Some(paths.binding.clone()),
+        target_parent_binding: Some(paths.parent_binding.clone()),
+        original_identity: Some(file_identity(&paths.target)?),
+        staged_identity: None,
     };
-    if let Err(error) = downloader.download(&plan.artifact.url, &staging) {
-        journal.state = UpdateTransactionState::Failed;
-        journal.failure = Some(error.to_string());
-        let _ = fs::remove_file(&staging);
-        return Err(error);
+    // Nothing has changed yet; a persistence failure here is a clean refusal.
+    // The core owns the create_new file descriptor, not a pathname returned
+    // by a downloader. Its inode receipt is durable before download begins.
+    let mut staged_file = safety::Slot::open(&staging)?.create()?;
+    journal.staged_identity = Some(FileIdentity::of(&staged_file)?);
+    crashed_boundary(MutationBoundary::StageCreated)?;
+    if let Err(error) = persist_journal(&journal) {
+        return Err(fail_before_publication(&mut journal, &staging, error));
+    }
+    journal.state = UpdateTransactionState::Downloading;
+    persist_journal(&journal).inspect_err(|_| {
+        mark_failed(
+            &mut journal,
+            UpdateTransactionState::Failed,
+            "record not saved",
+        )
+    })?;
+    if let Err(error) = downloader.download(&plan.artifact.url, &mut staged_file) {
+        return Err(fail_before_publication(&mut journal, &staging, error));
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode();
-        let permissions = fs::Permissions::from_mode(mode);
-        fs::set_permissions(&staging, permissions)
-            .map_err(|error| UpdateExecutionError::Io(error.to_string()))?;
+        let mode = fs::symlink_metadata(&plan.target_path)
+            .map_err(io_err)
+            .map(|metadata| metadata.permissions().mode());
+        if let Err(error) = mode.and_then(|mode| {
+            staged_file
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(io_err)
+        }) {
+            return Err(fail_before_publication(&mut journal, &staging, error));
+        }
     }
     journal.state = UpdateTransactionState::Verifying;
-    let hash = hash_file(&staging)?;
+    let hash = match hash_reader(&mut staged_file) {
+        Ok(hash) => hash,
+        Err(error) => return Err(fail_before_publication(&mut journal, &staging, error)),
+    };
     if plan.artifact.sha256.as_deref() != Some(hash.as_str()) {
-        journal.state = UpdateTransactionState::Failed;
-        let _ = fs::remove_file(&staging);
-        return Err(UpdateExecutionError::Verification(
-            "SHA-256 does not match published artifact".into(),
+        let error =
+            UpdateExecutionError::Verification("SHA-256 does not match published artifact".into());
+        return Err(fail_before_publication(&mut journal, &staging, error));
+    }
+    staged_file.sync_all().map_err(io_err)?;
+    if file_identity(&staging).ok() != journal.staged_identity
+        || observe(&staging)? != Observed::Hash(hash.clone())
+    {
+        return Err(fail_before_publication(
+            &mut journal,
+            &staging,
+            UpdateExecutionError::Stale,
         ));
     }
     journal.state = UpdateTransactionState::Staged;
-    if let Some(parent) = plan.rollback_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| UpdateExecutionError::Io(error.to_string()))?;
+    // The original must still be exactly the reviewed file.
+    match observe(&plan.target_path) {
+        Ok(Observed::Hash(current)) if current == plan.target_sha256 => {}
+        Ok(_) | Err(_) => {
+            return Err(fail_before_publication(
+                &mut journal,
+                &staging,
+                UpdateExecutionError::Stale,
+            ));
+        }
     }
-    fs::rename(&plan.target_path, &plan.rollback_path)
-        .map_err(|error| UpdateExecutionError::Io(error.to_string()))?;
-    if let Err(error) = fs::rename(&staging, &plan.target_path) {
-        let _ = fs::rename(&plan.rollback_path, &plan.target_path);
-        return Err(UpdateExecutionError::NeedsReconciliation(error.to_string()));
+    // Fresh quiescence evidence immediately before the first byte moves.
+    if let Err(error) = require_stopped(quiescence()) {
+        return Err(fail_before_publication(&mut journal, &staging, error));
     }
+    lock.check()?;
+    paths.check()?;
+    if let Err(error) = safety::require_single_link(&plan.target_path) {
+        return Err(fail_before_publication(&mut journal, &staging, error));
+    }
+    // Durable intent BEFORE replacing anything.
+    journal.state = UpdateTransactionState::Applying;
+    if let Err(error) = persist_journal(&journal) {
+        return Err(fail_before_publication(&mut journal, &staging, error));
+    }
+    crashed(UpdateTransactionState::Applying)?;
+    lock.check()?;
+    paths.check()?;
+    if let Err(error) = move_noreplace(&plan.target_path, &plan.rollback_path) {
+        if matches!(error, UpdateExecutionError::NeedsReconciliation(_)) {
+            return Err(error);
+        }
+        return Err(fail_before_publication(&mut journal, &staging, error));
+    }
+    crashed_boundary(MutationBoundary::OriginalMoved)?;
+    // The preserved copy must be exactly the file that was reviewed.
+    match observe(&plan.rollback_path) {
+        Ok(Observed::Hash(ref backup))
+            if *backup == plan.target_sha256
+                && file_identity(&plan.rollback_path).ok() == journal.original_identity => {}
+        other => {
+            // The target changed between the check and the move: what we
+            // moved is someone else's file.  Give it back untouched.
+            let cause = UpdateExecutionError::Stale;
+            let note = format!(
+                "preserved copy did not match the reviewed file ({})",
+                other
+                    .as_ref()
+                    .map(describe)
+                    .unwrap_or_else(|e| e.to_string())
+            );
+            journal.failure = Some(note);
+            return match move_noreplace(&plan.rollback_path, &plan.target_path) {
+                Ok(()) => Err(fail_before_publication(&mut journal, &staging, cause)),
+                Err(error) => {
+                    let message = format!(
+                        "target changed during update and could not be restored ({error}); it is preserved at {}",
+                        plan.rollback_path.display()
+                    );
+                    mark_failed(
+                        &mut journal,
+                        UpdateTransactionState::NeedsReconciliation,
+                        &message,
+                    );
+                    Err(UpdateExecutionError::NeedsReconciliation(message))
+                }
+            };
+        }
+    }
+    journal.state = UpdateTransactionState::BackupMoved;
+    if let Err(error) = persist_journal(&journal) {
+        return Err(compensate(
+            &mut journal,
+            &staging,
+            error,
+            paths,
+            lock,
+            quiescence,
+        ));
+    }
+    crashed(UpdateTransactionState::BackupMoved)?;
+    if let Err(cause) = lock.check().and_then(|_| paths.check()) {
+        return Err(partial_failure(&mut journal, "Update", &cause));
+    }
+    // Download ownership and bytes must still match immediately before publication.
+    if !matches_file(&staging, &journal.published_sha256, journal.staged_identity)? {
+        return Err(compensate(
+            &mut journal,
+            &staging,
+            UpdateExecutionError::Stale,
+            paths,
+            lock,
+            quiescence,
+        ));
+    }
+    let published = if fault_hit(Fault::FailPublishRename) {
+        Err(io_err("injected publish failure"))
+    } else {
+        move_noreplace(&staging, &plan.target_path)
+    };
+    if let Err(error) = published {
+        if matches!(error, UpdateExecutionError::NeedsReconciliation(_)) {
+            return Err(error);
+        }
+        return Err(compensate(
+            &mut journal,
+            &staging,
+            error,
+            paths,
+            lock,
+            quiescence,
+        ));
+    }
+    crashed_boundary(MutationBoundary::PublishedMoved)?;
     if let Some(parent) = plan.target_path.parent() {
         sync_directory(parent)
             .map_err(|error| UpdateExecutionError::NeedsReconciliation(error.to_string()))?;
     }
+    if observe(&plan.target_path)? != Observed::Hash(journal.published_sha256.clone()) {
+        let message = "published file does not match the verified artifact".to_string();
+        mark_failed(
+            &mut journal,
+            UpdateTransactionState::NeedsReconciliation,
+            &message,
+        );
+        return Err(UpdateExecutionError::NeedsReconciliation(message));
+    }
     journal.state = UpdateTransactionState::Published;
     journal.staged_path = None;
+    if !terminal_consistent(&journal).unwrap_or(false) {
+        let message = "the published state contradicts the recorded identities (target, backup or leftovers); it was not recorded as complete".to_string();
+        journal.state = UpdateTransactionState::BackupMoved;
+        mark_failed(
+            &mut journal,
+            UpdateTransactionState::NeedsReconciliation,
+            &message,
+        );
+        return Err(UpdateExecutionError::NeedsReconciliation(message));
+    }
+    if let Err(error) = persist_journal(&journal) {
+        // Published on disk, but the final record is missing.  The earlier
+        // BackupMoved record plus the matching hashes let recovery finish.
+        return Err(UpdateExecutionError::NeedsReconciliation(format!(
+            "update was published but its final record could not be saved ({error}); run recovery"
+        )));
+    }
     Ok(journal)
 }
 
-pub fn rollback_staged_update(
+/// Undo of a published update.  Requires the durable record, the current
+/// output to match the recorded publication, the backup to match the
+/// recorded original, and fresh quiescence evidence.  The replaced
+/// (published) executable is never deleted: it is kept beside the backup.
+pub fn rollback_staged_update<Q>(
     journal: &UpdateJournal,
-) -> Result<UpdateJournal, UpdateExecutionError> {
-    if journal.state != UpdateTransactionState::Published {
+    mut quiescence: Q,
+) -> Result<UpdateJournal, UpdateExecutionError>
+where
+    Q: FnMut() -> QuiescenceEvidence,
+{
+    let record = journal.record_path()?;
+    let paths = safety::Paths::journal(&record, journal)?;
+    if !journal.has_ownership_evidence() {
+        return Err(UpdateExecutionError::Record(
+            "this record predates executable ownership receipts; Undo is refused because file contents alone cannot prove which executables are EmuWiz's. Nothing was changed"
+                .into(),
+        ));
+    }
+    require_stopped(quiescence())?;
+    let lock = acquire_lock(&paths.directory, &paths.target, &journal.transaction_id)?;
+    let recorded = load_journal(&record)?;
+    safety::Paths::journal(&record, &recorded)?;
+    if &recorded != journal {
+        return Err(UpdateExecutionError::Record(
+            "the reviewed journal differs from the durable record; reload it".into(),
+        ));
+    }
+    if recorded.state != UpdateTransactionState::Published
+        || latest_record(&discover_update_records(&paths.root), &paths.target).as_ref()
+            != Some(&recorded)
+    {
         return Err(UpdateExecutionError::Ineligible(
             UpdateExecutionEligibility::ReviewRequired,
         ));
     }
-    if !journal.rollback_path.is_file() || journal.target_path.is_symlink() {
+    let directory = paths.directory.clone();
+    let result = undo_locked(recorded.clone(), &directory, &mut quiescence, &paths, &lock);
+    result
+}
+
+fn undo_locked<Q>(
+    mut journal: UpdateJournal,
+    _directory: &Path,
+    quiescence: &mut Q,
+    paths: &safety::Paths,
+    lock: &safety::TargetLock,
+) -> Result<UpdateJournal, UpdateExecutionError>
+where
+    Q: FnMut() -> QuiescenceEvidence,
+{
+    let current = observe(&journal.target_path)?;
+    if current != Observed::Hash(journal.published_sha256.clone())
+        || !matches_file(
+            &journal.target_path,
+            &journal.published_sha256,
+            journal.staged_identity,
+        )?
+    {
+        return Err(UpdateExecutionError::TargetChanged(format!(
+            "{} {}; it no longer matches the recorded update, so nothing was changed",
+            journal.target_path.display(),
+            describe(&current)
+        )));
+    }
+    let backup = observe(&journal.rollback_path)?;
+    if backup != Observed::Hash(journal.original_sha256.clone())
+        || !matches_file(
+            &journal.rollback_path,
+            &journal.original_sha256,
+            journal.original_identity,
+        )?
+    {
+        return Err(UpdateExecutionError::BackupChanged(format!(
+            "{} {}; the preserved copy cannot be trusted, so nothing was changed",
+            journal.rollback_path.display(),
+            describe(&backup)
+        )));
+    }
+    let displaced = paths.displaced.clone();
+    if fs::symlink_metadata(&displaced).is_ok() {
         return Err(UpdateExecutionError::NeedsReconciliation(
-            "rollback target or backup is not trustworthy".into(),
+            "a displaced-executable path already exists; it is never overwritten".into(),
         ));
     }
-    let failed_new = journal
-        .target_path
-        .with_file_name(format!(".emuwiz-update-failed-{}", journal.transaction_id));
-    fs::rename(&journal.target_path, &failed_new)
-        .map_err(|error| UpdateExecutionError::NeedsReconciliation(error.to_string()))?;
-    if let Err(error) = fs::rename(&journal.rollback_path, &journal.target_path) {
-        let _ = fs::rename(&failed_new, &journal.target_path);
-        return Err(UpdateExecutionError::NeedsReconciliation(error.to_string()));
+    require_stopped(quiescence())?;
+    lock.check()?;
+    paths.check()?;
+    safety::require_single_link(&journal.target_path)?;
+    safety::require_single_link(&journal.rollback_path)?;
+    // Durable intent before any executable bytes move.
+    journal.state = UpdateTransactionState::Undoing;
+    journal.displaced_path = Some(displaced.clone());
+    if let Err(error) = persist_journal(&journal) {
+        return Err(error);
     }
+    crashed(UpdateTransactionState::Undoing)?;
+    let restore_published = |journal: &mut UpdateJournal| {
+        journal.state = UpdateTransactionState::Published;
+        journal.displaced_path = None;
+        let _ = persist_journal(journal);
+    };
+    if let Err(error) = move_noreplace(&journal.target_path, &displaced) {
+        if matches!(error, UpdateExecutionError::NeedsReconciliation(_)) {
+            return Err(error);
+        }
+        restore_published(&mut journal);
+        return Err(error);
+    }
+    crashed_boundary(MutationBoundary::UndoDisplaced)?;
+    match observe(&displaced) {
+        Ok(Observed::Hash(ref hash))
+            if *hash == journal.published_sha256
+                && file_identity(&displaced).ok() == journal.staged_identity => {}
+        other => {
+            // Replaced between the check and the move: it is not ours.
+            return match move_noreplace(&displaced, &journal.target_path) {
+                Ok(()) => {
+                    restore_published(&mut journal);
+                    Err(UpdateExecutionError::TargetChanged(format!(
+                        "the executable changed during undo ({}); it was put back",
+                        other
+                            .as_ref()
+                            .map(describe)
+                            .unwrap_or_else(|e| e.to_string())
+                    )))
+                }
+                Err(error) => Err(UpdateExecutionError::NeedsReconciliation(format!(
+                    "the executable changed during undo and could not be put back ({error}); it is at {}",
+                    displaced.display()
+                ))),
+            };
+        }
+    }
+    // From here the published executable is already parked. Any stop is a
+    // partial operation: say so, keep the Undoing record, require recovery.
+    if let Err(cause) = lock
+        .check()
+        .and_then(|_| paths.check())
+        .and_then(|_| require_stopped(quiescence()))
+    {
+        return Err(partial_failure(&mut journal, "Undo", &cause));
+    }
+    match matches_file(
+        &journal.rollback_path,
+        &journal.original_sha256,
+        journal.original_identity,
+    ) {
+        Ok(true) => {}
+        other => {
+            let cause = UpdateExecutionError::NeedsReconciliation(match other {
+                Ok(_) => "the backup changed immediately before Undo restoration".into(),
+                Err(error) => error.to_string(),
+            });
+            return Err(partial_failure(&mut journal, "Undo", &cause));
+        }
+    }
+    if let Err(error) = move_noreplace(&journal.rollback_path, &journal.target_path) {
+        if matches!(error, UpdateExecutionError::NeedsReconciliation(_)) {
+            return Err(error);
+        }
+        return match move_noreplace(&displaced, &journal.target_path) {
+            Ok(()) => {
+                restore_published(&mut journal);
+                Err(error)
+            }
+            Err(second) => Err(UpdateExecutionError::NeedsReconciliation(format!(
+                "{error}; putting the update back failed ({second}); it is at {}",
+                displaced.display()
+            ))),
+        };
+    }
+    crashed_boundary(MutationBoundary::UndoRestored)?;
     if let Some(parent) = journal.target_path.parent() {
         sync_directory(parent)
             .map_err(|error| UpdateExecutionError::NeedsReconciliation(error.to_string()))?;
     }
-    let _ = fs::remove_file(failed_new);
-    let mut restored = journal.clone();
-    restored.state = UpdateTransactionState::RolledBack;
-    Ok(restored)
+    if !matches_file(
+        &journal.target_path,
+        &journal.original_sha256,
+        journal.original_identity,
+    )? {
+        let cause = UpdateExecutionError::NeedsReconciliation(
+            "restored file does not match the recorded original".into(),
+        );
+        return Err(partial_failure(&mut journal, "Undo", &cause));
+    }
+    journal.state = UpdateTransactionState::RolledBack;
+    if !terminal_consistent(&journal).unwrap_or(false) {
+        journal.state = UpdateTransactionState::Undoing;
+        let cause = UpdateExecutionError::NeedsReconciliation(
+            "the restored state contradicts the recorded identities".into(),
+        );
+        return Err(partial_failure(&mut journal, "Undo", &cause));
+    }
+    if let Err(error) = persist_journal(&journal) {
+        return Err(UpdateExecutionError::NeedsReconciliation(format!(
+            "the previous executable was restored but the record could not be saved ({error}); run recovery"
+        )));
+    }
+    Ok(journal)
+}
+
+/// One durable record associated with its containing installation root.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct UpdateRecordEntry {
+    pub path: PathBuf,
+    pub journal: Result<UpdateJournal, String>,
+    pub superseded: bool,
+}
+impl UpdateRecordEntry {
+    pub fn needs_attention(&self) -> bool {
+        if self.superseded {
+            return false;
+        }
+        match &self.journal {
+            Err(_) => true,
+            Ok(j) => {
+                !matches!(
+                    j.state,
+                    UpdateTransactionState::Published
+                        | UpdateTransactionState::RolledBack
+                        | UpdateTransactionState::Failed
+                ) || !terminal_consistent(j).unwrap_or(false)
+            }
+        }
+    }
+}
+fn terminal_consistent(j: &UpdateJournal) -> Result<bool, UpdateExecutionError> {
+    let p = safety::Paths::journal(&j.record_path()?, j)?;
+    use UpdateTransactionState as S;
+    let original = matches_file(&p.target, &j.original_sha256, j.original_identity)?;
+    let backup = matches_file(&p.backup, &j.original_sha256, j.original_identity)?;
+    let staged = match &j.staged_path {
+        None => observe(&p.staging)? == Observed::Missing,
+        Some(path) => {
+            observe(path)? == Observed::Missing
+                || j.staged_identity
+                    .is_some_and(|id| file_identity(path).ok() == Some(id))
+        }
+    };
+    Ok(staged
+        && match j.state {
+            S::Published => {
+                matches_file(&p.target, &j.published_sha256, j.staged_identity)?
+                    && backup
+                    && j.staged_path.is_none()
+                    && j.displaced_path.is_none()
+                    && observe(&p.retained)? == Observed::Missing
+                    && observe(&p.displaced)? == Observed::Missing
+            }
+            S::RolledBack => {
+                original
+                    && observe(&p.backup)? == Observed::Missing
+                    && j.displaced_path.as_ref() == Some(&p.displaced)
+                    && matches_file(&p.displaced, &j.published_sha256, j.staged_identity)?
+            }
+            S::Failed => {
+                original
+                    && observe(&p.backup)? == Observed::Missing
+                    && j.displaced_path.is_none()
+                    && observe(&p.displaced)? == Observed::Missing
+            }
+            _ => false,
+        })
+}
+/// Directory filenames are display order only; never Undo authority.
+pub fn discover_update_records(root: &Path) -> Vec<UpdateRecordEntry> {
+    let directory = root.join(ROLLBACK_DIR);
+    let failure = |message: String| UpdateRecordEntry {
+        path: directory.clone(),
+        journal: Err(message),
+        superseded: false,
+    };
+    let entries = match fs::read_dir(&directory) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            return vec![failure(format!(
+                "update record directory cannot be inspected: {e}"
+            ))];
+        }
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                records.push(failure(format!(
+                    "update record entry cannot be inspected: {e}"
+                )));
+                continue;
+            }
+        };
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| !n.starts_with('.') && n.ends_with(".journal.json"))
+        {
+            continue;
+        }
+        if records.len() >= 4096 {
+            records.push(failure(
+                "too many update records; results were not silently truncated".into(),
+            ));
+            break;
+        }
+        let path = entry.path();
+        let journal = load_journal(&path)
+            .and_then(|j| {
+                safety::Paths::journal(&path, &j)?;
+                Ok(j)
+            })
+            .map_err(|e| e.to_string());
+        records.push(UpdateRecordEntry {
+            path,
+            journal,
+            superseded: false,
+        });
+    }
+    let orders: std::collections::BTreeMap<PathBuf, u64> = records
+        .iter()
+        .filter_map(|e| e.journal.as_ref().ok())
+        .filter_map(|j| j.sequence.map(|n| (j.target_path.clone(), n)))
+        .fold(std::collections::BTreeMap::new(), |mut m, (p, n)| {
+            m.entry(p).and_modify(|v| *v = (*v).max(n)).or_insert(n);
+            m
+        });
+    for entry in &mut records {
+        if let Ok(j) = &entry.journal {
+            entry.superseded = j
+                .sequence
+                .is_some_and(|n| orders.get(&j.target_path).is_some_and(|new| n < *new));
+        }
+    }
+    records.sort_by(|a, b| {
+        a.journal
+            .as_ref()
+            .ok()
+            .and_then(|j| j.sequence)
+            .cmp(&b.journal.as_ref().ok().and_then(|j| j.sequence))
+            .then(a.path.cmp(&b.path))
+    });
+    records
+}
+fn next_sequence(root: &Path, target: &Path) -> Result<u64, UpdateExecutionError> {
+    discover_update_records(root)
+        .iter()
+        .filter_map(|e| e.journal.as_ref().ok())
+        .filter(|j| j.target_path == target)
+        .filter_map(|j| j.sequence)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            UpdateExecutionError::Record("transaction ordering space is exhausted".into())
+        })
+}
+/// Only an unambiguous latest record for THIS target can be offered as Undo.
+/// Multiple old records without ordering evidence require manual review.
+fn latest_record(records: &[UpdateRecordEntry], target: &Path) -> Option<UpdateJournal> {
+    if records.iter().any(|e| {
+        e.journal.is_err()
+            && (if e.path.file_name() == Some(std::ffi::OsStr::new(ROLLBACK_DIR)) {
+                e.path.parent()
+            } else {
+                e.path.parent().and_then(Path::parent)
+            })
+            .is_some_and(|root| target.starts_with(root))
+    }) {
+        return None;
+    }
+    let matching: Vec<_> = records
+        .iter()
+        .filter_map(|e| e.journal.as_ref().ok())
+        .filter(|j| j.target_path == target)
+        .collect();
+    let selected = if matching.len() == 1 {
+        matching[0]
+    } else {
+        if matching.iter().any(|j| j.sequence.is_none()) {
+            return None;
+        }
+        let max = matching.iter().filter_map(|j| j.sequence).max()?;
+        let latest: Vec<_> = matching
+            .iter()
+            .filter(|j| j.sequence == Some(max))
+            .collect();
+        if latest.len() != 1 {
+            return None;
+        }
+        latest[0]
+    };
+    Some(selected.clone())
+}
+pub fn actionable_undo(records: &[UpdateRecordEntry], target: &Path) -> Option<UpdateJournal> {
+    // A control is offered only when Undo can actually run: the latest record,
+    // Published, consistent with disk, and carrying the ownership receipts Undo
+    // requires (legacy records without them are review-only).
+    latest_record(records, target).filter(|j| {
+        j.state == UpdateTransactionState::Published
+            && j.has_ownership_evidence()
+            && terminal_consistent(j).ok() == Some(true)
+    })
+}
+
+/// A discovery pointer is not mutation authority: every record still validates
+/// its derived root, paths, content and identities before any operation.
+fn remembered_directory() -> Result<PathBuf, UpdateExecutionError> {
+    crate::app_dirs::data_dir()
+        .map(|p| p.join("emulator-update-roots"))
+        .map_err(io_err)
+}
+fn remember_installation_root(root: &Path) -> Result<(), UpdateExecutionError> {
+    let directory = remembered_directory()?;
+    fs::create_dir_all(&directory).map_err(io_err)?;
+    let name: String = Sha256::digest(root.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let path = directory.join(format!("{name}.json"));
+    match safety::Slot::open(&path)?.create() {
+        Ok(mut f) => {
+            f.write_all(&serde_json::to_vec(root).map_err(io_err)?)
+                .map_err(io_err)?;
+            f.sync_all().map_err(io_err)?;
+            sync_directory(&directory)
+        }
+        Err(UpdateExecutionError::Io(_)) if path.is_file() => {
+            let mut bytes = Vec::new();
+            safety::Slot::open(&path)?
+                .read()?
+                .take(MAX_METADATA_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(io_err)?;
+            if bytes.len() > MAX_METADATA_BYTES {
+                return Err(io_err("root pointer too large"));
+            }
+            let prior: PathBuf = serde_json::from_slice(&bytes).map_err(io_err)?;
+            if prior != root {
+                return Err(io_err("root pointer identity changed"));
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+pub fn remembered_installation_roots() -> Result<Vec<PathBuf>, UpdateExecutionError> {
+    let directory = remembered_directory()?;
+    let entries = match fs::read_dir(directory) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(io_err)?;
+        if entry.path().extension() != Some(std::ffi::OsStr::new("json")) {
+            continue;
+        }
+        if roots.len() >= 4096 {
+            return Err(io_err(
+                "too many update roots; discovery was not silently truncated",
+            ));
+        }
+        let slot = safety::Slot::open(&entry.path())?;
+        let mut bytes = Vec::new();
+        slot.read()?
+            .take(MAX_METADATA_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(io_err)?;
+        if bytes.len() > MAX_METADATA_BYTES {
+            return Err(io_err("root pointer too large"));
+        }
+        let root: PathBuf = serde_json::from_slice(&bytes).map_err(io_err)?;
+        roots.push(root);
+    }
+    roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// Recovery holds exactly the same kernel target lock as Apply and Undo.
+/// All executable moves are no-clobber; staging is retained, never deleted.
+pub fn recover_update<Q>(
+    record: &Path,
+    mut quiescence: Q,
+) -> Result<UpdateJournal, UpdateExecutionError>
+where
+    Q: FnMut() -> QuiescenceEvidence,
+{
+    let reviewed = load_journal(record)?;
+    let paths = safety::Paths::journal(record, &reviewed)?;
+    let lock = acquire_lock(&paths.directory, &paths.target, &reviewed.transaction_id)?;
+    let mut journal = load_journal(record)?;
+    if journal != reviewed {
+        return Err(UpdateExecutionError::Record(
+            "record changed while recovery acquired its lock".into(),
+        ));
+    }
+    safety::Paths::journal(record, &journal)?;
+    lock.check()?;
+    paths.check()?;
+    use UpdateTransactionState as S;
+    if matches!(journal.state, S::Published | S::RolledBack | S::Failed) {
+        return if terminal_consistent(&journal)? {
+            Ok(journal)
+        } else {
+            Err(UpdateExecutionError::NeedsReconciliation("terminal record conflicts with installation, backup or displaced state; all evidence was preserved".into()))
+        };
+    }
+    if matches!(journal.state, S::NeedsReconciliation | S::Stale) {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "record requires explicit manual review; no evidence was discarded".into(),
+        ));
+    }
+    if !journal.has_ownership_evidence() {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "this record predates executable ownership receipts; recovery will not move files on content equality alone. Review it manually; nothing was changed".into(),
+        ));
+    }
+    require_stopped(quiescence())?;
+    let target = observe(&paths.target)?;
+    let backup = observe(&paths.backup)?;
+    let original = Observed::Hash(journal.original_sha256.clone());
+    let published = Observed::Hash(journal.published_sha256.clone());
+    let refuse = || {
+        UpdateExecutionError::NeedsReconciliation("target, backup or displaced evidence contradicts the recorded transaction; nothing was overwritten or deleted".into())
+    };
+    match journal.state {
+        S::Planned | S::Downloading | S::Verifying | S::Staged | S::Applying | S::BackupMoved => {
+            if target == Observed::Missing
+                && backup == original
+                && matches!(journal.state, S::Applying | S::BackupMoved)
+            {
+                restore_verified(
+                    &journal,
+                    &paths,
+                    &lock,
+                    &paths.backup,
+                    &journal.original_sha256,
+                    journal.original_identity,
+                    &mut quiescence,
+                )?;
+                crashed_boundary(MutationBoundary::RecoveryMoved)?;
+            } else if target == published && backup == original && journal.state == S::BackupMoved {
+                if !matches_file(
+                    &paths.backup,
+                    &journal.original_sha256,
+                    journal.original_identity,
+                )? || !matches_file(
+                    &paths.target,
+                    &journal.published_sha256,
+                    journal.staged_identity,
+                )? {
+                    return Err(refuse());
+                }
+                journal.state = S::Published;
+                journal.staged_path = None;
+                persist_verified_terminal(&journal)?;
+                return Ok(journal);
+            } else if !(target == original
+                && backup == Observed::Missing
+                && matches_file(
+                    &paths.target,
+                    &journal.original_sha256,
+                    journal.original_identity,
+                )?)
+            {
+                return Err(refuse());
+            }
+            if let Some(stage) = journal.staged_path.clone() {
+                retain_staging(&mut journal, &stage)?;
+            }
+            journal.state = S::Failed;
+            journal.failure=Some("interrupted update reconciled; the original is at its install path and temporary output was preserved".into());
+            persist_verified_terminal(&journal)?;
+            Ok(journal)
+        }
+        S::Undoing => {
+            if journal.displaced_path.as_ref() != Some(&paths.displaced) {
+                return Err(refuse());
+            }
+            let displaced = observe(&paths.displaced)?;
+            if target == published && backup == original && displaced == Observed::Missing {
+                if !matches_file(
+                    &paths.backup,
+                    &journal.original_sha256,
+                    journal.original_identity,
+                )? || !matches_file(
+                    &paths.target,
+                    &journal.published_sha256,
+                    journal.staged_identity,
+                )? {
+                    return Err(refuse());
+                }
+                journal.state = S::Published;
+                journal.displaced_path = None;
+            } else if target == Observed::Missing && backup == original && displaced == published {
+                // Content equality is not ownership: the backup must be the
+                // exact recorded inode before anything moves.
+                if !matches_file(
+                    &paths.backup,
+                    &journal.original_sha256,
+                    journal.original_identity,
+                )? {
+                    return Err(refuse());
+                }
+                restore_verified(
+                    &journal,
+                    &paths,
+                    &lock,
+                    &paths.displaced,
+                    &journal.published_sha256,
+                    journal.staged_identity,
+                    &mut quiescence,
+                )?;
+                crashed_boundary(MutationBoundary::RecoveryMoved)?;
+                journal.state = S::Published;
+                journal.displaced_path = None;
+            } else if target == original && backup == Observed::Missing && displaced == published {
+                if !matches_file(
+                    &paths.target,
+                    &journal.original_sha256,
+                    journal.original_identity,
+                )? || !matches_file(
+                    &paths.displaced,
+                    &journal.published_sha256,
+                    journal.staged_identity,
+                )? {
+                    return Err(refuse());
+                }
+                journal.state = S::RolledBack;
+            } else {
+                return Err(refuse());
+            }
+            persist_verified_terminal(&journal)?;
+            Ok(journal)
+        }
+        _ => Err(refuse()),
+    }
+}
+fn restore_verified<Q: FnMut() -> QuiescenceEvidence>(
+    journal: &UpdateJournal,
+    paths: &safety::Paths,
+    lock: &safety::TargetLock,
+    source: &Path,
+    hash: &str,
+    identity: Option<FileIdentity>,
+    quiescence: &mut Q,
+) -> Result<(), UpdateExecutionError> {
+    lock.check()?;
+    paths.check()?;
+    require_stopped(quiescence())?;
+    safety::require_single_link(source)?;
+    if !matches_file(source, hash, identity)? || observe(&paths.target)? != Observed::Missing {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "recovery source changed or a new executable appeared; both were preserved".into(),
+        ));
+    }
+    if fault_hit(Fault::FailRestoreRename) {
+        return Err(UpdateExecutionError::NeedsReconciliation(
+            "injected recovery restore failure; evidence preserved".into(),
+        ));
+    }
+    move_noreplace(source, &paths.target)?;
+    if !matches_file(&paths.target, hash, identity)? {
+        let _ = move_noreplace(&paths.target, source);
+        return Err(UpdateExecutionError::NeedsReconciliation(format!(
+            "recovery source changed during its move for {}; bytes preserved",
+            journal.transaction_id
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -866,6 +2194,18 @@ mod tests {
     use super::*;
     use crate::emulator_inventory::{InventoryCandidate, VersionConfidence, VersionSource};
     use std::fs;
+    fn stopped() -> QuiescenceEvidence {
+        QuiescenceEvidence::Stopped
+    }
+    fn with_fault<T>(fault: Fault, run: impl FnOnce() -> T) -> T {
+        with_faults(&[fault], run)
+    }
+    fn with_faults<T>(faults: &[Fault], run: impl FnOnce() -> T) -> T {
+        FAULT.with(|cell| *cell.borrow_mut() = faults.to_vec());
+        let out = run();
+        FAULT.with(|cell| cell.borrow_mut().clear());
+        out
+    }
     fn install(
         version: Option<&str>,
         channel: BuildChannel,
@@ -994,6 +2334,8 @@ mod tests {
     }
 
     fn executable_install(root: &Path) -> EmulatorInstallation {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700)).unwrap();
         let path = root.join("dolphin");
         fs::write(&path, b"old emulator").unwrap();
         let mut item = install(
@@ -1029,8 +2371,14 @@ mod tests {
     }
 
     impl UpdateDownloader for FixtureDownloader {
-        fn download(&mut self, _url: &str, destination: &Path) -> Result<(), UpdateExecutionError> {
-            fs::write(destination, &self.bytes).map_err(|e| UpdateExecutionError::Io(e.to_string()))
+        fn download(
+            &mut self,
+            _url: &str,
+            destination: &mut File,
+        ) -> Result<(), UpdateExecutionError> {
+            destination
+                .write_all(&self.bytes)
+                .map_err(|e| UpdateExecutionError::Io(e.to_string()))
         }
     }
 
@@ -1056,7 +2404,12 @@ mod tests {
         let mut installation = executable_install(directory.path());
         let update = update_result(&installation);
         let bytes = b"new emulator";
-        let plan = plan_staged_update(&installation, &update, artifact(bytes), false);
+        let plan = plan_staged_update(
+            &installation,
+            &update,
+            artifact(bytes),
+            QuiescenceEvidence::Stopped,
+        );
         assert_eq!(plan.eligibility, UpdateExecutionEligibility::Ready);
         assert!(plan.save_state_warning);
         let source_hash = hash_file(&installation.executable_path).unwrap();
@@ -1064,11 +2417,11 @@ mod tests {
             bytes: bytes.to_vec(),
         };
         let journal =
-            execute_staged_update(&plan, &installation, &update, false, &mut downloader).unwrap();
+            execute_staged_update(&plan, &installation, &update, stopped, &mut downloader).unwrap();
         assert_eq!(journal.state, UpdateTransactionState::Published);
         assert_eq!(fs::read(&installation.executable_path).unwrap(), bytes);
         assert_eq!(fs::read(&plan.rollback_path).unwrap(), b"old emulator");
-        let restored = rollback_staged_update(&journal).unwrap();
+        let restored = rollback_staged_update(&journal, stopped).unwrap();
         assert_eq!(restored.state, UpdateTransactionState::RolledBack);
         assert_eq!(
             hash_file(&installation.executable_path).unwrap(),
@@ -1086,21 +2439,38 @@ mod tests {
         let mut unverified_artifact = artifact(b"new emulator");
         unverified_artifact.sha256 = None;
         assert_eq!(
-            plan_staged_update(&installation, &update, unverified_artifact, false).eligibility,
+            plan_staged_update(
+                &installation,
+                &update,
+                unverified_artifact,
+                QuiescenceEvidence::Stopped
+            )
+            .eligibility,
             UpdateExecutionEligibility::VerificationUnavailable
         );
         assert_eq!(
-            plan_staged_update(&installation, &update, artifact(b"new emulator"), true).eligibility,
+            plan_staged_update(
+                &installation,
+                &update,
+                artifact(b"new emulator"),
+                QuiescenceEvidence::Running
+            )
+            .eligibility,
             UpdateExecutionEligibility::RunningBlocked
         );
         let mut changed = installation.clone();
         changed.version = Some("1.1".into());
-        let plan = plan_staged_update(&installation, &update, artifact(b"new emulator"), false);
+        let plan = plan_staged_update(
+            &installation,
+            &update,
+            artifact(b"new emulator"),
+            QuiescenceEvidence::Stopped,
+        );
         let mut downloader = FixtureDownloader {
             bytes: b"new emulator".to_vec(),
         };
         assert_eq!(
-            execute_staged_update(&plan, &changed, &update, false, &mut downloader),
+            execute_staged_update(&plan, &changed, &update, stopped, &mut downloader),
             Err(UpdateExecutionError::Stale)
         );
         assert_eq!(
@@ -1114,12 +2484,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let installation = executable_install(directory.path());
         let update = update_result(&installation);
-        let plan = plan_staged_update(&installation, &update, artifact(b"expected"), false);
+        let plan = plan_staged_update(
+            &installation,
+            &update,
+            artifact(b"expected"),
+            QuiescenceEvidence::Stopped,
+        );
         let mut downloader = FixtureDownloader {
             bytes: b"wrong".to_vec(),
         };
         assert!(matches!(
-            execute_staged_update(&plan, &installation, &update, false, &mut downloader),
+            execute_staged_update(&plan, &installation, &update, stopped, &mut downloader),
             Err(UpdateExecutionError::Verification(_))
         ));
         assert_eq!(
@@ -1128,4 +2503,606 @@ mod tests {
         );
         assert!(!plan.rollback_path.exists());
     }
+
+    const OLD: &[u8] = b"old emulator";
+    const NEW: &[u8] = b"new emulator";
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        installation: EmulatorInstallation,
+        update: UpdateResult,
+        plan: UpdateExecutionPlan,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let installation = executable_install(dir.path());
+        let update = update_result(&installation);
+        let plan = plan_staged_update(
+            &installation,
+            &update,
+            artifact(NEW),
+            QuiescenceEvidence::Stopped,
+        );
+        Fixture {
+            _dir: dir,
+            installation,
+            update,
+            plan,
+        }
+    }
+
+    fn run(
+        f: &Fixture,
+        q: impl FnMut() -> QuiescenceEvidence,
+    ) -> Result<UpdateJournal, UpdateExecutionError> {
+        let mut downloader = FixtureDownloader {
+            bytes: NEW.to_vec(),
+        };
+        execute_staged_update(&f.plan, &f.installation, &f.update, q, &mut downloader)
+    }
+
+    fn target(f: &Fixture) -> Vec<u8> {
+        fs::read(&f.installation.executable_path).unwrap()
+    }
+
+    fn no_leftovers(f: &Fixture) {
+        let root = f.installation.installation_root.clone();
+        for entry in fs::read_dir(&root).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            assert!(
+                !name.starts_with(".emuwiz-update-staging"),
+                "staging left: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn undo_refuses_when_executable_was_replaced_externally() {
+        let f = fixture();
+        let journal = run(&f, stopped).unwrap();
+        fs::write(&f.installation.executable_path, b"user's own build").unwrap();
+        let err = rollback_staged_update(&journal, stopped).unwrap_err();
+        assert!(
+            matches!(err, UpdateExecutionError::TargetChanged(_)),
+            "{err:?}"
+        );
+        assert_eq!(target(&f), b"user's own build");
+        assert_eq!(fs::read(&f.plan.rollback_path).unwrap(), OLD);
+    }
+
+    #[test]
+    fn undo_refuses_symlinked_or_missing_output() {
+        let f = fixture();
+        let journal = run(&f, stopped).unwrap();
+        let path = &f.installation.executable_path;
+        fs::remove_file(path).unwrap();
+        assert!(matches!(
+            rollback_staged_update(&journal, stopped),
+            Err(UpdateExecutionError::TargetChanged(_))
+        ));
+        std::os::unix::fs::symlink("/bin/true", path).unwrap();
+        assert!(matches!(
+            rollback_staged_update(&journal, stopped),
+            Err(UpdateExecutionError::TargetChanged(_))
+        ));
+        assert_eq!(fs::read(&f.plan.rollback_path).unwrap(), OLD);
+    }
+
+    #[test]
+    fn undo_refuses_modified_or_missing_backup() {
+        let f = fixture();
+        let journal = run(&f, stopped).unwrap();
+        fs::write(&f.plan.rollback_path, b"tampered").unwrap();
+        let err = rollback_staged_update(&journal, stopped).unwrap_err();
+        assert!(
+            matches!(err, UpdateExecutionError::BackupChanged(_)),
+            "{err:?}"
+        );
+        assert_eq!(target(&f), NEW);
+        fs::remove_file(&f.plan.rollback_path).unwrap();
+        assert!(matches!(
+            rollback_staged_update(&journal, stopped),
+            Err(UpdateExecutionError::BackupChanged(_))
+        ));
+        assert_eq!(target(&f), NEW);
+    }
+
+    #[test]
+    fn emulator_started_after_preview_blocks_apply_before_any_change() {
+        let f = fixture();
+        // Stopped at the first check, running by the pre-apply recheck.
+        let mut calls = 0;
+        let err = run(&f, || {
+            calls += 1;
+            if calls == 1 {
+                QuiescenceEvidence::Stopped
+            } else {
+                QuiescenceEvidence::Running
+            }
+        })
+        .unwrap_err();
+        assert_eq!(
+            err,
+            UpdateExecutionError::Ineligible(UpdateExecutionEligibility::RunningBlocked)
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(target(&f), OLD);
+        assert!(!f.plan.rollback_path.exists());
+        no_leftovers(&f);
+        // The kernel lock was released; a newly reviewed transaction can retry.
+        assert!(fresh_run(&f).is_ok());
+    }
+
+    #[test]
+    fn unknown_running_state_is_not_stopped() {
+        let f = fixture();
+        assert_eq!(
+            run(&f, || QuiescenceEvidence::Unknown).unwrap_err(),
+            UpdateExecutionError::QuiescenceUnknown
+        );
+        let mut calls = 0;
+        assert_eq!(
+            run(&f, || {
+                calls += 1;
+                if calls == 1 {
+                    QuiescenceEvidence::Stopped
+                } else {
+                    QuiescenceEvidence::Unknown
+                }
+            })
+            .unwrap_err(),
+            UpdateExecutionError::QuiescenceUnknown
+        );
+        assert_eq!(target(&f), OLD);
+        assert_eq!(
+            plan_staged_update(
+                &f.installation,
+                &f.update,
+                artifact(NEW),
+                QuiescenceEvidence::Unknown
+            )
+            .eligibility,
+            // Unknown is not stopped, and it is not "running" either.
+            UpdateExecutionEligibility::QuiescenceUnknown
+        );
+        let journal = fresh_run(&f).unwrap();
+        assert_eq!(
+            rollback_staged_update(&journal, || QuiescenceEvidence::Unknown).unwrap_err(),
+            UpdateExecutionError::QuiescenceUnknown
+        );
+        assert_eq!(
+            rollback_staged_update(&journal, || QuiescenceEvidence::Running).unwrap_err(),
+            UpdateExecutionError::Ineligible(UpdateExecutionEligibility::RunningBlocked)
+        );
+        assert_eq!(target(&f), NEW);
+    }
+
+    #[test]
+    fn failure_between_moving_old_and_publishing_new_restores_the_original() {
+        let f = fixture();
+        let err = with_fault(Fault::FailPublishRename, || run(&f, stopped).unwrap_err());
+        assert!(matches!(err, UpdateExecutionError::Io(_)), "{err:?}");
+        assert_eq!(target(&f), OLD);
+        assert!(!f.plan.rollback_path.exists());
+        no_leftovers(&f);
+        let record = discover_update_records(&f.installation.installation_root);
+        let journal = record[0].journal.as_ref().unwrap();
+        assert_eq!(journal.state, UpdateTransactionState::Failed);
+        assert!(!record[0].needs_attention());
+    }
+
+    #[test]
+    fn failed_restore_marks_reconciliation_and_keeps_the_preserved_original() {
+        let f = fixture();
+        let err = with_faults(
+            &[Fault::FailPublishRename, Fault::FailRestoreRename],
+            || run(&f, stopped).unwrap_err(),
+        );
+        assert!(
+            matches!(err, UpdateExecutionError::NeedsReconciliation(_)),
+            "{err:?}"
+        );
+        // The user's original is preserved at the backup path, never lost.
+        assert_eq!(fs::read(&f.plan.rollback_path).unwrap(), OLD);
+        let records = discover_update_records(&f.installation.installation_root);
+        let journal = records[0].journal.as_ref().unwrap();
+        assert_eq!(journal.state, UpdateTransactionState::NeedsReconciliation);
+        assert!(records[0].needs_attention());
+        // No new update can start over an unresolved one (the target is gone
+        // and the durable incomplete record still requires review).
+        assert!(matches!(
+            run(&f, stopped),
+            Err(UpdateExecutionError::Stale | UpdateExecutionError::Concurrent(_))
+        ));
+        assert!(!f.installation.executable_path.exists());
+    }
+
+    #[test]
+    fn record_persistence_failure_before_replacement_changes_nothing() {
+        for state in [
+            UpdateTransactionState::Planned,
+            UpdateTransactionState::Applying,
+        ] {
+            let f = fixture();
+            let err = with_fault(Fault::FailPersist(state), || run(&f, stopped).unwrap_err());
+            assert!(
+                matches!(err, UpdateExecutionError::Io(_)),
+                "{state:?}: {err:?}"
+            );
+            assert_eq!(target(&f), OLD, "{state:?}");
+            assert!(!f.plan.rollback_path.exists());
+            no_leftovers(&f);
+            assert!(
+                fresh_run(&f).is_ok(),
+                "a newly reviewed transaction can acquire the released lock after {state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_persistence_failure_after_backup_move_restores_the_original() {
+        let f = fixture();
+        let err = with_fault(
+            Fault::FailPersist(UpdateTransactionState::BackupMoved),
+            || run(&f, stopped).unwrap_err(),
+        );
+        assert!(matches!(err, UpdateExecutionError::Io(_)), "{err:?}");
+        assert_eq!(target(&f), OLD);
+        assert!(!f.plan.rollback_path.exists());
+        no_leftovers(&f);
+    }
+
+    #[test]
+    fn final_record_failure_reports_partial_state_and_recovery_completes_it() {
+        let f = fixture();
+        let err = with_fault(
+            Fault::FailPersist(UpdateTransactionState::Published),
+            || run(&f, stopped).unwrap_err(),
+        );
+        assert!(
+            matches!(err, UpdateExecutionError::NeedsReconciliation(_)),
+            "{err:?}"
+        );
+        assert_eq!(target(&f), NEW);
+        // A second attempt is refused (the target is no longer the reviewed file).
+        assert!(matches!(
+            run(&f, stopped),
+            Err(UpdateExecutionError::Stale | UpdateExecutionError::Concurrent(_))
+        ));
+        let records = discover_update_records(&f.installation.installation_root);
+        assert_eq!(records.len(), 1);
+        assert!(records[0].needs_attention());
+        let recovered = recover_update(&records[0].path, stopped).unwrap();
+        assert_eq!(recovered.state, UpdateTransactionState::Published);
+        let undone = rollback_staged_update(&recovered, stopped).unwrap();
+        assert_eq!(undone.state, UpdateTransactionState::RolledBack);
+        assert_eq!(target(&f), OLD);
+    }
+
+    #[test]
+    fn crash_after_old_moved_is_found_and_recovered_conservatively() {
+        let f = fixture();
+        let err = with_fault(Fault::Crash(UpdateTransactionState::BackupMoved), || {
+            run(&f, stopped).unwrap_err()
+        });
+        assert_eq!(
+            err,
+            UpdateExecutionError::Io("simulated process crash".into())
+        );
+        // Restart: the target is gone, the original is preserved.
+        assert!(!f.installation.executable_path.exists());
+        assert!(matches!(
+            run(&f, stopped),
+            Err(UpdateExecutionError::Stale | UpdateExecutionError::Io(_))
+        ));
+        let records = discover_update_records(&f.installation.installation_root);
+        assert!(records[0].needs_attention());
+        // Recovery refuses while the emulator state is unknown.
+        assert_eq!(
+            recover_update(&records[0].path, || QuiescenceEvidence::Unknown).unwrap_err(),
+            UpdateExecutionError::QuiescenceUnknown
+        );
+        let recovered = recover_update(&records[0].path, stopped).unwrap();
+        assert_eq!(recovered.state, UpdateTransactionState::Failed);
+        assert_eq!(target(&f), OLD);
+        assert!(!f.plan.rollback_path.exists());
+        no_leftovers(&f);
+        assert!(fresh_run(&f).is_ok(), "lock released by recovery");
+    }
+
+    #[test]
+    fn crash_before_any_move_recovers_without_touching_the_executable() {
+        let f = fixture();
+        with_fault(Fault::Crash(UpdateTransactionState::Applying), || {
+            run(&f, stopped).unwrap_err()
+        });
+        assert_eq!(target(&f), OLD);
+        let records = discover_update_records(&f.installation.installation_root);
+        let recovered = recover_update(&records[0].path, stopped).unwrap();
+        assert_eq!(recovered.state, UpdateTransactionState::Failed);
+        assert_eq!(target(&f), OLD);
+        no_leftovers(&f);
+    }
+
+    #[test]
+    fn recovery_does_not_guess_when_files_match_no_recorded_outcome() {
+        let f = fixture();
+        with_fault(Fault::Crash(UpdateTransactionState::BackupMoved), || {
+            run(&f, stopped).unwrap_err()
+        });
+        fs::write(&f.installation.executable_path, b"someone else's file").unwrap();
+        let records = discover_update_records(&f.installation.installation_root);
+        let err = recover_update(&records[0].path, stopped).unwrap_err();
+        assert!(
+            matches!(err, UpdateExecutionError::NeedsReconciliation(_)),
+            "{err:?}"
+        );
+        assert_eq!(target(&f), b"someone else's file");
+        assert_eq!(fs::read(&f.plan.rollback_path).unwrap(), OLD);
+    }
+
+    #[test]
+    fn crash_during_undo_recovers_back_to_published() {
+        let f = fixture();
+        let journal = run(&f, stopped).unwrap();
+        with_fault(Fault::Crash(UpdateTransactionState::Undoing), || {
+            rollback_staged_update(&journal, stopped).unwrap_err()
+        });
+        assert_eq!(target(&f), NEW);
+        let records = discover_update_records(&f.installation.installation_root);
+        assert!(records[0].needs_attention());
+        let recovered = recover_update(&records[0].path, stopped).unwrap();
+        assert_eq!(recovered.state, UpdateTransactionState::Published);
+        assert_eq!(
+            rollback_staged_update(&recovered, stopped).unwrap().state,
+            UpdateTransactionState::RolledBack
+        );
+        assert_eq!(target(&f), OLD);
+    }
+
+    #[test]
+    fn successful_update_and_undo_preserve_everything_and_delete_nothing() {
+        let f = fixture();
+        let journal = run(&f, stopped).unwrap();
+        assert_eq!(journal.state, UpdateTransactionState::Published);
+        assert_eq!(
+            journal.original_sha256,
+            hash_file(&f.plan.rollback_path).unwrap()
+        );
+        assert_eq!(
+            journal.published_sha256,
+            hash_file(&f.installation.executable_path).unwrap()
+        );
+        assert_eq!(target(&f), NEW);
+        // The durable record matches what was returned.
+        let records = discover_update_records(&f.installation.installation_root);
+        assert_eq!(records[0].journal.as_ref().unwrap(), &journal);
+        assert!(!records[0].needs_attention());
+        let undone = rollback_staged_update(&journal, stopped).unwrap();
+        assert_eq!(undone.state, UpdateTransactionState::RolledBack);
+        assert_eq!(target(&f), OLD);
+        // The published executable is parked, not deleted.
+        let displaced = undone.displaced_path.clone().unwrap();
+        assert_eq!(fs::read(&displaced).unwrap(), NEW);
+        // A second undo is refused: the record is no longer Published.
+        let again = discover_update_records(&f.installation.installation_root)[0]
+            .journal
+            .clone()
+            .unwrap();
+        assert_eq!(again.state, UpdateTransactionState::RolledBack);
+        assert!(rollback_staged_update(&again, stopped).is_err());
+    }
+
+    #[test]
+    fn concurrent_update_attempts_are_serialised() {
+        let f = fixture();
+        let mut nested: Option<Result<UpdateJournal, UpdateExecutionError>> = None;
+        struct Reentrant<'a> {
+            fixture: &'a Fixture,
+            result: &'a mut Option<Result<UpdateJournal, UpdateExecutionError>>,
+        }
+        impl UpdateDownloader for Reentrant<'_> {
+            fn download(
+                &mut self,
+                _url: &str,
+                destination: &mut File,
+            ) -> Result<(), UpdateExecutionError> {
+                // A second attempt while the first holds the lock.
+                let mut other = FixtureDownloader {
+                    bytes: NEW.to_vec(),
+                };
+                *self.result = Some(execute_staged_update(
+                    &self.fixture.plan,
+                    &self.fixture.installation,
+                    &self.fixture.update,
+                    stopped,
+                    &mut other,
+                ));
+                destination.write_all(NEW).map_err(io_err)
+            }
+        }
+        let mut downloader = Reentrant {
+            fixture: &f,
+            result: &mut nested,
+        };
+        let journal = execute_staged_update(
+            &f.plan,
+            &f.installation,
+            &f.update,
+            stopped,
+            &mut downloader,
+        )
+        .unwrap();
+        assert!(matches!(
+            nested.unwrap(),
+            Err(UpdateExecutionError::Concurrent(_))
+        ));
+        assert_eq!(journal.state, UpdateTransactionState::Published);
+        assert_eq!(target(&f), NEW);
+    }
+
+    #[test]
+    fn missing_or_corrupt_recovery_record_refuses_undo_and_recovery() {
+        let f = fixture();
+        let journal = run(&f, stopped).unwrap();
+        let record = journal.record_path().unwrap();
+        fs::write(&record, b"{ not json").unwrap();
+        let entries = discover_update_records(&f.installation.installation_root);
+        assert!(entries[0].journal.is_err() && entries[0].needs_attention());
+        assert!(matches!(
+            rollback_staged_update(&journal, stopped),
+            Err(UpdateExecutionError::Record(_))
+        ));
+        assert!(matches!(
+            recover_update(&record, stopped),
+            Err(UpdateExecutionError::Record(_))
+        ));
+        fs::remove_file(&record).unwrap();
+        assert!(matches!(
+            rollback_staged_update(&journal, stopped),
+            Err(UpdateExecutionError::Record(_))
+        ));
+        assert_eq!(target(&f), NEW);
+        assert_eq!(fs::read(&f.plan.rollback_path).unwrap(), OLD);
+    }
+
+    #[test]
+    fn executable_changed_between_review_and_apply_is_not_replaced() {
+        let f = fixture();
+        fs::write(&f.installation.executable_path, b"edited after review").unwrap();
+        assert_eq!(run(&f, stopped).unwrap_err(), UpdateExecutionError::Stale);
+        assert_eq!(target(&f), b"edited after review");
+        assert!(!f.plan.rollback_path.exists());
+    }
+
+    #[test]
+    fn existing_backup_path_is_never_overwritten() {
+        let f = fixture();
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(f.plan.rollback_path.parent().unwrap())
+                .unwrap();
+        }
+        fs::write(&f.plan.rollback_path, b"earlier backup").unwrap();
+        assert!(matches!(
+            run(&f, stopped),
+            Err(UpdateExecutionError::NeedsReconciliation(_))
+        ));
+        assert_eq!(fs::read(&f.plan.rollback_path).unwrap(), b"earlier backup");
+        assert_eq!(target(&f), OLD);
+    }
+
+    // ---- Independent review reproducers (expected to FAIL on the candidate) ----
+
+    /// A process that died after taking the lock but before the first record was
+    /// written leaves a lock and no journal: nothing can ever clear it.
+    #[test]
+    fn review_lock_left_by_a_crash_before_the_first_record_is_recoverable() {
+        let f = fixture();
+        let directory = f.plan.rollback_path.parent().unwrap().to_path_buf();
+        // A kernel lock does not need a rollback directory or a record.
+        // The state a killed process leaves: lock present, no journal.
+        acquire_lock(&directory, &f.plan.target_path, "deadbeefdeadbeefdeadbeef").unwrap();
+        assert!(discover_update_records(&f.installation.installation_root).is_empty());
+        // Required: some supported path must let an update proceed (or at least
+        // offer recovery) once the owner is provably gone. Today it is permanent.
+        let outcome = run(&f, stopped);
+        assert!(
+            outcome.is_ok(),
+            "an orphaned lock from a dead process blocks every later update: {outcome:?}"
+        );
+    }
+
+    struct BlockingDownloader {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+    impl UpdateDownloader for BlockingDownloader {
+        fn download(
+            &mut self,
+            _url: &str,
+            destination: &mut File,
+        ) -> Result<(), UpdateExecutionError> {
+            destination.write_all(NEW).unwrap();
+            self.started.send(()).unwrap();
+            self.release.recv().unwrap();
+            Ok(())
+        }
+    }
+
+    /// Recovery must not act on a transaction whose owner is still alive.
+    #[test]
+    fn review_recovery_refuses_a_transaction_that_is_still_running() {
+        let f = std::sync::Arc::new(fixture());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let f = f.clone();
+            std::thread::spawn(move || {
+                let mut downloader = BlockingDownloader {
+                    started: started_tx,
+                    release: release_rx,
+                };
+                execute_staged_update(
+                    &f.plan,
+                    &f.installation,
+                    &f.update,
+                    stopped,
+                    &mut downloader,
+                )
+            })
+        };
+        started_rx.recv().unwrap();
+        let records = discover_update_records(&f.installation.installation_root);
+        let recovered = recover_update(&records[0].path, stopped);
+        release_tx.send(()).unwrap();
+        let finished = worker.join().unwrap();
+        assert!(
+            recovered.is_err(),
+            "recovery 'finished' ({recovered:?}) a live update; the live update then ended as {finished:?}"
+        );
+    }
+
+    /// Recovery must delete only files it can prove it created.
+    #[test]
+    fn review_recovery_never_deletes_a_file_named_only_by_the_record() {
+        let f = fixture();
+        with_fault(Fault::Crash(UpdateTransactionState::Applying), || {
+            run(&f, stopped).unwrap_err()
+        });
+        let records = discover_update_records(&f.installation.installation_root);
+        let innocent = f.installation.installation_root.join("user-save-data.bin");
+        fs::write(&innocent, b"irreplaceable").unwrap();
+        // A damaged or hand-edited record pointing at an unrelated file.
+        let mut journal = records[0].journal.clone().unwrap();
+        journal.staged_path = Some(innocent.clone());
+        fs::write(&records[0].path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let _ = recover_update(&records[0].path, stopped);
+        assert!(
+            innocent.exists(),
+            "recovery deleted a file it did not create"
+        );
+    }
+
+    /// Crash right after the old executable moved but before BackupMoved was
+    /// written: the user is left with no executable at the install path.
+    #[test]
+    fn review_crash_between_the_backup_rename_and_its_record_is_restored() {
+        let f = fixture();
+        with_fault(Fault::Crash(UpdateTransactionState::Applying), || {
+            run(&f, stopped).unwrap_err()
+        });
+        fs::rename(&f.plan.target_path, &f.plan.rollback_path).unwrap();
+        let records = discover_update_records(&f.installation.installation_root);
+        let recovered = recover_update(&records[0].path, stopped);
+        assert!(
+            recovered.is_ok() && target(&f) == OLD,
+            "recovery left the emulator missing: {recovered:?}"
+        );
+    }
+    include!("emulator_update/safety_tests.rs");
+    include!("emulator_update/closure_tests.rs");
 }

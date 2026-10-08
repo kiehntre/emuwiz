@@ -166,8 +166,14 @@ dreamcast-cdi = ["dep:opticaldiscs"]
 # alone does not enable CDI, and enabling `dreamcast-cdi` alone pulls in
 # no native code.
 chd-optical-specialist = ["dep:opticaldiscs", "opticaldiscs/chd"]
+# Test-binary environment isolation (`crate::test_environment`). Enabled only
+# from `[dev-dependencies]`, so no release or ordinary build contains it.
+test-support = []
 
 [dev-dependencies]
+# Integration tests link the library without `cfg(test)`; this self-dependency
+# turns on the test-support feature for them (and only for test builds).
+archivefs-core = { path = ".", features = ["test-support"] }
 # Same crate, fuller feature set: only test fixtures need to *write* 7z
 # files (solid, encrypted, multi-member) to exercise the read-only reader
 # against real archives. Cargo unifies features for one crate across

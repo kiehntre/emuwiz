@@ -4,6 +4,8 @@
 //! temporary directory and asserts on what is actually on disk and in
 //! the journal, never on source strings.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -2,6 +2,8 @@
 //! Every database here is a private temporary copy; nothing touches a real
 //! library.
 
+archivefs_core::install_test_environment!();
+
 use archivefs_core::catalogue_health::{
     REBIND_REVIEW_AGAIN, RebindReason, SourceHealthState, SourceRootBinding,
 };

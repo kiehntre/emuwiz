@@ -308,5 +308,28 @@ class ReleasePackagerTests(unittest.TestCase):
         self.assertEqual(sidecar.read_text(), "foreign checksum")
 
 
+    def test_22_user_state_and_private_data_never_enter_the_payload(self) -> None:
+        # The release must never carry a user's database, configuration,
+        # journals or game data. Each denied name is refused whether it appears
+        # as a file or as a directory, at the top level or nested.
+        for name in sorted(packager.DENIED_PAYLOAD_NAMES):
+            for layout in (pathlib.Path(name), pathlib.Path("share") / name / "inner.bin"):
+                payload = self.root / f"payload-{abs(hash((name, str(layout))))}"
+                target = payload / layout
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"x")
+                with self.assertRaises(packager.ReleaseError) as raised:
+                    packager.payload_files(payload)
+                self.assertEqual(raised.exception.code, packager.EXIT_UNSAFE, (name, layout))
+        # The denial list itself must keep naming the user-state classes.
+        for required in ("library.sqlite3", "config.toml", "rename-transactions",
+                         "journals", "roms", "bios", "saves", ".config", ".local"):
+            self.assertIn(required, packager.DENIED_PAYLOAD_NAMES)
+        clean = self.root / "payload-clean"
+        (clean / "bin").mkdir(parents=True)
+        (clean / "bin" / "emuwiz").write_bytes(b"#!/bin/sh\n")
+        self.assertTrue(packager.payload_files(clean))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -8,6 +8,8 @@
 //! external-tool suites in this crate behave on a machine without the
 //! backend installed.
 
+archivefs_core::install_test_environment!();
+
 use std::{fs, path::Path, process::Command};
 
 use archivefs_core::standalone_patch::{

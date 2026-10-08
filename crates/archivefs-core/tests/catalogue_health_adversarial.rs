@@ -1,3 +1,5 @@
+archivefs_core::install_test_environment!();
+
 use archivefs_core::catalogue_health::{CatalogueHealth, MoveEvidence, preview_catalogue_health};
 use archivefs_core::{Archive, Config, Database, scan_and_persist};
 use rusqlite::{Connection, params};
