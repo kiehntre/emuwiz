@@ -557,12 +557,7 @@ fn simulated_restart_recovers_the_exact_prior_bytes_from_nothing_but_the_path() 
     // does up to (but not including) its own final cleanup step - this is
     // the "crashed after the real write, before recovery-record removal"
     // case, the hardest one to resolve correctly.
-    write_recovery_record(
-        &es_de_gamelist_recovery_path(&gamelist_path),
-        &gamelist_path,
-        &publication.previous_content,
-    )
-    .unwrap();
+    persist_record(&publication_record(&publication).unwrap()).unwrap();
     std::fs::write(&gamelist_path, &publication.new_content).unwrap();
     assert!(
         std::fs::read_to_string(&gamelist_path)
@@ -597,12 +592,7 @@ fn simulated_restart_recovers_a_freshly_created_gamelist_by_removing_it() {
     let gamelist_path = publication.gamelist_path.clone();
     assert!(publication.previous_content.is_none());
 
-    write_recovery_record(
-        &es_de_gamelist_recovery_path(&gamelist_path),
-        &gamelist_path,
-        &publication.previous_content,
-    )
-    .unwrap();
+    persist_record(&publication_record(&publication).unwrap()).unwrap();
     std::fs::write(&gamelist_path, &publication.new_content).unwrap();
     drop(publication);
 
@@ -909,16 +899,9 @@ fn writing_the_recovery_record_through_a_symlinked_path_never_touches_its_target
     ));
 }
 
-/// The `atomic_write_text` symlink refusal covers the *final* path
-/// component. It does not walk intermediate directories, so a recovery
-/// path whose parent directory is itself a symlink is followed. This is
-/// tolerated here only because `write_recovery_record` is always given a
-/// sibling of a profile-resolved `gamelists/<system>/gamelist.xml` path
-/// (see `es_de_gamelist_recovery_path`), never an attacker-supplied
-/// directory - the parent chain is EmuWiz's own resolved ES-DE layout.
-/// Recorded as a test so the boundary is explicit, not silently assumed;
-/// hardening intermediate components belongs in the shared write helper,
-/// not this module.
+/// Pins the shared atomic writer's leaf-only boundary via the test-only legacy
+/// receipt writer. Production publication never trusts profile discovery to
+/// freeze ancestors: DestinationEvidence separately rejects parent symlinks.
 #[cfg(unix)]
 #[test]
 fn a_symlinked_parent_directory_of_the_recovery_path_is_out_of_this_helper_s_scope() {
@@ -931,41 +914,24 @@ fn a_symlinked_parent_directory_of_the_recovery_path_is_out_of_this_helper_s_sco
 
     let gamelist_path = linked_parent.join("gamelist.xml");
     let recovery_path = es_de_gamelist_recovery_path(&gamelist_path);
-    // Only the final component matters to the guard; the record lands in the
-    // resolved directory. The test's job is to pin this behaviour, not bless
-    // an attacker-controlled parent - which cannot occur for a
-    // profile-resolved gamelist path.
+    // This fixture writer bypasses production evidence checks deliberately.
     write_recovery_record(&recovery_path, &gamelist_path, &Some("x".to_string())).unwrap();
     assert!(real_dir.join(recovery_path.file_name().unwrap()).is_file());
 }
 
 #[test]
-fn an_ordinary_recovery_record_write_round_trips_and_atomically_replaces_a_prior_one() {
-    let home = tempdir().unwrap();
-    let gamelist_path = home.path().join("gamelists/psx/gamelist.xml");
-    std::fs::create_dir_all(gamelist_path.parent().unwrap()).unwrap();
-    let recovery_path = es_de_gamelist_recovery_path(&gamelist_path);
-
-    write_recovery_record(&recovery_path, &gamelist_path, &Some("first".to_string())).unwrap();
-    assert!(!recovery_path.is_symlink());
-    let record = read_recovery_record(&recovery_path, &gamelist_path).unwrap();
-    assert_eq!(record.previous_content.as_deref(), Some("first"));
-
-    // A second write over the existing regular file is an ordinary atomic
-    // replace - a non-symlinked regular file is a permitted destination.
-    write_recovery_record(&recovery_path, &gamelist_path, &None).unwrap();
-    let record = read_recovery_record(&recovery_path, &gamelist_path).unwrap();
-    assert_eq!(record.previous_content, None);
-
-    // No temp file left behind by either write.
-    let leftovers: Vec<_> = std::fs::read_dir(gamelist_path.parent().unwrap())
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
+fn an_owned_recovery_record_round_trips_and_cannot_be_replaced() {
+    let (_root, p) = preservation_fixture(Some("<gameList></gameList>"));
+    let record = publication_record(&p).unwrap();
+    persist_record(&record).unwrap();
+    let path = es_de_gamelist_recovery_path(&p.gamelist_path);
     assert_eq!(
-        leftovers,
-        vec![recovery_path.file_name().unwrap().to_os_string()]
+        read_recovery_record(&path, &p.gamelist_path).unwrap(),
+        record
     );
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(persist_record(&record).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
 
 #[test]
@@ -1048,4 +1014,427 @@ fn publication_points_at_the_launcher_file_never_a_companion() {
     assert!(publication.new_content.contains("Game (Europe).cue"));
     assert!(!publication.new_content.contains("track1.bin"));
     assert!(!publication.new_content.contains("track2.bin"));
+}
+
+// Preservation regressions: every path is inside this owned temporary fixture.
+fn preservation_fixture(existing: Option<&str>) -> (tempfile::TempDir, EsDeGamelistPublication) {
+    let root = tempdir().unwrap();
+    let path = root.path().join("gamelists/psx/gamelist.xml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    if let Some(text) = existing {
+        std::fs::write(&path, text).unwrap();
+    }
+    let profile = profile_with_psx_system(root.path());
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    let publication = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    (root, publication)
+}
+
+#[test]
+fn preservation_external_edit_after_preview_is_refused() {
+    let (_root, p) = preservation_fixture(Some("<gameList><!-- before --></gameList>"));
+    let edited = "<gameList><!-- user's later edit --></gameList>";
+    std::fs::write(&p.gamelist_path, edited).unwrap();
+    assert!(apply_es_de_gamelist_publication(&p).is_err());
+    assert_eq!(std::fs::read_to_string(&p.gamelist_path).unwrap(), edited);
+}
+
+#[test]
+fn preservation_file_created_after_absence_preview_is_refused() {
+    let (_root, p) = preservation_fixture(None);
+    let edited = "<gameList><!-- externally created --></gameList>";
+    std::fs::write(&p.gamelist_path, edited).unwrap();
+    assert!(apply_es_de_gamelist_publication(&p).is_err());
+    assert_eq!(std::fs::read_to_string(&p.gamelist_path).unwrap(), edited);
+}
+
+#[test]
+fn preservation_undo_refuses_modified_existing_and_new_output() {
+    for before in [None, Some("<gameList><!-- before --></gameList>")] {
+        let (_root, p) = preservation_fixture(before);
+        apply_es_de_gamelist_publication(&p).unwrap();
+        let edited = "<gameList><!-- edit after publish --></gameList>";
+        std::fs::write(&p.gamelist_path, edited).unwrap();
+        assert!(rollback_es_de_gamelist_publication(&p).is_err());
+        assert_eq!(std::fs::read_to_string(&p.gamelist_path).unwrap(), edited);
+    }
+}
+
+#[test]
+fn preservation_two_stale_plans_cannot_replace_each_other() {
+    let (_root, first) = preservation_fixture(Some("<gameList></gameList>"));
+    let second = first.clone();
+    apply_es_de_gamelist_publication(&first).unwrap();
+    let edited = first
+        .new_content
+        .replace("<name>Game</name>", "<name>Changed</name>");
+    std::fs::write(&first.gamelist_path, &edited).unwrap();
+    assert!(apply_es_de_gamelist_publication(&second).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&first.gamelist_path).unwrap(),
+        edited
+    );
+}
+
+#[test]
+fn preservation_malformed_xml_with_closing_tag_is_refused() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("gamelists/psx/gamelist.xml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let profile = profile_with_psx_system(root.path());
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", root.path().join("playing/Game.chd"))],
+    );
+    for text in [
+        "<gameList><game></gameList>",
+        "<wrong></gameList>",
+        "<gameList><!-- </gameList> -->",
+        "<gameList></gameList><other/>",
+        "<gameList><1bad/></gameList>",
+        "<gameList custom='&unknown;'></gameList>",
+        "<gameList><game><path>&#0;</path></game></gameList>",
+        "<!DOCTYPE gameList><gameList/>",
+        "<?xml version='1.0'?><?xml version='1.0'?><gameList/>",
+    ] {
+        std::fs::write(&path, text).unwrap();
+        assert!(
+            plan_es_de_gamelist_publication(&plan, "PSX", &profile).is_err(),
+            "accepted {text}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+}
+
+#[test]
+fn preservation_recovery_refuses_external_changes_and_keeps_evidence() {
+    for before in [None, Some("<gameList><!-- before --></gameList>")] {
+        let (_root, p) = preservation_fixture(before);
+        PUBLICATION_FAULT.with(|fault| *fault.borrow_mut() = Some("after_write"));
+        let result = apply_es_de_gamelist_publication(&p);
+        PUBLICATION_FAULT.with(|fault| *fault.borrow_mut() = None);
+        assert!(result.is_err());
+        let record_path = es_de_gamelist_recovery_path(&p.gamelist_path);
+        let receipt = std::fs::read(&record_path).unwrap();
+        let edited = "<gameList><!-- externally changed after interruption --></gameList>";
+        std::fs::write(&p.gamelist_path, edited).unwrap();
+        assert!(recover_es_de_gamelist_publication(&p.gamelist_path).is_err());
+        assert_eq!(std::fs::read_to_string(&p.gamelist_path).unwrap(), edited);
+        assert_eq!(std::fs::read(record_path).unwrap(), receipt);
+    }
+}
+
+#[test]
+fn preservation_legacy_receipt_requires_review_even_when_original_absent() {
+    for before in [None, Some("<gameList></gameList>".to_string())] {
+        let (_root, p) = preservation_fixture(None);
+        let current = "<gameList><!-- user data --></gameList>";
+        std::fs::write(&p.gamelist_path, current).unwrap();
+        write_recovery_record(
+            &es_de_gamelist_recovery_path(&p.gamelist_path),
+            &p.gamelist_path,
+            &before,
+        )
+        .unwrap();
+        assert!(recover_es_de_gamelist_publication(&p.gamelist_path).is_err());
+        assert_eq!(std::fs::read_to_string(&p.gamelist_path).unwrap(), current);
+        assert!(has_unresolved_es_de_gamelist_recovery(&p.gamelist_path));
+    }
+}
+
+#[test]
+fn preservation_fault_stages_recover_only_known_before_or_after_images() {
+    for stage in ["before_write", "after_write", "finalize"] {
+        for before in [None, Some("<gameList><!-- before --></gameList>")] {
+            let (_root, p) = preservation_fixture(before);
+            PUBLICATION_FAULT.with(|fault| *fault.borrow_mut() = Some(stage));
+            let result = apply_es_de_gamelist_publication(&p);
+            PUBLICATION_FAULT.with(|fault| *fault.borrow_mut() = None);
+            assert!(result.is_err());
+            let expected = if stage == "before_write" {
+                EsDeRestoreOutcome::AlreadyRestored
+            } else {
+                EsDeRestoreOutcome::Restored
+            };
+            assert_eq!(
+                recover_es_de_gamelist_publication_with_outcome(&p.gamelist_path).unwrap(),
+                expected
+            );
+            assert_eq!(read_current(&p.gamelist_path).unwrap().as_deref(), before);
+            assert!(!has_unresolved_es_de_gamelist_recovery(&p.gamelist_path));
+        }
+    }
+}
+
+#[test]
+fn preservation_modified_v2_receipt_is_not_restoration_authority() {
+    let (_root, p) = preservation_fixture(Some("<gameList></gameList>"));
+    PUBLICATION_FAULT.with(|fault| *fault.borrow_mut() = Some("after_write"));
+    assert!(apply_es_de_gamelist_publication(&p).is_err());
+    PUBLICATION_FAULT.with(|fault| *fault.borrow_mut() = None);
+    let path = es_de_gamelist_recovery_path(&p.gamelist_path);
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    json["previous_content"] = serde_json::Value::String("foreign data".into());
+    std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(recover_es_de_gamelist_publication(&p.gamelist_path).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&p.gamelist_path).unwrap(),
+        p.new_content
+    );
+    assert!(path.exists());
+}
+
+#[test]
+fn preservation_replaced_file_same_bytes_is_stale() {
+    let (_root, p) = preservation_fixture(Some("<gameList></gameList>"));
+    let replacement = p.gamelist_path.with_extension("replacement");
+    std::fs::write(&replacement, p.previous_content.as_ref().unwrap()).unwrap();
+    std::fs::rename(replacement, &p.gamelist_path).unwrap();
+    assert!(apply_es_de_gamelist_publication(&p).is_err());
+    assert_eq!(read_current(&p.gamelist_path).unwrap(), p.previous_content);
+}
+
+#[test]
+fn preservation_replaced_or_unavailable_parent_refuses_without_recreation() {
+    for replace in [false, true] {
+        let (_root, p) = preservation_fixture(Some("<gameList></gameList>"));
+        let parent = p.gamelist_path.parent().unwrap();
+        let saved = parent.with_extension("old");
+        std::fs::rename(parent, &saved).unwrap();
+        if replace {
+            std::fs::create_dir(parent).unwrap();
+        }
+        assert!(apply_es_de_gamelist_publication(&p).is_err());
+        assert!(!p.gamelist_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(saved.join("gamelist.xml")).unwrap(),
+            p.previous_content.unwrap()
+        );
+        if !replace {
+            assert!(!parent.exists());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preservation_parent_and_leaf_symlink_substitution_refuse() {
+    for parent_swap in [false, true] {
+        let (root, p) = preservation_fixture(Some("<gameList></gameList>"));
+        let target = root.path().join("foreign");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("gamelist.xml"), "foreign bytes").unwrap();
+        if parent_swap {
+            let parent = p.gamelist_path.parent().unwrap();
+            std::fs::rename(parent, parent.with_extension("old")).unwrap();
+            std::os::unix::fs::symlink(&target, parent).unwrap();
+        } else {
+            std::fs::remove_file(&p.gamelist_path).unwrap();
+            std::os::unix::fs::symlink(target.join("gamelist.xml"), &p.gamelist_path).unwrap();
+        }
+        assert!(apply_es_de_gamelist_publication(&p).is_err());
+        assert_eq!(
+            std::fs::read_to_string(target.join("gamelist.xml")).unwrap(),
+            "foreign bytes"
+        );
+    }
+}
+
+#[test]
+fn preservation_semantic_paths_unknown_metadata_and_comment_text() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("gamelists/psx/gamelist.xml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let game = root.path().join("playing/Game&One.chd");
+    let encoded = game.to_str().unwrap().replace('&', "&#38;");
+    let existing = format!(
+        "<?xml version=\"1.0\"?><gameList custom=\"yes\"><!-- </gameList> --><game foreign=\"keep\"><path> {encoded} </path><custom>hello &amp; goodbye</custom></game></gameList>"
+    );
+    std::fs::write(&path, &existing).unwrap();
+    let profile = profile_with_psx_system(root.path());
+    let plan = plan_with_operations(root.path().join("playing"), &[("Game", game)]);
+    let p = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert!(p.is_unchanged());
+    assert_eq!(p.new_content, existing);
+    apply_es_de_gamelist_publication(&p).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    assert_eq!(
+        rollback_es_de_gamelist_publication_with_outcome(&p).unwrap(),
+        EsDeRestoreOutcome::AlreadyRestored
+    );
+    std::fs::write(&path, "<gameList><!-- external --></gameList>").unwrap();
+    assert!(rollback_es_de_gamelist_publication_with_outcome(&p).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "<gameList><!-- external --></gameList>"
+    );
+}
+
+#[test]
+fn preservation_matching_path_in_comment_is_not_an_entry() {
+    let (root, p) = preservation_fixture(None);
+    let existing = format!(
+        "<gameList><!-- <path>{}</path> --></gameList>",
+        p.added[0].destination_path.display()
+    );
+    std::fs::write(&p.gamelist_path, &existing).unwrap();
+    let profile = profile_with_psx_system(root.path());
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", p.added[0].destination_path.clone())],
+    );
+    let fresh = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert_eq!(fresh.added.len(), 1);
+    assert!(fresh.new_content.starts_with("<gameList><!-- <path>"));
+}
+
+#[test]
+fn preservation_repeat_apply_and_repeat_undo_are_explicit_noops() {
+    let (root, p) = preservation_fixture(Some("<gameList></gameList>"));
+    apply_es_de_gamelist_publication(&p).unwrap();
+    let identity = crate::dat::rename_apply::capture_identity(&p.gamelist_path).unwrap();
+    assert!(apply_es_de_gamelist_publication(&p).is_err());
+    let profile = profile_with_psx_system(root.path());
+    let plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Game", p.added[0].destination_path.clone())],
+    );
+    let fresh = plan_es_de_gamelist_publication(&plan, "PSX", &profile).unwrap();
+    assert!(fresh.is_unchanged());
+    apply_es_de_gamelist_publication(&fresh).unwrap();
+    assert_eq!(
+        crate::dat::rename_apply::capture_identity(&p.gamelist_path).unwrap(),
+        identity
+    );
+    assert_eq!(
+        rollback_es_de_gamelist_publication_with_outcome(&p).unwrap(),
+        EsDeRestoreOutcome::Restored
+    );
+    assert_eq!(
+        rollback_es_de_gamelist_publication_with_outcome(&p).unwrap(),
+        EsDeRestoreOutcome::AlreadyRestored
+    );
+}
+
+#[test]
+fn preservation_empty_root_preserves_attributes_and_surrounding_bytes() {
+    let (_root, p) = preservation_fixture(Some(
+        "<?xml version=\"1.0\"?>\n<gameList custom=\"keep\"/>\n<!-- tail -->",
+    ));
+    apply_es_de_gamelist_publication(&p).unwrap();
+    assert!(
+        p.new_content
+            .starts_with("<?xml version=\"1.0\"?>\n<gameList custom=\"keep\">")
+    );
+    assert!(p.new_content.ends_with("</gameList>\n<!-- tail -->"));
+    rollback_es_de_gamelist_publication(&p).unwrap();
+    assert_eq!(read_current(&p.gamelist_path).unwrap(), p.previous_content);
+}
+
+#[cfg(unix)]
+#[test]
+fn preservation_competing_reservation_fails_while_owner_holds_lock() {
+    let (_root, p) = preservation_fixture(None);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let path = p.gamelist_path.clone();
+    let b = barrier.clone();
+    let r = release.clone();
+    let owner = std::thread::spawn(move || {
+        let _lock = PublicationLock::acquire(&path).unwrap();
+        b.wait();
+        r.wait();
+    });
+    barrier.wait();
+    let result = apply_es_de_gamelist_publication(&p);
+    release.wait();
+    owner.join().unwrap();
+    assert!(result.is_err());
+    assert!(!p.gamelist_path.exists());
+    apply_es_de_gamelist_publication(&p).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn preservation_two_actual_publications_are_excluded_at_the_write_barrier() {
+    let (_root, p) = preservation_fixture(Some("<gameList></gameList>"));
+    let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let first = p.clone();
+    let e = entered.clone();
+    let r = release.clone();
+    let worker = std::thread::spawn(move || {
+        PUBLICATION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |stage, _| {
+                if stage == "before_write" {
+                    e.wait();
+                    r.wait();
+                }
+            }))
+        });
+        let result = apply_es_de_gamelist_publication(&first);
+        PUBLICATION_HOOK.with(|hook| *hook.borrow_mut() = None);
+        result
+    });
+    entered.wait();
+    let second = apply_es_de_gamelist_publication(&p);
+    release.wait();
+    assert!(worker.join().unwrap().is_ok());
+    assert!(second.is_err());
+    assert_eq!(read_current(&p.gamelist_path).unwrap(), Some(p.new_content));
+}
+
+#[test]
+fn preservation_external_edit_after_receipt_is_refused_without_blind_recovery() {
+    let (_root, p) = preservation_fixture(Some("<gameList></gameList>"));
+    let external = "<gameList><!-- late external edit --></gameList>";
+    PUBLICATION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |stage, path| {
+            if stage == "before_write" {
+                std::fs::write(path, external).unwrap();
+            }
+        }))
+    });
+    let result = apply_es_de_gamelist_publication(&p);
+    PUBLICATION_HOOK.with(|hook| *hook.borrow_mut() = None);
+    assert!(result.is_err());
+    assert_eq!(
+        read_current(&p.gamelist_path).unwrap().as_deref(),
+        Some(external)
+    );
+    assert!(has_unresolved_es_de_gamelist_recovery(&p.gamelist_path));
+    assert!(recover_es_de_gamelist_publication(&p.gamelist_path).is_err());
+    assert_eq!(
+        read_current(&p.gamelist_path).unwrap().as_deref(),
+        Some(external)
+    );
+}
+
+#[test]
+fn preservation_distinct_stale_plans_preserve_the_first_publication() {
+    let (root, first) = preservation_fixture(Some("<gameList></gameList>"));
+    let profile = profile_with_psx_system(root.path());
+    let second_plan = plan_with_operations(
+        root.path().join("playing"),
+        &[("Other", root.path().join("playing/Other.chd"))],
+    );
+    let second = plan_es_de_gamelist_publication(&second_plan, "PSX", &profile).unwrap();
+    apply_es_de_gamelist_publication(&first).unwrap();
+    assert!(apply_es_de_gamelist_publication(&second).is_err());
+    assert_eq!(
+        read_current(&first.gamelist_path).unwrap(),
+        Some(first.new_content)
+    );
+}
+
+#[test]
+fn preservation_external_creation_matching_proposed_bytes_is_still_stale() {
+    let (_root, p) = preservation_fixture(None);
+    std::fs::write(&p.gamelist_path, &p.new_content).unwrap();
+    assert!(apply_es_de_gamelist_publication(&p).is_err());
+    assert_eq!(read_current(&p.gamelist_path).unwrap(), Some(p.new_content));
 }

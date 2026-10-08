@@ -1861,6 +1861,8 @@ mod tests {
         let path = temp.path().join("gamelist.xml");
         let publication = EsDeGamelistPublication {
             es_de_system: "nes",
+            destination_evidence: crate::launch::es_de_publish::DestinationEvidence::capture(&path)
+                .unwrap(),
             gamelist_path: path.clone(),
             previous_content: None,
             new_content: "<gameList/>".into(),
