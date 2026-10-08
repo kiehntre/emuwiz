@@ -34,13 +34,18 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
+use archivefs_core::memory_card_inventory::restore_guard::{
+    ProcScanQuiescence, Ps2GuardedRestore, Ps2RestorePhase, apply_ps2_psu_restore_guarded,
+    default_ps2_restore_guard_options, default_ps2_restore_journal_dir,
+    discover_ps2_restore_journals, recover_all_interrupted_ps2_restores,
+    undo_ps2_psu_restore_guarded, unix_now,
+};
 use archivefs_core::memory_card_inventory::{
     MemoryCardHealth, MemoryCardInventory, Ps2ClusterChainHealth, Ps2DirectoryEntry,
     Ps2DirectoryEntryKind, Ps2FileExportError, Ps2FileExportPlan, Ps2FileExportResult,
     Ps2InventoryWarning, Ps2PsuExportError, Ps2PsuExportPlan, Ps2PsuExportResult,
-    Ps2PsuRestoreError, Ps2PsuRestorePlan, Ps2PsuRestoreResult, Ps2SaveDirectory, Ps2SaveFile,
-    apply_ps2_file_export, apply_ps2_psu_export, apply_ps2_psu_restore, plan_ps2_file_export,
-    plan_ps2_psu_export, plan_ps2_psu_restore, undo_ps2_psu_restore,
+    Ps2PsuRestoreError, Ps2PsuRestorePlan, Ps2SaveDirectory, Ps2SaveFile, apply_ps2_file_export,
+    apply_ps2_psu_export, plan_ps2_file_export, plan_ps2_psu_export, plan_ps2_psu_restore,
 };
 use archivefs_core::patch_manager::{
     Pcsx2BiosVerification, Pcsx2GameInspection, Pcsx2GameRequest, Pcsx2InstallationType,
@@ -651,7 +656,7 @@ enum PsuRestoreDialogState {
         message: String,
     },
     Confirm(Box<Ps2PsuRestorePlan>),
-    Success(Ps2PsuRestoreResult),
+    Success(Box<Ps2GuardedRestore>),
     Undone,
     Refused(String),
 }
@@ -977,6 +982,80 @@ fn psu_restore_error_message(error: &Ps2PsuRestoreError) -> String {
         }
         Ps2PsuRestoreError::InvalidPlan(detail) => format!("Restore was refused: {detail}"),
         Ps2PsuRestoreError::Io(detail) => format!("Restore could not be completed: {detail}"),
+        Ps2PsuRestoreError::EmulatorRunning => {
+            "A PS2 emulator is running or has this memory card open. Close it completely, then try again. The card was not changed.".into()
+        }
+        Ps2PsuRestoreError::EmulatorStateUnknown => {
+            "EmuWiz could not confirm that no PS2 emulator is using this card, so it did not change it. Close PCSX2 completely and try again.".into()
+        }
+        Ps2PsuRestoreError::UnsupportedRepresentation(detail) => format!(
+            "This card image cannot be restored safely: {detail}. The card was not changed."
+        ),
+        Ps2PsuRestoreError::JournalCorrupt(detail) => {
+            format!("The restore record is damaged ({detail}); nothing was changed. Your backup, if one was made, is untouched.")
+        }
+        Ps2PsuRestoreError::RollbackFailed {
+            detail,
+            backup_path,
+            ..
+        } => format!(
+            "The restore failed AND putting the card back also failed ({detail}). Your verified backup is safe at {} - restore it manually before using this card.",
+            backup_path.display()
+        ),
+        Ps2PsuRestoreError::RecoveryRequired(detail) => {
+            format!("This needs attention before it can continue: {detail}")
+        }
+    }
+}
+
+/// Warns about interrupted restores found on disk and lets the user have them
+/// judged. Judging only reads the card and updates the restore record; it never
+/// writes the card.
+fn show_interrupted_restore_notice(ui: &mut egui::Ui) {
+    let Ok(dir) = default_ps2_restore_journal_dir() else {
+        return;
+    };
+    let pending: Vec<_> = discover_ps2_restore_journals(&dir)
+        .into_iter()
+        .filter(|summary| summary.needs_recovery || summary.needs_attention)
+        .collect();
+    let note_id = egui::Id::new("ps2_restore_interrupted_note");
+    if pending.is_empty() {
+        return;
+    }
+    ui.colored_label(
+        egui::Color32::from_rgb(200, 140, 0),
+        format!(
+            "{} earlier PS2 restore(s) did not finish cleanly. Check them before restoring again.",
+            pending.len()
+        ),
+    );
+    if pending.iter().any(|summary| summary.needs_recovery)
+        && widgets::action_button(
+            ui,
+            "Check interrupted restores",
+            widgets::ActionStyle::Secondary,
+            true,
+        )
+        .clicked()
+    {
+        let text = recover_all_interrupted_ps2_restores(&dir, unix_now())
+            .into_iter()
+            .map(|(_, outcome)| match outcome {
+                Ok(outcome) => format!("{outcome:?}"),
+                Err(error) => psu_restore_error_message(&error),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.data_mut(|data| data.insert_temp(note_id, text));
+    }
+    if let Some(text) = ui.data_mut(|data| data.get_temp::<String>(note_id)) {
+        ui.label(text);
+    }
+    if pending.iter().any(|summary| {
+        summary.phase.is_some_and(Ps2RestorePhase::needs_attention) || summary.error.is_some()
+    }) {
+        ui.label("At least one restore needs a person to look at it. Your verified backups are not deleted.");
     }
 }
 
@@ -991,7 +1070,14 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
         .id(id)
         .collapsible(false)
         .resizable(false)
-        .show(ui.ctx(), |ui| match &state {
+        .show(ui.ctx(), |ui| {
+            if matches!(
+                &state,
+                PsuRestoreDialogState::Conflict { .. } | PsuRestoreDialogState::Confirm(_)
+            ) {
+                show_interrupted_restore_notice(ui);
+            }
+            match &state {
             PsuRestoreDialogState::Conflict {
                 card,
                 source_psu,
@@ -1032,8 +1118,10 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 }
                 ui.horizontal(|ui| {
                     if widgets::action_button(ui, "Create backup and restore", widgets::ActionStyle::Primary, true).clicked() {
-                        match apply_ps2_psu_restore(plan) {
-                            Ok(result) => next_state = Some(PsuRestoreDialogState::Success(result)),
+                        match default_ps2_restore_guard_options().and_then(|options| {
+                            apply_ps2_psu_restore_guarded(plan, &ProcScanQuiescence::new(), &options)
+                        }) {
+                            Ok(done) => next_state = Some(PsuRestoreDialogState::Success(Box::new(done))),
                             Err(error) => next_state = Some(PsuRestoreDialogState::Refused(psu_restore_error_message(&error))),
                         }
                     }
@@ -1042,7 +1130,8 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                     }
                 });
             }
-            PsuRestoreDialogState::Success(result) => {
+            PsuRestoreDialogState::Success(done) => {
+                let result = &done.result;
                 ui.heading("Restore completed and verified");
                 ui.label(format!("Save: {}", result.save_display_name));
                 ui.label(format!("Backup created: {}", result.backup_path.display()));
@@ -1051,7 +1140,7 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 ui.label("The card was re-opened and the restored save was found.");
                 ui.horizontal(|ui| {
                     if widgets::action_button(ui, "Undo last restore", widgets::ActionStyle::Secondary, true).clicked() {
-                        match undo_ps2_psu_restore(result) {
+                        match undo_ps2_psu_restore_guarded(&done.journal_path, &ProcScanQuiescence::new(), unix_now()) {
                             Ok(()) => next_state = Some(PsuRestoreDialogState::Undone),
                             Err(error) => next_state = Some(PsuRestoreDialogState::Refused(psu_restore_error_message(&error))),
                         }
@@ -1075,6 +1164,7 @@ fn show_psu_restore_dialog(ui: &mut egui::Ui, advanced_mode: bool) {
                 if widgets::action_button(ui, "Close", widgets::ActionStyle::Secondary, true).clicked() {
                     close = true;
                 }
+            }
             }
         });
     if close {
@@ -1342,6 +1432,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn every_guarded_restore_refusal_has_an_actionable_message() {
+        let backup = PathBuf::from("/tmp/backup.card");
+        for error in [
+            Ps2PsuRestoreError::EmulatorRunning,
+            Ps2PsuRestoreError::EmulatorStateUnknown,
+            Ps2PsuRestoreError::UnsupportedRepresentation("spare".into()),
+            Ps2PsuRestoreError::JournalCorrupt("checksum".into()),
+            Ps2PsuRestoreError::RollbackFailed {
+                detail: "disk".into(),
+                backup_path: backup.clone(),
+                journal_path: None,
+            },
+            Ps2PsuRestoreError::RecoveryRequired("look".into()),
+        ] {
+            let message = psu_restore_error_message(&error);
+            assert!(message.len() > 30, "{error:?}");
+        }
+        let rollback = psu_restore_error_message(&Ps2PsuRestoreError::RollbackFailed {
+            detail: "disk".into(),
+            backup_path: backup.clone(),
+            journal_path: None,
+        });
+        assert!(rollback.contains("/tmp/backup.card") && rollback.contains("AND"));
+        let running = psu_restore_error_message(&Ps2PsuRestoreError::EmulatorRunning);
+        assert!(running.contains("not changed"));
+    }
 
     fn empty_inspection() -> Pcsx2GameInspection {
         Pcsx2GameInspection {
