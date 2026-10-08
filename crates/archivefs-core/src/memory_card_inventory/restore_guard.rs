@@ -27,6 +27,7 @@ use std::os::unix::fs::OpenOptionsExt;
 mod exchange;
 mod ownership;
 mod proc_scan;
+mod recovery_evidence;
 pub use proc_scan::{ProcScanQuiescence, ProcScanReport};
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -255,17 +256,20 @@ pub fn discover_ps2_restore_journals(journal_dir: &Path) -> Vec<Ps2RestoreJourna
     paths
         .into_iter()
         .map(|path| match load_ps2_restore_journal(&path) {
-            Ok(journal) => Ps2RestoreJournalSummary {
-                operation_id: Some(journal.operation_id.clone()),
-                phase: Some(journal.phase),
-                card_path: Some(journal.card_path.clone()),
-                error: None,
-                needs_recovery: journal.phase.needs_recovery(),
-                needs_attention: journal.phase.needs_attention(),
-                undo_available: journal.phase == Ps2RestorePhase::Published,
-                detail: journal.detail.clone(),
-                path,
-            },
+            Ok(journal) => {
+                let evidence_problem = recovery_evidence::problem(&journal);
+                Ps2RestoreJournalSummary {
+                    operation_id: Some(journal.operation_id.clone()),
+                    phase: Some(journal.phase),
+                    card_path: Some(journal.card_path.clone()),
+                    error: None,
+                    needs_recovery: journal.phase.needs_recovery(),
+                    needs_attention: journal.phase.needs_attention() || evidence_problem.is_some(),
+                    undo_available: journal.phase == Ps2RestorePhase::Published,
+                    detail: evidence_problem.or_else(|| journal.detail.clone()),
+                    path,
+                }
+            }
             Err(error) => Ps2RestoreJournalSummary {
                 path,
                 operation_id: None,
@@ -794,8 +798,9 @@ fn unwind(
             .journal
             .staged_path
             .as_ref()
-            .is_some_and(|path| path.exists())
-            || (run.journal.backup_path.exists() && run.journal.backup_sha256.is_none());
+            .is_some_and(|path| !recovery_evidence::confirmed_absent(path))
+            || (!recovery_evidence::confirmed_absent(&run.journal.backup_path)
+                && run.journal.backup_sha256.is_none());
         let phase = if incomplete {
             Ps2RestorePhase::NeedsAttention
         } else {
@@ -1010,7 +1015,7 @@ pub(crate) fn undo_with_hook(
             if !undo_published {
                 set(
                     &mut journal,
-                    if undo_temp.exists() {
+                    if !recovery_evidence::confirmed_absent(&undo_temp) {
                         Ps2RestorePhase::NeedsAttention
                     } else {
                         Ps2RestorePhase::Published
@@ -1120,9 +1125,18 @@ pub fn recover_ps2_psu_restore(
         });
     }
 
-    let live_sha = read_source_card(&journal.card_path)
-        .ok()
-        .map(|bytes| sha256_hex(&bytes));
+    if let Some(detail) = recovery_evidence::problem(&journal) {
+        // Keep the exact in-flight receipt for restart visibility and safe retry.
+        return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
+    }
+    let live_sha = match read_source_card(&journal.card_path) {
+        Ok(bytes) => Some(sha256_hex(&bytes)),
+        Err(error) => {
+            return Ok(Ps2RecoveryOutcome::NeedsAttention(format!(
+                "Live card evidence unavailable: {error}; receipt retained for retry"
+            )));
+        }
+    };
     let remove_staged = remove_owned_temp;
     let finish =
         |journal: &mut Ps2RestoreJournal, phase, detail: &str| -> Result<(), Ps2PsuRestoreError> {
@@ -1131,38 +1145,6 @@ pub fn recover_ps2_psu_restore(
             journal.history.push((phase, unix_seconds));
             persist_journal(journal_path, journal)
         };
-    // A crash during creation must leave discoverable, explicit partial artifacts.
-    for (path, expected, kind) in [
-        (
-            Some(journal.backup_path.clone()),
-            Some(journal.original_sha256.clone()),
-            "backup",
-        ),
-        (
-            journal.staged_path.clone(),
-            journal.staged_sha256.clone(),
-            "staged image",
-        ),
-    ] {
-        if let Some(path) = path
-            && path.exists()
-        {
-            let valid = path_identity(&path).is_ok()
-                && fs::read(&path).is_ok_and(|bytes| {
-                    let sha = sha256_hex(&bytes);
-                    Some(sha.as_str()) == expected.as_deref()
-                        || (kind == "staged image" && sha == journal.original_sha256)
-                });
-            if !valid {
-                let detail = format!(
-                    "Incomplete or changed {kind} retained at {}. Preserve it and the card for independent inspection.",
-                    path.display()
-                );
-                finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
-                return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
-            }
-        }
-    }
     let live = live_sha.as_deref();
     let original = Some(journal.original_sha256.as_str());
     let post = journal.post_sha256.as_deref();
@@ -1173,13 +1155,12 @@ pub fn recover_ps2_psu_restore(
             {
                 remove_staged(&journal);
                 if let Some(path) = &journal.staged_path
-                    && path.exists()
+                    && !recovery_evidence::confirmed_absent(path)
                 {
                     let detail = format!(
                         "Staged artifact identity or cleanup could not be verified. File retained at {}. The live card was not written by recovery.",
                         path.display()
                     );
-                    finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
                     return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
                 }
                 finish(
@@ -1200,13 +1181,12 @@ pub fn recover_ps2_psu_restore(
             {
                 remove_staged(&journal);
                 if let Some(path) = &journal.staged_path
-                    && path.exists()
+                    && !recovery_evidence::confirmed_absent(path)
                 {
                     let detail = format!(
                         "Staged artifact identity or cleanup could not be verified. File retained at {}. The live card was not written by recovery.",
                         path.display()
                     );
-                    finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
                     return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
                 }
                 finish(
@@ -1217,7 +1197,8 @@ pub fn recover_ps2_psu_restore(
                 Ok(Ps2RecoveryOutcome::NotPublished)
             } else if live.is_some() && live == post {
                 if journal.staged_path.as_ref().is_some_and(|path| {
-                    path.exists() && path_identity(path).ok() != Some(journal.original_identity)
+                    !recovery_evidence::confirmed_absent(path)
+                        && path_identity(path).ok() != Some(journal.original_identity)
                 }) || journal.post_identity != path_identity(&journal.card_path).ok()
                     || fs::read(&journal.backup_path)
                         .ok()
@@ -1237,6 +1218,11 @@ pub fn recover_ps2_psu_restore(
                 journal.post_identity = Some(path_identity(&journal.card_path)?);
                 // After an exchange the staged path holds the displaced original.
                 remove_staged(&journal);
+                if let Some(path) = &journal.staged_path
+                    && !recovery_evidence::confirmed_absent(path)
+                {
+                    return Ok(Ps2RecoveryOutcome::NeedsAttention("Displaced artifact cleanup could not be verified; receipt retained for retry".into()));
+                }
                 finish(
                     &mut journal,
                     Ps2RestorePhase::Published,
@@ -1252,27 +1238,22 @@ pub fn recover_ps2_psu_restore(
             }
         }
         Ps2RestorePhase::UndoIntent => {
-            if let Some(parent) = journal.card_path.parent() {
-                let temp = undo_temp_path(parent, &journal.operation_id);
-                if temp.exists()
-                    && fs::read(&temp).is_ok_and(|bytes| {
-                        let sha = sha256_hex(&bytes);
-                        sha != journal.original_sha256 && Some(sha.as_str()) != post
-                    })
-                {
-                    let detail = format!(
-                        "Incomplete undo image retained at {}. Manual inspection required.",
-                        temp.display()
-                    );
-                    finish(&mut journal, Ps2RestorePhase::NeedsAttention, &detail)?;
-                    return Ok(Ps2RecoveryOutcome::NeedsAttention(detail));
-                }
-            }
             if live.is_some()
                 && live == post
                 && path_identity(&journal.card_path).ok() == journal.post_identity
             {
                 clean_undo_temp(&journal);
+                if let Some(parent) = journal.card_path.parent()
+                    && !recovery_evidence::confirmed_absent(&undo_temp_path(
+                        parent,
+                        &journal.operation_id,
+                    ))
+                {
+                    return Ok(Ps2RecoveryOutcome::NeedsAttention(
+                        "Undo artifact cleanup could not be verified; receipt retained for retry"
+                            .into(),
+                    ));
+                }
                 finish(
                     &mut journal,
                     Ps2RestorePhase::Published,
@@ -1283,6 +1264,17 @@ pub fn recover_ps2_psu_restore(
                 && path_identity(&journal.card_path).ok() == journal.undo_identity
             {
                 clean_undo_temp(&journal);
+                if let Some(parent) = journal.card_path.parent()
+                    && !recovery_evidence::confirmed_absent(&undo_temp_path(
+                        parent,
+                        &journal.operation_id,
+                    ))
+                {
+                    return Ok(Ps2RecoveryOutcome::NeedsAttention(
+                        "Undo artifact cleanup could not be verified; receipt retained for retry"
+                            .into(),
+                    ));
+                }
                 finish(&mut journal, Ps2RestorePhase::Undone, "undo had completed")?;
                 Ok(Ps2RecoveryOutcome::UndoCompleted)
             } else {

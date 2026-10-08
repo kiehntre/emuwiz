@@ -564,3 +564,274 @@ fn cleanup_never_unlinks_card_even_when_its_name_matches_stage_prefix() {
     ));
     assert_eq!(fs::read(&undo_named).unwrap(), before);
 }
+
+#[test]
+fn recovery_untrusted_stage_preserves_receipt_and_remains_visible() {
+    use std::os::unix::fs::symlink;
+    let world = World::new();
+    world
+        .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+        .unwrap_err();
+    let path = world.journal_files().remove(0);
+    let journal = load_ps2_restore_journal(&path).unwrap();
+    let stage = journal.staged_path.unwrap();
+    let staged_bytes = fs::read(&stage).unwrap();
+    let receipt = fs::read(&path).unwrap();
+    fs::rename(&stage, world.dir.path().join("retained-original-stage")).unwrap();
+    symlink(&stage, &stage).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            recover_ps2_psu_restore(&path, 3).unwrap(),
+            Ps2RecoveryOutcome::NeedsAttention(_)
+        ));
+        assert_eq!(fs::read(&path).unwrap(), receipt);
+        assert_eq!(world.card_bytes(), world.original);
+        assert!(fs::symlink_metadata(&stage).unwrap().is_symlink());
+        let rows = discover_ps2_restore_journals(&world.journals);
+        assert!(rows[0].needs_attention && rows[0].needs_recovery);
+        assert!(!rows[0].undo_available);
+    }
+    fs::remove_file(&stage).unwrap();
+    fs::write(&stage, staged_bytes).unwrap();
+    // Replacement inode is untrusted even when the content matches.
+    assert!(matches!(
+        recover_ps2_psu_restore(&path, 4).unwrap(),
+        Ps2RecoveryOutcome::NeedsAttention(_)
+    ));
+}
+
+#[test]
+fn recovery_confirmed_missing_stage_can_abandon() {
+    let world = World::new();
+    world
+        .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+        .unwrap_err();
+    let path = world.journal_files().remove(0);
+    fs::remove_file(world.only_journal().staged_path.unwrap()).unwrap();
+    assert_eq!(
+        recover_ps2_psu_restore(&path, 3).unwrap(),
+        Ps2RecoveryOutcome::AbandonedBeforePublication
+    );
+    assert_eq!(world.card_bytes(), world.original);
+}
+
+#[test]
+fn recovery_unavailable_evidence_is_retryable_and_byte_preserving() {
+    for errno in [libc::EACCES, libc::ELOOP, libc::EIO] {
+        let world = World::new();
+        world
+            .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+            .unwrap_err();
+        let path = world.journal_files().remove(0);
+        let stage = world.only_journal().staged_path.unwrap();
+        let receipt = fs::read(&path).unwrap();
+        let bytes = fs::read(&stage).unwrap();
+        recovery_evidence::INSPECTION_ERROR
+            .with(|fault| *fault.borrow_mut() = Some((stage.clone(), errno)));
+        for _ in 0..2 {
+            let result = recover_ps2_psu_restore(&path, 3).unwrap();
+            assert!(
+                matches!(result, Ps2RecoveryOutcome::NeedsAttention(_)),
+                "{result:?}"
+            );
+            let rows = discover_ps2_restore_journals(&world.journals);
+            assert!(rows[0].needs_attention && rows[0].needs_recovery);
+            assert!(!rows[0].undo_available);
+            assert_eq!(fs::read(&path).unwrap(), receipt);
+            assert_eq!(fs::read(&stage).unwrap(), bytes);
+            assert_eq!(world.card_bytes(), world.original);
+        }
+        recovery_evidence::INSPECTION_ERROR.with(|fault| *fault.borrow_mut() = None);
+        assert_eq!(
+            recover_ps2_psu_restore(&path, 4).unwrap(),
+            Ps2RecoveryOutcome::AbandonedBeforePublication
+        );
+        assert!(recovery_evidence::confirmed_absent(&stage));
+        assert_eq!(world.card_bytes(), world.original);
+    }
+}
+
+#[test]
+fn recovery_actual_parent_eloop_is_not_absence() {
+    use std::os::unix::fs::symlink;
+    let world = World::new();
+    world
+        .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+        .unwrap_err();
+    let path = world.journal_files().remove(0);
+    let mut journal = world.only_journal();
+    let loop_parent = world.dir.path().join("loop-parent");
+    symlink(&loop_parent, &loop_parent).unwrap();
+    journal.staged_path = Some(loop_parent.join("stage.tmp"));
+    persist_journal(&path, &journal).unwrap();
+    let receipt = fs::read(&path).unwrap();
+    assert_eq!(
+        fs::symlink_metadata(journal.staged_path.as_ref().unwrap())
+            .unwrap_err()
+            .raw_os_error(),
+        Some(libc::ELOOP)
+    );
+    assert!(matches!(
+        recover_ps2_psu_restore(&path, 3).unwrap(),
+        Ps2RecoveryOutcome::NeedsAttention(_)
+    ));
+    assert_eq!(fs::read(path).unwrap(), receipt);
+    assert_eq!(world.card_bytes(), world.original);
+}
+
+#[test]
+fn recovery_does_not_follow_valid_symlink_to_trusted_contents() {
+    use std::os::unix::fs::symlink;
+    let world = World::new();
+    world
+        .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+        .unwrap_err();
+    let path = world.journal_files().remove(0);
+    let stage = world.only_journal().staged_path.unwrap();
+    let saved = world.dir.path().join("saved-stage");
+    fs::rename(&stage, &saved).unwrap();
+    symlink(&saved, &stage).unwrap();
+    let receipt = fs::read(&path).unwrap();
+    assert!(matches!(
+        recover_ps2_psu_restore(&path, 3).unwrap(),
+        Ps2RecoveryOutcome::NeedsAttention(_)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), receipt);
+    fs::remove_file(&stage).unwrap();
+    fs::rename(&saved, &stage).unwrap();
+    assert_eq!(
+        recover_ps2_psu_restore(&path, 4).unwrap(),
+        Ps2RecoveryOutcome::AbandonedBeforePublication
+    );
+    assert_eq!(world.card_bytes(), world.original);
+}
+
+#[test]
+fn recovery_real_eacces_preserves_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+    // The deterministic errno test above also covers privileged test runners.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let world = World::new();
+    world
+        .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+        .unwrap_err();
+    let path = world.journal_files().remove(0);
+    let stage = world.only_journal().staged_path.unwrap();
+    let receipt = fs::read(&path).unwrap();
+    let permissions = fs::metadata(&stage).unwrap().permissions();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0)).unwrap();
+    assert_eq!(
+        fs::File::open(&stage).unwrap_err().raw_os_error(),
+        Some(libc::EACCES)
+    );
+    assert!(matches!(
+        recover_ps2_psu_restore(&path, 3).unwrap(),
+        Ps2RecoveryOutcome::NeedsAttention(_)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), receipt);
+    assert!(discover_ps2_restore_journals(&world.journals)[0].needs_attention);
+    fs::set_permissions(&stage, permissions).unwrap();
+    assert_eq!(
+        recover_ps2_psu_restore(&path, 4).unwrap(),
+        Ps2RecoveryOutcome::AbandonedBeforePublication
+    );
+}
+
+#[test]
+fn recovery_unavailable_card_preserves_receipt_and_allows_retry() {
+    let world = World::new();
+    world
+        .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+        .unwrap_err();
+    let path = world.journal_files().remove(0);
+    let receipt = fs::read(&path).unwrap();
+    recovery_evidence::INSPECTION_ERROR
+        .with(|fault| *fault.borrow_mut() = Some((world.card.clone(), libc::EACCES)));
+    assert!(matches!(
+        recover_ps2_psu_restore(&path, 3).unwrap(),
+        Ps2RecoveryOutcome::NeedsAttention(_)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), receipt);
+    assert!(discover_ps2_restore_journals(&world.journals)[0].needs_attention);
+    recovery_evidence::INSPECTION_ERROR.with(|fault| *fault.borrow_mut() = None);
+    assert_eq!(
+        recover_ps2_psu_restore(&path, 4).unwrap(),
+        Ps2RecoveryOutcome::AbandonedBeforePublication
+    );
+    assert_eq!(world.card_bytes(), world.original);
+}
+
+#[test]
+fn recovery_missing_parent_is_insufficient_absence_evidence() {
+    let world = World::new();
+    world
+        .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterStaged))
+        .unwrap_err();
+    let path = world.journal_files().remove(0);
+    let mut journal = world.only_journal();
+    journal.staged_path = Some(world.dir.path().join("unavailable-parent/stage.tmp"));
+    persist_journal(&path, &journal).unwrap();
+    let receipt = fs::read(&path).unwrap();
+    assert!(matches!(
+        recover_ps2_psu_restore(&path, 3).unwrap(),
+        Ps2RecoveryOutcome::NeedsAttention(_)
+    ));
+    assert_eq!(fs::read(path).unwrap(), receipt);
+    assert_eq!(world.card_bytes(), world.original);
+}
+
+#[test]
+fn recovery_publishing_and_undo_refuse_untrusted_artifacts() {
+    use std::os::unix::fs::symlink;
+    for undo in [false, true] {
+        let world = World::new();
+        let path;
+        let artifact;
+        if undo {
+            let applied = world.apply().unwrap();
+            undo_with_hook(&applied.journal_path, &CLOSED, 2, &|step| {
+                crash(step, Ps2RestoreStep::BeforeUndoRename)
+            })
+            .unwrap_err();
+            path = applied.journal_path;
+            artifact = undo_temp_path(
+                world.card.parent().unwrap(),
+                &world.only_journal().operation_id,
+            );
+        } else {
+            world
+                .apply_hooked(&CLOSED, &|step| crash(step, Ps2RestoreStep::AfterRename))
+                .unwrap_err();
+            path = world.journal_files().remove(0);
+            artifact = world.only_journal().staged_path.unwrap();
+        }
+        let card = world.card_bytes();
+        let receipt = fs::read(&path).unwrap();
+        let saved = world.dir.path().join("retained-artifact");
+        fs::rename(&artifact, &saved).unwrap();
+        symlink(&artifact, &artifact).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                recover_ps2_psu_restore(&path, 3).unwrap(),
+                Ps2RecoveryOutcome::NeedsAttention(_)
+            ));
+            assert_eq!(world.card_bytes(), card);
+            assert_eq!(fs::read(&path).unwrap(), receipt);
+            let rows = discover_ps2_restore_journals(&world.journals);
+            assert!(rows[0].needs_attention && rows[0].needs_recovery && !rows[0].undo_available);
+        }
+        fs::remove_file(&artifact).unwrap();
+        fs::rename(saved, artifact).unwrap();
+        assert_eq!(
+            recover_ps2_psu_restore(&path, 4).unwrap(),
+            if undo {
+                Ps2RecoveryOutcome::UndoNotApplied
+            } else {
+                Ps2RecoveryOutcome::ConfirmedPublished
+            }
+        );
+        assert_eq!(world.card_bytes(), card);
+    }
+}

@@ -321,6 +321,105 @@ mod restart_tests {
     }
 
     #[test]
+    fn restarted_unavailable_stage_is_visible_without_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        let card = dir.path().join("synthetic-card.ps2");
+        let backup = dir.path().join("synthetic-backup.ps2");
+        std::fs::write(&card, b"synthetic unchanged card").unwrap();
+        std::fs::write(&backup, b"synthetic unchanged card").unwrap();
+        let mut journal = Ps2RestoreJournal {
+            version: 1,
+            operation_id: "synthetic".into(),
+            phase: Ps2RestorePhase::Staged,
+            binding: ps2_card_binding(&card, "synthetic save"),
+            card_path: card.clone(),
+            psu_path: dir.path().join("synthetic.psu"),
+            psu_sha256: "synthetic".into(),
+            backup_path: backup.clone(),
+            backup_sha256: Some("synthetic".into()),
+            original_sha256: "synthetic".into(),
+            original_size: 0,
+            original_identity: FileIdentity {
+                device: 0,
+                inode: 0,
+                size: 0,
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+            },
+            staged_path: None,
+            staged_sha256: None,
+            post_sha256: Some("synthetic".into()),
+            post_identity: None,
+            undo_identity: None,
+            save_display_name: "synthetic save".into(),
+            file_count: 1,
+            detail: None,
+            history: vec![(Ps2RestorePhase::Staged, 1)],
+        };
+        let stage = dir.path().join(".emuwiz-ps2-stage-synthetic.tmp");
+        std::os::unix::fs::symlink(&stage, &stage).unwrap();
+        journal.staged_path = Some(stage.clone());
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&card).unwrap();
+        journal.original_size = metadata.len();
+        journal.original_identity = FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            mtime_seconds: metadata.mtime(),
+            mtime_nanoseconds: metadata.mtime_nsec(),
+        };
+        journal.original_sha256 = Sha256::digest(std::fs::read(&backup).unwrap())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let path = dir.path().join("ps2-psu-restore-synthetic.json");
+        let body = serde_json::to_vec(&journal).unwrap();
+        let mut bytes = format!(
+            "EMUWIZ-PS2-RESTORE-JOURNAL v1 sha256={}\n",
+            Sha256::digest(&body)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+        .into_bytes();
+        bytes.extend(body);
+        std::fs::write(&path, bytes).unwrap();
+        let receipt = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            archivefs_core::memory_card_inventory::restore_guard::recover_ps2_psu_restore(&path, 2)
+                .unwrap(),
+            Ps2RecoveryOutcome::NeedsAttention(_)
+        ));
+        for _ in 0..2 {
+            let ctx = egui::Context::default();
+            let output = render(&ctx, egui::RawInput::default(), dir.path());
+            let history = ctx
+                .data_mut(|data| data.get_temp::<History>(history_id()))
+                .unwrap();
+            assert!(history.rows[0].needs_attention && history.rows[0].needs_recovery);
+            assert!(!history.rows[0].undo_available);
+            let texts: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(!texts.contains(&"Review Undo"));
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains("Unsupported recovery artifact"))
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), receipt);
+            assert_eq!(std::fs::read(&card).unwrap(), b"synthetic unchanged card");
+            assert!(std::fs::symlink_metadata(&stage).unwrap().is_symlink());
+        }
+    }
+
+    #[test]
     fn viewing_missing_history_does_not_create_directory() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing-history");
