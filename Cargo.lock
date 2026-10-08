@@ -152,6 +152,7 @@ name = "archivefs-core"
 version = "0.9.0"
 dependencies = [
  "affs-read",
+ "archivefs-core",
  "chd",
  "encoding_rs",
  "flate2",

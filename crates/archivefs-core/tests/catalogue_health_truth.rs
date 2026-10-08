@@ -1,3 +1,5 @@
+archivefs_core::install_test_environment!();
+
 use archivefs_core::catalogue_health::{
     CatalogueHealth, MoveEvidence, ScanCoverageState, SourceRootBinding, preview_catalogue_health,
 };

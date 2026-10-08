@@ -6,6 +6,8 @@
 //! These tests exercise real files in a temporary directory. They assert on
 //! what is on disk and what the journal records, never on source strings.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

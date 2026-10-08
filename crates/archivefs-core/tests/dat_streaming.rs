@@ -1,4 +1,6 @@
 //! Synthetic fixtures only; the large stress case is opt-in.
+archivefs_core::install_test_environment!();
+
 use std::io::Write;
 use std::path::Path;
 

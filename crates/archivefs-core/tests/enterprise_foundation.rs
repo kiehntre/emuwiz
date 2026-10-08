@@ -1,3 +1,5 @@
+archivefs_core::install_test_environment!();
+
 use archivefs_core::game_identity::IdentityPlatform;
 use archivefs_core::platform::{
     platform_by_id, platform_for_alias, platforms_with_strong_extension,

@@ -2,6 +2,8 @@
 //! It scans normalized source text, so comments/literals can false-positive and
 //! dynamically assembled SQL can evade it; canonical database paths provide safety.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::{Path, PathBuf};
 

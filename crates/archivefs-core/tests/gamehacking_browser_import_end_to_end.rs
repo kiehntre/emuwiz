@@ -11,6 +11,8 @@
 //! marker is fresh, so the only thing it can possibly serve is the
 //! imported cache - which is exactly the claim under test.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,3 +1,6 @@
+#[cfg(test)]
+archivefs_core::install_test_environment!();
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -10446,4 +10449,20 @@ struct DiskFormatAuditAccumulator {
     refused: usize,
     refusal_counts: std::collections::BTreeMap<String, usize>,
     bytes_inspected: u64,
+}
+
+#[cfg(test)]
+mod test_environment_isolation {
+    #[test]
+    fn cli_unit_tests_run_in_the_private_test_environment() {
+        let Some(root) = archivefs_core::test_environment::isolated_root() else {
+            assert_eq!(
+                std::env::var("EMUWIZ_TEST_REAL_ENVIRONMENT").as_deref(),
+                Ok("1")
+            );
+            return;
+        };
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(home.starts_with(root), "{home:?} escapes {root:?}");
+    }
 }

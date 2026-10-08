@@ -7145,9 +7145,33 @@ fn drain(
     }
 }
 
+/// Writes a minimal valid `config.toml` into the private test home. These
+/// tests start the real backend worker, which loads the user's configuration;
+/// they used to pass only on a machine that already had one. Refuses to write
+/// anywhere but the isolated home.
+fn seed_private_config() {
+    let home = archivefs_core::test_environment::private_home_for_fixtures();
+    let path = archivefs_core::default_config_path().unwrap();
+    assert!(path.starts_with(&home), "{path:?} is outside {home:?}");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Identical content from every caller, replaced atomically so a concurrent
+    // reader never sees a partial file.
+    let staging = path.with_extension(format!("toml.{:?}.tmp", std::thread::current().id()));
+    std::fs::write(
+        &staging,
+        format!(
+            "source_folders = []\nmount_root = \"{}\"\nratarmount_bin = \"ratarmount\"\n",
+            home.join("mnt").display()
+        ),
+    )
+    .unwrap();
+    std::fs::rename(&staging, &path).unwrap();
+}
+
 #[test]
 fn gui_v2_duplicate_scan_on_the_real_worker_emits_phase_progress() {
     let context = egui::Context::default();
+    seed_private_config();
     let backend = super::backend::Backend::start(context);
     let directory = tempfile::tempdir().unwrap();
     let games = dup_games(directory.path(), 5);
@@ -7177,6 +7201,7 @@ fn gui_v2_duplicate_scan_on_the_real_worker_emits_phase_progress() {
 #[test]
 fn gui_v2_cancelled_duplicate_scan_and_preview_stop_with_the_cancel_marker_and_change_nothing() {
     let context = egui::Context::default();
+    seed_private_config();
     let backend = super::backend::Backend::start(context);
     let directory = tempfile::tempdir().unwrap();
     let games = dup_games(directory.path(), 4);

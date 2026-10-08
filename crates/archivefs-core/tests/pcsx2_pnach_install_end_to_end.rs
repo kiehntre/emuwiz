@@ -1,3 +1,5 @@
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};

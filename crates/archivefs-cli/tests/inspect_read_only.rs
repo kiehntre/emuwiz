@@ -2,6 +2,8 @@
 //! real binary against a throwaway HOME so a stray config, database or cache
 //! write would be visible.
 
+archivefs_core::install_test_environment!();
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;

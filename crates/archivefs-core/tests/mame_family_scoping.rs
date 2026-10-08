@@ -2,6 +2,8 @@
 //! republish of unchanged member evidence must write nothing while any real
 //! difference is still written.
 
+archivefs_core::install_test_environment!();
+
 use std::path::{Path, PathBuf};
 
 use archivefs_core::Database;

@@ -16,6 +16,8 @@
 // broad layout rewrite; the dedicated GUI migration can remove this once
 // its changed panel semantics are reviewed independently.
 #![allow(deprecated)]
+#[cfg(test)]
+archivefs_core::install_test_environment!();
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;

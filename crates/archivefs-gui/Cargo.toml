@@ -92,4 +92,5 @@ tempfile = "3"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+archivefs-core = { path = "../archivefs-core", features = ["test-support"] }
 rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }

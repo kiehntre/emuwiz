@@ -1,3 +1,5 @@
+archivefs_core::install_test_environment!();
+
 use archivefs_core::content_detector::stream_probe::probe_content_stream;
 use archivefs_core::content_detector::{ContentDetectionOutcome, ContentDetector};
 use archivefs_core::content_evidence::{

@@ -282,20 +282,22 @@ mod tests {
 
     #[test]
     fn release_packaging_has_no_database_input_or_database_member() {
-        let script = include_str!("../../../scripts/build-release.sh");
-        assert!(!script.contains("cheatbase.sqlite"));
-        assert!(!script.contains("bsfree.db"));
-        assert!(!script.contains("cheat-sources"));
+        // The release is assembled by `package_release.py` (driven by
+        // `build-release.sh`); the shipped members are named there.
+        let build = include_str!("../../../scripts/build-release.sh");
+        let packager = include_str!("../../../scripts/release/package_release.py");
+        for script in [build, packager] {
+            assert!(!script.contains("cheatbase.sqlite"));
+            assert!(!script.contains("bsfree.db"));
+            assert!(!script.contains("cheat-sources"));
+        }
         for member in [
-            "archivefs-cli",
-            "archivefs-gui",
+            "bin/emuwiz",
+            "bin/emuwiz-cli",
             "install.sh",
-            "README.md",
-            "CHANGELOG.md",
-            "LICENSE",
             "config.toml.example",
         ] {
-            assert!(script.contains(member), "missing release member {member}");
+            assert!(packager.contains(member), "missing release member {member}");
         }
     }
 }

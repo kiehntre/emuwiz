@@ -3,6 +3,8 @@
 //! apply -> undo pipeline via `local_cheat_install`'s bridge, with no new
 //! safety behavior introduced along the way.
 
+archivefs_core::install_test_environment!();
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
