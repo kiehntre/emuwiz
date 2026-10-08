@@ -143,13 +143,66 @@ On the committed tree, through `scripts/cargo-iso`:
 * `cargo test --workspace --no-fail-fast -- --test-threads=4`: 15944 passed,
   0 failed, 57 ignored (the ignored tests were already `#[ignore]`d; none was
   added by this change). No tripwire warning.
-* The three library test binaries (CLI 345, core 11624, GUI 3624 tests) were also
-  run under `strace -f`, logging every open-for-write, create, mkdir, rename,
-  unlink, symlink or truncate whose path is inside the real `~/.config`,
-  `~/.local`, `~/.var` or `~/.cache` (excluding the build directory): **zero**
-  events. The same filter was shown to fire on a control open.
-* Reads of the real home were not enumerated by that run; with `$HOME` replaced
-  they cannot reach it except through hard-coded absolute paths.
+* All 35 test executables (3 library binaries and 32 integration binaries, CLI
+  345 / core 11625 / GUI 3624 library tests; every one passing) were run under
+  `strace -f`, logging every open-for-write/create, `mkdir`, rename, unlink,
+  symlink, link, truncate or rmdir whose path is **anywhere under `/home/davedap`**,
+  excluding only this worktree's own build directory. Result: zero
+  open-for-write events; the only `mkdir` calls were the `create_dir_all`
+  walk over the three existing ancestors of that build directory (`EEXIST`,
+  nothing created); the remaining matches were read-only opens of repository
+  files whose names contain `rename`/`link`. An earlier run limited to
+  `~/.config`, `~/.local`, `~/.var` and `~/.cache` (excluding the whole shared
+  `emuwiz-cargo-targets` directory) also found nothing; the broader run
+  replaced it because that exclusion was too wide. A control open of a real
+  file `O_RDWR` showed the filter fires.
+* Not covered by that evidence: writes outside `/home/davedap` (for example
+  `/tmp` or a mounted ROM share), reads of the real home, writes by processes
+  that tests spawn without `strace -f` following them (it did follow children),
+  and doc-tests (the workspace has none today; a future doc-test would run in a
+  process without the constructor).
+* Release-packager tests: `scripts/release/test_package_release.py` 22/22
+  (including the new `test_22_...` which refuses every `DENIED_PAYLOAD_NAMES`
+  entry as a file or directory). `test_release_packager_sbom.py` has one
+  **pre-existing, unrelated** failure: `test_01_valid_verified_sbom_…` asserts
+  `package_count == 493` but the workspace lock file has 517 packages (identical
+  on `origin/main`); it is stale test data, not caused by this change, and was
+  left alone.
+* A release build (`--locked`) of `emuwiz` and `emuwiz-cli` contains no
+  `test_environment` symbol and none of the module's strings; `cargo tree`
+  shows `test-support` only on the dev-dependency edge.
 
 To re-check after changing test infrastructure, repeat the strace run against the
 test executables (`scripts/cargo-iso test --workspace --no-run` prints them).
+
+## Historical incident: the real approvals file
+
+`~/.local/share/archivefs/rom_organisation_approvals.json` is the user's real
+ROM-organisation approval sidecar. What was observed, and what was not:
+
+* **2026-10-07 22:51:22 (local)**: the file was found containing exactly
+  `{"version":1,"approved":["/roms/game.iso"]}` (43 bytes). That is byte-for-byte
+  the payload the old `persist_clears_the_warning_on_success` test wrote through
+  the production data path (it approved `/roms/game.iso` on a default state and
+  persisted it). So the *content* is explained: some run of a test binary built
+  before the fix of commit `a1b5e2a9` wrote it.
+* **Which process wrote it is not established.** Several test runs from different
+  worktrees and sessions were using the real home at that time, including runs by
+  the session that found the file. No evidence (process accounting, file
+  history) was captured that distinguishes them, so no run is blamed here.
+* **2026-10-08 00:44:56 (local)**: the file's content was observed as
+  `{"version":1,"approved":[]}` (27 bytes), i.e. the synthetic entry was gone.
+  The real GUI persisting an empty approval set, or another un-isolated test
+  clearing approvals, would both produce this; the writer was not identified and
+  is not attributed. The same window also showed changes to `gui-v2.json`,
+  `gui_mode.txt` and `onboarding_state.txt`, which the real application or
+  un-isolated test runs may have written.
+* The file was **not** modified, restored or deleted by this work. It was read
+  and `stat`ed (read-only) during diagnosis on 2026-10-07/08, before the final
+  review; no later check opens it. Whether its current content reflects what
+  the user wants is the user's decision; nothing here restores it
+  automatically.
+
+The isolation work makes a repeat impossible from test binaries that install it:
+no `strace`d test process opened anything under the real home for writing (see
+"Validation record").

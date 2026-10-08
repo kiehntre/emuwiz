@@ -66,6 +66,11 @@ struct Isolation {
 
 static ISOLATION: OnceLock<Option<Isolation>> = OnceLock::new();
 
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+}
+
 fn stat(path: &Path) -> Option<(u64, std::time::SystemTime)> {
     let meta = std::fs::symlink_metadata(path).ok()?;
     Some((meta.len(), meta.modified().ok()?))
@@ -111,7 +116,19 @@ pub fn isolate_process_environment() {
             })
             .unwrap_or_else(|| std::env::temp_dir().join("emuwiz-test-env"));
         let root = base.join(format!("{exe}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // The shared parent must be a real directory we can create, never a
+        // symlink someone planted; the per-process root is then created
+        // *exclusively* (after clearing a stale tree left by an earlier process
+        // that happened to have this pid), so we never adopt a pre-existing path.
+        std::fs::create_dir_all(&base).expect("create the test environment parent");
+        assert!(is_real_directory(&base), "{base:?} must not be a symlink");
+        if std::fs::symlink_metadata(&root).is_ok() {
+            // `remove_dir_all` does not follow symlinks, so a planted link is
+            // removed itself, not its target.
+            std::fs::remove_dir_all(&root).expect("clear a stale test environment");
+        }
+        std::fs::create_dir(&root).expect("create the test environment root exclusively");
+        assert!(is_real_directory(&root), "{root:?} must not be a symlink");
         let home = root.join("home");
         let dirs = [
             ("HOME", home.clone()),
@@ -159,12 +176,15 @@ extern "C" fn finish_isolation() {
             );
         }
     }
-    // Only ever remove the tree this process created.
-    if isolation
-        .root
-        .parent()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "emuwiz-test-env")
+    // Only ever remove the tree this process created: a real directory (never a
+    // symlink) directly under `emuwiz-test-env`. `remove_dir_all` does not follow
+    // symlinks inside it either.
+    if is_real_directory(&isolation.root)
+        && isolation
+            .root
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "emuwiz-test-env")
     {
         let _ = std::fs::remove_dir_all(&isolation.root);
     }
@@ -360,5 +380,26 @@ mod tests {
             .map(|home| stat(&home.join(".local/share/archivefs/rom_organisation_approvals.json")));
         assert_eq!(before, after);
         std::fs::remove_file(&sidecar).unwrap();
+    }
+
+    #[test]
+    fn a_symlink_is_never_treated_as_an_owned_directory() {
+        let root = isolated_root()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        let victim = root.join("symlink-victim-dir");
+        let link = root.join("symlink-probe");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), "x").unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(is_real_directory(&victim));
+        assert!(!is_real_directory(&link), "a symlink must not be owned");
+        // Removing the link (as the stale-tree path would) leaves its target.
+        std::fs::remove_dir_all(&link)
+            .or_else(|_| std::fs::remove_file(&link))
+            .unwrap();
+        assert!(victim.join("keep.txt").exists());
+        std::fs::remove_dir_all(&victim).unwrap();
     }
 }

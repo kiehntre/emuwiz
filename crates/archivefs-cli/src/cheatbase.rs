@@ -296,8 +296,23 @@ mod tests {
             "bin/emuwiz-cli",
             "install.sh",
             "config.toml.example",
+            "docs/README.txt",
+            "docs/LICENSES.txt",
+            "docs/licenses",
         ] {
             assert!(packager.contains(member), "missing release member {member}");
+        }
+        // The packager's payload walk refuses user state outright
+        // (behaviourally covered by `test_22_user_state_and_private_data_never_
+        // enter_the_payload`); keep the denial list from being quietly emptied.
+        assert!(packager.contains("DENIED_PAYLOAD_NAMES"));
+        for denied in [
+            "\"library.sqlite3\"",
+            "\"config.toml\"",
+            "\"rename-transactions\"",
+            "\"journals\"",
+        ] {
+            assert!(packager.contains(denied), "denial list lost {denied}");
         }
     }
 }
