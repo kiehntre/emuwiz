@@ -815,6 +815,15 @@ pub(super) fn show_sidebar(
     // enlarged; the version footer keeps its place below them. Nothing is
     // dropped: a row that does not fit is one wheel turn or Tab away.
     let rows = (ui.available_height() - FOOTER_HEIGHT).max(NAV_TARGET_HEIGHT);
+    // The selected row is brought into view when the selection changes or the
+    // room for rows does (a restored session, a link from a page, a resize, a
+    // new scale) - and on no other frame, so wheel scrolling is never undone.
+    let shown_for = (selected, rows.round() as i32);
+    let shown_id = egui::Id::new("v2_simple_selected_shown");
+    let reveal_selected = ui.data(|data| data.get_temp(shown_id)) != Some(shown_for);
+    if reveal_selected {
+        ui.data_mut(|data| data.insert_temp(shown_id, shown_for));
+    }
     egui::ScrollArea::vertical()
         .id_salt("v2_simple_destinations")
         .max_height(rows)
@@ -822,7 +831,9 @@ pub(super) fn show_sidebar(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             for destination in DESTINATIONS {
-                if nav_item(ui, destination, selected == Some(destination)).clicked() {
+                let is_selected = selected == Some(destination);
+                let reveal = reveal_selected && is_selected;
+                if nav_item(ui, destination, is_selected, reveal).clicked() {
                     chosen = Some(destination);
                 }
             }
@@ -879,7 +890,12 @@ fn nav_metrics(width: f32, label_width_at_full_size: f32) -> (f32, f32, f32) {
 /// One navigation row: transparent until hovered, a dim blue pill with a
 /// bright left edge when selected. A real focusable button for the keyboard
 /// and for assistive technology.
-fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui::Response {
+fn nav_item(
+    ui: &mut egui::Ui,
+    destination: Destination,
+    selected: bool,
+    reveal: bool,
+) -> egui::Response {
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), NAV_TARGET_HEIGHT));
     let response = ui.interact(rect, nav_id(destination), egui::Sense::click());
     response.widget_info(|| {
@@ -890,9 +906,10 @@ fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui
             destination.label(),
         )
     });
-    // Keyboard focus must never land on a row that is scrolled out of view.
-    // Immediately, not eased: the row is on screen by the next frame.
-    if response.gained_focus() {
+    // Keyboard focus must never land on a row that is scrolled out of view,
+    // and the selected row is shown when asked. Immediately, not eased: the
+    // row is on screen by the next frame.
+    if response.gained_focus() || reveal {
         response.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
     }
     if ui.is_rect_visible(rect) {

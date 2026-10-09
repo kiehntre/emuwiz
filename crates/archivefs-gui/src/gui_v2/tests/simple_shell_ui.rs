@@ -1033,3 +1033,353 @@ fn manage_card_pointer_press_does_not_scroll_a_partially_visible_card() {
     );
     assert_eq!(app.router.current, Route::Section(task.section));
 }
+
+// ---- second review coverage: both window sizes, the selectable steps, reverse
+// ---- Tab, the selected row, and repeated palette lifecycles
+
+const REVIEW_WINDOWS: [[f32; 2]; 2] = [[1024.0, 640.0], [1280.0, 720.0]];
+/// The steps a person can select: 80%, 100%, the 130% the preference rounds
+/// 125% to, and 160%.
+const REVIEW_SCALES: [f32; 4] = [0.8, 1.0, 1.3, 1.6];
+
+/// A `window` in pixels, in points at `scale`.
+fn window_at(window: [f32; 2], scale: f32) -> [f32; 2] {
+    [window[0] / scale, window[1] / scale]
+}
+
+/// A Simple window at `scale` on a page no sidebar row opens.
+fn review_window(window: [f32; 2], scale: f32) -> (egui::Context, App, [f32; 2]) {
+    let context = egui::Context::default();
+    let mut app = scaled(&context, scale);
+    assert!(
+        (app.simple.ui_scale - scale).abs() < 1e-6,
+        "{scale} is not a step"
+    );
+    app.router.current = Route::Section(Section::Tape);
+    let size = window_at(window, scale);
+    frame(&context, &mut app, size);
+    frame(&context, &mut app, size);
+    (context, app, size)
+}
+
+/// Asserts the destination's whole row is inside the part of the sidebar that
+/// shows rows: below the brand and above the version footer, with its label
+/// painted. A row scrolled out of the list fails this.
+#[track_caller]
+fn assert_row_shown(
+    context: &egui::Context,
+    layout: &egui::FullOutput,
+    destination: Destination,
+    when: &str,
+) {
+    use crate::gui_v2::simple_shell::nav_id;
+    let brand = text_bounds(layout, "Play More. Manage Better.")
+        .first()
+        .map(|rect| rect.max.y)
+        .expect("the brand is always shown");
+    let footer = text_bounds(layout, concat!("EmuWiz v", env!("CARGO_PKG_VERSION")))
+        .first()
+        .map(|rect| rect.min.y)
+        .expect("the version footer is always shown");
+    let row = context
+        .read_response(nav_id(destination))
+        .unwrap_or_else(|| panic!("{} has no row {when}", destination.label()))
+        .rect;
+    assert!(
+        row.min.y >= brand - 0.5 && row.max.y <= footer + 0.5,
+        "{} row {:?} is outside the visible list {brand}..{footer} {when}",
+        destination.label(),
+        row.y_range()
+    );
+    assert!(
+        text_bounds(layout, destination.label())
+            .iter()
+            .any(|label| row.contains(label.center())),
+        "{} label is not painted in its row {when}",
+        destination.label()
+    );
+}
+
+/// A settled frame. The sidebar scroll, and the response egui remembers for a
+/// row, each trail the input by a frame or two.
+fn settled(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    for _ in 0..6 {
+        frame(context, app, size);
+    }
+    frame(context, app, size)
+}
+
+fn focused_destination(context: &egui::Context) -> Option<Destination> {
+    use crate::gui_v2::simple_shell::nav_id;
+    let focused = context.memory(|memory| memory.focused());
+    DESTINATIONS
+        .iter()
+        .copied()
+        .find(|destination| focused == Some(nav_id(*destination)))
+}
+
+fn wheel_sidebar(context: &egui::Context, app: &mut App, size: [f32; 2], delta: f32) {
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(60.0, size[1] * 0.6)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, delta),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    frame(context, app, size);
+}
+
+#[test]
+fn tab_reveals_and_opens_every_destination_at_every_window_and_step() {
+    for window in REVIEW_WINDOWS {
+        for scale in REVIEW_SCALES {
+            let (context, mut app, size) = review_window(window, scale);
+            let when = format!("with Tab at {window:?}, {scale}");
+            let mut reached = Vec::new();
+            for _ in 0..24 {
+                key_press(&context, &mut app, size, egui::Key::Tab);
+                let Some(destination) = focused_destination(&context) else {
+                    continue;
+                };
+                if reached.contains(&destination.label()) {
+                    break;
+                }
+                let layout = settled(&context, &mut app, size);
+                assert_row_shown(&context, &layout, destination, &when);
+                key_press(&context, &mut app, size, egui::Key::Enter);
+                assert_eq!(app.router.current, destination.route(), "Enter {when}");
+                reached.push(destination.label());
+            }
+            let expected: Vec<_> = DESTINATIONS.iter().map(|d| d.label()).collect();
+            assert_eq!(reached, expected, "{when}");
+        }
+    }
+}
+
+#[test]
+fn shift_tab_reveals_every_destination_at_every_window_and_step() {
+    for window in REVIEW_WINDOWS {
+        for scale in REVIEW_SCALES {
+            let (context, mut app, size) = review_window(window, scale);
+            let when = format!("with Shift+Tab at {window:?}, {scale}");
+            let mut reached = Vec::new();
+            // Backwards from the end of the window: the page first, then the
+            // header, then the sidebar from Settings up to Home.
+            for _ in 0..240 {
+                shift_tab(&context, &mut app, size);
+                let Some(destination) = focused_destination(&context) else {
+                    if reached.is_empty() {
+                        continue;
+                    }
+                    break;
+                };
+                let layout = settled(&context, &mut app, size);
+                assert_row_shown(&context, &layout, destination, &when);
+                reached.push(destination.label());
+                if reached.len() == DESTINATIONS.len() {
+                    break;
+                }
+            }
+            let expected: Vec<_> = DESTINATIONS.iter().rev().map(|d| d.label()).collect();
+            assert_eq!(reached, expected, "{when}");
+        }
+    }
+}
+
+#[test]
+fn the_wheel_reaches_every_destination_at_every_window_and_step() {
+    for window in REVIEW_WINDOWS {
+        for scale in REVIEW_SCALES {
+            for destination in DESTINATIONS {
+                let (context, mut app, size) = review_window(window, scale);
+                for _ in 0..14 {
+                    let bounds = text_bounds(&frame(&context, &mut app, size), destination.label());
+                    if let Some(row) = bounds.iter().find(|rect| rect.min.x < 100.0) {
+                        click_at(&context, &mut app, size, row.center());
+                        if app.router.current == destination.route() {
+                            break;
+                        }
+                    }
+                    wheel_sidebar(&context, &mut app, size, -40.0);
+                }
+                assert_eq!(
+                    app.router.current,
+                    destination.route(),
+                    "{} not reachable by wheel at {window:?}, {scale}",
+                    destination.label()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_label_fits_its_row_at_every_window_and_step() {
+    use crate::gui_v2::simple_shell::{SIDEBAR_WIDTH, SIDEBAR_WIDTH_NARROW};
+    for window in REVIEW_WINDOWS {
+        for scale in REVIEW_SCALES {
+            for destination in DESTINATIONS {
+                // Selected, so the row is shown whatever the window height.
+                let (context, mut app, size) = review_window(window, scale);
+                app.router.current = destination.route();
+                let layout = settled(&context, &mut app, size);
+                let edge = if size[0] < 900.0 {
+                    SIDEBAR_WIDTH_NARROW
+                } else {
+                    SIDEBAR_WIDTH
+                };
+                let labels: Vec<_> = text_bounds(&layout, destination.label())
+                    .into_iter()
+                    .filter(|rect| rect.min.x < 100.0)
+                    .collect();
+                // The whole label, on one line, inside the sidebar.
+                assert_eq!(
+                    labels.len(),
+                    1,
+                    "{} is not shown whole at {window:?}, {scale}",
+                    destination.label()
+                );
+                assert!(
+                    labels[0].max.x <= edge - 6.0 && labels[0].height() < 30.0,
+                    "{} label {:?} does not fit the {edge} sidebar at {window:?}, {scale}",
+                    destination.label(),
+                    labels[0]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn the_selected_destination_is_shown_at_every_window_and_step() {
+    for window in REVIEW_WINDOWS {
+        for scale in REVIEW_SCALES {
+            // Opened there: a restored session, or a link from a page.
+            for destination in DESTINATIONS {
+                let (context, mut app, size) = review_window(window, scale);
+                app.router.current = destination.route();
+                let layout = settled(&context, &mut app, size);
+                assert_row_shown(
+                    &context,
+                    &layout,
+                    destination,
+                    &format!("when opened at {window:?}, {scale}"),
+                );
+            }
+            // Moving between the ends of the list in one session.
+            let (context, mut app, size) = review_window(window, scale);
+            for destination in [
+                Destination::Settings,
+                Destination::Home,
+                Destination::ActivityHistory,
+                Destination::Library,
+                Destination::Settings,
+            ] {
+                app.router.current = destination.route();
+                let layout = settled(&context, &mut app, size);
+                assert_row_shown(
+                    &context,
+                    &layout,
+                    destination,
+                    &format!("after moving there at {window:?}, {scale}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn showing_the_selected_destination_does_not_undo_wheel_scrolling() {
+    // 1024x640 at 160%: the list is taller than the sidebar.
+    let (context, mut app, size) = review_window([1024.0, 640.0], 1.6);
+    app.router.current = Destination::Settings.route();
+    let layout = settled(&context, &mut app, size);
+    assert_row_shown(&context, &layout, Destination::Settings, "when opened");
+    // The person scrolls back to the top of the list; it stays there.
+    for _ in 0..12 {
+        wheel_sidebar(&context, &mut app, size, 40.0);
+    }
+    let layout = settled(&context, &mut app, size);
+    assert_row_shown(&context, &layout, Destination::Home, "after wheeling up");
+    assert_eq!(app.router.current, Destination::Settings.route());
+}
+
+#[test]
+fn home_to_cheats_and_mods_and_back_keeps_the_exact_blue_style_every_time() {
+    let context = egui::Context::default();
+    let mut app = simple(&context);
+    frame(&context, &mut app, DESKTOP);
+    frame(&context, &mut app, DESKTOP);
+    assert!(blue(&context));
+    // Every field, not a sample of colours.
+    let blue_style = (*context.style()).clone();
+    for round in 0..10 {
+        for route in [Destination::CheatsMods.route(), Route::Home] {
+            app.router.current = route.clone();
+            frame(&context, &mut app, DESKTOP);
+            frame(&context, &mut app, DESKTOP);
+            assert_eq!(
+                *context.style(),
+                blue_style,
+                "round {round}: the blue style changed on {route:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn twelve_blue_classic_cycles_restore_both_complete_styles_without_drift() {
+    let classic = fresh_classic();
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    frame(&context, &mut app, DESKTOP);
+    assert_classic(&context, &classic, "default-off start");
+    let mut first_blue: Option<egui::Style> = None;
+    for round in 0..12 {
+        let scale = REVIEW_SCALES[round % REVIEW_SCALES.len()];
+        app.simple.enabled = true;
+        app.simple.set_ui_scale(scale);
+        // Through the page that restyles the context, and back.
+        for route in [Route::Home, Destination::CheatsMods.route(), Route::Home] {
+            app.router.current = route;
+            frame(&context, &mut app, DESKTOP);
+            frame(&context, &mut app, DESKTOP);
+            let now = (*context.style()).clone();
+            match &first_blue {
+                None => {
+                    assert!(blue(&context));
+                    first_blue = Some(now);
+                }
+                Some(first) => assert_eq!(&now, first, "round {round}: blue drifted"),
+            }
+        }
+        assert!(
+            (context.zoom_factor() - scale).abs() < 1e-6,
+            "round {round}"
+        );
+        app.simple.enabled = false;
+        for route in [Destination::CheatsMods.route(), Route::Home] {
+            app.router.current = route;
+            frame(&context, &mut app, DESKTOP);
+            frame(&context, &mut app, DESKTOP);
+            assert_classic(
+                &context,
+                &classic,
+                &format!("round {round}: classic drifted"),
+            );
+            assert_eq!(context.zoom_factor(), 1.0, "round {round}");
+        }
+    }
+}
