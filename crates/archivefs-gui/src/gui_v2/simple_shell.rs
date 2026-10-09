@@ -1105,12 +1105,40 @@ pub(super) fn show_manage_library(ui: &mut egui::Ui) -> Option<Section> {
     chosen
 }
 
+/// Stable across the hub's responsive row layout.
+pub(super) fn task_id(section: Section) -> egui::Id {
+    egui::Id::new(("v2_simple_manage_task", section))
+}
+
 fn task_card(ui: &mut egui::Ui, task: &ManageTask, width: f32) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, TASK_CARD_HEIGHT), egui::Sense::click());
+    let (_, rect) = ui.allocate_space(egui::vec2(width, TASK_CARD_HEIGHT));
+    let response = ui.interact(rect, task_id(task.section), egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), task.title)
     });
+    // Reveal keyboard focus once, in either Tab direction. Pointer input and
+    // an already-focused card must not undo the person's wheel scrolling.
+    if response.gained_focus()
+        && !ui.input(|input| input.pointer.any_pressed() || input.pointer.any_released())
+    {
+        // Use the actual clip boundary: alignment-based scroll targets add
+        // item spacing and can clip a tall card in a short viewport. Leave
+        // one point for pixel rounding and move only as far as necessary.
+        let visible = ui.clip_rect().shrink2(egui::vec2(0.0, 1.0));
+        let delta = if rect.min.y < visible.min.y {
+            visible.min.y - rect.min.y
+        } else if rect.max.y > visible.max.y {
+            visible.max.y - rect.max.y
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            ui.scroll_with_delta_animation(
+                egui::vec2(0.0, delta),
+                egui::style::ScrollAnimation::none(),
+            );
+        }
+    }
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let active = response.hovered() || response.has_focus();

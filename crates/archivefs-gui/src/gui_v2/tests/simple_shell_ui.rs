@@ -721,3 +721,315 @@ fn a_session_restored_with_simple_on_can_still_return_to_exact_classic() {
     );
     assert_eq!(context.zoom_factor(), 1.0);
 }
+
+// Manage-card focus must follow the page scroll, including reverse Tab.
+fn manage_window(window: [f32; 2], scale: f32) -> (egui::Context, App, [f32; 2]) {
+    let context = egui::Context::default();
+    let mut app = scaled(&context, scale);
+    app.router.current = Destination::ManageLibrary.route();
+    app.beginner_hints_enabled = false;
+    let size = [window[0] / scale, window[1] / scale];
+    frame(&context, &mut app, size);
+    frame(&context, &mut app, size);
+    // The preference rounds 125% to 130%. Exercise an actual 125% viewport
+    // too, without changing that existing preference policy.
+    context.set_zoom_factor(scale);
+    frame(&context, &mut app, size);
+    frame(&context, &mut app, size);
+    assert!((context.zoom_factor() - scale).abs() < 1e-6);
+    (context, app, size)
+}
+
+fn shift_tab(context: &egui::Context, app: &mut App, size: [f32; 2]) {
+    let modifiers = egui::Modifiers {
+        shift: true,
+        ..Default::default()
+    };
+    for pressed in [true, false] {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(size[0], size[1]),
+                )),
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Tab,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+    }
+}
+
+fn settled_card_frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    // Match a native repaint interval (about 350 ms). Scroll-area targets and
+    // scrollbar layout can span several passes, especially with reverse Tab.
+    for _ in 0..20 {
+        frame(context, app, size);
+    }
+    frame(context, app, size)
+}
+
+fn tab_to_task(context: &egui::Context, app: &mut App, size: [f32; 2], section: Section) {
+    let id = crate::gui_v2::simple_shell::task_id(section);
+    for _ in 0..32 {
+        key_press(context, app, size, egui::Key::Tab);
+        frame(context, app, size);
+        frame(context, app, size);
+        if context.memory(|memory| memory.focused()) == Some(id) {
+            settled_card_frame(context, app, size);
+            return;
+        }
+    }
+    panic!("Tab never reached {section:?}");
+}
+
+fn assert_task_visible(
+    context: &egui::Context,
+    output: &egui::FullOutput,
+    task: &crate::gui_v2::simple_shell::ManageTask,
+) {
+    use crate::gui_v2::simple_shell::task_id;
+    let response = context.read_response(task_id(task.section)).unwrap();
+    assert!(response.has_focus(), "{} lacks keyboard focus", task.title);
+    // Check the entire focus outline against the actual scroll-area clip,
+    // not merely whether the title's coordinates fall inside the window.
+    assert!(
+        output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Rect(rect)
+                if rect.rect.min.distance(response.rect.min) < 0.01
+                    && rect.rect.max.distance(response.rect.max) < 0.01
+                    && rect.stroke.width >= 2.0
+                    && rect.stroke.color == palette::ACCENT
+                    && shape.clip_rect.contains_rect(rect.rect))
+        }),
+        "{} focus outline is missing or clipped: {:?}; painted focus rectangles: {:?}",
+        task.title,
+        response.rect,
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.stroke.width >= 2.0 && rect.stroke.color == palette::ACCENT =>
+                    Some((rect.rect, shape.clip_rect)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+    for wanted in [task.title, task.description] {
+        assert!(
+            output.shapes.iter().any(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    let bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    text.galley.text() == wanted
+                        && response.rect.contains_rect(bounds)
+                        && shape.clip_rect.contains_rect(bounds)
+                } else {
+                    false
+                }
+            }),
+            "{} text is missing or clipped: {wanted}",
+            task.title
+        );
+    }
+}
+
+#[test]
+fn manage_cards_are_fully_visible_with_forward_and_reverse_tab_at_all_sizes() {
+    use crate::gui_v2::simple_shell::{MANAGE_TASKS, task_id};
+    for window in [SMALL, DESKTOP] {
+        for scale in [0.8, 1.0, 1.25, 1.6] {
+            let (context, mut app, size) = manage_window(window, scale);
+            tab_to_task(&context, &mut app, size, MANAGE_TASKS[0].section);
+            for (index, task) in MANAGE_TASKS.iter().enumerate() {
+                if index > 0 {
+                    key_press(&context, &mut app, size, egui::Key::Tab);
+                }
+                frame(&context, &mut app, size);
+                let output = settled_card_frame(&context, &mut app, size);
+                assert_eq!(context.memory(|m| m.focused()), Some(task_id(task.section)));
+                assert_task_visible(&context, &output, task);
+            }
+            for task in MANAGE_TASKS[..4].iter().rev() {
+                shift_tab(&context, &mut app, size);
+                frame(&context, &mut app, size);
+                let output = settled_card_frame(&context, &mut app, size);
+                assert_eq!(context.memory(|m| m.focused()), Some(task_id(task.section)));
+                assert_task_visible(&context, &output, task);
+            }
+        }
+    }
+}
+
+#[test]
+fn manage_cards_enter_opens_the_visibly_focused_destination_at_all_sizes() {
+    use crate::gui_v2::simple_shell::MANAGE_TASKS;
+    for window in [SMALL, DESKTOP] {
+        for scale in [0.8, 1.0, 1.25, 1.6] {
+            for task in MANAGE_TASKS {
+                let (context, mut app, size) = manage_window(window, scale);
+                tab_to_task(&context, &mut app, size, task.section);
+                frame(&context, &mut app, size);
+                let output = settled_card_frame(&context, &mut app, size);
+                assert_task_visible(&context, &output, &task);
+                key_press(&context, &mut app, size, egui::Key::Enter);
+                assert_eq!(app.router.current, Route::Section(task.section));
+            }
+        }
+    }
+}
+
+fn page_wheel(context: &egui::Context, app: &mut App, size: [f32; 2], delta: f32) {
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(size[0] - 40.0, size[1] * 0.7)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, delta),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    // Wheel input is smoothed by egui. Finish that movement before comparing
+    // geometry or sending the next pointer event.
+    for _ in 0..20 {
+        frame(context, app, size);
+    }
+}
+
+#[test]
+fn manage_cards_remain_mouse_reachable_with_wheel_scrolling_at_all_sizes() {
+    use crate::gui_v2::simple_shell::MANAGE_TASKS;
+    for window in [SMALL, DESKTOP] {
+        for scale in [0.8, 1.0, 1.25, 1.6] {
+            for task in MANAGE_TASKS {
+                let (context, mut app, size) = manage_window(window, scale);
+                let mut clicked = false;
+                for _ in 0..30 {
+                    let output = frame(&context, &mut app, size);
+                    let point = output.shapes.iter().find_map(|shape| {
+                        if let egui::Shape::Text(text) = &shape.shape {
+                            let bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+                            (text.galley.text() == task.title
+                                && shape.clip_rect.contains_rect(bounds))
+                            .then_some(bounds.center())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(point) = point {
+                        click_at(&context, &mut app, size, point);
+                        assert_eq!(app.router.current, Route::Section(task.section));
+                        clicked = true;
+                        break;
+                    }
+                    page_wheel(&context, &mut app, size, -40.0);
+                }
+                assert!(clicked, "{} not mouse reachable at {scale}", task.title);
+            }
+        }
+    }
+}
+
+#[test]
+fn manage_card_focus_does_not_snap_back_after_explicit_wheel_scrolling() {
+    use crate::gui_v2::simple_shell::{MANAGE_TASKS, task_id};
+    let (context, mut app, size) = manage_window(SMALL, 1.6);
+    let task = MANAGE_TASKS[4];
+    tab_to_task(&context, &mut app, size, task.section);
+    frame(&context, &mut app, size);
+    for _ in 0..4 {
+        page_wheel(&context, &mut app, size, 40.0);
+    }
+    let before = context.read_response(task_id(task.section)).unwrap().rect;
+    frame(&context, &mut app, size);
+    let after = context.read_response(task_id(task.section)).unwrap().rect;
+    assert_eq!(
+        before, after,
+        "idle/hover snapped the page back to focused card"
+    );
+    assert!(
+        after.max.y > size[1],
+        "explicit wheel scrolling did not move the card off screen"
+    );
+}
+
+#[test]
+fn manage_card_pointer_press_does_not_scroll_a_partially_visible_card() {
+    use crate::gui_v2::simple_shell::{MANAGE_TASKS, task_id};
+    let (context, mut app, size) = manage_window(SMALL, 1.6);
+    let task = MANAGE_TASKS[0];
+    page_wheel(&context, &mut app, size, -40.0);
+    let output = frame(&context, &mut app, size);
+    let before = context.read_response(task_id(task.section)).unwrap().rect;
+    let (point, clip) = output
+        .shapes
+        .iter()
+        .find_map(|shape| {
+            if let egui::Shape::Text(text) = &shape.shape {
+                (text.galley.text() == task.title)
+                    .then_some((text.pos + text.galley.size() * 0.5, shape.clip_rect))
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(
+        !clip.contains_rect(before),
+        "fixture must have a clipped card"
+    );
+    assert!(clip.contains(point), "click target must be visible");
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+    frame(&context, &mut app, size);
+    assert_eq!(
+        context.read_response(task_id(task.section)).unwrap().rect,
+        before
+    );
+    assert_eq!(app.router.current, Destination::ManageLibrary.route());
+    frame_with(
+        &context,
+        &mut app,
+        size,
+        vec![egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert_eq!(app.router.current, Route::Section(task.section));
+}
