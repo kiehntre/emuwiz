@@ -324,6 +324,20 @@ impl TransactionEntry {
     pub fn is_eligible_for_rollback(&self) -> bool {
         self.state == EntryState::Applied
     }
+
+    /// Whether this entry's own state rules out calling the transaction fully
+    /// rolled back: it is still applied, still in flight, or an earlier undo
+    /// of it failed. Entries that were never applied (planned, skipped, failed
+    /// to apply) and entries already rolled back do not block.
+    pub fn blocks_full_rollback(&self) -> bool {
+        matches!(
+            self.state,
+            EntryState::Applying
+                | EntryState::Applied
+                | EntryState::RollingBack
+                | EntryState::RollbackFailed
+        )
+    }
 }
 
 /// A gated, journal-backed rename transaction.
@@ -435,6 +449,17 @@ impl RenameTransaction {
     pub fn is_rollbackable(&self) -> bool {
         (self.state == TransactionState::Applied && self.has_applied_entries())
             || self.state.needs_recovery()
+    }
+
+    /// Whether the journal as a whole proves a full rollback: the transaction
+    /// is `RolledBack` and no entry contradicts that. The transaction-level
+    /// state alone is never enough.
+    pub fn is_fully_rolled_back(&self) -> bool {
+        self.state == TransactionState::RolledBack
+            && !self
+                .entries
+                .iter()
+                .any(TransactionEntry::blocks_full_rollback)
     }
 }
 

@@ -516,14 +516,16 @@ fn show_mame_normalizer(ui: &mut egui::Ui, state: &mut OrganisationState) {
                     ui.label(format!("Destination: {}", entry.destination_path.display()));
                 }
                 ui.label(format!("Recorded: {}", transaction.created_at_unix));
-                ui.label(match transaction.state {
-                    TransactionState::Applied => "Verified publication complete; undo is available.",
-                    TransactionState::RolledBack => "Rolled back; the generated destination is removed.",
-                    _ => "Recovery is required before this transaction can be considered complete.",
-                });
-                if transaction.is_rollbackable() {
+                ui.label(mame_history_status(transaction));
+                if mame_undo_actionable(transaction) {
+                    // "Published" is only said of a verified publication.
+                    let undo_label = if mame_publication_succeeded(transaction) {
+                        "Undo published MAME output"
+                    } else {
+                        "Undo this transaction's remaining applied outputs"
+                    };
                     if state.mame_undo_pending.as_deref() != Some(transaction.transaction_id.as_str())
-                        && ui.button("Undo published MAME output").clicked()
+                        && ui.button(undo_label).clicked()
                     {
                         state.mame_undo_pending = Some(transaction.transaction_id.clone());
                         state.mame_confirmation.clear();
@@ -634,6 +636,76 @@ fn mame_failure_reasons(transaction: &RenameTransaction) -> String {
         String::new()
     } else {
         format!(": {}", reasons.join("; "))
+    }
+}
+
+/// Whether an undo request has anything it could act on: an applied output, or
+/// an entry an interrupted run left in flight (the rollback reconciles those
+/// against the filesystem before touching anything). A transaction that never
+/// published, or whose only unresolved entries are refused undos, has nothing
+/// an undo could safely do, so none is offered or run.
+fn mame_undo_actionable(transaction: &RenameTransaction) -> bool {
+    transaction.is_rollbackable()
+        && transaction.entries.iter().any(|entry| {
+            matches!(
+                entry.state,
+                EntryState::Applied | EntryState::Applying | EntryState::RollingBack
+            )
+        })
+}
+
+/// A MAME undo is verified only when the journal's transaction state and every
+/// entry agree, and at least one output was actually reversed.
+fn mame_rollback_verified(transaction: &RenameTransaction) -> bool {
+    transaction.is_fully_rolled_back()
+        && transaction
+            .entries
+            .iter()
+            .any(|entry| entry.state == EntryState::RolledBack)
+}
+
+fn mame_entry_states(transaction: &RenameTransaction) -> String {
+    if transaction.entries.is_empty() {
+        return "no entries".into();
+    }
+    transaction
+        .entries
+        .iter()
+        .map(|entry| entry.state.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The one-line status of a history row, decided from the transaction state
+/// and the entry receipts together - never from the transaction state alone.
+fn mame_history_status(transaction: &RenameTransaction) -> String {
+    match transaction.state {
+        TransactionState::Applied if mame_publication_succeeded(transaction) => {
+            "Verified publication complete; undo is available.".into()
+        }
+        TransactionState::Applied => format!(
+            "This record says \"Applied\" but its entries do not confirm a publication (entries: {}). It is not treated as published; review is required.",
+            mame_entry_states(transaction)
+        ),
+        TransactionState::RolledBack if mame_rollback_verified(transaction) => {
+            "Rolled back; the generated destination is removed.".into()
+        }
+        TransactionState::RolledBack if transaction.is_fully_rolled_back() => {
+            "Closed without a publication: this transaction published nothing, so nothing was rolled back.".into()
+        }
+        TransactionState::RolledBack => format!(
+            "This record says \"Rolled back\" but its entries do not confirm it (entries: {}){}. The undo is not verified and the destination may still be present; manual review is required.",
+            mame_entry_states(transaction),
+            mame_failure_reasons(transaction)
+        ),
+        TransactionState::RollbackFailed => format!(
+            "Undo did not complete{}. The destination was left as it is and may still be present; manual review is required before this transaction can be considered complete.",
+            mame_failure_reasons(transaction)
+        ),
+        TransactionState::ApplyFailed if !mame_undo_actionable(transaction) => {
+            "Publication did not complete: nothing was published, so there is nothing to undo. Recovery is required before this transaction can be considered complete.".into()
+        }
+        _ => "Recovery is required before this transaction can be considered complete.".into(),
     }
 }
 
@@ -758,6 +830,18 @@ impl OrganisationState {
             ));
             return;
         }
+        if !mame_undo_actionable(&transaction) {
+            // Nothing is applied or in flight, so a rollback pass could only
+            // rewrite the journal. Refuse instead and leave it as recorded.
+            self.mame_message = Some(format!(
+                "Undo is unavailable for this MAME transaction: its recorded state is \"{}\" and it has no published output an undo could act on{}. Nothing was changed; the transaction and its journal are kept for review.",
+                transaction.state.label(),
+                mame_failure_reasons(&transaction)
+            ));
+            self.mame_confirmation.clear();
+            self.mame_undo_pending = None;
+            return;
+        }
         let Some(destination_parent) = transaction
             .entries
             .first()
@@ -790,10 +874,14 @@ impl OrganisationState {
         match result {
             Ok(outcome) => {
                 // As with publication, `Ok` carries the rollback's own result.
-                let rolled_back = matches!(outcome.result, RollbackResult::FullyRolledBack)
-                    && outcome.transaction.state == TransactionState::RolledBack;
-                let message = if rolled_back {
+                // The reported result, the transaction state and every entry
+                // receipt must all agree before anything is called rolled back.
+                let receipts_agree = matches!(outcome.result, RollbackResult::FullyRolledBack)
+                    && outcome.transaction.is_fully_rolled_back();
+                let message = if receipts_agree && mame_rollback_verified(&outcome.transaction) {
                     "MAME reconstruction was rolled back safely; the source archives were not touched.".to_string()
+                } else if receipts_agree {
+                    "This MAME transaction had published nothing, so there was nothing to undo; it is now closed. The source archives were not touched.".to_string()
                 } else {
                     let failed = outcome
                         .result
@@ -801,12 +889,19 @@ impl OrganisationState {
                         .into_iter()
                         .map(|(path, reason)| format!("{} ({reason})", path.display()))
                         .collect::<Vec<_>>();
+                    let recorded = if outcome.transaction.state == TransactionState::RolledBack {
+                        format!(
+                            "is recorded as \"Rolled back\" but its entries do not confirm that (entries: {})",
+                            mame_entry_states(&outcome.transaction)
+                        )
+                    } else {
+                        format!("ended as \"{}\"", outcome.transaction.state.label())
+                    };
                     format!(
-                        "MAME undo did not complete: transaction {} ended as \"{}\"{}. The generated destination may still be present; review this transaction before trying again. The source archives were not touched.",
+                        "MAME undo did not complete: transaction {} {recorded}{}. The generated destination may still be present; review this transaction before trying again. The source archives were not touched.",
                         outcome.transaction.transaction_id,
-                        outcome.transaction.state.label(),
                         if failed.is_empty() {
-                            String::new()
+                            mame_failure_reasons(&outcome.transaction)
                         } else {
                             format!(": {}", failed.join("; "))
                         }
@@ -1717,6 +1812,463 @@ mod tests {
             b"changed by the user"
         );
         assert_eq!(fixture.journaled().len(), 1);
+    }
+
+    const UNDO_BUTTONS: [&str; 2] = [
+        "Undo published MAME output",
+        "Undo this transaction's remaining applied outputs",
+    ];
+    const VERIFIED_ROLLBACK: &str = "Rolled back; the generated destination is removed.";
+    const VERIFIED_PUBLICATION: &str = "Verified publication complete; undo is available.";
+
+    impl MamePublishFixture {
+        /// A second (third...) output in the same private root.
+        fn plan_named(&self, parent: &str) -> MameMergedReconstructionPlan {
+            let mut plan = self.plan.clone();
+            plan.parent = parent.into();
+            plan.destination = self.output().join(format!("{parent}.zip"));
+            plan
+        }
+
+        /// One journaled transaction holding a real publication per name.
+        fn publish_combined(&self, parents: &[&str]) -> RenameTransaction {
+            let mut published = parents.iter().map(|parent| {
+                apply_staged_reconstruction_output(
+                    &self.plan_named(parent),
+                    &self.root.path().join("staging"),
+                    &self.journal(),
+                )
+                .unwrap()
+                .transaction
+            });
+            let mut combined = published.next().unwrap();
+            for other in published {
+                combined.entries.extend(other.entries);
+                archivefs_core::dat::rename_apply::remove_journal(
+                    &self.journal(),
+                    &other.transaction_id,
+                )
+                .unwrap();
+            }
+            archivefs_core::dat::rename_apply::write_journal(&self.journal(), &combined).unwrap();
+            combined
+        }
+
+        /// The real confined rollback, as `undo_mame` runs it, fed to the real
+        /// result handler.
+        fn undo(&self, state: &mut OrganisationState, index: usize) {
+            let mut transaction = state.mame_history[index].clone();
+            let result = rollback_transaction_confined(
+                &mut transaction,
+                &self.journal(),
+                &AtomicBool::new(false),
+                &TrustedRoots::from_paths([self.root.path().join("staging"), self.output()]),
+            );
+            state.record_mame_undo(index, result);
+        }
+
+        fn journal_file(&self, transaction_id: &str) -> Vec<u8> {
+            std::fs::read(
+                archivefs_core::dat::rename_apply::journal_path(&self.journal(), transaction_id)
+                    .unwrap(),
+            )
+            .unwrap()
+        }
+
+        fn only_journal(&self) -> RenameTransaction {
+            let mut journaled = self.journaled();
+            assert_eq!(journaled.len(), 1);
+            journaled.remove(0)
+        }
+    }
+
+    fn entry_states(transaction: &RenameTransaction) -> Vec<EntryState> {
+        transaction
+            .entries
+            .iter()
+            .map(|entry| entry.state)
+            .collect()
+    }
+
+    fn assert_no_undo_offered(text: &str) {
+        for button in UNDO_BUTTONS {
+            assert!(!text.contains(button), "{button} offered in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn mame_undo_after_a_verified_publication_is_reported_and_recorded_as_rolled_back() {
+        let fixture = MamePublishFixture::new();
+        let mut state = OrganisationState::default();
+        state.record_mame_publication(&fixture.plan.destination, fixture.publish());
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(text.contains(VERIFIED_PUBLICATION), "{text}");
+        assert!(text.contains("Undo published MAME output"), "{text}");
+
+        fixture.undo(&mut state, 0);
+        let message = state.mame_message.clone().unwrap();
+        assert!(
+            message.starts_with("MAME reconstruction was rolled back safely"),
+            "{message}"
+        );
+        assert!(!fixture.plan.destination.exists());
+        assert_eq!(std::fs::read(&fixture.member).unwrap(), b"mame member");
+        let journaled = fixture.only_journal();
+        assert_eq!(journaled.state, TransactionState::RolledBack);
+        assert_eq!(entry_states(&journaled), vec![EntryState::RolledBack]);
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(text.contains(VERIFIED_ROLLBACK), "{text}");
+        assert_no_undo_offered(&text);
+    }
+
+    #[test]
+    fn a_second_mame_undo_after_a_failed_undo_never_reports_a_rollback() {
+        let fixture = MamePublishFixture::new();
+        let mut state = OrganisationState::default();
+        state.record_mame_publication(&fixture.plan.destination, fixture.publish());
+        let transaction_id = state.mame_history[0].transaction_id.clone();
+        std::fs::write(&fixture.plan.destination, b"changed by the user").unwrap();
+
+        fixture.undo(&mut state, 0);
+        let first = state.mame_message.clone().unwrap();
+        assert!(first.contains("did not complete"), "{first}");
+        let reason = fixture.only_journal().entries[0]
+            .failure_reason
+            .clone()
+            .expect("the refusal is journaled");
+        assert!(first.contains(&reason), "{first}");
+
+        // The failed row offers no undo, and says why it is unresolved.
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert_no_undo_offered(&text);
+        assert!(text.contains("Undo did not complete"), "{text}");
+        assert!(text.contains(&reason), "{text}");
+        assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+
+        // The button's own handler refuses and leaves the journal as it is.
+        let journal_before = fixture.journal_file(&transaction_id);
+        state.mame_undo_pending = Some(transaction_id.clone());
+        state.undo_mame(&transaction_id);
+        let refused = state.mame_message.clone().unwrap();
+        assert!(refused.starts_with("Undo is unavailable"), "{refused}");
+        assert!(refused.contains(&reason), "{refused}");
+        assert!(state.mame_undo_pending.is_none());
+        assert_eq!(journal_before, fixture.journal_file(&transaction_id));
+
+        // Even when the rollback is run again directly (the path that used to
+        // report "rolled back safely"), repeatedly, nothing claims success.
+        for attempt in 2..=3 {
+            fixture.undo(&mut state, 0);
+            let message = state.mame_message.clone().unwrap();
+            assert!(
+                !message.contains("rolled back safely"),
+                "{attempt}: {message}"
+            );
+            assert!(message.contains("did not complete"), "{attempt}: {message}");
+            assert!(message.contains(&reason), "{attempt}: {message}");
+            assert_eq!(
+                state.mame_history[0].state,
+                TransactionState::RollbackFailed
+            );
+            let journaled = fixture.only_journal();
+            assert_eq!(journaled.state, TransactionState::RollbackFailed);
+            assert_eq!(entry_states(&journaled), vec![EntryState::RollbackFailed]);
+            assert_eq!(
+                journaled.entries[0].failure_reason.as_deref(),
+                Some(reason.as_str())
+            );
+            assert_eq!(
+                std::fs::read(&fixture.plan.destination).unwrap(),
+                b"changed by the user"
+            );
+            let text = rendered_mame_text(&mut state).join("\n");
+            assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+            assert_no_undo_offered(&text);
+        }
+        assert_eq!(std::fs::read(&fixture.member).unwrap(), b"mame member");
+    }
+
+    #[test]
+    fn a_second_mame_undo_after_a_partial_undo_never_reports_a_rollback() {
+        let fixture = MamePublishFixture::new();
+        let combined = fixture.publish_combined(&["alpha", "beta"]);
+        let alpha = fixture.output().join("alpha.zip");
+        let beta = fixture.output().join("beta.zip");
+        // Reverse order: beta is undone first, alpha is then refused.
+        std::fs::write(&alpha, b"changed by the user").unwrap();
+        let mut state = OrganisationState {
+            mame_history: vec![combined],
+            ..OrganisationState::default()
+        };
+
+        fixture.undo(&mut state, 0);
+        let first = state.mame_message.clone().unwrap();
+        assert!(first.contains("did not complete"), "{first}");
+        assert!(!beta.exists(), "the untouched output was undone");
+        assert_eq!(
+            entry_states(&fixture.only_journal()),
+            vec![EntryState::RollbackFailed, EntryState::RolledBack]
+        );
+
+        fixture.undo(&mut state, 0);
+        let second = state.mame_message.clone().unwrap();
+        assert!(!second.contains("rolled back safely"), "{second}");
+        assert!(second.contains("did not complete"), "{second}");
+        let journaled = fixture.only_journal();
+        assert_eq!(journaled.state, TransactionState::RollbackFailed);
+        assert_eq!(
+            entry_states(&journaled),
+            vec![EntryState::RollbackFailed, EntryState::RolledBack]
+        );
+        assert!(journaled.entries[0].failure_reason.is_some());
+        assert_eq!(std::fs::read(&alpha).unwrap(), b"changed by the user");
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(text.contains("Undo did not complete"), "{text}");
+        assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+        assert_no_undo_offered(&text);
+    }
+
+    #[test]
+    fn a_mixed_mame_undo_retries_only_the_outputs_that_are_still_applied() {
+        let fixture = MamePublishFixture::new();
+        let combined = fixture.publish_combined(&["alpha", "beta", "gamma"]);
+        let beta = fixture.output().join("beta.zip");
+        // Reverse order: gamma undone, beta refused, alpha left applied.
+        std::fs::write(&beta, b"changed by the user").unwrap();
+        let mut state = OrganisationState {
+            mame_history: vec![combined],
+            ..OrganisationState::default()
+        };
+        fixture.undo(&mut state, 0);
+        assert_eq!(
+            entry_states(&state.mame_history[0]),
+            vec![
+                EntryState::Applied,
+                EntryState::RollbackFailed,
+                EntryState::RolledBack
+            ]
+        );
+        // An output is still applied, so a retry is offered - not as an undo
+        // of a "published" transaction.
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(
+            text.contains("Undo this transaction's remaining applied outputs"),
+            "{text}"
+        );
+        assert!(!text.contains("Undo published MAME output"), "{text}");
+
+        fixture.undo(&mut state, 0);
+        let message = state.mame_message.clone().unwrap();
+        assert!(!message.contains("rolled back safely"), "{message}");
+        assert!(message.contains("did not complete"), "{message}");
+        assert!(!fixture.output().join("alpha.zip").exists());
+        assert_eq!(std::fs::read(&beta).unwrap(), b"changed by the user");
+        let journaled = fixture.only_journal();
+        assert_eq!(journaled.state, TransactionState::RollbackFailed);
+        assert_eq!(
+            entry_states(&journaled),
+            vec![
+                EntryState::RolledBack,
+                EntryState::RollbackFailed,
+                EntryState::RolledBack
+            ]
+        );
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+        assert_no_undo_offered(&text);
+    }
+
+    #[test]
+    fn an_undo_receipt_contradicted_by_its_entries_is_never_a_rollback() {
+        let fixture = MamePublishFixture::new();
+        let applied = fixture.publish().unwrap().transaction;
+        for entry_state in [
+            EntryState::Applying,
+            EntryState::Applied,
+            EntryState::RollingBack,
+            EntryState::RollbackFailed,
+        ] {
+            // The outer result and the transaction state both claim success.
+            let mut claimed = applied.clone();
+            claimed.state = TransactionState::RolledBack;
+            claimed.entries[0].state = entry_state;
+            let mut state = OrganisationState {
+                mame_history: vec![applied.clone()],
+                ..OrganisationState::default()
+            };
+            state.record_mame_undo(
+                0,
+                Ok(RollbackOutcome {
+                    result: RollbackResult::FullyRolledBack,
+                    transaction: claimed,
+                }),
+            );
+            let message = state.mame_message.clone().unwrap();
+            assert!(!message.contains("rolled back safely"), "{entry_state:?}");
+            assert!(message.contains("did not complete"), "{entry_state:?}");
+            assert!(
+                message.contains("entries do not confirm"),
+                "{entry_state:?}: {message}"
+            );
+            let text = rendered_mame_text(&mut state).join("\n");
+            assert!(!text.contains(VERIFIED_ROLLBACK), "{entry_state:?}: {text}");
+            assert!(
+                text.contains("its entries do not confirm it"),
+                "{entry_state:?}: {text}"
+            );
+            assert_no_undo_offered(&text);
+        }
+        assert!(fixture.plan.destination.is_file());
+    }
+
+    #[test]
+    fn a_mame_history_row_never_claims_what_its_entries_contradict() {
+        let fixture = MamePublishFixture::new();
+        let applied = fixture.publish().unwrap().transaction;
+        let render = |transaction: RenameTransaction| {
+            let mut state = OrganisationState {
+                mame_history: vec![transaction],
+                ..OrganisationState::default()
+            };
+            rendered_mame_text(&mut state).join("\n")
+        };
+        // "Applied" with a skipped (or otherwise unapplied) entry.
+        for entry_state in [
+            EntryState::Skipped,
+            EntryState::ApplyFailed,
+            EntryState::Planned,
+        ] {
+            let mut mixed = applied.clone();
+            mixed.entries.push(applied.entries[0].clone());
+            mixed.entries[1].state = entry_state;
+            let text = render(mixed);
+            assert!(!text.contains(VERIFIED_PUBLICATION), "{entry_state:?}");
+            assert!(
+                text.contains("its entries do not confirm a publication"),
+                "{entry_state:?}: {text}"
+            );
+            assert!(!text.contains("Undo published MAME output"), "{text}");
+        }
+        // "Rolled back" with every entry rolled back is the only verified one.
+        let mut rolled_back = applied.clone();
+        rolled_back.state = TransactionState::RolledBack;
+        rolled_back.entries[0].state = EntryState::RolledBack;
+        assert!(mame_rollback_verified(&rolled_back));
+        assert!(render(rolled_back.clone()).contains(VERIFIED_ROLLBACK));
+        // "Rolled back" where nothing was ever applied is not a rollback.
+        let mut nothing = rolled_back.clone();
+        nothing.entries[0].state = EntryState::ApplyFailed;
+        assert!(!mame_rollback_verified(&nothing));
+        let text = render(nothing);
+        assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+        assert!(text.contains("published nothing"), "{text}");
+        // An empty receipt proves nothing either.
+        let mut empty = rolled_back;
+        empty.entries.clear();
+        assert!(!mame_rollback_verified(&empty));
+        assert!(!render(empty).contains(VERIFIED_ROLLBACK));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mame_publication_that_never_succeeded_offers_no_undo_and_keeps_its_failure_record() {
+        let fixture = MamePublishFixture::new();
+        let mut state = OrganisationState::default();
+        let result = fixture.publish_into_unwritable_destination();
+        state.record_mame_publication(&fixture.plan.destination, result);
+        let transaction_id = state.mame_history[0].transaction_id.clone();
+        assert_eq!(state.mame_history[0].state, TransactionState::ApplyFailed);
+        assert!(!mame_undo_actionable(&state.mame_history[0]));
+
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert_no_undo_offered(&text);
+        assert!(text.contains("nothing was published"), "{text}");
+        assert!(!text.contains(VERIFIED_PUBLICATION), "{text}");
+
+        // The handler refuses, and the failure journal is byte-identical.
+        let journal_before = fixture.journal_file(&transaction_id);
+        state.undo_mame(&transaction_id);
+        let message = state.mame_message.clone().unwrap();
+        assert!(message.starts_with("Undo is unavailable"), "{message}");
+        assert!(message.contains("Apply failed"), "{message}");
+        assert!(!message.contains("rolled back"), "{message}");
+        assert_eq!(journal_before, fixture.journal_file(&transaction_id));
+        assert_eq!(state.mame_history[0].state, TransactionState::ApplyFailed);
+        assert!(!fixture.plan.destination.exists());
+        assert_eq!(std::fs::read(&fixture.member).unwrap(), b"mame member");
+
+        // A rollback pass over it has nothing to reverse; if one is run
+        // anyway it is never worded as a rollback of something published.
+        fixture.undo(&mut state, 0);
+        let message = state.mame_message.clone().unwrap();
+        assert!(!message.contains("rolled back safely"), "{message}");
+        assert!(message.contains("nothing to undo"), "{message}");
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+        assert!(text.contains("published nothing"), "{text}");
+        assert!(!fixture.plan.destination.exists());
+    }
+
+    #[test]
+    fn persisted_mame_failure_journals_stay_truthful_after_a_restart() {
+        let fixture = MamePublishFixture::new();
+        let mut state = OrganisationState::default();
+        state.record_mame_publication(&fixture.plan.destination, fixture.publish());
+        std::fs::write(&fixture.plan.destination, b"changed by the user").unwrap();
+        fixture.undo(&mut state, 0);
+        drop(state);
+
+        // "Restart": the history is rebuilt from the journal on disk alone.
+        let mut restarted = OrganisationState {
+            mame_history: fixture.journaled(),
+            ..OrganisationState::default()
+        };
+        let transaction_id = restarted.mame_history[0].transaction_id.clone();
+        let reason = restarted.mame_history[0].entries[0]
+            .failure_reason
+            .clone()
+            .unwrap();
+        let text = rendered_mame_text(&mut restarted).join("\n");
+        assert!(text.contains("Undo did not complete"), "{text}");
+        assert!(text.contains(&reason), "{text}");
+        assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+        assert_no_undo_offered(&text);
+        let journal_before = fixture.journal_file(&transaction_id);
+        restarted.undo_mame(&transaction_id);
+        assert!(
+            restarted
+                .mame_message
+                .clone()
+                .unwrap()
+                .starts_with("Undo is unavailable")
+        );
+        assert_eq!(journal_before, fixture.journal_file(&transaction_id));
+
+        // A journal already rewritten by the old behaviour (transaction
+        // "Rolled back", entry still "Rollback failed") is shown as
+        // unverified, and a rollback pass neither accepts nor rewrites it.
+        let mut legacy = restarted.mame_history[0].clone();
+        legacy.state = TransactionState::RolledBack;
+        archivefs_core::dat::rename_apply::write_journal(&fixture.journal(), &legacy).unwrap();
+        let journal_before = fixture.journal_file(&transaction_id);
+        let mut restarted = OrganisationState {
+            mame_history: fixture.journaled(),
+            ..OrganisationState::default()
+        };
+        let text = rendered_mame_text(&mut restarted).join("\n");
+        assert!(!text.contains(VERIFIED_ROLLBACK), "{text}");
+        assert!(text.contains("its entries do not confirm it"), "{text}");
+        assert!(text.contains(&reason), "{text}");
+        assert_no_undo_offered(&text);
+        fixture.undo(&mut restarted, 0);
+        let message = restarted.mame_message.clone().unwrap();
+        assert!(!message.contains("rolled back safely"), "{message}");
+        assert!(message.contains("did not complete"), "{message}");
+        assert_eq!(journal_before, fixture.journal_file(&transaction_id));
+        assert_eq!(
+            std::fs::read(&fixture.plan.destination).unwrap(),
+            b"changed by the user"
+        );
     }
 
     #[test]

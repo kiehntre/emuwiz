@@ -10,6 +10,14 @@
 //! already rolled back. Cancellation stops the loop with any not-yet-reversed
 //! Applied entries left untouched (and retryable); it is an incomplete
 //! rollback, never reported as a full one.
+//!
+//! An entry whose reverse rename was refused is recorded `RollbackFailed` with
+//! its reason and is **not** retried automatically by a later request: the
+//! refusal means the destination or the original path is no longer what the
+//! journal recorded, so it needs a person. A repeated request still reverses
+//! any entries that are still Applied, reports the earlier failure again from
+//! the journal, and stays `RollbackFailed` - a pass that found nothing it could
+//! reverse is never a full rollback.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,8 +84,38 @@ fn rollback_transaction_inner(
     trusted: Option<&TrustedRoots>,
 ) -> Result<RollbackOutcome, String> {
     if transaction.state == TransactionState::RolledBack {
+        // A `RolledBack` journal is a finished rollback only when its entries
+        // agree. One that still records an applied, in-flight or failed-undo
+        // entry is contradictory: report it, change nothing on disk and leave
+        // the journal exactly as it was found for manual review.
+        let contradicting: Vec<(std::path::PathBuf, String)> = transaction
+            .entries
+            .iter()
+            .filter(|entry| entry.blocks_full_rollback())
+            .map(|entry| {
+                (
+                    entry.source_path.clone(),
+                    format!(
+                        "the journal says rolled back but this entry is recorded as \"{}\"{}; \
+                         manual review required",
+                        entry.state.label(),
+                        entry
+                            .failure_reason
+                            .as_deref()
+                            .map(|reason| format!(" ({reason})"))
+                            .unwrap_or_default()
+                    ),
+                )
+            })
+            .collect();
         return Ok(RollbackOutcome {
-            result: RollbackResult::FullyRolledBack,
+            result: if contradicting.is_empty() {
+                RollbackResult::FullyRolledBack
+            } else {
+                RollbackResult::RollbackFailed {
+                    failed: contradicting,
+                }
+            },
             transaction: transaction.clone(),
         });
     }
@@ -189,6 +227,29 @@ fn rollback_transaction_inner(
         .map(|entry| entry.source_path.clone())
         .collect();
 
+    // An entry whose undo failed in an earlier pass is not eligible for an
+    // automatic retry (the loop above skips it), so it is still unresolved: its
+    // recorded state and reason stay in the journal untouched and are reported
+    // again here. Without this a repeated request found nothing to process and
+    // was recorded as a full rollback.
+    for entry in &transaction.entries {
+        if entry.state == EntryState::RollbackFailed
+            && !failed.iter().any(|(path, _)| path == &entry.source_path)
+        {
+            failed.push((
+                entry.source_path.clone(),
+                format!(
+                    "{} (recorded by an earlier undo attempt and not retried; manual review \
+                     required)",
+                    entry
+                        .failure_reason
+                        .as_deref()
+                        .unwrap_or("an earlier undo of this entry failed")
+                ),
+            ));
+        }
+    }
+
     let fully_rolled_back = failed.is_empty() && remaining_incomplete.is_empty();
 
     transaction.state = if fully_rolled_back {
@@ -201,7 +262,7 @@ fn rollback_transaction_inner(
     let result = if fully_rolled_back {
         RollbackResult::FullyRolledBack
     } else if stopped_by_cancellation {
-        let cancelled_remaining: Vec<(std::path::PathBuf, String)> = remaining_incomplete
+        let mut cancelled_remaining: Vec<(std::path::PathBuf, String)> = remaining_incomplete
             .iter()
             .map(|path| {
                 (
@@ -210,6 +271,7 @@ fn rollback_transaction_inner(
                 )
             })
             .collect();
+        cancelled_remaining.extend(failed);
         if rolled_back.is_empty() {
             RollbackResult::RollbackFailed {
                 failed: cancelled_remaining,

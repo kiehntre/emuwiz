@@ -1361,6 +1361,271 @@ fn repeated_rollback_is_idempotent_and_safe() {
     assert!(!roms.join("b.bin").exists());
 }
 
+/// Applies `names.len()` renames (`x.bin` -> `X.bin`) as one transaction.
+fn apply_many(dir: &Path, names: &[&str]) -> (RenameTransaction, PathBuf) {
+    let roms = dir.join("roms");
+    std::fs::create_dir_all(&roms).unwrap();
+    let journal = dir.join("journal");
+    std::fs::create_dir_all(&journal).unwrap();
+    let sources: Vec<PathBuf> = names.iter().map(|name| write(&roms, name)).collect();
+    let proposals = sources
+        .iter()
+        .zip(names)
+        .map(|(source, name)| {
+            proposal(
+                source.to_str().unwrap(),
+                name,
+                &name.to_uppercase().replace(".BIN", ".bin"),
+                ProposalState::Suggested,
+            )
+        })
+        .collect();
+    let plan = plan(proposals, 1, &roms);
+    let cancel = no_cancel();
+    let approved: Vec<&Path> = sources.iter().map(PathBuf::as_path).collect();
+    let outcome = apply(
+        &plan,
+        approved_of(&approved),
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        HardConflictMode::AbortAll,
+        &cancel,
+    )
+    .unwrap();
+    assert_eq!(outcome.summary.applied, names.len());
+    (outcome.transaction, journal)
+}
+
+fn journal_bytes(journal: &Path, transaction_id: &str) -> Vec<u8> {
+    std::fs::read(journal_path(journal, transaction_id).unwrap()).unwrap()
+}
+
+#[test]
+fn a_repeated_rollback_after_a_refused_undo_is_never_a_full_rollback() {
+    // CONFIRMED BUG: the first pass correctly ended RollbackFailed, but a
+    // second request found no Applied entry to process, counted nothing as
+    // incomplete and rewrote the journal as RolledBack / FullyRolledBack while
+    // the changed destination was still on disk.
+    let dir = tempfile::tempdir().unwrap();
+    let (_plan, mut tx, _) = apply_one(dir.path());
+    let journal = dir.path().join("journal");
+    let roms = dir.path().join("roms");
+    std::fs::write(roms.join("b.bin"), b"changed by the user").unwrap();
+    let cancel = no_cancel();
+
+    let first = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert!(matches!(
+        first.result,
+        RollbackResult::RollbackFailed { .. }
+    ));
+    let reason = tx.entries[0]
+        .failure_reason
+        .clone()
+        .expect("the refusal is recorded");
+
+    for attempt in 2..=3 {
+        let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+        let RollbackResult::RollbackFailed { failed } = &outcome.result else {
+            panic!("attempt {attempt} must stay failed: {:?}", outcome.result);
+        };
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].1.contains(&reason), "{failed:?}");
+        assert_eq!(outcome.transaction.state, TransactionState::RollbackFailed);
+        assert!(!outcome.transaction.is_fully_rolled_back());
+        // The durable journal keeps the failure and its original reason.
+        let persisted = read_journal(&journal_path(&journal, &tx.transaction_id).unwrap()).unwrap();
+        assert_eq!(persisted.state, TransactionState::RollbackFailed);
+        assert_eq!(persisted.entries[0].state, EntryState::RollbackFailed);
+        assert_eq!(
+            persisted.entries[0].failure_reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert!(persisted.state.needs_recovery());
+        // The user's file is untouched and nothing was moved back.
+        assert_eq!(
+            std::fs::read(roms.join("b.bin")).unwrap(),
+            b"changed by the user"
+        );
+        assert!(!roms.join("a.bin").exists());
+    }
+}
+
+#[test]
+fn a_persisted_rollback_failure_survives_a_restart_and_a_repeated_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_plan, mut tx, _) = apply_one(dir.path());
+    let journal = dir.path().join("journal");
+    let roms = dir.path().join("roms");
+    std::fs::write(roms.join("b.bin"), b"changed by the user").unwrap();
+    let cancel = no_cancel();
+    rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    let transaction_id = tx.transaction_id.clone();
+    drop(tx);
+
+    // "Restart": only the journal on disk is known.
+    let (recovery, problems) = find_recovery_transactions(&journal);
+    assert!(problems.is_empty());
+    assert_eq!(recovery.len(), 1);
+    let mut reloaded = recovery.into_iter().next().unwrap();
+    assert_eq!(reloaded.transaction_id, transaction_id);
+    let outcome = rollback_transaction(&mut reloaded, &journal, &cancel).unwrap();
+    assert!(matches!(
+        outcome.result,
+        RollbackResult::RollbackFailed { .. }
+    ));
+    let (still_recovery, _) = find_recovery_transactions(&journal);
+    assert_eq!(still_recovery.len(), 1, "the failure is still surfaced");
+    assert_eq!(still_recovery[0].state, TransactionState::RollbackFailed);
+    assert_eq!(
+        std::fs::read(roms.join("b.bin")).unwrap(),
+        b"changed by the user"
+    );
+}
+
+#[test]
+fn a_repeated_rollback_after_a_partial_undo_stays_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin"]);
+    let roms = dir.path().join("roms");
+    // Index 1 (b) is reversed first; index 0 (a) is then refused.
+    std::fs::write(roms.join("A.bin"), b"changed by the user").unwrap();
+    let cancel = no_cancel();
+    let first = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert!(matches!(
+        first.result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+
+    let second = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    // Nothing further could be reversed, so this pass is a plain failure.
+    let RollbackResult::RollbackFailed { failed } = &second.result else {
+        panic!("a repeat must stay incomplete: {:?}", second.result);
+    };
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, roms.join("a.bin"));
+    let persisted = read_journal(&journal_path(&journal, &tx.transaction_id).unwrap()).unwrap();
+    assert_eq!(persisted.state, TransactionState::RollbackFailed);
+    assert_eq!(persisted.entries[0].state, EntryState::RollbackFailed);
+    assert!(persisted.entries[0].failure_reason.is_some());
+    assert_eq!(persisted.entries[1].state, EntryState::RolledBack);
+    assert_eq!(
+        std::fs::read(roms.join("A.bin")).unwrap(),
+        b"changed by the user"
+    );
+    assert!(!roms.join("a.bin").exists());
+    assert_eq!(
+        std::fs::read(roms.join("b.bin")).unwrap(),
+        b"fixture contents"
+    );
+}
+
+#[test]
+fn a_repeated_rollback_reverses_the_still_applied_entries_but_not_the_failed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut tx, journal) = apply_many(dir.path(), &["a.bin", "b.bin", "c.bin"]);
+    let roms = dir.path().join("roms");
+    // Reverse order: c is reversed, b is refused, a is left Applied.
+    std::fs::write(roms.join("B.bin"), b"changed by the user").unwrap();
+    let cancel = no_cancel();
+    let first = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    assert!(matches!(
+        first.result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+    assert_eq!(tx.entries[0].state, EntryState::Applied);
+    assert_eq!(tx.entries[1].state, EntryState::RollbackFailed);
+    let reason = tx.entries[1].failure_reason.clone().unwrap();
+
+    // The explicit retry rule: still-Applied entries are reversed with the
+    // usual checks; the refused entry is reported again and never retried.
+    let second = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+    let RollbackResult::PartiallyRolledBack {
+        rolled_back,
+        failed,
+    } = &second.result
+    else {
+        panic!("{:?}", second.result);
+    };
+    assert_eq!(rolled_back, &vec![roms.join("a.bin")]);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, roms.join("b.bin"));
+    assert!(failed[0].1.contains(&reason));
+    let persisted = read_journal(&journal_path(&journal, &tx.transaction_id).unwrap()).unwrap();
+    assert_eq!(persisted.state, TransactionState::RollbackFailed);
+    assert_eq!(
+        persisted
+            .entries
+            .iter()
+            .map(|entry| entry.state)
+            .collect::<Vec<_>>(),
+        vec![
+            EntryState::RolledBack,
+            EntryState::RollbackFailed,
+            EntryState::RolledBack
+        ]
+    );
+    assert_eq!(
+        persisted.entries[1].failure_reason.as_deref(),
+        Some(reason.as_str())
+    );
+    assert_eq!(
+        std::fs::read(roms.join("B.bin")).unwrap(),
+        b"changed by the user"
+    );
+    assert!(!roms.join("b.bin").exists());
+}
+
+#[test]
+fn a_rolled_back_journal_contradicted_by_its_entries_is_refused_and_left_unchanged() {
+    for contradicting in [
+        EntryState::Applied,
+        EntryState::Applying,
+        EntryState::RollingBack,
+        EntryState::RollbackFailed,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_plan, mut tx, _) = apply_one(dir.path());
+        let journal = dir.path().join("journal");
+        let roms = dir.path().join("roms");
+        tx.state = TransactionState::RolledBack;
+        tx.entries[0].state = contradicting;
+        write_journal(&journal, &tx).unwrap();
+        let before = journal_bytes(&journal, &tx.transaction_id);
+        let cancel = no_cancel();
+
+        let outcome = rollback_transaction(&mut tx, &journal, &cancel).unwrap();
+        assert!(
+            matches!(outcome.result, RollbackResult::RollbackFailed { .. }),
+            "{contradicting:?}: {:?}",
+            outcome.result
+        );
+        assert!(!outcome.transaction.is_fully_rolled_back());
+        assert_eq!(before, journal_bytes(&journal, &tx.transaction_id));
+        assert!(roms.join("b.bin").exists(), "nothing was moved");
+        assert!(!roms.join("a.bin").exists());
+    }
+}
+
+#[test]
+fn entries_that_were_never_applied_do_not_block_a_full_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_plan, mut tx, _) = apply_one(dir.path());
+    for state in [
+        EntryState::Planned,
+        EntryState::PreflightPassed,
+        EntryState::ApplyFailed,
+        EntryState::Skipped,
+        EntryState::RolledBack,
+    ] {
+        tx.entries[0].state = state;
+        assert!(!tx.entries[0].blocks_full_rollback(), "{state:?}");
+    }
+    tx.state = TransactionState::RolledBack;
+    assert!(tx.is_fully_rolled_back());
+    tx.state = TransactionState::RollbackFailed;
+    assert!(!tx.is_fully_rolled_back());
+}
+
 #[test]
 fn a_completed_transaction_cannot_be_applied_twice() {
     let dir = tempfile::tempdir().unwrap();
