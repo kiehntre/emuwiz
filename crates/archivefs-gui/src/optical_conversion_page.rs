@@ -20,7 +20,7 @@ use archivefs_core::psp_reversible_shrink::{
 };
 use archivefs_core::repair::{
     ChdConversionError, ChdConversionPlan, ChdConversionResult, ChdConversionSourceMode,
-    ChdConversionTransaction, build_chd_conversion_plan, execute_chd_conversion,
+    ChdConversionTransaction, ChdSourceCleanup, build_chd_conversion_plan, execute_chd_conversion,
     rollback_chd_conversion,
 };
 use archivefs_core::safe_read::TrustedRoots;
@@ -1477,13 +1477,16 @@ pub(crate) fn show_optical_conversion_page(
     if let Some(result) = &state.result {
         let target_path = result.target_path.display().to_string();
         let transaction_id = result.transaction_id.clone();
-        let source_quarantined = result.source_quarantined;
+        let source_cleanup = result.source_cleanup.clone();
         ui.separator();
         widgets::card(ui, |ui| {
             ui.heading("Result");
             ui.horizontal_wrapped(|ui| {
                 widgets::status_badge(ui, "Converted", widgets::StatusTone::Success);
                 widgets::status_badge(ui, "Verified", widgets::StatusTone::Success);
+                if matches!(source_cleanup, ChdSourceCleanup::QuarantineFailed { .. }) {
+                    widgets::status_badge(ui, "Needs attention", widgets::StatusTone::Warning);
+                }
             });
             ui.add(
                 egui::Label::new(
@@ -1492,13 +1495,31 @@ pub(crate) fn show_optical_conversion_page(
                 )
                 .wrap(),
             );
-            ui.label(if source_quarantined {
-                "Originals quarantined after verification."
-            } else {
-                "Originals kept."
+            ui.label(match &source_cleanup {
+                ChdSourceCleanup::Quarantined => "Originals quarantined after verification.",
+                ChdSourceCleanup::NotRequested => "Originals kept.",
+                ChdSourceCleanup::QuarantineFailed {
+                    sources_restored: true,
+                    ..
+                } => {
+                    "The conversion succeeded, but the originals could not be moved to \
+                     quarantine. They are still in their original place and no space was \
+                     reclaimed."
+                }
+                ChdSourceCleanup::QuarantineFailed {
+                    sources_restored: false,
+                    ..
+                } => {
+                    "The conversion succeeded, but moving the originals to quarantine failed \
+                     part-way and could not be fully reversed. Nothing was deleted; check \
+                     the details before changing these files."
+                }
             });
             widgets::technical_details(ui, ("optical-conversion-result",), |ui| {
                 ui.label(format!("Transaction: {transaction_id}"));
+                if let ChdSourceCleanup::QuarantineFailed { detail, .. } = &source_cleanup {
+                    ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
+                }
             });
             if widgets::action_button(ui, "Undo conversion", widgets::ActionStyle::Secondary, true)
                 .clicked()
@@ -2193,6 +2214,44 @@ mod tests {
         assert!(!rendered_text_contains(&output, "canonical SHA-256"));
     }
 
+    /// A published CHD whose source quarantine failed is never shown as a
+    /// completed replacement.
+    #[test]
+    fn failed_source_quarantine_is_shown_as_needing_attention() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ready_candidate_state(directory.path());
+        let fingerprint = state.candidates[0]
+            .plan
+            .as_ref()
+            .unwrap()
+            .source_fingerprint
+            .clone();
+        state.result = Some(ChdConversionResult {
+            target_path: directory.path().join("Game space ü.chd"),
+            source_fingerprint: fingerprint.clone(),
+            output_fingerprint: fingerprint,
+            source_mode: ChdConversionSourceMode::QuarantineSource,
+            source_quarantined: false,
+            source_cleanup: ChdSourceCleanup::QuarantineFailed {
+                detail: "synthetic quarantine refusal".into(),
+                sources_restored: true,
+            },
+            transaction_id: "synthetic-transaction".into(),
+        });
+        let output = render(&mut state);
+        assert!(rendered_text_contains(&output, "Converted"));
+        assert!(rendered_text_contains(&output, "Needs attention"));
+        assert!(rendered_text_contains(
+            &output,
+            "originals could not be moved to quarantine"
+        ));
+        assert!(!rendered_text_contains(
+            &output,
+            "Originals quarantined after verification."
+        ));
+        assert!(!rendered_text_contains(&output, "Originals kept."));
+    }
+
     /// 11. A completed conversion shows a clear Converted/Verified summary.
     #[test]
     fn result_summary_shows_converted_and_verified() {
@@ -2214,6 +2273,7 @@ mod tests {
                 .clone(),
             source_mode: ChdConversionSourceMode::KeepSource,
             source_quarantined: false,
+            source_cleanup: ChdSourceCleanup::NotRequested,
             transaction_id: "synthetic-transaction".into(),
         });
         let output = render(&mut state);
@@ -2255,6 +2315,7 @@ mod tests {
                 .clone(),
             source_mode: ChdConversionSourceMode::KeepSource,
             source_quarantined: false,
+            source_cleanup: ChdSourceCleanup::NotRequested,
             transaction_id: "synthetic-transaction".into(),
         });
         let output = render_scrolled_to_bottom(&mut state, egui::vec2(1024.0, 600.0));
@@ -2311,6 +2372,7 @@ mod tests {
                 .clone(),
             source_mode: ChdConversionSourceMode::KeepSource,
             source_quarantined: false,
+            source_cleanup: ChdSourceCleanup::NotRequested,
             transaction_id: "synthetic".into(),
         });
         assert_eq!(workflow_step(&state), 4);

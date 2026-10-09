@@ -16,15 +16,16 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::dat::rename_apply::identity::capture_identity;
-use crate::dat::rename_apply::model::RollbackResult;
+use crate::dat::rename_apply::model::{RenameTransaction, RollbackResult, TransactionState};
 use crate::dat::sources::now_unix;
 use crate::optical_fingerprint::{
     CanonicalOpticalFingerprint, OpticalFingerprintComparison, compare_optical_fingerprints,
     fingerprint_chd, fingerprint_cue_layout,
 };
 use crate::repair::execute::{
-    RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairTransactionResult,
-    apply_repair_transaction, build_repair_transaction, rollback_repair_transaction,
+    RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairReverifyOutcome,
+    RepairTransactionResult, apply_repair_transaction, build_repair_transaction,
+    rollback_repair_transaction,
 };
 use crate::repair::plan::{RepairPlan, RepairPlanId, build_repair_plan};
 use crate::repair::proposal::{
@@ -121,8 +122,43 @@ pub struct ChdConversionResult {
     pub source_fingerprint: CanonicalOpticalFingerprint,
     pub output_fingerprint: CanonicalOpticalFingerprint,
     pub source_mode: ChdConversionSourceMode,
+    /// True only when both originals were moved and re-verified in quarantine.
     pub source_quarantined: bool,
+    /// What became of the originals. A verified, published CHD is kept even
+    /// when the requested source quarantine could not be completed.
+    pub source_cleanup: ChdSourceCleanup,
     pub transaction_id: String,
+}
+
+/// The outcome of the source-replacement step that follows a verified,
+/// published conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChdSourceCleanup {
+    /// `KeepSource`: the originals were never going to move.
+    NotRequested,
+    /// Both originals were moved to quarantine and re-verified there.
+    Quarantined,
+    /// The conversion succeeded and the CHD is published, but the originals
+    /// could not be quarantined as one unit. Partial success: it needs the
+    /// user's attention and is never reported as a completed replacement.
+    QuarantineFailed {
+        detail: String,
+        /// Whether every original is proven back at (or never left) its
+        /// reviewed path. When false, the unresolved quarantine transaction
+        /// is retained in [`ChdConversionTransaction::source_quarantine`].
+        sources_restored: bool,
+    },
+}
+
+impl ChdConversionResult {
+    /// Whether the conversion is published but its requested source cleanup
+    /// is not, so it must not be presented as an ordinary full success.
+    pub fn needs_attention(&self) -> bool {
+        matches!(
+            self.source_cleanup,
+            ChdSourceCleanup::QuarantineFailed { .. }
+        )
+    }
 }
 
 /// The explicit policy bound to the currently proven execution lane.  The
@@ -521,7 +557,7 @@ pub fn execute_chd_conversion(
                 RepairEvidenceKind::UserRequestedOrganisation,
                 "source/output canonical optical fingerprints match",
             )],
-            expected_source_identity: Some(staged_identity),
+            expected_source_identity: Some(staged_identity.clone()),
             originating_audit: None,
             safety: SafetyState::Safe,
             blockers: Vec::new(),
@@ -544,58 +580,47 @@ pub fn execute_chd_conversion(
         journal_dir: journal_dir.to_path_buf(),
         audit_cache: crate::dat::sources::audit_cache::AuditCacheConfig::Disabled,
     };
-    let output = apply_repair_transaction(&mut RepairApplyExecution {
-        transaction: &mut output_tx,
-        current_generation: 0,
-        options: &options,
-        cancel,
-    })
-    .map_err(ChdConversionError::Transaction)?;
-    // The output transaction's rollback source is inside this directory.
-    // Retain the empty staging directory until that transaction is explicitly
-    // rolled back or recovery has settled it.
+    // From here the journal owns the staged path, including an ambiguous
+    // publication failure: retain the staging directory unless a failure
+    // path below proves the staged CHD is back in it.
     stage_guard.retain = true;
-    let source_quarantine = if plan.source_mode == ChdConversionSourceMode::QuarantineSource {
-        let dir = quarantine_root
-            .join(DISC_CONVERSION_QUARANTINE_SUBDIR)
-            .join(&plan.source_fingerprint.canonical_sha256[..16]);
-        fs::create_dir_all(&dir).map_err(|e| {
-            ChdConversionError::Transaction(RepairExecutionError::Build {
-                detail: e.to_string(),
-            })
-        })?;
-        let p1 = proposal(
-            "chd-source-cue",
-            &plan.cue_path,
-            &dir.join(plan.cue_path.file_name().unwrap()),
-            "quarantine original CUE after verified conversion".into(),
-            &plan.cue_identity,
-        )?;
-        let p2 = proposal(
-            "chd-source-bin",
-            &plan.bin_path,
-            &dir.join(plan.bin_path.file_name().unwrap()),
-            "quarantine original BIN after verified conversion".into(),
-            &plan.bin_identity,
-        )?;
-        let source_plan = plan_for_moves(
-            &format!("chd-conversion-source-{}", now_unix()),
-            vec![p1, p2],
-        )?;
-        let mut tx =
-            build_repair_transaction(&source_plan).map_err(ChdConversionError::Transaction)?;
-        match apply_repair_transaction(&mut RepairApplyExecution {
-            transaction: &mut tx,
+    let output = match confirmed(
+        apply_repair_transaction(&mut RepairApplyExecution {
+            transaction: &mut output_tx,
             current_generation: 0,
             options: &options,
             cancel,
-        }) {
-            Ok(result) => Some(result),
-            Err(error) => return Err(ChdConversionError::Transaction(error)),
+        }),
+        1,
+    ) {
+        Ok(output) => output,
+        Err(detail) => {
+            let (_, rollback) = roll_back_unconfirmed(&mut output_tx, journal_dir);
+            stage_guard.retain = !staged_output_recovered(&staged, &staged_identity);
+            return Err(transaction_failure(format!(
+                "CHD publication was not confirmed ({detail}); no source was moved; \
+                 publication rollback: {rollback}"
+            )));
         }
-    } else {
-        None
     };
+    // Only a confirmed publication reaches this point. A source quarantine
+    // that then fails never withdraws the verified CHD: the originals are put
+    // back and the result says the cleanup needs attention.
+    let (source_quarantine, source_cleanup) =
+        if plan.source_mode == ChdConversionSourceMode::QuarantineSource {
+            match quarantine_sources(plan, quarantine_root, &options, cancel) {
+                Ok(result) => (Some(result), ChdSourceCleanup::Quarantined),
+                Err(failure) => (
+                    failure.unresolved,
+                    ChdSourceCleanup::QuarantineFailed {
+                        detail: failure.detail,
+                        sources_restored: failure.sources_restored,
+                    },
+                ),
+            }
+        } else {
+            (None, ChdSourceCleanup::NotRequested)
+        };
     let transaction_id = output.transaction.transaction_id.clone();
     Ok((
         ChdConversionResult {
@@ -603,7 +628,8 @@ pub fn execute_chd_conversion(
             source_fingerprint: plan.source_fingerprint.clone(),
             output_fingerprint,
             source_mode: plan.source_mode,
-            source_quarantined: source_quarantine.is_some(),
+            source_quarantined: source_cleanup == ChdSourceCleanup::Quarantined,
+            source_cleanup,
             transaction_id,
         },
         ChdConversionTransaction {
@@ -612,6 +638,160 @@ pub fn execute_chd_conversion(
             staged_path: staged,
         },
     ))
+}
+
+fn transaction_failure(detail: String) -> ChdConversionError {
+    ChdConversionError::Transaction(RepairExecutionError::Apply(detail))
+}
+
+/// Accepts an apply only when the journaled transaction itself settled.
+///
+/// The shared engine returns `Ok` with the transaction in `ApplyFailed` when
+/// an entry fails after the whole-batch preflight, so the outer `Ok` is never
+/// evidence of publication. Every one of the `expected` entries must be
+/// applied and re-verified at its destination - the same rule
+/// `wiiu_conversion` applies to its own publication.
+fn confirmed(
+    outcome: Result<RepairTransactionResult, RepairExecutionError>,
+    expected: usize,
+) -> Result<RepairTransactionResult, String> {
+    let result = outcome.map_err(|error| error.to_string())?;
+    if result.transaction.state == TransactionState::Applied
+        && result.summary.applied == expected
+        && result.summary.failed == 0
+        && result.reverify.len() == expected
+        && result
+            .reverify
+            .iter()
+            .all(|entry| entry.outcome == RepairReverifyOutcome::Verified)
+    {
+        return Ok(result);
+    }
+    let reasons = result
+        .transaction
+        .entries
+        .iter()
+        .filter_map(|entry| entry.failure_reason.as_deref())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "{} of {expected} move(s) applied, transaction state {:?}{}{reasons}",
+        result.summary.applied,
+        result.transaction.state,
+        if reasons.is_empty() { "" } else { ": " },
+    ))
+}
+
+/// Reverses whatever an unconfirmed transaction applied, reporting the
+/// outcome rather than hiding it. Failure cleanup must not be cancelled by
+/// the forward operation's flag; the reused rollback still requires identity
+/// and no-clobber proof for every reverse move.
+fn roll_back_unconfirmed(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+) -> (bool, String) {
+    if transaction.state == TransactionState::Planned {
+        // Refused before the engine journalled or moved anything.
+        return (true, "nothing was applied".into());
+    }
+    match rollback_repair_transaction(transaction, journal_dir, &AtomicBool::new(false)) {
+        Ok(RollbackResult::FullyRolledBack) => (true, "fully rolled back".into()),
+        Ok(other) => (
+            false,
+            format!("NOT fully rolled back, manual recovery required: {other:?}"),
+        ),
+        Err(error) => (
+            false,
+            format!("NOT rolled back, manual recovery required: {error}"),
+        ),
+    }
+}
+
+/// Whether the reviewed staged CHD is provably back in (or never left) its
+/// staging directory, so the disposable stage may be discarded. Anything
+/// else keeps the directory for the journal's recovery rules.
+fn staged_output_recovered(
+    staged: &Path,
+    staged_identity: &crate::dat::rename_apply::model::ObjectIdentity,
+) -> bool {
+    capture_identity(staged).ok().as_ref() == Some(staged_identity)
+}
+
+/// Why the originals were not quarantined, and what state they are in.
+struct SourceQuarantineFailure {
+    detail: String,
+    sources_restored: bool,
+    /// The quarantine transaction, kept only when its rollback did not prove
+    /// every original back in place, so [`rollback_chd_conversion`] and the
+    /// journal's recovery rules can still settle it.
+    unresolved: Option<RepairTransactionResult>,
+}
+
+/// Moves the reviewed CUE and BIN into quarantine as one unit. Either both
+/// moves are applied and re-verified, or whatever was moved is put back and
+/// the call fails.
+fn quarantine_sources(
+    plan: &ChdConversionPlan,
+    quarantine_root: &Path,
+    options: &RepairExecutionOptions,
+    cancel: &AtomicBool,
+) -> Result<RepairTransactionResult, SourceQuarantineFailure> {
+    // Nothing has moved until the transaction is applied.
+    let untouched = |detail: String| SourceQuarantineFailure {
+        detail: format!("source quarantine could not start ({detail}); no original was moved"),
+        sources_restored: true,
+        unresolved: None,
+    };
+    let dir = quarantine_root
+        .join(DISC_CONVERSION_QUARANTINE_SUBDIR)
+        .join(&plan.source_fingerprint.canonical_sha256[..16]);
+    fs::create_dir_all(&dir).map_err(|e| untouched(e.to_string()))?;
+    let p1 = proposal(
+        "chd-source-cue",
+        &plan.cue_path,
+        &dir.join(plan.cue_path.file_name().unwrap()),
+        "quarantine original CUE after verified conversion".into(),
+        &plan.cue_identity,
+    )
+    .map_err(|e| untouched(e.to_string()))?;
+    let p2 = proposal(
+        "chd-source-bin",
+        &plan.bin_path,
+        &dir.join(plan.bin_path.file_name().unwrap()),
+        "quarantine original BIN after verified conversion".into(),
+        &plan.bin_identity,
+    )
+    .map_err(|e| untouched(e.to_string()))?;
+    let source_plan = plan_for_moves(
+        &format!("chd-conversion-source-{}", now_unix()),
+        vec![p1, p2],
+    )
+    .map_err(|e| untouched(e.to_string()))?;
+    let mut tx = build_repair_transaction(&source_plan).map_err(|e| untouched(e.to_string()))?;
+    let outcome = apply_repair_transaction(&mut RepairApplyExecution {
+        transaction: &mut tx,
+        current_generation: 0,
+        options,
+        cancel,
+    });
+    // Kept so an incomplete rollback still hands the caller the transaction.
+    let attempted = outcome.as_ref().ok().cloned();
+    confirmed(outcome, 2).map_err(|detail| {
+        let (sources_restored, rollback) = roll_back_unconfirmed(&mut tx, &options.journal_dir);
+        SourceQuarantineFailure {
+            detail: format!(
+                "source quarantine was not confirmed ({detail}); source rollback: {rollback}"
+            ),
+            sources_restored,
+            unresolved: (!sources_restored)
+                .then_some(attempted)
+                .flatten()
+                .map(|mut result| {
+                    result.transaction = tx.clone();
+                    result
+                }),
+        }
+    })
 }
 
 pub fn rollback_chd_conversion(

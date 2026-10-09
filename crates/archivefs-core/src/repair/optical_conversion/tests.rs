@@ -744,3 +744,286 @@ fn metadata_only_cue_edits_after_preview_are_stale_before_the_converter() {
         assert!(!dir.path().join("journal").exists(), "{change}");
     }
 }
+
+// --- Transaction-state discipline -------------------------------------------
+//
+// The shared apply engine returns `Ok` with the journaled transaction in
+// `ApplyFailed` when an entry fails after the whole-batch preflight. These
+// tests force that inner failure through the executor's pre-rename seam and
+// prove conversion never treats the outer `Ok` as publication or quarantine.
+
+use crate::dat::rename_apply::executor::set_test_before_rename_hook;
+
+const BLOCKED_TARGET_NAME: &str = "converted.chd";
+const FOREIGN_BYTES: &[u8] = b"foreign object that appeared during apply";
+
+fn staging_leftovers(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(DISC_CONVERSION_STAGING_PREFIX)
+        })
+        .collect()
+}
+
+/// Occupies the reviewed target between the whole-batch preflight and the
+/// no-clobber rename of the staged CHD (`<dir>/.emuwiz-chd-*/output.chd`).
+fn occupy_target_before_output_rename(staged: &Path) {
+    let dir = staged.parent().unwrap().parent().unwrap();
+    std::fs::write(dir.join(BLOCKED_TARGET_NAME), FOREIGN_BYTES).unwrap();
+}
+
+#[test]
+fn failed_output_publication_is_an_error_and_never_quarantines_the_source() {
+    if !chdman_available() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let (cue, bin) = source(dir.path());
+    let target = dir.path().join(BLOCKED_TARGET_NAME);
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &target,
+        ChdConversionSourceMode::QuarantineSource,
+        Some(std::path::Path::new("/usr/bin/chdman")),
+    )
+    .unwrap();
+    let before_cue = std::fs::read(&cue).unwrap();
+    let before_bin = std::fs::read(&bin).unwrap();
+
+    set_test_before_rename_hook(Some(occupy_target_before_output_rename));
+    let outcome = execute_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([dir.path()]),
+        &dir.path().join("journal"),
+        dir.path(),
+        &AtomicBool::new(false),
+    );
+    set_test_before_rename_hook(None);
+
+    let error = outcome.expect_err("an unpublished CHD must never be reported as a conversion");
+    assert!(
+        matches!(error, ChdConversionError::Transaction(_)),
+        "{error:?}"
+    );
+    // The original media is exactly where and what it was.
+    assert_eq!(std::fs::read(&cue).unwrap(), before_cue);
+    assert_eq!(std::fs::read(&bin).unwrap(), before_bin);
+    assert!(
+        !dir.path().join(DISC_CONVERSION_QUARANTINE_SUBDIR).exists(),
+        "no source quarantine may be attempted after a failed publication"
+    );
+    // The object at the target is the foreign one, untouched; it is not ours.
+    assert_eq!(std::fs::read(&target).unwrap(), FOREIGN_BYTES);
+    assert_eq!(staging_leftovers(dir.path()), Vec::<PathBuf>::new());
+}
+
+#[test]
+fn failed_output_publication_is_not_completed_by_the_safe_lane() {
+    if !chdman_available() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let (cue, bin) = source(dir.path());
+    let target = dir.path().join(BLOCKED_TARGET_NAME);
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &target,
+        ChdConversionSourceMode::KeepSource,
+        Some(std::path::Path::new("/usr/bin/chdman")),
+    )
+    .unwrap();
+    let before_cue = std::fs::read(&cue).unwrap();
+    let before_bin = std::fs::read(&bin).unwrap();
+
+    set_test_before_rename_hook(Some(occupy_target_before_output_rename));
+    let outcome = execute_safe_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([dir.path()]),
+        &dir.path().join("journal"),
+        dir.path(),
+        &AtomicBool::new(false),
+    );
+    set_test_before_rename_hook(None);
+
+    // A foreign file at the destination must never be measured and reported
+    // as the `Completed` conversion output.
+    let error = outcome.expect_err("a foreign destination is not a completed conversion");
+    assert!(
+        matches!(error, ChdConversionError::Transaction(_)),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), FOREIGN_BYTES);
+    assert_eq!(std::fs::read(&cue).unwrap(), before_cue);
+    assert_eq!(std::fs::read(&bin).unwrap(), before_bin);
+    assert_eq!(staging_leftovers(dir.path()), Vec::<PathBuf>::new());
+}
+
+thread_local! {
+    static SOURCE_QUARANTINE_MOVES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Lets the staged output and the first source move through, then occupies
+/// the second source's quarantine destination so that move fails after the
+/// first source has already left the library. The seam is one-shot, so it
+/// re-arms itself until then.
+fn occupy_second_source_quarantine_destination(moving: &Path) {
+    let parent = moving.parent().unwrap();
+    let is_staged_output = parent
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with(DISC_CONVERSION_STAGING_PREFIX);
+    if !is_staged_output {
+        let seen = SOURCE_QUARANTINE_MOVES.with(|moves| {
+            moves.set(moves.get() + 1);
+            moves.get()
+        });
+        if seen == 2 {
+            let bucket = std::fs::read_dir(parent.join(DISC_CONVERSION_QUARANTINE_SUBDIR))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::write(bucket.join(moving.file_name().unwrap()), FOREIGN_BYTES).unwrap();
+            return;
+        }
+    }
+    set_test_before_rename_hook(Some(occupy_second_source_quarantine_destination));
+}
+
+#[test]
+fn failed_source_quarantine_restores_sources_keeps_the_chd_and_needs_attention() {
+    if !chdman_available() {
+        return;
+    }
+    let dir = tempdir().unwrap();
+    let (cue, bin) = source(dir.path());
+    let target = dir.path().join("converted.chd");
+    let journal = dir.path().join("journal");
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &target,
+        ChdConversionSourceMode::QuarantineSource,
+        Some(std::path::Path::new("/usr/bin/chdman")),
+    )
+    .unwrap();
+    let before_cue = std::fs::read(&cue).unwrap();
+    let before_bin = std::fs::read(&bin).unwrap();
+
+    SOURCE_QUARANTINE_MOVES.with(|moves| moves.set(0));
+    set_test_before_rename_hook(Some(occupy_second_source_quarantine_destination));
+    let outcome = execute_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([dir.path()]),
+        &journal,
+        dir.path(),
+        &AtomicBool::new(false),
+    );
+    set_test_before_rename_hook(None);
+
+    // The scenario really happened: one source moved, the second was refused.
+    assert_eq!(SOURCE_QUARANTINE_MOVES.with(std::cell::Cell::get), 2);
+    let (result, mut transaction) =
+        outcome.expect("a verified, published CHD is kept when source cleanup fails");
+
+    // Typed partial success: never an ordinary completed replacement.
+    assert!(result.needs_attention());
+    assert!(!result.source_quarantined);
+    let ChdSourceCleanup::QuarantineFailed {
+        detail,
+        sources_restored,
+    } = &result.source_cleanup
+    else {
+        panic!("{:?}", result.source_cleanup);
+    };
+    assert!(*sources_restored, "{detail}");
+    assert!(detail.contains("fully rolled back"), "{detail}");
+    assert!(transaction.source_quarantine.is_none());
+
+    // The source that had already moved is back; both are byte-identical.
+    assert_eq!(std::fs::read(&cue).unwrap(), before_cue);
+    assert_eq!(std::fs::read(&bin).unwrap(), before_bin);
+    // Nothing of the original pair is left behind in quarantine.
+    let bucket = std::fs::read_dir(dir.path().join(DISC_CONVERSION_QUARANTINE_SUBDIR))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let quarantined: Vec<Vec<u8>> = std::fs::read_dir(&bucket)
+        .unwrap()
+        .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+        .collect();
+    assert_eq!(quarantined, vec![FOREIGN_BYTES.to_vec()]);
+
+    // The verified CHD stays published and is the reviewed conversion.
+    assert_eq!(result.target_path, target);
+    assert_eq!(
+        compare_optical_fingerprints(
+            &result.source_fingerprint,
+            &fingerprint_chd(&target).unwrap()
+        ),
+        OpticalFingerprintComparison::Equivalent
+    );
+    assert_eq!(
+        transaction.output.transaction.state,
+        crate::dat::rename_apply::model::TransactionState::Applied
+    );
+    assert_eq!(
+        result.transaction_id,
+        transaction.output.transaction.transaction_id
+    );
+
+    // It remains manageable afterwards through the ordinary Undo path.
+    rollback_chd_conversion(&mut transaction, &journal, &AtomicBool::new(false)).unwrap();
+    assert!(!target.exists());
+    assert_eq!(std::fs::read(&cue).unwrap(), before_cue);
+    assert_eq!(std::fs::read(&bin).unwrap(), before_bin);
+}
+
+#[test]
+fn completed_modes_report_their_source_cleanup_without_needing_attention() {
+    if !chdman_available() {
+        return;
+    }
+    for (mode, expected) in [
+        (
+            ChdConversionSourceMode::KeepSource,
+            ChdSourceCleanup::NotRequested,
+        ),
+        (
+            ChdConversionSourceMode::QuarantineSource,
+            ChdSourceCleanup::Quarantined,
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let (cue, _) = source(dir.path());
+        let plan = build_chd_conversion_plan(
+            &cue,
+            &dir.path().join("converted.chd"),
+            mode,
+            Some(std::path::Path::new("/usr/bin/chdman")),
+        )
+        .unwrap();
+        let (result, _) = execute_chd_conversion(
+            &plan,
+            TrustedRoots::from_paths([dir.path()]),
+            &dir.path().join("journal"),
+            dir.path(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(result.source_cleanup, expected);
+        assert!(!result.needs_attention());
+        assert_eq!(
+            result.source_quarantined,
+            mode == ChdConversionSourceMode::QuarantineSource
+        );
+    }
+}
