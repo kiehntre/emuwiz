@@ -23,9 +23,11 @@ use archivefs_core::dat::mame_merged_reconstruction::{
     MAME_RECONSTRUCTION_WORKFLOW, MameMergedReconstructionPlan, apply_staged_reconstruction_output,
     build_merged_reconstruction_plan, discover_packed_zip_sources, reconstruction_family_names,
 };
-use archivefs_core::dat::rename_apply::model::{RenameTransaction, TransactionState};
+use archivefs_core::dat::rename_apply::model::{
+    EntryState, RenameTransaction, RollbackResult, TransactionState,
+};
 use archivefs_core::dat::rename_apply::{
-    default_rename_transaction_dir, rollback_transaction_confined,
+    ApplyOutcome, RollbackOutcome, default_rename_transaction_dir, rollback_transaction_confined,
 };
 use archivefs_core::dat::rom_organisation::OrganisationMode;
 use archivefs_core::safe_read::TrustedRoots;
@@ -603,6 +605,38 @@ fn is_mame_reconstruction(transaction: &RenameTransaction) -> bool {
         == Some(MAME_RECONSTRUCTION_WORKFLOW)
 }
 
+/// A MAME publication succeeded only when its transaction ended `Applied` with
+/// every entry applied. Every other terminal state (failed, cancelled midway,
+/// still in flight, rolled back) is not a publication.
+fn mame_publication_succeeded(transaction: &RenameTransaction) -> bool {
+    transaction.state == TransactionState::Applied
+        && !transaction.entries.is_empty()
+        && transaction
+            .entries
+            .iter()
+            .all(|entry| entry.state == EntryState::Applied)
+}
+
+/// The recorded reasons a transaction did not complete, for the operator.
+fn mame_failure_reasons(transaction: &RenameTransaction) -> String {
+    let reasons = transaction
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .failure_reason
+                .iter()
+                .chain(entry.preflight_failures.iter())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", reasons.join("; "))
+    }
+}
+
 fn load_mame_history() -> Vec<RenameTransaction> {
     let Ok(journal_dir) = default_rename_transaction_dir() else {
         return Vec::new();
@@ -662,18 +696,40 @@ impl OrganisationState {
             }
         };
         let staging_root = mame_staging_root(&root);
-        match apply_staged_reconstruction_output(&plan, &staging_root, &journal_dir) {
+        let result = apply_staged_reconstruction_output(&plan, &staging_root, &journal_dir);
+        self.record_mame_publication(&plan.destination, result);
+    }
+
+    fn record_mame_publication(
+        &mut self,
+        destination: &std::path::Path,
+        result: Result<ApplyOutcome, String>,
+    ) {
+        match result {
             Ok(outcome) => {
+                // `Ok` only means the executor ran and journaled its result.
+                // Whether anything was published is the transaction's own state.
                 let transaction = outcome.transaction;
+                let message = if mame_publication_succeeded(&transaction) {
+                    format!(
+                        "Published {} with staged verification complete. The source archives were not changed; recovery is available from this transaction's journal.",
+                        destination.display()
+                    )
+                } else {
+                    format!(
+                        "MAME publication did not complete: transaction {} ended as \"{}\"{}. {} is not reported as published. The source archives were not changed; the transaction is kept in the MAME rebuild history below for review and recovery.",
+                        transaction.transaction_id,
+                        transaction.state.label(),
+                        mame_failure_reasons(&transaction),
+                        destination.display()
+                    )
+                };
                 self.mame_history
                     .retain(|item| item.transaction_id != transaction.transaction_id);
                 self.mame_history.push(transaction);
                 self.mame_confirmation.clear();
                 self.mame_publish_pending = false;
-                self.mame_message = Some(format!(
-                    "Published {} with staged verification complete. The source archives were not changed; recovery is available from this transaction's journal.",
-                    plan.destination.display()
-                ));
+                self.mame_message = Some(message);
             }
             Err(error) => {
                 self.mame_history = load_mame_history();
@@ -721,19 +777,45 @@ impl OrganisationState {
             }
         };
         let cancel = AtomicBool::new(false);
-        match rollback_transaction_confined(
+        let result = rollback_transaction_confined(
             &mut transaction,
             &journal_dir,
             &cancel,
             &TrustedRoots::from_paths([staging_root.as_path(), &destination_parent]),
-        ) {
+        );
+        self.record_mame_undo(index, result);
+    }
+
+    fn record_mame_undo(&mut self, index: usize, result: Result<RollbackOutcome, String>) {
+        match result {
             Ok(outcome) => {
+                // As with publication, `Ok` carries the rollback's own result.
+                let rolled_back = matches!(outcome.result, RollbackResult::FullyRolledBack)
+                    && outcome.transaction.state == TransactionState::RolledBack;
+                let message = if rolled_back {
+                    "MAME reconstruction was rolled back safely; the source archives were not touched.".to_string()
+                } else {
+                    let failed = outcome
+                        .result
+                        .failed()
+                        .into_iter()
+                        .map(|(path, reason)| format!("{} ({reason})", path.display()))
+                        .collect::<Vec<_>>();
+                    format!(
+                        "MAME undo did not complete: transaction {} ended as \"{}\"{}. The generated destination may still be present; review this transaction before trying again. The source archives were not touched.",
+                        outcome.transaction.transaction_id,
+                        outcome.transaction.state.label(),
+                        if failed.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", failed.join("; "))
+                        }
+                    )
+                };
                 self.mame_history[index] = outcome.transaction;
                 self.mame_confirmation.clear();
                 self.mame_undo_pending = None;
-                self.mame_message = Some(
-                    "MAME reconstruction was rolled back safely; the source archives were not touched.".into(),
-                );
+                self.mame_message = Some(message);
             }
             Err(error) => {
                 self.mame_history = load_mame_history();
@@ -1365,6 +1447,276 @@ mod tests {
                 "missing reconstruction preview summary: {expected}"
             );
         }
+    }
+
+    /// A synthetic one-member reconstruction under a private temporary root.
+    struct MamePublishFixture {
+        root: tempfile::TempDir,
+        plan: MameMergedReconstructionPlan,
+        member: PathBuf,
+    }
+
+    impl MamePublishFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("source-set");
+            let output = root.path().join("output");
+            for dir in [&source, &output, &root.path().join("staging")] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::create_dir_all(root.path().join("journal")).unwrap();
+            let member = source.join("member.bin");
+            std::fs::write(&member, b"mame member").unwrap();
+            // SHA-1 of the member bytes written above.
+            let sha1 = String::from("d7683e1248fc7350d22a395549d2e6dd1933e6b8");
+            let mut plan = mame_plan(true);
+            plan.destination = output.join("pacman.zip");
+            plan.required_members = vec![
+                archivefs_core::dat::mame_merged_reconstruction::ReconstructionMemberRequirement {
+                    owner_set: "pacman".into(),
+                    member_name: "member.bin".into(),
+                    size_bytes: Some(11),
+                    sha1: Some(sha1.clone()),
+                    crc32: None,
+                },
+            ];
+            plan.sources = vec![
+                archivefs_core::dat::mame_merged_reconstruction::ReconstructionMemberSource {
+                    archive_identity: None,
+                    archive_path: source,
+                    member_path: member.clone(),
+                    current_name: "member.bin".into(),
+                    target_name: "member.bin".into(),
+                    observed_sha1: Some(sha1),
+                    observed_crc32: None,
+                },
+            ];
+            Self { root, plan, member }
+        }
+
+        fn journal(&self) -> PathBuf {
+            self.root.path().join("journal")
+        }
+
+        fn output(&self) -> PathBuf {
+            self.root.path().join("output")
+        }
+
+        /// The real core publication, exactly as `publish_mame` calls it.
+        fn publish(&self) -> Result<ApplyOutcome, String> {
+            apply_staged_reconstruction_output(
+                &self.plan,
+                &self.root.path().join("staging"),
+                &self.journal(),
+            )
+        }
+
+        /// The same call with the destination directory refusing new entries,
+        /// so the final rename fails after every preflight check has passed.
+        #[cfg(unix)]
+        fn publish_into_unwritable_destination(&self) -> Result<ApplyOutcome, String> {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |bits| std::fs::Permissions::from_mode(bits);
+            std::fs::set_permissions(self.output(), mode(0o555)).unwrap();
+            let result = self.publish();
+            std::fs::set_permissions(self.output(), mode(0o755)).unwrap();
+            result
+        }
+
+        fn journaled(&self) -> Vec<RenameTransaction> {
+            archivefs_core::dat::rename_apply::list_journals(&self.journal()).0
+        }
+    }
+
+    fn pending_publish_state(plan: &MameMergedReconstructionPlan) -> OrganisationState {
+        OrganisationState {
+            mame_plan: Some(plan.clone()),
+            mame_publish_pending: true,
+            mame_confirmation: mame_publish_confirmation_phrase(1),
+            ..OrganisationState::default()
+        }
+    }
+
+    #[test]
+    fn mame_publication_that_ends_applied_is_reported_as_published() {
+        let fixture = MamePublishFixture::new();
+        let mut state = pending_publish_state(&fixture.plan);
+        let result = fixture.publish();
+        assert_eq!(
+            result.as_ref().unwrap().transaction.state,
+            TransactionState::Applied
+        );
+        state.record_mame_publication(&fixture.plan.destination, result);
+
+        let message = state.mame_message.clone().unwrap();
+        assert!(message.starts_with("Published "), "{message}");
+        assert!(fixture.plan.destination.is_file());
+        assert_eq!(state.mame_history.len(), 1);
+        assert_eq!(state.mame_history[0].state, TransactionState::Applied);
+        assert!(!state.mame_publish_pending);
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(text.contains("Verified publication complete; undo is available."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mame_publication_that_ends_apply_failed_is_never_reported_as_published() {
+        let fixture = MamePublishFixture::new();
+        let mut state = pending_publish_state(&fixture.plan);
+        let result = fixture.publish_into_unwritable_destination();
+        // The executor reports this failure inside `Ok`.
+        let outcome = result.as_ref().expect("an Ok outcome");
+        assert_eq!(outcome.transaction.state, TransactionState::ApplyFailed);
+        let reason = outcome.transaction.entries[0]
+            .failure_reason
+            .clone()
+            .expect("the executor records why the rename failed");
+        let transaction_id = outcome.transaction.transaction_id.clone();
+        state.record_mame_publication(&fixture.plan.destination, result);
+
+        // No success wording, and the reason reaches the operator.
+        let message = state.mame_message.clone().unwrap();
+        assert!(!message.contains("Published "), "{message}");
+        assert!(!message.contains("verification complete"), "{message}");
+        assert!(message.contains("did not complete"), "{message}");
+        assert!(message.contains("Apply failed"), "{message}");
+        assert!(message.contains(&reason), "{message}");
+        assert!(message.contains(&transaction_id), "{message}");
+        assert!(!fixture.plan.destination.exists());
+        assert_eq!(std::fs::read(&fixture.member).unwrap(), b"mame member");
+
+        // The failed transaction stays visible and its journal is retained.
+        assert_eq!(state.mame_history.len(), 1);
+        assert_eq!(state.mame_history[0].state, TransactionState::ApplyFailed);
+        let journaled = fixture.journaled();
+        assert_eq!(journaled.len(), 1);
+        assert_eq!(journaled[0].transaction_id, transaction_id);
+        assert_eq!(journaled[0].state, TransactionState::ApplyFailed);
+
+        // The stale confirmation cannot be reused for a blind retry.
+        assert!(!state.mame_publish_pending);
+        assert!(state.mame_confirmation.is_empty());
+
+        let text = rendered_mame_text(&mut state).join("\n");
+        assert!(!text.contains("Published "), "{text}");
+        assert!(!text.contains("Verified publication complete"), "{text}");
+        assert!(text.contains("did not complete"), "{text}");
+        assert!(text.contains("Apply failed"), "{text}");
+        assert!(
+            text.contains(
+                "Recovery is required before this transaction can be considered complete."
+            )
+        );
+    }
+
+    #[test]
+    fn only_an_applied_mame_transaction_with_every_entry_applied_is_a_publication() {
+        let fixture = MamePublishFixture::new();
+        let applied = fixture.publish().unwrap().transaction;
+        assert!(mame_publication_succeeded(&applied));
+        for state in [
+            TransactionState::Planned,
+            TransactionState::Applying,
+            TransactionState::ApplyFailed,
+            TransactionState::RollingBack,
+            TransactionState::RolledBack,
+            TransactionState::RollbackFailed,
+        ] {
+            let mut transaction = applied.clone();
+            transaction.state = state;
+            assert!(!mame_publication_succeeded(&transaction), "{state:?}");
+        }
+        // A cancelled or skipped entry is not a publication, whatever the
+        // transaction-level state claims.
+        for entry_state in [
+            EntryState::Planned,
+            EntryState::Applying,
+            EntryState::ApplyFailed,
+            EntryState::Skipped,
+            EntryState::RolledBack,
+        ] {
+            let mut transaction = applied.clone();
+            transaction.entries[0].state = entry_state;
+            assert!(!mame_publication_succeeded(&transaction), "{entry_state:?}");
+        }
+        let mut empty = applied.clone();
+        empty.entries.clear();
+        assert!(!mame_publication_succeeded(&empty));
+    }
+
+    #[test]
+    fn mame_publication_refusal_keeps_its_stopped_safely_wording() {
+        let mut fixture = MamePublishFixture::new();
+        // A staged member that fails verification is refused before any journal.
+        fixture.plan.required_members[0].sha1 =
+            Some("0000000000000000000000000000000000000000".into());
+        fixture.plan.sources[0].observed_sha1 =
+            Some("0000000000000000000000000000000000000000".into());
+        let mut state = pending_publish_state(&fixture.plan);
+        let result = fixture.publish();
+        assert!(result.is_err());
+        state.record_mame_publication(&fixture.plan.destination, result);
+        let message = state.mame_message.clone().unwrap();
+        assert!(
+            message.starts_with("MAME publication stopped safely before claiming success: "),
+            "{message}"
+        );
+        assert!(!fixture.plan.destination.exists());
+        assert!(fixture.journaled().is_empty());
+    }
+
+    #[test]
+    fn mame_undo_that_fully_rolls_back_is_reported_as_rolled_back() {
+        let fixture = MamePublishFixture::new();
+        let mut state = OrganisationState::default();
+        state.record_mame_publication(&fixture.plan.destination, fixture.publish());
+        let mut transaction = state.mame_history[0].clone();
+        let result = rollback_transaction_confined(
+            &mut transaction,
+            &fixture.journal(),
+            &AtomicBool::new(false),
+            &TrustedRoots::from_paths([fixture.root.path().join("staging"), fixture.output()]),
+        );
+        state.record_mame_undo(0, result);
+        let message = state.mame_message.clone().unwrap();
+        assert!(
+            message.starts_with("MAME reconstruction was rolled back safely"),
+            "{message}"
+        );
+        assert_eq!(state.mame_history[0].state, TransactionState::RolledBack);
+        assert!(!fixture.plan.destination.exists());
+    }
+
+    #[test]
+    fn mame_undo_whose_rollback_did_not_complete_is_never_reported_as_rolled_back() {
+        let fixture = MamePublishFixture::new();
+        let mut state = OrganisationState::default();
+        state.record_mame_publication(&fixture.plan.destination, fixture.publish());
+        // The published output is changed afterwards, so undo must not remove it.
+        std::fs::write(&fixture.plan.destination, b"changed by the user").unwrap();
+        let mut transaction = state.mame_history[0].clone();
+        let result = rollback_transaction_confined(
+            &mut transaction,
+            &fixture.journal(),
+            &AtomicBool::new(false),
+            &TrustedRoots::from_paths([fixture.root.path().join("staging"), fixture.output()]),
+        );
+        let outcome = result
+            .as_ref()
+            .expect("the rollback reports its failure inside Ok");
+        assert_ne!(outcome.transaction.state, TransactionState::RolledBack);
+        state.mame_undo_pending = Some(outcome.transaction.transaction_id.clone());
+        state.record_mame_undo(0, result);
+
+        let message = state.mame_message.clone().unwrap();
+        assert!(!message.contains("rolled back safely"), "{message}");
+        assert!(message.contains("did not complete"), "{message}");
+        assert_ne!(state.mame_history[0].state, TransactionState::RolledBack);
+        assert_eq!(
+            std::fs::read(&fixture.plan.destination).unwrap(),
+            b"changed by the user"
+        );
+        assert_eq!(fixture.journaled().len(), 1);
     }
 
     #[test]

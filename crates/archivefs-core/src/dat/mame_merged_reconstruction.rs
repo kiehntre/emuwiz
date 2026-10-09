@@ -1575,6 +1575,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The executor reports a publication that failed after preflight as
+    /// `Ok(ApplyOutcome)` whose transaction is `ApplyFailed`, so the outer
+    /// `Result` alone never proves that anything was published.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_publication_is_an_ok_outcome_whose_transaction_is_apply_failed() {
+        use crate::dat::rename_apply::journal::list_journals;
+        use crate::dat::rename_apply::model::{EntryState, TransactionState};
+        use sha1::Digest;
+        use std::os::unix::fs::PermissionsExt;
+
+        let digest = sha1::Sha1::digest(b"mame member")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let (plan, root, member_path) = publish_fixture(&digest);
+        let staging = root.join("staging");
+        let journal = root.join("journal");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&journal).unwrap();
+        // The destination directory refuses new entries, so the final rename
+        // fails after every preflight check has passed.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = apply_staged_reconstruction_output(&plan, &staging, &journal);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let outcome = result.expect("the executor reports this failure inside Ok");
+        assert_eq!(outcome.transaction.state, TransactionState::ApplyFailed);
+        assert_eq!(
+            outcome.transaction.entries[0].state,
+            EntryState::ApplyFailed
+        );
+        assert!(outcome.transaction.entries[0].failure_reason.is_some());
+        assert_eq!(outcome.summary.applied, 0);
+        assert_eq!(outcome.summary.failed, 1);
+        assert!(!plan.destination.exists());
+        assert_eq!(std::fs::read(&member_path).unwrap(), b"mame member");
+        // The failed transaction stays in the recovery journal for diagnosis.
+        let (journals, problems) = list_journals(&journal);
+        assert!(problems.is_empty());
+        assert_eq!(journals.len(), 1);
+        assert_eq!(journals[0].state, TransactionState::ApplyFailed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn failed_staged_verification_never_publishes_the_destination() {
         let (mut plan, root, member_path) =
