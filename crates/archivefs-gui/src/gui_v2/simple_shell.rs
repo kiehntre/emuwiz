@@ -14,6 +14,8 @@
 //! exactly the existing one. When it is on, **All Tools** restores the complete
 //! existing navigation at any time.
 
+use std::sync::Arc;
+
 use eframe::egui;
 
 use super::routes::{Route, Section};
@@ -27,14 +29,24 @@ pub(super) const UI_SCALE_STEP: f32 = 0.1;
 /// Presentation state. `enabled` and `ui_scale` are saved preferences;
 /// `all_tools` is a per-session view switch and is never persisted, so a
 /// restart always returns to the short sidebar.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// This type owns the context style while Simple is on. It remembers the
+/// complete classic style it replaced and restores that exact value when
+/// Simple is turned off, and it re-asserts the blue profile whenever anything
+/// else restyles the context (the embedded workflow host calls
+/// `readable_style` when it is first built).
+#[derive(Clone, Debug)]
 pub(super) struct ShellState {
     pub enabled: bool,
     pub all_tools: bool,
     pub ui_scale: f32,
-    /// What was last applied to the egui context, so the style is only rebuilt
-    /// when a preference actually changes.
-    applied: Option<(bool, f32)>,
+    /// The complete style in force when Simple was turned on.
+    classic: Option<Arc<egui::Style>>,
+    /// The blue style this type installed, as the context holds it. A
+    /// different pointer in the context means something else restyled it.
+    blue: Option<Arc<egui::Style>>,
+    /// The zoom last requested, so it is only set when it changes.
+    zoom: Option<f32>,
 }
 
 impl Default for ShellState {
@@ -43,7 +55,9 @@ impl Default for ShellState {
             enabled: false,
             all_tools: false,
             ui_scale: 1.0,
-            applied: None,
+            classic: None,
+            blue: None,
+            zoom: None,
         }
     }
 }
@@ -58,23 +72,42 @@ impl ShellState {
         self.ui_scale = clamp_scale(scale);
     }
 
-    /// Applies the palette and scale if they changed. With Simple off this
-    /// restores the stock v2 style and a scale of exactly 1.0.
+    /// Keeps the context style and zoom in step with the preference. Cheap
+    /// when nothing changed: one pointer comparison per frame.
+    ///
+    /// With Simple never turned on this touches nothing, so the default
+    /// interface is exactly the host's.
     pub fn sync_style(&mut self, context: &egui::Context) {
-        let wanted = (self.enabled, if self.enabled { self.ui_scale } else { 1.0 });
-        if self.applied == Some(wanted) {
-            return;
-        }
-        // The first frame with Simple off must not touch a context the host
-        // already styled.
-        if self.applied.is_some() || self.enabled {
-            super::readable_style(context);
-            if self.enabled {
-                apply_blue(context);
+        if self.enabled {
+            let current = context.style();
+            let ours = self
+                .blue
+                .as_ref()
+                .is_some_and(|blue| Arc::ptr_eq(blue, &current));
+            if !ours {
+                // First frame after turning on: `current` is the classic
+                // style. Later: something restyled the context under us, and
+                // the classic style already remembered is still the truth.
+                let classic = self.classic.get_or_insert(current).clone();
+                let mut style = (*classic).clone();
+                blue_style(&mut style);
+                context.set_style(style);
+                self.blue = Some(context.style());
             }
-            context.set_zoom_factor(wanted.1);
+            self.set_zoom(context, self.ui_scale);
+        } else if let Some(classic) = self.classic.take() {
+            // Every slot the blue profile touched, restored at once.
+            context.set_style(classic);
+            self.blue = None;
+            self.set_zoom(context, 1.0);
         }
-        self.applied = Some(wanted);
+    }
+
+    fn set_zoom(&mut self, context: &egui::Context, zoom: f32) {
+        if self.zoom != Some(zoom) {
+            context.set_zoom_factor(zoom);
+            self.zoom = Some(zoom);
+        }
     }
 }
 
@@ -559,8 +592,10 @@ pub(super) const PAGE_TITLE_SIZE: f32 = 32.0;
 const CORNER_RADIUS: u8 = 12;
 const ICON_SIDE: f32 = 22.0;
 
-fn apply_blue(context: &egui::Context) {
-    context.style_mut(|style| {
+/// Turns a classic style into the blue profile. Works on a value, never on
+/// the live context, so the result is the same whatever happened in between.
+fn blue_style(style: &mut egui::Style) {
+    {
         style.text_styles.insert(
             egui::TextStyle::Heading,
             egui::FontId::proportional(PAGE_TITLE_SIZE),
@@ -605,7 +640,7 @@ fn apply_blue(context: &egui::Context) {
         visuals.window_corner_radius = radius;
         visuals.menu_corner_radius = radius;
         visuals.window_stroke = egui::Stroke::new(1.0_f32, palette::BORDER_SUBTLE);
-    });
+    }
 }
 
 pub(super) fn sidebar_frame() -> egui::Frame {
@@ -748,60 +783,105 @@ pub(super) fn show_sidebar(
 ) -> Option<Destination> {
     let selected = destination_for(current);
     let mut chosen = None;
+    let narrow = ui.available_width() < 190.0;
     ui.horizontal(|ui| {
         if let Some(texture) = mascot {
+            let side = if narrow { 36.0 } else { 46.0 };
             ui.add(
-                egui::Image::new((texture.id(), egui::vec2(46.0, 46.0)))
+                egui::Image::new((texture.id(), egui::vec2(side, side)))
                     .sense(egui::Sense::hover()),
             );
         }
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            ui.label(egui::RichText::new("EmuWiz").size(26.0).strong());
             ui.label(
-                egui::RichText::new("Play More. Manage Better.")
-                    .size(12.5)
-                    .color(palette::SECONDARY_TEXT),
+                egui::RichText::new("EmuWiz")
+                    .size(if narrow { 22.0 } else { 26.0 })
+                    .strong(),
+            );
+            // Wraps rather than running under the sidebar edge.
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("Play More. Manage Better.")
+                        .size(12.5)
+                        .color(palette::SECONDARY_TEXT),
+                )
+                .wrap(),
             );
         });
     });
-    ui.add_space(18.0);
-    ui.spacing_mut().item_spacing.y = 6.0;
-    for destination in DESTINATIONS {
-        if nav_item(ui, destination, selected == Some(destination)).clicked() {
-            chosen = Some(destination);
-        }
-    }
-    if selected.is_none() {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(format!(
-                "You are in All Tools: {}",
-                current.section().title()
-            ))
+    ui.add_space(if narrow { 10.0 } else { 18.0 });
+    // The destinations scroll when the window is short or the interface is
+    // enlarged; the version footer keeps its place below them. Nothing is
+    // dropped: a row that does not fit is one wheel turn or Tab away.
+    let rows = (ui.available_height() - FOOTER_HEIGHT).max(NAV_TARGET_HEIGHT);
+    egui::ScrollArea::vertical()
+        .id_salt("v2_simple_destinations")
+        .max_height(rows)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for destination in DESTINATIONS {
+                if nav_item(ui, destination, selected == Some(destination)).clicked() {
+                    chosen = Some(destination);
+                }
+            }
+            if selected.is_none() {
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "You are in All Tools: {}",
+                            current.section().title()
+                        ))
+                        .size(14.0)
+                        .color(palette::SECONDARY_TEXT),
+                    )
+                    .wrap(),
+                );
+            }
+        });
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(concat!("EmuWiz v", env!("CARGO_PKG_VERSION")))
             .size(14.0)
             .color(palette::SECONDARY_TEXT),
-        );
-    }
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(concat!("EmuWiz v", env!("CARGO_PKG_VERSION")))
-                .size(14.0)
-                .color(palette::SECONDARY_TEXT),
-        );
-    });
+    );
     chosen
+}
+
+/// The stable identity of a destination's sidebar row (focus, tests).
+pub(super) fn nav_id(destination: Destination) -> egui::Id {
+    egui::Id::new(("v2_simple_destination", destination))
+}
+
+const FOOTER_HEIGHT: f32 = 30.0;
+const NAV_LABEL_SIZE: f32 = 17.0;
+const NAV_LABEL_MIN_SIZE: f32 = 12.5;
+
+/// Where a row's icon and label go, and how large the label is, for a row of
+/// `width`. The reference spacing when it fits; tighter, then smaller, when
+/// the sidebar is narrow or the interface is enlarged - never cut off.
+fn nav_metrics(width: f32, label_width_at_full_size: f32) -> (f32, f32, f32) {
+    const RIGHT_PAD: f32 = 10.0;
+    for (icon_x, text_x) in [(30.0, 66.0), (22.0, 48.0)] {
+        if label_width_at_full_size <= width - text_x - RIGHT_PAD {
+            return (icon_x, text_x, NAV_LABEL_SIZE);
+        }
+    }
+    let room = (width - 48.0 - RIGHT_PAD).max(1.0);
+    let size = (NAV_LABEL_SIZE * room / label_width_at_full_size)
+        .clamp(NAV_LABEL_MIN_SIZE, NAV_LABEL_SIZE);
+    // Whole-ish steps keep text crisp.
+    (22.0, 48.0, (size * 2.0).floor() / 2.0)
 }
 
 /// One navigation row: transparent until hovered, a dim blue pill with a
 /// bright left edge when selected. A real focusable button for the keyboard
 /// and for assistive technology.
 fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), NAV_TARGET_HEIGHT),
-        egui::Sense::click(),
-    );
+    let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), NAV_TARGET_HEIGHT));
+    let response = ui.interact(rect, nav_id(destination), egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::Button,
@@ -810,6 +890,11 @@ fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui
             destination.label(),
         )
     });
+    // Keyboard focus must never land on a row that is scrolled out of view.
+    // Immediately, not eased: the row is on screen by the next frame.
+    if response.gained_focus() {
+        response.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
+    }
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if selected {
@@ -832,21 +917,26 @@ fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui
         } else {
             palette::SECONDARY_TEXT
         };
+        let full_width = painter
+            .layout_no_wrap(
+                destination.label().to_owned(),
+                egui::FontId::proportional(NAV_LABEL_SIZE),
+                color,
+            )
+            .size()
+            .x;
+        let (icon_x, text_x, size) = nav_metrics(rect.width(), full_width);
         let icon = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 30.0, rect.center().y),
+            egui::pos2(rect.left() + icon_x, rect.center().y),
             egui::vec2(ICON_SIDE, ICON_SIDE),
         );
         paint_icon(painter, destination, icon, color);
         painter.text(
-            egui::pos2(rect.left() + 66.0, rect.center().y),
+            egui::pos2(rect.left() + text_x, rect.center().y),
             egui::Align2::LEFT_CENTER,
             destination.label(),
-            egui::FontId::proportional(17.0),
-            if selected {
-                palette::PRIMARY_TEXT
-            } else {
-                color
-            },
+            egui::FontId::proportional(size),
+            color,
         );
         if response.has_focus() {
             painter.rect_stroke(
@@ -1351,30 +1441,73 @@ mod tests {
     }
 
     #[test]
-    fn style_is_untouched_until_simple_is_turned_on_and_restored_when_off() {
+    fn style_is_untouched_until_simple_is_turned_on_and_fully_restored_when_off() {
         let context = egui::Context::default();
-        let before = context.style().visuals.panel_fill;
+        crate::gui_v2::readable_style(&context);
+        let classic = (*context.style()).clone();
         let mut shell = ShellState::default();
         shell.sync_style(&context);
-        assert_eq!(context.style().visuals.panel_fill, before);
+        assert_eq!(*context.style(), classic);
         assert_eq!(context.zoom_factor(), 1.0);
 
-        shell.enabled = true;
-        shell.set_ui_scale(1.3);
-        shell.sync_style(&context);
-        // egui applies a requested zoom at the start of the next frame.
-        let _ = context.run(egui::RawInput::default(), |_| {});
-        assert_eq!(context.style().visuals.panel_fill, palette::APP_BACKGROUND);
-        assert!((context.zoom_factor() - 1.3).abs() < 1e-6);
+        for scale in [1.3, 0.8, 1.6] {
+            shell.enabled = true;
+            shell.set_ui_scale(scale);
+            shell.sync_style(&context);
+            // egui applies a requested zoom at the start of the next frame.
+            let _ = context.run(egui::RawInput::default(), |_| {});
+            assert_eq!(context.style().visuals.panel_fill, palette::APP_BACKGROUND);
+            assert_ne!(*context.style(), classic);
+            assert!((context.zoom_factor() - scale).abs() < 1e-6);
 
+            shell.enabled = false;
+            shell.sync_style(&context);
+            let _ = context.run(egui::RawInput::default(), |_| {});
+            // The whole style, not selected fields.
+            assert_eq!(*context.style(), classic);
+            assert_eq!(context.zoom_factor(), 1.0);
+        }
+    }
+
+    #[test]
+    fn an_outside_restyle_is_corrected_without_forgetting_classic() {
+        let context = egui::Context::default();
+        crate::gui_v2::readable_style(&context);
+        let classic = (*context.style()).clone();
+        let mut shell = ShellState {
+            enabled: true,
+            ..Default::default()
+        };
+        shell.sync_style(&context);
+        let blue = (*context.style()).clone();
+        // What the embedded workflow host does when it is first built.
+        crate::gui_v2::readable_style(&context);
+        assert_ne!(*context.style(), blue);
+        shell.sync_style(&context);
+        assert_eq!(*context.style(), blue);
+        // A settled frame changes nothing further.
+        let held = context.style();
+        shell.sync_style(&context);
+        assert!(Arc::ptr_eq(&held, &context.style()));
         shell.enabled = false;
         shell.sync_style(&context);
-        let _ = context.run(egui::RawInput::default(), |_| {});
-        assert_eq!(
-            context.style().visuals.panel_fill,
-            crate::ui::theme::APP_BACKGROUND
-        );
-        assert_eq!(context.zoom_factor(), 1.0);
+        assert_eq!(*context.style(), classic);
+    }
+
+    #[test]
+    fn navigation_labels_tighten_then_shrink_but_never_overrun_the_row() {
+        // Roomy: the reference spacing at full size.
+        assert_eq!(nav_metrics(216.0, 118.0), (30.0, 66.0, NAV_LABEL_SIZE));
+        // Narrow: tighter spacing first...
+        assert_eq!(nav_metrics(172.0, 110.0), (22.0, 48.0, NAV_LABEL_SIZE));
+        // ...then a smaller label, within the readable floor.
+        for (width, label) in [(172.0, 122.0), (150.0, 122.0), (120.0, 122.0)] {
+            let (_, text_x, size) = nav_metrics(width, label);
+            assert!((NAV_LABEL_MIN_SIZE..=NAV_LABEL_SIZE).contains(&size));
+            if size > NAV_LABEL_MIN_SIZE {
+                assert!(text_x + label * size / NAV_LABEL_SIZE <= width - 9.5);
+            }
+        }
     }
 
     #[test]

@@ -431,3 +431,293 @@ fn manage_library_cards_are_keyboard_reachable() {
         "cards reached by Tab then Enter"
     );
 }
+
+// ---- review corrections: zoomed navigation, palette lifecycle, exact classic ----
+
+/// The window size in points for a 1024x640 pixel window at `scale`.
+fn small_window_at(scale: f32) -> [f32; 2] {
+    [1024.0 / scale, 640.0 / scale]
+}
+
+fn scaled(context: &egui::Context, scale: f32) -> App {
+    let mut app = simple(context);
+    app.simple.set_ui_scale(scale);
+    app
+}
+
+fn key_press(context: &egui::Context, app: &mut App, size: [f32; 2], key: egui::Key) {
+    for pressed in [true, false] {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(size[0], size[1]),
+                )),
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+    }
+}
+
+#[test]
+fn every_destination_is_keyboard_reachable_and_shown_when_focused_at_every_scale() {
+    use crate::gui_v2::simple_shell::nav_id;
+    for scale in [0.8, 1.0, 1.25, 1.6] {
+        let size = small_window_at(scale);
+        let context = egui::Context::default();
+        let mut app = scaled(&context, scale);
+        // Somewhere no sidebar row opens, so any arrival is from the keyboard.
+        app.router.current = Route::Section(Section::Tape);
+        frame(&context, &mut app, size);
+        let mut reached = Vec::new();
+        // Tab through the window. Enter is pressed only while a sidebar row
+        // holds the focus, so no control on the page behind is activated.
+        for _ in 0..24 {
+            key_press(&context, &mut app, size, egui::Key::Tab);
+            let focused = context.memory(|memory| memory.focused());
+            let Some(destination) = DESTINATIONS
+                .iter()
+                .copied()
+                .find(|destination| focused == Some(nav_id(*destination)))
+            else {
+                continue;
+            };
+            if reached.contains(&destination.label()) {
+                break;
+            }
+            // The focused row must be on screen, inside the sidebar.
+            let layout = frame(&context, &mut app, size);
+            let row = text_bounds(&layout, destination.label())
+                .into_iter()
+                .find(|rect| rect.min.x < 100.0)
+                .unwrap_or_else(|| {
+                    panic!("{} was focused off screen at {scale}", destination.label())
+                });
+            assert!(
+                row.min.y >= 0.0 && row.max.y <= size[1],
+                "{} focused outside the window at {scale}",
+                destination.label()
+            );
+            key_press(&context, &mut app, size, egui::Key::Enter);
+            assert_eq!(
+                app.router.current,
+                destination.route(),
+                "Enter on {} at {scale}",
+                destination.label()
+            );
+            reached.push(destination.label());
+        }
+        let expected: Vec<_> = DESTINATIONS.iter().map(|d| d.label()).collect();
+        assert_eq!(reached, expected, "keyboard reach at scale {scale}");
+    }
+}
+
+#[test]
+fn every_destination_is_mouse_reachable_by_scrolling_the_sidebar_at_every_scale() {
+    for scale in [0.8, 1.0, 1.25, 1.6] {
+        let size = small_window_at(scale);
+        for destination in DESTINATIONS {
+            let context = egui::Context::default();
+            let mut app = scaled(&context, scale);
+            app.router.current = Route::Section(Section::Tape);
+            frame(&context, &mut app, size);
+            let over_sidebar = egui::pos2(60.0, size[1] * 0.6);
+            // Click the row if it is showing; otherwise wheel down over the
+            // sidebar and look again, as a person would.
+            for _ in 0..14 {
+                let bounds = text_bounds(&frame(&context, &mut app, size), destination.label());
+                if let Some(row) = bounds.iter().find(|rect| rect.min.x < 100.0) {
+                    click_at(&context, &mut app, size, row.center());
+                    if app.router.current == destination.route() {
+                        break;
+                    }
+                }
+                let _ = context.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(size[0], size[1]),
+                        )),
+                        events: vec![
+                            egui::Event::PointerMoved(over_sidebar),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, -40.0),
+                                phase: egui::TouchPhase::Move,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |context| app.show(context),
+                );
+                frame(&context, &mut app, size);
+            }
+            assert_eq!(
+                app.router.current,
+                destination.route(),
+                "{} not reachable by mouse at {scale}",
+                destination.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn sidebar_labels_are_never_cut_off_by_the_sidebar_edge() {
+    use crate::gui_v2::simple_shell::{SIDEBAR_WIDTH, SIDEBAR_WIDTH_NARROW};
+    for scale in [0.8, 1.0, 1.25, 1.6] {
+        for window in [[1024.0, 640.0], [1672.0, 941.0]] {
+            let size = [window[0] / scale, window[1] / scale];
+            let context = egui::Context::default();
+            let mut app = scaled(&context, scale);
+            frame(&context, &mut app, size);
+            let layout = frame(&context, &mut app, size);
+            let edge = if size[0] < 900.0 {
+                SIDEBAR_WIDTH_NARROW
+            } else {
+                SIDEBAR_WIDTH
+            };
+            for destination in DESTINATIONS {
+                for rect in text_bounds(&layout, destination.label()) {
+                    // Sidebar rows only; the page may repeat a label.
+                    if rect.min.x < 100.0 {
+                        assert!(
+                            rect.max.x <= edge - 6.0,
+                            "{} runs to {} past the {edge} sidebar at {scale}, {window:?}",
+                            destination.label(),
+                            rect.max.x
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn blue(context: &egui::Context) -> bool {
+    let style = context.style();
+    style.visuals.panel_fill == palette::APP_BACKGROUND
+        && style.visuals.faint_bg_color == palette::CARD_SURFACE
+        && style.text_styles[&egui::TextStyle::Heading].size
+            == crate::gui_v2::simple_shell::PAGE_TITLE_SIZE
+}
+
+#[test]
+fn the_blue_profile_survives_every_route_including_embedded_workflows() {
+    let context = egui::Context::default();
+    let mut app = simple(&context);
+    let mut visit = |app: &mut App, route: Route| {
+        app.router.current = route.clone();
+        frame(&context, app, DESKTOP);
+        frame(&context, app, DESKTOP);
+        assert!(blue(&context), "palette lost on {route:?}");
+    };
+    visit(&mut app, Destination::ManageLibrary.route());
+    // Cheats & Mods builds the embedded workflow host, which restyles the context.
+    visit(&mut app, Destination::CheatsMods.route());
+    visit(&mut app, Route::Home);
+    for section in crate::gui_v2::routes::SECTIONS {
+        visit(&mut app, Route::Section(*section));
+        visit(&mut app, Route::Home);
+    }
+    // All Tools and back keep it too.
+    app.simple.all_tools = true;
+    visit(&mut app, Destination::CheatsMods.route());
+    app.simple.all_tools = false;
+    visit(&mut app, Route::Home);
+    // Something else restyling the context mid-session is corrected next frame.
+    readable_style(&context);
+    visit(&mut app, Route::Home);
+}
+
+/// A context styled exactly as a fresh classic GUI v2 window.
+fn fresh_classic() -> egui::Style {
+    let context = egui::Context::default();
+    readable_style(&context);
+    (*context.style()).clone()
+}
+
+/// Asserts `context` carries the complete classic style: every field of a
+/// fresh classic window. egui compares a style's number formatter by pointer,
+/// and each context makes its own, so that one slot is aligned first.
+#[track_caller]
+fn assert_classic(context: &egui::Context, classic: &egui::Style, when: &str) {
+    let mut expected = classic.clone();
+    expected.number_formatter = context.style().number_formatter.clone();
+    assert_eq!(*context.style(), expected, "{when}");
+}
+
+#[test]
+fn turning_simple_off_restores_the_complete_classic_style() {
+    let classic = fresh_classic();
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    frame(&context, &mut app, DESKTOP);
+    assert_classic(&context, &classic, "default-off start");
+
+    for round in 0..4 {
+        app.simple.enabled = true;
+        app.simple.set_ui_scale(1.0 + 0.2 * round as f32);
+        // Visit pages in both modes, including the one that restyles the context.
+        for route in [
+            Route::Home,
+            Destination::CheatsMods.route(),
+            Destination::ManageLibrary.route(),
+            Route::Section(Section::Settings),
+        ] {
+            app.router.current = route;
+            frame(&context, &mut app, DESKTOP);
+            frame(&context, &mut app, DESKTOP);
+            assert!(blue(&context), "round {round}");
+        }
+        app.simple.enabled = false;
+        for route in [
+            Route::Section(Section::Settings),
+            Destination::CheatsMods.route(),
+            Route::Home,
+        ] {
+            app.router.current = route;
+            frame(&context, &mut app, DESKTOP);
+            frame(&context, &mut app, DESKTOP);
+            assert_classic(
+                &context,
+                &classic,
+                &format!("round {round}: classic not restored"),
+            );
+            assert_eq!(context.zoom_factor(), 1.0);
+        }
+    }
+}
+
+#[test]
+fn a_session_restored_with_simple_on_can_still_return_to_exact_classic() {
+    // On restart the saved preference arrives after the window was styled.
+    let classic = fresh_classic();
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    frame(&context, &mut app, DESKTOP);
+    app.simple.enabled = true;
+    app.simple.set_ui_scale(1.6);
+    frame(&context, &mut app, DESKTOP);
+    frame(&context, &mut app, DESKTOP);
+    assert!(blue(&context));
+    assert!((context.zoom_factor() - 1.6).abs() < 1e-6);
+    app.simple.enabled = false;
+    frame(&context, &mut app, DESKTOP);
+    frame(&context, &mut app, DESKTOP);
+    assert_classic(
+        &context,
+        &classic,
+        "after a restored Simple session is turned off",
+    );
+    assert_eq!(context.zoom_factor(), 1.0);
+}
