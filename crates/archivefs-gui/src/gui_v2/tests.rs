@@ -123,6 +123,7 @@ fn fixture(context: &egui::Context) -> App {
         equiv: Default::default(),
         storage: Default::default(),
         multi: Default::default(),
+        simple: Default::default(),
     }
 }
 
@@ -2764,6 +2765,8 @@ fn gui_v2_preferences_round_trip_is_separate_from_legacy_mode() {
             document_roots: Vec::new(),
             document_associations: std::collections::BTreeMap::new(),
             document_reading: std::collections::BTreeMap::new(),
+            simple_shell: false,
+            ui_scale: 1.0,
         },
     )
     .unwrap();
@@ -9119,3 +9122,5 @@ mod history_page {
         assert_eq!(all.matches("Preview undo").count(), 2);
     }
 }
+
+mod simple_shell_ui;

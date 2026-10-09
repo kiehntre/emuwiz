@@ -173,7 +173,7 @@ impl App {
                     )
                 });
                 let hovered = response.hovered();
-                ui.painter().rect_filled(rect, 10.0, theme::CARD_SURFACE);
+                ui.painter().rect_filled(rect, 10.0, theme::card_fill(ui));
                 ui.painter().rect_stroke(
                     rect,
                     10.0,
@@ -189,7 +189,7 @@ impl App {
                     rect.min + egui::vec2(6.0, 6.0),
                     egui::vec2(rect.width() - 12.0, 96.0),
                 );
-                ui.painter().rect_filled(plate, 8.0, theme::DEEP_BACKGROUND);
+                ui.painter().rect_filled(plate, 8.0, theme::deep_fill(ui));
                 self.imagery
                     .paint_platform(ui, plate.shrink(6.0), platform, egui::Color32::WHITE);
                 let name = ui.painter().layout(
@@ -350,7 +350,7 @@ impl App {
         let mut choice = None;
 
         egui::Frame::new()
-            .fill(theme::CARD_SURFACE)
+            .fill(theme::card_fill(ui))
             .stroke(theme::border(ui))
             .corner_radius(10)
             .inner_margin(egui::Margin::same(10))
@@ -365,7 +365,7 @@ impl App {
                     };
                     let (plate, _) =
                         ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
-                    ui.painter().rect_filled(plate, 8.0, theme::DEEP_BACKGROUND);
+                    ui.painter().rect_filled(plate, 8.0, theme::deep_fill(ui));
                     self.imagery.paint_platform(
                         ui,
                         plate.shrink(8.0),

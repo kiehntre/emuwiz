@@ -362,7 +362,7 @@ pub(super) fn empty_state(
 ) -> bool {
     let mut clicked = false;
     egui::Frame::new()
-        .fill(theme::CARD_SURFACE)
+        .fill(theme::card_fill(ui))
         .stroke(theme::border(ui))
         .corner_radius(10)
         .inner_margin(egui::Margin::same(theme::SPACE_LG as i8))
@@ -372,7 +372,7 @@ pub(super) fn empty_state(
                 let side = 76.0;
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
-                ui.painter().rect_filled(rect, 10.0, theme::DEEP_BACKGROUND);
+                ui.painter().rect_filled(rect, 10.0, theme::deep_fill(ui));
                 let inner = rect.shrink(6.0);
                 match art {
                     EmptyArt::Mascot => {

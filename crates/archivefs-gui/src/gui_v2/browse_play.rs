@@ -378,9 +378,9 @@ impl App {
         let fill = if selected {
             theme::PRIMARY_ACTION
         } else if hovered {
-            theme::RAISED_SURFACE
+            theme::raised_fill(ui)
         } else {
-            theme::CARD_SURFACE
+            theme::card_fill(ui)
         };
         ui.painter().rect_filled(rect, 16.0, fill);
         ui.painter().rect_stroke(
@@ -391,7 +391,7 @@ impl App {
                 if selected {
                     theme::PRIMARY_ACTION_HOVER
                 } else {
-                    theme::BORDER_SUBTLE
+                    theme::border_color(ui)
                 },
             ),
             egui::StrokeKind::Inside,
@@ -525,9 +525,9 @@ impl App {
     fn card_background(ui: &egui::Ui, rect: egui::Rect, selected: bool, response: &egui::Response) {
         let hovered = response.hovered();
         let fill = if selected || hovered {
-            theme::RAISED_SURFACE
+            theme::raised_fill(ui)
         } else {
-            theme::CARD_SURFACE
+            theme::card_fill(ui)
         };
         ui.painter().rect_filled(rect, 10.0, fill);
         let stroke = if selected {
@@ -535,7 +535,7 @@ impl App {
         } else if hovered {
             egui::Stroke::new(1.0_f32, theme::BORDER_FOCUS)
         } else {
-            egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE)
+            theme::border(ui)
         };
         ui.painter()
             .rect_stroke(rect, 10.0, stroke, egui::StrokeKind::Inside);
@@ -647,8 +647,8 @@ impl App {
     fn browse_play_selected(&mut self, ui: &mut egui::Ui, game: &Game, compact: bool) {
         let id = game.archive.id;
         egui::Frame::new()
-            .fill(theme::CARD_SURFACE)
-            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+            .fill(theme::card_fill(ui))
+            .stroke(theme::border(ui))
             .corner_radius(10.0)
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
@@ -763,8 +763,8 @@ impl App {
 
     fn selected_game_prompt(ui: &mut egui::Ui) {
         egui::Frame::new()
-            .fill(theme::CARD_SURFACE)
-            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+            .fill(theme::card_fill(ui))
+            .stroke(theme::border(ui))
             .corner_radius(10.0)
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
@@ -779,8 +779,8 @@ impl App {
 
     fn browse_play_empty(&mut self, ui: &mut egui::Ui, library_empty: bool) {
         egui::Frame::new()
-            .fill(theme::CARD_SURFACE)
-            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_SUBTLE))
+            .fill(theme::card_fill(ui))
+            .stroke(theme::border(ui))
             .corner_radius(10.0)
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {

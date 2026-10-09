@@ -114,19 +114,77 @@ pub(crate) fn muted(ui: &egui::Ui) -> egui::Color32 {
     MUTED_TEXT
 }
 
+/// Whether the context carries the stock v2 palette set by [`apply`]. A scoped
+/// style profile (the opt-in Simple v1 shell) replaces these slots; the
+/// surface helpers below then follow it so page cards match the shell.
+fn stock_profile(ui: &egui::Ui) -> bool {
+    ui.visuals().faint_bg_color == CARD_SURFACE
+}
+
+/// Card surface. Exactly [`CARD_SURFACE`] under the stock palette.
 pub(crate) fn card_fill(ui: &egui::Ui) -> egui::Color32 {
-    let _ = ui;
-    CARD_SURFACE
+    ui.visuals().faint_bg_color
+}
+
+/// Raised/hovered surface. Exactly [`RAISED_SURFACE`] under the stock palette.
+pub(crate) fn raised_fill(ui: &egui::Ui) -> egui::Color32 {
+    if stock_profile(ui) {
+        RAISED_SURFACE
+    } else {
+        ui.visuals().widgets.inactive.weak_bg_fill
+    }
+}
+
+/// Recessed plate. Exactly [`DEEP_BACKGROUND`] under the stock palette.
+pub(crate) fn deep_fill(ui: &egui::Ui) -> egui::Color32 {
+    if stock_profile(ui) {
+        DEEP_BACKGROUND
+    } else {
+        ui.visuals().extreme_bg_color
+    }
+}
+
+/// Subtle border colour. Exactly [`BORDER_SUBTLE`] under the stock palette.
+pub(crate) fn border_color(ui: &egui::Ui) -> egui::Color32 {
+    if stock_profile(ui) {
+        BORDER_SUBTLE
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke.color
+    }
+}
+
+/// Emphasised border. Exactly [`BORDER_FOCUS`] under the stock palette.
+pub(crate) fn focus_border_color(ui: &egui::Ui) -> egui::Color32 {
+    if stock_profile(ui) {
+        BORDER_FOCUS
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke.color
+    }
 }
 
 pub(crate) fn border(ui: &egui::Ui) -> egui::Stroke {
-    let _ = ui;
-    egui::Stroke::new(1.0_f32, BORDER_SUBTLE)
+    egui::Stroke::new(1.0_f32, border_color(ui))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_helpers_are_the_stock_constants_under_the_stock_palette() {
+        let context = egui::Context::default();
+        apply(&context);
+        let _ = context.run(egui::RawInput::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| {
+                assert_eq!(card_fill(ui), CARD_SURFACE);
+                assert_eq!(raised_fill(ui), RAISED_SURFACE);
+                assert_eq!(deep_fill(ui), DEEP_BACKGROUND);
+                assert_eq!(border_color(ui), BORDER_SUBTLE);
+                assert_eq!(focus_border_color(ui), BORDER_FOCUS);
+                assert_eq!(border(ui), egui::Stroke::new(1.0_f32, BORDER_SUBTLE));
+            });
+        });
+    }
 
     #[test]
     fn semantic_palette_keeps_roles_distinct() {

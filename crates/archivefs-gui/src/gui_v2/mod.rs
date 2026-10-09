@@ -40,6 +40,7 @@ mod routes;
 mod saturn_manifest;
 mod saves_states;
 mod setup_portability;
+mod simple_shell;
 mod sources_providers;
 mod storage_review;
 #[cfg(test)]
@@ -350,6 +351,8 @@ pub(super) struct App {
     storage: storage_review::StorageState,
     reconcile: library_reconciliation::ReconcileState,
     multi: media_sets::MultiDiscState,
+    /// Simple v1 shell: presentation state only.
+    simple: simple_shell::ShellState,
 }
 
 impl App {
@@ -441,6 +444,7 @@ impl App {
             storage: Default::default(),
             reconcile: Default::default(),
             multi: Default::default(),
+            simple: Default::default(),
         };
         let environment_job = app.activity.queue(
             "Checking EmuWiz setup",
@@ -1603,6 +1607,8 @@ impl App {
                                     self.welcome_dismissed = preferences.welcome_dismissed;
                                     self.beginner_hints_enabled =
                                         preferences.beginner_hints_enabled;
+                                    self.simple.enabled = preferences.simple_shell;
+                                    self.simple.set_ui_scale(preferences.ui_scale);
                                     self.document_preferences.roots =
                                         preferences.document_roots.clone();
                                     self.document_preferences.associations =
@@ -1860,6 +1866,8 @@ impl App {
                     document_roots: self.document_preferences.roots.clone(),
                     document_associations: self.document_preferences.associations.clone(),
                     document_reading: self.document_preferences.reading.clone(),
+                    simple_shell: self.simple.enabled,
+                    ui_scale: self.simple.ui_scale,
                 }),
             );
         }

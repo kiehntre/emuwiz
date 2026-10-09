@@ -39,6 +39,16 @@ pub(super) struct Preferences {
     pub document_associations: BTreeMap<PathBuf, i64>,
     #[serde(default)]
     pub document_reading: BTreeMap<PathBuf, crate::gui_v2::documents::DocumentReadingState>,
+    /// Opt-in Simple v1 shell. Off unless the person turns it on in Settings.
+    #[serde(default)]
+    pub simple_shell: bool,
+    /// Interface scale used with the Simple v1 shell; 1.0 when absent.
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+}
+
+fn default_ui_scale() -> f32 {
+    1.0
 }
 
 fn default_beginner_hints_enabled() -> bool {
@@ -55,6 +65,8 @@ impl Default for Preferences {
             document_roots: Vec::new(),
             document_associations: BTreeMap::new(),
             document_reading: BTreeMap::new(),
+            simple_shell: false,
+            ui_scale: 1.0,
         }
     }
 }

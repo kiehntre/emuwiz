@@ -296,6 +296,8 @@ impl App {
         }
     }
     pub(super) fn show(&mut self, context: &egui::Context) {
+        // Presentation only: a no-op unless the Simple v1 preference changed.
+        self.simple.sync_style(context);
         if self.show_manual_viewer(context) {
             return;
         }
@@ -395,94 +397,129 @@ impl App {
                 }
             }
         });
-        self.app_chrome(context);
+        // Classic: the header spans the window. Simple: the sidebar runs the
+        // full height and the header starts beside it, so it is added first.
+        if !self.simple.simple_navigation() {
+            self.app_chrome(context);
+        }
         let sidebar_width = if context.content_rect().width() < 900.0 {
             178.0
         } else {
             230.0
         };
-        egui::SidePanel::left("v2_navigation")
-            .exact_width(sidebar_width)
-            .resizable(false)
-            .show(context, |ui| {
-                ui.heading("EmuWiz");
-                ui.label("Your game library");
-                ui.push_id("v2_sidebar_browse_play", |ui| {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 40.0],
-                            egui::Button::new("Browse & Play")
-                                .selected(matches!(
-                                    self.router.current,
-                                    Route::BrowsePlay | Route::BrowsePlayGame(_)
-                                ))
-                                .wrap(),
-                        )
-                        .clicked()
-                    {
-                        self.go(Route::BrowsePlay);
-                    }
+        if self.simple.simple_navigation() {
+            // Seven destinations over the same routes; All Tools (in the
+            // header) restores the complete navigation below.
+            let width = if context.content_rect().width() < 900.0 {
+                super::simple_shell::SIDEBAR_WIDTH_NARROW
+            } else {
+                super::simple_shell::SIDEBAR_WIDTH
+            };
+            let mut chosen = None;
+            // The bundled badge, through the existing off-thread loader.
+            let mascot = self.imagery.mascot(context).cloned();
+            egui::SidePanel::left("v2_simple_navigation")
+                .exact_width(width)
+                .resizable(false)
+                .frame(super::simple_shell::sidebar_frame())
+                .show(context, |ui| {
+                    chosen = super::simple_shell::show_sidebar(
+                        ui,
+                        &self.router.current,
+                        mascot.as_ref(),
+                    );
                 });
-                egui::ScrollArea::vertical()
-                    .id_salt("v2_sidebar_scroll")
-                    .show(ui, |ui| {
-                        // One heading per group, followed by all of its entries;
-                        // ungrouped entries keep their position.
-                        let mut shown_groups: Vec<&str> = Vec::new();
-                        let mut ordered: Vec<Section> = Vec::new();
-                        for section in SECTIONS {
-                            match section.group() {
-                                None => ordered.push(*section),
-                                Some(group) if !shown_groups.contains(&group) => {
-                                    shown_groups.push(group);
-                                    ordered.extend(
-                                        SECTIONS
-                                            .iter()
-                                            .copied()
-                                            .filter(|other| other.group() == Some(group)),
-                                    );
-                                }
-                                Some(_) => {}
-                            }
+            self.app_chrome(context);
+            if let Some(destination) = chosen {
+                self.go(destination.route());
+            }
+        } else {
+            egui::SidePanel::left("v2_navigation")
+                .exact_width(sidebar_width)
+                .resizable(false)
+                .show(context, |ui| {
+                    ui.heading("EmuWiz");
+                    ui.label("Your game library");
+                    ui.push_id("v2_sidebar_browse_play", |ui| {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 40.0],
+                                egui::Button::new("Browse & Play")
+                                    .selected(matches!(
+                                        self.router.current,
+                                        Route::BrowsePlay | Route::BrowsePlayGame(_)
+                                    ))
+                                    .wrap(),
+                            )
+                            .clicked()
+                        {
+                            self.go(Route::BrowsePlay);
                         }
-                        let mut current_group: Option<&str> = None;
-                        for section in &ordered {
-                            if let Some(group) = section.group()
-                                && current_group != Some(group)
-                            {
-                                ui.separator();
-                                ui.strong(group);
-                            }
-                            current_group = section.group();
-                            // Browse & Play has its own button above; it must not also
-                            // light up the older Games catalogue entry.
-                            let selected = self.router.current.section() == *section
-                                && !matches!(
-                                    self.router.current,
-                                    Route::BrowsePlay | Route::BrowsePlayGame(_)
-                                );
-                            ui.push_id(("v2_sidebar_section", *section), |ui| {
-                                if ui
-                                    .add_sized(
-                                        [ui.available_width(), 40.0],
-                                        egui::Button::new(section.sidebar_title())
-                                            .selected(selected)
-                                            .wrap(),
-                                    )
-                                    .clicked()
-                                {
-                                    self.go(if *section == Section::Home {
-                                        Route::Home
-                                    } else {
-                                        Route::Section(*section)
-                                    });
-                                }
-                            });
-                        }
-                        ui.label("Tab: move focus\nEnter: open\nAlt+Left: back");
                     });
-            });
+                    egui::ScrollArea::vertical()
+                        .id_salt("v2_sidebar_scroll")
+                        .show(ui, |ui| {
+                            // One heading per group, followed by all of its entries;
+                            // ungrouped entries keep their position.
+                            let mut shown_groups: Vec<&str> = Vec::new();
+                            let mut ordered: Vec<Section> = Vec::new();
+                            for section in SECTIONS {
+                                match section.group() {
+                                    None => ordered.push(*section),
+                                    Some(group) if !shown_groups.contains(&group) => {
+                                        shown_groups.push(group);
+                                        ordered.extend(
+                                            SECTIONS
+                                                .iter()
+                                                .copied()
+                                                .filter(|other| other.group() == Some(group)),
+                                        );
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
+                            let mut current_group: Option<&str> = None;
+                            for section in &ordered {
+                                if let Some(group) = section.group()
+                                    && current_group != Some(group)
+                                {
+                                    ui.separator();
+                                    ui.strong(group);
+                                }
+                                current_group = section.group();
+                                // Browse & Play has its own button above; it must not also
+                                // light up the older Games catalogue entry.
+                                let selected = self.router.current.section() == *section
+                                    && !matches!(
+                                        self.router.current,
+                                        Route::BrowsePlay | Route::BrowsePlayGame(_)
+                                    );
+                                ui.push_id(("v2_sidebar_section", *section), |ui| {
+                                    if ui
+                                        .add_sized(
+                                            [ui.available_width(), 40.0],
+                                            egui::Button::new(section.sidebar_title())
+                                                .selected(selected)
+                                                .wrap(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.go(if *section == Section::Home {
+                                            Route::Home
+                                        } else {
+                                            Route::Section(*section)
+                                        });
+                                    }
+                                });
+                            }
+                            ui.label("Tab: move focus\nEnter: open\nAlt+Left: back");
+                        });
+                });
+        }
         egui::CentralPanel::default().show(context, |ui| {
+            if self.simple.simple_navigation() {
+                self.simple_breadcrumbs(ui);
+            }
             self.page_header(ui);
             if let Some(notice) = &self.notice {
                 let mut dismiss = false;
@@ -574,6 +611,15 @@ impl App {
                         } => self.history(ui),
                         Route::Section(Section::Settings) => self.settings(ui),
                         Route::Section(Section::Advanced) => self.advanced(ui),
+                        // Simple view only: the same location is the Manage
+                        // Library hub. All Tools shows the overview below.
+                        Route::Section(Section::OrganisationFamily)
+                            if self.simple.simple_navigation() =>
+                        {
+                            if let Some(section) = super::simple_shell::show_manage_library(ui) {
+                                self.go(Route::Section(section));
+                            }
+                        }
                         Route::Section(
                             section @ (Section::DatVerification
                             | Section::CheatsMods
@@ -721,6 +767,10 @@ impl App {
     }
 
     fn app_chrome(&mut self, context: &egui::Context) {
+        if self.simple.simple_navigation() {
+            self.simple_header(context);
+            return;
+        }
         let route = self.router.current.clone();
         let game_title = route
             .game()
@@ -773,6 +823,15 @@ impl App {
                     });
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Reached only in All Tools; the way back to the short view.
+                    if self.simple.enabled
+                        && ui
+                            .button("Simple view")
+                            .on_hover_text("Return to the seven main destinations.")
+                            .clicked()
+                    {
+                        self.simple.all_tools = false;
+                    }
                     // Keep the popup inside the window; the list scrolls when it cannot fit.
                     let popup_height = (ui.ctx().content_rect().height() - 90.0).max(120.0);
                     ui.menu_button("Jump to…", |ui| {
@@ -809,7 +868,168 @@ impl App {
         });
     }
 
+    /// Simple v1 header: a wide search on the left that feeds the existing
+    /// library filter, and the outlined All Tools button on the right. Back,
+    /// Home and Jump to are not repeated here; the sidebar, the breadcrumb row
+    /// and the existing shortcuts (Escape, Alt+Left, Alt+Home) cover them.
+    fn simple_header(&mut self, context: &egui::Context) {
+        use super::simple_shell::{self, palette};
+        egui::TopBottomPanel::top("v2_simple_header")
+            .exact_height(simple_shell::HEADER_HEIGHT)
+            .frame(simple_shell::header_frame())
+            .show(context, |ui| {
+                ui.horizontal_centered(|ui| {
+                    let width = simple_shell::search_width(ui.available_width());
+                    let field = egui::Frame::new()
+                        .fill(palette::DEEP_BACKGROUND)
+                        .stroke(egui::Stroke::new(1.0_f32, palette::BORDER_SUBTLE))
+                        .corner_radius(8)
+                        .inner_margin(egui::Margin::symmetric(12, 6))
+                        .show(ui, |ui| {
+                            let (icon, _) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                            simple_shell::paint_search_icon(
+                                ui.painter(),
+                                icon.center(),
+                                palette::SECONDARY_TEXT,
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.filter.search)
+                                    .hint_text("Search your games or systems…")
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(width - 60.0),
+                            )
+                        });
+                    let response = field.inner;
+                    if response.changed() {
+                        self.change_filter();
+                    }
+                    if response.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        && !matches!(
+                            self.router.current,
+                            Route::BrowsePlay | Route::BrowsePlayGame(_)
+                        )
+                    {
+                        // The results live in the existing Browse & Play view.
+                        self.go(Route::BrowsePlay);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if simple_shell::all_tools_button(ui).clicked() {
+                            self.simple.all_tools = true;
+                        }
+                    });
+                });
+            });
+    }
+
+    /// Simple v1: the location trail sits under the header on contextual
+    /// pages (anything deeper than a top-level destination), with Back.
+    fn simple_breadcrumbs(&mut self, ui: &mut egui::Ui) {
+        let route = self.router.current.clone();
+        let game_title = route
+            .game()
+            .and_then(|id| self.library.game(id))
+            .map(|game| game.title.as_str());
+        let breadcrumbs = breadcrumb_labels(&route, game_title);
+        if breadcrumbs.len() < 2 {
+            return;
+        }
+        ui.push_id("v2_simple_breadcrumbs", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if self.router.can_back()
+                    && ui
+                        .link("‹ Back")
+                        .on_hover_text("Return to the previous location (Alt+Left).")
+                        .clicked()
+                {
+                    self.back();
+                }
+                let muted = super::simple_shell::palette::SECONDARY_TEXT;
+                for (index, label) in breadcrumbs.iter().enumerate() {
+                    if index > 0 || self.router.can_back() {
+                        ui.label(egui::RichText::new("/").color(muted));
+                    }
+                    let last = index + 1 == breadcrumbs.len();
+                    if last && route.game().is_some() {
+                        if ui
+                            .link(egui::RichText::new(label).strong())
+                            .on_hover_text("Open Game Details.")
+                            .clicked()
+                            && let Some(id) = route.game()
+                        {
+                            self.go(Route::Game(id));
+                        }
+                    } else if last {
+                        ui.label(egui::RichText::new(label).strong());
+                    } else {
+                        ui.label(egui::RichText::new(label).color(muted));
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+    }
+
+    /// Settings controls for the opt-in Simple v1 shell.
+    fn simple_shell_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Simple view (preview)");
+        ui.label("A shorter sidebar with seven destinations and a blue colour scheme. It changes how EmuWiz looks, not what it does: every tool stays available through All Tools at the top right.");
+        if ui
+            .checkbox(&mut self.simple.enabled, "Use the Simple view")
+            .changed()
+        {
+            self.simple.all_tools = false;
+            self.preferences_dirty = Some(std::time::Instant::now());
+        }
+        if self.simple.enabled {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Text and interface size: {}%",
+                    (self.simple.ui_scale * 100.0).round() as u32
+                ));
+                let step = super::simple_shell::UI_SCALE_STEP;
+                let mut scale = self.simple.ui_scale;
+                if ui
+                    .add_enabled(
+                        scale > super::simple_shell::UI_SCALE_MIN,
+                        egui::Button::new("Smaller"),
+                    )
+                    .clicked()
+                {
+                    scale -= step;
+                }
+                if ui
+                    .add_enabled(
+                        scale < super::simple_shell::UI_SCALE_MAX,
+                        egui::Button::new("Larger"),
+                    )
+                    .clicked()
+                {
+                    scale += step;
+                }
+                if ui.button("Reset size").clicked() {
+                    scale = 1.0;
+                }
+                if scale != self.simple.ui_scale {
+                    self.simple.set_ui_scale(scale);
+                    self.preferences_dirty = Some(std::time::Instant::now());
+                }
+            });
+        }
+        ui.separator();
+    }
+
     fn page_header(&mut self, ui: &mut egui::Ui) {
+        if self.simple.simple_navigation()
+            && self.router.current == Route::Section(Section::OrganisationFamily)
+        {
+            ui.heading(super::simple_shell::MANAGE_TITLE);
+            ui.label(super::simple_shell::MANAGE_PURPOSE);
+            ui.add_space(8.0);
+            return;
+        }
         let family = family_for_route(&self.router.current);
         let title = match &self.router.current {
             Route::BrowsePlay | Route::BrowsePlayGame(_) => "Browse & Play",
@@ -1215,7 +1435,7 @@ impl App {
         self.ensure_artwork_index();
         let key = self.artwork.request(game.archive.id, kind);
         if let Some(Picture::Ready { texture, .. }) = self.artwork.pictures.get(&key) {
-            ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
+            ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
             let aspect = texture.size_vec2();
             let factor = (size.x / aspect.x).min(size.y / aspect.y);
             let target = egui::Rect::from_center_size(rect.center(), aspect * factor);
@@ -1228,7 +1448,7 @@ impl App {
         } else {
             // No cover (yet): the game's own platform hardware, dimmed, on the
             // same plate, so an uncovered shelf still reads as distinct systems.
-            ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
+            ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
             ui.painter()
                 .rect_stroke(rect, 8.0, theme::border(ui), egui::StrokeKind::Inside);
             let label = super::artwork::picture_label(
@@ -1706,7 +1926,7 @@ impl App {
     fn duplicates_hero(&mut self, ui: &mut egui::Ui) {
         let wide = ui.available_width() >= 620.0;
         egui::Frame::new()
-            .fill(theme::CARD_SURFACE)
+            .fill(theme::card_fill(ui))
             .stroke(egui::Stroke::new(
                 1.0_f32,
                 theme::PRIMARY_ACTION.gamma_multiply(0.45),
@@ -1751,14 +1971,14 @@ impl App {
                             motif.left_top() + egui::vec2(70.0, 11.0),
                             egui::vec2(48.0, 44.0),
                         );
-                        painter.rect_filled(left, 6.0, theme::DEEP_BACKGROUND);
+                        painter.rect_filled(left, 6.0, theme::deep_fill(ui));
                         painter.rect_stroke(
                             left,
                             6.0,
                             egui::Stroke::new(2.0_f32, theme::PRIMARY_ACTION),
                             egui::StrokeKind::Inside,
                         );
-                        painter.rect_filled(right, 6.0, theme::DEEP_BACKGROUND);
+                        painter.rect_filled(right, 6.0, theme::deep_fill(ui));
                         painter.rect_stroke(
                             right,
                             6.0,
@@ -1877,7 +2097,7 @@ impl App {
                 ui,
                 move |ui, size| {
                     let rect = ui.max_rect().shrink(5.0);
-                    ui.painter().rect_filled(rect, 8.0, theme::DEEP_BACKGROUND);
+                    ui.painter().rect_filled(rect, 8.0, theme::deep_fill(ui));
                     ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0_f32, theme::TEAL.gamma_multiply(0.65)), egui::StrokeKind::Inside);
                     ui.painter().rect_stroke(rect.shrink(10.0), 3.0, egui::Stroke::new(1.0_f32, theme::PRIMARY_ACTION.gamma_multiply(0.65)), egui::StrokeKind::Inside);
                     if let Some(mascot) = mascot {
@@ -3100,6 +3320,7 @@ impl App {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
+        self.simple_shell_settings(ui);
         self.setup_portability.render(ui);
         ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
         ui.separator();

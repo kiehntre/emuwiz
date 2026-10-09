@@ -598,8 +598,8 @@ pub(crate) fn folder_picker(ui: &mut egui::Ui, label: &str, value: &mut String) 
 /// hierarchy while leaving all actions and state decisions to the caller.
 pub(crate) fn hero_card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
-        .fill(theme::RAISED_SURFACE)
-        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER_FOCUS))
+        .fill(theme::raised_fill(ui))
+        .stroke(egui::Stroke::new(1.0_f32, theme::focus_border_color(ui)))
         .corner_radius(10)
         .inner_margin(egui::Margin::same(theme::SPACE_SM as i8))
         .show(ui, add_contents)
