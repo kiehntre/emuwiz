@@ -391,12 +391,21 @@ pub fn attach_amiga_floppy(
     record: &mut MediaRecord,
     inspection: &crate::amiga_disk::AmigaFloppyInspection,
 ) {
-    let mut e = MediaEvidence::new(EvidenceKind::Embedded, "existing Amiga OFS/FFS inspection");
+    let validated = inspection.filesystem().is_some();
+    let mut e = MediaEvidence::new(
+        if validated {
+            EvidenceKind::Embedded
+        } else {
+            EvidenceKind::Metadata
+        },
+        "existing Amiga floppy inspection",
+    );
     e.side_layout = Some(SideLayout::WholeMedium);
-    e.notes.push(format!(
-        "Validated {:?}; volume label {:?}; the label is descriptive, not a release ID",
-        inspection.filesystem.family, inspection.filesystem.volume_label
-    ));
+    e.notes.push(inspection.description());
+    e.notes.push(
+        "Media evidence supplies no game or release identity; a volume label is descriptive only"
+            .into(),
+    );
     if record
         .platform
         .as_deref()
@@ -406,7 +415,7 @@ pub fn attach_amiga_floppy(
         .is_some_and(|p| p.id != "Amiga")
     {
         e.notes
-            .push("Conflicting supplied platform and validated Amiga filesystem".into());
+            .push("Conflicting supplied platform and Amiga floppy evidence".into());
     } else {
         record.platform = Some("Amiga".into());
     }

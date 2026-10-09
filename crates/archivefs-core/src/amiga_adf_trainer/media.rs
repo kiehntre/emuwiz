@@ -45,7 +45,10 @@ impl std::fmt::Display for AdfMediaError {
             Self::Io(m) => write!(f, "could not read the image: {m}"),
             Self::NotARegularFile => f.write_str("not a regular file"),
             Self::TooLarge { len, max } => write!(f, "image is {len} bytes; limit is {max}"),
-            Self::NotAnAmigaFloppy(m) => write!(f, "not a valid AmigaDOS floppy: {m}"),
+            Self::NotAnAmigaFloppy(m) => write!(
+                f,
+                "ADF trainer requires a validated AmigaDOS filesystem: {m}"
+            ),
             Self::ChangedWhileReading => f.write_str("the image changed while it was read"),
         }
     }
@@ -174,6 +177,10 @@ pub fn inspect_adf_media(
     // Structure first: an extension is never trusted.
     let floppy =
         inspect_amiga_floppy(path).map_err(|e| AdfMediaError::NotAnAmigaFloppy(e.to_string()))?;
+    // Plausible media is not authority for the existing trainer contract.
+    let filesystem = floppy
+        .filesystem()
+        .ok_or_else(|| AdfMediaError::NotAnAmigaFloppy(floppy.description()))?;
     let mut file = fs::File::open(path).map_err(|e| AdfMediaError::Io(e.to_string()))?;
     let mut bytes = Vec::new();
     (&mut file)
@@ -201,13 +208,13 @@ pub fn inspect_adf_media(
         path: path.to_path_buf(),
         len: bytes.len() as u64,
         sha256,
-        dos_family: match floppy.filesystem.family {
+        dos_family: match filesystem.family {
             AmigaDosFamily::Ofs => "OFS",
             AmigaDosFamily::Ffs => "FFS",
         },
-        volume_label: floppy
-            .filesystem
+        volume_label: filesystem
             .volume_label
+            .clone()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty()),
         alternate: catalogue_name.map_or(AlternateMedia::NoFlag, classify_alternate_media),

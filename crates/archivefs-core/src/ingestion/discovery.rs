@@ -286,13 +286,13 @@ impl SkipReasonCounts {
 /// One structural lineage observation produced during discovery, paired
 /// with the file it describes.
 ///
-/// This is how a bytes-validated structural fact from discovery enters the
+/// This is how content-derived media evidence from discovery enters the
 /// existing identity pipeline
 /// ([`crate::platform_evidence_fusion::evidence_lineage`]) without discovery
 /// itself resolving identity. Currently only
-/// [`structural_amiga_floppy_observation`] for a `.adf` whose OFS/FFS
-/// structures validated - a `Strong` `Amiga` platform candidate, never an
-/// exact release (see that function's own contract).
+/// [`structural_amiga_floppy_observation`] for raw ADF or decompressed ADZ:
+/// `Strong` when OFS/FFS validates, `Weak` for plausible floppy media. Both
+/// are platform candidates, never exact releases.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredStructuralEvidence {
     pub path: PathBuf,
@@ -308,7 +308,7 @@ pub struct SourceDiscoveryReport {
     /// Structural lineage evidence gathered while classifying items - the
     /// `.adf` content-inspection path's own
     /// [`structural_amiga_floppy_observation`] output, one per validated
-    /// Amiga floppy. Empty when no such file was seen.
+    /// or plausible Amiga floppy. Empty when no such file was seen.
     pub structural_evidence: Vec<DiscoveredStructuralEvidence>,
     pub archive_evidence: Vec<ArchiveListingEvidence>,
     pub reuse: DiscoveryReuseStats,
@@ -1536,8 +1536,8 @@ fn amiga_explanation(disk: &AmigaDisk) -> String {
 /// is Amiga-specific - it is a real cross-platform extension collision:
 /// Acorn ADFS / Archimedes floppy images use `.adf` too (see the `Amiga`
 /// platform's `conflicts_with`). It has therefore always been classified
-/// mainly by extension and weak platform evidence, never by its own
-/// contents. This routes it through [`amiga_disk::inspect_amiga_floppy`],
+/// mainly by extension and weak platform evidence. This routes it through
+/// [`amiga_disk::inspect_amiga_floppy`],
 /// which reuses the existing bounded RDB / flat-AmigaDOS reader and the
 /// existing OFS/FFS traversal to validate the on-disc boot and root
 /// blocks:
@@ -1546,11 +1546,14 @@ fn amiga_explanation(disk: &AmigaDisk) -> String {
 ///    with a structural `Amiga` platform hint that outranks any filename
 ///    signal, and an explanation naming the DOS variant, OFS/FFS family,
 ///    block size, and flags.
-/// 2. Contents do not validate as Amiga, but the existing identity system
+/// 2. Standard floppy size and recognized Amiga boot evidence without a
+///    readable AmigaDOS filesystem -> visible plausible Amiga media with
+///    weak platform evidence; no title/game identity and no validation claim.
+/// 3. Insufficient Amiga media evidence, but the existing identity system
 ///    still resolves a *non-Amiga* platform (e.g. an `Acorn Archimedes`
 ///    folder) -> accepted as the more general [`ContentKind::ComputerDisk`],
 ///    visible with that platform, the Amiga claim withheld.
-/// 3. Neither -> refused with the structural failure explained; no Amiga
+/// 4. Neither -> refused with the structural failure explained; no Amiga
 ///    identity is produced from the `.adf` extension alone.
 fn discover_amiga_floppy(
     path: &Path,
@@ -1559,13 +1562,9 @@ fn discover_amiga_floppy(
 ) -> GameDiscovery {
     match amiga_disk::inspect_amiga_floppy(path) {
         Ok(inspection) => {
-            // The one production caller of `structural_amiga_floppy_observation`:
-            // the validated OFS/FFS inspection becomes a `Strong` `Amiga`
-            // platform candidate in the lineage pipeline. It is the
-            // authority for the platform hint here - ahead of any filename
-            // or folder signal - and it never asserts a release identity
-            // (see that function's contract; the volume label stays in its
-            // descriptive `notes` only).
+            // Filesystem validation and weaker media evidence have different
+            // strengths. Neither a filename nor a volume label is a game ID.
+            let validated = inspection.filesystem().is_some();
             let observation = structural_amiga_floppy_observation(&inspection);
             let platform_hint = observation.platform_candidate.clone();
             structural_evidence.push(DiscoveredStructuralEvidence {
@@ -1577,10 +1576,18 @@ fn discover_amiga_floppy(
                 container: ContainerKind::DirectFile,
                 content: Some(ContentKind::AmigaImage),
                 platform_hint,
-                identity_candidate: identity_for(path, source_root),
-                validation_state: ValidationState::Accepted,
+                identity_candidate: None,
+                validation_state: if validated {
+                    ValidationState::Accepted
+                } else {
+                    ValidationState::Skipped
+                },
                 explanation: amiga_floppy_explanation(&inspection),
-                skip_reason: None,
+                skip_reason: if validated {
+                    None
+                } else {
+                    Some(SkipReason::RecognizedContentNoIdentityMatch)
+                },
             }
         }
         Err(error) => {
@@ -1610,32 +1617,7 @@ fn discover_amiga_floppy(
 }
 
 fn amiga_floppy_explanation(inspection: &amiga_disk::AmigaFloppyInspection) -> String {
-    let filesystem = &inspection.filesystem;
-    let family = match filesystem.family {
-        amiga_disk::AmigaDosFamily::Ofs => "OFS",
-        amiga_disk::AmigaDosFamily::Ffs => "FFS",
-    };
-    let mut detail = format!(
-        "Amiga floppy image (DOS\\{} / {family}, {}-byte blocks",
-        filesystem.dos_type, filesystem.block_size
-    );
-    if filesystem.international {
-        detail.push_str(", international");
-    }
-    if filesystem.directory_cache {
-        detail.push_str(", dir-cache");
-    }
-    detail.push(')');
-    if let Some(label) = filesystem
-        .volume_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-    {
-        detail.push_str(&format!(" - volume {label:?}"));
-    }
-    detail.push('.');
-    detail
+    inspection.description()
 }
 
 fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> GameDiscovery {
@@ -1654,9 +1636,9 @@ fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> Ga
                 .to_string(),
         ),
         AmigaFloppyError::Filesystem(inner) => (
-            SkipReason::InvalidContent(format!("{inner:?}")),
+            SkipReason::RecognizedContentNoIdentityMatch,
             format!(
-                "This .adf has an AmigaDOS boot signature but its OFS/FFS structures \
+                "This .adf has recognized Amiga boot evidence but its OFS/FFS structures \
                  did not validate: {inner}."
             ),
         ),
@@ -1675,7 +1657,7 @@ fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> Ga
 /// bounded-decompresses the container and reuses exactly the same
 /// [`structural_amiga_floppy_observation`] path [`discover_amiga_floppy`]
 /// uses for a raw `.adf` - the platform hint and structural evidence come
-/// from the decompressed AmigaDOS structure, never from the `.adz`
+/// from the decompressed media evidence, never from the `.adz`
 /// extension alone.
 fn discover_amiga_adz_floppy(
     path: &Path,
@@ -1684,6 +1666,7 @@ fn discover_amiga_adz_floppy(
 ) -> GameDiscovery {
     match crate::amiga_adz::inspect_adz(path) {
         Ok(inspection) => {
+            let validated = inspection.floppy.filesystem().is_some();
             let observation = structural_amiga_floppy_observation(&inspection.floppy);
             let platform_hint = observation.platform_candidate.clone();
             structural_evidence.push(DiscoveredStructuralEvidence {
@@ -1695,14 +1678,22 @@ fn discover_amiga_adz_floppy(
                 container: ContainerKind::DirectFile,
                 content: Some(ContentKind::AmigaImage),
                 platform_hint,
-                identity_candidate: identity_for(path, source_root),
-                validation_state: ValidationState::Accepted,
+                identity_candidate: None,
+                validation_state: if validated {
+                    ValidationState::Accepted
+                } else {
+                    ValidationState::Skipped
+                },
                 explanation: format!(
                     "Compressed Amiga floppy image (.adz, {} decompressed bytes): {}",
                     inspection.decompressed_bytes,
                     amiga_floppy_explanation(&inspection.floppy)
                 ),
-                skip_reason: None,
+                skip_reason: if validated {
+                    None
+                } else {
+                    Some(SkipReason::RecognizedContentNoIdentityMatch)
+                },
             }
         }
         Err(error) => {

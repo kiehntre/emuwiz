@@ -1,5 +1,33 @@
 use super::*;
 use std::collections::BTreeSet;
+
+#[test]
+fn plausible_amiga_floppy_adds_no_release_or_medium_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Famous Game (Disk 1 of 1).adf");
+    let mut bytes = vec![0_u8; 880 * 1024];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    bytes[8..12].copy_from_slice(&880_u32.to_be_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    let inspection = crate::amiga_disk::inspect_amiga_floppy(&path).unwrap();
+    let mut record = media_record(&path, None);
+    record.availability = MediaAvailability::Observed;
+    attach_amiga_floppy(&mut record, &inspection);
+    let evidence = record.evidence.last().unwrap();
+    assert_eq!(evidence.provenance.kind, EvidenceKind::Metadata);
+    assert_eq!(evidence.release, None);
+    assert_eq!(evidence.medium, None);
+    assert_eq!(evidence.title, None);
+    assert!(
+        evidence
+            .notes
+            .iter()
+            .any(|n| n.contains("no readable AmigaDOS filesystem"))
+    );
+    let result = resolve_index(index_media(vec![record]));
+    assert!(result.sets.iter().all(|set| !set.identity.verified));
+}
+
 fn rec(name: &str, platform: &str) -> MediaRecord {
     let mut r = media_record(name, Some(platform));
     r.availability = MediaAvailability::Observed;

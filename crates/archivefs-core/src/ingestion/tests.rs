@@ -834,6 +834,10 @@ fn adf_ofs_dos0_is_discovered_as_amiga_from_its_contents() {
     assert_eq!(item.validation_state, ValidationState::Accepted);
     assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
     assert_eq!(item.skip_reason, None);
+    assert_eq!(
+        item.identity_candidate, None,
+        "filesystem validation is not a title identity"
+    );
     assert!(item.explanation.contains("OFS"));
     assert!(item.explanation.contains("DOS\\0"));
     assert_eq!(report.stats.amiga_images, 1);
@@ -973,7 +977,7 @@ fn malformed_root_block_adf_fails_closed_with_no_structural_evidence() {
     assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
     assert!(matches!(
         item.skip_reason,
-        Some(SkipReason::InvalidContent(_))
+        Some(SkipReason::RecognizedContentNoIdentityMatch)
     ));
     assert!(report.structural_evidence.is_empty());
 }
@@ -1243,8 +1247,108 @@ fn adz_with_valid_gzipped_adf_is_discovered_as_amiga_image() {
     assert_eq!(item.content, Some(ContentKind::AmigaImage));
     assert_eq!(item.validation_state, ValidationState::Accepted);
     assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_eq!(item.identity_candidate, None);
     assert!(item.explanation.contains("OFS"), "{}", item.explanation);
     assert_eq!(report.structural_evidence.len(), 1);
+}
+
+#[test]
+fn plausible_adf_and_adz_remain_visible_media_without_filename_game_identity() {
+    use crate::game_identity::{IdentityKind, IdentityStatus, inspect_game_identity};
+    use crate::platform_evidence_fusion::evidence_lineage::{ClaimStrength, IdentityScope};
+    let dir = source_dir("amiga-plausible-media");
+    let mut bytes = vec![0_u8; 880 * 1024];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    put32(&mut bytes, 8, 880);
+    let adf = dir.path().join("Turrican II (1991)(Disk 1 of 1).adf");
+    std::fs::write(&adf, &bytes).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &bytes).unwrap();
+    let adz = dir.path().join("Turrican II (1991)(Disk 1 of 1).adz");
+    std::fs::write(&adz, encoder.finish().unwrap()).unwrap();
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 2);
+    assert_eq!(report.stats.amiga_images, 2);
+    for item in &report.items {
+        assert_eq!(item.content, Some(ContentKind::AmigaImage));
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert_eq!(item.identity_candidate, None);
+        assert_eq!(
+            item.skip_reason,
+            Some(SkipReason::RecognizedContentNoIdentityMatch)
+        );
+        assert!(item.explanation.contains(
+            "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
+        ));
+        assert!(!item.explanation.contains("Turrican"));
+        let identity = inspect_game_identity(&item.path, Some("Amiga"));
+        assert_eq!(identity.verified_value(IdentityKind::AmigaWHDLoad), None);
+        assert!(
+            identity
+                .evidence
+                .iter()
+                .all(|e| e.status != IdentityStatus::Verified)
+        );
+    }
+    assert_eq!(report.structural_evidence.len(), 2);
+    for evidence in &report.structural_evidence {
+        assert_eq!(evidence.observation.claim_strength, ClaimStrength::Weak);
+        assert_eq!(
+            evidence.observation.identity_scope,
+            IdentityScope::PlatformIdentity
+        );
+        assert_eq!(evidence.observation.release_candidate, None);
+        assert_eq!(evidence.observation.hash_or_value, None);
+    }
+}
+
+#[test]
+fn whdload_identity_still_requires_exactly_one_structurally_valid_slave() {
+    use crate::game_identity::{IdentityKind, IdentityStatus, inspect_game_identity};
+    if !lha_backend_available() {
+        eprintln!("optional LHA backend absent: WHDLoad archive identity cases not exercised");
+        return;
+    }
+    let dir = source_dir("whdload-identity-boundary");
+    let slave = minimal_whdload_slave();
+    for (name, entries, expected) in [
+        (
+            "Famous Game",
+            vec![("Game.slave", b"not a slave".as_slice())],
+            0,
+        ),
+        (
+            "Unrelated Title",
+            vec![("A/Game.slave", slave.as_slice())],
+            1,
+        ),
+        (
+            "Bundle",
+            vec![
+                ("A/Game.slave", slave.as_slice()),
+                ("B/Other.slave", slave.as_slice()),
+            ],
+            2,
+        ),
+    ] {
+        let path = dir.path().join(format!("{name}.lha"));
+        std::fs::write(&path, stored_lha(&entries)).unwrap();
+        let report = inspect_game_identity(&path, Some("Amiga"));
+        if expected == 1 {
+            assert!(report.verified_value(IdentityKind::AmigaWHDLoad).is_some());
+        } else {
+            assert_eq!(report.verified_value(IdentityKind::AmigaWHDLoad), None);
+            if expected == 2 {
+                assert!(
+                    report
+                        .evidence
+                        .iter()
+                        .any(|e| e.kind == IdentityKind::AmigaWHDLoad
+                            && e.status == IdentityStatus::Ambiguous)
+                );
+            }
+        }
+    }
 }
 
 #[test]

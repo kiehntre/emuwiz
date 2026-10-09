@@ -65,7 +65,7 @@ fn valid_gzipped_adf_is_inspected_as_amiga_floppy() {
     assert_eq!(inspection.container_path, path);
     assert_eq!(inspection.decompressed_bytes, adf.len() as u64);
     assert_eq!(
-        inspection.floppy.filesystem.family,
+        inspection.floppy.filesystem().unwrap().family,
         amiga_disk::AmigaDosFamily::Ofs
     );
 }
@@ -85,8 +85,40 @@ fn decompressed_adf_evidence_matches_the_raw_fixture() {
     let adz_path = write_adz(dir.path(), "same.adz", &adf);
     let inspection = inspect_adz(&adz_path).unwrap();
 
-    assert_eq!(inspection.floppy.filesystem, raw.filesystem);
+    assert_eq!(inspection.floppy.evidence, raw.evidence);
     assert_eq!(inspection.floppy.disk.rdb, raw.disk.rdb);
+}
+
+#[test]
+fn adz_preserves_plausible_logical_evidence_without_container_or_game_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut adf = vec![0_u8; 880 * 1024];
+    adf[..4].copy_from_slice(b"DOS\x01");
+    put32(&mut adf, 8, 880);
+    let raw_path = dir.path().join("raw.adf");
+    std::fs::write(&raw_path, &adf).unwrap();
+    let raw = amiga_disk::inspect_amiga_floppy(&raw_path).unwrap();
+    let path = write_adz(dir.path(), "Famous Game (Disk 1).adz", &adf);
+    let before = std::fs::read(&path).unwrap();
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let inspection = inspect_adz(&path).unwrap();
+    assert!(inspection.floppy.filesystem().is_none());
+    assert_eq!(inspection.floppy.evidence, raw.evidence);
+    assert_eq!(inspection.container_path, path);
+    assert_ne!(inspection.floppy.disk.path, path);
+    assert_eq!(inspection.decompressed_bytes, adf.len() as u64);
+    let evidence = amiga_disk::structural_amiga_floppy_observation(&inspection.floppy);
+    assert_eq!(
+        evidence.claim_strength,
+        crate::platform_evidence_fusion::evidence_lineage::ClaimStrength::Weak
+    );
+    assert_eq!(evidence.release_candidate, None);
+    assert_eq!(evidence.hash_or_value, None);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+    );
 }
 
 #[test]

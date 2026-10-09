@@ -259,6 +259,32 @@ fn non_amiga_bytes_are_not_inspected_as_adf() {
     ));
 }
 
+#[test]
+fn plausible_non_amigados_media_cannot_supply_trainer_identity_facts() {
+    let fx = Fx::new();
+    let mut bytes = vec![0_u8; 880 * 1024];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    p32(&mut bytes, 8, 880);
+    let path = fx.dir.path().join("Known Game [t +3].adf");
+    std::fs::write(&path, &bytes).unwrap();
+    assert!(
+        crate::amiga_disk::inspect_amiga_floppy(&path)
+            .unwrap()
+            .filesystem()
+            .is_none()
+    );
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert!(matches!(
+        inspect_adf_media(&path, None),
+        Err(AdfMediaError::NotAnAmigaFloppy(_))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before
+    );
+}
+
 // ---- release / revision -----------------------------------------------------
 
 #[test]

@@ -378,28 +378,52 @@ fn structural_media_details(
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if extension == "adf"
-        && let Ok(inspection) = archivefs_core::amiga_disk::inspect_amiga_floppy(path)
-    {
-        let disk = &inspection.disk.rdb;
-        let filesystem = &inspection.filesystem;
-        return Some(StructuralMediaDetails::Disk(DiskMediaDetails {
-            format: "ADF (Amiga floppy image)".into(),
-            geometry: vec![
-                format!("Image size: {} bytes", inspection.disk.image_size),
-                format!(
-                    "Geometry: {} cylinders, {} heads, {} sectors",
-                    disk.cylinders, disk.heads, disk.sectors
-                ),
-                format!("Logical block size: {} bytes", filesystem.block_size),
-            ],
-            filesystem: Some(format!("AmigaDOS {:?}", filesystem.family)),
-            volume_label: filesystem.volume_label.clone(),
-            integrity: "Good (boot and root structures validated)".into(),
-            warnings: Vec::new(),
-            preservation_caveat:
-                "Volume label is descriptive provenance, not confirmed release identity.".into(),
-        }));
+    if matches!(extension.as_str(), "adf" | "adz") {
+        let inspected = if extension == "adz" {
+            archivefs_core::amiga_adz::inspect_adz(path)
+                .map(|inspection| inspection.floppy)
+                .map_err(|error| error.to_string())
+        } else {
+            archivefs_core::amiga_disk::inspect_amiga_floppy(path)
+                .map_err(|error| error.to_string())
+        };
+        let format = if extension == "adz" {
+            "ADZ (gzip container; assessment of decompressed ADF bytes)"
+        } else {
+            "ADF (Amiga floppy candidate)"
+        };
+        let details = match inspected {
+            Ok(inspection) => {
+                let filesystem = inspection.filesystem();
+                let mut geometry =
+                    vec![format!("Image size: {} bytes", inspection.disk.image_size)];
+                if let Some(filesystem) = filesystem {
+                    geometry.push(format!(
+                        "Logical block size: {} bytes",
+                        filesystem.block_size
+                    ));
+                }
+                DiskMediaDetails {
+                    format: format.into(),
+                    geometry,
+                    filesystem: filesystem.map(|fs| format!("AmigaDOS {:?}", fs.family)),
+                    volume_label: filesystem.and_then(|fs| fs.volume_label.clone()),
+                    integrity: inspection.description(),
+                    warnings: Vec::new(),
+                    preservation_caveat: "Media structure is not game identity or dump verification. A volume label is descriptive only.".into(),
+                }
+            }
+            Err(reason) => DiskMediaDetails {
+                format: format!("{} candidate", extension.to_ascii_uppercase()),
+                geometry: Vec::new(),
+                filesystem: None,
+                volume_label: None,
+                integrity: "Rejected / unsupported or insufficient Amiga floppy evidence".into(),
+                warnings: vec![reason],
+                preservation_caveat: "No game identity or dump verification is established.".into(),
+            },
+        };
+        return Some(StructuralMediaDetails::Disk(details));
     }
     if matches!(
         extension.as_str(),
@@ -1646,6 +1670,88 @@ mod tests {
     };
     use std::io::Write;
     use std::time::Duration;
+
+    fn amiga_floppy_bytes(dos: u8, readable_root: bool) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 880 * 1024];
+        bytes[..4].copy_from_slice(&[b'D', b'O', b'S', dos]);
+        bytes[8..12].copy_from_slice(&880_u32.to_be_bytes());
+        if readable_root {
+            let root = &mut bytes[880 * 512..881 * 512];
+            root[..4].copy_from_slice(&2_u32.to_be_bytes());
+            root[12..16].copy_from_slice(&72_u32.to_be_bytes());
+            root[508..512].copy_from_slice(&1_u32.to_be_bytes());
+            let sum = root
+                .chunks_exact(4)
+                .map(|v| u32::from_be_bytes(v.try_into().unwrap()))
+                .fold(0_u32, u32::wrapping_add);
+            root[20..24].copy_from_slice(&0_u32.wrapping_sub(sum).to_be_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn amiga_floppy_wording_distinguishes_filesystem_validation_and_plausible_media() {
+        for (dos, root) in [(0, true), (1, true), (1, false)] {
+            let bytes = amiga_floppy_bytes(dos, root);
+            let dir = write_temp_rom("Famous Game.adf", &bytes);
+            let path = dir.path().join("Famous Game.adf");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let report = gather_selected_evidence_fast(&path, Some("Amiga")).unwrap();
+            let Some(StructuralMediaDetails::Disk(details)) = report.structural_media else {
+                panic!("Amiga floppy details must be visible");
+            };
+            if root {
+                assert!(
+                    details
+                        .integrity
+                        .starts_with("AmigaDOS filesystem validated")
+                );
+                assert!(details.filesystem.is_some());
+            } else {
+                assert_eq!(
+                    details.integrity,
+                    "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
+                );
+                assert_eq!(details.filesystem, None);
+                assert_eq!(details.volume_label, None);
+            }
+            for word in [
+                "Good",
+                "verified game",
+                "verified dump",
+                "original disk",
+                "complete",
+                "corrupt",
+            ] {
+                assert!(!details.integrity.contains(word));
+            }
+            assert_eq!(
+                report
+                    .game_identity_report
+                    .verified_value(archivefs_core::game_identity::IdentityKind::AmigaWHDLoad),
+                None
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                modified
+            );
+        }
+    }
+
+    #[test]
+    fn amiga_floppy_rejected_wording_does_not_claim_a_filesystem_or_dump_status() {
+        for name in ["Unknown.adf", "Unknown.adz"] {
+            let dir = write_temp_rom(name, &[0_u8; 1024]);
+            let report = gather_selected_evidence_fast(&dir.path().join(name), None).unwrap();
+            let Some(StructuralMediaDetails::Disk(details)) = report.structural_media else {
+                panic!("a rejected candidate must explain its evidence limit");
+            };
+            assert!(details.integrity.contains("Rejected / unsupported"));
+            assert_eq!(details.filesystem, None);
+            assert!(!details.warnings.is_empty());
+        }
+    }
 
     fn gb_rom_bytes() -> Vec<u8> {
         // A minimal, deterministic synthetic Game Boy header - not real

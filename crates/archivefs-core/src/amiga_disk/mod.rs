@@ -251,20 +251,72 @@ fn inspect_flat_amigados(path: &Path) -> Result<AmigaDisk, DiskError> {
     })
 }
 
-/// The content-derived result of confirming one Amiga floppy / flat disk
-/// image (`.adf`): the validated container plus the OFS/FFS filesystem
-/// metadata the existing bounded reader was able to prove. Produced only
-/// when both [`inspect_amiga_image`] and [`inspect_amiga_filesystem`]
-/// succeed - never from an extension alone.
+/// Content evidence, separate from game identity and dump verification.
+/// An unreadable root can be a custom-loader disk or a damaged filesystem;
+/// this model deliberately does not decide which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmigaFloppyEvidence {
+    /// Boot/root structures passed the existing bounded OFS/FFS reader.
+    AmigaDosValidated(AmigaFilesystem),
+    /// Standard DD/HD size plus an existing recognized Amiga boot
+    /// identifier (DOS\0..DOS\7, PFS, SFS or MuFS), but no readable
+    /// AmigaDOS filesystem. Neither size nor a filename alone suffices.
+    Plausible { filesystem_error: FilesystemError },
+}
+
+/// A read-only floppy / flat-image assessment. Unsupported, invalid and
+/// insufficient evidence is the third outcome: `Err(AmigaFloppyError)`
+/// from [`inspect_amiga_floppy`]. Neither successful state asserts a game.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmigaFloppyInspection {
     pub disk: AmigaDisk,
-    pub filesystem: AmigaFilesystem,
+    pub evidence: AmigaFloppyEvidence,
+}
+
+impl AmigaFloppyInspection {
+    /// Only validated metadata can be used by filesystem-dependent callers.
+    pub fn filesystem(&self) -> Option<&AmigaFilesystem> {
+        match &self.evidence {
+            AmigaFloppyEvidence::AmigaDosValidated(filesystem) => Some(filesystem),
+            AmigaFloppyEvidence::Plausible { .. } => None,
+        }
+    }
+
+    pub fn description(&self) -> String {
+        let Some(filesystem) = self.filesystem() else {
+            return "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
+                .into();
+        };
+        let family = match filesystem.family {
+            AmigaDosFamily::Ofs => "OFS",
+            AmigaDosFamily::Ffs => "FFS",
+        };
+        let mut notes = format!(
+            "AmigaDOS filesystem validated: DOS\\{} ({family}), {}-byte logical blocks",
+            filesystem.dos_type, filesystem.block_size
+        );
+        if filesystem.international {
+            notes.push_str(", international");
+        }
+        if filesystem.directory_cache {
+            notes.push_str(", directory-cache");
+        }
+        if let Some(label) = filesystem
+            .volume_label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+        {
+            notes.push_str(&format!(", volume {label:?}"));
+        }
+        notes
+    }
 }
 
 /// Why an `.adf` / flat Amiga image could not be structurally confirmed.
-/// Every variant means "not trusted as Amiga content", never "probably
-/// fine".
+/// These refusals are not evidence that a dump is bad or that a game is
+/// damaged. Absence of a supported filesystem is not itself a refusal when
+/// the weaker floppy evidence can be established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AmigaFloppyError {
     /// The container itself is not a readable Amiga image (bad/absent boot
@@ -302,11 +354,12 @@ impl std::error::Error for AmigaFloppyError {}
 /// partition to validate the on-disc OFS/FFS boot and root blocks with the
 /// existing bounded reader and its traversal limits.
 ///
-/// `.adf` is a real cross-platform extension collision (Acorn ADFS /
-/// Archimedes floppy images use it too), so identity here is taken only
-/// from disc contents. A file that merely ends in `.adf` but whose bytes
-/// do not present a valid AmigaDOS boot block and a structurally valid
-/// root block is refused, not trusted.
+/// Validated OFS/FFS remains the stronger state, including existing flat
+/// images with nonstandard sizes. When traversal fails, only an unpartitioned
+/// 80-cylinder, two-sided DD/HD image size (11/22 512-byte sectors per track)
+/// with a recognized Amiga boot identifier gets the weaker state. This does not
+/// verify boot code, game content or a dump. Custom loaders without such an
+/// identifier stay unknown; arbitrary 880 KiB data is never admitted by size.
 pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
     let disk = inspect_amiga_image(path).map_err(AmigaFloppyError::Container)?;
     let partition = disk
@@ -315,13 +368,33 @@ pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaF
         .first()
         .cloned()
         .ok_or(AmigaFloppyError::NoPartition)?;
-    let filesystem =
-        inspect_amiga_filesystem(&disk, &partition).map_err(AmigaFloppyError::Filesystem)?;
-    Ok(AmigaFloppyInspection { disk, filesystem })
+    let evidence = match inspect_amiga_filesystem(&disk, &partition) {
+        Ok(filesystem) => AmigaFloppyEvidence::AmigaDosValidated(filesystem),
+        Err(filesystem_error)
+            if matches!(disk.image_size, 901_120 | 1_802_240)
+                && disk.rdb.partition_head == NONE
+                && disk.rdb.partitions.len() == 1
+                && partition.byte_offset == 0
+                && partition.byte_length == disk.image_size
+                && matches!(
+                    partition.boot_signature.map(classify),
+                    Some(
+                        FileSystem::Dos(0..=7)
+                            | FileSystem::Pfs
+                            | FileSystem::Sfs
+                            | FileSystem::MuFs
+                    )
+                ) =>
+        {
+            AmigaFloppyEvidence::Plausible { filesystem_error }
+        }
+        Err(error) => return Err(AmigaFloppyError::Filesystem(error)),
+    };
+    Ok(AmigaFloppyInspection { disk, evidence })
 }
 
-/// Strong, local, structural Amiga *platform* evidence for a `.adf` / flat
-/// image whose OFS/FFS structures validated. Mirrors
+/// Local, structural Amiga *platform* evidence for a `.adf` / flat image:
+/// strong when OFS/FFS validates, weak for plausible media. Mirrors
 /// [`structural_hdf_observation`], but for a floppy-shaped image
 /// ([`Representation::StructuralMetadata`], not
 /// [`Representation::WholeHdf`]). It is a platform candidate only: it never
@@ -331,29 +404,6 @@ pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaF
 pub fn structural_amiga_floppy_observation(
     inspection: &AmigaFloppyInspection,
 ) -> EvidenceObservation {
-    let filesystem = &inspection.filesystem;
-    let family = match filesystem.family {
-        AmigaDosFamily::Ofs => "OFS",
-        AmigaDosFamily::Ffs => "FFS",
-    };
-    let mut notes = format!(
-        "validated Amiga floppy image: DOS\\{} ({family}), {}-byte logical blocks",
-        filesystem.dos_type, filesystem.block_size
-    );
-    if filesystem.international {
-        notes.push_str(", international");
-    }
-    if filesystem.directory_cache {
-        notes.push_str(", directory-cache");
-    }
-    if let Some(label) = filesystem
-        .volume_label
-        .as_deref()
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-    {
-        notes.push_str(&format!(", volume {label:?}"));
-    }
     EvidenceObservation {
         provenance: Provenance {
             channel: EvidenceChannel::LocalStructural,
@@ -367,12 +417,16 @@ pub fn structural_amiga_floppy_observation(
             representation: Representation::StructuralMetadata,
         },
         claim: ClaimType::PlatformCandidate,
-        claim_strength: ClaimStrength::Strong,
+        claim_strength: if inspection.filesystem().is_some() {
+            ClaimStrength::Strong
+        } else {
+            ClaimStrength::Weak
+        },
         identity_scope: IdentityScope::PlatformIdentity,
         hash_or_value: None,
         platform_candidate: Some("Amiga".into()),
         release_candidate: None,
-        notes: Some(notes),
+        notes: Some(inspection.description()),
     }
 }
 

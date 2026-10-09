@@ -188,13 +188,13 @@ fn flat_adf(dos: u8, volume: &[u8]) -> Vec<u8> {
 fn flat_adf_ofs_dos0_is_structurally_confirmed_from_contents() {
     let (_d, p) = file(&flat_adf(0, b"WorkbenchDisk"));
     let inspection = inspect_amiga_floppy(&p).unwrap();
-    assert_eq!(inspection.filesystem.dos_type, 0);
-    assert_eq!(inspection.filesystem.family, AmigaDosFamily::Ofs);
-    assert!(!inspection.filesystem.international);
-    assert!(!inspection.filesystem.directory_cache);
-    assert_eq!(inspection.filesystem.block_size, 512);
+    assert_eq!(inspection.filesystem().unwrap().dos_type, 0);
+    assert_eq!(inspection.filesystem().unwrap().family, AmigaDosFamily::Ofs);
+    assert!(!inspection.filesystem().unwrap().international);
+    assert!(!inspection.filesystem().unwrap().directory_cache);
+    assert_eq!(inspection.filesystem().unwrap().block_size, 512);
     assert_eq!(
-        inspection.filesystem.volume_label.as_deref(),
+        inspection.filesystem().unwrap().volume_label.as_deref(),
         Some("WorkbenchDisk")
     );
     assert_eq!(inspection.disk.rdb.partitions.len(), 1);
@@ -204,10 +204,10 @@ fn flat_adf_ofs_dos0_is_structurally_confirmed_from_contents() {
 fn flat_adf_ffs_dos1_is_structurally_confirmed_from_contents() {
     let (_d, p) = file(&flat_adf(1, b"GameDisk1"));
     let inspection = inspect_amiga_floppy(&p).unwrap();
-    assert_eq!(inspection.filesystem.dos_type, 1);
-    assert_eq!(inspection.filesystem.family, AmigaDosFamily::Ffs);
+    assert_eq!(inspection.filesystem().unwrap().dos_type, 1);
+    assert_eq!(inspection.filesystem().unwrap().family, AmigaDosFamily::Ffs);
     assert_eq!(
-        inspection.filesystem.volume_label.as_deref(),
+        inspection.filesystem().unwrap().volume_label.as_deref(),
         Some("GameDisk1")
     );
 }
@@ -218,17 +218,20 @@ fn flat_adf_dos2_through_dos7_variants_are_confirmed_at_512_byte_blocks() {
         let (_d, p) = file(&flat_adf(dos, b"Vol"));
         let inspection = inspect_amiga_floppy(&p)
             .unwrap_or_else(|error| panic!("DOS\\{dos} should be supported: {error:?}"));
-        assert_eq!(inspection.filesystem.dos_type, dos);
+        assert_eq!(inspection.filesystem().unwrap().dos_type, dos);
         assert_eq!(
-            inspection.filesystem.family,
+            inspection.filesystem().unwrap().family,
             if dos & 1 == 0 {
                 AmigaDosFamily::Ofs
             } else {
                 AmigaDosFamily::Ffs
             }
         );
-        assert_eq!(inspection.filesystem.international, dos & 2 != 0);
-        assert_eq!(inspection.filesystem.directory_cache, dos & 4 != 0);
+        assert_eq!(inspection.filesystem().unwrap().international, dos & 2 != 0);
+        assert_eq!(
+            inspection.filesystem().unwrap().directory_cache,
+            dos & 4 != 0
+        );
     }
 }
 
@@ -280,6 +283,157 @@ fn adf_with_dos_signature_but_malformed_root_block_fails_closed() {
         inspect_amiga_floppy(&p),
         Err(AmigaFloppyError::Filesystem(_))
     ));
+}
+
+#[test]
+fn standard_floppy_with_dos_boot_and_missing_root_is_not_rejected_as_media() {
+    let mut bytes = vec![0_u8; 880 * 1024];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    p32(&mut bytes, 8, 880);
+    let (_dir, path) = file(&bytes);
+    let inspection = inspect_amiga_floppy(&path).expect("plausible media must not require a root");
+    assert!(matches!(
+        inspection.evidence,
+        AmigaFloppyEvidence::Plausible { .. }
+    ));
+    assert!(inspection.filesystem().is_none());
+    let evidence = structural_amiga_floppy_observation(&inspection);
+    assert_eq!(evidence.claim_strength, ClaimStrength::Weak);
+    assert_eq!(evidence.release_candidate, None);
+    assert_eq!(evidence.hash_or_value, None);
+    assert_eq!(
+        inspection.description(),
+        "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
+    );
+}
+
+#[test]
+fn standard_ofs_and_ffs_adfs_keep_validated_filesystem_evidence_without_writes() {
+    for dos in [0, 1] {
+        let tiny = flat_adf(dos, b"DescriptiveLabel");
+        let mut bytes = vec![0_u8; 880 * 1024];
+        bytes[..512].copy_from_slice(&tiny[..512]);
+        p32(&mut bytes, 8, 880);
+        bytes[880 * 512..881 * 512].copy_from_slice(&tiny[64 * 512..65 * 512]);
+        let (_dir, path) = file(&bytes);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let inspection = inspect_amiga_floppy(&path).unwrap();
+        assert!(matches!(
+            inspection.evidence,
+            AmigaFloppyEvidence::AmigaDosValidated(_)
+        ));
+        assert_eq!(inspection.filesystem().unwrap().dos_type, dos);
+        assert!(
+            inspection
+                .description()
+                .starts_with("AmigaDOS filesystem validated")
+        );
+        assert_eq!(
+            structural_amiga_floppy_observation(&inspection).claim_strength,
+            ClaimStrength::Strong
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+}
+
+#[test]
+fn standard_dd_and_hd_bad_roots_are_plausible_not_validated_or_declared_damaged() {
+    for size in [880 * 1024, 1760 * 1024] {
+        let mut bytes = vec![0_u8; size];
+        bytes[..4].copy_from_slice(b"DOS\x01");
+        p32(&mut bytes, 8, (size / 1024) as u32);
+        p32(&mut bytes, size / 2, 0xDEAD_BEEF);
+        let (_dir, path) = file(&bytes);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let inspection = inspect_amiga_floppy(&path).unwrap();
+        assert!(inspection.filesystem().is_none());
+        assert!(matches!(
+            inspection.evidence,
+            AmigaFloppyEvidence::Plausible {
+                filesystem_error: FilesystemError::InvalidFilesystem(_)
+            }
+        ));
+        // The original filesystem validator still rejects the same structure.
+        assert!(
+            inspect_amiga_filesystem(&inspection.disk, &inspection.disk.rdb.partitions[0]).is_err()
+        );
+        for overclaim in ["corrupt", "verified", "good dump", "original", "complete"] {
+            assert!(!inspection.description().to_lowercase().contains(overclaim));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+    }
+}
+
+#[test]
+fn random_zero_and_other_format_880_kib_files_have_insufficient_amiga_evidence() {
+    let mut random = vec![0_u8; 880 * 1024];
+    let mut seed = 0xC0FFEE_u32;
+    for byte in &mut random {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        *byte = seed as u8;
+    }
+    let (_dir, path) = file(&random);
+    assert!(inspect_amiga_floppy(&path).is_err());
+    for header in [
+        b"\0\0\0\0".as_slice(),
+        b"Hugo",
+        b"PK\x03\x04",
+        b"DOS\x08",
+        b"\xEB\x3C\x90M",
+    ] {
+        let mut bytes = vec![0_u8; 880 * 1024];
+        bytes[..header.len()].copy_from_slice(header);
+        let (_dir, path) = file(&bytes);
+        assert!(inspect_amiga_floppy(&path).is_err(), "header {header:?}");
+    }
+}
+
+#[test]
+fn recognized_non_amigados_boot_identifiers_are_detection_only_at_floppy_sizes() {
+    for header in [b"PFS\x03", b"SFS\0", b"MuFS"] {
+        let mut bytes = vec![0_u8; 880 * 1024];
+        bytes[..4].copy_from_slice(header);
+        let (_dir, path) = file(&bytes);
+        let inspection = inspect_amiga_floppy(&path).unwrap();
+        assert!(matches!(
+            inspection.evidence,
+            AmigaFloppyEvidence::Plausible {
+                filesystem_error: FilesystemError::UnsupportedFilesystem(_)
+            }
+        ));
+        assert!(inspection.filesystem().is_none());
+        let observation = structural_amiga_floppy_observation(&inspection);
+        assert_eq!(observation.claim_strength, ClaimStrength::Weak);
+        assert_eq!(observation.release_candidate, None);
+    }
+}
+
+#[test]
+fn boot_identifier_without_supported_floppy_size_cannot_get_weaker_evidence() {
+    for size in [
+        4,
+        511,
+        512,
+        4096,
+        880 * 1024 - 1,
+        880 * 1024 - 512,
+        880 * 1024 + 512,
+    ] {
+        let mut bytes = vec![0_u8; size];
+        bytes[..4].copy_from_slice(b"DOS\x01");
+        let (_dir, path) = file(&bytes);
+        assert!(inspect_amiga_floppy(&path).is_err(), "size {size}");
+    }
 }
 
 #[test]

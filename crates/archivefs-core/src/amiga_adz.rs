@@ -2,10 +2,10 @@
 //! containers.
 //!
 //! `.adz` is not a new filesystem and not a new disk format: it is a plain
-//! gzip wrapper around an ordinary `.adf` (raw AmigaDOS floppy) image. This
+//! gzip wrapper around an ordinary `.adf` (raw Amiga floppy) image. This
 //! module adds no ADF/AmigaDOS parsing of its own - it bounded-decompresses
 //! the gzip stream to a private, unlinked temporary file and reuses
-//! [`crate::amiga_disk::inspect_amiga_floppy`] completely unchanged, exactly
+//! [`crate::amiga_disk::inspect_amiga_floppy`] for media evidence, exactly
 //! as a raw `.adf` would be inspected.
 //!
 //! The decompressed logical image and the compressed container are kept as
@@ -28,9 +28,9 @@ use crate::amiga_disk::{self, AmigaFloppyError, AmigaFloppyInspection};
 
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 
-/// Smallest plausible standard Amiga floppy image: a single 512-byte boot
-/// block. Anything smaller cannot be a real ADF and is refused before the
-/// decompressed bytes are ever handed to the ADF parser.
+/// Minimum input for the existing image reader: one 512-byte block. This
+/// bound alone supplies no floppy evidence. Smaller output is refused before
+/// the decompressed bytes are handed to the ADF parser.
 const MIN_ADF_BYTES: u64 = 512;
 
 /// Largest decompressed size accepted from a `.adz`. Comfortably above the
@@ -119,8 +119,8 @@ pub struct AdzInspection {
     pub floppy: AmigaFloppyInspection,
 }
 
-/// Inspect `path` as a gzip-wrapped Amiga floppy image: bounded-decompress,
-/// then reuse [`amiga_disk::inspect_amiga_floppy`] unchanged on the result.
+/// Inspect `path` as a gzip-wrapped Amiga floppy candidate: bounded-decompress,
+/// then reuse [`amiga_disk::inspect_amiga_floppy`] on the result.
 /// Never extracts to a named/linked file, never mutates `path`, and never
 /// claims a decompressed stream is an ADF beyond what the existing parser
 /// itself validates.
