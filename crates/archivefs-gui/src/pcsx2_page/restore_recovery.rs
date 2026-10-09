@@ -174,10 +174,21 @@ pub(super) fn process_gate(card: &Path, save: &str) -> Result<(), Ps2PsuRestoreE
     Ok(())
 }
 
-/// True while the cached discovery is known to be incomplete.
-fn undo_withheld(ui: &egui::Ui) -> bool {
-    ui.data(|data| data.get_temp::<History>(history_id()))
-        .is_some_and(|history| history.incomplete())
+/// What the Undo review knows about the restore-record listing. Only a cached,
+/// complete discovery permits Undo; an absent cache is "unknown", never "fine".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscoveryState {
+    Complete,
+    Incomplete,
+    Unknown,
+}
+
+fn discovery_state(ui: &egui::Ui) -> DiscoveryState {
+    match ui.data(|data| data.get_temp::<History>(history_id())) {
+        None => DiscoveryState::Unknown,
+        Some(history) if history.incomplete() => DiscoveryState::Incomplete,
+        Some(_) => DiscoveryState::Complete,
+    }
 }
 
 pub(super) fn confirm_undo(
@@ -193,12 +204,20 @@ pub(super) fn confirm_undo(
         }
     };
     ui.heading("Review Undo from restore record");
-    // An already-open review must not outlive a discovery that became
-    // incomplete: the same list-dependent gate applies to this control.
-    let incomplete = undo_withheld(ui);
-    if incomplete {
-        ui.label("Undo is withheld: the restore record list is INCOMPLETE. Fix the cause and press Refresh records first. The card was not changed.");
+    // Undo acts on the discovered record set, so it needs a known-complete
+    // discovery: an open review must not outlive an incomplete one, and an
+    // absent (unknown) one withholds it too.
+    let state = discovery_state(ui);
+    match state {
+        DiscoveryState::Complete => {}
+        DiscoveryState::Incomplete => {
+            ui.label("Undo is withheld: the restore record list is INCOMPLETE. Fix the cause and press Refresh records first. The card was not changed.");
+        }
+        DiscoveryState::Unknown => {
+            ui.label("Undo is unavailable until the restore records have been checked. Press Refresh records (or reopen this page), then review again. The card was not changed.");
+        }
     }
+    let withheld = state != DiscoveryState::Complete;
     widgets::path_value(ui, "Card", &journal.card_path);
     widgets::path_value(ui, "Verified backup", &journal.backup_path);
     ui.label(format!("Save: {}", journal.save_display_name));
@@ -207,10 +226,11 @@ pub(super) fn confirm_undo(
         ui,
         "Confirm Undo",
         widgets::ActionStyle::Secondary,
-        advanced_mode && !incomplete && journal.phase == Ps2RestorePhase::Published,
+        advanced_mode && !withheld && journal.phase == Ps2RestorePhase::Published,
     )
     .clicked()
-        && !incomplete
+        // The handler re-reads the state itself; it does not trust the button.
+        && discovery_state(ui) == DiscoveryState::Complete
     {
         let provider = ProcScanQuiescence::new();
         let report = provider.report(&ps2_card_binding(

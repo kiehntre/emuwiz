@@ -188,3 +188,28 @@ was completed after the Cargo checks; the final diff/scope check follows it.
 Commit is local-only on `fix/ps2-psu-independent-review-p0`. The resulting SHA
 is supplied in the task completion response; independent re-review is required
 before any promotion. No push, merge, release or real-data operation occurred.
+
+## Restore-record discovery: retention, gating and accepted limitations
+
+Discovery keeps the newest 1,024 journals (greatest names; the omitted count is
+exact; no journal body is read to choose them). While the listing is incomplete
+(truncation, failed listing, interrupted enumeration) **or its state is unknown**
+(no cached discovery yet), the Undo review withholds Confirm Undo and its click
+handler independently re-reads that state and refuses. Unknown is worded as
+"Undo is unavailable until the restore records have been checked", never as
+INCOMPLETE or a listing failure, because neither was established. Per-record
+identity, SHA-256, verified backup, quiescence, per-card lock and custody checks
+are unchanged.
+
+Remaining limitations, deliberately not addressed here:
+
+- **Same-second ordering.** Journal names are `{seconds:010x}-{pid:x}-{counter:04x}`.
+  Names order chronologically across seconds; within one second the pid/counter
+  text does not guarantee exact creation order, and the seconds come from the
+  caller's clock. This can only affect which record is "newest" at the 1,024
+  boundary.
+- **Stale cache.** A discovery result is cached until Refresh records or a dialog
+  transition invalidates it; journals created after a previously complete
+  discovery may not be visible (or counted toward truncation) until Refresh.
+- **Records do not gate one another.** One record's Undo or recovery does not take
+  another record for the same card into account.

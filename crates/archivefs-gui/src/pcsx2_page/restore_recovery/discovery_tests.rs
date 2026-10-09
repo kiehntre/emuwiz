@@ -165,12 +165,6 @@ fn an_already_open_undo_review_is_withheld_when_discovery_is_incomplete() {
     let open = |path: &Path| {
         texts(&ctx.run(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                assert_eq!(
-                    undo_withheld(ui),
-                    ctx.data_mut(|d| d
-                        .get_temp::<History>(history_id())
-                        .is_some_and(|h| !h.problems.is_empty()))
-                );
                 let _ = confirm_undo(ui, path, true);
             });
         }))
@@ -228,4 +222,160 @@ fn a_failed_listing_blocks_the_batch_recovery_claim_of_nothing_to_do() {
     let run = recover_all_interrupted_ps2_restores(&journals, 1);
     std::fs::set_permissions(&journals, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(run.outcomes.is_empty() && !run.problems.is_empty());
+}
+
+// ---- unknown discovery state (no cached result) fails closed ----
+
+/// Draws the Undo review for `journal` and, when `click`, presses and releases the
+/// pointer on "Confirm Undo". Returns what the review asked the dialog to do on the
+/// release frame, and the texts of the first frame. Deterministic: fixed frames.
+fn review_undo(
+    ctx: &egui::Context,
+    journal: &Path,
+    click: bool,
+) -> (Option<PsuRestoreDialogState>, Vec<String>) {
+    let frame = |input: egui::RawInput| {
+        let mut asked = None;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                asked = confirm_undo(ui, journal, true);
+            });
+        });
+        (asked, out)
+    };
+    let (_, first) = frame(egui::RawInput::default());
+    let shown = texts(&first);
+    if !click {
+        return (None, shown);
+    }
+    let pos = first
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.job.text == "Confirm Undo" => Some(text.pos),
+            _ => None,
+        })
+        .expect("Confirm Undo is drawn");
+    let at = pos + egui::vec2(6.0, 4.0);
+    let button = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    let mut press = egui::RawInput::default();
+    press.events = vec![egui::Event::PointerMoved(at), button(true)];
+    frame(press);
+    let mut release = egui::RawInput::default();
+    release.events = vec![button(false)];
+    let (asked, _) = frame(release);
+    (asked, shown)
+}
+
+fn one_published_journal() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    write_journal(
+        dir.path(),
+        "ps2-psu-restore-00001.json",
+        Ps2RestorePhase::Published,
+    );
+    let path = dir.path().join("ps2-psu-restore-00001.json");
+    (dir, path)
+}
+
+#[test]
+fn no_cached_discovery_is_unknown_and_withholds_undo_with_honest_wording() {
+    let (_dir, journal) = one_published_journal();
+    let ctx = egui::Context::default();
+    assert!(
+        ctx.data_mut(|d| d.get_temp::<History>(history_id()))
+            .is_none()
+    );
+    let (asked, shown) = review_undo(&ctx, &journal, true);
+    assert!(has(&shown, "Review Undo from restore record"), "{shown:?}");
+    assert!(
+        has(
+            &shown,
+            "Undo is unavailable until the restore records have been checked"
+        ),
+        "{shown:?}"
+    );
+    // Never claims a state that was not established.
+    assert!(!has(&shown, "INCOMPLETE"), "{shown:?}");
+    assert!(!has(&shown, "cannot be listed"), "{shown:?}");
+    // A real click on Confirm Undo asks for nothing, and the journal is untouched.
+    assert!(asked.is_none(), "Undo asked for a dialog transition");
+    assert_eq!(
+        load_ps2_restore_journal(&journal).unwrap().phase,
+        Ps2RestorePhase::Published
+    );
+}
+
+#[test]
+fn the_click_handler_refuses_on_its_own_when_the_cache_is_absent() {
+    // Even with the button forced to look enabled, the handler re-reads the state.
+    let (_dir, journal) = one_published_journal();
+    let ctx = egui::Context::default();
+    for _ in 0..2 {
+        let (asked, _) = review_undo(&ctx, &journal, true);
+        assert!(asked.is_none(), "Undo asked for a dialog transition");
+    }
+    // The state was never populated by merely drawing the review.
+    assert!(
+        ctx.data_mut(|d| d.get_temp::<History>(history_id()))
+            .is_none()
+    );
+}
+
+#[test]
+fn first_complete_discovery_restores_normal_eligibility() {
+    let (dir, journal) = one_published_journal();
+    let ctx = egui::Context::default();
+    assert!(review_undo(&ctx, &journal, true).0.is_none());
+    // The page's own discovery populates the cache (complete listing).
+    let shown = render(&ctx, dir.path());
+    assert!(!has(&shown, WARNING), "{shown:?}");
+    let (asked, shown) = review_undo(&ctx, &journal, true);
+    assert!(!has(&shown, "Undo is unavailable"), "{shown:?}");
+    assert!(!has(&shown, "Undo is withheld"), "{shown:?}");
+    // Normal existing behaviour: the click reaches the guarded Undo path (which
+    // then applies its own per-record checks and may refuse).
+    assert!(asked.is_some(), "a click must reach the guarded Undo path");
+}
+
+#[test]
+fn known_incomplete_discovery_still_withholds_the_click() {
+    let dir = newest_valid_dir(1025);
+    let journal = dir.path().join("ps2-psu-restore-01024.json");
+    let ctx = egui::Context::default();
+    render(&ctx, dir.path());
+    let (asked, shown) = review_undo(&ctx, &journal, true);
+    assert!(has(&shown, "INCOMPLETE"), "{shown:?}");
+    assert!(!has(&shown, "Undo is unavailable until"), "{shown:?}");
+    assert!(asked.is_none(), "Undo asked for a dialog transition");
+}
+
+#[test]
+fn refresh_from_unknown_or_incomplete_to_complete_restores_eligible_actions() {
+    // unknown -> complete
+    let (dir, journal) = one_published_journal();
+    let ctx = egui::Context::default();
+    assert!(review_undo(&ctx, &journal, true).0.is_none());
+    render(&ctx, dir.path());
+    assert!(review_undo(&ctx, &journal, true).0.is_some());
+    // incomplete -> complete (the user moves the oldest record aside, then Refresh)
+    let big = newest_valid_dir(1025);
+    let newest = big.path().join("ps2-psu-restore-01024.json");
+    let ctx = egui::Context::default();
+    render(&ctx, big.path());
+    assert!(review_undo(&ctx, &newest, true).0.is_none());
+    let aside = tempfile::tempdir().unwrap();
+    std::fs::rename(
+        big.path().join("ps2-psu-restore-00000.json"),
+        aside.path().join("ps2-psu-restore-00000.json"),
+    )
+    .unwrap();
+    ctx.data_mut(|d| d.remove::<History>(history_id())); // what Refresh records replaces
+    render(&ctx, big.path());
+    assert!(review_undo(&ctx, &newest, true).0.is_some());
 }
