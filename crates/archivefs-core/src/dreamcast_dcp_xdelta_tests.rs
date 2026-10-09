@@ -528,3 +528,95 @@ fn if_the_journal_cannot_be_removed_the_error_says_the_staged_tree_has_no_receip
     assert!(!world.destination.exists());
     assert!(leftovers(&world, Path::new("")).is_empty());
 }
+
+// --- Regression fixtures from the 2026-10-09 OpenROM feature-delta audit -----
+//
+// Unsafe behaviour prevented: a multi-member apply that logs a failed delta,
+// carries on with the remaining members, and reports the whole operation as a
+// success with a "files patched" count. Here one failed member fails the
+// operation: nothing is staged for publication, no receipt claims an output,
+// and the source tree is untouched.
+
+/// Every regular file under the test's temp root, relative, sorted.
+fn every_file(world: &World) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut queue = vec![world.temp.path().to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        for entry in fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push(path);
+            } else {
+                found.push(
+                    path.strip_prefix(world.temp.path())
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn assert_whole_operation_failed(world: &World, plan: &DreamcastDcpPlan, before: &Contents) {
+    let error = plan
+        .prepare()
+        .err()
+        .expect("one failed member must fail the whole apply");
+    assert!(!error.to_string().is_empty());
+    assert!(!world.destination.exists(), "nothing is published");
+    assert_eq!(&world.source_snapshot(), before, "the source is untouched");
+    assert!(
+        plan.delta_receipt().is_none(),
+        "no receipt claims an output"
+    );
+    let files = every_file(world);
+    assert!(
+        !files.iter().any(|file| file.ends_with("dcp-delta.json")),
+        "no delta receipt survives a failed apply: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|file| file.starts_with("published")),
+        "{files:?}"
+    );
+}
+
+#[test]
+fn regression_a_failed_member_fails_the_apply_whichever_member_it_is() {
+    for failing in ["a.bin", "b.bin"] {
+        let world = World::new(&[
+            ("a.bin.xdelta", VCDIFF),
+            ("b.bin.xdelta", VCDIFF),
+            ("1ST_READ.BIN", b"new boot"),
+        ]);
+        let tool = script(
+            &world.tool_dir(),
+            "one-fails",
+            &format!(
+                "case \"$3\" in *{failing}) echo bad base >&2; exit 3;; esac\n\
+                 printf 'DELTA:' > \"$5\"; cat \"$3\" >> \"$5\""
+            ),
+        );
+        let before = world.source_snapshot();
+        let plan = world.review(Some(&tool)).unwrap();
+        assert_whole_operation_failed(&world, &plan, &before);
+    }
+}
+
+/// A decoder that exits zero without producing its output has not succeeded.
+/// The exit status alone must never be taken as proof that a member applied.
+#[test]
+fn regression_a_member_whose_tool_reports_success_but_writes_nothing_fails_the_apply() {
+    let world = World::new(&[("a.bin.xdelta", VCDIFF), ("b.bin.xdelta", VCDIFF)]);
+    let tool = script(
+        &world.tool_dir(),
+        "silent-no-output",
+        "case \"$3\" in *b.bin) exit 0;; esac\n\
+         printf 'DELTA:' > \"$5\"; cat \"$3\" >> \"$5\"",
+    );
+    let before = world.source_snapshot();
+    let plan = world.review(Some(&tool)).unwrap();
+    assert_whole_operation_failed(&world, &plan, &before);
+}

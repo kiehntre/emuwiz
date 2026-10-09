@@ -1564,3 +1564,127 @@ fn transaction_destination(journals: &[RenameTransaction], original: &Path) -> O
         .find(|entry| entry.source_path == original)
         .map(|entry| entry.destination_path.clone())
 }
+// --- Regression fixtures from the 2026-10-09 OpenROM feature-delta audit -----
+//
+// Unsafe behaviour prevented: a CHD "audio codec" choice that hands chdman a
+// compressor it does not have (`cdav`, presented as lossy audio). These two
+// tests cover the command itself, not a description of it: the first pins
+// the one helper that writes the argument vector, the second proves that the
+// same vector is what a spawned process actually receives.
+
+const COMPRESSION_FLAGS: [&str; 4] = ["-c", "--compression", "-hs", "--hunksize"];
+
+fn assert_no_codec_selection(arguments: &[String]) {
+    for argument in arguments {
+        assert!(
+            !COMPRESSION_FLAGS
+                .iter()
+                .any(|flag| argument == flag || argument.starts_with(&format!("{flag}="))),
+            "no compressor or hunk-size argument may be emitted: {arguments:?}"
+        );
+    }
+    // The fixed (non-path) arguments name no codec at all, valid or not.
+    for fixed in [&arguments[0], &arguments[1], &arguments[3]] {
+        for codec in [
+            "cdav", "cdlz", "cdzl", "cdzs", "cdfl", "avhu", "vorbis", "flac",
+        ] {
+            assert!(!fixed.contains(codec), "{fixed:?} names codec {codec:?}");
+        }
+    }
+}
+
+#[test]
+fn regression_chdman_createcd_arguments_are_exactly_mode_input_and_output() {
+    let cue = std::path::Path::new("/synthetic/Disc cdav.cue");
+    let staged = std::path::Path::new("/synthetic/stage/output.chd");
+    let arguments: Vec<String> = chdman_createcd_args(cue, staged)
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        arguments,
+        [
+            "createcd",
+            "--input",
+            "/synthetic/Disc cdav.cue",
+            "--output",
+            "/synthetic/stage/output.chd",
+        ]
+    );
+    // A path is passed through verbatim as one argument; it can never be
+    // reinterpreted as a codec, whatever it contains.
+    assert_no_codec_selection(&arguments);
+}
+
+#[cfg(unix)]
+#[test]
+fn regression_the_spawned_chdman_receives_only_the_helper_arguments() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let (cue, bin) = source(dir.path());
+    let before = (std::fs::read(&cue).unwrap(), std::fs::read(&bin).unwrap());
+    let recorded = dir.path().join("argv.txt");
+    let tool = dir.path().join("recording-converter");
+    // Records one argument per line, then fails so nothing is ever published.
+    std::fs::write(
+        &tool,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexit 99\n",
+            recorded.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let target = dir.path().join("output.chd");
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &target,
+        ChdConversionSourceMode::KeepSource,
+        Some(&tool),
+    )
+    .unwrap();
+
+    let error = execute_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([dir.path()]),
+        &dir.path().join("journal"),
+        dir.path(),
+        &AtomicBool::new(false),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ChdConversionError::ProcessFailed(_)),
+        "{error:?}"
+    );
+
+    let arguments: Vec<String> = std::fs::read_to_string(&recorded)
+        .expect("the converter was started and recorded its arguments")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(arguments.len(), 5, "{arguments:?}");
+    // The process received exactly what the helper builds for these paths.
+    let expected: Vec<String> =
+        chdman_createcd_args(&plan.cue_path, std::path::Path::new(&arguments[4]))
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+    assert_eq!(arguments, expected);
+    assert_eq!(arguments[0], "createcd");
+    assert_eq!(arguments[1], "--input");
+    assert_eq!(arguments[3], "--output");
+    assert!(arguments[4].ends_with("output.chd"), "{arguments:?}");
+    assert_ne!(
+        std::path::Path::new(&arguments[4]),
+        target,
+        "chdman writes to staging, never to the final destination"
+    );
+    assert_no_codec_selection(&arguments);
+
+    // The failed run published nothing and left the source byte-identical.
+    assert!(!target.exists());
+    assert_eq!(
+        (std::fs::read(&cue).unwrap(), std::fs::read(&bin).unwrap()),
+        before
+    );
+}
