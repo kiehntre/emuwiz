@@ -1567,17 +1567,17 @@ pub struct HttpsManagedDatTransport {
 
 impl HttpsManagedDatTransport {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(MANAGED_DAT_OVERALL_TIMEOUT))
-            .timeout_resolve(Some(MANAGED_DAT_CONNECT_TIMEOUT))
-            .timeout_connect(Some(MANAGED_DAT_CONNECT_TIMEOUT))
-            .timeout_recv_response(None)
-            .timeout_recv_body(Some(MANAGED_DAT_IDLE_TIMEOUT))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(MANAGED_DAT_OVERALL_TIMEOUT))
+                .timeout_resolve(Some(MANAGED_DAT_CONNECT_TIMEOUT))
+                .timeout_connect(Some(MANAGED_DAT_CONNECT_TIMEOUT))
+                .timeout_recv_response(None)
+                .timeout_recv_body(Some(MANAGED_DAT_IDLE_TIMEOUT))
+        });
         Self {
             agent: config.new_agent(),
         }

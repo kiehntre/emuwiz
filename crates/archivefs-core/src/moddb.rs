@@ -203,15 +203,15 @@ pub struct UreqModDbTransport {
 
 impl Default for UreqModDbTransport {
     fn default() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_global(Some(GLOBAL_TIMEOUT))
-            .timeout_recv_body(Some(IDLE_TIMEOUT))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_connect(Some(CONNECT_TIMEOUT))
+                .timeout_global(Some(GLOBAL_TIMEOUT))
+                .timeout_recv_body(Some(IDLE_TIMEOUT))
+        });
         Self {
             agent: config.new_agent(),
         }

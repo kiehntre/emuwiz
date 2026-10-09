@@ -242,13 +242,13 @@ impl UpdateDownloader for HttpsUpdateDownloader {
                 "only HTTPS sources are allowed".into(),
             ));
         }
-        let agent = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .timeout_global(Some(UPDATE_TIMEOUT))
-            .build()
-            .new_agent();
+        let agent = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .timeout_global(Some(UPDATE_TIMEOUT))
+        })
+        .new_agent();
         let mut response = agent
             .get(url)
             .call()
@@ -1824,13 +1824,13 @@ pub struct OfficialMetadataProvider {
 
 impl Default for OfficialMetadataProvider {
     fn default() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(METADATA_TIMEOUT))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(METADATA_TIMEOUT))
+        });
         Self {
             agent: config.new_agent(),
         }

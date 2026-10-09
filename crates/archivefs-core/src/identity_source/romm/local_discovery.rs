@@ -1391,15 +1391,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_production_transport_ignores_proxy_environment() {
-        // The only HTTP used by verification is `UreqTransport`, which is
-        // built with `.proxy(None)`; the source of that guarantee is pinned
-        // here so a refactor cannot silently reintroduce env proxies.
-        let source = include_str!("client.rs");
-        assert!(source.contains(".proxy(None)"));
-        assert!(source.contains(".max_redirects(0)"));
-    }
+    // Proxy isolation is exercised through the real transport in romm::tests
+    // and browser::tests, and through the shared http_agent behavioural suite.
 
     #[test]
     fn validation_falls_back_only_on_dns_and_never_rewrites_the_configuration() {

@@ -236,13 +236,13 @@ pub struct UreqGithubTransport {
 impl UreqGithubTransport {
     #[must_use]
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(GITHUB_REQUEST_TIMEOUT))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(GITHUB_REQUEST_TIMEOUT))
+        });
         Self {
             agent: config.new_agent(),
         }

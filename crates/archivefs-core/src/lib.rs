@@ -82,6 +82,7 @@ pub mod game_profile_planner;
 pub mod homebrew_artifact;
 /// GitHub Releases provider for already-known homebrew repositories.
 pub mod homebrew_github;
+mod http_agent;
 pub mod identity_attention;
 pub mod job_progress;
 /// Typed library presentation visibility, separate from source ownership and

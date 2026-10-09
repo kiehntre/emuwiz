@@ -285,15 +285,15 @@ impl Default for UreqTransport {
 
 impl UreqTransport {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(5)))
-            .timeout_global(Some(DEFAULT_TIMEOUT))
-            .max_redirects(0)
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .timeout_connect(Some(Duration::from_secs(5)))
+                .timeout_global(Some(DEFAULT_TIMEOUT))
+                .max_redirects(0)
             // No environment proxy: credentials travel in the query string, and
             // EmuWiz never routes provider traffic through a proxy it was not
             // explicitly configured to use.
-            .proxy(None)
-            .build();
+        });
         Self {
             agent: config.into(),
         }

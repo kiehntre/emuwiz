@@ -324,27 +324,27 @@ pub struct HttpsCheatSourceTransport {
 
 impl HttpsCheatSourceTransport {
     pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(
-                CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS,
-            )))
-            .timeout_resolve(Some(Duration::from_secs(
-                CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
-            )))
-            .timeout_connect(Some(Duration::from_secs(
-                CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
-            )))
-            // ureq 3.3 carries recv-response deadlines into body reads. Leaving
-            // this unset avoids turning a header timeout into a whole-body cap;
-            // the global bound still covers headers and the receive-body bound
-            // below is a true per-read idle timeout.
-            .timeout_recv_response(None)
-            .timeout_recv_body(Some(Duration::from_secs(CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS)))
-            .build();
+        let config = crate::http_agent::config(|builder| {
+            builder
+                .https_only(true)
+                .max_redirects(0)
+                .http_status_as_error(false)
+                .timeout_global(Some(Duration::from_secs(
+                    CHEAT_SOURCE_OVERALL_TIMEOUT_SECONDS,
+                )))
+                .timeout_resolve(Some(Duration::from_secs(
+                    CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+                )))
+                .timeout_connect(Some(Duration::from_secs(
+                    CHEAT_SOURCE_CONNECT_TIMEOUT_SECONDS,
+                )))
+                // ureq 3.3 carries recv-response deadlines into body reads. Leaving
+                // this unset avoids turning a header timeout into a whole-body cap;
+                // the global bound still covers headers and the receive-body bound
+                // below is a true per-read idle timeout.
+                .timeout_recv_response(None)
+                .timeout_recv_body(Some(Duration::from_secs(CHEAT_SOURCE_IDLE_TIMEOUT_SECONDS)))
+        });
         Self {
             agent: config.new_agent(),
         }
