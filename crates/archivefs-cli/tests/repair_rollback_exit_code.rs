@@ -719,3 +719,48 @@ fn non_chd_failed_rollback_json_keeps_its_exact_shape_and_exit_code() {
         assert_eq!(json["transaction_id"], transaction_id.as_str(), "{name}");
     }
 }
+
+/// The originals are restored but the CHD can no longer be removed (it was
+/// replaced): the CHD and the foreign file are kept, the exit is non-zero, and
+/// the text says the CUE/BIN may already be back instead of implying they are
+/// still in quarantine.
+#[test]
+fn chd_undo_that_restores_originals_but_cannot_remove_the_chd_says_so() {
+    let Some(disc) = Converted::new(ChdConversionSourceMode::QuarantineSource) else {
+        return;
+    };
+    let chd_path = disc.root().join("Disc.chd");
+    std::fs::write(&chd_path, FOREIGN).unwrap();
+
+    for attempt in 0..2 {
+        let output = disc.undo(false);
+        let text = stdout(&output);
+        assert!(!output.status.success(), "attempt {attempt}: {text}");
+        assert!(
+            text.contains("Result: RollbackFailed"),
+            "attempt {attempt}: {text}"
+        );
+        assert!(
+            text.contains("original CUE/BIN may already be back"),
+            "attempt {attempt}: {text}"
+        );
+        assert!(
+            !text.contains("not undone; nothing was deleted"),
+            "attempt {attempt}: {text}"
+        );
+        assert!(disc.originals_in_place(), "attempt {attempt}");
+        assert_eq!(
+            std::fs::read(&chd_path).unwrap(),
+            FOREIGN,
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            disc.states(),
+            (
+                TransactionState::RollbackFailed,
+                Some(TransactionState::RolledBack)
+            ),
+            "attempt {attempt}"
+        );
+    }
+}

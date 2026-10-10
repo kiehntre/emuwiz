@@ -677,7 +677,11 @@ fn run_rollback(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
             }
             RollbackResult::RollbackFailed { failed } => {
                 if chd_conversion {
-                    println!("  The conversion was not undone; nothing was deleted.");
+                    println!(
+                        "  The conversion was not fully undone and nothing was deleted: the \
+                         verified CHD was kept, and the original CUE/BIN may already be back \
+                         at their reviewed paths. Check both before retrying."
+                    );
                 }
                 println!("  Entries not restored: {}", failed.len());
                 for (path, reason) in failed {
