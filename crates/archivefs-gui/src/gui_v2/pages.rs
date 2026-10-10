@@ -298,6 +298,9 @@ impl App {
     pub(super) fn show(&mut self, context: &egui::Context) {
         // Presentation only: a no-op unless the Simple v1 preference changed.
         self.simple.sync_style(context);
+        if self.simple.simple_navigation() {
+            super::simple_shell::prepare_keyboard_reveal(context);
+        }
         if self.show_manual_viewer(context) {
             return;
         }
@@ -569,10 +572,12 @@ impl App {
                 self.browse_play(ui, selected);
                 return;
             }
-            egui::ScrollArea::vertical()
-                .id_salt(("v2_page_content", route.section()))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+            super::simple_shell::show_page_scroll(
+                ui,
+                route.section(),
+                self.simple.simple_navigation()
+                    && route == Route::Section(Section::OrganisationFamily),
+                |ui| {
                     match route {
                         Route::Home | Route::Section(Section::Home) => self.home(ui),
                         Route::BrowsePlay => self.browse_play(ui, None),
@@ -673,7 +678,8 @@ impl App {
                         Route::Task { section, .. } => self.handoff(ui, section),
                     }
                     // Contextual guidance stays above this potentially unbounded body.
-                });
+                },
+            );
         });
         if self.confirm_scan {
             egui::Window::new("Scan your game folders?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(context, |ui| {

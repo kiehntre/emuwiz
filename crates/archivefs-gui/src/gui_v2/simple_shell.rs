@@ -815,25 +815,17 @@ pub(super) fn show_sidebar(
     // enlarged; the version footer keeps its place below them. Nothing is
     // dropped: a row that does not fit is one wheel turn or Tab away.
     let rows = (ui.available_height() - FOOTER_HEIGHT).max(NAV_TARGET_HEIGHT);
-    // The selected row is brought into view when the selection changes or the
-    // room for rows does (a restored session, a link from a page, a resize, a
-    // new scale) - and on no other frame, so wheel scrolling is never undone.
-    let shown_for = (selected, rows.round() as i32);
-    let shown_id = egui::Id::new("v2_simple_selected_shown");
-    let reveal_selected = ui.data(|data| data.get_temp(shown_id)) != Some(shown_for);
-    if reveal_selected {
-        ui.data_mut(|data| data.insert_temp(shown_id, shown_for));
-    }
-    egui::ScrollArea::vertical()
-        .id_salt("v2_simple_destinations")
-        .max_height(rows)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
+    show_reveal_scroll(
+        ui,
+        "v2_simple_destinations",
+        rows,
+        &DESTINATIONS.map(nav_id),
+        selected.map(nav_id),
+        |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
             for destination in DESTINATIONS {
                 let is_selected = selected == Some(destination);
-                let reveal = reveal_selected && is_selected;
-                if nav_item(ui, destination, is_selected, reveal).clicked() {
+                if nav_item(ui, destination, is_selected).clicked() {
                     chosen = Some(destination);
                 }
             }
@@ -851,7 +843,8 @@ pub(super) fn show_sidebar(
                     .wrap(),
                 );
             }
-        });
+        },
+    );
     ui.add_space(4.0);
     ui.label(
         egui::RichText::new(concat!("EmuWiz v", env!("CARGO_PKG_VERSION")))
@@ -890,12 +883,7 @@ fn nav_metrics(width: f32, label_width_at_full_size: f32) -> (f32, f32, f32) {
 /// One navigation row: transparent until hovered, a dim blue pill with a
 /// bright left edge when selected. A real focusable button for the keyboard
 /// and for assistive technology.
-fn nav_item(
-    ui: &mut egui::Ui,
-    destination: Destination,
-    selected: bool,
-    reveal: bool,
-) -> egui::Response {
+fn nav_item(ui: &mut egui::Ui, destination: Destination, selected: bool) -> egui::Response {
     let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), NAV_TARGET_HEIGHT));
     let response = ui.interact(rect, nav_id(destination), egui::Sense::click());
     response.widget_info(|| {
@@ -906,12 +894,6 @@ fn nav_item(
             destination.label(),
         )
     });
-    // Keyboard focus must never land on a row that is scrolled out of view,
-    // and the selected row is shown when asked. Immediately, not eased: the
-    // row is on screen by the next frame.
-    if response.gained_focus() || reveal {
-        response.scroll_to_me_animation(None, egui::style::ScrollAnimation::none());
-    }
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if selected {
@@ -1127,35 +1109,170 @@ pub(super) fn task_id(section: Section) -> egui::Id {
     egui::Id::new(("v2_simple_manage_task", section))
 }
 
+/// egui queues reverse focus until the next pass. Complete that pass within
+/// the same rendered frame; do not delay or consume the keyboard event.
+pub(super) fn prepare_keyboard_reveal(context: &egui::Context) {
+    if context.input(|input| input.modifiers.shift_only() && input.key_pressed(egui::Key::Tab)) {
+        context.request_discard("finish reverse Simple keyboard focus before display");
+    }
+}
+
+/// Keep the existing page scroller and identity. Only the Simple Manage hub
+/// uses focus reveal; Classic and every other page keep their usual scroller.
+pub(super) fn show_page_scroll<R>(
+    ui: &mut egui::Ui,
+    section: Section,
+    manage: bool,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    let salt = ("v2_page_content", section);
+    if manage {
+        show_reveal_scroll(
+            ui,
+            salt,
+            ui.available_height(),
+            &MANAGE_TASKS.map(|task| task_id(task.section)),
+            None,
+            content,
+        );
+    } else {
+        egui::ScrollArea::vertical()
+            .id_salt(salt)
+            .auto_shrink([false, false])
+            .show(ui, content);
+    }
+}
+
+#[derive(Clone, Default)]
+struct RevealLayout {
+    focused: Option<egui::Id>,
+    selected: Option<egui::Id>,
+    size: egui::Vec2,
+    /// Rectangles in content coordinates, independent of the scroll offset.
+    controls: Vec<(egui::Id, egui::Rect)>,
+    clip_start: f32,
+    clip_height: f32,
+}
+
+/// The nearest absolute offset fitting a rect inside the real clip, with one
+/// point for pixel rounding. Repeating this calculation is idempotent.
+fn reveal_offset(offset: f32, rect: egui::Rect, clip_start: f32, height: f32) -> f32 {
+    let first = rect.max.y - clip_start - height + 1.0;
+    let last = rect.min.y - clip_start - 1.0;
+    if first <= last {
+        offset.clamp(first, last).max(0.0)
+    } else {
+        // A control taller than the viewport cannot fit. Keep its top readable.
+        last.max(0.0)
+    }
+}
+
+/// Selection changes reveal once; new keyboard focus takes precedence. Pointer
+/// focus, wheel input and unchanged repaints never submit a reveal intent.
+fn show_reveal_scroll<R>(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + Copy,
+    height: f32,
+    controls: &[egui::Id],
+    selected: Option<egui::Id>,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    let id = ui.make_persistent_id(egui::Id::new(salt));
+    let layout_id = id.with("simple_reveal_layout");
+    let previous = ui
+        .data(|data| data.get_temp::<RevealLayout>(layout_id))
+        .unwrap_or_default();
+    let size = egui::vec2(ui.available_width(), height.min(ui.available_height()));
+    let selection_changed = selected != previous.selected || size != previous.size;
+    let pointer = ui.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
+    let focus = || {
+        ui.ctx()
+            .memory(|memory| memory.focused())
+            .filter(|id| controls.contains(id))
+    };
+    let intent = |focused: Option<egui::Id>| {
+        if !pointer && focused != previous.focused && focused.is_some() {
+            focused
+        } else if selection_changed {
+            selected
+        } else {
+            None
+        }
+    };
+    let mut scroll = egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .max_height(height)
+        .auto_shrink([false, false])
+        .animated(false);
+    // On a reverse-focus pass the target is known before layout. Use its last
+    // content rect, never a relative delta from its earlier screen position.
+    if let Some(target) = intent(focus())
+        && let Some((_, rect)) = previous.controls.iter().find(|(id, _)| *id == target)
+        && previous.clip_height > 0.0
+    {
+        let offset = egui::scroll_area::State::load(ui.ctx(), id)
+            .unwrap_or_default()
+            .offset
+            .y;
+        scroll = scroll.vertical_scroll_offset(reveal_offset(
+            offset,
+            *rect,
+            previous.clip_start,
+            previous.clip_height,
+        ));
+    }
+    let mut layout = RevealLayout {
+        selected,
+        size,
+        ..Default::default()
+    };
+    let mut drawn_offset = 0.0;
+    let output = scroll.show_viewport(ui, |ui, viewport| {
+        let origin = ui.max_rect().min;
+        drawn_offset = viewport.min.y;
+        layout.clip_start = ui.clip_rect().min.y - origin.y - drawn_offset;
+        layout.clip_height = ui.clip_rect().height();
+        let inner = content(ui);
+        // Read inside this pass: egui's post-frame read_response can return
+        // the preceding pass after a multi-pass frame.
+        layout.controls = controls
+            .iter()
+            .filter_map(|id| {
+                ui.ctx()
+                    .read_response(*id)
+                    .map(|response| (*id, response.rect.translate(-origin.to_vec2())))
+            })
+            .collect();
+        layout.focused = ui
+            .ctx()
+            .memory(|memory| memory.focused())
+            .filter(|id| controls.contains(id));
+        inner
+    });
+    // Forward focus arrives during widget layout. Store one absolute target
+    // and discard that stale picture, so its replacement uses the new offset.
+    if let Some(target) = intent(layout.focused)
+        && let Some((_, rect)) = layout.controls.iter().find(|(id, _)| *id == target)
+    {
+        let target = reveal_offset(drawn_offset, *rect, layout.clip_start, layout.clip_height)
+            .min((output.content_size.y - output.inner_rect.height()).max(0.0));
+        if (target - drawn_offset).abs() > 0.01 {
+            let mut state = output.state;
+            state.offset.y = target;
+            state.store(ui.ctx(), output.id);
+            ui.ctx()
+                .request_discard("display the absolute Simple reveal offset");
+        }
+    }
+    ui.data_mut(|data| data.insert_temp(layout_id, layout));
+}
+
 fn task_card(ui: &mut egui::Ui, task: &ManageTask, width: f32) -> egui::Response {
     let (_, rect) = ui.allocate_space(egui::vec2(width, TASK_CARD_HEIGHT));
     let response = ui.interact(rect, task_id(task.section), egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), task.title)
     });
-    // Reveal keyboard focus once, in either Tab direction. Pointer input and
-    // an already-focused card must not undo the person's wheel scrolling.
-    if response.gained_focus()
-        && !ui.input(|input| input.pointer.any_pressed() || input.pointer.any_released())
-    {
-        // Use the actual clip boundary: alignment-based scroll targets add
-        // item spacing and can clip a tall card in a short viewport. Leave
-        // one point for pixel rounding and move only as far as necessary.
-        let visible = ui.clip_rect().shrink2(egui::vec2(0.0, 1.0));
-        let delta = if rect.min.y < visible.min.y {
-            visible.min.y - rect.min.y
-        } else if rect.max.y > visible.max.y {
-            visible.max.y - rect.max.y
-        } else {
-            0.0
-        };
-        if delta != 0.0 {
-            ui.scroll_with_delta_animation(
-                egui::vec2(0.0, delta),
-                egui::style::ScrollAnimation::none(),
-            );
-        }
-    }
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let active = response.hovered() || response.has_focus();

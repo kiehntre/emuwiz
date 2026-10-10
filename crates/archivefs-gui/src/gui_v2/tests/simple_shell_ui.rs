@@ -1383,3 +1383,258 @@ fn twelve_blue_classic_cycles_restore_both_complete_styles_without_drift() {
         }
     }
 }
+
+// No release-only or settling frames between these key presses. A complete
+// physical key gesture is delivered to App::show in one rendered frame.
+fn hardening_key_frame(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    key: egui::Key,
+    reverse: bool,
+) -> egui::FullOutput {
+    let modifiers = egui::Modifiers {
+        shift: reverse,
+        ..Default::default()
+    };
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            modifiers,
+            events: [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        |context| {
+            app.show(context);
+            for id in DESTINATIONS
+                .map(crate::gui_v2::simple_shell::nav_id)
+                .into_iter()
+                .chain(
+                    crate::gui_v2::simple_shell::MANAGE_TASKS
+                        .map(|task| crate::gui_v2::simple_shell::task_id(task.section)),
+                )
+            {
+                if let Some(response) = context.read_response(id) {
+                    context.data_mut(|data| {
+                        data.insert_temp(id.with("hardening_actual_rect"), response.rect)
+                    });
+                }
+            }
+        },
+    )
+}
+
+#[track_caller]
+fn hardening_row_visible(
+    context: &egui::Context,
+    output: &egui::FullOutput,
+    destination: Destination,
+    keyboard: bool,
+) {
+    let response = context
+        .read_response(crate::gui_v2::simple_shell::nav_id(destination))
+        .unwrap();
+    let rect = if keyboard {
+        context
+            .data(|data| data.get_temp::<egui::Rect>(response.id.with("hardening_actual_rect")))
+            .unwrap()
+    } else {
+        response.rect
+    };
+    assert!(
+        output.shapes.iter().any(|shape| {
+            matches!(&shape.shape, egui::Shape::Text(text)
+                if text.galley.text() == destination.label()
+                    && rect.contains(text.pos)
+                    && shape.clip_rect.contains_rect(rect))
+        }),
+        "{} row {:?} is outside its actual sidebar clip",
+        destination.label(),
+        rect
+    );
+}
+
+#[test]
+fn hardening_sidebar_direct_route_reveals_once_matrix() {
+    use crate::gui_v2::simple_shell::nav_id;
+    for window in [[1024.0, 640.0], [1280.0, 720.0]] {
+        for scale in [0.8, 1.0, 1.3, 1.6] {
+            let (context, mut app, size) = manage_window(window, scale);
+            // Exercise every route, including changes between the two ends.
+            for destination in DESTINATIONS.into_iter().rev().chain(DESTINATIONS) {
+                app.router.current = destination.route();
+                frame(&context, &mut app, size);
+                let output = frame(&context, &mut app, size);
+                hardening_row_visible(&context, &output, destination, false);
+            }
+            // Wheel up while Settings stays selected. Idle repaint must leave
+            // that deliberate position alone, including at sizes without overflow.
+            app.router.current = Destination::Settings.route();
+            frame(&context, &mut app, size);
+            frame(&context, &mut app, size);
+            for _ in 0..12 {
+                wheel_sidebar(&context, &mut app, size, 40.0);
+            }
+            for _ in 0..20 {
+                frame(&context, &mut app, size);
+            }
+            let before = context
+                .read_response(nav_id(Destination::Home))
+                .unwrap()
+                .rect;
+            let output = frame(&context, &mut app, size);
+            assert_eq!(
+                context
+                    .read_response(nav_id(Destination::Home))
+                    .unwrap()
+                    .rect,
+                before
+            );
+            hardening_row_visible(&context, &output, Destination::Home, false);
+            assert_eq!(app.router.current, Destination::Settings.route());
+        }
+    }
+}
+
+#[test]
+fn hardening_sidebar_tabs_every_frame_forward_reverse_matrix() {
+    use crate::gui_v2::simple_shell::nav_id;
+    for window in [[1024.0, 640.0], [1280.0, 720.0]] {
+        for scale in [0.8, 1.0, 1.3, 1.6] {
+            for reverse in [false, true] {
+                let (context, mut app, size) = manage_window(window, scale);
+                let mut reached = Vec::new();
+                for _ in 0..80 {
+                    let output =
+                        hardening_key_frame(&context, &mut app, size, egui::Key::Tab, reverse);
+                    let focused = context.memory(|memory| memory.focused());
+                    if let Some(destination) = DESTINATIONS
+                        .into_iter()
+                        .find(|d| focused == Some(nav_id(*d)))
+                    {
+                        hardening_row_visible(&context, &output, destination, true);
+                        if reached.last() != Some(&destination) {
+                            reached.push(destination);
+                        }
+                        if reached.len() == DESTINATIONS.len() {
+                            break;
+                        }
+                    }
+                }
+                let expected: Vec<_> = if reverse {
+                    DESTINATIONS.into_iter().rev().collect()
+                } else {
+                    DESTINATIONS.to_vec()
+                };
+                assert_eq!(reached, expected, "{window:?} {scale} reverse={reverse}");
+            }
+        }
+    }
+}
+
+#[track_caller]
+fn hardening_card_visible(
+    context: &egui::Context,
+    output: &egui::FullOutput,
+    task: &crate::gui_v2::simple_shell::ManageTask,
+) {
+    let id = crate::gui_v2::simple_shell::task_id(task.section);
+    assert_eq!(context.memory(|memory| memory.focused()), Some(id));
+    let rect = context
+        .data(|data| data.get_temp::<egui::Rect>(id.with("hardening_actual_rect")))
+        .unwrap();
+    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(painted)
+        if painted.rect == rect && painted.stroke.width >= 2.0 && painted.stroke.color == palette::ACCENT
+            && shape.clip_rect.contains_rect(rect))), "{} focused rect {rect:?} is not fully painted inside the content clip", task.title);
+    for wanted in [task.title, task.description] {
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text)
+            if text.galley.text() == wanted && rect.contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                && shape.clip_rect.contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size())))), "{wanted} is missing/clipped");
+    }
+}
+
+fn hardening_card_walk(reverse: bool, slow: bool, activate: Option<usize>) -> Vec<Section> {
+    use crate::gui_v2::simple_shell::{MANAGE_TASKS, task_id};
+    let (context, mut app, size) = manage_window(SMALL, 1.6);
+    let mut reached = Vec::new();
+    for step in 0..80 {
+        let mut output = hardening_key_frame(&context, &mut app, size, egui::Key::Tab, reverse);
+        if slow {
+            output = settled_card_frame(&context, &mut app, size);
+        }
+        let focused = context.memory(|memory| memory.focused());
+        let Some(task) = MANAGE_TASKS
+            .iter()
+            .find(|task| focused == Some(task_id(task.section)))
+        else {
+            continue;
+        };
+        if slow {
+            assert_task_visible(&context, &output, task);
+        } else {
+            hardening_card_visible(&context, &output, task);
+        }
+        if reached.last() != Some(&task.section) {
+            reached.push(task.section);
+            if activate == Some(reached.len() - 1) {
+                // The very next event activates the visibly outlined card.
+                hardening_key_frame(&context, &mut app, size, egui::Key::Enter, false);
+                assert_eq!(
+                    app.router.current,
+                    Route::Section(task.section),
+                    "Enter at step {step}"
+                );
+                return reached;
+            }
+        }
+        if reached.len() == MANAGE_TASKS.len() {
+            return reached;
+        }
+    }
+    panic!("did not reach every card: {reached:?}, reverse={reverse}");
+}
+
+#[test]
+fn hardening_manage_tabs_every_frame_forward_reverse() {
+    use crate::gui_v2::simple_shell::MANAGE_TASKS;
+    let expected: Vec<_> = MANAGE_TASKS.iter().map(|task| task.section).collect();
+    assert_eq!(hardening_card_walk(false, false, None), expected);
+    assert_eq!(
+        hardening_card_walk(true, false, None),
+        expected.into_iter().rev().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn hardening_manage_enter_after_every_rapid_focus_step() {
+    for reverse in [false, true] {
+        for index in 0..5 {
+            assert_eq!(
+                hardening_card_walk(reverse, false, Some(index)).len(),
+                index + 1
+            );
+        }
+    }
+}
+
+#[test]
+fn hardening_manage_fast_and_slow_focus_orders_match() {
+    for reverse in [false, true] {
+        assert_eq!(
+            hardening_card_walk(reverse, false, None),
+            hardening_card_walk(reverse, true, None)
+        );
+    }
+}
