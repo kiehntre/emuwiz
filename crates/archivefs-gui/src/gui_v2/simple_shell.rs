@@ -72,11 +72,39 @@ impl ShellState {
         self.ui_scale = clamp_scale(scale);
     }
 
+    /// Ctrl+Plus, Ctrl+Equals, Ctrl+Minus and Ctrl+0 change the saved
+    /// `ui_scale`, within the same bounds as the Settings buttons, and never
+    /// egui's own unsaved zoom. Returns true when the saved value changed.
+    pub fn apply_zoom_shortcuts(&mut self, context: &egui::Context) -> bool {
+        // egui would otherwise zoom by its own step and ignore our bounds.
+        context.options_mut(|options| options.zoom_with_keyboard = false);
+        let action = context.input_mut(|input| {
+            let command = egui::Modifiers::COMMAND;
+            if input.consume_key(command, egui::Key::Plus)
+                || input.consume_key(command, egui::Key::Equals)
+            {
+                Some(self.ui_scale + UI_SCALE_STEP)
+            } else if input.consume_key(command, egui::Key::Minus) {
+                Some(self.ui_scale - UI_SCALE_STEP)
+            } else if input.consume_key(command, egui::Key::Num0) {
+                Some(1.0)
+            } else {
+                None
+            }
+        });
+        let Some(target) = action else {
+            return false;
+        };
+        let before = self.ui_scale;
+        self.set_ui_scale(target);
+        (self.ui_scale - before).abs() > f32::EPSILON
+    }
+
     /// Keeps the context style and zoom in step with the preference. Cheap
     /// when nothing changed: one pointer comparison per frame.
     ///
-    /// With Simple never turned on this touches nothing, so the default
-    /// interface is exactly the host's.
+    /// With Simple never turned on and the scale at 100% this changes
+    /// nothing, so the default interface is exactly the host's.
     pub fn sync_style(&mut self, context: &egui::Context) {
         if self.enabled {
             let current = context.style();
@@ -95,11 +123,15 @@ impl ShellState {
                 self.blue = Some(context.style());
             }
             self.set_zoom(context, self.ui_scale);
-        } else if let Some(classic) = self.classic.take() {
-            // Every slot the blue profile touched, restored at once.
-            context.set_style(classic);
-            self.blue = None;
-            self.set_zoom(context, 1.0);
+        } else {
+            if let Some(classic) = self.classic.take() {
+                // Every slot the blue profile touched, restored at once.
+                context.set_style(classic);
+                self.blue = None;
+            }
+            // Classic honours the same saved scale. At 100% this is the
+            // host's own zoom, so the default interface is unchanged.
+            self.set_zoom(context, self.ui_scale);
         }
     }
 
@@ -1139,7 +1171,40 @@ pub(super) fn show_page_scroll<R>(
         egui::ScrollArea::vertical()
             .id_salt(salt)
             .auto_shrink([false, false])
-            .show(ui, content);
+            // A revealed control must be in view in the pass that finds it.
+            .animated(false)
+            .show(ui, |ui| {
+                let inner = content(ui);
+                reveal_new_keyboard_focus(ui, egui::Id::new(salt));
+                inner
+            });
+    }
+}
+
+/// A control that takes keyboard focus inside an ordinary page scroller is
+/// brought into view. Pointer presses, wheel scrolling and focus that did not
+/// change never scroll, and only controls laid out inside this content are
+/// revealed, so sidebar and header focus is left to its own reveal.
+fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id) {
+    let context = ui.ctx().clone();
+    let slot = key.with("last_focus");
+    let focused = context.memory(|memory| memory.focused());
+    let before = context
+        .data(|data| data.get_temp::<Option<egui::Id>>(slot))
+        .flatten();
+    context.data_mut(|data| data.insert_temp(slot, focused));
+    let Some(id) = focused else {
+        return;
+    };
+    let pointer =
+        context.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
+    if pointer || Some(id) == before {
+        return;
+    }
+    if let Some(response) = context.read_response(id)
+        && ui.min_rect().contains_rect(response.rect)
+    {
+        ui.scroll_to_rect(response.rect, None);
     }
 }
 
@@ -1625,9 +1690,10 @@ mod tests {
             shell.enabled = false;
             shell.sync_style(&context);
             let _ = context.run(egui::RawInput::default(), |_| {});
-            // The whole style, not selected fields.
+            // The whole style, not selected fields. Classic keeps the saved
+            // scale (Slice 2A); only the style returns to its own.
             assert_eq!(*context.style(), classic);
-            assert_eq!(context.zoom_factor(), 1.0);
+            assert!((context.zoom_factor() - scale).abs() < 1e-6);
         }
     }
 

@@ -693,7 +693,8 @@ fn turning_simple_off_restores_the_complete_classic_style() {
                 &classic,
                 &format!("round {round}: classic not restored"),
             );
-            assert_eq!(context.zoom_factor(), 1.0);
+            // Classic honours the saved scale; only the style is restored.
+            assert!((context.zoom_factor() - app.simple.ui_scale).abs() < 1e-6);
         }
     }
 }
@@ -719,7 +720,7 @@ fn a_session_restored_with_simple_on_can_still_return_to_exact_classic() {
         &classic,
         "after a restored Simple session is turned off",
     );
-    assert_eq!(context.zoom_factor(), 1.0);
+    assert!((context.zoom_factor() - 1.6).abs() < 1e-6);
 }
 
 // Manage-card focus must follow the page scroll, including reverse Tab.
@@ -1379,7 +1380,10 @@ fn twelve_blue_classic_cycles_restore_both_complete_styles_without_drift() {
                 &classic,
                 &format!("round {round}: classic drifted"),
             );
-            assert_eq!(context.zoom_factor(), 1.0, "round {round}");
+            assert!(
+                (context.zoom_factor() - app.simple.ui_scale).abs() < 1e-6,
+                "round {round}"
+            );
         }
     }
 }
@@ -1636,5 +1640,240 @@ fn hardening_manage_fast_and_slow_focus_orders_match() {
             hardening_card_walk(reverse, false, None),
             hardening_card_walk(reverse, true, None)
         );
+    }
+}
+
+// ------------------------------------------------------------ Slice 2A scale
+
+const WINDOWS_2A: [[f32; 2]; 3] = [[1024.0, 640.0], [1280.0, 720.0], [1920.0, 1080.0]];
+const SCALES_2A: [f32; 4] = [0.8, 1.0, 1.3, 1.6];
+
+fn pass_2a(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+) {
+    let _ = context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            modifiers,
+            events,
+            ..Default::default()
+        },
+        |context| app.show(context),
+    );
+}
+
+fn chord(context: &egui::Context, app: &mut App, size: [f32; 2], key: egui::Key) {
+    let modifiers = egui::Modifiers::COMMAND;
+    for pressed in [true, false] {
+        pass_2a(
+            context,
+            app,
+            size,
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            }],
+            modifiers,
+        );
+    }
+    for _ in 0..3 {
+        frame(context, app, size);
+    }
+}
+
+/// A Settings page in either profile at one window and saved scale.
+fn settings_2a(
+    blue: bool,
+    window: [f32; 2],
+    scale: f32,
+    hints: bool,
+) -> (egui::Context, App, [f32; 2]) {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.simple.enabled = blue;
+    app.simple.set_ui_scale(scale);
+    app.beginner_hints_enabled = hints;
+    app.router.current = Route::Section(Section::Settings);
+    let size = [window[0] / scale, window[1] / scale];
+    for _ in 0..4 {
+        frame(&context, &mut app, size);
+    }
+    (context, app, size)
+}
+
+fn zoom_of(context: &egui::Context) -> f32 {
+    context.zoom_factor()
+}
+
+#[test]
+fn slice2a_keyboard_zoom_and_saved_scale_are_one_value_in_both_profiles() {
+    for blue in [true, false] {
+        let (context, mut app, size) = settings_2a(blue, SMALL, 1.0, false);
+        for (key, expected) in [
+            (egui::Key::Plus, 1.1),
+            (egui::Key::Equals, 1.2),
+            (egui::Key::Minus, 1.1),
+            (egui::Key::Num0, 1.0),
+        ] {
+            chord(&context, &mut app, size, key);
+            assert!(
+                (app.simple.ui_scale - expected).abs() < 1e-6,
+                "blue={blue} {key:?}: saved {}",
+                app.simple.ui_scale
+            );
+            assert!(
+                (zoom_of(&context) - expected).abs() < 1e-6,
+                "blue={blue} {key:?}"
+            );
+        }
+        assert!(app.preferences_dirty.is_some(), "the new size is saved");
+    }
+}
+
+#[test]
+fn slice2a_keyboard_zoom_never_leaves_the_supported_bounds() {
+    for blue in [true, false] {
+        let (context, mut app, size) = settings_2a(blue, SMALL, 1.6, false);
+        for _ in 0..3 {
+            chord(&context, &mut app, size, egui::Key::Plus);
+        }
+        assert!((app.simple.ui_scale - 1.6).abs() < 1e-6);
+        assert!(
+            (zoom_of(&context) - 1.6).abs() < 1e-6,
+            "blue={blue} above max"
+        );
+        let (context, mut app, size) = settings_2a(blue, SMALL, 0.8, false);
+        for _ in 0..3 {
+            chord(&context, &mut app, size, egui::Key::Minus);
+        }
+        assert!((app.simple.ui_scale - 0.8).abs() < 1e-6);
+        assert!(
+            (zoom_of(&context) - 0.8).abs() < 1e-6,
+            "blue={blue} below min"
+        );
+    }
+}
+
+#[test]
+fn slice2a_classic_renders_the_saved_scale_and_modes_preserve_it() {
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.simple.set_ui_scale(1.3);
+    app.router.current = Route::Section(Section::Settings);
+    let size = [DESKTOP[0] / 1.3, DESKTOP[1] / 1.3];
+    for mode in [false, true, false, true, false] {
+        app.simple.enabled = mode;
+        for _ in 0..3 {
+            frame(&context, &mut app, size);
+        }
+        assert!((zoom_of(&context) - 1.3).abs() < 1e-6, "blue={mode}");
+        assert!((app.simple.ui_scale - 1.3).abs() < 1e-6, "blue={mode}");
+    }
+}
+
+/// The painted text of `label` lies fully inside both its clip and the window.
+fn label_visible(output: &egui::FullOutput, label: &str, size: [f32; 2]) -> bool {
+    let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+    output.shapes.iter().any(|shape| match &shape.shape {
+        egui::Shape::Text(text) if text.galley.text() == label => {
+            let bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+            shape.clip_rect.contains_rect(bounds) && window.contains_rect(bounds)
+        }
+        _ => false,
+    })
+}
+
+#[test]
+fn slice2a_settings_scale_controls_are_visible_without_scrolling_at_every_size() {
+    for blue in [true, false] {
+        for window in WINDOWS_2A {
+            for scale in SCALES_2A {
+                for hints in [true, false] {
+                    let (context, mut app, size) = settings_2a(blue, window, scale, hints);
+                    let output = frame(&context, &mut app, size);
+                    for label in ["Smaller", "Larger", "Reset size"] {
+                        assert!(
+                            label_visible(&output, label, size),
+                            "{label}: blue={blue} window={window:?} scale={scale} hints={hints}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn slice2a_tab_reveals_every_settings_control_at_the_hardest_setting() {
+    for (blue, hints, reverse) in [
+        (true, true, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, false),
+        (true, true, true),
+        (false, false, true),
+    ] {
+        {
+            let (context, mut app, size) = settings_2a(blue, SMALL, 1.6, hints);
+            let mut seen = 0;
+            let mut last = None;
+            for step in 0..48 {
+                if reverse {
+                    shift_tab(&context, &mut app, size);
+                } else {
+                    key_press(&context, &mut app, size, egui::Key::Tab);
+                }
+                for _ in 0..3 {
+                    frame(&context, &mut app, size);
+                }
+                let output = frame(&context, &mut app, size);
+                let Some(id) = context.memory(|memory| memory.focused()) else {
+                    continue;
+                };
+                if last == Some(id) {
+                    continue;
+                }
+                last = Some(id);
+                let Some(response) = context.read_response(id) else {
+                    continue;
+                };
+                // Only content-area controls are under test; the header and
+                // sidebar have their own reveal.
+                if response.rect.min.x < 200.0 / 1.6 {
+                    continue;
+                }
+                seen += 1;
+                let window =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+                assert!(
+                    window.contains_rect(response.rect),
+                    "step {step}: focused control {:?} outside the window (blue={blue} hints={hints})",
+                    response.rect
+                );
+                let painted = output.shapes.iter().any(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => {
+                        let bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        response.rect.contains_rect(bounds) && shape.clip_rect.contains_rect(bounds)
+                    }
+                    _ => false,
+                });
+                assert!(
+                    painted,
+                    "step {step}: focused control {:?} not shown (blue={blue} hints={hints})",
+                    response.rect
+                );
+            }
+            assert!(seen >= 6, "only {seen} Settings controls were reached");
+        }
     }
 }

@@ -31,6 +31,9 @@ pub(super) fn primary(ui: &mut egui::Ui, text: &str) -> bool {
     .clicked()
 }
 
+/// Below this much body height (points) contextual guidance scrolls with the page.
+const COMPACT_BODY_HEIGHT: f32 = 260.0;
+
 /// One bounded main-content scroller; sidebar and header are outside it.
 fn check_scroll(ui: &mut egui::Ui, platform: Option<&str>, content: impl FnOnce(&mut egui::Ui)) {
     let salt = ("v2_check_scroll", platform);
@@ -297,10 +300,11 @@ impl App {
     }
     pub(super) fn show(&mut self, context: &egui::Context) {
         // Presentation only: a no-op unless the Simple v1 preference changed.
-        self.simple.sync_style(context);
-        if self.simple.simple_navigation() {
-            super::simple_shell::prepare_keyboard_reveal(context);
+        if self.simple.apply_zoom_shortcuts(context) {
+            self.preferences_dirty = Some(std::time::Instant::now());
         }
+        self.simple.sync_style(context);
+        super::simple_shell::prepare_keyboard_reveal(context);
         if self.show_manual_viewer(context) {
             return;
         }
@@ -554,11 +558,21 @@ impl App {
             // Keep contextual guidance in the bounded upper interaction area.
             // A virtualised/nested page body can occupy thousands of rows;
             // appending the strip after that body makes it effectively invisible.
+            // When the viewport is short (a large scale on a small window)
+            // the strip would leave the page almost no body, so it scrolls
+            // with the page instead of pinning above it.
+            let compact = ui.available_height() < COMPACT_BODY_HEIGHT
+                && !matches!(route, Route::BrowsePlay | Route::BrowsePlayGame(_));
+            let mut pinned_guidance = None;
             if self.beginner_hints_enabled
                 && let Some(guidance) = guidance
             {
-                super::guidance::show(ui, &mut self.guidance, guidance);
-                ui.add_space(theme::SPACE_SM);
+                if compact {
+                    pinned_guidance = Some(guidance);
+                } else {
+                    super::guidance::show(ui, &mut self.guidance, guidance);
+                    ui.add_space(theme::SPACE_SM);
+                }
             }
             // A failed library load is shown as a failure, never as a loading
             // spinner or an empty catalogue.
@@ -578,6 +592,13 @@ impl App {
                 self.simple.simple_navigation()
                     && route == Route::Section(Section::OrganisationFamily),
                 |ui| {
+                    // Settings leads with its size controls, so there the
+                    // strip follows the page rather than preceding it.
+                    let guidance_last = route == Route::Section(Section::Settings);
+                    if !guidance_last && let Some(guidance) = pinned_guidance.clone() {
+                        super::guidance::show(ui, &mut self.guidance, guidance);
+                        ui.add_space(theme::SPACE_SM);
+                    }
                     match route {
                         Route::Home | Route::Section(Section::Home) => self.home(ui),
                         Route::BrowsePlay => self.browse_play(ui, None),
@@ -676,6 +697,10 @@ impl App {
                             game,
                         } => self.tape_inspector(ui, Some(game)),
                         Route::Task { section, .. } => self.handoff(ui, section),
+                    }
+                    if guidance_last && let Some(guidance) = pinned_guidance {
+                        ui.add_space(theme::SPACE_SM);
+                        super::guidance::show(ui, &mut self.guidance, guidance);
                     }
                     // Contextual guidance stays above this potentially unbounded body.
                 },
@@ -978,8 +1003,52 @@ impl App {
         ui.add_space(4.0);
     }
 
+    /// The saved interface size, shared by Simple and Classic. Wraps, so
+    /// Reset size is never pushed past the edge at large scales.
+    fn interface_scale_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let step = super::simple_shell::UI_SCALE_STEP;
+            let mut scale = self.simple.ui_scale;
+            if ui
+                .add_enabled(
+                    scale > super::simple_shell::UI_SCALE_MIN,
+                    egui::Button::new("Smaller"),
+                )
+                .clicked()
+            {
+                scale -= step;
+            }
+            if ui
+                .add_enabled(
+                    scale < super::simple_shell::UI_SCALE_MAX,
+                    egui::Button::new("Larger"),
+                )
+                .clicked()
+            {
+                scale += step;
+            }
+            if ui
+                .button("Reset size")
+                .on_hover_text("Ctrl+Plus, Ctrl+Minus and Ctrl+0 change this same saved size.")
+                .clicked()
+            {
+                scale = 1.0;
+            }
+            if scale != self.simple.ui_scale {
+                self.simple.set_ui_scale(scale);
+                self.preferences_dirty = Some(std::time::Instant::now());
+            }
+        });
+    }
+
     /// Settings controls for the opt-in Simple v1 shell.
     fn simple_shell_settings(&mut self, ui: &mut egui::Ui) {
+        // First, so recovery from a too-large size is the first thing reached.
+        ui.heading(format!(
+            "Text and interface size: {}%",
+            (self.simple.ui_scale * 100.0).round() as u32
+        ));
+        self.interface_scale_controls(ui);
         ui.heading("Simple view (preview)");
         ui.label("A shorter sidebar with seven destinations and a blue colour scheme. It changes how EmuWiz looks, not what it does: every tool stays available through All Tools at the top right.");
         if ui
@@ -988,41 +1057,6 @@ impl App {
         {
             self.simple.all_tools = false;
             self.preferences_dirty = Some(std::time::Instant::now());
-        }
-        if self.simple.enabled {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "Text and interface size: {}%",
-                    (self.simple.ui_scale * 100.0).round() as u32
-                ));
-                let step = super::simple_shell::UI_SCALE_STEP;
-                let mut scale = self.simple.ui_scale;
-                if ui
-                    .add_enabled(
-                        scale > super::simple_shell::UI_SCALE_MIN,
-                        egui::Button::new("Smaller"),
-                    )
-                    .clicked()
-                {
-                    scale -= step;
-                }
-                if ui
-                    .add_enabled(
-                        scale < super::simple_shell::UI_SCALE_MAX,
-                        egui::Button::new("Larger"),
-                    )
-                    .clicked()
-                {
-                    scale += step;
-                }
-                if ui.button("Reset size").clicked() {
-                    scale = 1.0;
-                }
-                if scale != self.simple.ui_scale {
-                    self.simple.set_ui_scale(scale);
-                    self.preferences_dirty = Some(std::time::Instant::now());
-                }
-            });
         }
         ui.separator();
     }
