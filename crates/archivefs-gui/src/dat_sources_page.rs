@@ -71,7 +71,6 @@ use archivefs_core::dat::rename_apply::{
     RecoveryHistoryState, RollbackOutcome, RollbackResult, TransactionEntry, TransactionState,
     apply_transaction, archive_recovery_transactions, classify_recovery_cleanup,
     inspect_exact_resume, load_recovery_history_state, resume_exact_transaction,
-    rollback_transaction,
 };
 use archivefs_core::dat::rename_plan::{
     PortabilityAssessment, PortabilityTarget, ProposalState, RenamePlan, RenamePlanContext,
@@ -4603,7 +4602,11 @@ impl DatSourcesPageState {
         let worker_cancel = cancel.clone();
         let rollback_sender = sender.clone();
         std::thread::spawn(move || {
-            let result = rollback_transaction(&mut transaction, &journal_dir, &worker_cancel);
+            let result = crate::optical_conversion_page::rollback_journal_transaction(
+                &mut transaction,
+                &journal_dir,
+                &worker_cancel,
+            );
             let _ = match result {
                 Ok(outcome) => rollback_sender.send(ApplyJobMessage::RolledBack(Box::new(outcome))),
                 Err(error) => rollback_sender.send(ApplyJobMessage::Failed(error)),

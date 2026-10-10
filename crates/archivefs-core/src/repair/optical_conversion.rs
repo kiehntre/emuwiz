@@ -16,7 +16,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::dat::rename_apply::identity::capture_identity;
-use crate::dat::rename_apply::model::{RenameTransaction, RollbackResult, TransactionState};
+use crate::dat::rename_apply::journal::{journal_path, read_journal, write_journal};
+use crate::dat::rename_apply::model::{
+    ObjectIdentity, RenameTransaction, RollbackResult, TransactionState, TransactionSummary,
+};
 use crate::dat::sources::now_unix;
 use crate::optical_fingerprint::{
     CanonicalOpticalFingerprint, OpticalFingerprintComparison, compare_optical_fingerprints,
@@ -25,7 +28,7 @@ use crate::optical_fingerprint::{
 use crate::repair::execute::{
     RepairApplyExecution, RepairExecutionError, RepairExecutionOptions, RepairReverifyOutcome,
     RepairTransactionResult, apply_repair_transaction, build_repair_transaction,
-    rollback_repair_transaction,
+    reverify_transaction, rollback_repair_transaction,
 };
 use crate::repair::plan::{RepairPlan, RepairPlanId, build_repair_plan};
 use crate::repair::proposal::{
@@ -114,6 +117,131 @@ pub struct ChdConversionTransaction {
     pub output: RepairTransactionResult,
     pub source_quarantine: Option<RepairTransactionResult>,
     staged_path: PathBuf,
+}
+
+// Optical-only pairing in the journal's existing forward-compatible extension
+// bag. The two ordinary rename journals remain authoritative for move/recovery
+// state; this records ordering and the reviewed originals, not another engine.
+const CHD_RECOVERY_KEY: &str = "chd_conversion_recovery";
+const CHD_OUTPUT_ID_KEY: &str = "chd_conversion_output_id";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ChdRecoveryLink {
+    version: u8,
+    originals: Vec<ChdOriginal>,
+    source_quarantine_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ChdOriginal {
+    path: PathBuf,
+    identity: ObjectIdentity,
+}
+
+fn recovery_link(transaction: &RenameTransaction) -> Result<Option<ChdRecoveryLink>, String> {
+    let Some(value) = transaction.unknown.get(CHD_RECOVERY_KEY) else {
+        return Ok(None);
+    };
+    let link: ChdRecoveryLink = serde_json::from_value(value.clone())
+        .map_err(|error| format!("unreadable CHD recovery link: {error}"))?;
+    if link.version != 1
+        || link.originals.len() != 2
+        || link.originals[0].path == link.originals[1].path
+        || link
+            .originals
+            .iter()
+            .any(|original| original.identity.freshness.is_none())
+        || link.source_quarantine_id.as_ref().is_some_and(|id| {
+            id == &transaction.transaction_id || journal_path(Path::new("."), id).is_none()
+        })
+    {
+        return Err("invalid CHD recovery link; manual recovery required".into());
+    }
+    Ok(Some(link))
+}
+
+fn transaction_snapshot(transaction: &RenameTransaction) -> RepairTransactionResult {
+    RepairTransactionResult {
+        transaction: transaction.clone(),
+        summary: TransactionSummary::from_transaction(transaction),
+        reverify: reverify_transaction(transaction),
+    }
+}
+
+/// Recognises output journals, including legacy ones that lack a safe pairing.
+/// GUI journal Undo must not bypass the original-source restoration guard.
+pub fn is_chd_conversion_output(transaction: &RenameTransaction) -> bool {
+    transaction.unknown.contains_key(CHD_RECOVERY_KEY)
+        || transaction
+            .entries
+            .iter()
+            .any(|entry| is_staged_chd_path(&entry.source_path))
+}
+
+fn is_staged_chd_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == "output.chd")
+        && path.parent().and_then(Path::file_name).is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with(DISC_CONVERSION_STAGING_PREFIX)
+        })
+}
+
+fn read_transaction(journal_dir: &Path, id: &str) -> Result<RenameTransaction, String> {
+    let path = journal_path(journal_dir, id).ok_or("unsafe conversion journal id")?;
+    let transaction = read_journal(&path).map_err(|error| error.to_string())?;
+    if transaction.transaction_id != id {
+        return Err("conversion journal identity mismatch".into());
+    }
+    Ok(transaction)
+}
+
+fn linked_source(
+    journal_dir: &Path,
+    output: &RenameTransaction,
+    link: &ChdRecoveryLink,
+) -> Result<Option<RepairTransactionResult>, String> {
+    let Some(id) = &link.source_quarantine_id else {
+        return Ok(None);
+    };
+    let source = read_transaction(journal_dir, id)?;
+    if source
+        .unknown
+        .get(CHD_OUTPUT_ID_KEY)
+        .and_then(serde_json::Value::as_str)
+        != Some(output.transaction_id.as_str())
+        || source.entries.len() != link.originals.len()
+        || link.originals.iter().any(|original| {
+            !source.entries.iter().any(|entry| {
+                entry.source_path == original.path && entry.identity == original.identity
+            })
+        })
+    {
+        return Err("contradictory CHD source journal pairing; manual recovery required".into());
+    }
+    Ok(Some(transaction_snapshot(&source)))
+}
+
+/// Reloads a conversion from its paired ordinary journals after restart. This
+/// only reads evidence; explicit Undo uses the existing shared rollback rules.
+/// Missing/corrupt/legacy pairing is refused rather than guessing a source set.
+pub fn load_chd_conversion_transaction(
+    journal_dir: &Path,
+    output_id: &str,
+) -> Result<ChdConversionTransaction, String> {
+    let output = read_transaction(journal_dir, output_id)?;
+    if output.entries.len() != 1 || !is_staged_chd_path(&output.entries[0].source_path) {
+        return Err("not a single-output CHD conversion journal".into());
+    }
+    let link = recovery_link(&output)?.ok_or(
+        "legacy CHD journal has no original-source recovery proof; manual recovery required",
+    )?;
+    let source_quarantine = linked_source(journal_dir, &output, &link)?;
+    let staged_path = output.entries[0].source_path.clone();
+    Ok(ChdConversionTransaction {
+        output: transaction_snapshot(&output),
+        source_quarantine,
+        staged_path,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -575,6 +703,26 @@ pub fn execute_chd_conversion(
     )?;
     let mut output_tx =
         build_repair_transaction(&output_plan).map_err(ChdConversionError::Transaction)?;
+    // Saved with the output's first checkpoint, before publication. Even a
+    // source-quarantine setup failure leaves restart Undo with original proof.
+    output_tx.unknown.insert(
+        CHD_RECOVERY_KEY.into(),
+        serde_json::to_value(ChdRecoveryLink {
+            version: 1,
+            originals: vec![
+                ChdOriginal {
+                    path: plan.cue_path.clone(),
+                    identity: plan.cue_identity.clone(),
+                },
+                ChdOriginal {
+                    path: plan.bin_path.clone(),
+                    identity: plan.bin_identity.clone(),
+                },
+            ],
+            source_quarantine_id: None,
+        })
+        .map_err(|error| transaction_failure(error.to_string()))?,
+    );
     let options = RepairExecutionOptions {
         trusted: trusted.clone(),
         journal_dir: journal_dir.to_path_buf(),
@@ -584,7 +732,7 @@ pub fn execute_chd_conversion(
     // publication failure: retain the staging directory unless a failure
     // path below proves the staged CHD is back in it.
     stage_guard.retain = true;
-    let output = match confirmed(
+    let mut output = match confirmed(
         apply_repair_transaction(&mut RepairApplyExecution {
             transaction: &mut output_tx,
             current_generation: 0,
@@ -608,7 +756,7 @@ pub fn execute_chd_conversion(
     // back and the result says the cleanup needs attention.
     let (source_quarantine, source_cleanup) =
         if plan.source_mode == ChdConversionSourceMode::QuarantineSource {
-            match quarantine_sources(plan, quarantine_root, &options, cancel) {
+            match quarantine_sources(plan, quarantine_root, &options, cancel, &mut output) {
                 Ok(result) => (Some(result), ChdSourceCleanup::Quarantined),
                 Err(failure) => (
                     failure.unresolved,
@@ -735,6 +883,7 @@ fn quarantine_sources(
     quarantine_root: &Path,
     options: &RepairExecutionOptions,
     cancel: &AtomicBool,
+    output: &mut RepairTransactionResult,
 ) -> Result<RepairTransactionResult, SourceQuarantineFailure> {
     // Nothing has moved until the transaction is applied.
     let untouched = |detail: String| SourceQuarantineFailure {
@@ -768,28 +917,43 @@ fn quarantine_sources(
     )
     .map_err(|e| untouched(e.to_string()))?;
     let mut tx = build_repair_transaction(&source_plan).map_err(|e| untouched(e.to_string()))?;
+    tx.unknown.insert(
+        CHD_OUTPUT_ID_KEY.into(),
+        output.transaction.transaction_id.clone().into(),
+    );
+    let mut link = recovery_link(&output.transaction)
+        .map_err(untouched)?
+        .ok_or_else(|| untouched("missing original-source recovery proof".into()))?;
+    link.source_quarantine_id = Some(tx.transaction_id.clone());
+    // Both identity and pairing must survive restart BEFORE the first source
+    // move. A failed checkpoint refuses source mutation, keeping the CHD.
+    write_journal(&options.journal_dir, &tx).map_err(|error| untouched(error.to_string()))?;
+    output.transaction.unknown.insert(
+        CHD_RECOVERY_KEY.into(),
+        serde_json::to_value(link).map_err(|error| untouched(error.to_string()))?,
+    );
+    write_journal(&options.journal_dir, &output.transaction)
+        .map_err(|error| untouched(error.to_string()))?;
     let outcome = apply_repair_transaction(&mut RepairApplyExecution {
         transaction: &mut tx,
         current_generation: 0,
         options,
         cancel,
     });
-    // Kept so an incomplete rollback still hands the caller the transaction.
-    let attempted = outcome.as_ref().ok().cloned();
     confirmed(outcome, 2).map_err(|detail| {
-        let (sources_restored, rollback) = roll_back_unconfirmed(&mut tx, &options.journal_dir);
+        let (rolled_back, rollback) = roll_back_unconfirmed(&mut tx, &options.journal_dir);
+        let sources_restored = rolled_back
+            && tx.entries.iter().all(|entry| {
+                capture_identity(&entry.source_path).ok().as_ref() == Some(&entry.identity)
+            });
         SourceQuarantineFailure {
             detail: format!(
                 "source quarantine was not confirmed ({detail}); source rollback: {rollback}"
             ),
             sources_restored,
-            unresolved: (!sources_restored)
-                .then_some(attempted)
-                .flatten()
-                .map(|mut result| {
-                    result.transaction = tx.clone();
-                    result
-                }),
+            // An outer Apply Err still mutated `tx`. Never depend on the
+            // presence of an Ok wrapper to preserve its recovery identity.
+            unresolved: (!sources_restored).then(|| transaction_snapshot(&tx)),
         }
     })
 }
@@ -799,12 +963,49 @@ pub fn rollback_chd_conversion(
     journal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<RollbackResult, String> {
-    if let Some(source) = transaction.source_quarantine.as_mut() {
-        rollback_repair_transaction(&mut source.transaction, journal_dir, cancel)?;
+    let link = recovery_link(&transaction.output.transaction)?;
+    if transaction.source_quarantine.is_none()
+        && let Some(link) = &link
+    {
+        transaction.source_quarantine =
+            linked_source(journal_dir, &transaction.output.transaction, link)?;
     }
-    let result =
-        rollback_repair_transaction(&mut transaction.output.transaction, journal_dir, cancel)?;
-    if transaction.staged_path.exists() {
+    if let Some(source) = transaction.source_quarantine.as_mut() {
+        let outcome = rollback_repair_transaction(&mut source.transaction, journal_dir, cancel);
+        *source = transaction_snapshot(&source.transaction);
+        match outcome? {
+            RollbackResult::FullyRolledBack => {}
+            incomplete => return Ok(incomplete),
+        }
+    }
+    // A typed full rollback can skip never-applied entries. Before removing
+    // the verified CHD, also prove every reviewed original at its actual path.
+    let originals_restored = if let Some(link) = &link {
+        link.originals.iter().all(|original| {
+            capture_identity(&original.path).ok().as_ref() == Some(&original.identity)
+        })
+    } else {
+        transaction.source_quarantine.as_ref().is_none_or(|source| {
+            source.transaction.entries.iter().all(|entry| {
+                capture_identity(&entry.source_path).ok().as_ref() == Some(&entry.identity)
+            })
+        })
+    };
+    if !originals_restored {
+        return Err("original CUE/BIN restoration is not proven; verified CHD retained, manual recovery required".into());
+    }
+    let outcome =
+        rollback_repair_transaction(&mut transaction.output.transaction, journal_dir, cancel);
+    transaction.output = transaction_snapshot(&transaction.output.transaction);
+    let result = outcome?;
+    if result == RollbackResult::FullyRolledBack
+        && transaction
+            .output
+            .transaction
+            .entries
+            .first()
+            .is_some_and(|entry| staged_output_recovered(&transaction.staged_path, &entry.identity))
+    {
         let _ = fs::remove_file(&transaction.staged_path);
         if let Some(parent) = transaction.staged_path.parent() {
             let _ = fs::remove_dir(parent);

@@ -5708,6 +5708,79 @@ fn rollback_from_the_page_restores_original_files() {
 }
 
 #[test]
+fn chd_recovery_undo_after_restart_keeps_output_and_partial_source_state() {
+    use archivefs_core::repair::{
+        ChdConversionSourceMode, build_chd_conversion_plan, execute_chd_conversion,
+    };
+    if !Path::new("/usr/bin/chdman").is_file() {
+        return;
+    }
+    let (fixture, roms, page) = page_with_apply_plan(0);
+    let journal = page.transaction_dir.clone();
+    drop(page);
+    let cue = roms.join("original.cue");
+    let bin = roms.join("original.bin");
+    let target = roms.join("converted.chd");
+    std::fs::write(&bin, vec![0x42u8; 2048 * 16]).unwrap();
+    std::fs::write(
+        &cue,
+        "FILE \"original.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &target,
+        ChdConversionSourceMode::QuarantineSource,
+        Some(Path::new("/usr/bin/chdman")),
+    )
+    .unwrap();
+    let (result, transaction) = execute_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([&roms]),
+        &journal,
+        &roms,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    drop(transaction);
+    let before = std::fs::read(&target).unwrap();
+    std::fs::write(&bin, b"foreign blocker").unwrap();
+    let mut restarted = DatSourcesPageState::load_with_transaction_dir(
+        fixture.config_path.clone(),
+        Vec::new(),
+        TrustedRoots::from_paths([&roms]),
+        journal,
+    );
+    restarted.apply(DatSourcesPageAction::RollbackTransaction {
+        id: result.transaction_id.clone(),
+    });
+    run_to_completion(&mut restarted);
+    let view = restarted.view();
+    assert_eq!(
+        view.rename_apply
+            .rollback_result
+            .as_ref()
+            .map(|result| result.label),
+        Some("Partially rolled back")
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), before);
+    assert_eq!(std::fs::read(&bin).unwrap(), b"foreign blocker");
+    assert!(cue.is_file());
+    // This session's output remains in the outcome card with its rollback
+    // control; the recovery list intentionally avoids duplicating that row.
+    let output = view.rename_apply.outcome.as_ref().unwrap();
+    assert_eq!(output.transaction_id, result.transaction_id);
+    assert_eq!(output.state, TransactionState::Applied);
+    assert_eq!(output.applied, 1);
+    assert!(
+        view.rename_apply
+            .recovery
+            .iter()
+            .any(|row| row.state == TransactionState::RollbackFailed)
+    );
+}
+
+#[test]
 fn an_interrupted_transaction_is_offered_for_recovery_and_never_auto_resumes() {
     let (_fixture, _roms, mut page) = page_with_apply_plan(0);
     // Write an interrupted journal directly into the page's temp journal dir.

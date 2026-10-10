@@ -146,6 +146,104 @@ fn wait_for_undo(state: &mut RepairHistoryPageState) {
     }
 }
 
+fn chd_history_fixture(root: &Path) -> (PathBuf, PathBuf, String) {
+    use archivefs_core::repair::{
+        ChdConversionSourceMode, build_chd_conversion_plan, execute_chd_conversion,
+    };
+    let bin = root.join("original.bin");
+    let cue = root.join("original.cue");
+    let target = root.join("converted.chd");
+    let journal = root.join("journal");
+    std::fs::write(&bin, vec![0x42u8; 2048 * 16]).unwrap();
+    std::fs::write(
+        &cue,
+        "FILE \"original.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n",
+    )
+    .unwrap();
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &target,
+        ChdConversionSourceMode::QuarantineSource,
+        Some(Path::new("/usr/bin/chdman")),
+    )
+    .unwrap();
+    let (result, transaction) = execute_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([root]),
+        &journal,
+        root,
+        &no_cancel(),
+    )
+    .unwrap();
+    // Only the durable journals survive into the newly loaded History page.
+    drop(transaction);
+    (journal, target, result.transaction_id)
+}
+
+#[test]
+fn chd_history_undo_after_restart_retains_output_when_source_rollback_is_partial() {
+    if !Path::new("/usr/bin/chdman").is_file() {
+        return;
+    }
+    let dir = TestDir::new("chd-partial-undo");
+    let (journal, target, id) = chd_history_fixture(dir.path());
+    let before = std::fs::read(&target).unwrap();
+    std::fs::write(dir.path().join("original.bin"), b"foreign blocker").unwrap();
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal.clone());
+    state.open_undo_confirmation(&id);
+    state.confirm_undo();
+    wait_for_undo(&mut state);
+    assert!(matches!(
+        state.undo_outcome.as_ref().unwrap().result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+    assert_eq!(std::fs::read(&target).unwrap(), before);
+    assert_eq!(
+        std::fs::read(dir.path().join("original.bin")).unwrap(),
+        b"foreign blocker"
+    );
+    assert!(state.can_undo(&id));
+    assert!(!state.clearable_transaction_ids().contains(&id));
+    let (journals, problems) = list_journals(&journal);
+    assert!(problems.is_empty());
+    assert!(
+        journals
+            .iter()
+            .any(|tx| tx.state == TransactionState::RollbackFailed)
+    );
+    let output = render(&mut state);
+    assert!(rendered_text_contains(&output, "Undo partially completed"));
+    assert!(!rendered_text_contains(&output, "Undo complete"));
+}
+
+#[test]
+fn chd_history_undo_after_restart_restores_originals_before_removing_output() {
+    if !Path::new("/usr/bin/chdman").is_file() {
+        return;
+    }
+    let dir = TestDir::new("chd-complete-undo");
+    let (journal, target, id) = chd_history_fixture(dir.path());
+    let mut state = RepairHistoryPageState::load_with_journal_dir(journal);
+    state.open_undo_confirmation(&id);
+    state.confirm_undo();
+    wait_for_undo(&mut state);
+    assert_eq!(
+        state.undo_outcome.as_ref().unwrap().result,
+        RollbackResult::FullyRolledBack
+    );
+    assert!(!target.exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("original.bin")).unwrap(),
+        vec![0x42u8; 2048 * 16]
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("original.cue")).unwrap(),
+        "FILE \"original.bin\" BINARY\nTRACK 01 MODE1/2048\nINDEX 01 00:00:00\n"
+    );
+    let output = render(&mut state);
+    assert!(rendered_text_contains(&output, "Conversion undone."));
+}
+
 fn rendered_text_contains(output: &egui::FullOutput, needle: &str) -> bool {
     fn shape_contains(shape: &egui::Shape, needle: &str) -> bool {
         match shape {

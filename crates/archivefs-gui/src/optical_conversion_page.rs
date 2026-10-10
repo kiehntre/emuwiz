@@ -15,6 +15,9 @@ use crate::selected_evidence_page;
 use crate::ui::{components as widgets, theme};
 use crate::zip_converter_page::ZipConverterPageState;
 use archivefs_core::conversion_queue::{ConversionPlanningInput, ConversionQueue, SpaceEstimate};
+use archivefs_core::dat::rename_apply::{
+    RenameTransaction, RollbackOutcome, RollbackResult, rollback_transaction,
+};
 use archivefs_core::psp_reversible_shrink::{
     PspShrinkInspection, PspShrinkResult, PspShrinkTrust, convert_psp_iso_to_cso, inspect_psp_iso,
 };
@@ -25,6 +28,28 @@ use archivefs_core::repair::{
 };
 use archivefs_core::safe_read::TrustedRoots;
 use eframe::egui;
+
+/// Both journal-based GUI Undo routes must preserve conversion ordering after
+/// restart. Ordinary rename journals still use their existing executor.
+pub(crate) fn rollback_journal_transaction(
+    transaction: &mut RenameTransaction,
+    journal_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<RollbackOutcome, String> {
+    use archivefs_core::repair::optical_conversion::{
+        is_chd_conversion_output, load_chd_conversion_transaction,
+    };
+    if !is_chd_conversion_output(transaction) {
+        return rollback_transaction(transaction, journal_dir, cancel);
+    }
+    let mut conversion = load_chd_conversion_transaction(journal_dir, &transaction.transaction_id)?;
+    let result = rollback_chd_conversion(&mut conversion, journal_dir, cancel);
+    *transaction = conversion.output.transaction;
+    result.map(|result| RollbackOutcome {
+        result,
+        transaction: transaction.clone(),
+    })
+}
 
 struct Candidate {
     path: PathBuf,
@@ -240,6 +265,9 @@ pub(crate) struct OpticalConversionPageState {
     /// can show a short beginner category (Section 11) with the untouched
     /// message still available under Technical details.
     conversion_failure: Option<ChdConversionError>,
+    /// An incomplete Undo keeps its result, transaction and recovery controls.
+    /// Forward success wording is no longer evidence of the current state.
+    undo_incomplete: Option<String>,
     hero_texture: Option<egui::TextureHandle>,
     hero_load_attempted: bool,
     hero_preview_scroll: bool,
@@ -353,6 +381,7 @@ impl Default for OpticalConversionPageState {
             transaction: None,
             error: None,
             conversion_failure: None,
+            undo_incomplete: None,
             hero_texture: None,
             hero_load_attempted: false,
             hero_preview_scroll: false,
@@ -390,8 +419,29 @@ fn collect_cues(root: &Path, output: &mut Vec<PathBuf>) {
 }
 
 impl OpticalConversionPageState {
+    fn recovery_pending(&self) -> bool {
+        self.undo_incomplete.is_some()
+            || self.result.as_ref().is_some_and(|result| {
+                matches!(
+                    result.source_cleanup,
+                    ChdSourceCleanup::QuarantineFailed {
+                        sources_restored: false,
+                        ..
+                    }
+                )
+            })
+    }
+
+    fn preserve_pending_recovery(&mut self) -> bool {
+        if !self.recovery_pending() {
+            return false;
+        }
+        self.error = Some("This conversion still needs recovery. Use Undo conversion or Repair History before starting another conversion.".into());
+        true
+    }
+
     pub(crate) fn set_selected_context(&mut self, context: Option<SelectedConversionContext>) {
-        if self.selected_context == context {
+        if self.selected_context == context || self.preserve_pending_recovery() {
             return;
         }
         self.selected_context = context;
@@ -421,6 +471,9 @@ impl OpticalConversionPageState {
     }
 
     fn scan(&mut self) {
+        if self.preserve_pending_recovery() {
+            return;
+        }
         self.candidates.clear();
         self.selected = None;
         self.confirm = false;
@@ -456,6 +509,9 @@ impl OpticalConversionPageState {
     }
 
     fn convert(&mut self) {
+        if self.preserve_pending_recovery() {
+            return;
+        }
         let Some(index) = self.selected else { return };
         let Some(mut plan) = self
             .candidates
@@ -486,6 +542,7 @@ impl OpticalConversionPageState {
                 self.transaction = Some(transaction);
                 self.error = None;
                 self.conversion_failure = None;
+                self.undo_incomplete = None;
             }
             Err(error) => {
                 self.error = Some(error.to_string());
@@ -495,6 +552,9 @@ impl OpticalConversionPageState {
     }
 
     fn preview_selected(&mut self) {
+        if self.preserve_pending_recovery() {
+            return;
+        }
         self.scanned = true;
         let Some(context) = self.selected_context.clone() else {
             self.error = Some("select a supported game or disc image first".into());
@@ -545,13 +605,28 @@ impl OpticalConversionPageState {
             self.error = Some("could not locate the repair journal".into());
             return;
         };
-        match rollback_chd_conversion(transaction, &journal, &AtomicBool::new(false)) {
-            Ok(_) => {
+        let outcome = rollback_chd_conversion(transaction, &journal, &AtomicBool::new(false));
+        self.record_undo_outcome(outcome);
+    }
+
+    fn record_undo_outcome(&mut self, outcome: Result<RollbackResult, String>) {
+        match outcome {
+            Ok(RollbackResult::FullyRolledBack) => {
                 self.result = None;
                 self.transaction = None;
                 self.error = None;
+                self.undo_incomplete = None;
             }
-            Err(error) => self.error = Some(format!("rollback failed: {error}")),
+            Ok(other) => {
+                let detail = format!("Undo is incomplete: {other:?}");
+                self.error = Some(detail.clone());
+                self.undo_incomplete = Some(detail);
+            }
+            Err(error) => {
+                let detail = format!("Undo could not finish: {error}");
+                self.error = Some(detail.clone());
+                self.undo_incomplete = Some(detail);
+            }
         }
     }
 }
@@ -605,7 +680,9 @@ const SUPPORTED_DISC_FORMAT_CHIPS: [(&str, egui::Color32); 2] = [
 /// value); it is only shown once a scan has actually produced candidates.
 fn dsk_signal_lines(state: &OpticalConversionPageState, ready_fraction: f32) -> [String; 2] {
     let percent = (ready_fraction * 100.0).round() as i32;
-    let status = if state.result.is_some() {
+    let status = if state.undo_incomplete.is_some() {
+        "NEEDS RECOVERY".to_string()
+    } else if state.result.is_some() {
         "CONVERTED".to_string()
     } else if state.conversion_failure.is_some() {
         "FAILED".to_string()
@@ -799,6 +876,9 @@ fn show_detection_summary(ui: &mut egui::Ui, candidates: &[Candidate]) {
 /// beside each state (Source discovery's "Find supported files", a
 /// candidate row's Preview/Confirm/Convert button, ...).
 fn next_step_hint(state: &OpticalConversionPageState) -> &'static str {
+    if state.undo_incomplete.is_some() {
+        return "Undo needs recovery - see Result below.";
+    }
     if state.result.is_some() {
         return "Verified result ready below.";
     }
@@ -1222,6 +1302,7 @@ pub(crate) fn show_optical_conversion_page(
                     .selectable_label(state.selected == Some(index), display_name)
                     .clicked()
                     && eligible
+                    && !state.preserve_pending_recovery()
                 {
                     state.selected = Some(index);
                     state.confirm = false;
@@ -1478,45 +1559,71 @@ pub(crate) fn show_optical_conversion_page(
         let target_path = result.target_path.display().to_string();
         let transaction_id = result.transaction_id.clone();
         let source_cleanup = result.source_cleanup.clone();
+        let undo_incomplete = state.undo_incomplete.clone();
         ui.separator();
         widgets::card(ui, |ui| {
             ui.heading("Result");
             ui.horizontal_wrapped(|ui| {
-                widgets::status_badge(ui, "Converted", widgets::StatusTone::Success);
-                widgets::status_badge(ui, "Verified", widgets::StatusTone::Success);
-                if matches!(source_cleanup, ChdSourceCleanup::QuarantineFailed { .. }) {
+                if undo_incomplete.is_none() {
+                    widgets::status_badge(ui, "Converted", widgets::StatusTone::Success);
+                    widgets::status_badge(ui, "Verified", widgets::StatusTone::Success);
+                }
+                if undo_incomplete.is_some()
+                    || matches!(source_cleanup, ChdSourceCleanup::QuarantineFailed { .. })
+                {
                     widgets::status_badge(ui, "Needs attention", widgets::StatusTone::Warning);
                 }
             });
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(format!("Verified CHD created: {}", target_path))
-                        .monospace(),
+                    egui::RichText::new(if undo_incomplete.is_some() {
+                        format!("CHD destination: {target_path}")
+                    } else {
+                        format!("Verified CHD created: {target_path}")
+                    })
+                    .monospace(),
                 )
                 .wrap(),
             );
-            ui.label(match &source_cleanup {
-                ChdSourceCleanup::Quarantined => "Originals quarantined after verification.",
-                ChdSourceCleanup::NotRequested => "Originals kept.",
-                ChdSourceCleanup::QuarantineFailed {
-                    sources_restored: true,
-                    ..
-                } => {
-                    "The conversion succeeded, but the originals could not be moved to \
+            if undo_incomplete.is_some() {
+                ui.label("Undo did not finish. The transaction journals and recovery controls have been kept. Check the recovery details before changing these files.");
+            } else {
+                ui.label(match &source_cleanup {
+                    ChdSourceCleanup::Quarantined => "Originals quarantined after verification.",
+                    ChdSourceCleanup::NotRequested => "Originals kept.",
+                    ChdSourceCleanup::QuarantineFailed {
+                        sources_restored: true,
+                        ..
+                    } => {
+                        "The conversion succeeded, but the originals could not be moved to \
                      quarantine. They are still in their original place and no space was \
                      reclaimed."
-                }
-                ChdSourceCleanup::QuarantineFailed {
-                    sources_restored: false,
-                    ..
-                } => {
-                    "The conversion succeeded, but moving the originals to quarantine failed \
+                    }
+                    ChdSourceCleanup::QuarantineFailed {
+                        sources_restored: false,
+                        ..
+                    } => {
+                        "The conversion succeeded, but moving the originals to quarantine failed \
                      part-way and could not be fully reversed. Nothing was deleted; check \
                      the details before changing these files."
-                }
-            });
+                    }
+                });
+            }
             widgets::technical_details(ui, ("optical-conversion-result",), |ui| {
                 ui.label(format!("Transaction: {transaction_id}"));
+                if let Some(source) = state
+                    .transaction
+                    .as_ref()
+                    .and_then(|transaction| transaction.source_quarantine.as_ref())
+                {
+                    ui.label(format!(
+                        "Source transaction: {}",
+                        source.transaction.transaction_id
+                    ));
+                }
+                if let Some(detail) = &undo_incomplete {
+                    ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
+                }
                 if let ChdSourceCleanup::QuarantineFailed { detail, .. } = &source_cleanup {
                     ui.add(egui::Label::new(egui::RichText::new(detail).monospace()).wrap());
                 }
@@ -2250,6 +2357,139 @@ mod tests {
             "Originals quarantined after verification."
         ));
         assert!(!rendered_text_contains(&output, "Originals kept."));
+    }
+
+    fn converted_recovery_state(
+        root: &Path,
+        mode: ChdConversionSourceMode,
+    ) -> OpticalConversionPageState {
+        let cue = source(root);
+        let plan = build_chd_conversion_plan(
+            &cue,
+            &cue.with_extension("chd"),
+            mode,
+            Some(Path::new("/usr/bin/chdman")),
+        )
+        .unwrap();
+        let journal =
+            archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir().unwrap();
+        let (result, transaction) = execute_chd_conversion(
+            &plan,
+            TrustedRoots::from_paths([root]),
+            &journal,
+            root,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        OpticalConversionPageState {
+            source_root_draft: root.display().to_string(),
+            result: Some(result),
+            transaction: Some(transaction),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn incomplete_source_undo_keeps_gui_recovery_and_never_claims_restoration() {
+        if !Path::new("/usr/bin/chdman").is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut state =
+            converted_recovery_state(dir.path(), ChdConversionSourceMode::QuarantineSource);
+        let target = state.result.as_ref().unwrap().target_path.clone();
+        let before = std::fs::read(&target).unwrap();
+        std::fs::write(dir.path().join("Track space ü.bin"), b"foreign blocker").unwrap();
+        state.rollback();
+        assert!(state.undo_incomplete.is_some());
+        assert!(state.result.is_some());
+        assert!(state.transaction.is_some());
+        assert_eq!(std::fs::read(&target).unwrap(), before);
+        assert_eq!(dsk_signal_lines(&state, 0.0)[1], "NEEDS RECOVERY");
+        assert_eq!(
+            next_step_hint(&state),
+            "Undo needs recovery - see Result below."
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("Track space ü.bin")).unwrap(),
+            b"foreign blocker"
+        );
+        let output = render_at(&mut state, egui::vec2(1280.0, 5000.0));
+        assert!(rendered_text_contains(&output, "Needs attention"));
+        assert!(rendered_text_contains(&output, "Undo did not finish"));
+        assert!(rendered_text_contains(&output, "Undo conversion"));
+        assert!(!rendered_text_contains(
+            &output,
+            "Originals quarantined after verification."
+        ));
+        assert!(!rendered_text_contains(&output, "Verified CHD created:"));
+        let id = state.result.as_ref().unwrap().transaction_id.clone();
+        state.scan();
+        state.set_selected_context(Some(SelectedConversionContext {
+            path: dir.path().join("other.cue"),
+            platform: None,
+        }));
+        state.preview_selected();
+        state.convert();
+        assert_eq!(state.result.as_ref().unwrap().transaction_id, id);
+        assert!(state.transaction.is_some());
+        assert!(state.selected_context.is_none());
+    }
+
+    #[test]
+    fn source_undo_journal_error_keeps_gui_recovery_controls() {
+        if !Path::new("/usr/bin/chdman").is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut state =
+            converted_recovery_state(dir.path(), ChdConversionSourceMode::QuarantineSource);
+        // Private journal directory, so another test's journals cannot be obstructed.
+        let blocked_journal = dir.path().join("blocked-journal");
+        std::fs::write(&blocked_journal, b"foreign blocker").unwrap();
+        let outcome = rollback_chd_conversion(
+            state.transaction.as_mut().unwrap(),
+            &blocked_journal,
+            &AtomicBool::new(false),
+        );
+        assert!(outcome.is_err());
+        state.record_undo_outcome(outcome);
+        assert!(state.recovery_pending());
+        assert!(state.transaction.is_some());
+        assert!(state.result.as_ref().unwrap().target_path.exists());
+        let output = render_at(&mut state, egui::vec2(1280.0, 5000.0));
+        assert!(rendered_text_contains(&output, "Undo did not finish"));
+        assert!(rendered_text_contains(&output, "Undo conversion"));
+        assert!(!rendered_text_contains(
+            &output,
+            "Originals quarantined after verification."
+        ));
+    }
+
+    #[test]
+    fn complete_conversion_undo_clears_gui_state_in_both_source_modes() {
+        if !Path::new("/usr/bin/chdman").is_file() {
+            return;
+        }
+        for mode in [
+            ChdConversionSourceMode::KeepSource,
+            ChdConversionSourceMode::QuarantineSource,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = converted_recovery_state(dir.path(), mode);
+            let target = state.result.as_ref().unwrap().target_path.clone();
+            state.rollback();
+            assert!(state.result.is_none());
+            assert!(state.transaction.is_none());
+            assert!(state.undo_incomplete.is_none());
+            assert!(state.error.is_none());
+            assert!(!target.exists());
+            assert_eq!(
+                std::fs::read(dir.path().join("Track space ü.bin")).unwrap(),
+                vec![0x42u8; 2048 * 16]
+            );
+            assert!(dir.path().join("Game space ü.cue").exists());
+        }
     }
 
     /// 11. A completed conversion shows a clear Converted/Verified summary.

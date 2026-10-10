@@ -13,9 +13,9 @@
 //! renaming, or crash reconciliation. Every read comes from
 //! [`archivefs_core::dat::rename_apply::list_journals`] (re-read from disk on
 //! every refresh, never trusted from a prior in-memory copy) and every
-//! mutation goes through the exact same
-//! [`archivefs_core::dat::rename_apply::rollback_transaction`] the DAT
-//! Sources page's own recovery UI already uses. "Can I undo this safely?" is
+//! mutation uses the same shared rollback engine as DAT Sources. CHD output
+//! journals first pass through the optical conversion core, which restores
+//! the paired originals before permitting output rollback. "Can I undo this safely?" is
 //! answered by [`archivefs_core::dat::rename_apply::RenameTransaction::is_rollbackable`],
 //! a core predicate rather than a GUI guess, and every fail-closed check
 //! (changed identity, an occupied original path, an ambiguous in-flight
@@ -39,7 +39,6 @@ use archivefs_core::dat::rename_apply::{
     RollbackOutcome, RollbackResult, TransactionSummary, archive_recovery_transaction,
     archive_recovery_transactions, classify_recovery_cleanup, journal_path, list_journals,
     load_recovery_history_state, read_journal, reconcile_recovery, remove_journal,
-    rollback_transaction,
 };
 use archivefs_core::repair::execute::{
     RepairReverifyEntry, RepairReverifyOutcome, reverify_transaction,
@@ -297,7 +296,7 @@ impl RepairHistoryPageState {
     /// Spawns the background undo worker. The GUI never mutates the
     /// filesystem itself: this re-reads the journal fresh from disk (never
     /// trusting the in-memory row a stale frame might still be showing) and
-    /// hands it to [`rollback_transaction`] on a dedicated thread, relaying
+    /// hands it to the feature-aware journal Undo route on a dedicated thread, relaying
     /// only the result back.
     fn spawn_undo(&mut self, transaction_id: String) {
         if self.undo_job.is_some() {
@@ -320,11 +319,15 @@ impl RepairHistoryPageState {
 
         let (sender, messages) = std::sync::mpsc::channel();
         // Never exposed to cancellation in this slice; still required by
-        // `rollback_transaction`'s signature.
+        // the rollback executor's signature.
         let cancel = AtomicBool::new(false);
 
         std::thread::spawn(move || {
-            let result = rollback_transaction(&mut transaction, &journal_dir, &cancel);
+            let result = crate::optical_conversion_page::rollback_journal_transaction(
+                &mut transaction,
+                &journal_dir,
+                &cancel,
+            );
             let message = match result {
                 Ok(outcome) => UndoMessage::Done(Box::new(outcome)),
                 Err(error) => UndoMessage::Failed(error),
@@ -1533,10 +1536,16 @@ fn show_undo_result(ui: &mut egui::Ui, state: &RepairHistoryPageState) {
             });
             match &outcome.result {
                 RollbackResult::FullyRolledBack => {
-                    ui.label(format!(
-                        "{} file(s) restored to their original path.",
-                        outcome.transaction.rolled_back_count()
-                    ));
+                    if archivefs_core::repair::optical_conversion::is_chd_conversion_output(
+                        &outcome.transaction,
+                    ) {
+                        ui.label("Conversion undone. Original CUE/BIN files were verified at their reviewed paths.");
+                    } else {
+                        ui.label(format!(
+                            "{} file(s) restored to their original path.",
+                            outcome.transaction.rolled_back_count()
+                        ));
+                    }
                 }
                 RollbackResult::PartiallyRolledBack {
                     rolled_back,

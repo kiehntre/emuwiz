@@ -1027,3 +1027,439 @@ fn completed_modes_report_their_source_cleanup_without_needing_attention() {
         );
     }
 }
+
+fn interrupt_source_journal_after_bin_move(moving: &Path) {
+    if moving.extension().is_some_and(|ext| ext == "bin") {
+        let root = moving.parent().unwrap();
+        std::fs::rename(root.join("journal"), root.join("journal-saved")).unwrap();
+        std::fs::write(root.join("journal"), FOREIGN_BYTES).unwrap();
+    } else {
+        set_test_before_rename_hook(Some(interrupt_source_journal_after_bin_move));
+    }
+}
+
+fn obstruct_source_move_and_restoration(moving: &Path) {
+    if moving.extension().is_some_and(|ext| ext == "cue") {
+        let root = moving.parent().unwrap();
+        let bucket = std::fs::read_dir(root.join(DISC_CONVERSION_QUARANTINE_SUBDIR))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(bucket.join(moving.file_name().unwrap()), FOREIGN_BYTES).unwrap();
+        std::fs::write(root.join("Track space ü.bin"), FOREIGN_BYTES).unwrap();
+    } else {
+        set_test_before_rename_hook(Some(obstruct_source_move_and_restoration));
+    }
+}
+
+fn recovery_fixture(
+    hook: fn(&Path),
+) -> (
+    tempfile::TempDir,
+    ChdConversionResult,
+    ChdConversionTransaction,
+) {
+    let dir = tempdir().unwrap();
+    let (cue, _) = source(dir.path());
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &dir.path().join("converted.chd"),
+        ChdConversionSourceMode::QuarantineSource,
+        Some(Path::new("/usr/bin/chdman")),
+    )
+    .unwrap();
+    set_test_before_rename_hook(Some(hook));
+    let outcome = execute_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([dir.path()]),
+        &dir.path().join("journal"),
+        dir.path(),
+        &AtomicBool::new(false),
+    );
+    set_test_before_rename_hook(None);
+    let (result, transaction) = outcome.unwrap();
+    assert!(matches!(
+        result.source_cleanup,
+        ChdSourceCleanup::QuarantineFailed {
+            sources_restored: false,
+            ..
+        }
+    ));
+    assert!(result.needs_attention());
+    assert!(!result.source_quarantined);
+    assert_eq!(
+        compare_optical_fingerprints(
+            &fingerprint_chd(&result.target_path).unwrap(),
+            &result.output_fingerprint
+        ),
+        OpticalFingerprintComparison::Equivalent
+    );
+    (dir, result, transaction)
+}
+
+#[test]
+fn outer_source_apply_error_retains_the_unresolved_transaction() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, transaction) = recovery_fixture(interrupt_source_journal_after_bin_move);
+    assert!(!dir.path().join("Track space ü.bin").exists());
+    assert!(dir.path().join("Disc space ü.cue").exists());
+    assert!(result.target_path.exists());
+    let source = transaction
+        .source_quarantine
+        .expect("the outer Apply error must retain recovery identity");
+    let persisted = crate::dat::rename_apply::read_journal(
+        &crate::dat::rename_apply::journal_path(
+            &dir.path().join("journal-saved"),
+            &source.transaction.transaction_id,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted.transaction_id, source.transaction.transaction_id);
+    assert_eq!(persisted.state, TransactionState::Applying);
+    let moved = persisted
+        .entries
+        .iter()
+        .find(|entry| {
+            entry
+                .source_path
+                .extension()
+                .is_some_and(|ext| ext == "bin")
+        })
+        .unwrap();
+    assert_eq!(
+        capture_identity(&moved.destination_path).unwrap(),
+        moved.identity
+    );
+}
+
+#[test]
+fn incomplete_source_undo_never_withdraws_the_verified_chd() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, mut transaction) = recovery_fixture(obstruct_source_move_and_restoration);
+    let chd_bytes = std::fs::read(&result.target_path).unwrap();
+    let outcome = rollback_chd_conversion(
+        &mut transaction,
+        &dir.path().join("journal"),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_ne!(
+        outcome,
+        RollbackResult::FullyRolledBack,
+        "source rollback failure is not complete recovery"
+    );
+    assert_eq!(std::fs::read(&result.target_path).unwrap(), chd_bytes);
+    assert_eq!(
+        std::fs::read(dir.path().join("Track space ü.bin")).unwrap(),
+        FOREIGN_BYTES
+    );
+    let source = transaction.source_quarantine.as_ref().unwrap();
+    assert_eq!(source.transaction.state, TransactionState::RollbackFailed);
+    let moved = source
+        .transaction
+        .entries
+        .iter()
+        .find(|entry| {
+            entry
+                .source_path
+                .extension()
+                .is_some_and(|ext| ext == "bin")
+        })
+        .unwrap();
+    assert_eq!(
+        capture_identity(&moved.destination_path).unwrap(),
+        moved.identity
+    );
+    assert_eq!(
+        transaction.output.transaction.state,
+        TransactionState::Applied
+    );
+}
+
+#[test]
+fn outer_source_apply_error_recovers_from_paired_journals_after_restart() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, transaction) = recovery_fixture(interrupt_source_journal_after_bin_move);
+    let source_id = transaction
+        .source_quarantine
+        .as_ref()
+        .unwrap()
+        .transaction
+        .transaction_id
+        .clone();
+    let output_id = result.transaction_id;
+    let journal = dir.path().join("journal");
+    let saved = dir.path().join("journal-saved");
+    let chd_bytes = std::fs::read(&result.target_path).unwrap();
+    drop(transaction);
+    // The failed journal path cannot authorize Undo or remove the CHD.
+    assert!(load_chd_conversion_transaction(&journal, &output_id).is_err());
+    assert_eq!(std::fs::read(&result.target_path).unwrap(), chd_bytes);
+    std::fs::remove_file(&journal).unwrap();
+    std::fs::rename(&saved, &journal).unwrap();
+    let mut recovered = load_chd_conversion_transaction(&journal, &output_id).unwrap();
+    let source_transaction = recovered.source_quarantine.as_ref().unwrap();
+    assert_eq!(source_transaction.transaction.transaction_id, source_id);
+    assert_eq!(
+        source_transaction.transaction.state,
+        TransactionState::Applying
+    );
+    assert_eq!(
+        rollback_chd_conversion(&mut recovered, &journal, &AtomicBool::new(false)).unwrap(),
+        RollbackResult::FullyRolledBack
+    );
+    let expected_dir = tempdir().unwrap();
+    let (expected_cue, expected_bin) = source(expected_dir.path());
+    assert_eq!(
+        std::fs::read(dir.path().join("Disc space ü.cue")).unwrap(),
+        std::fs::read(expected_cue).unwrap()
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("Track space ü.bin")).unwrap(),
+        std::fs::read(expected_bin).unwrap()
+    );
+    assert!(!result.target_path.exists());
+    let (journals, problems) = crate::dat::rename_apply::list_journals(&journal);
+    assert!(problems.is_empty());
+    assert_eq!(journals.len(), 2);
+    assert!(journals.iter().all(RenameTransaction::is_fully_rolled_back));
+}
+
+#[test]
+fn incomplete_source_rollback_is_preserved_after_restart_and_repeat_undo() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, transaction) = recovery_fixture(obstruct_source_move_and_restoration);
+    let journal = dir.path().join("journal");
+    let source_id = transaction
+        .source_quarantine
+        .as_ref()
+        .unwrap()
+        .transaction
+        .transaction_id
+        .clone();
+    let before = std::fs::read(&result.target_path).unwrap();
+    drop(transaction);
+    for _ in 0..2 {
+        let mut recovered =
+            load_chd_conversion_transaction(&journal, &result.transaction_id).unwrap();
+        assert_eq!(
+            recovered
+                .source_quarantine
+                .as_ref()
+                .unwrap()
+                .transaction
+                .transaction_id,
+            source_id
+        );
+        assert!(matches!(
+            rollback_chd_conversion(&mut recovered, &journal, &AtomicBool::new(false)).unwrap(),
+            RollbackResult::RollbackFailed { .. }
+        ));
+        assert_eq!(std::fs::read(&result.target_path).unwrap(), before);
+        assert_eq!(
+            recovered.output.transaction.state,
+            TransactionState::Applied
+        );
+        assert_eq!(
+            recovered
+                .source_quarantine
+                .as_ref()
+                .unwrap()
+                .transaction
+                .state,
+            TransactionState::RollbackFailed
+        );
+    }
+}
+
+fn completed_fixture(
+    mode: ChdConversionSourceMode,
+) -> (
+    tempfile::TempDir,
+    ChdConversionResult,
+    ChdConversionTransaction,
+) {
+    let dir = tempdir().unwrap();
+    let (cue, _) = source(dir.path());
+    let plan = build_chd_conversion_plan(
+        &cue,
+        &dir.path().join("converted.chd"),
+        mode,
+        Some(Path::new("/usr/bin/chdman")),
+    )
+    .unwrap();
+    let (result, transaction) = execute_chd_conversion(
+        &plan,
+        TrustedRoots::from_paths([dir.path()]),
+        &dir.path().join("journal"),
+        dir.path(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    (dir, result, transaction)
+}
+
+#[test]
+fn typed_partial_source_undo_keeps_chd_and_both_journals() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, mut transaction) =
+        completed_fixture(ChdConversionSourceMode::QuarantineSource);
+    let before = std::fs::read(&result.target_path).unwrap();
+    std::fs::write(dir.path().join("Track space ü.bin"), FOREIGN_BYTES).unwrap();
+    let outcome = rollback_chd_conversion(
+        &mut transaction,
+        &dir.path().join("journal"),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let RollbackResult::PartiallyRolledBack {
+        rolled_back,
+        failed,
+    } = outcome
+    else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(rolled_back, vec![dir.path().join("Disc space ü.cue")]);
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].0, dir.path().join("Track space ü.bin"));
+    assert_eq!(std::fs::read(&result.target_path).unwrap(), before);
+    assert_eq!(
+        std::fs::read(dir.path().join("Track space ü.bin")).unwrap(),
+        FOREIGN_BYTES
+    );
+    assert!(dir.path().join("Disc space ü.cue").is_file());
+    let source = transaction.source_quarantine.as_ref().unwrap();
+    let bin = source
+        .transaction
+        .entries
+        .iter()
+        .find(|entry| {
+            entry
+                .source_path
+                .extension()
+                .is_some_and(|ext| ext == "bin")
+        })
+        .unwrap();
+    assert_eq!(
+        capture_identity(&bin.destination_path).unwrap(),
+        bin.identity
+    );
+    let (journals, problems) = crate::dat::rename_apply::list_journals(&dir.path().join("journal"));
+    assert!(problems.is_empty());
+    assert_eq!(journals.len(), 2);
+    assert_eq!(
+        transaction.output.transaction.state,
+        TransactionState::Applied
+    );
+}
+
+#[test]
+fn cancelled_source_undo_retains_chd_and_can_be_explicitly_retried() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, mut transaction) =
+        completed_fixture(ChdConversionSourceMode::QuarantineSource);
+    let journal = dir.path().join("journal");
+    let before = std::fs::read(&result.target_path).unwrap();
+    assert_ne!(
+        rollback_chd_conversion(&mut transaction, &journal, &AtomicBool::new(true)).unwrap(),
+        RollbackResult::FullyRolledBack
+    );
+    assert_eq!(std::fs::read(&result.target_path).unwrap(), before);
+    assert!(!dir.path().join("Track space ü.bin").exists());
+    drop(transaction);
+    let mut recovered = load_chd_conversion_transaction(&journal, &result.transaction_id).unwrap();
+    assert_eq!(
+        rollback_chd_conversion(&mut recovered, &journal, &AtomicBool::new(false)).unwrap(),
+        RollbackResult::FullyRolledBack
+    );
+    assert!(!result.target_path.exists());
+    assert!(dir.path().join("Track space ü.bin").is_file());
+}
+
+#[test]
+fn normal_undo_survives_restart_in_both_source_modes() {
+    if !chdman_available() {
+        return;
+    }
+    for mode in [
+        ChdConversionSourceMode::KeepSource,
+        ChdConversionSourceMode::QuarantineSource,
+    ] {
+        let (dir, result, transaction) = completed_fixture(mode);
+        drop(transaction);
+        let journal = dir.path().join("journal");
+        let mut recovered =
+            load_chd_conversion_transaction(&journal, &result.transaction_id).unwrap();
+        assert_eq!(
+            rollback_chd_conversion(&mut recovered, &journal, &AtomicBool::new(false)).unwrap(),
+            RollbackResult::FullyRolledBack
+        );
+        assert!(!result.target_path.exists());
+        assert!(dir.path().join("Track space ü.bin").is_file());
+        assert!(dir.path().join("Disc space ü.cue").is_file());
+    }
+}
+
+#[test]
+fn missing_corrupt_or_contradictory_source_journal_cannot_authorize_output_undo() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, transaction) = completed_fixture(ChdConversionSourceMode::QuarantineSource);
+    let journal = dir.path().join("journal");
+    let source = &transaction.source_quarantine.as_ref().unwrap().transaction;
+    let source_path = journal_path(&journal, &source.transaction_id).unwrap();
+    let before = std::fs::read(&result.target_path).unwrap();
+    std::fs::remove_file(&source_path).unwrap();
+    assert!(load_chd_conversion_transaction(&journal, &result.transaction_id).is_err());
+    std::fs::write(&source_path, b"invalid json").unwrap();
+    assert!(load_chd_conversion_transaction(&journal, &result.transaction_id).is_err());
+    let mut contradictory = source.clone();
+    contradictory
+        .unknown
+        .insert(CHD_OUTPUT_ID_KEY.into(), "different-output".into());
+    write_journal(&journal, &contradictory).unwrap();
+    assert!(load_chd_conversion_transaction(&journal, &result.transaction_id).is_err());
+    write_journal(&journal, source).unwrap();
+    assert!(load_chd_conversion_transaction(&journal, &result.transaction_id).is_ok());
+    assert_eq!(std::fs::read(&result.target_path).unwrap(), before);
+    assert!(!dir.path().join("Track space ü.bin").exists());
+}
+
+#[test]
+fn original_bytes_must_be_proven_even_when_the_source_journal_says_rolled_back() {
+    if !chdman_available() {
+        return;
+    }
+    let (dir, result, transaction) = completed_fixture(ChdConversionSourceMode::QuarantineSource);
+    let journal = dir.path().join("journal");
+    let mut source = transaction.source_quarantine.unwrap().transaction;
+    assert_eq!(
+        rollback_repair_transaction(&mut source, &journal, &AtomicBool::new(false)).unwrap(),
+        RollbackResult::FullyRolledBack
+    );
+    std::fs::write(dir.path().join("Track space ü.bin"), FOREIGN_BYTES).unwrap();
+    let before = std::fs::read(&result.target_path).unwrap();
+    let mut recovered = load_chd_conversion_transaction(&journal, &result.transaction_id).unwrap();
+    assert!(rollback_chd_conversion(&mut recovered, &journal, &AtomicBool::new(false)).is_err());
+    assert_eq!(std::fs::read(&result.target_path).unwrap(), before);
+    assert_eq!(
+        recovered.output.transaction.state,
+        TransactionState::Applied
+    );
+}
