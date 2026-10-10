@@ -6,18 +6,22 @@
 //! authoritative parser for local `-listxml` output; this layer gives that
 //! parsed expectation a small, provenance-bearing compatibility projection.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::dat::archive::{ArchiveMemberEvidence, ArchivePassCompletion};
-use crate::dat::dependency::DependencyKind;
+use crate::dat::dependency::{
+    DependencyKind, DependencyOutcome, DependencyRequirement, DependencyTarget,
+};
 use crate::dat::model::{DatChecksum, DatGameEntry, DatRomEntry, ParsedDat};
 use crate::identity_source::mame_listxml::ImportedMameListxmlSource;
 use crate::ready_to_play::ReadyToPlayState;
 
-pub const MAME_COMPATIBILITY_SCHEMA_VERSION: u32 = 1;
+mod dependencies;
+
+pub const MAME_COMPATIBILITY_SCHEMA_VERSION: u32 = 2;
 
 /// Identity of the MAME expectation source used by an audit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -148,6 +152,60 @@ pub struct MameDependencyEvidence {
     pub runnable: Option<String>,
     pub is_bios: Option<String>,
     pub is_device: Option<String>,
+    pub resolution: MameDependencyResolution,
+}
+
+/// Metadata reference outcomes describe declaration validity, not file presence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MameDependencyReference {
+    pub declaring_set: String,
+    pub requirement: DependencyRequirement,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MameCollectionLayout {
+    #[default]
+    RuntimeSearch,
+    Split,
+    Merged,
+    NonMerged,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct MameRomLocation {
+    pub set_name: String,
+    pub member_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MameRomRequirementEvidence {
+    pub declaring_set: String,
+    pub member_name: String,
+    pub supporting_kind: Option<DependencyKind>,
+    /// Declared owner after validating every explicit merge link.
+    pub owner: Option<DependencyTarget>,
+    /// Facts for this member's explicit borrow chain, with original declaring
+    /// names and checksums. These are evidence, not additional required files.
+    pub declarations: Vec<MameExpectedRom>,
+    /// Physical locations permitted by this layout, never inventory inheritance.
+    pub locations: Vec<MameRomLocation>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct MameDependencyResolution {
+    pub layout: MameCollectionLayout,
+    pub references: Vec<MameDependencyReference>,
+    pub roms: Vec<MameRomRequirementEvidence>,
+    /// Effective default or caller-selected variant for each relevant machine.
+    pub bios_selections: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct MameVerifiedRom {
+    pub declaring_set: String,
+    pub member_name: String,
+    pub observed: MameObservedRom,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -191,6 +249,14 @@ impl MameRequirementGroup {
         if expectation.disks.iter().any(|disk| disk.merge.is_some()) {
             dependency_kinds.push(DependencyKind::MergedDisk);
         }
+        dependency_kinds.extend(
+            expectation
+                .dependencies
+                .resolution
+                .references
+                .iter()
+                .map(|reference| reference.requirement.kind),
+        );
         dependency_kinds.sort_unstable();
         dependency_kinds.dedup();
         Self {
@@ -496,6 +562,13 @@ impl ObservedArcadeSetEvidence {
             .unwrap_or_default();
         let mut mismatches = results
             .iter()
+            .filter(|result| {
+                !matches!(
+                    state,
+                    MameSetCompatibilityState::Compatible
+                        | MameSetCompatibilityState::CompatibleWithWarnings
+                ) || result.state == state
+            })
             .flat_map(|result| result.mismatches.iter().cloned())
             .collect::<Vec<_>>();
         mismatches.sort_by_key(|item| {
@@ -526,11 +599,12 @@ pub struct MameSetCompatibility {
     pub driver_status: Option<String>,
     pub collection_provenance_known: bool,
     pub ready_to_play_state: Option<ReadyToPlayState>,
+    pub verified_roms: Vec<MameVerifiedRom>,
 }
 
 impl MameSetExpectation {
     pub fn from_game(game: &DatGameEntry) -> Self {
-        Self {
+        let mut expectation = Self {
             set_name: game.name.clone(),
             parent: game.clone_of.clone(),
             rom_of: game.rom_of.clone(),
@@ -538,22 +612,8 @@ impl MameSetExpectation {
             is_bios: game.is_bios.clone(),
             is_device: game.is_device.clone(),
             driver_status: game.original_metadata.fields.get("driver.status").cloned(),
-            roms: game
-                .roms
-                .iter()
-                .map(|rom| expected_rom(&game.name, rom))
-                .collect(),
-            disks: game
-                .disks
-                .iter()
-                .map(|disk| MameExpectedDisk {
-                    set_name: game.name.clone(),
-                    name: disk.name.clone(),
-                    sha1: disk.sha1.clone(),
-                    status: disk.status.clone(),
-                    merge: disk.merge.clone(),
-                })
-                .collect(),
+            roms: Vec::new(),
+            disks: Vec::new(),
             dependencies: MameDependencyEvidence {
                 set_name: game.name.clone(),
                 parent: game.clone_of.clone(),
@@ -567,8 +627,11 @@ impl MameSetExpectation {
                 runnable: game.runnable.clone(),
                 is_bios: game.is_bios.clone(),
                 is_device: game.is_device.clone(),
+                resolution: MameDependencyResolution::default(),
             },
-        }
+        };
+        dependencies::direct(&mut expectation, game);
+        expectation
     }
 }
 
@@ -583,88 +646,47 @@ impl<'a> MameExpectationIndex<'a> {
         Self { dat }
     }
 
-    /// Returns the selected machine and its explicitly declared parent/ROM
-    /// and device closure. Missing closure nodes remain visible as dependency
-    /// evidence and are reported by the compatibility audit.
+    /// Resolve the selected machine without inheriting clone/ROM-source inventories.
+    /// Runtime search permits supported split, merged and non-merged locations.
     pub fn expectation_for(&self, set_name: &str) -> Option<MameSetExpectation> {
-        let mut names = BTreeSet::new();
-        let mut queue = vec![set_name.to_string()];
-        while let Some(name) = queue.pop() {
-            if !names.insert(name.clone()) {
-                continue;
-            }
-            let Some(game) = self.dat.games.iter().find(|game| game.name == name) else {
-                continue;
-            };
-            if let Some(parent) = game.clone_of.as_ref().or(game.rom_of.as_ref()) {
-                queue.push(parent.clone());
-            }
-            queue.extend(
-                game.device_refs
-                    .iter()
-                    .filter_map(|reference| reference.name.clone()),
-            );
-        }
-        let selected = self.dat.games.iter().find(|game| game.name == set_name)?;
-        let mut expectation = MameSetExpectation::from_game(selected);
-        expectation.dependencies.closure_set_names = names.iter().cloned().collect();
-        for name in names.into_iter().filter(|name| name != set_name) {
-            if let Some(game) = self.dat.games.iter().find(|game| game.name == name) {
-                expectation
-                    .roms
-                    .extend(game.roms.iter().map(|rom| expected_rom(&game.name, rom)));
-                expectation
-                    .disks
-                    .extend(game.disks.iter().map(|disk| MameExpectedDisk {
-                        set_name: game.name.clone(),
-                        name: disk.name.clone(),
-                        sha1: disk.sha1.clone(),
-                        status: disk.status.clone(),
-                        merge: disk.merge.clone(),
-                    }));
-            }
-        }
-        Some(expectation)
+        dependencies::resolve(
+            self.dat,
+            set_name,
+            MameCollectionLayout::RuntimeSearch,
+            &BTreeMap::new(),
+        )
     }
 
-    /// Return the authoritative alternatives currently expressible by the
-    /// imported DAT.  A normal set has one group.  A clone/ROM-source set also
-    /// gets a conservative standalone group containing the authoritative
-    /// closure's declared members under the selected set name; this models a
-    /// duplicated standalone layout without inspecting the collection.
+    /// A caller may pin BIOS variants by declaring machine name. This only
+    /// evaluates metadata and gathered files; it does not change launch options.
+    pub fn expectation_for_with_bios(
+        &self,
+        set_name: &str,
+        bios_selections: &BTreeMap<String, String>,
+    ) -> Option<MameSetExpectation> {
+        dependencies::resolve(
+            self.dat,
+            set_name,
+            MameCollectionLayout::RuntimeSearch,
+            bios_selections,
+        )
+    }
+
+    pub fn expectation_for_layout(
+        &self,
+        set_name: &str,
+        layout: MameCollectionLayout,
+    ) -> Option<MameSetExpectation> {
+        dependencies::resolve(self.dat, set_name, layout, &BTreeMap::new())
+    }
+
+    /// Layout alternatives preserve all metadata references and support
+    /// requirements. A standalone layout cannot erase unresolved dependencies.
     pub fn alternatives_for(&self, set_name: &str) -> Option<MameCompletenessAlternativeSet> {
-        let resolved = self.expectation_for(set_name)?;
-        let selected = self.dat.games.iter().find(|game| game.name == set_name)?;
-        if selected.clone_of.is_none() && selected.rom_of.is_none() {
-            return Some(MameCompletenessAlternativeSet::from_expectations([
-                resolved,
-            ]));
-        }
-        let mut standalone = MameSetExpectation::from_game(selected);
-        standalone.parent = None;
-        standalone.rom_of = None;
-        standalone.dependencies.parent = None;
-        standalone.dependencies.rom_of = None;
-        standalone.dependencies.closure_set_names = vec![set_name.to_string()];
-        standalone.roms = resolved
-            .roms
-            .iter()
-            .map(|rom| MameExpectedRom {
-                set_name: set_name.to_string(),
-                ..rom.clone()
-            })
-            .collect();
-        standalone.disks = resolved
-            .disks
-            .iter()
-            .map(|disk| MameExpectedDisk {
-                set_name: set_name.to_string(),
-                ..disk.clone()
-            })
-            .collect();
-        Some(MameCompletenessAlternativeSet::new([
-            MameRequirementGroup::from_expectation(resolved),
-            MameRequirementGroup::from_expectation(standalone),
+        Some(MameCompletenessAlternativeSet::from_expectations([
+            self.expectation_for_layout(set_name, MameCollectionLayout::Split)?,
+            self.expectation_for_layout(set_name, MameCollectionLayout::Merged)?,
+            self.expectation_for_layout(set_name, MameCollectionLayout::NonMerged)?,
         ]))
     }
 }
@@ -713,6 +735,89 @@ fn mismatch(
     }
 }
 
+fn rom_identity_matches(expected: &MameExpectedRom, observed: &MameObservedRom) -> bool {
+    expected.size_bytes.is_some()
+        && expected.size_bytes == observed.size_bytes
+        && ["CRC32", "SHA-1"]
+            .iter()
+            .any(|algorithm| checksum(expected, algorithm).is_some())
+        && [
+            ("CRC32", observed.crc32.as_deref()),
+            ("SHA-1", observed.sha1.as_deref()),
+        ]
+        .iter()
+        .all(|(algorithm, observed)| {
+            checksum(expected, algorithm).is_none_or(|expected| {
+                observed.is_some_and(|observed| observed.eq_ignore_ascii_case(expected))
+            })
+        })
+}
+
+/// CRC lookup within a permitted archive also handles renamed and subdirectory
+/// members. SHA-1 and size still have to agree before recording verification.
+fn resolve_observed_rom<'a>(
+    expected: &MameExpectedRom,
+    provenance: Option<&MameRomRequirementEvidence>,
+    observed: &'a [MameObservedRom],
+) -> Result<Option<&'a MameObservedRom>, DependencyOutcome> {
+    let fallback = [MameRomLocation {
+        set_name: expected.set_name.clone(),
+        member_name: expected.name.clone(),
+    }];
+    let locations = provenance.map_or(fallback.as_slice(), |r| r.locations.as_slice());
+    let mut candidates: Vec<_> = observed
+        .iter()
+        .filter(|item| {
+            locations.iter().any(|location| {
+                item.set_name == location.set_name
+                    && (item.name == location.member_name
+                        || checksum(expected, "CRC32").is_some_and(|crc| {
+                            item.crc32
+                                .as_deref()
+                                .is_some_and(|observed| observed.eq_ignore_ascii_case(crc))
+                        }))
+            })
+        })
+        .collect();
+    // The input has no per-copy rompath priority. Contradictory facts at one
+    // reported location cannot be resolved by preferring the matching copy.
+    let candidate_locations: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .map(|item| (item.set_name.as_str(), item.name.as_str()))
+        .collect();
+    let mut facts = BTreeMap::new();
+    for item in observed
+        .iter()
+        .filter(|item| candidate_locations.contains(&(item.set_name.as_str(), item.name.as_str())))
+    {
+        let (size, crc, sha1) = facts
+            .entry((&item.set_name, &item.name))
+            .or_insert((None, None, None));
+        let item_crc = item.crc32.as_ref().map(|value| value.to_ascii_lowercase());
+        let item_sha1 = item.sha1.as_ref().map(|value| value.to_ascii_lowercase());
+        if matches!((*size, item.size_bytes), (Some(a), Some(b)) if a != b)
+            || matches!((&*crc, &item_crc), (Some(a), Some(b)) if a != b)
+            || matches!((&*sha1, &item_sha1), (Some(a), Some(b)) if a != b)
+        {
+            return Err(DependencyOutcome::Ambiguous);
+        }
+        *size = size.or(item.size_bytes);
+        *crc = crc.take().or(item_crc);
+        *sha1 = sha1.take().or(item_sha1);
+    }
+    candidates.sort_by_key(|item| {
+        (
+            !rom_identity_matches(expected, item),
+            item.set_name.clone(),
+            item.name.clone(),
+            item.size_bytes,
+            item.crc32.clone(),
+            item.sha1.clone(),
+        )
+    });
+    Ok(candidates.first().copied())
+}
+
 /// Compare one selected set and its supplied resolved content evidence.
 ///
 /// `observed_roms` should contain the result of MAME's configured rompath
@@ -740,7 +845,7 @@ pub fn audit_mame_set(
 fn audit_mame_set_with_completeness(
     mame: &InstalledMameEvidence,
     expectation: MameSetExpectation,
-    observed_set_names: &[String],
+    _observed_set_names: &[String],
     observed_roms: &[MameObservedRom],
     observed_disks: &[MameObservedDisk],
     collection_provenance_known: bool,
@@ -764,40 +869,55 @@ fn audit_mame_set_with_completeness(
     }
 
     let mut mismatches = Vec::new();
-    for dependency in &expectation.dependencies.closure_set_names {
-        if completeness == ObservedEvidenceCompleteness::Complete
-            && !observed_set_names.iter().any(|name| name == dependency)
-        {
-            let reason = if dependency == &expectation.set_name {
-                MameMismatchReason::RequiredFileMissing
-            } else if expectation
-                .dependencies
-                .device_refs
-                .iter()
-                .any(|name| name == dependency)
-            {
-                MameMismatchReason::DeviceDependencyMissing
-            } else if expectation.dependencies.parent.as_deref() == Some(dependency)
-                || expectation.dependencies.rom_of.as_deref() == Some(dependency)
-            {
-                MameMismatchReason::ParentMissing
-            } else {
-                MameMismatchReason::BiosMissing
-            };
-            mismatches.push(MameMismatch {
-                reason,
-                set_name: dependency.clone(),
-                member_name: None,
-                expected_size: None,
-                observed_size: None,
-                detail: "Required MAME dependency set was not resolved through the supplied rompath evidence".into(),
-            });
+    let mut verified_roms = Vec::new();
+    let metadata_incomplete = expectation
+        .dependencies
+        .resolution
+        .references
+        .iter()
+        .any(|r| r.requirement.outcome != DependencyOutcome::Satisfied);
+    for reference in &expectation.dependencies.resolution.references {
+        if reference.requirement.outcome == DependencyOutcome::Satisfied {
+            continue;
         }
+        let requirement = &reference.requirement;
+        let set_name = match &requirement.target {
+            DependencyTarget::Set { name } => name.clone(),
+            DependencyTarget::SetMember { set_name, .. }
+            | DependencyTarget::BiosSet { set_name, .. } => set_name.clone(),
+            _ => reference.declaring_set.clone(),
+        };
+        mismatches.push(MameMismatch {
+            reason: MameMismatchReason::EvidenceUnavailable,
+            set_name,
+            member_name: requirement.via_member.clone(),
+            expected_size: None,
+            observed_size: None,
+            detail: format!(
+                "{} declared by {} is {:?}: {:?}",
+                requirement.kind.label(),
+                reference.declaring_set,
+                requirement.outcome,
+                requirement.target
+            ),
+        });
     }
     for expected in &expectation.roms {
-        let observed = observed_roms
+        let provenance = expectation
+            .dependencies
+            .resolution
+            .roms
             .iter()
-            .find(|item| item.set_name == expected.set_name && item.name == expected.name);
+            .find(|r| r.declaring_set == expected.set_name && r.member_name == expected.name);
+        let observed = match resolve_observed_rom(expected, provenance, observed_roms) {
+            Ok(observed) => observed,
+            Err(_) if status_is(expected.status.as_deref(), "nodump") => None,
+            Err(outcome) => {
+                mismatches.push(mismatch(MameMismatchReason::EvidenceUnavailable, expected, None,
+                    format!("{outcome:?} observations at the same ROM location; resolved rompath evidence is required")));
+                continue;
+            }
+        };
         if status_is(expected.status.as_deref(), "nodump") {
             mismatches.push(mismatch(
                 MameMismatchReason::NoDump,
@@ -812,13 +932,32 @@ fn audit_mame_set_with_completeness(
                 continue;
             }
             mismatches.push(mismatch(
-                MameMismatchReason::RequiredFileMissing,
+                match provenance.and_then(|r| r.supporting_kind) {
+                    Some(DependencyKind::Bios) => MameMismatchReason::BiosMissing,
+                    Some(DependencyKind::Device) => MameMismatchReason::DeviceDependencyMissing,
+                    _ => MameMismatchReason::RequiredFileMissing,
+                },
                 expected,
                 None,
-                "Required ROM member was not resolved through the supplied rompath evidence",
+                format!(
+                    "Required ROM member was not resolved; permitted locations: {:?}",
+                    provenance.map(|r| &r.locations)
+                ),
             ));
             continue;
         };
+        if expected.size_bytes.is_none()
+            || observed.size_bytes.is_none()
+            || (checksum(expected, "CRC32").is_none() && checksum(expected, "SHA-1").is_none())
+        {
+            mismatches.push(mismatch(
+                MameMismatchReason::EvidenceUnavailable,
+                expected,
+                Some(observed),
+                "Required size or checksum identity is unavailable",
+            ));
+            continue;
+        }
         if expected.size_bytes != observed.size_bytes {
             mismatches.push(mismatch(
                 MameMismatchReason::WrongSize,
@@ -838,7 +977,7 @@ fn audit_mame_set_with_completeness(
                 ));
                 continue;
             };
-            if observed_crc != expected_crc {
+            if !observed_crc.eq_ignore_ascii_case(expected_crc) {
                 mismatches.push(mismatch(
                     MameMismatchReason::CrcMismatch,
                     expected,
@@ -858,7 +997,7 @@ fn audit_mame_set_with_completeness(
                 ));
                 continue;
             };
-            if observed_sha1 != expected_sha1 {
+            if !observed_sha1.eq_ignore_ascii_case(expected_sha1) {
                 mismatches.push(mismatch(
                     MameMismatchReason::Sha1Mismatch,
                     expected,
@@ -868,6 +1007,11 @@ fn audit_mame_set_with_completeness(
                 continue;
             }
         }
+        verified_roms.push(MameVerifiedRom {
+            declaring_set: expected.set_name.clone(),
+            member_name: expected.name.clone(),
+            observed: observed.clone(),
+        });
         if status_is(expected.status.as_deref(), "baddump") {
             mismatches.push(mismatch(
                 MameMismatchReason::BadDump,
@@ -923,7 +1067,9 @@ fn audit_mame_set_with_completeness(
         }
     }
 
-    let state = if mismatches.iter().any(|item| {
+    let state = if metadata_incomplete {
+        MameSetCompatibilityState::Unknown
+    } else if mismatches.iter().any(|item| {
         matches!(
             item.reason,
             MameMismatchReason::RequiredFileMissing
@@ -953,13 +1099,15 @@ fn audit_mame_set_with_completeness(
     } else {
         MameSetCompatibilityState::CompatibleWithWarnings
     };
-    result(
+    let mut compatibility = result(
         mame,
         expectation,
         state,
         mismatches,
         collection_provenance_known,
-    )
+    );
+    compatibility.verified_roms = verified_roms;
+    compatibility
 }
 
 fn result(
@@ -1002,6 +1150,7 @@ fn result(
         driver_status,
         collection_provenance_known,
         ready_to_play_state,
+        verified_roms: Vec::new(),
     }
 }
 
@@ -1447,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_index_exposes_a_standalone_clone_alternative() {
+    fn authority_index_layouts_preserve_clone_metadata() {
         let selected = game(None);
         let parent = DatGameEntry {
             name: "parent".into(),
@@ -1482,11 +1631,18 @@ mod tests {
         let set = MameExpectationIndex::new(&dat)
             .alternatives_for("clone")
             .unwrap();
-        assert_eq!(set.alternatives.len(), 2);
+        assert_eq!(set.alternatives.len(), 3);
         assert!(
-            set.alternatives
-                .iter()
-                .any(|group| { group.expectation.dependencies.parent.is_none() })
+            set.alternatives.iter().all(|group| {
+                group.expectation.dependencies.parent.as_deref() == Some("parent")
+            })
         );
+        assert!(set.alternatives.iter().all(|group| {
+            group
+                .expectation
+                .roms
+                .iter()
+                .all(|rom| rom.name != "parent-rom")
+        }));
     }
 }

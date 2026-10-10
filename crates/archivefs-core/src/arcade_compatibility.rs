@@ -206,6 +206,7 @@ mod tests {
                 rom_of: None,
                 device_refs: Vec::new(),
                 closure_set_names: vec!["neogeo".into()],
+                resolution: Default::default(),
                 runnable: Some("yes".into()),
                 is_bios: Some("yes".into()),
                 is_device: Some("no".into()),
@@ -283,6 +284,8 @@ mod tests {
     fn mame_and_fbneo_expectations_remain_separate() {
         let mut wrong_mame = mame_expectation();
         wrong_mame.roms[0].name = "other.bin".into();
+        // Renaming alone can resolve by CRC; this expectation needs other bytes.
+        wrong_mame.roms[0].checksums[0].value = "87654321".into();
         let summary = evaluate_arcade_compatibility(
             &observed(),
             Some((&mame(), Some(wrong_mame))),

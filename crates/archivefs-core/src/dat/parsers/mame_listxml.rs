@@ -13,8 +13,8 @@ use crate::dat::hash::{normalise_crc32, normalise_md5, normalise_sha1};
 use crate::dat::limits::DatLimits;
 use crate::dat::mame_input_metadata::{MameControlMetadata, MameInputMetadata};
 use crate::dat::model::{
-    DatDeviceRefEntry, DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry, DatPackingPolicy,
-    DatRomEntry, DatSource, ParsedDat,
+    DatBiosSetEntry, DatDeviceRefEntry, DatDiskEntry, DatEcosystem, DatFormat, DatGameEntry,
+    DatPackingPolicy, DatRomEntry, DatSource, ParsedDat,
 };
 use crate::dat::parser::{ParseError, ParseOutcome, ParseWarning};
 
@@ -223,12 +223,15 @@ fn end_tag(e: &quick_xml::events::BytesEnd<'_>) -> Result<String, ParseError> {
         })
 }
 fn attr(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
+    declared_attr(e, name).filter(|v| !v.is_empty())
+}
+/// Relationship markers retain declared emptiness for fail-closed resolution.
+fn declared_attr(e: &quick_xml::events::BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.try_get_attribute(name)
         .ok()
         .flatten()
         .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok())
         .map(|v| v.into_owned())
-        .filter(|v| !v.is_empty())
 }
 fn bounded(value: &str, max: usize) -> Result<String, ParseError> {
     if value.len() > max {
@@ -264,6 +267,7 @@ struct Machine {
     roms: Vec<DatRomEntry>,
     disks: Vec<DatDiskEntry>,
     device_refs: Vec<DatDeviceRefEntry>,
+    bios_sets: Vec<DatBiosSetEntry>,
 }
 impl Machine {
     fn from_attrs(
@@ -273,8 +277,8 @@ impl Machine {
     ) -> Self {
         let mut m = Self {
             name: attr(e, b"name"),
-            clone_of: attr(e, b"cloneof"),
-            rom_of: attr(e, b"romof"),
+            clone_of: declared_attr(e, b"cloneof"),
+            rom_of: declared_attr(e, b"romof"),
             sample_of: attr(e, b"sampleof"),
             is_bios: attr(e, b"isbios"),
             is_device: attr(e, b"isdevice"),
@@ -306,6 +310,7 @@ impl Machine {
             runnable: self.runnable,
             disks: self.disks,
             device_refs: self.device_refs,
+            bios_sets: self.bios_sets,
             year: self.year,
             manufacturer: self.manufacturer,
             source_file: self.source_file,
@@ -332,7 +337,7 @@ fn handle_empty_like(
                     limit: limits.max_roms_per_entry,
                 });
             }
-            let status = attr(e, b"status");
+            let status = declared_attr(e, b"status");
             let crc = attr(e, b"crc").and_then(|v| normalise_crc32(&v));
             let md5 = attr(e, b"md5").and_then(|v| normalise_md5(&v));
             let sha1 = attr(e, b"sha1").and_then(|v| normalise_sha1(&v));
@@ -355,7 +360,7 @@ fn handle_empty_like(
                 md5,
                 sha1,
                 status,
-                merge: attr(e, b"merge"),
+                merge: declared_attr(e, b"merge"),
                 // `region`/`offset`/`bios`/`optional` are real MAME `-listxml`
                 // `<rom>` attributes (see MAME's `mame.xsd`) that the model
                 // already has fields for (populated by the Logiqx/ClrMamePro
@@ -364,8 +369,8 @@ fn handle_empty_like(
                 // such as Neo Geo's `maincpu`/`fixed`/`audiocpu`/`sprites`/
                 // `ymsnd*` regions - see `neogeo_set::neogeo_rom_role`.
                 offset: attr(e, b"offset"),
-                bios: attr(e, b"bios"),
-                optional: attr(e, b"optional"),
+                bios: declared_attr(e, b"bios"),
+                optional: declared_attr(e, b"optional"),
                 region: attr(e, b"region"),
                 ..Default::default()
             });
@@ -374,11 +379,16 @@ fn handle_empty_like(
             name: attr(e, b"name"),
             sha1: attr(e, b"sha1").and_then(|v| normalise_sha1(&v)),
             status: attr(e, b"status"),
-            merge: attr(e, b"merge"),
+            merge: declared_attr(e, b"merge"),
             ..Default::default()
         }),
         "device_ref" => m.device_refs.push(DatDeviceRefEntry {
-            name: attr(e, b"name"),
+            name: declared_attr(e, b"name"),
+        }),
+        "biosset" => m.bios_sets.push(DatBiosSetEntry {
+            name: declared_attr(e, b"name"),
+            description: attr(e, b"description"),
+            default: declared_attr(e, b"default"),
         }),
         "softwarelist" => {
             if let Some(name) = attr(e, b"name") {

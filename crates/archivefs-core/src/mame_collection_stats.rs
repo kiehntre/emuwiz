@@ -227,7 +227,7 @@ mod tests {
             roms: vec![DatRomEntry {
                 name: "rom".into(),
                 size_bytes: Some(1),
-                crc32: Some("aa".into()),
+                crc32: Some("aaaaaaaa".into()),
                 ..Default::default()
             }],
             ..Default::default()
@@ -246,7 +246,7 @@ mod tests {
                     set_name: name.into(),
                     name: "rom".into(),
                     size_bytes: Some(1),
-                    crc32: Some("aa".into()),
+                    crc32: Some("aaaaaaaa".into()),
                     sha1: None,
                 });
         }
@@ -380,6 +380,7 @@ mod tests {
         let mut second = first.clone();
         let mut first = first;
         first.roms[0].name = "rom-a".into();
+        first.roms[0].checksums[0].value = "bbbbbbbb".into();
         second.roms[0].name = "rom-b".into();
         let mut evidence =
             ObservedArcadeSetEvidence::new("layout", ObservedEvidenceCompleteness::Complete);
@@ -390,7 +391,7 @@ mod tests {
                 set_name: "layout".into(),
                 name: "rom-b".into(),
                 size_bytes: Some(1),
-                crc32: Some("aa".into()),
+                crc32: Some("aaaaaaaa".into()),
                 sha1: None,
             });
         let result = evidence.audit_alternatives(

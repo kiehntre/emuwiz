@@ -1330,7 +1330,7 @@ fn combine_worst(a: DependencyOutcome, b: DependencyOutcome) -> DependencyOutcom
 /// CRC32 on one entry and SHA-1 on another is not reported as conflicting -
 /// there is simply nothing comparable. Absence of a comparable pair is never
 /// read as agreement.
-fn checksums_conflict(left: &DatRomEntry, right: &DatRomEntry) -> bool {
+pub(crate) fn checksums_conflict(left: &DatRomEntry, right: &DatRomEntry) -> bool {
     for mine in left.checksums() {
         for theirs in right.checksums() {
             if mine.algorithm == theirs.algorithm && !mine.value.eq_ignore_ascii_case(&theirs.value)
