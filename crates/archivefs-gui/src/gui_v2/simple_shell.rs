@@ -1174,18 +1174,53 @@ pub(super) fn show_page_scroll<R>(
             // A revealed control must be in view in the pass that finds it.
             .animated(false)
             .show(ui, |ui| {
+                let layer = ui.layer_id();
+                let first = widgets_in_layer(ui.ctx(), layer);
                 let inner = content(ui);
-                reveal_new_keyboard_focus(ui, egui::Id::new(salt));
+                let owned = widgets_created_since(ui.ctx(), layer, first);
+                reveal_new_keyboard_focus(ui, egui::Id::new(salt), &owned);
                 inner
             });
     }
 }
 
+/// Widgets registered so far in `layer` during this pass. egui only appends,
+/// so the entries added between two calls are exactly what ran in between.
+fn widgets_in_layer(context: &egui::Context, layer: egui::LayerId) -> usize {
+    context.viewport(|viewport| {
+        viewport
+            .this_pass
+            .widgets
+            .layers()
+            .find(|(candidate, _)| **candidate == layer)
+            .map_or(0, |(_, widgets)| widgets.len())
+    })
+}
+
+/// The widgets a scroller's own content created: what was registered in
+/// `layer` after `first`. Status-bar, header and sidebar controls are drawn
+/// outside that closure, so they are never in this set whatever their rect.
+fn widgets_created_since(
+    context: &egui::Context,
+    layer: egui::LayerId,
+    first: usize,
+) -> Vec<egui::Id> {
+    context.viewport(|viewport| {
+        viewport
+            .this_pass
+            .widgets
+            .layers()
+            .find(|(candidate, _)| **candidate == layer)
+            .map(|(_, widgets)| widgets.iter().skip(first).map(|widget| widget.id).collect())
+            .unwrap_or_default()
+    })
+}
+
 /// A control that takes keyboard focus inside an ordinary page scroller is
 /// brought into view. Pointer presses, wheel scrolling and focus that did not
-/// change never scroll, and only controls laid out inside this content are
-/// revealed, so sidebar and header focus is left to its own reveal.
-fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id) {
+/// change never scroll, and only controls this content itself created (`owned`)
+/// are revealed, so status-bar, header and sidebar focus never moves the page.
+fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id, owned: &[egui::Id]) {
     let context = ui.ctx().clone();
     let slot = key.with("last_focus");
     let focused = context.memory(|memory| memory.focused());
@@ -1198,7 +1233,7 @@ fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id) {
     };
     let pointer =
         context.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
-    if pointer || Some(id) == before {
+    if pointer || Some(id) == before || !owned.contains(&id) {
         return;
     }
     if let Some(response) = context.read_response(id)

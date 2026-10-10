@@ -1877,3 +1877,158 @@ fn slice2a_tab_reveals_every_settings_control_at_the_hardest_setting() {
         }
     }
 }
+
+// ---- Slice 2A focus correction: status-bar focus never scrolls the page body
+
+/// The size heading and all three size controls are fully painted and visible.
+#[track_caller]
+fn size_controls_visible(output: &egui::FullOutput, size: [f32; 2], when: &str) {
+    for label in [
+        "Text and interface size: 160%",
+        "Smaller",
+        "Larger",
+        "Reset size",
+    ] {
+        assert!(
+            label_visible(output, label, size),
+            "{label:?} not visible {when}"
+        );
+    }
+}
+
+#[test]
+fn slice2a_first_tab_to_the_status_bar_leaves_the_settings_scroll_unchanged() {
+    for blue in [true, false] {
+        for hints in [true, false] {
+            let when = format!("blue={blue} hints={hints}");
+            let (context, mut app, size) = settings_2a(blue, SMALL, 1.6, hints);
+            let output = frame(&context, &mut app, size);
+            size_controls_visible(&output, size, &format!("before Tab, {when}"));
+
+            key_press(&context, &mut app, size, egui::Key::Tab);
+            for _ in 0..3 {
+                frame(&context, &mut app, size);
+            }
+            let output = frame(&context, &mut app, size);
+            size_controls_visible(&output, size, &format!("after the first Tab, {when}"));
+            let focused = context
+                .memory(|memory| memory.focused())
+                .and_then(|id| context.read_response(id))
+                .expect("the first Tab focuses a control");
+            assert!(
+                focused.rect.min.x < 200.0 / 1.6 || focused.rect.min.y > size[1] - 60.0,
+                "the first Tab reaches chrome, not the page body, {when}: {:?}",
+                focused.rect
+            );
+        }
+    }
+}
+
+/// Every painted text with its position, as a sorted, comparable snapshot of
+/// where the page body is. Equal snapshots mean nothing scrolled.
+fn painted_text(output: &egui::FullOutput) -> Vec<(String, i32, i32)> {
+    let mut texts: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some((
+                text.galley.text().to_string(),
+                text.pos.x.round() as i32,
+                text.pos.y.round() as i32,
+            )),
+            _ => None,
+        })
+        .collect();
+    texts.sort();
+    texts
+}
+
+fn settled_frame(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    for _ in 0..3 {
+        frame(context, app, size);
+    }
+    frame(context, app, size)
+}
+
+#[test]
+fn slice2a_first_tab_never_scrolls_any_page_body_in_either_profile() {
+    for blue in [true, false] {
+        for section in DESTINATIONS {
+            let context = egui::Context::default();
+            let mut app = fixture(&context);
+            app.simple.enabled = blue;
+            app.simple.set_ui_scale(1.6);
+            app.router.current = section.route();
+            let size = [SMALL[0] / 1.6, SMALL[1] / 1.6];
+            let before = painted_text(&settled_frame(&context, &mut app, size));
+            key_press(&context, &mut app, size, egui::Key::Tab);
+            let after = painted_text(&settled_frame(&context, &mut app, size));
+            let moved: Vec<_> = after
+                .iter()
+                .filter(|text| text.1 >= (200.0 / 1.6) as i32 && !before.contains(text))
+                .collect();
+            let content_y = |text: &(String, i32, i32)| text.2;
+            let focus_ring_only = moved.iter().all(|text| content_y(text) > 0);
+            assert!(
+                focus_ring_only && moved.len() <= 2,
+                "first Tab moved the {section:?} body (blue={blue}): {moved:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn slice2a_wheel_scrolling_stays_where_the_user_put_it() {
+    for blue in [true, false] {
+        let (context, mut app, size) = settings_2a(blue, SMALL, 1.6, true);
+        let start = painted_text(&settled_frame(&context, &mut app, size));
+        page_wheel(&context, &mut app, size, -120.0);
+        let scrolled = painted_text(&settled_frame(&context, &mut app, size));
+        assert_ne!(start, scrolled, "the wheel scrolls Settings (blue={blue})");
+        for _ in 0..30 {
+            frame(&context, &mut app, size);
+        }
+        assert_eq!(
+            scrolled,
+            painted_text(&frame(&context, &mut app, size)),
+            "an idle page does not drift after a wheel scroll (blue={blue})"
+        );
+    }
+}
+
+#[test]
+fn slice2a_a_genuine_offscreen_page_control_is_revealed_after_the_status_bar_fix() {
+    // Tab until a page-body control that began below the fold takes focus: it
+    // must end fully visible, in both directions and both profiles.
+    for blue in [true, false] {
+        for reverse in [false, true] {
+            let (context, mut app, size) = settings_2a(blue, SMALL, 1.6, true);
+            let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+            let mut revealed = 0;
+            for _ in 0..48 {
+                if reverse {
+                    shift_tab(&context, &mut app, size);
+                } else {
+                    key_press(&context, &mut app, size, egui::Key::Tab);
+                }
+                settled_frame(&context, &mut app, size);
+                let Some(response) = context
+                    .memory(|memory| memory.focused())
+                    .and_then(|id| context.read_response(id))
+                else {
+                    continue;
+                };
+                if response.rect.min.x < 200.0 / 1.6 {
+                    continue;
+                }
+                assert!(
+                    window.contains_rect(response.rect),
+                    "focused page control {:?} is outside the window (blue={blue} reverse={reverse})",
+                    response.rect
+                );
+                revealed += 1;
+            }
+            assert!(revealed >= 4, "only {revealed} page controls were reached");
+        }
+    }
+}
