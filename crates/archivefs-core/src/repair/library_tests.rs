@@ -2190,3 +2190,76 @@ fn a_full_apply_of_a_mixed_plan_refuses_before_any_mutation() {
     );
     assert!(!roms.join(".emuwiz-quarantine").exists());
 }
+
+// A library under a deeply nested folder still yields its safe repairs: a
+// proposal id derived from a long source path must not make the repair vanish.
+#[test]
+fn a_long_source_path_keeps_its_safe_repair_and_a_unique_valid_id() {
+    let dir = temp();
+    let deep = dir.path().join("N".repeat(90)).join("S".repeat(90));
+    std::fs::create_dir_all(&deep).unwrap();
+    let (dat, roms) = three_proposal_fixture(&deep);
+    assert!(
+        roms.join("a.bin").to_string_lossy().len() > 200,
+        "the fixture path is long enough to exceed the id limit"
+    );
+
+    let plan = saved_plan(&dat, &roms);
+    assert_eq!(plan.safe_repair_count(), 3, "no repair is dropped");
+
+    let ids: Vec<String> = scan(&dat, &roms)
+        .repair_plan
+        .proposals
+        .iter()
+        .map(|proposal| proposal.id.to_string())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    let unique: std::collections::BTreeSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 3, "every proposal id is distinct: {ids:?}");
+    assert!(ids.iter().all(|id| id.len() <= 128), "{ids:?}");
+
+    // The fallback id is stable across rescans, so a saved plan still matches.
+    let again: Vec<String> = scan(&dat, &roms)
+        .repair_plan
+        .proposals
+        .iter()
+        .map(|proposal| proposal.id.to_string())
+        .collect();
+    assert_eq!(ids, again);
+
+    let beta_id = proposal_id_for(&dat, &roms, "b.bin");
+    let result = apply_saved_plan_selected(
+        &plan,
+        &roms,
+        &dat,
+        plan.generation,
+        std::slice::from_ref(&beta_id),
+        &options(&deep),
+        &no_cancel(),
+    )
+    .expect("the selected long-path proposal applies");
+    assert_eq!(result.rename.expect("a rename ran").summary.applied, 1);
+    assert!(roms.join("beta.bin").exists());
+    assert!(roms.join("a.bin").exists(), "unselected source untouched");
+}
+
+// A short path keeps exactly the readable id it always had.
+#[test]
+fn a_short_source_path_keeps_its_readable_proposal_id() {
+    let dir = temp();
+    let (dat, roms) = three_proposal_fixture(dir.path());
+    let outcome = scan(&dat, &roms);
+    let proposal = outcome
+        .repair_plan
+        .proposals
+        .iter()
+        .find(|proposal| proposal.source_path.ends_with("a.bin"))
+        .unwrap();
+    let expected = format!(
+        "dat-{}",
+        roms.join("a.bin")
+            .to_string_lossy()
+            .replace(['/', '\\'], "_")
+    );
+    assert_eq!(proposal.id.as_str(), expected);
+}

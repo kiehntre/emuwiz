@@ -13,7 +13,9 @@
 //! The Repair Center must not weaken a rename proposal; it only re-presents the
 //! strongest existing classification in the Repair vocabulary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::dat::rename_plan::{ProposalState, RenamePlan, RenameProposal, SourceObjectKind};
 
@@ -22,6 +24,29 @@ use super::proposal::{
     RepairAction, RepairAuditRef, RepairEvidence, RepairEvidenceKind, RepairProposal,
     RepairProposalId, SafetyState,
 };
+
+/// A durable, path-safe proposal id derived from the source path.
+///
+/// The readable `dat-<path>` form is kept whenever it fits, so existing ids do
+/// not change. A path too long for an id (a deeply nested library folder) uses
+/// a digest of the exact path instead: still stable across rescans and unique
+/// per path, and the repair is never silently dropped for being long. The
+/// `dat~` prefix cannot collide with a readable id, which always starts `dat-`.
+fn dat_proposal_id(source_path: &Path) -> Option<RepairProposalId> {
+    let readable = format!(
+        "dat-{}",
+        source_path.to_string_lossy().replace(['/', '\\'], "_")
+    );
+    RepairProposalId::new(readable).or_else(|| {
+        use std::fmt::Write as _;
+        let digest = Sha256::digest(source_path.as_os_str().as_encoded_bytes());
+        let mut id = String::from("dat~");
+        for byte in digest {
+            let _ = write!(id, "{byte:02x}");
+        }
+        RepairProposalId::new(id)
+    })
+}
 
 /// Bridges one trusted (Suggested) DAT rename proposal into a Safe Repair
 /// proposal. Returns `None` for anything that is not executable, so an
@@ -40,15 +65,7 @@ pub fn repair_proposal_from_suggested_rename(
     let proposed_basename = proposal.proposed_basename.as_ref()?;
     let destination = proposal.source_path.parent()?.join(proposed_basename);
 
-    // A durable, path-safe proposal id derived from the source path.
-    let id_raw = format!(
-        "dat-{}",
-        proposal
-            .source_path
-            .to_string_lossy()
-            .replace(['/', '\\'], "_")
-    );
-    let id = RepairProposalId::new(id_raw)?;
+    let id = dat_proposal_id(&proposal.source_path)?;
 
     let mut evidence = Vec::new();
     evidence.push(RepairEvidence::new(
