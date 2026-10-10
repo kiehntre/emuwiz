@@ -1463,3 +1463,99 @@ fn original_bytes_must_be_proven_even_when_the_source_journal_says_rolled_back()
         TransactionState::Applied
     );
 }
+
+/// Regression for the fail-open branch found in independent review of
+/// 66f45056: an output transaction with no recovery link and no in-memory
+/// source handle used to skip every original-source check, withdraw the CHD,
+/// delete its staged copy and return `FullyRolledBack` while both originals
+/// were still in quarantine. The link is now mandatory: without it the Undo
+/// is refused and nothing on disk or in the journals changes.
+#[test]
+fn undo_without_a_recovery_link_is_refused_and_changes_nothing() {
+    if !chdman_available() {
+        return;
+    }
+    for mode in [
+        ChdConversionSourceMode::QuarantineSource,
+        ChdConversionSourceMode::KeepSource,
+    ] {
+        for keep_source_handle in [false, true] {
+            let (dir, result, mut transaction) = completed_fixture(mode);
+            let journal = dir.path().join("journal");
+            let chd = std::fs::read(&result.target_path).unwrap();
+            let staged = transaction.staged_path.clone();
+            let journals_before = crate::dat::rename_apply::list_journals(&journal).0;
+            let bin = dir.path().join("Track space ü.bin");
+            let cue = dir.path().join("Disc space ü.cue");
+            let quarantined = |path: &Path| {
+                transaction_destination(&journals_before, path)
+                    .is_some_and(|destination| destination.is_file())
+            };
+            let originals_before = (
+                bin.exists(),
+                cue.exists(),
+                quarantined(&bin),
+                quarantined(&cue),
+            );
+            assert_eq!(
+                originals_before,
+                match mode {
+                    ChdConversionSourceMode::QuarantineSource => (false, false, true, true),
+                    ChdConversionSourceMode::KeepSource => (true, true, false, false),
+                }
+            );
+
+            transaction
+                .output
+                .transaction
+                .unknown
+                .remove(CHD_RECOVERY_KEY);
+            if !keep_source_handle {
+                transaction.source_quarantine = None;
+            }
+
+            let error =
+                rollback_chd_conversion(&mut transaction, &journal, &AtomicBool::new(false))
+                    .expect_err("an unlinked CHD output must never be undone");
+            assert!(
+                error.contains("no original-source recovery proof")
+                    && error.contains("verified CHD retained"),
+                "{mode:?}/{keep_source_handle}: {error}"
+            );
+            // The verified CHD is exactly where it was; its staging is intact.
+            assert_eq!(std::fs::read(&result.target_path).unwrap(), chd);
+            assert_eq!(staged.parent().map(Path::is_dir), Some(true));
+            // No original moved, in either direction.
+            assert_eq!(
+                (
+                    bin.exists(),
+                    cue.exists(),
+                    quarantined(&bin),
+                    quarantined(&cue)
+                ),
+                originals_before,
+                "{mode:?}/{keep_source_handle}"
+            );
+            // The refusal happened before any journal write.
+            assert_eq!(
+                crate::dat::rename_apply::list_journals(&journal).0,
+                journals_before,
+                "{mode:?}/{keep_source_handle}: journals untouched"
+            );
+            assert!(
+                journals_before
+                    .iter()
+                    .all(|journal| journal.state == TransactionState::Applied)
+            );
+        }
+    }
+}
+
+/// Where the journals say `original` was moved to, if any journal moved it.
+fn transaction_destination(journals: &[RenameTransaction], original: &Path) -> Option<PathBuf> {
+    journals
+        .iter()
+        .flat_map(|journal| journal.entries.iter())
+        .find(|entry| entry.source_path == original)
+        .map(|entry| entry.destination_path.clone())
+}

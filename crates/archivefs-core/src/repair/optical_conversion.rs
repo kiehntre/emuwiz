@@ -963,12 +963,16 @@ pub fn rollback_chd_conversion(
     journal_dir: &Path,
     cancel: &AtomicBool,
 ) -> Result<RollbackResult, String> {
-    let link = recovery_link(&transaction.output.transaction)?;
-    if transaction.source_quarantine.is_none()
-        && let Some(link) = &link
-    {
+    // The link is the only proof of which originals this CHD replaced. Without
+    // it there is nothing to verify, so the CHD is never withdrawn - whatever
+    // the in-memory transaction does or does not carry.
+    let link = recovery_link(&transaction.output.transaction)?.ok_or(
+        "CHD conversion has no original-source recovery proof; verified CHD retained, \
+         manual recovery required",
+    )?;
+    if transaction.source_quarantine.is_none() {
         transaction.source_quarantine =
-            linked_source(journal_dir, &transaction.output.transaction, link)?;
+            linked_source(journal_dir, &transaction.output.transaction, &link)?;
     }
     if let Some(source) = transaction.source_quarantine.as_mut() {
         let outcome = rollback_repair_transaction(&mut source.transaction, journal_dir, cancel);
@@ -980,17 +984,10 @@ pub fn rollback_chd_conversion(
     }
     // A typed full rollback can skip never-applied entries. Before removing
     // the verified CHD, also prove every reviewed original at its actual path.
-    let originals_restored = if let Some(link) = &link {
-        link.originals.iter().all(|original| {
-            capture_identity(&original.path).ok().as_ref() == Some(&original.identity)
-        })
-    } else {
-        transaction.source_quarantine.as_ref().is_none_or(|source| {
-            source.transaction.entries.iter().all(|entry| {
-                capture_identity(&entry.source_path).ok().as_ref() == Some(&entry.identity)
-            })
-        })
-    };
+    let originals_restored = link
+        .originals
+        .iter()
+        .all(|original| capture_identity(&original.path).ok().as_ref() == Some(&original.identity));
     if !originals_restored {
         return Err("original CUE/BIN restoration is not proven; verified CHD retained, manual recovery required".into());
     }
