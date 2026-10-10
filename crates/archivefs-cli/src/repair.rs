@@ -37,8 +37,8 @@ use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir;
 use archivefs_core::dat::rename_apply::model::RollbackStatus;
 use archivefs_core::dat::rename_apply::{
-    EntryState, RenameTransaction, RollbackOutcome, RollbackResult, TransactionSummary,
-    journal_path, list_journals, read_journal, reconcile_recovery, rollback_transaction,
+    EntryState, RenameTransaction, RollbackResult, TransactionSummary, journal_path, list_journals,
+    read_journal, reconcile_recovery, rollback_transaction,
 };
 use archivefs_core::dat::sources::audit_cache::AuditCacheConfig;
 use archivefs_core::dat::sources::{DatSourceKind, suggest_display_name};
@@ -51,12 +51,11 @@ use archivefs_core::repair::library::{
     CombinedApplyResult, LibraryRepairPlan, RepairProfile, apply_saved_plan,
     apply_saved_plan_selected, plan_file_from_scan, preview_library_repair_plan, run_library_scan,
 };
-use archivefs_core::repair::optical_conversion::{
-    is_chd_conversion_output, load_chd_conversion_transaction,
-};
+use archivefs_core::repair::optical_conversion::is_chd_conversion_output;
 use archivefs_core::repair::proposal::{RepairEvidenceKind, RepairProposalId};
-use archivefs_core::repair::rollback_chd_conversion;
 use archivefs_core::safe_read::TrustedRoots;
+
+mod chd_recovery;
 
 /// The cache the repair commands use: the user's default, except in this
 /// crate's own tests, which must never touch the real cache.
@@ -619,7 +618,25 @@ fn run_rollback(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let chd_conversion = is_chd_conversion_output(&transaction);
     let outcome = if chd_conversion {
-        rollback_chd_output(&journal_dir, &transaction_id, &cancel)?
+        match chd_recovery::rollback_output(&journal_dir, &transaction_id, &transaction, &cancel) {
+            Ok(outcome) => outcome,
+            Err(failure) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "transaction_id": transaction_id,
+                            "result": "RollbackError",
+                            "chd_conversion": true,
+                            "phase": failure.phase,
+                            "error": failure.reason,
+                            "recovery": failure.recovery,
+                        }))?
+                    );
+                }
+                return Err(failure.text(&transaction_id).into());
+            }
+        }
     } else {
         rollback_transaction(&mut transaction, &journal_dir, &cancel)
             .map_err(|error| format!("rollback could not complete: {error}"))?
@@ -628,6 +645,10 @@ fn run_rollback(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
     // 6. Re-read/reverify the journal after rollback for reporting.
     let reread = read_journal(&path).unwrap_or_else(|_| outcome.transaction.clone());
     let reverify = reverify_transaction(&reread);
+    let chd_recovery =
+        (chd_conversion && outcome.result != RollbackResult::FullyRolledBack).then(|| {
+            chd_recovery::inspect_incomplete(&journal_dir, &transaction_id, &outcome.transaction)
+        });
 
     if json {
         let mut report = serde_json::json!({
@@ -648,6 +669,9 @@ fn run_rollback(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
         if chd_conversion {
             report["chd_conversion"] = serde_json::Value::Bool(true);
         }
+        if let Some(recovery) = &chd_recovery {
+            report["recovery"] = serde_json::to_value(recovery)?;
+        }
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("Repair rollback: transaction {}", reread.transaction_id);
@@ -666,8 +690,8 @@ fn run_rollback(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
                 rolled_back,
                 failed,
             } => {
-                if chd_conversion {
-                    println!("  The verified CHD was kept: the originals are not all restored.");
+                if let Some(recovery) = &chd_recovery {
+                    print!("{}", recovery.text());
                 }
                 println!("  Entries restored: {}", rolled_back.len());
                 println!("  Entries not restored: {}", failed.len());
@@ -676,12 +700,8 @@ fn run_rollback(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
                 }
             }
             RollbackResult::RollbackFailed { failed } => {
-                if chd_conversion {
-                    println!(
-                        "  The conversion was not fully undone and nothing was deleted: the \
-                         verified CHD was kept, and the original CUE/BIN may already be back \
-                         at their reviewed paths. Check both before retrying."
-                    );
+                if let Some(recovery) = &chd_recovery {
+                    print!("{}", recovery.text());
                 }
                 println!("  Entries not restored: {}", failed.len());
                 for (path, reason) in failed {
@@ -717,39 +737,6 @@ fn run_rollback(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>>
             Err(format!("transaction '{transaction_id}' rollback failed").into())
         }
     }
-}
-
-/// Undoes a CHD conversion through [`rollback_chd_conversion`], reloaded
-/// from its paired journals. A refusal changes nothing on disk and says what
-/// is still where, so the user is never left guessing.
-fn rollback_chd_output(
-    journal_dir: &Path,
-    transaction_id: &str,
-    cancel: &std::sync::atomic::AtomicBool,
-) -> Result<RollbackOutcome, Box<dyn std::error::Error>> {
-    const KEPT: &str = "Nothing was changed: the verified CHD is still in place and any \
-                        quarantined CUE/BIN is still in quarantine.";
-    let mut conversion =
-        load_chd_conversion_transaction(journal_dir, transaction_id).map_err(|error| {
-            format!(
-                "CHD conversion '{transaction_id}' cannot be undone automatically: {error}. \
-                 {KEPT} Run `repair history --journal-dir <path>` to find the transaction \
-                 that quarantined the originals and roll that one back, or restore the \
-                 CUE/BIN by hand; only then remove the CHD yourself."
-            )
-        })?;
-    let result = rollback_chd_conversion(&mut conversion, journal_dir, cancel);
-    let transaction = conversion.output.transaction;
-    let result = result.map_err(|error| {
-        format!(
-            "CHD conversion '{transaction_id}' was not undone: {error}. The verified CHD was \
-             kept. Check the original CUE/BIN paths and their quarantine copies, then retry."
-        )
-    })?;
-    Ok(RollbackOutcome {
-        result,
-        transaction,
-    })
 }
 
 fn rollback_result_label(result: &RollbackResult) -> &'static str {

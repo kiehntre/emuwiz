@@ -542,10 +542,8 @@ fn chd_undo_with_blocked_restoration_keeps_the_chd_and_exits_non_zero() {
         );
     }
     let first = stdout(&disc.undo(false));
-    assert!(
-        first.contains("CHD was kept") || first.contains("was not undone"),
-        "{first}"
-    );
+    assert!(first.contains("Files may already have moved"), "{first}");
+    assert!(!first.contains("CHD was kept"), "{first}");
 }
 
 /// CLI Undo using a legacy unpaired output journal: without the recorded
@@ -583,7 +581,12 @@ fn chd_undo_of_a_legacy_unpaired_output_journal_is_refused_untouched() {
             error.contains("cannot be undone automatically"),
             "{mode:?}: {error}"
         );
-        assert!(error.contains("Nothing was changed"), "{mode:?}: {error}");
+        assert!(error.contains("before rollback"), "{mode:?}: {error}");
+        assert!(!error.contains("Nothing was changed"), "{mode:?}: {error}");
+        assert!(
+            !error.contains("CHD is still in place"),
+            "{mode:?}: {error}"
+        );
         assert!(error.contains("repair history"), "{mode:?}: {error}");
 
         assert!(disc.chd_published_intact(), "{mode:?}: CHD kept");
@@ -721,9 +724,8 @@ fn non_chd_failed_rollback_json_keeps_its_exact_shape_and_exit_code() {
 }
 
 /// The originals are restored but the CHD can no longer be removed (it was
-/// replaced): the CHD and the foreign file are kept, the exit is non-zero, and
-/// the text says the CUE/BIN may already be back instead of implying they are
-/// still in quarantine.
+/// replaced): the foreign file survives, the exit is non-zero, and reporting
+/// distinguishes the restored originals from the unverified published object.
 #[test]
 fn chd_undo_that_restores_originals_but_cannot_remove_the_chd_says_so() {
     let Some(disc) = Converted::new(ChdConversionSourceMode::QuarantineSource) else {
@@ -741,13 +743,18 @@ fn chd_undo_that_restores_originals_but_cannot_remove_the_chd_says_so() {
             "attempt {attempt}: {text}"
         );
         assert!(
-            text.contains("original CUE/BIN may already be back"),
+            text.contains("Files may already have moved"),
             "attempt {attempt}: {text}"
         );
         assert!(
             !text.contains("not undone; nothing was deleted"),
             "attempt {attempt}: {text}"
         );
+        assert!(!text.contains("verified CHD was kept"), "{text}");
+        assert!(text.contains("identity_mismatch"), "{text}");
+        for name in ["Disc.cue", "Track.bin", "Disc.chd", "output.chd"] {
+            assert!(text.contains(name), "{name}: {text}");
+        }
         assert!(disc.originals_in_place(), "attempt {attempt}");
         assert_eq!(
             std::fs::read(&chd_path).unwrap(),
@@ -764,3 +771,7 @@ fn chd_undo_that_restores_originals_but_cannot_remove_the_chd_says_so() {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[path = "repair_rollback_exit_code/chd_journal_faults.rs"]
+mod chd_journal_faults;
