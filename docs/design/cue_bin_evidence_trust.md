@@ -91,3 +91,29 @@ construction, deserialization, fabricated comparison input and upgrading an
 observation. Payload-independent tests compare pre-collected 8/64 MiB streams
 and 99-member alias layouts after their paths disappear. Platform-specific
 reproduction limits must be reported honestly; metadata is never fabricated.
+
+## Review conditions carried forward
+
+The independent review (PASS WITH CONDITIONS, reviewed SHA
+`93fbebacf9ed8ff0ccb25641a0f82e6c60d37863`) left five non-blocking conditions.
+They bind every future consumer of this adapter:
+
+1. **`UnsupportedLayout` is coarse.** It also covers invalid layouts and empty
+   BINs, because the engine's unsupported classifier defaults to "unsupported".
+   Do not read it as "this format is unsupported"; read the carried error.
+2. **Symlink policy is the engine's.** A symlinked BIN in the same directory is
+   accepted by the existing collector. The adapter neither adds nor removes that
+   policy; any tightening belongs in the collector, with its own review.
+3. **Public enums carry no authority.** `ObservedRelation`, `LayoutSupport` and
+   related values can be constructed by callers. A consumer must take a
+   `CueObservationAssessment` produced by `assess_cue_observations`, never a
+   bare enum value, and may not treat any of them as permission.
+4. **Restored-mtime test is a documented baseline exception.**
+   `changed_bytes_with_restored_mtime_are_not_the_inspected_identity` in
+   `crates/archivefs-core/tests/cue_preservation_evidence.rs` fails
+   intermittently (about 9% of runs in review) in untouched collection code.
+   Its assertions must never be weakened, skipped or retried-until-green; the
+   fix belongs to a custody backend.
+5. **Classification depends on the engine's `is_unsupported`.** A change to that
+   classifier silently changes `LayoutSupport`. The direct tests cover it, and
+   such a change needs review.
