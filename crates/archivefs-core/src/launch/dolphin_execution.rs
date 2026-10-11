@@ -51,7 +51,10 @@ use crate::launch::planning::{
     CanonicalIdentityStatus, LaunchContainerKind, LaunchContentKind, LaunchContentRef,
     LaunchTarget, StandaloneProfileInput, build_launch_plan,
 };
-use crate::launch::process_spawn::{self, CapturedFileIdentity, ProcessExitReport, WatchedProcess};
+use crate::launch::process_spawn::{
+    self, CapturedFileIdentity, GracefulStopOutcome, GracefulStopScope, ProcessExitReport,
+    WatchedProcess,
+};
 use crate::launch::readiness::{FirmwareReadiness, LaunchReadiness};
 use crate::patch_manager::{
     DolphinLocalDiscoveryRoots, DolphinUserDirectoryMode, discover_dolphin_local_profiles,
@@ -587,6 +590,19 @@ impl LaunchedDolphinProcess {
 
     pub fn is_running(&self) -> bool {
         self.watched.is_running()
+    }
+
+    /// Forwards an explicit, scoped stop request to the owned launched
+    /// child. Whole-tree requests refuse; a wrapper's exit is not proof
+    /// that its descendants exited. No second signal or forced kill is
+    /// sent, and polling remains necessary for stderr and the exit report.
+    /// This does not widen native launch support to Flatpak or AppImage.
+    pub fn request_graceful_stop(
+        &mut self,
+        scope: GracefulStopScope,
+        grace_period: std::time::Duration,
+    ) -> GracefulStopOutcome {
+        self.watched.request_graceful_stop(scope, grace_period)
     }
 }
 

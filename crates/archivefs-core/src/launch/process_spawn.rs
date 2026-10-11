@@ -4,7 +4,7 @@
 //!
 //! This module contains no emulator-specific policy at all: no argv
 //! construction, no executable/profile selection, no identity or content
-//! inspection. It only ever does three narrow, reusable things:
+//! inspection. It provides these narrow, reusable pieces:
 //!
 //! - [`CapturedFileIdentity`] - a point-in-time `(device, inode, size,
 //!   mtime)` snapshot a caller uses to detect a file swapped out from under
@@ -19,6 +19,9 @@
 //! - [`read_bounded_stderr`] - the bounded stderr drain
 //!   [`spawn_watched_process`] itself uses, exposed separately so it stays
 //!   independently testable.
+//! - Explicit, scoped [`WatchedProcess::request_graceful_stop`], using
+//!   launch-captured ownership rather than a numeric PID. It never forces
+//!   termination and refuses unsupervised whole-process-tree requests.
 //!
 //! Linux also has a crate-private, opt-in preservation-workspace spawn seam:
 //! per-child environment, inherited workspace lease, and lifecycle callbacks.
@@ -30,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 /// Caps how much of a launched process's stderr this module ever retains in
 /// memory - a diagnostic aid for a failed/crashed launch, never a full log.
@@ -118,9 +121,66 @@ pub struct ProcessExitReport {
 /// notice it has exited, backed by a background thread that only ever
 /// drains stderr and waits - it never sends a signal.
 pub struct WatchedProcess {
+    /// Diagnostic only. Changing this value cannot redirect a stop request.
     pub pid: u32,
     receiver: Receiver<ProcessExitReport>,
     exit_report: Option<ProcessExitReport>,
+    stop_identity: OwnedChildIdentity,
+    stop_requested: bool,
+}
+
+/// The caller must explicitly choose the scope of a stop request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GracefulStopScope {
+    /// Only the child captured at launch. No claim about descendants.
+    LaunchedChild,
+    /// Refused: this launcher does not own a supervised process tree.
+    ProcessTree,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GracefulStopRefusal {
+    /// Neither a shared process group nor a `/proc` ancestry snapshot is
+    /// sufficient authority to signal descendants, including orphans.
+    ProcessTreeNotSupervised,
+    UnsupportedPlatform,
+    OwnershipUnavailable {
+        operation: &'static str,
+        raw_os_error: Option<i32>,
+    },
+    ExitObservationFailed {
+        raw_os_error: Option<i32>,
+    },
+    SignalFailed {
+        raw_os_error: Option<i32>,
+    },
+    InvalidGracePeriod,
+}
+
+/// Describes the launched child only, never an entire emulator tree. Child
+/// exit can precede the stderr drain, exit report and workspace callback;
+/// callers must continue polling for those existing lifecycle operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GracefulStopOutcome {
+    AlreadyExited,
+    ExitedAfterRequest,
+    /// The observation period ended without observing child exit. No
+    /// second signal or escalation was sent. Subsequent calls only observe.
+    StillRunning {
+        request_already_pending: bool,
+    },
+    Refused(GracefulStopRefusal),
+}
+
+enum OwnedChildIdentity {
+    #[cfg(target_os = "linux")]
+    ProcessFd(std::os::fd::OwnedFd),
+    Unavailable {
+        operation: &'static str,
+        raw_os_error: Option<i32>,
+    },
+    #[cfg(not(target_os = "linux"))]
+    UnsupportedPlatform,
 }
 
 impl WatchedProcess {
@@ -140,6 +200,127 @@ impl WatchedProcess {
 
     pub fn is_running(&self) -> bool {
         self.exit_report.is_none()
+    }
+
+    /// Explicitly requests one SIGTERM to the owned launched child, then
+    /// observes it for at most `grace_period`. Repeated requests never send
+    /// a second SIGTERM (which can itself force some emulators to stop).
+    /// No SIGKILL, timeout-triggered signal, drop-triggered signal, numeric
+    /// PID lookup, process-group signal or descendant walk is performed.
+    ///
+    /// Linux ownership is a pidfd opened by the child itself before exec
+    /// and transferred to this handle. It survives child exit and numeric
+    /// PID reuse without ever referring to the replacement process. Other
+    /// platforms, missing ownership and whole-tree requests fail closed.
+    pub fn request_graceful_stop(
+        &mut self,
+        scope: GracefulStopScope,
+        grace_period: Duration,
+    ) -> GracefulStopOutcome {
+        if scope == GracefulStopScope::ProcessTree {
+            return GracefulStopOutcome::Refused(GracefulStopRefusal::ProcessTreeNotSupervised);
+        }
+        let Some(deadline) = Instant::now().checked_add(grace_period) else {
+            return GracefulStopOutcome::Refused(GracefulStopRefusal::InvalidGracePeriod);
+        };
+        match &self.stop_identity {
+            OwnedChildIdentity::Unavailable {
+                operation,
+                raw_os_error,
+            } => GracefulStopOutcome::Refused(GracefulStopRefusal::OwnershipUnavailable {
+                operation,
+                raw_os_error: *raw_os_error,
+            }),
+            #[cfg(not(target_os = "linux"))]
+            OwnedChildIdentity::UnsupportedPlatform => {
+                let _ = deadline;
+                GracefulStopOutcome::Refused(GracefulStopRefusal::UnsupportedPlatform)
+            }
+            #[cfg(target_os = "linux")]
+            OwnedChildIdentity::ProcessFd(fd) => {
+                use std::os::fd::AsRawFd;
+                let fd = fd.as_raw_fd();
+                match pidfd_has_exited(fd) {
+                    Ok(true) => return GracefulStopOutcome::AlreadyExited,
+                    Ok(false) => {}
+                    Err(error) => {
+                        return GracefulStopOutcome::Refused(
+                            GracefulStopRefusal::ExitObservationFailed {
+                                raw_os_error: error.raw_os_error(),
+                            },
+                        );
+                    }
+                }
+                let request_already_pending = self.stop_requested;
+                if !request_already_pending {
+                    // SAFETY: fd is a live OwnedFd acquired from this exact
+                    // child before exec. A null siginfo and zero flags target
+                    // only that process; PID/group numbers are never used.
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            fd,
+                            libc::SIGTERM,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0u32,
+                        )
+                    };
+                    if result < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ESRCH) {
+                            return GracefulStopOutcome::AlreadyExited;
+                        }
+                        return GracefulStopOutcome::Refused(GracefulStopRefusal::SignalFailed {
+                            raw_os_error: error.raw_os_error(),
+                        });
+                    }
+                    self.stop_requested = true;
+                }
+                loop {
+                    match pidfd_has_exited(fd) {
+                        Ok(true) => return GracefulStopOutcome::ExitedAfterRequest,
+                        Ok(false) => {}
+                        Err(error) => {
+                            return GracefulStopOutcome::Refused(
+                                GracefulStopRefusal::ExitObservationFailed {
+                                    raw_os_error: error.raw_os_error(),
+                                },
+                            );
+                        }
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return GracefulStopOutcome::StillRunning {
+                            request_already_pending,
+                        };
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_has_exited(fd: i32) -> std::io::Result<bool> {
+    let mut observation = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one initialized pollfd, valid for this non-blocking call.
+        if unsafe { libc::poll(&mut observation, 1, 0) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if observation.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        }
+        return Ok(observation.revents & (libc::POLLIN | libc::POLLHUP) != 0);
     }
 }
 
@@ -209,33 +390,37 @@ fn spawn_watched_process_inner(
     on_start: Option<Box<dyn FnOnce(u32)>>,
     on_exit: Option<ExitCallback>,
 ) -> std::io::Result<WatchedProcess> {
-    let mut process = Command::new(&command.executable);
-    process.args(&command.arguments);
-    process.envs(environment.iter().map(|(key, value)| (key, value)));
-    process.stdin(Stdio::null());
-    process.stdout(Stdio::null());
-    process.stderr(Stdio::piped());
-    if let Some(working_directory) = &command.working_directory {
-        process.current_dir(working_directory);
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(fd) = inherited_lease {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: only async-signal-safe fcntl is called after fork. The
-        // caller keeps this fd alive through spawn; CLOEXEC changes only in
-        // the child, never in another thread/the parent environment.
-        unsafe {
-            process.pre_exec(move || {
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    // Each test-only ETXTBSY retry needs a fresh command and ownership
+    // channel, so a failed exec's descriptor can never name a later child.
+    let (mut child, stop_identity) = spawn_child(|| {
+        let mut process = Command::new(&command.executable);
+        process.args(&command.arguments);
+        process.envs(environment.iter().map(|(key, value)| (key, value)));
+        process.stdin(Stdio::null());
+        process.stdout(Stdio::null());
+        process.stderr(Stdio::piped());
+        if let Some(working_directory) = &command.working_directory {
+            process.current_dir(working_directory);
         }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = inherited_lease;
-    let mut child: Child = spawn_child(&mut process)?;
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = inherited_lease {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: only async-signal-safe fcntl is called after fork. The
+            // caller keeps this fd alive through spawn; CLOEXEC changes only in
+            // the child, never in another thread/the parent environment.
+            unsafe {
+                process.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = inherited_lease;
+        spawn_with_owned_identity(&mut process)
+    })?;
     let pid = child.id();
     if let Some(on_start) = on_start {
         on_start(pid);
@@ -260,15 +445,200 @@ fn spawn_watched_process_inner(
         pid,
         receiver,
         exit_report: None,
+        stop_identity,
+        stop_requested: false,
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn spawn_with_owned_identity(
+    command: &mut Command,
+) -> std::io::Result<(Child, OwnedChildIdentity)> {
+    Ok((command.spawn()?, OwnedChildIdentity::UnsupportedPlatform))
+}
+
+/// Capture ownership before exec, without looking up a child by PID in the
+/// parent. In particular, this remains safe if SIGCHLD is ignored or another
+/// library reaps a child prematurely. SCM_RIGHTS transfers the child's own
+/// pidfd through a private, CLOEXEC socket pair; no emulator inherits it.
+/// Capture failure disables stopping, not an otherwise valid launch.
+#[cfg(target_os = "linux")]
+fn spawn_with_owned_identity(
+    command: &mut Command,
+) -> std::io::Result<(Child, OwnedChildIdentity)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixDatagram;
+    use std::os::unix::process::CommandExt;
+
+    // Command installs stdin/stdout/stderr before pre_exec. If the parent's
+    // stdio is closed, socketpair can otherwise allocate 0, 1 or 2 and those
+    // sockets would be replaced by that setup. Keep both strictly above 2.
+    let above_stdio = |socket: OwnedFd| -> std::io::Result<OwnedFd> {
+        if socket.as_raw_fd() >= 3 {
+            return Ok(socket);
+        }
+        // SAFETY: socket remains owned through the duplication. The new fd
+        // is uniquely owned and CLOEXEC, like the original private socket.
+        let fd = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let channels = UnixDatagram::pair()
+        .and_then(|(parent, child)| Ok((above_stdio(parent.into())?, above_stdio(child.into())?)));
+    let (parent, child_channel) = match channels {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Ok((
+                command.spawn()?,
+                OwnedChildIdentity::Unavailable {
+                    operation: "ownership socket pair above stdio",
+                    raw_os_error: error.raw_os_error(),
+                },
+            ));
+        }
+    };
+    let parent_fd = parent.as_raw_fd();
+    let child_fd = child_channel.as_raw_fd();
+    // SAFETY: all post-fork operations below are direct syscalls, use only
+    // initialized stack storage, and allocate or lock nothing. The socket
+    // pair stays alive in the parent through spawn. No parent fd flags or
+    // signal dispositions are changed. Existing lease pre_exec runs first.
+    unsafe {
+        command.pre_exec(move || {
+            // pre_exec selects std's fork path. When the parent's stdio is
+            // closed, a null/pipe source can already be fd 0, 1 or 2: dup2
+            // of a descriptor onto itself does not clear CLOEXEC. Preserve
+            // the explicitly configured stdio through exec in that case.
+            for stdio in 0..=2 {
+                let flags = libc::fcntl(stdio, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(stdio, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            libc::close(parent_fd);
+            let pidfd = libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0u32) as i32;
+            let mut error = if pidfd < 0 {
+                *libc::__errno_location()
+            } else {
+                0
+            };
+            let mut data = libc::iovec {
+                iov_base: std::ptr::addr_of_mut!(error).cast(),
+                iov_len: std::mem::size_of::<i32>(),
+            };
+            // usize storage supplies cmsghdr alignment on 32/64-bit Linux.
+            let mut control = [0usize; 4];
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_iov = &mut data;
+            message.msg_iovlen = 1;
+            if pidfd >= 0 {
+                message.msg_control = control.as_mut_ptr().cast();
+                message.msg_controllen =
+                    libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize;
+                let header = libc::CMSG_FIRSTHDR(&message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = libc::SCM_RIGHTS;
+                (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+                libc::CMSG_DATA(header).cast::<i32>().write(pidfd);
+            }
+            while libc::sendmsg(child_fd, &message, libc::MSG_NOSIGNAL) < 0 {
+                if *libc::__errno_location() != libc::EINTR {
+                    break;
+                }
+            }
+            if pidfd >= 0 {
+                libc::close(pidfd);
+            }
+            libc::close(child_fd);
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    drop(child_channel);
+    let mut error = 0i32;
+    let mut data = libc::iovec {
+        iov_base: std::ptr::addr_of_mut!(error).cast(),
+        iov_len: std::mem::size_of::<i32>(),
+    };
+    let mut control = [0usize; 4];
+    // SAFETY: msghdr's zero representation is valid; pointers below refer
+    // to live, correctly aligned stack buffers throughout recvmsg/parsing.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_iov = &mut data;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = std::mem::size_of_val(&control);
+    let received = unsafe {
+        libc::recvmsg(
+            parent.as_raw_fd(),
+            &mut message,
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    let identity = if received < 0 {
+        OwnedChildIdentity::Unavailable {
+            operation: "ownership descriptor transfer",
+            raw_os_error: std::io::Error::last_os_error().raw_os_error(),
+        }
+    } else {
+        // Only our pre_exec sends to this socket, and sends exactly one fd.
+        // Own any received fd immediately, including malformed/truncated
+        // messages, so every refusal closes it instead of leaking it.
+        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        let descriptor = if !header.is_null()
+            && unsafe {
+                (*header).cmsg_level == libc::SOL_SOCKET
+                    && (*header).cmsg_type == libc::SCM_RIGHTS
+                    && (*header).cmsg_len
+                        == libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize
+            } {
+            Some(unsafe { OwnedFd::from_raw_fd(libc::CMSG_DATA(header).cast::<i32>().read()) })
+        } else {
+            None
+        };
+        if received != std::mem::size_of::<i32>() as isize
+            || message.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0
+        {
+            OwnedChildIdentity::Unavailable {
+                operation: "ownership transfer protocol",
+                raw_os_error: Some(libc::EPROTO),
+            }
+        } else if error != 0 {
+            OwnedChildIdentity::Unavailable {
+                operation: "child pidfd_open",
+                raw_os_error: Some(error),
+            }
+        } else if let Some(descriptor) = descriptor {
+            // recvmsg can also allocate 0/1/2 when parent stdio is closed.
+            // Keep the ownership capability private even if the caller
+            // subsequently reopens or restores its standard descriptors.
+            match above_stdio(descriptor) {
+                Ok(descriptor) => OwnedChildIdentity::ProcessFd(descriptor),
+                Err(error) => OwnedChildIdentity::Unavailable {
+                    operation: "ownership descriptor above stdio",
+                    raw_os_error: error.raw_os_error(),
+                },
+            }
+        } else {
+            OwnedChildIdentity::Unavailable {
+                operation: "missing ownership descriptor",
+                raw_os_error: Some(libc::EPROTO),
+            }
+        }
+    };
+    Ok((child, identity))
 }
 
 /// Production spawn: exactly one `Command::spawn`, no retry, no other
 /// behaviour. This is the only spawn path any shipped binary ever compiles.
 #[cfg(not(test))]
 #[inline]
-fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
-    command.spawn()
+fn spawn_child(
+    mut spawn: impl FnMut() -> std::io::Result<(Child, OwnedChildIdentity)>,
+) -> std::io::Result<(Child, OwnedChildIdentity)> {
+    spawn()
 }
 
 /// Test-build-only spawn: identical to the production path except it retries
@@ -287,11 +657,13 @@ fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
 /// keeps this entirely out of every non-test build: production launch
 /// behaviour is byte-for-byte the `#[cfg(not(test))]` function above.
 #[cfg(test)]
-fn spawn_child(command: &mut Command) -> std::io::Result<Child> {
+fn spawn_child(
+    mut spawn: impl FnMut() -> std::io::Result<(Child, OwnedChildIdentity)>,
+) -> std::io::Result<(Child, OwnedChildIdentity)> {
     const MAX_ATTEMPTS: u32 = 10;
     let mut attempt = 0;
     loop {
-        match command.spawn() {
+        match spawn() {
             Err(error)
                 if attempt + 1 < MAX_ATTEMPTS && error.raw_os_error() == Some(libc::ETXTBSY) =>
             {

@@ -22,6 +22,426 @@ use super::*;
 use crate::launch::process_spawn::CapturedFileIdentity;
 use crate::patch_manager::{DolphinLocalDiscoveryRoots, DolphinUserDirectoryMode};
 
+#[cfg(target_os = "linux")]
+mod graceful_stop {
+    use super::*;
+    use crate::launch::process_spawn::{
+        GracefulStopOutcome, GracefulStopRefusal, GracefulStopScope, PreparedProcessCommand,
+        spawn_watched_process_isolated,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    // All processes are disposable interpreters of this private fixture.
+    // Release files provide cooperative test cleanup, including orphans;
+    // no test signals a guessed PID, an installed emulator, or a user process.
+    const PROBE: &str = r#"#!/usr/bin/python3
+import json, os, pathlib, signal, subprocess, sys, time
+mode, directory = sys.argv[1:3]
+root = pathlib.Path(directory)
+running = True
+terms = 0
+def term(signum, frame):
+    global running, terms
+    terms += 1
+    (root / (mode + '.terms')).write_text(str(terms))
+    sys.stderr.write('graceful TERM\n')
+    sys.stderr.flush()
+    if mode != 'ignore':
+        running = False
+signal.signal(signal.SIGTERM, term)
+if mode == 'stdio':
+    os.fstat(0)
+    os.fstat(1)
+if mode == 'separate-group':
+    os.setsid()
+child = None
+if mode in ('tree', 'branch', 'orphan-wrapper'):
+    child_mode = 'branch' if mode == 'tree' else 'leaf'
+    child = subprocess.Popen([sys.executable, __file__, child_mode, str(root)],
+                             stderr=subprocess.DEVNULL if mode == 'orphan-wrapper' else None)
+sys.stderr.write('synthetic diagnostic\n')
+sys.stderr.flush()
+(root / (mode + '.ready')).write_text(json.dumps({'pid': os.getpid(), 'pgrp': os.getpgrp()}))
+if mode == 'orphan-wrapper':
+    (root / (mode + '.done')).write_text('done')
+    sys.exit(0)
+heartbeat = 0
+while running and not (root / 'release').exists():
+    heartbeat += 1
+    (root / (mode + '.heartbeat')).write_text(str(heartbeat))
+    time.sleep(0.01)
+if child is not None:
+    child.wait(timeout=5)
+(root / (mode + '.done')).write_text('done')
+"#;
+
+    fn until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "synthetic process did not reach checkpoint"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    struct SyntheticProcess {
+        fixture: Fixture,
+        mode: &'static str,
+        watched: Option<WatchedProcess>,
+        exit_callbacks: Arc<AtomicUsize>,
+        start_callbacks: Arc<AtomicUsize>,
+    }
+
+    impl SyntheticProcess {
+        fn new(mode: &'static str) -> Self {
+            let fixture = Fixture::new("graceful-stop");
+            let executable = fixture.write_executable("probe", PROBE.as_bytes());
+            let command = PreparedProcessCommand {
+                executable,
+                arguments: vec![mode.into(), fixture.root.clone().into_os_string()],
+                working_directory: None,
+            };
+            let lease = fs::File::create(fixture.path("lease")).unwrap();
+            let exit_callbacks = Arc::new(AtomicUsize::new(0));
+            let start_callbacks = Arc::new(AtomicUsize::new(0));
+            let exit_count = Arc::clone(&exit_callbacks);
+            let start_count = Arc::clone(&start_callbacks);
+            let watched = spawn_watched_process_isolated(
+                &command,
+                &[],
+                &lease,
+                move |_| {
+                    start_count.fetch_add(1, Ordering::SeqCst);
+                },
+                move |_| {
+                    exit_count.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+            let result = Self {
+                fixture,
+                mode,
+                watched: Some(watched),
+                exit_callbacks,
+                start_callbacks,
+            };
+            until(|| {
+                fs::read(result.fixture.path(&format!("{mode}.ready")))
+                    .ok()
+                    .is_some_and(|bytes| {
+                        serde_json::from_slice::<serde_json::Value>(&bytes).is_ok()
+                    })
+            });
+            result
+        }
+
+        fn stop(&mut self, scope: GracefulStopScope, duration: Duration) -> GracefulStopOutcome {
+            self.watched
+                .as_mut()
+                .unwrap()
+                .request_graceful_stop(scope, duration)
+        }
+
+        fn exit_report(&mut self) -> &ProcessExitReport {
+            let watched = self.watched.as_mut().unwrap();
+            until(|| watched.poll().is_some());
+            watched.poll().unwrap()
+        }
+
+        fn release(&self) {
+            fs::write(self.fixture.path("release"), b"release").unwrap();
+        }
+
+        fn heartbeat(&self, mode: &str) -> u64 {
+            fs::read_to_string(self.fixture.path(&format!("{mode}.heartbeat")))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0)
+        }
+
+        fn assert_alive(&self, mode: &str) {
+            let before = self.heartbeat(mode);
+            until(|| self.heartbeat(mode) > before);
+            assert!(!self.fixture.path(&format!("{mode}.done")).exists());
+            assert!(!self.fixture.path(&format!("{mode}.terms")).exists());
+        }
+    }
+
+    impl Drop for SyntheticProcess {
+        fn drop(&mut self) {
+            self.release();
+            // Wait for the existing watcher/callback, even if its public
+            // handle was dropped. Private descendants exit on the same file.
+            until(|| self.exit_callbacks.load(Ordering::SeqCst) == 1);
+            if self.mode == "orphan-wrapper" {
+                until(|| self.fixture.path("leaf.done").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn process_spawn_single_owned_child_stops_gracefully_and_reports_stderr() {
+        let mut process = SyntheticProcess::new("single");
+        assert_eq!(
+            process.stop(GracefulStopScope::LaunchedChild, Duration::from_secs(3)),
+            GracefulStopOutcome::ExitedAfterRequest
+        );
+        let report = process.exit_report();
+        assert!(report.status.as_ref().unwrap().success());
+        assert_eq!(report.stderr, b"synthetic diagnostic\ngraceful TERM\n");
+        assert_eq!(process.start_callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(process.exit_callbacks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn process_spawn_owned_child_and_grandchild_tree_request_refuses_without_signalling() {
+        let mut process = SyntheticProcess::new("tree");
+        until(|| process.fixture.path("leaf.ready").exists());
+        assert_eq!(
+            process.stop(GracefulStopScope::ProcessTree, Duration::ZERO),
+            GracefulStopOutcome::Refused(GracefulStopRefusal::ProcessTreeNotSupervised)
+        );
+        for mode in ["tree", "branch", "leaf"] {
+            process.assert_alive(mode);
+        }
+    }
+
+    #[test]
+    fn process_spawn_exited_wrapper_does_not_claim_or_stop_its_orphaned_child() {
+        let mut process = SyntheticProcess::new("orphan-wrapper");
+        until(|| process.fixture.path("leaf.ready").exists());
+        assert!(process.exit_report().status.as_ref().unwrap().success());
+        assert_eq!(
+            process.stop(GracefulStopScope::ProcessTree, Duration::ZERO),
+            GracefulStopOutcome::Refused(GracefulStopRefusal::ProcessTreeNotSupervised)
+        );
+        assert_eq!(
+            process.stop(GracefulStopScope::LaunchedChild, Duration::ZERO),
+            GracefulStopOutcome::AlreadyExited
+        );
+        process.assert_alive("leaf");
+    }
+
+    #[test]
+    fn process_spawn_reused_diagnostic_pid_cannot_redirect_the_launch_descriptor() {
+        let mut owned = SyntheticProcess::new("single");
+        let unrelated = SyntheticProcess::new("separate-group");
+        // Simulate a stale/public PID now naming another live process. No
+        // global kernel PID counter is changed to force actual numeric reuse.
+        owned.watched.as_mut().unwrap().pid = unrelated.watched.as_ref().unwrap().pid;
+        assert_eq!(
+            owned.stop(GracefulStopScope::LaunchedChild, Duration::from_secs(3)),
+            GracefulStopOutcome::ExitedAfterRequest
+        );
+        unrelated.assert_alive("separate-group");
+    }
+
+    #[test]
+    fn process_spawn_exited_child_with_reused_pid_does_not_signal_the_replacement() {
+        let mut owned = SyntheticProcess::new("single");
+        owned.release();
+        assert!(owned.exit_report().status.as_ref().unwrap().success());
+        let unrelated = SyntheticProcess::new("separate-group");
+        owned.watched.as_mut().unwrap().pid = unrelated.watched.as_ref().unwrap().pid;
+        assert_eq!(
+            owned.stop(GracefulStopScope::LaunchedChild, Duration::ZERO),
+            GracefulStopOutcome::AlreadyExited
+        );
+        unrelated.assert_alive("separate-group");
+    }
+
+    #[test]
+    fn process_spawn_process_group_reuse_never_authorizes_a_tree_signal() {
+        let mut owned = SyntheticProcess::new("single");
+        owned.release();
+        owned.exit_report();
+        let unrelated = SyntheticProcess::new("separate-group");
+        let facts: serde_json::Value = serde_json::from_slice(
+            &fs::read(unrelated.fixture.path("separate-group.ready")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(facts["pid"], facts["pgrp"]);
+        owned.watched.as_mut().unwrap().pid = unrelated.watched.as_ref().unwrap().pid;
+        assert_eq!(
+            owned.stop(GracefulStopScope::ProcessTree, Duration::ZERO),
+            GracefulStopOutcome::Refused(GracefulStopRefusal::ProcessTreeNotSupervised)
+        );
+        unrelated.assert_alive("separate-group");
+    }
+
+    #[test]
+    fn process_spawn_already_exited_child_is_a_truthful_no_op() {
+        let mut process = SyntheticProcess::new("single");
+        process.release();
+        process.exit_report();
+        assert_eq!(
+            process.stop(GracefulStopScope::LaunchedChild, Duration::ZERO),
+            GracefulStopOutcome::AlreadyExited
+        );
+        assert!(!process.fixture.path("single.terms").exists());
+    }
+
+    #[test]
+    fn process_spawn_repeated_stop_requests_send_exactly_one_term_without_escalation() {
+        let mut process = SyntheticProcess::new("ignore");
+        assert_eq!(
+            process.stop(GracefulStopScope::LaunchedChild, Duration::from_millis(50)),
+            GracefulStopOutcome::StillRunning {
+                request_already_pending: false
+            }
+        );
+        until(|| process.fixture.path("ignore.terms").exists());
+        assert_eq!(
+            process.stop(GracefulStopScope::LaunchedChild, Duration::from_millis(50)),
+            GracefulStopOutcome::StillRunning {
+                request_already_pending: true
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(process.fixture.path("ignore.terms")).unwrap(),
+            "1"
+        );
+        assert!(process.watched.as_mut().unwrap().poll().is_none());
+        process.release();
+        assert!(process.exit_report().status.as_ref().unwrap().success());
+    }
+
+    #[test]
+    fn process_spawn_unrelated_process_in_another_group_survives_a_stop() {
+        let mut owned = SyntheticProcess::new("single");
+        let unrelated = SyntheticProcess::new("separate-group");
+        assert_eq!(
+            owned.stop(GracefulStopScope::LaunchedChild, Duration::from_secs(3)),
+            GracefulStopOutcome::ExitedAfterRequest
+        );
+        unrelated.assert_alive("separate-group");
+    }
+
+    #[test]
+    fn process_spawn_exit_concurrent_with_stop_has_no_unowned_fallback() {
+        let mut owned = SyntheticProcess::new("single");
+        let unrelated = SyntheticProcess::new("separate-group");
+        owned.release();
+        let outcome = owned.stop(GracefulStopScope::LaunchedChild, Duration::from_secs(3));
+        assert!(matches!(
+            outcome,
+            GracefulStopOutcome::AlreadyExited | GracefulStopOutcome::ExitedAfterRequest
+        ));
+        assert!(owned.exit_report().status.as_ref().unwrap().success());
+        unrelated.assert_alive("separate-group");
+    }
+
+    #[test]
+    fn process_spawn_dropping_watched_handle_sends_no_signal_and_watcher_finishes() {
+        let mut process = SyntheticProcess::new("single");
+        drop(process.watched.take().unwrap());
+        process.assert_alive("single");
+        assert_eq!(process.exit_callbacks.load(Ordering::SeqCst), 0);
+        process.release();
+        until(|| process.exit_callbacks.load(Ordering::SeqCst) == 1);
+        assert!(!process.fixture.path("single.terms").exists());
+    }
+
+    #[test]
+    fn dolphin_wrapper_forwards_owned_child_stop_and_retains_exact_command_facts() {
+        let ready = build_ready_fixture("graceful-stop-wrapper");
+        fs::write(&ready.request.expected_executable, PROBE.as_bytes()).unwrap();
+        let mut command = preflight(&ready).unwrap();
+        // Direct spawn test only: synthetic probe argv, no real emulator.
+        command.arguments = vec!["single".into(), ready.fixture.root.clone().into_os_string()];
+        let expected = command_facts(&command);
+        let mut process = spawn_dolphin(command).unwrap();
+        until(|| ready.fixture.path("single.ready").exists());
+        assert_eq!(
+            process.request_graceful_stop(GracefulStopScope::ProcessTree, Duration::ZERO),
+            GracefulStopOutcome::Refused(GracefulStopRefusal::ProcessTreeNotSupervised)
+        );
+        assert_eq!(
+            process.request_graceful_stop(GracefulStopScope::LaunchedChild, Duration::from_secs(3)),
+            GracefulStopOutcome::ExitedAfterRequest
+        );
+        assert_eq!(process.command_facts, expected);
+        until(|| process.poll().is_some());
+        assert_eq!(
+            process.poll().unwrap().stderr,
+            b"synthetic diagnostic\ngraceful TERM\n"
+        );
+        assert_eq!(
+            process.request_graceful_stop(GracefulStopScope::LaunchedChild, Duration::ZERO),
+            GracefulStopOutcome::AlreadyExited
+        );
+    }
+
+    #[test]
+    fn process_spawn_closed_parent_stdio_does_not_alias_the_ownership_channel() {
+        const CHILD_FLAG: &str = "EMUWIZ_CLOSED_STDIO_STOP_TEST_CHILD";
+        if std::env::var_os(CHILD_FLAG).is_some() {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            struct RestoreStdio(OwnedFd, OwnedFd);
+            impl Drop for RestoreStdio {
+                fn drop(&mut self) {
+                    // Only this disposable test subprocess closes stdio;
+                    // restore it before the Rust test harness resumes.
+                    unsafe {
+                        libc::dup2(self.0.as_raw_fd(), 0);
+                        libc::dup2(self.1.as_raw_fd(), 1);
+                    }
+                }
+            }
+            let fixture = Fixture::new("closed-stdio-stop");
+            let executable = fixture.write_executable("probe", PROBE.as_bytes());
+            let command = PreparedProcessCommand {
+                executable,
+                arguments: vec!["stdio".into(), fixture.root.clone().into_os_string()],
+                working_directory: None,
+            };
+            let saved_in = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+            let saved_out = unsafe { libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(saved_in >= 3 && saved_out >= 3);
+            let restore = RestoreStdio(unsafe { OwnedFd::from_raw_fd(saved_in) }, unsafe {
+                OwnedFd::from_raw_fd(saved_out)
+            });
+            unsafe {
+                libc::close(0);
+                libc::close(1);
+            }
+            let spawned = process_spawn::spawn_watched_process(&command);
+            drop(restore);
+            let mut watched = spawned.unwrap();
+            until(|| fixture.path("stdio.ready").exists());
+            assert_eq!(
+                watched.request_graceful_stop(
+                    GracefulStopScope::LaunchedChild,
+                    Duration::from_secs(3)
+                ),
+                GracefulStopOutcome::ExitedAfterRequest
+            );
+            until(|| watched.poll().is_some());
+            assert!(watched.poll().unwrap().status.as_ref().unwrap().success());
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launch::dolphin_execution::tests::graceful_stop::process_spawn_closed_parent_stdio_does_not_alias_the_ownership_channel",
+                "--test-threads=1",
+            ])
+            .env(CHILD_FLAG, "disposable-test-child")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture {
