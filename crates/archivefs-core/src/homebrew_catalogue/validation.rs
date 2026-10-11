@@ -108,7 +108,6 @@ pub(super) fn display_text(
     field: &str,
     required: bool,
 ) -> Result<(), LocalCatalogueError> {
-    text(value, field, required)?;
     if let Some((index, c, kind)) = value
         .chars()
         .enumerate()
@@ -121,6 +120,19 @@ pub(super) fn display_text(
                 c as u32
             ),
         ));
+    }
+    text(value, field, required)
+}
+
+// Validate titles/summaries before catalogue-wide NUL checks can hide the
+// first forbidden character. Other fields keep their existing validation.
+pub(super) fn display_fields(records: &[LocalHomebrewRecord]) -> Result<(), LocalCatalogueError> {
+    for (index, record) in records.iter().enumerate() {
+        let field = format!("records[{index}].project");
+        display_text(&record.project.title, &format!("{field}.title"), true)?;
+        if let Some(summary) = &record.project.summary {
+            display_text(summary, &format!("{field}.summary"), false)?;
+        }
     }
     Ok(())
 }
@@ -248,10 +260,6 @@ pub(super) fn record(
             &format!("{field}.project.id.provider"),
             "does not match catalogue namespace",
         ));
-    }
-    display_text(&project.title, &format!("{field}.project.title"), true)?;
-    if let Some(summary) = &project.summary {
-        display_text(summary, &format!("{field}.project.summary"), false)?;
     }
     url(
         &project.source_page_url,

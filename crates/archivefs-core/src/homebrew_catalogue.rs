@@ -187,6 +187,8 @@ impl LocalCatalogueProvider {
         let raw: serde_json::Value = serde_json::from_slice(bytes).map_err(malformed)?;
         let known = serde_json::to_value(&catalogue).map_err(malformed)?;
         validation::known_fields(&raw, &known, "catalogue")?;
+        // Specific character diagnostics must precede generic NUL/size checks.
+        validation::display_fields(&catalogue.records)?;
         validation::bounded_strings(&raw, "catalogue")?;
         validation::provider_id(&catalogue.provider, "provider")?;
         let mut records = BTreeMap::new();

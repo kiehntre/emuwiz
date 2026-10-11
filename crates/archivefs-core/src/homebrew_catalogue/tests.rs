@@ -723,6 +723,88 @@ fn with_title(title: &str, summary: Option<&str>) -> Value {
     catalogue("local", vec![value])
 }
 
+fn assert_display_diagnostic(value: &Value, expected_field: &str, codepoint: &str, index: usize) {
+    match load(value) {
+        Err(LocalCatalogueError::Invalid { field, reason }) => {
+            assert_eq!(field, expected_field);
+            assert!(reason.contains(codepoint), "{reason}");
+            assert!(
+                reason.contains(&format!("at character {index};")),
+                "{reason}"
+            );
+        }
+        other => panic!("expected character diagnostic, got {:?}", other.map(|_| ())),
+    }
+}
+
+#[test]
+fn display_character_diagnostics_cover_all_seven_review_gaps() {
+    for (field, text, codepoint, index) in [
+        ("title", "é👩\0Q", "U+0000", 2),
+        ("summary", "é👩\0Q", "U+0000", 2),
+        ("title", "\n", "U+000A", 0),
+        ("title", "\r", "U+000D", 0),
+        ("title", "\t", "U+0009", 0),
+        ("title", "\n\t\r", "U+000A", 0),
+        ("title", "A\u{1b}B\0", "U+001B", 1),
+    ] {
+        let value = if field == "title" {
+            with_title(text, None)
+        } else {
+            with_title("Safe", Some(text))
+        };
+        assert_display_diagnostic(
+            &value,
+            &format!("records[0].project.{field}"),
+            codepoint,
+            index,
+        );
+    }
+}
+
+#[test]
+fn first_forbidden_character_wins_with_multibyte_prefixes_in_both_display_fields() {
+    for (text, codepoint) in [
+        ("é👩\u{1b}\0\n", "U+001B"),
+        ("é👩\0\u{1b}\n", "U+0000"),
+        ("é👩\u{202e}\0\u{1b}", "U+202E"),
+        ("é👩\u{200b}\0\n", "U+200B"),
+    ] {
+        assert_display_diagnostic(
+            &with_title(text, None),
+            "records[0].project.title",
+            codepoint,
+            2,
+        );
+        assert_display_diagnostic(
+            &with_title("Safe", Some(text)),
+            "records[0].project.summary",
+            codepoint,
+            2,
+        );
+    }
+}
+
+#[test]
+fn display_diagnostic_precedence_retains_empty_bounds_and_other_nul_rejections() {
+    for title in ["", "   ", "\u{2003}"] {
+        assert!(
+            matches!(load(&with_title(title, None)), Err(LocalCatalogueError::Invalid { field, reason })
+            if field == "records[0].project.title" && reason.contains("empty"))
+        );
+    }
+    assert!(load(&with_title("Safe", Some(""))).is_ok());
+    assert!(load(&with_title("Safe", Some("   "))).is_ok());
+    assert!(load(&with_title(&"x".repeat(4097), None)).is_err());
+    assert!(load(&with_title("Safe", Some(&"x".repeat(4097)))).is_err());
+    let mut value = with_title("Safe", None);
+    value["records"][0]["project"]["id"]["provider_id"] = json!("has\0nul");
+    assert!(
+        matches!(load(&value), Err(LocalCatalogueError::Invalid { field, reason })
+        if field == "catalogue.records[0].project.id.provider_id" && reason.contains("NUL"))
+    );
+}
+
 #[test]
 fn control_and_spoofing_characters_in_titles_and_summaries_are_refused() {
     for (name, bad) in [
