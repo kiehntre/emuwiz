@@ -18,6 +18,9 @@ use crate::dat::model::{
 };
 use crate::dat::parser::{ParseError, ParseOutcome, ParseWarning};
 
+/// Version that preserves BIOS defaults and declared empty dependency markers.
+pub const MAME_LISTXML_PARSER_SCHEMA_VERSION: u32 = 2;
+
 pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
     parse_mame_listxml_with_sink(path, limits, super::EntrySink::collect())
 }
@@ -316,6 +319,7 @@ impl Machine {
             source_file: self.source_file,
             original_metadata: self.metadata,
             mame_input: self.mame_input,
+            mame_listxml_schema_version: Some(MAME_LISTXML_PARSER_SCHEMA_VERSION),
             content_classification: DatContentClassification::unknown(),
             ..Default::default()
         })

@@ -728,6 +728,7 @@ fn emit_game(
             });
         }
         games.push(DatGameEntry {
+            mame_listxml_schema_version: None,
             name: game_name,
             // ClrMamePro has no `id`/`cloneofid` concept in the subset this
             // parser understands.

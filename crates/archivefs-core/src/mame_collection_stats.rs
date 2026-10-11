@@ -99,11 +99,12 @@ impl MameCollectionCompletenessStats {
                 MameSetCompatibilityState::Unknown => stats.unknown_sets += 1,
                 MameSetCompatibilityState::Unsupported => stats.unsupported_sets += 1,
             }
-            if result
-                .mismatches
-                .iter()
-                .any(|item| item.reason == MameMismatchReason::EvidenceUnavailable)
-            {
+            if result.mismatches.iter().any(|item| {
+                matches!(
+                    item.reason,
+                    MameMismatchReason::EvidenceUnavailable | MameMismatchReason::StaleMetadata
+                )
+            }) {
                 stats.evidence_unavailable_sets += 1;
             }
             count_dependencies(result, &mut stats.dependency_breakdown);
@@ -224,6 +225,9 @@ mod tests {
     fn expectation(name: &str) -> MameSetExpectation {
         MameSetExpectation::from_game(&DatGameEntry {
             name: name.into(),
+            mame_listxml_schema_version: Some(
+                crate::dat::parsers::mame_listxml::MAME_LISTXML_PARSER_SCHEMA_VERSION,
+            ),
             roms: vec![DatRomEntry {
                 name: "rom".into(),
                 size_bytes: Some(1),

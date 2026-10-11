@@ -85,6 +85,14 @@ pub(super) fn resolve(
         SetRef::Duplicate => {
             let mut expectation = MameSetExpectation::from_game(&DatGameEntry {
                 name: set_name.into(),
+                mame_listxml_schema_version: dat
+                    .games
+                    .iter()
+                    .filter(|game| game.name == set_name)
+                    .all(|game| {
+                        game.mame_listxml_schema_version == Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+                    })
+                    .then_some(MAME_LISTXML_PARSER_SCHEMA_VERSION),
                 ..Default::default()
             });
             expectation
@@ -108,6 +116,7 @@ pub(super) fn resolve(
     let mut expectation = MameSetExpectation::from_game(game);
     expectation.dependencies.resolution = MameDependencyResolution {
         layout,
+        parser_schema_version: game.mame_listxml_schema_version,
         ..Default::default()
     };
     expectation.roms.clear();
@@ -125,6 +134,9 @@ pub(super) fn resolve(
             continue;
         }
         let current = graph.game(index);
+        if current.mame_listxml_schema_version != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION) {
+            continue;
+        }
         if let DeclaredName::Named(name) = declared_name(&current.rom_of)
             && let SetRef::Unique(provider) = graph.resolve_set(name)
         {
@@ -212,6 +224,8 @@ pub(super) fn resolve(
         )
     });
     resolution.references.dedup();
+    resolution.stale_metadata_sets.sort();
+    resolution.stale_metadata_sets.dedup();
     Some(expectation)
 }
 
@@ -245,6 +259,14 @@ fn validate_graph(
         } // Checked on the declaring edge below.
         let game = graph.game(index);
         stack.push(Step::Exit(index));
+        if game.mame_listxml_schema_version != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION) {
+            expectation
+                .dependencies
+                .resolution
+                .stale_metadata_sets
+                .push(game.name.clone());
+            continue;
+        }
         for (kind, target) in edges(game).into_iter().rev() {
             let mut outcome;
             match declared_name(&target) {
@@ -367,6 +389,9 @@ fn append_members<'a>(
     bios: &BTreeMap<String, String>,
     graph: Option<(&DependencyGraph<'a>, usize)>,
 ) {
+    if game.mame_listxml_schema_version != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION) {
+        return;
+    }
     let selection = bios_selection(game, bios.get(&game.name));
     let selected_bios = match selection {
         Ok(selection) => {
@@ -432,12 +457,6 @@ fn append_members<'a>(
             }
             _ => {}
         }
-        // Validate markers before applying optionality, and preserve the
-        // evaluator's existing NO_DUMP preservation-gap policy.
-        if status_is(rom.optional.as_deref(), "yes") && !status_is(rom.status.as_deref(), "nodump")
-        {
-            continue;
-        }
         let mut owner = Some(DependencyTarget::SetMember {
             set_name: game.name.clone(),
             member_name: rom.name.clone(),
@@ -479,6 +498,12 @@ fn append_members<'a>(
                     outcome,
                     Some(rom.name.clone()),
                 ));
+        }
+        // Dump status and optionality do not validate a declared merge marker.
+        // Preserve the evaluator's existing NO_DUMP preservation-gap policy.
+        if status_is(rom.optional.as_deref(), "yes") && !status_is(rom.status.as_deref(), "nodump")
+        {
+            continue;
         }
         let locations = locations(expectation, game, rom, owner.as_ref(), kind, graph);
         let mut required_rom = expected_rom(&game.name, rom);
@@ -553,14 +578,18 @@ fn merge_owner<'a>(
             ChainFault::DepthExceeded => DependencyOutcome::Unsupported,
         })?;
         let game = graph.game(index);
-        let DeclaredName::Named(wanted) = declared_name(&rom.merge) else {
-            return Ok((
-                DependencyTarget::SetMember {
-                    set_name: game.name.clone(),
-                    member_name: rom.name.clone(),
-                },
-                declarations,
-            ));
+        let wanted = match declared_name(&rom.merge) {
+            DeclaredName::Malformed => return Err(DependencyOutcome::Contradictory),
+            DeclaredName::Absent => {
+                return Ok((
+                    DependencyTarget::SetMember {
+                        set_name: game.name.clone(),
+                        member_name: rom.name.clone(),
+                    },
+                    declarations,
+                ));
+            }
+            DeclaredName::Named(wanted) => wanted,
         };
         // cloneof is usable only for an explicit, validated member borrow.
         // It is never a default owner or an inventory inheritance rule.
@@ -573,6 +602,10 @@ fn merge_owner<'a>(
             SetRef::Duplicate => return Err(DependencyOutcome::Ambiguous),
             SetRef::Absent => return Err(DependencyOutcome::EvidenceUnavailable),
         };
+        if graph.game(index).mame_listxml_schema_version != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+        {
+            return Err(DependencyOutcome::EvidenceUnavailable);
+        }
         let target = match graph.rom_declared_as(index, wanted) {
             MemberRef::Unique((_, rom)) => rom,
             MemberRef::Duplicate => return Err(DependencyOutcome::Ambiguous),
@@ -629,6 +662,11 @@ fn locations(
             let mut guard = ChainGuard::default();
             while let SetRef::Unique(index) = graph.resolve_set(&name) {
                 if guard.visit(index).is_err() {
+                    break;
+                }
+                if graph.game(index).mame_listxml_schema_version
+                    != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+                {
                     break;
                 }
                 match declared_name(&graph.game(index).clone_of) {
@@ -697,6 +735,28 @@ fn locations(
     // A source/ancestor contributes no inventory: every candidate still has to
     // prove this specific required member's size and checksums in the evaluator.
     if let Some((graph, index)) = graph {
+        if kind == Some(DependencyKind::Device) {
+            // Device ROMs also search the system, its parents and corresponding
+            // BIOS archives. These are locations, not owners or inventories.
+            if let SetRef::Unique(system) = graph.resolve_set(selected) {
+                for system_name in
+                    std::iter::once(selected.clone()).chain(search_chain(graph, system, true))
+                {
+                    add(&system_name, &rom.name);
+                    if let SetRef::Unique(system) = graph.resolve_set(&system_name) {
+                        for source in search_chain(graph, system, false) {
+                            if let SetRef::Unique(source_index) = graph.resolve_set(&source)
+                                && graph.game(source_index).mame_listxml_schema_version
+                                    == Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+                                && status_is(graph.game(source_index).is_bios.as_deref(), "yes")
+                            {
+                                add(&source, &rom.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if layout != MameCollectionLayout::NonMerged {
             add(&game.name, &rom.name);
             for name in search_chain(graph, index, true)
@@ -719,6 +779,9 @@ fn search_chain(graph: &DependencyGraph<'_>, mut index: usize, lineage: bool) ->
     let mut guard = ChainGuard::default();
     while guard.visit(index).is_ok() {
         let game = graph.game(index);
+        if game.mame_listxml_schema_version != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION) {
+            break;
+        }
         let target = if lineage {
             &game.clone_of
         } else {

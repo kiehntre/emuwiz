@@ -386,6 +386,11 @@ pub struct DatGameEntry {
     /// This is deliberately MAME-specific and is not a controller requirement.
     #[serde(default)]
     pub mame_input: Option<MameInputMetadata>,
+    /// Parser provenance for MAME listxml dependency facts. Older parsed caches
+    /// omitted BIOS/default declarations and empty relationship markers. Their
+    /// missing stamp must remain unknown rather than inherit today's version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mame_listxml_schema_version: Option<u32>,
     /// Derived EmuWiz annotation. Never changes upstream identity semantics.
     #[serde(default)]
     pub content_classification: DatContentClassification,

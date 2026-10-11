@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -14,16 +16,101 @@ fn bin(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Writes an executable script to `path` via a temp name + rename, so the
-/// final path is never held open for writing while a sibling test exec's it
-/// (avoids a cross-test `ETXTBSY` race under full-suite parallelism).
+/// Only the fixture-writer child opens the executable for writing. A sibling
+/// process forked by another test cannot inherit that writable descriptor.
+/// Wait for the writer to exit before setting executable mode and publishing.
 #[cfg(unix)]
 fn write_exec(path: &Path, body: &[u8]) {
+    write_exec_with_hook(path, body, || ());
+}
+
+#[cfg(unix)]
+fn write_exec_with_hook<T>(path: &Path, body: &[u8], during_creation: impl FnOnce() -> T) -> T {
     use std::os::unix::fs::PermissionsExt;
     let staging = path.with_extension("staging");
-    std::fs::write(&staging, body).unwrap();
+    let mut writer = std::process::Command::new("/bin/sh")
+        .args(["-c", "umask 077; exec /bin/cat > \"$1\"", "fixture-writer"])
+        .arg(&staging)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start private fixture writer");
+    writer
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(body)
+        .expect("send fixture body");
+    let result = during_creation();
+    assert!(writer.wait().expect("wait for fixture writer").success());
     std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::rename(&staging, path).unwrap();
+    result
+}
+
+/// Keeps a sibling fork alive before exec, as a concurrently spawned process
+/// can be while running pre_exec. The child uses only async-signal-safe calls.
+#[cfg(target_os = "linux")]
+struct ForkObserver {
+    pid: libc::pid_t,
+    release: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+impl ForkObserver {
+    fn start() -> Self {
+        let mut pipe = [-1; 2];
+        // SAFETY: private descriptors; after fork the child performs no Rust
+        // allocation, locking or unwinding and exits directly through _exit.
+        unsafe {
+            assert_eq!(libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC), 0);
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::close(pipe[1]);
+                let mut byte = 0u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+            libc::close(pipe[0]);
+            assert!(pid > 0, "fork failed: {}", std::io::Error::last_os_error());
+            Self {
+                pid,
+                release: pipe[1],
+            }
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for ForkObserver {
+    fn drop(&mut self) {
+        // SAFETY: close releases the waiting child; waitpid reaps only our child.
+        unsafe {
+            libc::close(self.release);
+            while libc::waitpid(self.pid, std::ptr::null_mut(), 0) < 0 {
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fixture_remains_executable_when_sibling_fork_overlaps_its_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mame = dir.path().join("mame");
+    let sibling = write_exec_with_hook(
+        &mame,
+        b"#!/bin/sh\necho '0.270 (mame0270)'\n",
+        ForkObserver::start,
+    );
+    let output = std::process::Command::new(&mame).arg("-version").output();
+    drop(sibling);
+    let output = output.expect("published fixture must execute while the sibling is alive");
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("0.270"));
 }
 
 fn install(emulator: &str, executable: Option<&str>) -> LinuxEmulatorInstallationEvidence {
@@ -129,8 +216,10 @@ fn probe_target_finds_a_real_mame_binary_and_ignores_fbneo() {
         Some(mame.as_path())
     );
     // FBNeo is deliberately never probed by this module.
+    let outputs = probe_arcade_emulator_versions(&installations);
+    assert_eq!(outputs.len(), 1, "the stub must actually run");
     assert!(
-        probe_arcade_emulator_versions(&installations)
+        outputs
             .iter()
             .all(|(emulator, _)| *emulator == ArcadeEmulator::Mame)
     );

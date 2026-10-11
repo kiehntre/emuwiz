@@ -206,7 +206,12 @@ mod tests {
                 rom_of: None,
                 device_refs: Vec::new(),
                 closure_set_names: vec!["neogeo".into()],
-                resolution: Default::default(),
+                resolution: crate::arcade_mame_compatibility::MameDependencyResolution {
+                    parser_schema_version: Some(
+                        crate::dat::parsers::mame_listxml::MAME_LISTXML_PARSER_SCHEMA_VERSION,
+                    ),
+                    ..Default::default()
+                },
                 runnable: Some("yes".into()),
                 is_bios: Some("yes".into()),
                 is_device: Some("no".into()),

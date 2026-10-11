@@ -16,6 +16,7 @@ use crate::dat::dependency::{
     DependencyKind, DependencyOutcome, DependencyRequirement, DependencyTarget,
 };
 use crate::dat::model::{DatChecksum, DatGameEntry, DatRomEntry, ParsedDat};
+use crate::dat::parsers::mame_listxml::MAME_LISTXML_PARSER_SCHEMA_VERSION;
 use crate::identity_source::mame_listxml::ImportedMameListxmlSource;
 use crate::ready_to_play::ReadyToPlayState;
 
@@ -56,7 +57,8 @@ impl InstalledMameEvidence {
             evidence_timestamp_unix,
             metadata_build_identity,
             effective_rompath: effective_rompath.into_iter().collect(),
-            parser_schema_version: MAME_COMPATIBILITY_SCHEMA_VERSION,
+            // Executable/version identity does not prove how metadata was parsed.
+            parser_schema_version: 0,
         }
     }
 
@@ -71,14 +73,22 @@ impl InstalledMameEvidence {
         imported: &ImportedMameListxmlSource,
         evidence_timestamp_unix: Option<u64>,
     ) -> Self {
-        Self::new(
+        let mut evidence = Self::new(
             executable_path,
             reported_version,
             metadata_source.to_path_buf(),
             effective_rompath,
             Some(imported.artifact_sha256.clone()),
             evidence_timestamp_unix,
-        )
+        );
+        if !imported.dat.games.is_empty()
+            && imported.dat.games.iter().all(|game| {
+                game.mame_listxml_schema_version == Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+            })
+        {
+            evidence.parser_schema_version = MAME_LISTXML_PARSER_SCHEMA_VERSION;
+        }
+        evidence
     }
 }
 
@@ -95,6 +105,7 @@ pub enum MameSetCompatibilityState {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MameMismatchReason {
+    StaleMetadata,
     RequiredFileMissing,
     WrongSize,
     CrcMismatch,
@@ -194,6 +205,10 @@ pub struct MameRomRequirementEvidence {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct MameDependencyResolution {
+    /// Parser provenance of the selected machine's own declarations.
+    pub parser_schema_version: Option<u32>,
+    /// Supporting declarations that require reimport before they can be used.
+    pub stale_metadata_sets: Vec<String>,
     pub layout: MameCollectionLayout,
     pub references: Vec<MameDependencyReference>,
     pub roms: Vec<MameRomRequirementEvidence>,
@@ -441,26 +456,6 @@ impl ObservedArcadeSetEvidence {
         mame: &InstalledMameEvidence,
         expectation: MameSetExpectation,
     ) -> MameSetCompatibility {
-        if matches!(
-            self.completeness,
-            ObservedEvidenceCompleteness::NotGathered | ObservedEvidenceCompleteness::Unknown
-        ) {
-            return result(
-                mame,
-                expectation,
-                MameSetCompatibilityState::Unknown,
-                vec![MameMismatch {
-                    reason: MameMismatchReason::EvidenceUnavailable,
-                    set_name: self.set_name.clone(),
-                    member_name: None,
-                    expected_size: None,
-                    observed_size: None,
-                    detail: "Existing archive/catalogue evidence was not gathered for this set"
-                        .into(),
-                }],
-                self.collection_provenance_known,
-            );
-        }
         let mut compatibility = audit_mame_set_with_completeness(
             mame,
             expectation,
@@ -470,7 +465,7 @@ impl ObservedArcadeSetEvidence {
             self.collection_provenance_known,
             self.completeness,
         );
-        if self.completeness == ObservedEvidenceCompleteness::Partial
+        if self.completeness != ObservedEvidenceCompleteness::Complete
             && matches!(
                 compatibility.state,
                 MameSetCompatibilityState::Compatible
@@ -485,8 +480,7 @@ impl ObservedArcadeSetEvidence {
                 member_name: None,
                 expected_size: None,
                 observed_size: None,
-                detail: "Only partial cached evidence was available; compatibility is not proven"
-                    .into(),
+                detail: "Observations are incomplete; compatibility is not proven".into(),
             });
         }
         compatibility.mismatches.sort_by_key(|item| {
@@ -627,7 +621,10 @@ impl MameSetExpectation {
                 runnable: game.runnable.clone(),
                 is_bios: game.is_bios.clone(),
                 is_device: game.is_device.clone(),
-                resolution: MameDependencyResolution::default(),
+                resolution: MameDependencyResolution {
+                    parser_schema_version: game.mame_listxml_schema_version,
+                    ..Default::default()
+                },
             },
         };
         dependencies::direct(&mut expectation, game);
@@ -851,6 +848,27 @@ fn audit_mame_set_with_completeness(
     collection_provenance_known: bool,
     completeness: ObservedEvidenceCompleteness,
 ) -> MameSetCompatibility {
+    if expectation.dependencies.resolution.parser_schema_version
+        != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+        || (mame.parser_schema_version != 0
+            && mame.parser_schema_version != MAME_LISTXML_PARSER_SCHEMA_VERSION)
+    {
+        let set_name = expectation.set_name.clone();
+        return result(
+            mame,
+            expectation,
+            MameSetCompatibilityState::Unknown,
+            vec![MameMismatch {
+                reason: MameMismatchReason::StaleMetadata,
+                set_name,
+                member_name: None,
+                expected_size: None,
+                observed_size: None,
+                detail: "MAME verification metadata is stale or unversioned. Reimport the retained MAME listxml file before checking compatibility.".into(),
+            }],
+            collection_provenance_known,
+        );
+    }
     if !mame.usable {
         return result(
             mame,
@@ -870,12 +888,31 @@ fn audit_mame_set_with_completeness(
 
     let mut mismatches = Vec::new();
     let mut verified_roms = Vec::new();
-    let metadata_incomplete = expectation
+    let stale_support = !expectation
         .dependencies
         .resolution
-        .references
-        .iter()
-        .any(|r| r.requirement.outcome != DependencyOutcome::Satisfied);
+        .stale_metadata_sets
+        .is_empty();
+    if stale_support {
+        mismatches.push(MameMismatch {
+            reason: MameMismatchReason::StaleMetadata,
+            set_name: expectation.set_name.clone(),
+            member_name: None,
+            expected_size: None,
+            observed_size: None,
+            detail: format!(
+                "Supporting MAME metadata is stale or unversioned for {}. Reimport the retained MAME listxml file before proving compatibility.",
+                expectation.dependencies.resolution.stale_metadata_sets.join(", ")
+            ),
+        });
+    }
+    let metadata_incomplete = stale_support
+        || expectation
+            .dependencies
+            .resolution
+            .references
+            .iter()
+            .any(|r| r.requirement.outcome != DependencyOutcome::Satisfied);
     for reference in &expectation.dependencies.resolution.references {
         if reference.requirement.outcome == DependencyOutcome::Satisfied {
             continue;
@@ -1035,7 +1072,7 @@ fn audit_mame_set_with_completeness(
             .find(|item| item.set_name == expected.set_name && item.name == expected.name);
         if expected.sha1.is_none() {
             mismatches.push(MameMismatch {
-                reason: MameMismatchReason::ChdMissing,
+                reason: MameMismatchReason::EvidenceUnavailable,
                 set_name: expected.set_name.clone(),
                 member_name: expected.name.clone(),
                 expected_size: None,
@@ -1055,7 +1092,20 @@ fn audit_mame_set_with_completeness(
                 detail: "Required CHD was not resolved through the supplied rompath evidence"
                     .into(),
             });
-        } else if observed.and_then(|item| item.sha1.as_deref()) != expected.sha1.as_deref() {
+        } else if observed.and_then(|item| item.sha1.as_deref()).is_none() {
+            mismatches.push(MameMismatch {
+                reason: MameMismatchReason::EvidenceUnavailable,
+                set_name: expected.set_name.clone(),
+                member_name: expected.name.clone(),
+                expected_size: None,
+                observed_size: None,
+                detail: "Observed CHD identity was not gathered".into(),
+            });
+        } else if observed
+            .and_then(|disk| disk.sha1.as_deref())
+            .zip(expected.sha1.as_deref())
+            .is_some_and(|(actual, expected)| !actual.eq_ignore_ascii_case(expected))
+        {
             mismatches.push(MameMismatch {
                 reason: MameMismatchReason::ChdHashMismatch,
                 set_name: expected.set_name.clone(),
@@ -1067,7 +1117,20 @@ fn audit_mame_set_with_completeness(
         }
     }
 
-    let state = if metadata_incomplete {
+    // Known wrong bytes are definite even if another dependency is unresolved.
+    // Absence still needs complete observations and resolved search locations.
+    let definite_content_failure = mismatches.iter().any(|item| {
+        matches!(
+            item.reason,
+            MameMismatchReason::WrongSize
+                | MameMismatchReason::CrcMismatch
+                | MameMismatchReason::Sha1Mismatch
+                | MameMismatchReason::ChdHashMismatch
+        )
+    });
+    let state = if definite_content_failure {
+        MameSetCompatibilityState::Incompatible
+    } else if metadata_incomplete {
         MameSetCompatibilityState::Unknown
     } else if mismatches.iter().any(|item| {
         matches!(
@@ -1141,10 +1204,26 @@ fn result(
         MameSetCompatibilityState::Unsupported => Some(ReadyToPlayState::Unsupported),
         MameSetCompatibilityState::Unknown => Some(ReadyToPlayState::Unknown),
     };
+    let mut mame = mame.clone();
+    if expectation.dependencies.resolution.parser_schema_version
+        != Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+        || !expectation
+            .dependencies
+            .resolution
+            .stale_metadata_sets
+            .is_empty()
+    {
+        // Preserve an explicit old version, but never label unproven facts current.
+        if mame.parser_schema_version == MAME_LISTXML_PARSER_SCHEMA_VERSION {
+            mame.parser_schema_version = 0;
+        }
+    } else if mame.parser_schema_version == 0 {
+        mame.parser_schema_version = MAME_LISTXML_PARSER_SCHEMA_VERSION;
+    }
     MameSetCompatibility {
         set_name: expectation.set_name.clone(),
         state,
-        mame: mame.clone(),
+        mame,
         expectation,
         mismatches,
         driver_status,
@@ -1175,6 +1254,7 @@ mod tests {
     fn game(status: Option<&str>) -> DatGameEntry {
         DatGameEntry {
             name: "pacman".into(),
+            mame_listxml_schema_version: Some(MAME_LISTXML_PARSER_SCHEMA_VERSION),
             roms: vec![DatRomEntry {
                 name: "pacman.6e".into(),
                 size_bytes: Some(4),
@@ -1308,6 +1388,7 @@ mod tests {
     fn expectation_index_includes_parent_and_device_closure_names() {
         let child = DatGameEntry {
             name: "child".into(),
+            mame_listxml_schema_version: Some(MAME_LISTXML_PARSER_SCHEMA_VERSION),
             clone_of: Some("parent".into()),
             device_refs: vec![crate::dat::model::DatDeviceRefEntry {
                 name: Some("qsound".into()),
@@ -1316,10 +1397,12 @@ mod tests {
         };
         let parent = DatGameEntry {
             name: "parent".into(),
+            mame_listxml_schema_version: Some(MAME_LISTXML_PARSER_SCHEMA_VERSION),
             ..Default::default()
         };
         let device = DatGameEntry {
             name: "qsound".into(),
+            mame_listxml_schema_version: Some(MAME_LISTXML_PARSER_SCHEMA_VERSION),
             is_device: Some("yes".into()),
             runnable: Some("no".into()),
             ..Default::default()

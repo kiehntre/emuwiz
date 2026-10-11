@@ -1409,6 +1409,7 @@ fn drop_current_game(
     }
     if let Some(game_name) = name.take() {
         games.push(DatGameEntry {
+            mame_listxml_schema_version: None,
             name: game_name,
             id: id.take(),
             description: desc.take(),
