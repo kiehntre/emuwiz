@@ -14,6 +14,16 @@
 # Linux only: safe asset publication requires Python 3, procfs, O_PATH
 # (Linux 2.6.39+), and descriptor-relative hardlink support on the install
 # filesystem. Missing support fails closed; there is no overwrite fallback.
+# The starter config (written only when none exists) also needs Python's
+# os.O_TMPFILE and ctypes, a configuration-directory filesystem that supports
+# O_TMPFILE anonymous files and hardlinks, and a mounted /proc: the anonymous
+# file is published with linkat() through /proc/self/fd. It is created with mode
+# 0600, not the umask-dependent default earlier versions produced, and an
+# existing config is never modified or re-permissioned. When any of that is
+# unavailable the step refuses with an explicit message (no traceback, no named
+# staging file, no fallback), assets already installed remain in place, and the
+# run exits 1. See "Installer requirements and failure behaviour" in
+# docs/RELEASE_ENGINEERING.md.
 # Close native EmuWiz processes before upgrading: owned regular files update
 # through held descriptors, non-atomically, just like the ownership manifest.
 # Hardlinked files refuse changed-byte updates. A running EmuWiz is detected before
@@ -49,17 +59,53 @@ else
 fi
 desktop_id="io.github.kiehntre.emuwiz"
 desktop_file="$data_home/applications/$desktop_id.desktop"
-# EmuWiz config directory, with legacy ArchiveFS reuse: an existing
-# `~/.config/archivefs` is honoured so pre-rename settings keep loading;
-# a fresh install uses `~/.config/emuwiz`. This mirrors the application's
-# own directory resolution.
-config_root="$HOME/.config/emuwiz"
-if [ ! -e "$config_root" ] && [ ! -L "$config_root" ] \
-    && { [ -e "$HOME/.config/archivefs" ] || [ -L "$HOME/.config/archivefs" ]; }; then
-    config_root="$HOME/.config/archivefs"
+# EmuWiz config directory. This mirrors the application's own resolution
+# (archivefs-core app_dirs::config_dir) exactly:
+#   1. EMUWIZ_CONFIG_HOME, when set, is the config directory itself;
+#   2. else XDG_CONFIG_HOME, when set, gives $XDG_CONFIG_HOME/emuwiz;
+#   3. else ~/.config/emuwiz, or the legacy ~/.config/archivefs when only
+#      that exists. Any directory entry, including a dangling symlink,
+#      counts as present, so a broken emuwiz entry never silently switches
+#      the profile to the legacy one.
+# Explicit and XDG roots never fall back to the legacy directory. A set but
+# non-absolute override (the application refuses it too) leaves the config
+# location unresolved: the binaries are still installed, no starter config
+# is written, and the run exits non-zero with a clear message.
+config_root=""
+config_unresolved_reason=""
+if [ "${EMUWIZ_CONFIG_HOME+set}" = set ]; then
+    case "$EMUWIZ_CONFIG_HOME" in
+        /*) config_root="$EMUWIZ_CONFIG_HOME" ;;
+        *) config_unresolved_reason="EMUWIZ_CONFIG_HOME is not an absolute path" ;;
+    esac
+fi
+if [ "${XDG_CONFIG_HOME+set}" = set ]; then
+    case "$XDG_CONFIG_HOME" in
+        /*)
+            if [ "${EMUWIZ_CONFIG_HOME+set}" != set ]; then
+                config_root="$XDG_CONFIG_HOME/emuwiz"
+            fi
+            ;;
+        *) config_unresolved_reason="XDG_CONFIG_HOME is not an absolute path" ;;
+    esac
+fi
+if [ "${EMUWIZ_CONFIG_HOME+set}" != set ] && [ "${XDG_CONFIG_HOME+set}" != set ]; then
+    config_root="$HOME/.config/emuwiz"
+    if [ ! -e "$config_root" ] && [ ! -L "$config_root" ] \
+        && { [ -e "$HOME/.config/archivefs" ] || [ -L "$HOME/.config/archivefs" ]; }; then
+        config_root="$HOME/.config/archivefs"
+    fi
+fi
+if [ -n "$config_unresolved_reason" ]; then
+    config_root=""
 fi
 config_dir="$config_root"
 config_file="$config_dir/config.toml"
+if [ -z "$config_root" ]; then
+    config_dir="(unresolved configuration directory)"
+    config_file="(unresolved configuration directory)/config.toml"
+fi
+config_step_failed=0
 
 # --------------------------------------------------------------------------
 # OWNERSHIP MODEL
@@ -289,8 +335,13 @@ Without --uninstall, this script:
      EmuWiz-owned paths apart from unrelated ones with the same name -
      never by filename, timestamp or inode alone.
   5. Creates $config_dir if it does not exist.
-  6. Copies config.toml.example to $config_file, but only if that file
-     does not already exist. An existing config is never overwritten.
+  6. Publishes config.toml.example as $config_file with an atomic,
+     no-clobber link, only if nothing exists at that name (a dangling
+     symlink counts as existing). An existing config is never overwritten
+     or written through, even if it appears while the installer runs.
+     The directory follows the application: EMUWIZ_CONFIG_HOME, else
+     XDG_CONFIG_HOME/emuwiz, else ~/.config/emuwiz (or the legacy
+     ~/.config/archivefs when only that exists).
   7. If a new config was just written and this script is running
      interactively, optionally prompts for one archive source folder to
      add via 'emuwiz-cli source add'. Leave blank to skip - source
@@ -1358,6 +1409,334 @@ if [ "$do_uninstall" -eq 1 ]; then
     exit 0
 fi
 
+# publish_starter_config SRC DIR DEST - never writes through or replaces DEST.
+# Linux and Python are already required by safe asset publication. Create an
+# anonymous O_TMPFILE regular inode in a pinned configuration directory, write
+# only its descriptor, then publish with linkat(AT_SYMLINK_FOLLOW) through procfs.
+# The kernel creates this inode without a staging name: existing regular files,
+# FIFOs, sockets and symlinks cannot be opened as staging or block acquisition.
+# No pathname is ever unlinked, including on failure or interruption. Closing
+# our descriptor reclaims an unpublished inode, or leaves the published config
+# intact. This eliminates the former ownership-check-to-unlink race entirely;
+# it does not claim atomic ownership-checked pathname deletion.
+# No named-file fallback: missing O_TMPFILE/filesystem support, procfs or linkat
+# fails closed. The pinned directory may be renamed by another directory writer;
+# publication remains in that directory, not a substituted pathname. This is
+# not protection against another process modifying a successfully published file.
+# States: none -> attempted/unproven -> owned regular -> published -> closed.
+# Ownership is established by O_TMPFILE plus fstat, never an inherited descriptor.
+# An unproven descriptor is closed only; no filesystem name needs cleanup.
+#
+# SIGNALS AND TRUTHFUL REPORTING. The Python worker's handlers for SIGINT, SIGTERM
+# and SIGHUP only RECORD the signal; they never raise. An exception raised from a
+# handler can fire between linkat() and the bookkeeping that follows it, or inside
+# the descriptor cleanup, and then a file that WAS published is reported as a
+# failure ("nothing was changed"). Instead the worker checks for a recorded signal
+# only at checkpoints that precede linkat(), so every interruption is either
+# before publication (nothing was published) or after it (the config is complete).
+# Nothing is masked or blocked. The worker's exit status is the only channel back
+# here, so each value is exact:
+#     0 published                           2 destination exists (not touched)
+#     3 published, then a signal arrived    4 a signal arrived and publication
+#                                             could not be established
+#     5 unsupported environment (nothing    6 refused before publication
+#       attempted)                          130 signal before publication
+# Any other status (for example SIGKILL or an interpreter crash) proves nothing
+# about the filesystem; it is reported as unconfirmed, never as "nothing changed".
+# starter_config_changed: no (provably not published) | unknown (not provable).
+starter_config_result=""
+starter_config_changed=no
+publish_starter_config() {
+    psc_src=$1
+    psc_dir=$2
+    psc_dest=$3
+    starter_config_changed=no
+    # Reserve fd 6 before any traps or child creation; inherited fd 6 is never
+    # evidence of staging ownership. The Python worker owns its own descriptors.
+    exec 6>&-
+    psc_pid=""
+    psc_interrupted=no
+    if [ -L "$psc_dir" ] && [ ! -d "$psc_dir" ]; then
+        starter_config_result="configuration directory is a dangling symlink"
+        return 1
+    fi
+    # Any directory created here is private (0700) whatever the caller's umask:
+    # the mode is fixed at creation by umask 077 in a subshell, never by a later
+    # chmod, so there is no window and the caller's umask is not changed. An
+    # existing directory (and every existing parent) is left exactly as found;
+    # its ownership and permissions are judged on the pinned descriptor by the
+    # worker, which refuses an unsafe one rather than altering it.
+    if ! (umask 077 && mkdir -p -- "$psc_dir") 2>/dev/null; then
+        starter_config_result="cannot create the configuration directory"
+        return 1
+    fi
+    # A signal before pid assignment records interruption; immediately after
+    # assignment we stop the worker too. Always reap it before exiting.
+    trap 'psc_interrupted=yes; if [ -n "$psc_pid" ]; then kill -TERM "$psc_pid" 2>/dev/null || true; fi' INT TERM HUP
+    # ACQUIRE-WINDOW: no staging descriptor has been acquired.
+    if [ "$psc_interrupted" = yes ]; then
+        trap - INT TERM HUP
+        printf 'install.sh: installation interrupted before starter-config acquisition; no starter config was written; already installed assets remain.\n' >&2
+        exit 130
+    fi
+    python3 - "$psc_src" "$psc_dir" "$psc_dest" 6>&- <<'PSC_PY' &
+import errno
+import os
+import signal
+import stat
+import sys
+
+
+def unsupported(reason):
+    print("install.sh: cannot write the starter config: " + reason + ". Safe starter-config "
+          "publication needs Linux, Python 3 with os.O_TMPFILE and ctypes, a filesystem that "
+          "supports O_TMPFILE and hardlinks, and a mounted /proc. Nothing was attempted and no "
+          "named staging fallback is used.", file=sys.stderr)
+    sys.exit(5)
+
+
+# CAPABILITY-CHECK: refuse explicitly, before any directory or descriptor is touched.
+if not sys.platform.startswith("linux"):
+    unsupported("this platform is " + sys.platform + ", not Linux")
+for needed in ("O_TMPFILE", "O_DIRECTORY", "O_CLOEXEC"):
+    if not hasattr(os, needed):
+        unsupported("this Python has no os." + needed)
+try:
+    import ctypes
+    linkat = ctypes.CDLL(None, use_errno=True).linkat
+    linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                       ctypes.c_char_p, ctypes.c_int]
+    linkat.restype = ctypes.c_int
+except (ImportError, OSError, AttributeError) as error:
+    unsupported("ctypes or linkat() is unavailable (" + str(error) + ")")
+
+
+class Interrupted(Exception):
+    pass
+
+
+received = []
+
+
+def record_signal(signum, frame):
+    # Record only: see the SIGNALS note above publish_starter_config.
+    received.append(signum)
+
+
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, record_signal)
+
+
+def checkpoint():
+    # Only called before linkat(): a recorded signal then means "not published".
+    if received:
+        raise Interrupted()
+
+
+def explain(error):
+    code = getattr(error, "errno", None)
+    name = errno.errorcode.get(code, "") if code else ""
+    if code in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL) and state == "attempted/unproven":
+        why = ("the filesystem holding the configuration directory does not support "
+               "anonymous O_TMPFILE files (" + name + ")")
+    elif code in (errno.ENOENT, errno.ENOSYS, errno.EACCES, errno.EPERM, errno.EXDEV,
+                  errno.EMLINK) and state == "owned regular":
+        why = ("descriptor linking through /proc/self/fd is unavailable or not permitted "
+               "here: is /proc mounted, and does this filesystem allow hardlinks? (" + name + ")")
+    else:
+        why = str(error)
+    print("install.sh: starter-config publication refused (" + state + "): " + why +
+          ". No starter config was published.", file=sys.stderr)
+
+
+src, directory, destination = sys.argv[1:]
+state = "none"
+stage_fd = None
+directory_fd = None
+published = False
+rc = 6
+try:
+    if os.path.normpath(os.path.dirname(destination)) != os.path.normpath(directory):
+        raise ValueError("destination must be inside the configuration directory")
+    checkpoint()
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    state = "attempted/unproven"
+    # DIRECTORY-CHECK: judged on the pinned descriptor (fstat), so the answer is
+    # about the exact directory objects we will publish into, whatever its name
+    # resolves to later. Never chmod: an unsafe directory is refused as found.
+    dir_info = os.fstat(directory_fd)
+    if not stat.S_ISDIR(dir_info.st_mode):
+        raise ValueError("the configuration path is not a directory")
+    if dir_info.st_uid != os.geteuid():
+        raise ValueError("the configuration directory is owned by uid " + str(dir_info.st_uid) +
+                         ", not by the installing user (uid " + str(os.geteuid()) +
+                         "); its owner could replace config.toml. It was not changed. Use a "
+                         "directory you own, or set EMUWIZ_CONFIG_HOME")
+    if dir_info.st_mode & stat.S_IWOTH:
+        raise ValueError("the configuration directory is writable by every user (mode " +
+                         format(stat.S_IMODE(dir_info.st_mode), "04o") + "), so any user could "
+                         "replace or pre-create config.toml. It was not changed; run "
+                         "'chmod go-w' on it yourself, or set EMUWIZ_CONFIG_HOME to a private one")
+    if dir_info.st_mode & stat.S_IWGRP:
+        print("install.sh: warning: the configuration directory is group-writable (mode " +
+              format(stat.S_IMODE(dir_info.st_mode), "04o") + "); members of its group can "
+              "replace config.toml. It was left unchanged.", file=sys.stderr)
+    # ANONYMOUS-OPEN-WINDOW: O_TMPFILE has no pre-existing pathname to follow.
+    checkpoint()
+    stage_fd = os.open(".", os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600,
+                       dir_fd=directory_fd)
+    # ACQUIRED-WINDOW: even interruption before fstat only closes our new fd.
+    info = os.fstat(stage_fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 0:
+        raise ValueError("anonymous staging ownership could not be established")
+    state = "owned regular"
+    # STAGE-WINDOW: bounded descriptor-only content write.
+    checkpoint()
+    with open(src, "rb") as source:
+        while True:
+            checkpoint()
+            chunk = source.read(65536)
+            if not chunk:
+                break
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(stage_fd, remaining)
+                if written <= 0:
+                    raise OSError("short staging write")
+                remaining = remaining[written:]
+    os.fsync(stage_fd)
+    # PUBLISH-WINDOW: linkat is no-clobber, including dangling symlinks.
+    checkpoint()
+    while True:
+        failed = linkat(-100, os.fsencode("/proc/self/fd/" + str(stage_fd)),
+                        directory_fd, os.fsencode(os.path.basename(destination)), 0x400)
+        failure = ctypes.get_errno() if failed else 0
+        if not (failed and failure == errno.EINTR):
+            break
+    if failed:
+        if failure == errno.EEXIST:
+            rc = 2
+        else:
+            raise OSError(failure, "cannot publish anonymous starter config")
+    else:
+        published = True
+        state = "published"
+        # PUBLISHED-WINDOW: interruption leaves the complete published config.
+        rc = 3 if received else 0
+except Interrupted:
+    rc = 130
+except (OSError, ValueError, AttributeError) as error:
+    explain(error)
+    rc = 6
+finally:
+    # CLOSE-WINDOW: never unlink a path; only close descriptors we acquired.
+    # Ground truth for "was it published?" is the inode we proved anonymous: it
+    # has a name (st_nlink > 0) if and only if our linkat() succeeded.
+    # An unproven descriptor (state "attempted/unproven") is never consulted: it may be
+    # a foreign object that legitimately has a name.
+    if not published and state == "owned regular":
+        try:
+            published = os.fstat(stage_fd).st_nlink > 0
+        except OSError:
+            rc = 4
+    for fd in (stage_fd, directory_fd):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            # CLOSE-LOOP-WINDOW: a signal here changes nothing about the outcome.
+    state = "closed"
+if published:
+    rc = 3 if received else 0
+elif received and rc != 4:
+    rc = 130
+sys.exit(rc)
+PSC_PY
+    psc_pid=$!
+    if [ "$psc_interrupted" = yes ]; then kill -TERM "$psc_pid" 2>/dev/null || true; fi
+    psc_rc=0
+    wait "$psc_pid" || psc_rc=$?
+    if [ "$psc_interrupted" = yes ]; then
+        # The first wait may have been cut short to run the trap. Collect the
+        # worker's real status (127 means it was already reaped); never invent one.
+        psc_rc2=0
+        wait "$psc_pid" 2>/dev/null || psc_rc2=$?
+        if [ "$psc_rc2" -ne 127 ]; then psc_rc=$psc_rc2; fi
+    fi
+    trap - INT TERM HUP
+    psc_pid=""
+    # An interrupted outcome is reported in exactly one place. A signal that reached
+    # THIS shell still ends the installation whatever the worker reported; a signal
+    # that reached only the worker shows up as status 3, 4 or 130.
+    psc_outcome=""
+    case "$psc_rc" in
+        3) psc_outcome=published ;;
+        4) psc_outcome=uncertain ;;
+        130) psc_outcome=unpublished ;;
+        0) if [ "$psc_interrupted" = yes ]; then psc_outcome=published; fi ;;
+        2|5|6) if [ "$psc_interrupted" = yes ]; then psc_outcome=unpublished; fi ;;
+    esac
+    if [ -n "$psc_outcome" ]; then
+        case "$psc_outcome" in
+            published)
+                printf 'install.sh: installation interrupted; the starter config was published and is complete: %s; already installed assets remain and the remaining installation steps did not run.\n' "$psc_dest" >&2
+                ;;
+            uncertain)
+                printf 'install.sh: installation interrupted; it could not be established whether the starter config was published, so inspect %s before retrying; already installed assets remain.\n' "$psc_dest" >&2
+                ;;
+            *)
+                printf 'install.sh: installation interrupted before the starter config was published; nothing was written at %s; already installed assets remain.\n' "$psc_dest" >&2
+                ;;
+        esac
+        exit 130
+    fi
+    case "$psc_rc" in
+        0) starter_config_result=""; return 0 ;;
+        2) starter_config_result="exists"; return 1 ;;
+        5)
+            starter_config_result="unsupported environment, see the explanation above"
+            return 1
+            ;;
+        6)
+            starter_config_result="cannot publish the starter config safely, see the explanation above"
+            return 1
+            ;;
+        *)
+            # A status the worker never reports (SIGKILL, interpreter failure, stray
+            # signal). It proves nothing about the filesystem.
+            starter_config_changed=unknown
+            if [ -e "$psc_dest" ] || [ -L "$psc_dest" ]; then
+                starter_config_result="the starter-config worker ended unexpectedly (status $psc_rc) and a file is present at $psc_dest; it could not be established whether this installer published it"
+            else
+                starter_config_result="the starter-config worker ended unexpectedly (status $psc_rc); no file is present at $psc_dest"
+            fi
+            if [ "$psc_interrupted" = yes ]; then
+                printf 'install.sh: installation interrupted; %s; already installed assets remain.\n' "$starter_config_result" >&2
+                exit 130
+            fi
+            return 1
+            ;;
+    esac
+}
+
+# warn_exposed_existing_config - an existing configuration is never modified,
+# replaced, re-owned or re-permissioned. If the directory holding it, or the file
+# itself, is not owned by the installing user, or the directory is writable by every
+# user, say so (stderr only; the exit status does not change).
+warn_exposed_existing_config() {
+    if [ -d "$config_dir" ]; then
+        if [ ! -O "$config_dir" ]; then
+            printf '%s: warning: %s is not owned by you; its owner can replace your configuration. It was left unchanged.\n' "$program_name" "$config_dir" >&2
+        elif [ -n "$(find "$config_dir" -prune -perm -002 2>/dev/null)" ]; then
+            printf '%s: warning: %s is writable by every user, so any user can replace your configuration. It was left unchanged; consider "chmod go-w" on it.\n' "$program_name" "$config_dir" >&2
+        fi
+    fi
+    if [ -f "$config_file" ] && [ ! -L "$config_file" ] && [ ! -O "$config_file" ]; then
+        printf '%s: warning: %s is not owned by you. It was left unchanged; check it before relying on it.\n' "$program_name" "$config_file" >&2
+    fi
+}
+
 # Prefer an extracted release bundle (binaries in bin/); fall
 # back to a workspace checkout with release binaries already built. The new
 # EmuWiz names are preferred, with the legacy ArchiveFS names accepted so
@@ -1635,17 +2014,45 @@ if [ "$skipped_any" -eq 1 ]; then
     printf 'flag "--replace-foreign" to move them aside and install there anyway.\n' >&2
 fi
 
-mkdir -p -- "$config_dir"
 wrote_new_config=0
-if [ -e "$config_file" ]; then
+if [ -z "$config_root" ]; then
+    printf '%s: warning: %s; no starter config was written.\n' "$program_name" "$config_unresolved_reason" >&2
+    printf 'Set it to an absolute path (or unset it) and create your config yourself.\n' >&2
+    printf '%s: note: the binaries and desktop files were installed; only the starter config step was skipped.\n' "$program_name" >&2
+    config_step_failed=1
+elif [ -e "$config_file" ] || [ -L "$config_file" ]; then
+    # -L as well as -e: a dangling symlink is an occupied name, and writing
+    # through it would create a file at wherever it points.
     printf 'Existing config found at %s - leaving it untouched.\n' "$config_file"
+    warn_exposed_existing_config
 else
     src_config_example="$script_dir/config.toml.example"
     if [ -f "$src_config_example" ]; then
-        cp -- "$src_config_example" "$config_file"
-        wrote_new_config=1
-        printf 'Wrote a starter config to %s - edit mount_root before running doctor.\n' "$config_file"
-        printf 'No source folders are configured yet; that is fine to run with.\n'
+        if publish_starter_config "$src_config_example" "$config_dir" "$config_file"; then
+            wrote_new_config=1
+            printf 'Wrote a starter config to %s - edit mount_root before running doctor.\n' "$config_file"
+            printf 'No source folders are configured yet; that is fine to run with.\n'
+        else
+            case "$starter_config_result" in
+                exists)
+                    printf 'Existing config found at %s - leaving it untouched.\n' "$config_file"
+                    warn_exposed_existing_config
+                    ;;
+                *)
+                    if [ "$starter_config_changed" = no ]; then
+                        printf '%s: warning: could not write a starter config to %s (%s); nothing was changed there.\n' \
+                            "$program_name" "$config_file" "$starter_config_result" >&2
+                    else
+                        # Not provable either way: never claim that nothing changed.
+                        printf '%s: warning: the starter config step for %s did not finish cleanly (%s). Inspect that path before retrying.\n' \
+                            "$program_name" "$config_file" "$starter_config_result" >&2
+                    fi
+                    printf '%s: note: the binaries, launchers and assets were already installed and remain in place; only the starter config step failed. To create the config yourself, copy config.toml.example to %s.\n' \
+                        "$program_name" "$config_file" >&2
+                    config_step_failed=1
+                    ;;
+            esac
+        fi
     else
         printf '%s: warning: config.toml.example not found next to this script; no starter config was written.\n' "$program_name" >&2
         printf 'Create %s yourself before running emuwiz-cli.\n' "$config_file" >&2
@@ -1724,6 +2131,6 @@ if [ "$bin_dir" != "$default_bin_dir" ]; then
 fi
 printf '\n'
 
-if [ "$skipped_any" -eq 1 ]; then
+if [ "$skipped_any" -eq 1 ] || [ "$config_step_failed" -eq 1 ]; then
     exit 1
 fi

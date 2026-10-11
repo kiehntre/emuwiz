@@ -108,6 +108,75 @@ Before publication:
 7. record `SKIPPED: <reason>` when GUI smoke cannot run;
 8. confirm no source-tree-only path or network dependency is required.
 
+The installer resolves the starter-config directory exactly as the
+application does: `EMUWIZ_CONFIG_HOME` (the directory itself), else
+`XDG_CONFIG_HOME/emuwiz`, else `~/.config/emuwiz` (or legacy
+`~/.config/archivefs` when only that exists). A set but non-absolute override
+is refused by both: the installer then installs binaries, writes no config and
+exits non-zero. The starter config is created with a no-clobber link and never
+replaces or writes through an existing file or dangling symlink.
+
+### Installer requirements and failure behaviour
+
+`install.sh` is Linux-only. Publishing the release assets needs Python 3,
+procfs, `O_PATH` (Linux 2.6.39+) and descriptor-relative hardlink support on
+the install filesystem. Writing the **starter config** additionally needs:
+
+- Python 3 with `os.O_TMPFILE`, `os.O_DIRECTORY`, `os.O_CLOEXEC` and `ctypes`
+  (for `linkat`). A Python without `os.O_TMPFILE` (non-Linux builds, very old
+  versions) is detected up front and refused by name.
+- A configuration-directory filesystem that supports `O_TMPFILE` anonymous
+  files and hardlinks. Some network and FUSE filesystems do not; the kernel then
+  reports `EOPNOTSUPP`, `EISDIR` or `EINVAL`.
+- A mounted `/proc`: the anonymous file is published with
+  `linkat(AT_SYMLINK_FOLLOW)` through `/proc/self/fd/N`.
+
+Publication is atomic and no-clobber: the kernel refuses the link when the name
+exists (a dangling symlink included), so a racing writer's file is never
+replaced. There is no staging pathname and nothing is ever unlinked, and there
+is no fallback to a named temporary file, to overwriting, or to elevated
+privileges.
+
+If the environment is unsupported, or the step fails before publication, the
+starter-config step is refused with an explicit message (never a Python
+traceback), `install.sh` exits 1, and everything already installed - binaries,
+launchers, icons and the ownership manifest - remains in place. Create the
+config yourself by copying `config.toml.example`. If the installer is signalled
+(SIGINT, SIGTERM or SIGHUP) it exits 130 and states whether the starter config
+was published (and is complete), was not published, or could not be
+established; it never reports that nothing changed when the file was published.
+
+**Permissions.** A newly written starter config is mode `0600` (owner
+read/write only). It is created with that mode by `O_TMPFILE`, and the result is
+the same under `umask 000`, `002`, `022`, `027` and `077`. Earlier installers
+produced the umask-dependent default, typically `0644`. An existing config is
+never modified, replaced or re-permissioned. (A umask that removes the owner's
+own write or search bit, such as `0277`, breaks directory creation for the whole
+installer, not only the config.)
+
+**Configuration directory.** Any configuration directory the installer has to
+create (and any missing parent) is created mode `0700` at creation, under
+whatever umask the caller has: the creation runs under `umask 077` in a
+subshell, so there is no later `chmod` and no window. This matters because the
+file's `0600` does not protect it against a directory that other users can write
+to: they could delete and replace `config.toml`, or plant one first. An
+**existing** directory is never chmod-ed, re-owned or moved. Before publishing,
+the installer judges the directory on the pinned descriptor it publishes into
+(so symlinked paths are judged on their real target) and:
+
+- refuses, changing nothing and exiting non-zero with the assets left in place, a
+  directory not owned by the installing user or writable by every user (any
+  `o+w`, sticky or not, because sticky does not stop a pre-created file);
+- continues with a warning for a group-writable directory (for example `0775`,
+  common under `umask 002`), since a private per-user group cannot be told from a
+  shared one here. Members of that group can replace `config.toml`; tighten it
+  yourself if the group is shared.
+
+If a config already exists the installer leaves it untouched and, on stderr
+only, warns when its directory is writable by every user or not owned by you, or
+the file is not owned by you.
+
+
 Release-candidate checks are orchestrated by
 `scripts/release/run-rc-acceptance.py`. The release gate does not silently
 turn unavailable GUI smoke into a pass.

@@ -510,6 +510,880 @@ kept=$(cat "$home/.config/emuwiz/config.toml")
 assert_contains "existing config content is preserved" "$kept" "$marker"
 rm -rf -- "$work"
 
+echo "=== test: starter config is no-clobber (dangling symlink, custom roots, races) ==="
+# Fresh scratch HOME per case; install.sh never sees the real one.
+cfg_case() {
+    cfg_work=$(mktemp -d)
+    make_bundle "$cfg_work/bundle"
+    cfg_home="$cfg_work/home"
+    mkdir -p -- "$cfg_home"
+    cfg_bin="$cfg_work/bin"
+}
+
+# Dangling config.toml symlink: left alone, nothing created at its target.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz"
+ln -s -- "$cfg_work/elsewhere/config.toml" "$cfg_home/.config/emuwiz/config.toml"
+assert_success "dangling config.toml symlink: install succeeds" \
+    env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin"
+assert_no_such_path "dangling symlink target was not created" "$cfg_work/elsewhere"
+if [ -L "$cfg_home/.config/emuwiz/config.toml" ] \
+    && [ "$(readlink "$cfg_home/.config/emuwiz/config.toml")" = "$cfg_work/elsewhere/config.toml" ]; then
+    ok "dangling symlink itself is untouched"
+else
+    bad "dangling symlink itself is untouched"
+fi
+rm -rf -- "$cfg_work"
+
+# Existing config with an unusual byte pattern is preserved byte for byte.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz"
+printf 'keep\0me\n\377' >"$cfg_home/.config/emuwiz/config.toml"
+cp -- "$cfg_home/.config/emuwiz/config.toml" "$cfg_work/before"
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+assert_files_equal "existing config bytes preserved" "$cfg_work/before" "$cfg_home/.config/emuwiz/config.toml"
+# --replace-foreign concerns installed assets only; it never authorises
+# replacing a user's configuration, including a dangling symlink.
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" --replace-foreign >/dev/null 2>&1 || true
+assert_files_equal "--replace-foreign preserves existing config bytes" "$cfg_work/before" "$cfg_home/.config/emuwiz/config.toml"
+if ls -A "$cfg_home/.config/emuwiz" | grep -q 'stage'; then
+    bad "no staging file is left behind"
+else
+    ok "no staging file is left behind"
+fi
+rm -rf -- "$cfg_work"
+
+# Destination appears between the existence check and publication: the
+# publisher must lose the race without writing through or replacing it.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz"
+cfg_probe="$cfg_work/probe.sh"
+{
+    # Source only the helper, then pre-create the destination as the racing
+    # writer would after the installer's own existence check.
+    sed -n '/^starter_config_result=""$/,/^}$/p' "$install_sh"
+    printf 'dest=%s\n' "'$cfg_home/.config/emuwiz/config.toml'"
+    printf 'printf "RACER\\n" >"$dest"\n'
+    printf 'publish_starter_config %s %s "$dest"; printf "%%s\\n" "$starter_config_result"\n' \
+        "'$config_example'" "'$cfg_home/.config/emuwiz'"
+} >"$cfg_probe"
+race_out=$(sh "$cfg_probe" 2>&1) || true
+assert_contains "race: publisher reports the destination exists" "$race_out" "exists"
+assert_contains "race: racing writer's bytes are intact" "$(cat "$cfg_home/.config/emuwiz/config.toml")" "RACER"
+rm -rf -- "$cfg_work"
+
+# Same race, destination is a dangling symlink created by the racer.
+cfg_case
+mkdir -p -- "$cfg_home/.config/emuwiz"
+ln -s -- "$cfg_work/nowhere" "$cfg_home/.config/emuwiz/config.toml"
+{
+    sed -n '/^starter_config_result=""$/,/^}$/p' "$install_sh"
+    printf 'publish_starter_config %s %s %s; printf "%%s\\n" "$starter_config_result"\n' \
+        "'$config_example'" "'$cfg_home/.config/emuwiz'" "'$cfg_home/.config/emuwiz/config.toml'"
+} >"$cfg_work/probe.sh"
+race_out=$(sh "$cfg_work/probe.sh" 2>&1) || true
+assert_contains "dangling symlink at publication: reported as existing" "$race_out" "exists"
+assert_no_such_path "dangling symlink at publication: nothing written through it" "$cfg_work/nowhere"
+rm -rf -- "$cfg_work"
+
+# Anonymous staging regressions. Instrument private helper copies only: there
+# are no production environment hooks. Assert inode/type/content preservation,
+# not merely successful exit. Replaces named-stage seams with the corresponding
+# acquisition/write/publication/signal seams of the anonymous implementation.
+if python3 -B - "$install_sh" "$config_example" <<'STAGING_TESTS'
+import errno
+import os
+from pathlib import Path
+import shlex
+import signal
+import shutil
+import socket
+import stat
+import subprocess
+import tempfile
+import unittest
+
+installer = Path(os.sys.argv[1]).read_text()
+example = Path(os.sys.argv[2])
+helper = 'starter_config_result=""\n' + installer.split('starter_config_result=""\n', 1)[1].split('\n}\n', 1)[0] + '\n}\n'
+
+class AnonymousStagingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="emuwiz-anonymous-stage-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.directory = self.root / "config"
+        self.directory.mkdir()
+        self.destination = self.directory / "config.toml"
+        self.foreign = self.root / "foreign"
+        self.foreign.write_bytes(b"FOREIGN\x00\xff\n")
+        self.original = self.identity(self.foreign)
+
+    def identity(self, path):
+        info = path.lstat()
+        value = os.readlink(path) if stat.S_ISLNK(info.st_mode) else path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+        return (info.st_dev, info.st_ino, info.st_mode, value)
+
+    def run_helper(self, marker=None, mutation=None, shell="dash", inherited=False, shell_mutation=None, text=None, umask=None):
+        content = helper if text is None else text
+        if marker:
+            self.assertEqual(content.count(marker), 1)
+            content = content.replace(marker, marker + "\n" + mutation)
+        if shell_mutation:
+            marker = "    # ACQUIRE-WINDOW: no staging descriptor has been acquired."
+            self.assertEqual(content.count(marker), 1)
+            content = content.replace(marker, marker + "\n" + shell_mutation)
+        script = self.root / "probe.sh"
+        script.write_text(content + '\npublish_starter_config ' + ' '.join(shlex.quote(str(p)) for p in (example, self.directory, self.destination)) + '\nrc=$?\nif (: >&6) 2>/dev/null; then printf "FD6-OPEN\\n"; else printf "FD6-CLOSED\\n"; fi\nprintf "result=%s\\n" "$starter_config_result"\nexit "$rc"\n')
+        command = [shell, str(script)]
+        if inherited:
+            command = [shell, "-c", 'exec 6<"$1"; exec "$2" "$3"', "probe", str(self.foreign), shell, str(script)]
+        return subprocess.run(command, capture_output=True, text=True, timeout=10,
+                              preexec_fn=(lambda: os.umask(umask)) if umask is not None else None)
+
+    def no_stage(self):
+        self.assertEqual(list(self.directory.glob(".config.toml.stage.*")), [])
+
+    def unchanged(self):
+        self.assertEqual(self.identity(self.foreign), self.original)
+
+    def test_inherited_fd6_never_establishes_ownership(self):
+        result = self.run_helper(inherited=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FD6-CLOSED", result.stdout)
+        self.unchanged()
+        self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+        self.no_stage()
+
+    def test_inherited_fd6_signal_before_acquisition(self):
+        for sig in ("INT", "TERM", "HUP"):
+            with self.subTest(signal=sig):
+                path = self.directory / "foreign-stage"
+                result = self.run_helper(inherited=True, shell_mutation='    mv -- ' + shlex.quote(str(self.foreign)) + ' ' + shlex.quote(str(path)) + '\n    kill -' + sig + ' "$$"')
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertEqual(self.identity(path), self.original)
+                self.assertFalse(self.destination.exists())
+                path.rename(self.foreign)
+
+    def test_signals_at_every_ownership_transition(self):
+        for marker in ("    # ANONYMOUS-OPEN-WINDOW:", "    # ACQUIRED-WINDOW:", "    # STAGE-WINDOW:", "    # PUBLISH-WINDOW:", "        # PUBLISHED-WINDOW:"):
+            # Use the whole unique source line as marker.
+            line = next(line for line in helper.splitlines() if line.startswith(marker))
+            for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
+                with self.subTest(marker=marker, signal=sig):
+                    mutation = ("        " if "PUBLISHED" in marker else "    ") + 'os.kill(os.getpid(), signal.' + sig + ')'
+                    result = self.run_helper(line, mutation, inherited=True)
+                    self.assertEqual(result.returncode, 130, result.stderr)
+                    self.assertIn("installation interrupted", result.stderr)
+                    self.assertIn("published and is complete" if "PUBLISHED" in marker else "nothing was written", result.stderr)
+                    self.assertNotIn("nothing was changed", result.stderr)
+                    self.unchanged()
+                    if "PUBLISHED" in marker:
+                        self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+                        self.destination.unlink()
+                    else:
+                        self.assertFalse(self.destination.exists())
+                    self.no_stage()
+
+    def test_foreign_objects_never_opened_or_cleaned(self):
+        for kind in ("fifo", "socket", "regular", "symlink"):
+            with self.subTest(kind=kind):
+                stage = self.directory / ".config.toml.stage.foreign"
+                sock = None
+                if kind == "fifo": os.mkfifo(stage)
+                elif kind == "socket":
+                    sock = socket.socket(socket.AF_UNIX)
+                    # sockaddr_un has a small pathname bound; use a relative
+                    # fixture name so a deliberately long TMPDIR is supported.
+                    previous_directory = os.getcwd()
+                    try:
+                        os.chdir(self.directory)
+                        sock.bind(stage.name)
+                    finally:
+                        os.chdir(previous_directory)
+                elif kind == "regular": stage.write_bytes(b"FOREIGN-STAGE\x00\xff")
+                else: stage.symlink_to(self.foreign)
+                before = self.identity(stage)
+                try:
+                    result = self.run_helper(inherited=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.identity(stage), before)
+                    self.unchanged()
+                    self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+                    self.destination.unlink()
+                finally:
+                    if sock: sock.close()
+                    stage.unlink()
+
+    def test_fifo_never_blocks_acquisition(self):
+        # No reader holds the FIFO open. A named redirection would hang, so
+        # run_helper's ten-second timeout is an independent blocking assertion.
+        stage = self.directory / ".config.toml.stage.fifo"
+        os.mkfifo(stage)
+        before = self.identity(stage)
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.identity(stage), before)
+
+    def test_substitutions_across_failure_and_success_paths(self):
+        markers = {"acquisition": "    # ACQUIRED-WINDOW:", "write": "    # STAGE-WINDOW:", "publication": "    # PUBLISH-WINDOW:", "success": "        # PUBLISHED-WINDOW:", "signal": "    # STAGE-WINDOW:"}
+        for action, prefix in markers.items():
+            for kind in ("regular", "symlink"):
+                with self.subTest(action=action, kind=kind):
+                    stage = self.directory / ".config.toml.stage.substituted"
+                    line = next(line for line in helper.splitlines() if line.startswith(prefix))
+                    indent = "        " if action == "success" else "    "
+                    mutation = indent + ('Path(' + repr(str(stage)) + ').write_bytes(b"FOREIGN-SUBSTITUTION")' if kind == "regular" else 'os.symlink(' + repr(str(self.foreign)) + ', ' + repr(str(stage)) + ')')
+                    mutation = indent + "from pathlib import Path\n" + mutation + '\n' + indent + 'before = os.lstat(' + repr(str(stage)) + ')\n'
+                    mutation += indent + 'assert before.st_ino > 0\n' + indent + 'with open(' + repr(str(self.root / "identity")) + ', "w") as record: record.write(str(before.st_ino))'
+                    if action in ("acquisition", "write", "publication"):
+                        mutation += '\n' + indent + 'raise OSError("synthetic failure")'
+                    elif action == "signal":
+                        mutation += '\n' + indent + 'os.kill(os.getpid(), signal.SIGTERM)'
+                    result = self.run_helper(line, mutation)
+                    self.assertEqual(stage.lstat().st_ino, int((self.root / "identity").read_text()))
+                    self.assertEqual(stage.read_bytes(), b"FOREIGN-SUBSTITUTION" if kind == "regular" else self.original[3])
+                    if kind == "symlink": self.assertEqual(os.readlink(stage), str(self.foreign))
+                    self.unchanged()
+                    self.assertEqual(result.returncode, 0 if action == "success" else 130 if action == "signal" else 1, result.stderr)
+                    if action == "success":
+                        self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+                        self.destination.unlink()
+                    else: self.assertFalse(self.destination.exists())
+                    stage.unlink()
+
+    def test_no_unlink_even_if_cleanup_metadata_unavailable(self):
+        marker = next(line for line in helper.splitlines() if line.startswith("    # CLOSE-WINDOW:"))
+        result = self.run_helper(marker, '    assert "unlink" not in globals()')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.no_stage()
+
+    def test_unproven_descriptor_only_closed(self):
+        # A negative control for an unexpected acquisition backend result.
+        line = next(line for line in helper.splitlines() if line.startswith("    # ACQUIRED-WINDOW:"))
+        result = self.run_helper(line, '    os.close(stage_fd)\n    stage_fd = os.open(' + repr(str(self.foreign)) + ', os.O_RDONLY)')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ownership could not be established", result.stderr)
+        self.unchanged()
+        self.assertFalse(self.destination.exists())
+
+    def test_anonymous_file_is_owned_regular_and_has_no_name(self):
+        line = next(line for line in helper.splitlines() if line.startswith("    # STAGE-WINDOW:"))
+        result = self.run_helper(line, '    assert state == "owned regular"\n    assert stat.S_ISREG(os.fstat(stage_fd).st_mode)\n    assert os.fstat(stage_fd).st_nlink == 0\n    assert os.fstat(stage_fd).st_mode & 0o777 == 0o600\n    assert os.listdir(directory) == []')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.no_stage()
+
+    def test_missing_source_closes_owned_stage(self):
+        text = helper.replace('with open(src, "rb") as source:', 'with open(src + ".missing", "rb") as source:')
+        result = self.run_helper(text=text)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(self.destination.exists())
+        self.no_stage()
+
+    def test_unsupported_anonymous_creation_fails_closed(self):
+        line = next(line for line in helper.splitlines() if line.startswith("    # ANONYMOUS-OPEN-WINDOW:"))
+        result = self.run_helper(line, '    raise OSError(errno.EOPNOTSUPP, "synthetic unsupported filesystem")')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(self.destination.exists())
+        self.no_stage()
+        self.unchanged()
+
+    def test_unavailable_linkat_fails_closed(self):
+        line = next(line for line in helper.splitlines() if line.startswith("    # PUBLISH-WINDOW:"))
+        result = self.run_helper(line, '    raise OSError(errno.ENOENT, "synthetic procfs unavailable")')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(self.destination.exists())
+        self.no_stage()
+
+    def test_existing_configuration_objects_preserved(self):
+        for kind in ("regular", "symlink", "fifo", "directory"):
+            with self.subTest(kind=kind):
+                if kind == "regular": self.destination.write_bytes(b"USER CONFIG\x00\xff")
+                elif kind == "symlink": self.destination.symlink_to(self.root / "missing")
+                elif kind == "fifo": os.mkfifo(self.destination)
+                else: self.destination.mkdir()
+                before = self.identity(self.destination)
+                result = self.run_helper()
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("result=exists", result.stdout)
+                self.assertEqual(self.identity(self.destination), before)
+                if kind == "directory": self.destination.rmdir()
+                else: self.destination.unlink()
+                self.no_stage()
+
+    def test_late_destination_creation_no_clobber(self):
+        line = next(line for line in helper.splitlines() if line.startswith("    # PUBLISH-WINDOW:"))
+        result = self.run_helper(line, '    with open(destination, "wb") as racer: racer.write(b"RACER\\x00\\xff")\n    with open(' + repr(str(self.root / "inode")) + ', "w") as record: record.write(str(os.stat(destination).st_ino))')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("result=exists", result.stdout)
+        self.assertEqual(self.destination.read_bytes(), b"RACER\x00\xff")
+        self.assertEqual(self.destination.stat().st_ino, int((self.root / "inode").read_text()))
+        self.no_stage()
+
+    def test_dash_sh_and_bash_wrappers(self):
+        for shell in ("dash", "sh", "bash"):
+            with self.subTest(shell=shell):
+                result = self.run_helper(shell=shell)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+                self.destination.unlink()
+                self.no_stage()
+
+    def test_parent_interruption_reaps_worker(self):
+        for prefix in ("    # ACQUIRED-WINDOW:", "        # PUBLISHED-WINDOW:"):
+            line = next(line for line in helper.splitlines() if line.startswith(prefix))
+            indent = "        " if "PUBLISHED" in prefix else "    "
+            record = self.root / "worker-pid"
+            mutation = indent + 'with open(' + repr(str(record)) + ', "w") as output: output.write(str(os.getpid()))\n'
+            mutation += indent + 'os.kill(os.getppid(), signal.SIGTERM)\n'
+            mutation += indent + 'import time; time.sleep(1)'
+            result = self.run_helper(line, mutation)
+            self.assertEqual(result.returncode, 130, result.stderr)
+            self.assertIn("installation interrupted", result.stderr)
+            self.assertIn("published and is complete" if "PUBLISHED" in prefix else "nothing was written", result.stderr)
+            pid = int(record.read_text())
+            with self.assertRaises(ProcessLookupError): os.kill(pid, 0)
+            self.unchanged()
+            if "PUBLISHED" in prefix:
+                self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+                self.destination.unlink()
+            else: self.assertFalse(self.destination.exists())
+            self.no_stage()
+
+    def test_full_install_interruption_and_partial_reporting(self):
+        for published in (False, True):
+            with self.subTest(published=published):
+                bundle = self.root / ("published-bundle" if published else "unpublished-bundle")
+                bundle.mkdir()
+                shutil.copytree(Path(os.sys.argv[1]).resolve().parent / "assets", bundle / "assets")
+                shutil.copyfile(example, bundle / "config.toml.example")
+                (bundle / "bin").mkdir()
+                for name in ("emuwiz", "emuwiz-cli"):
+                    (bundle / "bin" / name).write_text("#!/bin/sh\nexit 0\n")
+                prefix = "        # PUBLISHED-WINDOW:" if published else "    # STAGE-WINDOW:"
+                line = next(line for line in helper.splitlines() if line.startswith(prefix))
+                indent = "        " if published else "    "
+                script = installer.replace(line, line + "\n" + indent + "os.kill(os.getpid(), signal.SIGTERM)")
+                (bundle / "install.sh").write_text(script)
+                home = bundle / "home"
+                home.mkdir()
+                env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+                           XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
+                           XDG_STATE_HOME=str(home / "state"), EMUWIZ_CONFIG_HOME=str(home / "config/emuwiz"))
+                result = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed")],
+                                        env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertIn("installation interrupted", result.stderr)
+                self.assertIn("already installed assets remain", result.stderr)
+                self.assertIn("published and is complete" if published else "nothing was written", result.stderr)
+                self.assertIn("Installed emuwiz-cli and emuwiz", result.stdout)
+                self.assertNotIn("Next steps:", result.stdout)
+                self.assertTrue((home / "data/emuwiz-installer/manifest").is_file())
+                self.assertTrue((bundle / "installed/emuwiz-cli").is_file())
+                config = home / "config/emuwiz/config.toml"
+                if published: self.assertEqual(config.read_bytes(), example.read_bytes())
+                else: self.assertFalse(config.exists())
+                self.assertEqual(list(config.parent.glob(".config.toml.stage.*")), [])
+
+    # ---- post-publication signals, truthful reporting, supported environments, permissions ----
+
+    def install_bundle(self, script, shell="dash", name="bundle", umask=None, config_bytes=None, config_mode=None):
+        """A complete disposable install of a (possibly mutated) installer copy; returns (result, home, bundle)."""
+        bundle = self.root / name
+        bundle.mkdir()
+        shutil.copytree(Path(os.sys.argv[1]).resolve().parent / "assets", bundle / "assets")
+        shutil.copyfile(example, bundle / "config.toml.example")
+        (bundle / "bin").mkdir()
+        for tool in ("emuwiz", "emuwiz-cli"):
+            (bundle / "bin" / tool).write_text("#!/bin/sh\nexit 0\n")
+        (bundle / "install.sh").write_text(script)
+        home = bundle / "home"
+        home.mkdir()
+        if config_bytes is not None:
+            (home / "config/emuwiz").mkdir(parents=True)
+            (home / "config/emuwiz/config.toml").write_bytes(config_bytes)
+            (home / "config/emuwiz/config.toml").chmod(config_mode)
+        env = dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+                   XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
+                   XDG_STATE_HOME=str(home / "state"), EMUWIZ_CONFIG_HOME=str(home / "config/emuwiz"))
+        result = subprocess.run([shell, str(bundle / "install.sh"), "--prefix", str(bundle / "installed")],
+                                env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60,
+                                preexec_fn=(lambda: os.umask(umask)) if umask is not None else None)
+        return result, home, bundle
+
+    def mutated_installer(self, prefix, mutation):
+        """The real installer with `mutation` inserted after the first worker line starting with `prefix`."""
+        start = installer.index("<<'PSC_PY' &\n") + len("<<'PSC_PY' &\n")
+        end = installer.index("\nPSC_PY\n", start)
+        line = next(l for l in installer[start:end].splitlines() if l.startswith(prefix))
+        position = installer.index(line, start)
+        self.assertLess(position, end)
+        return installer[:position] + line + "\n" + mutation + installer[position + len(line):]
+
+    def assert_published_and_complete(self, inode_record=None):
+        """Bytes, inode identity, link count and mode of the published config; no staging leftovers."""
+        info = self.destination.lstat()
+        self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+        self.assertEqual(info.st_nlink, 1)
+        if inode_record is not None:
+            self.assertEqual(inode_record.read_text(), "%d %d" % (info.st_dev, info.st_ino))
+        self.no_stage()
+
+    def test_signal_after_publication_is_reported_as_published(self):
+        # A signal that lands right after linkat() (and, below, inside the descriptor cleanup)
+        # must never be reported as a failure or as "nothing changed".
+        windows = {"after publication": ("        # PUBLISHED-WINDOW:", "        "),
+                   "start of cleanup": ("    # CLOSE-WINDOW:", "    "),
+                   "during descriptor cleanup": ("            # CLOSE-LOOP-WINDOW:", "            ")}
+        published_line = next(l for l in helper.splitlines() if l.startswith("        # PUBLISHED-WINDOW:"))
+        for label, (marker, indent) in windows.items():
+            line = next(l for l in helper.splitlines() if l.startswith(marker))
+            for shell in ("dash", "bash"):
+                for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
+                    with self.subTest(window=label, shell=shell, signal=sig):
+                        record = self.root / "inode"
+                        pidfile = self.root / "worker-pid"
+                        # Record the staged inode's identity and the worker pid while its descriptor is still open.
+                        text = helper.replace(published_line, published_line + "\n" +
+                                              '        st = os.fstat(stage_fd)\n' +
+                                              '        with open(' + repr(str(record)) + ', "w") as out: out.write("%d %d" % (st.st_dev, st.st_ino))\n' +
+                                              '        with open(' + repr(str(pidfile)) + ', "w") as out: out.write(str(os.getpid()))', 1)
+                        text = text.replace(line, line + "\n" + indent + 'os.kill(os.getpid(), signal.' + sig + ')', 1)
+                        result = self.run_helper(text=text, shell=shell)
+                        self.assertEqual(result.returncode, 130, result.stderr)
+                        self.assertIn("installation interrupted", result.stderr)
+                        self.assertIn("published and is complete", result.stderr)
+                        for wrong in ("Traceback", "nothing was changed", "if published", "nothing was written"):
+                            self.assertNotIn(wrong, result.stderr)
+                        self.assert_published_and_complete(record)
+                        with self.assertRaises(ProcessLookupError):  # the worker was reaped, not left behind
+                            os.kill(int(pidfile.read_text()), 0)
+                        self.unchanged()
+                        self.destination.unlink()
+
+    def test_signal_in_cleanup_full_install_reports_published(self):
+        for label, marker, indent in (("after publication", "        # PUBLISHED-WINDOW:", "        "),
+                                      ("start of cleanup", "    # CLOSE-WINDOW:", "    "),
+                                      ("during descriptor cleanup", "            # CLOSE-LOOP-WINDOW:", "            ")):
+            for shell in ("dash", "bash"):
+                with self.subTest(window=label, shell=shell):
+                    script = self.mutated_installer(marker, indent + "os.kill(os.getpid(), signal.SIGTERM)")
+                    result, home, bundle = self.install_bundle(script, shell, name="cleanup-" + shell + "-" + str(len(label)))
+                    self.assertEqual(result.returncode, 130, result.stderr)
+                    self.assertIn("published and is complete", result.stderr)
+                    self.assertIn("already installed assets remain", result.stderr)
+                    for wrong in ("Traceback", "nothing was changed", "could not write a starter config"):
+                        self.assertNotIn(wrong, result.stderr)
+                    self.assertIn("Installed emuwiz-cli and emuwiz", result.stdout)
+                    self.assertNotIn("Next steps:", result.stdout)
+                    config = home / "config/emuwiz/config.toml"
+                    self.assertEqual(config.read_bytes(), example.read_bytes())
+                    self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+                    self.assertTrue((bundle / "installed/emuwiz-cli").is_file())
+                    self.assertTrue((home / "data/emuwiz-installer/manifest").is_file())
+                    self.assertEqual(list(config.parent.glob(".config.toml.stage.*")), [])
+
+    def test_signal_to_the_shell_after_publication_is_reported_as_published(self):
+        # The installer itself (not just the worker) is signalled once the config is published.
+        line = next(l for l in helper.splitlines() if l.startswith("        # PUBLISHED-WINDOW:"))
+        record = self.root / "worker-pid"
+        mutation = ('        with open(' + repr(str(record)) + ', "w") as out: out.write(str(os.getpid()))\n' +
+                    '        os.kill(os.getppid(), signal.SIGTERM)\n        import time; time.sleep(1)')
+        for shell in ("dash", "bash"):
+            with self.subTest(shell=shell):
+                result = self.run_helper(line, mutation, shell=shell)
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertIn("published and is complete", result.stderr)
+                self.assertNotIn("nothing was changed", result.stderr)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(record.read_text()), 0)
+                self.assert_published_and_complete()
+                self.destination.unlink()
+
+    def test_interruption_before_publication_says_nothing_was_written(self):
+        for marker in ("    # ANONYMOUS-OPEN-WINDOW:", "    # ACQUIRED-WINDOW:", "    # STAGE-WINDOW:", "    # PUBLISH-WINDOW:"):
+            line = next(l for l in helper.splitlines() if l.startswith(marker))
+            for shell in ("dash", "bash"):
+                with self.subTest(marker=marker, shell=shell):
+                    result = self.run_helper(line, "    os.kill(os.getpid(), signal.SIGTERM)", shell=shell)
+                    self.assertEqual(result.returncode, 130, result.stderr)
+                    self.assertIn("before the starter config was published", result.stderr)
+                    self.assertIn("nothing was written", result.stderr)
+                    self.assertNotIn("published and is complete", result.stderr)
+                    self.assertFalse(self.destination.exists())
+                    self.no_stage()
+
+    def test_worker_killed_is_unconfirmed_never_nothing_changed(self):
+        # SIGKILL proves nothing about the filesystem, so the installer must say so.
+        for label, marker, indent, published in (("after publication", "        # PUBLISHED-WINDOW:", "        ", True),
+                                                 ("before publication", "    # STAGE-WINDOW:", "    ", False)):
+            for shell in ("dash", "bash"):
+                with self.subTest(window=label, shell=shell):
+                    script = self.mutated_installer(marker, indent + "os.kill(os.getpid(), signal.SIGKILL)")
+                    result, home, bundle = self.install_bundle(script, shell, name="killed-" + shell + str(published))
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("ended unexpectedly", result.stderr)
+                    self.assertIn("Inspect that path before retrying", result.stderr)
+                    self.assertNotIn("nothing was changed", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertIn("remain in place", result.stderr)
+                    self.assertTrue((bundle / "installed/emuwiz-cli").is_file())
+                    self.assertEqual((home / "config/emuwiz/config.toml").exists(), published)
+
+    def test_unsupported_environments_refuse_explicitly_without_traceback(self):
+        cases = {
+            "python without os.O_TMPFILE": ("del os.O_TMPFILE", "this Python has no os.O_TMPFILE"),
+            "non-Linux platform": ('sys.platform = "darwin"', "not Linux"),
+            "ctypes unavailable": ('sys.modules["ctypes"] = None', "ctypes or linkat() is unavailable"),
+            "linkat unavailable": ("import ctypes; ctypes.CDLL = lambda *a, **k: object()", "ctypes or linkat() is unavailable"),
+        }
+        line = next(l for l in helper.splitlines() if l.startswith("# CAPABILITY-CHECK:"))
+        for label, (mutation, expected) in cases.items():
+            for shell in ("dash", "bash"):
+                with self.subTest(case=label, shell=shell):
+                    result = self.run_helper(line, mutation, shell=shell)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(expected, result.stderr)
+                    self.assertIn("Nothing was attempted", result.stderr)
+                    self.assertIn("no named staging fallback", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertIn("result=unsupported environment", result.stdout)
+                    self.assertFalse(self.destination.exists())
+                    self.assertEqual(list(self.directory.iterdir()), [])
+                    self.unchanged()
+
+    def test_unsupported_filesystem_and_procfs_get_specific_explanations(self):
+        open_line = next(l for l in helper.splitlines() if l.startswith("    # ANONYMOUS-OPEN-WINDOW:"))
+        result = self.run_helper(open_line, '    raise OSError(errno.EOPNOTSUPP, "synthetic")')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("does not support anonymous O_TMPFILE files", result.stderr)
+        self.assertIn("No starter config was published", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        publish_line = next(l for l in helper.splitlines() if l.startswith("    # PUBLISH-WINDOW:"))
+        result = self.run_helper(publish_line, '    raise OSError(errno.ENOENT, "synthetic")')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("/proc/self/fd is unavailable", result.stderr)
+        self.assertIn("is /proc mounted", result.stderr)
+        self.assertFalse(self.destination.exists())
+
+    def test_unsupported_environment_full_install_keeps_assets_and_explains(self):
+        line = next(l for l in installer.splitlines() if l.startswith("# CAPABILITY-CHECK:"))
+        script = installer.replace(line, line + "\ndel os.O_TMPFILE", 1)
+        for shell in ("dash", "bash"):
+            with self.subTest(shell=shell):
+                result, home, bundle = self.install_bundle(script, shell, name="unsupported-" + shell)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("this Python has no os.O_TMPFILE", result.stderr)
+                self.assertIn("could not write a starter config", result.stderr)
+                self.assertIn("nothing was changed there", result.stderr)
+                self.assertIn("remain in place", result.stderr)
+                self.assertIn("copy config.toml.example to", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertTrue((bundle / "installed/emuwiz-cli").is_file())
+                self.assertTrue((home / "data/emuwiz-installer/manifest").is_file())
+                self.assertFalse((home / "config/emuwiz/config.toml").exists())
+
+    def test_new_starter_config_is_0600_under_normal_and_restrictive_umasks(self):
+        # Intentional policy (previously the mode followed the umask, typically 0644).
+        for um in (0o000, 0o002, 0o022, 0o027, 0o077):
+            for shell in ("dash", "bash"):
+                with self.subTest(umask=oct(um), shell=shell):
+                    result = self.run_helper(shell=shell, umask=um)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(stat.S_IMODE(self.destination.stat().st_mode), 0o600)
+                    self.destination.unlink()
+
+    def test_existing_config_permissions_and_bytes_are_never_changed(self):
+        for mode in (0o644, 0o640, 0o600, 0o400):
+            with self.subTest(mode=oct(mode)):
+                result, home, bundle = self.install_bundle(installer, "dash", name="existing-%o" % mode,
+                                                           config_bytes=b"USER CONFIG\x00\xff", config_mode=mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = home / "config/emuwiz/config.toml"
+                self.assertEqual(config.read_bytes(), b"USER CONFIG\x00\xff")
+                self.assertEqual(stat.S_IMODE(config.stat().st_mode), mode)
+
+    def test_unprovable_publication_state_is_reported_as_uncertain(self):
+        # Simulate lost bookkeeping AFTER a real publication: the flag is cleared and the proof
+        # descriptor is gone, so the worker cannot establish what happened. It must say so.
+        line = next(l for l in helper.splitlines() if l.startswith("    # CLOSE-WINDOW:"))
+        mutation = '    published = False\n    state = "owned regular"\n    os.close(stage_fd)'
+        for shell in ("dash", "bash"):
+            with self.subTest(shell=shell):
+                result = self.run_helper(line, mutation, shell=shell)
+                self.assertEqual(result.returncode, 130, result.stderr)
+                self.assertIn("could not be established whether the starter config was published", result.stderr)
+                self.assertIn("inspect " + str(self.destination), result.stderr)
+                for wrong in ("published and is complete", "nothing was written", "nothing was changed", "Traceback"):
+                    self.assertNotIn(wrong, result.stderr)
+                self.assertTrue(self.destination.exists())  # it WAS published; the report must not deny it
+                self.destination.unlink()
+
+    def test_signal_handler_never_raises(self):
+        # The root cause of the false "nothing was changed": an exception raised from a handler can
+        # fire after linkat() or inside the cleanup. Handlers must only record.
+        body = helper.split("def record_signal(signum, frame):", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("raise", body)
+        self.assertIn("received.append(signum)", body)
+        self.assertNotIn("signal.pthread_sigmask", helper)  # no signal masking is needed
+
+    # ---- configuration directory creation and safety (never follows the umask, never chmods) ----
+
+    def test_new_config_directories_are_private_under_every_umask(self):
+        for um in (0o000, 0o002, 0o022, 0o027, 0o077):
+            for shell in ("dash", "bash"):
+                with self.subTest(umask=oct(um), shell=shell):
+                    # The parent ("config") does not exist either: every directory this
+                    # step creates must be 0700 from creation, whatever the caller's umask.
+                    result, home, bundle = self.install_bundle(
+                        installer, shell, name="fresh-%o-%s" % (um, shell), umask=um)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for created in (home / "config", home / "config/emuwiz"):
+                        self.assertEqual(stat.S_IMODE(created.stat().st_mode), 0o700, created)
+                    config = home / "config/emuwiz/config.toml"
+                    self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+                    self.assertEqual(config.read_bytes(), example.read_bytes())
+
+    def test_existing_directories_are_never_chmodded_and_group_writable_is_flagged(self):
+        for mode in (0o700, 0o750, 0o755, 0o775):
+            with self.subTest(mode=oct(mode)):
+                self.directory.chmod(mode)
+                (self.directory / "user-file").write_bytes(b"KEEP")
+                result = self.run_helper()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), mode)
+                self.assertEqual((self.directory / "user-file").read_bytes(), b"KEEP")
+                self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+                if mode & 0o020:
+                    self.assertIn("group-writable", result.stderr)
+                    self.assertIn("left unchanged", result.stderr)
+                else:
+                    self.assertEqual(result.stderr, "")
+                self.destination.unlink()
+        self.directory.chmod(0o700)
+
+    def test_world_writable_existing_directory_is_refused_unchanged(self):
+        for mode in (0o777, 0o757, 0o707, 0o1777, 0o702):
+            for shell in ("dash", "bash"):
+                with self.subTest(mode=oct(mode), shell=shell):
+                    self.directory.chmod(mode)
+                    (self.directory / "user-file").write_bytes(b"KEEP")
+                    before = self.directory.stat()
+                    result = self.run_helper(shell=shell)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("writable by every user", result.stderr)
+                    self.assertIn("It was not changed", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertIn("result=cannot publish the starter config safely", result.stdout)
+                    self.assertEqual(self.directory.stat().st_mode, before.st_mode)
+                    self.assertEqual((self.directory / "user-file").read_bytes(), b"KEEP")
+                    self.assertFalse(self.destination.exists())
+                    self.no_stage()
+        self.directory.chmod(0o700)
+
+    def test_directory_owned_by_another_user_is_refused_unchanged(self):
+        # Only the effective-uid comparison is simulated (the test cannot create a foreign uid).
+        self.assertEqual(helper.count("os.geteuid()"), 2)
+        text = helper.replace("dir_info.st_uid != os.geteuid()", "dir_info.st_uid != os.geteuid() + 1")
+        before = self.directory.stat()
+        result = self.run_helper(text=text)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("is owned by uid", result.stderr)
+        self.assertIn("could replace config.toml", result.stderr)
+        self.assertEqual(self.directory.stat().st_mode, before.st_mode)
+        self.assertFalse(self.destination.exists())
+        self.no_stage()
+
+    def test_symlinked_configuration_directory_is_judged_on_its_target(self):
+        real = self.root / "real-config"
+        real.mkdir(mode=0o700)
+        alias = self.root / "alias-config"
+        alias.symlink_to(real)
+        script = self.root / "alias.sh"
+        def run(directory):
+            script.write_text(helper + '\npublish_starter_config %s %s %s\nrc=$?\nprintf "result=%%s\\n" "$starter_config_result"\nexit "$rc"\n'
+                              % tuple(shlex.quote(str(p)) for p in (example, directory, directory / "config.toml")))
+            return subprocess.run(["dash", str(script)], capture_output=True, text=True, timeout=10)
+        safe = run(alias)
+        self.assertEqual(safe.returncode, 0, safe.stderr)
+        self.assertEqual((real / "config.toml").read_bytes(), example.read_bytes())
+        self.assertTrue(alias.is_symlink())
+        (real / "config.toml").unlink()
+        real.chmod(0o777)
+        unsafe = run(alias)
+        self.assertNotEqual(unsafe.returncode, 0)
+        self.assertIn("writable by every user", unsafe.stderr)
+        self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o777)
+        self.assertFalse((real / "config.toml").exists())
+        real.chmod(0o700)
+
+    def test_unsupported_environment_still_creates_only_a_private_directory(self):
+        import shutil as _shutil
+        _shutil.rmtree(self.directory)
+        text = helper.replace("if not hasattr(os, needed):", "if True:")
+        result = self.run_helper(text=text, umask=0o000)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Nothing was attempted", result.stderr)
+        self.assertEqual(stat.S_IMODE(self.directory.stat().st_mode), 0o700)
+        self.assertFalse(self.destination.exists())
+        self.no_stage()
+
+    def test_existing_config_in_an_exposed_directory_is_untouched_but_flagged(self):
+        for mode, expect in ((0o777, "writable by every user"), (0o775, None), (0o700, None)):
+            with self.subTest(mode=oct(mode)):
+                result, home, bundle = self.install_bundle(
+                    installer, "dash", name="exposed-%o" % mode, config_bytes=b"USER CONFIG\x00\xff", config_mode=0o644)
+                directory = home / "config/emuwiz"
+                # (install_bundle already ran once at the default mode; rerun at the chosen one)
+                directory.chmod(mode)
+                again = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed")],
+                                       env=dict(os.environ, HOME=str(home), XDG_CONFIG_HOME=str(home / "config"),
+                                                XDG_DATA_HOME=str(home / "data"), XDG_CACHE_HOME=str(home / "cache"),
+                                                XDG_STATE_HOME=str(home / "state"), EMUWIZ_CONFIG_HOME=str(directory)),
+                                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertEqual((directory / "config.toml").read_bytes(), b"USER CONFIG\x00\xff")
+                self.assertEqual(stat.S_IMODE((directory / "config.toml").stat().st_mode), 0o644)
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), mode)
+                if expect:
+                    self.assertIn(expect, again.stderr)
+                    self.assertIn("left unchanged", again.stderr)
+                else:
+                    self.assertNotIn("writable by every user", again.stderr)
+                directory.chmod(0o700)
+
+    def test_full_install_with_exposed_directory_keeps_assets_and_exits_nonzero(self):
+        result, home2, bundle = self.install_bundle(installer, "dash", name="full-exposed-run")
+        # fresh run is private and succeeds; now repeat with a pre-existing 0777 directory
+        exposed = bundle / "home2"
+        (exposed / "config/emuwiz").mkdir(parents=True)
+        (exposed / "config/emuwiz").chmod(0o777)
+        env = dict(os.environ, HOME=str(exposed), XDG_CONFIG_HOME=str(exposed / "config"), XDG_DATA_HOME=str(exposed / "data"),
+                   XDG_CACHE_HOME=str(exposed / "cache"), XDG_STATE_HOME=str(exposed / "state"),
+                   EMUWIZ_CONFIG_HOME=str(exposed / "config/emuwiz"))
+        run = subprocess.run(["dash", str(bundle / "install.sh"), "--prefix", str(bundle / "installed2")],
+                             env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 1, run.stderr)
+        self.assertIn("writable by every user", run.stderr)
+        self.assertIn("remain in place", run.stderr)
+        self.assertTrue((bundle / "installed2/emuwiz-cli").is_file())
+        self.assertEqual(stat.S_IMODE((exposed / "config/emuwiz").stat().st_mode), 0o777)
+        self.assertFalse((exposed / "config/emuwiz/config.toml").exists())
+
+    def test_trailing_separator_config_directory(self):
+        text = helper.replace('src, directory, destination = sys.argv[1:]',
+                              'src, directory, destination = sys.argv[1:]\ndirectory += "/"')
+        result = self.run_helper(text=text)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.destination.read_bytes(), example.read_bytes())
+        self.no_stage()
+
+    def test_no_named_cleanup_or_unsafe_fallback(self):
+        self.assertNotIn("rm -", helper)
+        self.assertNotIn("unlink(", helper)
+        self.assertNotIn("set -C", helper)
+        self.assertIn("os.O_TMPFILE", helper)
+        self.assertIn("written = os.write(stage_fd, remaining)", helper)
+        self.assertIn('"published"', helper)
+        self.assertIn('"attempted/unproven"', helper)
+
+unittest.main(argv=["anonymous-staging"], verbosity=2)
+STAGING_TESTS
+then
+    ok "anonymous staging ownership and preservation regressions"
+else
+    bad "anonymous staging ownership and preservation regressions"
+fi
+
+# Permission-denied destination directory: warn, change nothing, exit 1.
+# (Skipped when running as root, which ignores directory permissions.)
+if [ "$(id -u)" -ne 0 ]; then
+    cfg_case
+    mkdir -p -- "$cfg_home/.config/emuwiz"
+    chmod 555 -- "$cfg_home/.config/emuwiz"
+    deny_err=$(env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" 2>&1 >/dev/null) && deny_rc=0 || deny_rc=$?
+    chmod 755 -- "$cfg_home/.config/emuwiz"
+    if [ "$deny_rc" -ne 0 ]; then ok "permission-denied config dir: exits non-zero"; else bad "permission-denied config dir: exits non-zero"; fi
+    assert_contains "permission-denied config dir: warning names the file" "$deny_err" "could not write a starter config"
+    assert_no_such_path "permission-denied config dir: no config created" "$cfg_home/.config/emuwiz/config.toml"
+    assert_executable "permission-denied config dir: binaries were still installed" "$cfg_bin/emuwiz-cli"
+    rm -rf -- "$cfg_work"
+fi
+
+# Concurrent installers sharing one config directory: exactly one writer wins,
+# the file equals the example, and no staging files remain.
+cfg_case
+for n in 1 2 3 4 5 6; do
+    mkdir -p -- "$cfg_work/p$n"
+    env HOME="$cfg_home" XDG_DATA_HOME="$cfg_work/p$n/data" \
+        sh "$cfg_work/bundle/install.sh" --prefix "$cfg_work/p$n/bin" >"$cfg_work/p$n/out" 2>&1 &
+done
+wait
+assert_files_equal "concurrent installers: config equals the example" \
+    "$config_example" "$cfg_home/.config/emuwiz/config.toml"
+wrote=$(cat "$cfg_work"/p*/out | grep -c '^Wrote a starter config' || true)
+if [ "$wrote" -eq 1 ]; then ok "concurrent installers: exactly one reports writing the config"; else bad "concurrent installers: exactly one reports writing the config (got $wrote)"; fi
+if ls -A "$cfg_home/.config/emuwiz" | grep -q 'stage'; then bad "concurrent installers: no staging leftovers"; else ok "concurrent installers: no staging leftovers"; fi
+rm -rf -- "$cfg_work"
+
+# EMUWIZ_CONFIG_HOME: the directory itself, no legacy fallback.
+cfg_case
+mkdir -p -- "$cfg_home/.config/archivefs"
+printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
+env HOME="$cfg_home" EMUWIZ_CONFIG_HOME="$cfg_work/explicit" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+assert_files_equal "EMUWIZ_CONFIG_HOME: starter config lands in the override" \
+    "$config_example" "$cfg_work/explicit/config.toml"
+assert_contains "EMUWIZ_CONFIG_HOME: legacy profile untouched" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
+assert_no_such_path "EMUWIZ_CONFIG_HOME: nothing created under ~/.config/emuwiz" "$cfg_home/.config/emuwiz"
+rm -rf -- "$cfg_work"
+
+# XDG_CONFIG_HOME: $XDG_CONFIG_HOME/emuwiz; EMUWIZ_CONFIG_HOME wins over it.
+cfg_case
+env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+assert_files_equal "XDG_CONFIG_HOME: starter config lands in <xdg>/emuwiz" \
+    "$config_example" "$cfg_work/xdg/emuwiz/config.toml"
+assert_no_such_path "XDG_CONFIG_HOME: nothing under ~/.config" "$cfg_home/.config"
+rm -rf -- "$cfg_work"
+cfg_case
+env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" EMUWIZ_CONFIG_HOME="$cfg_work/explicit" \
+    sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+assert_file_exists "EMUWIZ_CONFIG_HOME wins over XDG_CONFIG_HOME" "$cfg_work/explicit/config.toml"
+assert_no_such_path "XDG location unused when explicit root is set" "$cfg_work/xdg"
+rm -rf -- "$cfg_work"
+
+# XDG_CONFIG_HOME never falls back to the legacy directory.
+cfg_case
+mkdir -p -- "$cfg_home/.config/archivefs"
+env HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_work/xdg" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1
+assert_file_exists "XDG root ignores a legacy profile" "$cfg_work/xdg/emuwiz/config.toml"
+rm -rf -- "$cfg_work"
+
+# Relative overrides are refused like the application does: binaries install,
+# no config is written, exit is non-zero, and nothing is created in the cwd.
+for var in EMUWIZ_CONFIG_HOME XDG_CONFIG_HOME; do
+    cfg_case
+    rel_rc=0
+    ( cd "$cfg_work" && env HOME="$cfg_home" "$var=relative/cfg" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" ) >/dev/null 2>"$cfg_work/err" || rel_rc=$?
+    if [ "$rel_rc" -ne 0 ]; then ok "relative $var: exits non-zero"; else bad "relative $var: exits non-zero"; fi
+    assert_contains "relative $var: reason is reported" "$(cat "$cfg_work/err")" "not an absolute path"
+    assert_no_such_path "relative $var: nothing created relative to cwd" "$cfg_work/relative"
+    assert_no_such_path "relative $var: no config under home" "$cfg_home/.config/emuwiz/config.toml"
+    assert_executable "relative $var: binaries still installed" "$cfg_bin/emuwiz-cli"
+    rm -rf -- "$cfg_work"
+done
+
+# A broken ~/.config/emuwiz entry still has precedence over a legacy profile
+# (matches the application), so no starter config is written to the legacy one.
+cfg_case
+mkdir -p -- "$cfg_home/.config/archivefs"
+printf 'legacy\n' >"$cfg_home/.config/archivefs/config.toml"
+ln -s -- "$cfg_work/gone" "$cfg_home/.config/emuwiz"
+env HOME="$cfg_home" sh "$cfg_work/bundle/install.sh" --prefix "$cfg_bin" >/dev/null 2>&1 || true
+assert_contains "broken emuwiz entry: legacy config untouched" "$(cat "$cfg_home/.config/archivefs/config.toml")" "legacy"
+assert_no_such_path "broken emuwiz entry: symlink target not created" "$cfg_work/gone"
+rm -rf -- "$cfg_work"
+
 echo "=== test: uninstall precisely removes owned binaries and desktop assets ==="
 work=$(mktemp -d)
 make_bundle "$work/bundle"
