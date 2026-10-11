@@ -12,6 +12,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod source_identity;
+
 const RDSK: &[u8; 4] = b"RDSK";
 const PART: &[u8; 4] = b"PART";
 const NONE: u32 = 0xffff_ffff;
@@ -369,19 +371,35 @@ impl std::error::Error for AmigaFloppyError {}
 /// code must have a valid checksum. This does not
 /// verify boot code, game content or a dump. Custom loaders without such an
 /// identifier stay unknown; arbitrary 880 KiB data is never admitted by size.
+///
+/// Reads stay pinned to the opened inode. Before returning evidence, the
+/// descriptor and original pathname are rechecked against the captured object.
+/// A later pathname replacement remains possible: this is not a source lock
+/// or an atomic filesystem snapshot.
 pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
     let file = open_amiga_media_file(path).map_err(AmigaFloppyError::Container)?;
     let before = file
         .metadata()
         .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?;
+    let source = source_identity::OpenedSource::capture(&before);
+    #[cfg(test)]
+    source_identity::test_support::checkpoint(
+        path,
+        source_identity::test_support::Checkpoint::Captured,
+    );
     // Keep every parser reopen on the pinned regular inode, including ADZ's
     // anonymous staging file. A path replacement cannot turn a read into a FIFO.
     let pinned = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
     let result = inspect_amiga_floppy_pinned(&pinned);
-    let after = file
-        .metadata()
-        .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+    #[cfg(test)]
+    source_identity::test_support::checkpoint(
+        path,
+        source_identity::test_support::Checkpoint::BeforePublish,
+    );
+    if !source
+        .unchanged(&file, path)
+        .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?
+    {
         return Err(AmigaFloppyError::Container(DiskError::ChangedWhileReading));
     }
     let mut inspection = result?;

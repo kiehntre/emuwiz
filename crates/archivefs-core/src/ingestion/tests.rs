@@ -2479,3 +2479,83 @@ fn a_truncated_mz_header_named_exe_is_refused() {
         Some(SkipReason::InvalidContent(_))
     ));
 }
+
+#[test]
+fn source_ownership_refusals_publish_no_identity_or_media_evidence() {
+    use crate::amiga_disk::source_identity::test_support::{Change, Checkpoint, mutate, with_hook};
+    for extension in ["adf", "adz"] {
+        for change in [
+            Change::Replace,
+            Change::SameSizeRestoredMtime,
+            Change::Remove,
+            Change::InPlace,
+        ] {
+            for point in [Checkpoint::Captured, Checkpoint::BeforePublish] {
+                let dir = source_dir("amiga-source-replacement");
+                let path = dir.path().join(format!("Known Game.{extension}"));
+                let raw = minimal_flat_adf(1, b"DisplayLabel");
+                let bytes = if extension == "adz" {
+                    gzip_bytes(&raw)
+                } else {
+                    raw
+                };
+                std::fs::write(&path, bytes).unwrap();
+                let source = path.clone();
+                let report = with_hook(
+                    &path,
+                    point,
+                    move || mutate(&source, change),
+                    || discover_source(dir.path()).unwrap(),
+                );
+                assert_eq!(report.items.len(), 1);
+                let item = &report.items[0];
+                assert_eq!(item.validation_state, ValidationState::Skipped);
+                assert!(
+                    matches!(item.skip_reason, Some(SkipReason::InspectionUnavailable(_))),
+                    "{extension} {change:?} at {point:?}: {item:?}"
+                );
+                assert_eq!(item.platform_hint, None);
+                assert_eq!(item.identity_candidate, None);
+                assert!(report.structural_evidence.is_empty());
+                assert!(report.archive_evidence.is_empty());
+                assert!(
+                    !item
+                        .skip_reason
+                        .as_ref()
+                        .unwrap()
+                        .suggested_action()
+                        .contains("may be corrupt")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn source_ownership_stable_discovery_remains_accepted_strong_without_game_claims() {
+    for extension in ["adf", "adz"] {
+        let dir = source_dir("stable-amiga-source");
+        let raw = minimal_flat_adf(1, b"DisplayLabel");
+        let bytes = if extension == "adz" {
+            gzip_bytes(&raw)
+        } else {
+            raw
+        };
+        std::fs::write(dir.path().join(format!("Known Game.{extension}")), bytes).unwrap();
+        for _ in 0..8 {
+            let report = discover_source(dir.path()).unwrap();
+            assert_eq!(report.items.len(), 1);
+            assert_eq!(report.items[0].validation_state, ValidationState::Accepted);
+            assert_eq!(report.items[0].skip_reason, None);
+            assert_eq!(report.items[0].identity_candidate, None);
+            assert_eq!(report.structural_evidence.len(), 1);
+            let evidence = &report.structural_evidence[0].observation;
+            assert_eq!(
+                evidence.claim_strength,
+                crate::platform_evidence_fusion::evidence_lineage::ClaimStrength::Strong
+            );
+            assert_eq!(evidence.release_candidate, None);
+            assert_eq!(evidence.hash_or_value, None);
+        }
+    }
+}

@@ -608,3 +608,93 @@ fn filesystem_host_open_failure_remains_an_io_error() {
         Err(FilesystemError::Io(_))
     ));
 }
+
+// Deterministic source ownership checks, at capture and immediately before publication.
+fn assert_source_ownership_change(change: super::source_identity::test_support::Change) {
+    use super::source_identity::test_support::{Checkpoint, changed};
+    for point in [Checkpoint::Captured, Checkpoint::BeforePublish] {
+        let result = changed(
+            &flat_adf(1, b"OwnershipDisk"),
+            change,
+            point,
+            inspect_amiga_floppy,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(AmigaFloppyError::Container(DiskError::ChangedWhileReading))
+            ),
+            "{change:?} at {point:?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn source_ownership_atomic_replacement() {
+    assert_source_ownership_change(super::source_identity::test_support::Change::Replace);
+}
+
+#[test]
+fn source_ownership_same_size_restored_mtime() {
+    assert_source_ownership_change(
+        super::source_identity::test_support::Change::SameSizeRestoredMtime,
+    );
+}
+
+#[test]
+fn source_ownership_symlink_retarget() {
+    assert_source_ownership_change(super::source_identity::test_support::Change::RetargetSymlink);
+}
+
+#[test]
+fn source_ownership_pathname_removal() {
+    assert_source_ownership_change(super::source_identity::test_support::Change::Remove);
+}
+
+#[test]
+fn source_ownership_same_descriptor_change() {
+    assert_source_ownership_change(super::source_identity::test_support::Change::InPlace);
+}
+
+#[test]
+fn source_ownership_repeated_stable_file_and_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stable.adf");
+    std::fs::write(&path, flat_adf(1, b"OwnershipDisk")).unwrap();
+    let link = dir.path().join("stable-link.adf");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    for _ in 0..8 {
+        for source in [&path, &link] {
+            let inspection = inspect_amiga_floppy(source).unwrap();
+            let evidence = structural_amiga_floppy_observation(&inspection);
+            assert_eq!(
+                evidence.claim_strength,
+                crate::platform_evidence_fusion::evidence_lineage::ClaimStrength::Strong
+            );
+            assert_eq!(evidence.release_candidate, None);
+            assert_eq!(evidence.hash_or_value, None);
+        }
+    }
+}
+
+#[test]
+fn source_ownership_refusal_cannot_prepare_trainer_media() {
+    use super::source_identity::test_support::{Change, Checkpoint, changed};
+    use crate::amiga_adf_trainer::{AdfMediaError, inspect_adf_media};
+    for change in [
+        Change::Replace,
+        Change::SameSizeRestoredMtime,
+        Change::Remove,
+        Change::InPlace,
+    ] {
+        for point in [Checkpoint::Captured, Checkpoint::BeforePublish] {
+            let result = changed(&flat_adf(1, b"TrainerDisk"), change, point, |path| {
+                inspect_adf_media(path, None)
+            });
+            assert!(
+                matches!(result, Err(AdfMediaError::NotAnAmigaFloppy(_))),
+                "{change:?} at {point:?}: {result:?}"
+            );
+        }
+    }
+}

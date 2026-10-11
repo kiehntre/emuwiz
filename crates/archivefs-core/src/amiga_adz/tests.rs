@@ -425,3 +425,78 @@ fn long_optional_gzip_fields_are_a_decoder_limit_not_corrupt_content() {
         ));
     }
 }
+
+// Deterministic source ownership checks, at capture and immediately before publication.
+fn assert_source_ownership_change(
+    change: crate::amiga_disk::source_identity::test_support::Change,
+) {
+    use crate::amiga_disk::source_identity::test_support::{Checkpoint, changed};
+    for point in [Checkpoint::Captured, Checkpoint::BeforePublish] {
+        let result = changed(
+            &gzip(&minimal_flat_adf(1, b"OwnershipDisk")),
+            change,
+            point,
+            inspect_adz,
+        );
+        assert!(
+            matches!(result, Err(AdzError::ChangedWhileReading)),
+            "{change:?} at {point:?}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn source_ownership_atomic_replacement() {
+    assert_source_ownership_change(
+        crate::amiga_disk::source_identity::test_support::Change::Replace,
+    );
+}
+
+#[test]
+fn source_ownership_same_size_restored_mtime() {
+    assert_source_ownership_change(
+        crate::amiga_disk::source_identity::test_support::Change::SameSizeRestoredMtime,
+    );
+}
+
+#[test]
+fn source_ownership_symlink_retarget() {
+    assert_source_ownership_change(
+        crate::amiga_disk::source_identity::test_support::Change::RetargetSymlink,
+    );
+}
+
+#[test]
+fn source_ownership_pathname_removal() {
+    assert_source_ownership_change(
+        crate::amiga_disk::source_identity::test_support::Change::Remove,
+    );
+}
+
+#[test]
+fn source_ownership_same_descriptor_change() {
+    assert_source_ownership_change(
+        crate::amiga_disk::source_identity::test_support::Change::InPlace,
+    );
+}
+
+#[test]
+fn source_ownership_repeated_stable_file_and_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stable.adz");
+    std::fs::write(&path, gzip(&minimal_flat_adf(1, b"OwnershipDisk"))).unwrap();
+    let link = dir.path().join("stable-link.adz");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    for _ in 0..8 {
+        for source in [&path, &link] {
+            let inspection = inspect_adz(source).unwrap();
+            let evidence = amiga_disk::structural_amiga_floppy_observation(&inspection.floppy);
+            assert_eq!(
+                evidence.claim_strength,
+                crate::platform_evidence_fusion::evidence_lineage::ClaimStrength::Strong
+            );
+            assert_eq!(evidence.release_candidate, None);
+            assert_eq!(evidence.hash_or_value, None);
+        }
+    }
+}

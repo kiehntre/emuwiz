@@ -54,7 +54,8 @@ pub enum AdzError {
     Io(String),
     /// A FIFO, device or directory is not an inspectable disk-image file.
     NotRegularFile,
-    /// The opened file changed during the bounded read; retry a stable copy.
+    /// The opened object or original pathname changed during inspection;
+    /// retry a stable copy.
     ChangedWhileReading,
     /// The container's own size exceeds [`MAX_ADZ_COMPRESSED_BYTES`] -
     /// refused before any byte is decompressed.
@@ -131,7 +132,9 @@ pub struct AdzInspection {
 /// then reuse [`amiga_disk::inspect_amiga_floppy`] on the result.
 /// Stages bytes only after obtaining an unlinked file, never mutates `path`, and never
 /// claims a decompressed stream is an ADF beyond what the existing parser
-/// itself validates.
+/// itself validates. The descriptor and original container pathname are
+/// rechecked after logical-image inspection; a subsequent replacement remains
+/// possible. This is not a source lock or an atomic filesystem snapshot.
 pub fn inspect_adz(path: &Path) -> Result<AdzInspection, AdzError> {
     inspect_adz_in_temp_dir(path, &std::env::temp_dir())
 }
@@ -153,52 +156,72 @@ pub(crate) fn inspect_adz_in_temp_dir(
     if !metadata.is_file() {
         return Err(AdzError::NotRegularFile);
     }
-    let compressed = read_compressed_file(&mut file, &metadata)?;
-    if compressed.len() < GZIP_MAGIC.len() || compressed[..2] != GZIP_MAGIC {
-        return Err(AdzError::NotGzip);
-    }
-
-    // RFC 1952 defines a gzip file as concatenated members. This decoder
-    // checks every header, CRC and ISIZE, and rejects non-member suffixes.
-    let decoder = MultiGzDecoder::new(compressed.as_slice());
-    let mut decoded = Vec::new();
-    // The extra byte bounds aggregate output across all members. Accepted
-    // streams reach EOF, including the final member's trailer validation.
-    if let Err(error) = decoder
-        .take(MAX_ADZ_DECOMPRESSED_BYTES + 1)
-        .read_to_end(&mut decoded)
-    {
-        // flate2 1.1.9 bounds optional filename/comment fields to 65535 bytes.
-        // RFC 1952 has no such length restriction; do not call this corruption.
-        if error.kind() == io::ErrorKind::InvalidInput
-            && error.to_string() == "gzip header field too long"
-        {
-            return Err(AdzError::UnsupportedGzip(error.to_string()));
+    let source = amiga_disk::source_identity::OpenedSource::capture(&metadata);
+    #[cfg(test)]
+    amiga_disk::source_identity::test_support::checkpoint(
+        path,
+        amiga_disk::source_identity::test_support::Checkpoint::Captured,
+    );
+    let result = (|| {
+        let compressed = read_compressed_file(&mut file, &metadata)?;
+        if compressed.len() < GZIP_MAGIC.len() || compressed[..2] != GZIP_MAGIC {
+            return Err(AdzError::NotGzip);
         }
-        return Err(AdzError::MalformedGzip(error.to_string()));
-    }
-    if decoded.len() as u64 > MAX_ADZ_DECOMPRESSED_BYTES {
-        return Err(AdzError::DecompressedTooLarge {
-            limit: MAX_ADZ_DECOMPRESSED_BYTES,
-        });
-    }
-    if (decoded.len() as u64) < MIN_ADF_BYTES {
-        return Err(AdzError::DecompressedTooSmall);
-    }
 
-    let mut temp = open_private_temp_file(temp_dir)
-        .map_err(|error| AdzError::TempFileUnavailable(error.to_string()))?;
-    temp.write_all(&decoded)
-        .map_err(|error| AdzError::Io(error.to_string()))?;
-    temp.flush()
-        .map_err(|error| AdzError::Io(error.to_string()))?;
-    let temp_path = proc_self_fd_path(temp.as_raw_fd());
-    let floppy = amiga_disk::inspect_amiga_floppy(&temp_path).map_err(AdzError::NotAdf)?;
-    Ok(AdzInspection {
-        container_path: path.to_path_buf(),
-        decompressed_bytes: decoded.len() as u64,
-        floppy,
-    })
+        // RFC 1952 defines a gzip file as concatenated members. This decoder
+        // checks every header, CRC and ISIZE, and rejects non-member suffixes.
+        let decoder = MultiGzDecoder::new(compressed.as_slice());
+        let mut decoded = Vec::new();
+        // The extra byte bounds aggregate output across all members. Accepted
+        // streams reach EOF, including the final member's trailer validation.
+        if let Err(error) = decoder
+            .take(MAX_ADZ_DECOMPRESSED_BYTES + 1)
+            .read_to_end(&mut decoded)
+        {
+            // flate2 1.1.9 bounds optional filename/comment fields to 65535 bytes.
+            // RFC 1952 has no such length restriction; do not call this corruption.
+            if error.kind() == io::ErrorKind::InvalidInput
+                && error.to_string() == "gzip header field too long"
+            {
+                return Err(AdzError::UnsupportedGzip(error.to_string()));
+            }
+            return Err(AdzError::MalformedGzip(error.to_string()));
+        }
+        if decoded.len() as u64 > MAX_ADZ_DECOMPRESSED_BYTES {
+            return Err(AdzError::DecompressedTooLarge {
+                limit: MAX_ADZ_DECOMPRESSED_BYTES,
+            });
+        }
+        if (decoded.len() as u64) < MIN_ADF_BYTES {
+            return Err(AdzError::DecompressedTooSmall);
+        }
+
+        let mut temp = open_private_temp_file(temp_dir)
+            .map_err(|error| AdzError::TempFileUnavailable(error.to_string()))?;
+        temp.write_all(&decoded)
+            .map_err(|error| AdzError::Io(error.to_string()))?;
+        temp.flush()
+            .map_err(|error| AdzError::Io(error.to_string()))?;
+        let temp_path = proc_self_fd_path(temp.as_raw_fd());
+        let floppy = amiga_disk::inspect_amiga_floppy(&temp_path).map_err(AdzError::NotAdf)?;
+        Ok(AdzInspection {
+            container_path: path.to_path_buf(),
+            decompressed_bytes: decoded.len() as u64,
+            floppy,
+        })
+    })();
+    #[cfg(test)]
+    amiga_disk::source_identity::test_support::checkpoint(
+        path,
+        amiga_disk::source_identity::test_support::Checkpoint::BeforePublish,
+    );
+    if !source
+        .unchanged(&file, path)
+        .map_err(|error| AdzError::Io(error.to_string()))?
+    {
+        return Err(AdzError::ChangedWhileReading);
+    }
+    result
 }
 
 fn read_compressed_file(

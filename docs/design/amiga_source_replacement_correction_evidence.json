@@ -1,0 +1,1486 @@
+{
+  "task": "Bounded Amiga ADF/ADZ source pathname replacement correction",
+  "completed_utc": "2026-10-11T16:23:40.420466+00:00",
+  "worktree": "/home/davedap/emuwiz-amiga-source-path-replacement",
+  "branch": "fix/amiga-source-path-replacement-20261011",
+  "parent_candidate": "0235ded1f95f8322f8b3bb140b452f44f9d99dc6",
+  "original_amiga_stack": [
+    "90923e5b5b5b79289a6e428a07cb3ff1a2df1289",
+    "b92addc6621a776792cdf581e0973841566d8e32",
+    "0235ded1f95f8322f8b3bb140b452f44f9d99dc6"
+  ],
+  "allowed_files": [
+    "crates/archivefs-core/src/amiga_disk/mod.rs",
+    "crates/archivefs-core/src/amiga_disk/source_identity.rs",
+    "crates/archivefs-core/src/amiga_disk/tests.rs",
+    "crates/archivefs-core/src/amiga_adz.rs",
+    "crates/archivefs-core/src/amiga_adz/tests.rs",
+    "crates/archivefs-core/src/ingestion/tests.rs",
+    "docs/design/amiga_source_replacement_correction_evidence.json"
+  ],
+  "source_files": [
+    {
+      "path": "crates/archivefs-core/src/amiga_disk/mod.rs",
+      "sha256": "fdb2b8f40e656bd3aca49d252937cfe5047e6cb77302c489453dda68ac2dea2c"
+    },
+    {
+      "path": "crates/archivefs-core/src/amiga_disk/source_identity.rs",
+      "sha256": "7526a7261ebb2f46dd7926edfa1e71358177b7718f15da01cc08073d3dfade04"
+    },
+    {
+      "path": "crates/archivefs-core/src/amiga_disk/tests.rs",
+      "sha256": "74fab341866a697eda47e584054d5c274bd438e40132767b3e1a076f679566cf"
+    },
+    {
+      "path": "crates/archivefs-core/src/amiga_adz.rs",
+      "sha256": "6ba040234b82e85f184f063d7cc140c28cfd1b7cff5f440f91bebc5230ecacc6"
+    },
+    {
+      "path": "crates/archivefs-core/src/amiga_adz/tests.rs",
+      "sha256": "54f73da3ded8f6caf95b1de0897e5824886ad0e2928dd1cf435a35a7b96a58e6"
+    },
+    {
+      "path": "crates/archivefs-core/src/ingestion/tests.rs",
+      "sha256": "942f3f6335017508b150f65143b6a064a936da7fd123d5c7215b45998c027b28"
+    }
+  ],
+  "defect": "Reading the pinned descriptor did not prove that the original pathname still named that inspected object when evidence was returned. ADZ also omitted a final descriptor check after decoding and logical inspection.",
+  "correction": "Capture opened-descriptor device/inode/size/mtime using the existing CapturedFileIdentity primitive plus ctime. Check the descriptor and resolve the original pathname with metadata before returning the inspection result. Never read or reopen the replacement pathname. Changed sources override content failures with ChangedWhileReading; metadata I/O stays InspectionUnavailable.",
+  "parser_and_bounds_preserved": [
+    {
+      "path": "crates/archivefs-core/src/amiga_disk/mod.rs",
+      "section": "fn inspect_amiga_floppy_pinned(",
+      "unchanged": true
+    },
+    {
+      "path": "crates/archivefs-core/src/amiga_adz.rs",
+      "section": "fn read_compressed_file(",
+      "unchanged": true
+    }
+  ],
+  "independent_reproduction": {
+    "script_sha256": "b4ff38da648780ad855214edcc2b063d3dcd09611d541f5ee3050a6bc542e9d8",
+    "before": {
+      "adf": "5/5 false Accepted/Strong; equal-size restored-mtime replacement also falsely accepted",
+      "adz": "5/5 false Accepted/Strong; equal-size restored-mtime non-gzip replacement also falsely accepted"
+    },
+    "after": {
+      "adf": "5/5 Skipped/InspectionUnavailable; same-size restored-mtime replacement refused",
+      "adz": "5/5 Skipped/InspectionUnavailable; same-size restored-mtime replacement refused"
+    },
+    "green_original_repro_passed": 10,
+    "green_same_size_passed": 2,
+    "no_platform_identity_or_Strong_on_refusal": true
+  },
+  "deterministic_regressions": {
+    "checkpoints": [
+      "after descriptor metadata capture",
+      "before final ownership validation and publication"
+    ],
+    "formats": [
+      "ADF",
+      "ADZ"
+    ],
+    "mutations": [
+      "atomic pathname replacement",
+      "equal-size replacement with restored mtime and different inode",
+      "symlink retarget to different inode without modifying inspected inode",
+      "pathname removal",
+      "same opened inode changed in-place with observable size difference and restored mtime"
+    ],
+    "stable_repetitions": {
+      "direct_file_and_symlink_per_format": 16,
+      "discovery_per_format": 8
+    },
+    "race_synchronization": "one-shot, per-thread inspection checkpoint; mutation completes before inspection continues; no timing sleeps",
+    "in_place_fixture_adjustment": "Initial immediate writes demonstrated ctime timestamp granularity; final fixture changes length to guarantee supported identity observation. Production ctime check retained; no assumption that ctime detects all edits.",
+    "content_scope": "synthetic files under private TMP only"
+  },
+  "red_supported_unit_summaries": [
+    "test result: FAILED. 4 passed; 11 failed; 0 ignored; 0 measured; 11884 filtered out; finished in 0.06s"
+  ],
+  "red_initial_fixture_issue": "The initial same-inode same-size restored-mtime test could not guarantee a different ctime on this filesystem. It was replaced with a deterministic observable size change before production implementation; the repeated red run has no invalid fixture premise. Production ctime validation remains.",
+  "fixture_matrix": {
+    "count": 106,
+    "distribution": {
+      "UnsupportedContent": 19,
+      "InvalidContent": 22,
+      "Skipped/Weak": 34,
+      "Accepted/Strong": 31
+    },
+    "matched_every_reviewed_output": true,
+    "method": "106 individually discovered isolated copies; Acorn aliases inspected with their direct parent as root to preserve file-level discovery. Source and copy hashes verified.",
+    "outcomes": [
+      {
+        "fixture": "Acorn Archimedes/broken-gzip.adz",
+        "sha256": "3b8f5bf20f566bdf49deca1673231f1fee18efd371451863d186d8d2be69f5e7",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"not a gzip-wrapped file\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "Acorn Archimedes/wrong-size-dos.adf",
+        "sha256": "2b600f974f1cf4f69ca8278a617468e2b8c2717dc6271fe3273a0b925a656864",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: InvalidBlockType\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "MuF-901120.adf",
+        "sha256": "0980610ca14c9207ea0f83bb4f6f8753687f7dc98681811d342d6d2ea36932de",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "MuF-901120.adz",
+        "sha256": "4ba44bbea7bd4e42e5fce15a43f16bbad593b5de4032d56d2d300c4344b4f388",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "MuF-912384.adf",
+        "sha256": "509acd5a24f3662cb1f9eec1211105cc98e8a5140389e6f5209ab46689424c35",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "MuF-912384.adz",
+        "sha256": "cf6e9abc89d681feb27d4e187a76db7f8105466db6d0518b4710e9c7f6b09322",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "Oversize.adz",
+        "sha256": "48d78500ba762889a60e515e98461b6514c7f178c2160d77c085465323b0d32d",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"compressed .adz exceeds the 16777216-byte container limit\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "PFS-901120.adf",
+        "sha256": "b3be4aba2066c1068f09b66a5469d44ab247c5e5d0602f42b1917bb6e1828b88",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "PFS-901120.adz",
+        "sha256": "082a24f350d9e4f9da7db362961046c8d5e6472786dba99ff1d3cabe13f4537e",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "PFS-912384.adf",
+        "sha256": "52d72c098a13f939a3aaf94440c4137cb4321e537c00d6945b33f1bb493bd3ef",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "PFS-912384.adz",
+        "sha256": "b1ff87a7b7432e790a25d0ca79f00424b3d090e0b8778a86ea2a909cc3ca64e9",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "SFS-901120.adf",
+        "sha256": "f8a4b98277cd99e39fb0baa81cff18af6b2fb2a3467cd902511f9a939678bd35",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "SFS-901120.adz",
+        "sha256": "f290bce530383287dee954ccfe37b5644613970c04bd3de4f8178b8604952338",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "SFS-912384.adf",
+        "sha256": "413e799e6007020eabdbbb673ad4c6a41618160fb70672970220279abe2adf32",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "SFS-912384.adz",
+        "sha256": "525c9a9a274ae7274acb937400cd03fdda9effbc6acf05e258299de5bbc64e2f",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "acorn.adf",
+        "sha256": "e5d57155a595738312bbbe83d94635fd601280ed420e63888b5cc15cd2acb02f",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "acorn.adz",
+        "sha256": "d5c795e326092ac8a66678f48b9c310c9839e8ed2079db67af5892d92334b675",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "custom-81-cyl.adf",
+        "sha256": "52b4e6b133d4e91b61fe8fca5f114bcca2b21d5daedc32420bac5cc6283d3d96",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "custom-81-cyl.adz",
+        "sha256": "00829b6b0f296c8ee4a5760f070c53a774a585388e2fb927c58d48765b8e0c0d",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "custom-82-cyl.adf",
+        "sha256": "9b640014fe956c2e5a8a31a5175625efc71fc7859852bff2d9d306e1543c283d",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "custom-82-cyl.adz",
+        "sha256": "d170bc6d38bd14e8f0d0aca201fae957fbf3ff8a54284b5209012f6145ba535b",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "custom-83-cyl.adf",
+        "sha256": "36a53c55d727daeece2ce06e5e05c11bb75cdcbee2758143deb0e9c3213cd154",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "custom-83-cyl.adz",
+        "sha256": "fddc54ab9e7a97af83b9f3a045f27cff6e221755a1f298ae519442edf0e2b3f1",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "cut-after-root.adf",
+        "sha256": "65844c159551d1e9ab6b7ce9740c5a83a7e0461e0eb037cc9d8fb6a2d4ff0a0d",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "cut-after-root.adz",
+        "sha256": "bd175b67e027940c8a45a129473a3b6ddb5ea0330764660da9e766d3d8767243",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "damaged-root-1802240.adf",
+        "sha256": "1ba8db1c26b675d091fa920eac5f8a07ad8a92fe1b11313731567066cb985977",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "damaged-root-1802240.adz",
+        "sha256": "28ad618b8141d3cb13abd9b111ed1ba48679a026dbf54137f2b5abcbaccaecdb",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "damaged-root-901120.adf",
+        "sha256": "a521670b869b15c4e3ed3e9bb1fd456a41b30b84d3ac2996c51eb0f6c2fee792",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "damaged-root-901120.adz",
+        "sha256": "b116c5586bc4e688c62aafea62e1bcae981c905a1c21ab30808e2b96f6a639fe",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos0-dd.adf",
+        "sha256": "d62a5ccccbbb78a027c13381da29f3bdd6054c3d09a80e6f7ee667b1a6a7f485",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos0-dd.adz",
+        "sha256": "4e187fe5f90d2987d940e14cbb4b1632a200e465511bbbc3738d2744d515f3c9",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos1-dd.adf",
+        "sha256": "d72ab7b94c4b1aa12d4f98c950a2b8ae96c026d0f2fe782a3dc59d801b1720fa",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos1-dd.adz",
+        "sha256": "5fbf6c3b54b53522b816e9b5d4481dc3b98168f83f9b48467721274a80338fa2",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos1-hd.adf",
+        "sha256": "021d52b378af655637b51eef46dddaddfa45c99ce3984055fc36262a16b3ff4d",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos1-hd.adz",
+        "sha256": "19e6b29e9a181801c150a9167012bc4adebc8011f0d26c910a2d6930658d6ff8",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos2-dd.adf",
+        "sha256": "d5bd3e6e7c77282f1ab9d78adadb9ae91eb2a9098e0d18be9a1321195d38b280",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos2-dd.adz",
+        "sha256": "189118f3f6ad7b589fdf8d87ed7d08ac5bab438d6178bf2288306dd48f33926a",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos3-dd.adf",
+        "sha256": "441fbafb641f2e294635dfdf843c5862d1595f38b3faf7e45427a7ffe41ce255",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos3-dd.adz",
+        "sha256": "ff8eccd44428980449bca45b70d95f4a965a5d9222abb7d4676bdf78e8fe4255",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos4-dd.adf",
+        "sha256": "bf17936d041404d30cd0e8d6c0699a09eeefee1120a580cb3607ba8f6b445491",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos4-dd.adz",
+        "sha256": "5b55c96d237b76568e702d0566983fbcf3d117f12c2b80a57a5e410d04cd0aa4",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos5-dd.adf",
+        "sha256": "50215b1c965f5646f6ac21b0606062eaef7fabbbc806d4cb8e8c093f072f81ca",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos5-dd.adz",
+        "sha256": "7c05037f577b96f014d49bf8798a91ef4a936b32972388cda843a9f92ccfacf9",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos6-dd.adf",
+        "sha256": "c0ae8de895ce240c7e3bf4b73533e0f35950b58e063b4d67b0c56c1d32e7e755",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos6-dd.adz",
+        "sha256": "f9ea031d4e690e304b97853c671c8f8e10e6d36a7dc5f211454ae9a7e72c54af",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos7-dd.adf",
+        "sha256": "b907114847d3d71040e306b30192e1e0f3f89d199bc849ac869b75da0974b847",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos7-dd.adz",
+        "sha256": "36c1ab4fc38731065238eaa6365f5df5ee98107048ff855d5bd30c8648b8e59e",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos8.adf",
+        "sha256": "f28c6f6bebb7847e85bdcf8e8fd030dae6e4ac5cfa08fb9d707d30383acb66cb",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "dos8.adz",
+        "sha256": "77177a3f388ad815a5de41028ecaf1fd5d4af80aeb4ed6c0b1259ccdc267c1fe",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "extended-adf.adf",
+        "sha256": "14b7cc1334bd27cd83dccc9cabc7551da3962dec049f28b7ff48159fa3f95146",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "extended-adf.adz",
+        "sha256": "2d47815fa30de8e3aac01a60949b5ef1f79830a896ed9fc2803ac4e8b20c6c1d",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "ffs-1024-nonstandard.adf",
+        "sha256": "caaa024d5791a846cace7729800394c8d1e1a3963d85bd2ae35d26362b735b00",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "ffs-1024-nonstandard.adz",
+        "sha256": "f555db42e649c471ab5749c9a5a494587465344df038f1af8c334126974f453f",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "ffs-1024.adf",
+        "sha256": "cbf72f182d5533899a60932d20d203227c5dd281b2fce35d4776a645c1f68c5c",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "ffs-1024.adz",
+        "sha256": "3dca3abee162b5670353a815cfd7a9093fe631e8f64d9a8ddd6d24501f7c3631",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-bad-crc.adz",
+        "sha256": "4620f511697a8918590a0b44971a1b4a03f3f1a3d4891b7d4b5a82a1545ac8bf",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"malformed gzip stream: corrupt gzip stream does not have a matching checksum\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-bad-deflate.adz",
+        "sha256": "b6a23dd717958e22423685cc4aab21e62aee3d14a8b0e3e12d4e2880c4df1e00",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"malformed gzip stream: corrupt deflate stream\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-bad-isize.adz",
+        "sha256": "52a92903e04259a5bb6e883978b679ba3a8f4cccc3fe9495d8097a9151f5e465",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"malformed gzip stream: corrupt gzip stream does not have a matching checksum\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-bomb.adz",
+        "sha256": "6856a8e117c7a95a8a959708fe3c4aa174f2e9bfdc9526faa3365cdfb67e0ab1",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"decompressed output exceeds the 2097152-byte plausible-ADF limit\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-member-overlimit.adz",
+        "sha256": "0885d558280179983b36b4a9ecc9fa026d18e4d1daf6273307d701f591d62668",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"decompressed output exceeds the 2097152-byte plausible-ADF limit\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-second-bad.adz",
+        "sha256": "e4da16c456f8a7fb03b8efab2595ef3cebf299eadc4bceaf7b2614a2ea5b73ad",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"malformed gzip stream: unexpected end of file\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-small.adz",
+        "sha256": "e705a1bbdfd1ab1a7730cbbc6440011734247988b400e8e9f53489926905367a",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"decompressed output is smaller than one Amiga boot block\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-split-members.adz",
+        "sha256": "242df8d726bc994986cb87c54808cecde94608b24f43702dc3f48037b5d36e35",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-trailing-garbage.adz",
+        "sha256": "601634d58e76fb3add1e906eb2e4fa47214c77e4f0a58216d6dde1a942da9f34",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"malformed gzip stream: invalid gzip header\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "gzip-truncated.adz",
+        "sha256": "11604f45f6bcd5df61f53f242509cd263a3bc76c93185a3692b1f71c96aa4b06",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"malformed gzip stream: unexpected end of file\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "loader-1802240.adf",
+        "sha256": "b9dc3271b159e459078e889745926c835f2ad168a42f0b2c8eaf5e913fea4224",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "loader-1802240.adz",
+        "sha256": "ce3d634d6cf376dccf09d17fcdb3bf3d7a28c7e6fb2eaa947ca025c236f1ca5f",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "loader-901120.adf",
+        "sha256": "1121cb51bc7c1e35466b9b1126bbcf6675788dcae8877187f3b3d0fe6bae93e8",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "loader-901120.adz",
+        "sha256": "c12890cfa4137d6f2de5357ab9bfa4c86e7f159b5bd2f7d85885f8d5a40fc34e",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "ndos.adf",
+        "sha256": "65379c9e0d3ac73f61d7ee291a7d30163c0c311113837acd32323dd51380fc13",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "ndos.adz",
+        "sha256": "339f694e886b8db0c13bd5c954358499cd1fd11b2898e66ec5e01ef1a4da761f",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "not-gzip.adz",
+        "sha256": "d72ab7b94c4b1aa12d4f98c950a2b8ae96c026d0f2fe782a3dc59d801b1720fa",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"not a gzip-wrapped file\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "random.adf",
+        "sha256": "4b666aa165432b967453c89227aef545ea1c325c2444f72a34ac867018f16ce9",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "random.adz",
+        "sha256": "14632a083161558f636e1b86535681d60cfa19ccae0fa4ecbfb3dac329092a94",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "rdb-standard-bad-root.adf",
+        "sha256": "b5ee38a095e55f1b5a229dcd7bb320c41d037b3ce6b9da0c2ed749357171ef67",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: InvalidBlockType\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "rdb-standard-bad-root.adz",
+        "sha256": "ca18e15f099bd67b3d9e59432a9af1445ad5314336baca452a482371dfc1009c",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: InvalidBlockType\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unknown.adf",
+        "sha256": "c0cfd75b631e831bdd42e43a01b14eceddabc4f230b606b5332edfc5db563141",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unknown.adz",
+        "sha256": "9c67c194f708b58c744a5c8aa456f964e32c5f3b6588a333c0fe5247d5bfc582",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-1000000.adf",
+        "sha256": "21e83d8b7d7e3f8cd4fba0533f90d659213b9f4a349d9eedcfcca04921ef97dc",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidPartitionRange\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-1000000.adz",
+        "sha256": "8f5f87fb139c0568583d37d2e6f2c4de49a63a6d3fdce49abd2a46ecea26e397",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidPartitionRange\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-16384.adf",
+        "sha256": "1e50cea676f4775ad9176a8d493661a505df9e7d2c681db6a9fe715895e2fea3",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: BlockOutOfRange\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-16384.adz",
+        "sha256": "19c57b822788ba85bb65279814aae3ed9c9943ba47bfbf262ee154579334ccc1",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: BlockOutOfRange\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-450560.adf",
+        "sha256": "9db0c090d1aca66c6777efc982cb9004c0956a9d4d0340189314f34aa6cdac55",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: BlockOutOfRange\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-450560.adz",
+        "sha256": "c372d7169cb9cf7fe64dd7c59c5f0f1148de72b8e5e7ab1bcb144a6ee30b9446",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: BlockOutOfRange\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-819200.adf",
+        "sha256": "7eac438ffcf33dce6e559aa690c45014d0ef703fc6df450a4176c1e4c283361c",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: InvalidBlockType\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-819200.adz",
+        "sha256": "34d68de54a58989d34b0db0eff1eb302998163c44f93a62937d6a2ce5160d20f",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidFilesystem(\\\"512-byte OFS/FFS reader rejected boot/root metadata: InvalidBlockType\\\")\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-901119.adf",
+        "sha256": "4e25fb093e73f0d86e6401e85ba72b18bc280a086adece4fdef987baeaf68b97",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidPartitionRange\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-901119.adz",
+        "sha256": "bcaa8a3f9d351d8fa3224cfea34e5c699538955c2a1003e863b1ca9d94af132d",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidPartitionRange\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-901121.adf",
+        "sha256": "9e7e7241ad3f1e9b6e58ec2d253a2a68a9d824dd90831a72dbb6456fe207c38b",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidPartitionRange\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-901121.adz",
+        "sha256": "d37342a41d23e1e2e13712147089df8478494511f27f98a559a9f38ae7dd83f6",
+        "outcome": "InvalidContent",
+        "reason": "Some(InvalidContent(\"InvalidPartitionRange\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-912384.adf",
+        "sha256": "202e4e92fdbb6730a9f97b33ee621e339a5cd729a675346e664d19f4483924d8",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-912384.adz",
+        "sha256": "c2375661c263208429fa3c9f7b4154e6cd279138081cbfe06a2adebbb956cdbb",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-923648.adf",
+        "sha256": "b8a9cbbac7bbaacafbb52aacd22c1338bce784513e865412d2f51ad4414082f9",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "unvalidated-923648.adz",
+        "sha256": "e8b7e8d28cc9d4d405f31ca39318e35ce69e90e77adf48f44dede97e851a9095",
+        "outcome": "Skipped/Weak",
+        "reason": "Some(RecognizedContentNoIdentityMatch)",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-2097152.adf",
+        "sha256": "63ad9be6262ebd4e3b1387723abd90932de4494f7833342374f3cb7b162eb318",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-2097152.adz",
+        "sha256": "e9e15600e9c56aadbf55c6f5f46e984712152a4daee7084ef7fa0f7d1ecb25c4",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-65536.adf",
+        "sha256": "c6bfb6b00e3d9955a0ab36d99ab82d8226e14b2622c57ed0f0eafab12e487e31",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-65536.adz",
+        "sha256": "86a02f7e055e1522729e68fc11d8f1589c4d0d1f8155e1bf889bddb8032645ac",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-819200.adf",
+        "sha256": "6a55ff03ae5ee07cffdc406f2e7953907f53dfafbb12fe822c9b3d96937cd3c0",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-819200.adz",
+        "sha256": "912fac77393aa99a5e0cd0a3c91eb79bd239834a9f67a99a130e601f9e01682f",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-912384.adf",
+        "sha256": "e1e6a31079f6daa08ec98a4aeb2b53501531e7a270a2fac5548272027c9cbf44",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-912384.adz",
+        "sha256": "c3e5834c20bc5a422d305f1b3926079ce39b5e0e44468b55a681b89200f87c97",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-923648.adf",
+        "sha256": "989fe4cbc92ff1a202bbd5fecde72b1f7512af6b55a0feedab4667874c0aeff8",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "valid-923648.adz",
+        "sha256": "1f66590a0837fd78e675087f67bfc3edceed51c57b975a56cf2c77f6a8a460da",
+        "outcome": "Accepted/Strong",
+        "reason": "None",
+        "platform": "Some(\"Amiga\")",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "zero.adf",
+        "sha256": "df62f37da18a38aea318c9312b32b445901c0f16934f25259f758a50277bf7f0",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      },
+      {
+        "fixture": "zero.adz",
+        "sha256": "e48678f07a5de0c069fc7a06ac2d8bbfc0f92143fca4dae4084165247fbc5bc3",
+        "outcome": "UnsupportedContent",
+        "reason": "Some(UnsupportedContent(\"Amiga disk inspection error: NoRdb\"))",
+        "platform": "None",
+        "identity": "None",
+        "exact_expected_output_matched": true
+      }
+    ]
+  },
+  "validation": [
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "source_ownership",
+        "--",
+        "--test-threads=2"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 487.89,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/green-unit.log",
+      "name": "green-unit",
+      "log_sha256": "27a8bd19c26f28bd1aa2a9bff8b2248cacc6e38d7dba974470c8607318e757ff",
+      "summaries": [
+        "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 11884 filtered out; finished in 0.08s"
+      ],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "amiga",
+        "--",
+        "--test-threads=2"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 5.13,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/amiga.log",
+      "name": "amiga",
+      "log_sha256": "0c8d5ffa4ef4ed7511868f901096b866b799865e53b3c95b3a99746e82af1c55",
+      "summaries": [
+        "test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 11735 filtered out; finished in 4.40s"
+      ],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "ingestion::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.36,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/ingestion.log",
+      "name": "ingestion",
+      "log_sha256": "8979e00c7daf4c7646e5a27be2be74d9be8fef911a7cfa11cde18f73f26d8d83",
+      "summaries": [
+        "test result: ok. 90 passed; 0 failed; 0 ignored; 0 measured; 11809 filtered out; finished in 0.76s"
+      ],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "whdload",
+        "--",
+        "--test-threads=2"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.28,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/whdload.log",
+      "name": "whdload",
+      "log_sha256": "0b4e2bb9638d193fae22f0a47803982aa06c562922bf9d9a0f56d75e876ecc1e",
+      "summaries": [
+        "test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 11822 filtered out; finished in 2.57s"
+      ],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "media_set::tests",
+        "--",
+        "--test-threads=2"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 6.93,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/media-set.log",
+      "name": "media-set",
+      "log_sha256": "21734a0b2615a9b9f659529ec01edd2b06cd74662afdfb54b9cdfd209cb5ddc9",
+      "summaries": [
+        "test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 11842 filtered out; finished in 6.29s"
+      ],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib",
+        "--",
+        "unsupported_media_and_inspection_failures_survive_persistence",
+        "recognised_unverified_and_unsupported_status_survive_persistence",
+        "--test-threads=2"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 1.56,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/database.log",
+      "name": "database",
+      "log_sha256": "e91afd4a6b35aaf601161c5c6b13bc2cd747f574b41576e316fa4579e12e7b49",
+      "summaries": [
+        "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 11897 filtered out; finished in 0.97s"
+      ],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "build",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-core",
+        "--lib"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 189.21,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/core-library.log",
+      "name": "core-library",
+      "log_sha256": "8825703071face04603ea74b83185c7fc1aa2a305cc3f077fd540d95a7a62ce5",
+      "summaries": [],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "archivefs-gui",
+        "--lib",
+        "--",
+        "selected_evidence_page::tests",
+        "collection_discovery_page::tests",
+        "--test-threads=2"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 350.25,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/gui.log",
+      "name": "gui",
+      "log_sha256": "5bd447c6017715d9b81d9803ff43997c7e3536c412b4fe7d23d516a199255d1c",
+      "summaries": [
+        "test result: ok. 58 passed; 0 failed; 2 ignored; 0 measured; 3660 filtered out; finished in 2.99s"
+      ],
+      "ignored": [
+        "test selected_evidence_page::tests::live_fast_pass_real_game_boy_completes_quickly ... ignored, live path; run explicitly with --ignored on the QA machine",
+        "test selected_evidence_page::tests::live_fast_pass_real_ps2_iso_surfaces_serial_without_full_hash ... ignored, live path; run explicitly with --ignored on the QA machine"
+      ]
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 16.79,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/formatting.log",
+      "name": "formatting",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "summaries": [],
+      "ignored": []
+    },
+    {
+      "command": [
+        "scripts/cargo-iso",
+        "--low-debug",
+        "check",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-targets"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 378.37,
+      "log": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/workspace.log",
+      "name": "workspace",
+      "log_sha256": "cffa73d320501944703104e72035807e45e896198c9c286c5629e2b708741129",
+      "summaries": [],
+      "ignored": []
+    }
+  ],
+  "private_execution_roots": {
+    "HOME": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/home",
+    "TMPDIR": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/tmp",
+    "XDG_CONFIG_HOME": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/config",
+    "XDG_DATA_HOME": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/data",
+    "XDG_STATE_HOME": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/state",
+    "XDG_CACHE_HOME": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/cache",
+    "XDG_RUNTIME_DIR": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/run",
+    "EMUWIZ_CONFIG_HOME": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/config",
+    "EMUWIZ_DATA_HOME": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/data",
+    "CARGO_HOME": "/home/davedap/.cargo",
+    "RUSTUP_HOME": "/home/davedap/.rustup",
+    "EMUWIZ_TARGET_ROOT": "/home/davedap/.cache/emuwiz-cargo-targets",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "4",
+    "RUST_TEST_THREADS": "2",
+    "LC_ALL": "C.UTF-8",
+    "TZ": "UTC"
+  },
+  "cargo_ownership": {
+    "canonical_worktree": "/home/davedap/emuwiz-amiga-source-path-replacement",
+    "path_hash": "7afe7fbb1705",
+    "cargo_target": "/home/davedap/.cache/emuwiz-cargo-targets/emuwiz-amiga-source-path-replacement-7afe7fbb1705"
+  },
+  "main_baseline": {
+    "named_main": "7f2c7e6327a6ed3c05328b947b42052db6af7fa7",
+    "observed_main": "f7debf0d111ce386650f34fb814312d18701a653",
+    "origin_main": "f7debf0d111ce386650f34fb814312d18701a653",
+    "merge_base": "1203d8bcba77da51461c2b04260518fe56820234",
+    "named_main_ancestor_of_observed": true,
+    "shared_primitive_blob_at_candidate": "a1df182f5eed191017c568db71f408cbbc7af789",
+    "shared_primitive_blob_at_observed_main": "a1df182f5eed191017c568db71f408cbbc7af789",
+    "primitive_unchanged": true
+  },
+  "integration_compatibility": {
+    "main": "f7debf0d111ce386650f34fb814312d18701a653",
+    "original_stack_tip": "0235ded1f95f8322f8b3bb140b452f44f9d99dc6",
+    "base": "1203d8bcba77da51461c2b04260518fe56820234",
+    "main_only_files": [
+      "Cargo.lock",
+      "crates/archivefs-cli/src/repair.rs",
+      "crates/archivefs-cli/src/repair/chd_recovery.rs",
+      "crates/archivefs-cli/tests/fixtures/chd_rollback_journal_fault.c",
+      "crates/archivefs-cli/tests/repair_rollback_exit_code.rs",
+      "crates/archivefs-cli/tests/repair_rollback_exit_code/chd_journal_faults.rs",
+      "crates/archivefs-core/Cargo.toml",
+      "crates/archivefs-core/examples/homebrew_discover.rs",
+      "crates/archivefs-core/src/arcade_compatibility.rs",
+      "crates/archivefs-core/src/arcade_mame_compatibility.rs",
+      "crates/archivefs-core/src/arcade_mame_compatibility/dependencies.rs",
+      "crates/archivefs-core/src/dat/dependency/resolve.rs",
+      "crates/archivefs-core/src/dat/model.rs",
+      "crates/archivefs-core/src/dat/parsers/clrmamepro.rs",
+      "crates/archivefs-core/src/dat/parsers/logiqx.rs",
+      "crates/archivefs-core/src/dat/parsers/mame_listxml.rs",
+      "crates/archivefs-core/src/diagnostics/arcade_version_probe/tests.rs",
+      "crates/archivefs-core/src/homebrew_catalogue.rs",
+      "crates/archivefs-core/src/homebrew_catalogue/tests.rs",
+      "crates/archivefs-core/src/homebrew_catalogue/validation.rs",
+      "crates/archivefs-core/src/ingestion/cue_preservation.rs",
+      "crates/archivefs-core/src/ingestion/mod.rs",
+      "crates/archivefs-core/src/lib.rs",
+      "crates/archivefs-core/src/mame_collection_stats.rs",
+      "crates/archivefs-core/src/repair/adapter.rs",
+      "crates/archivefs-core/src/repair/library_tests.rs",
+      "crates/archivefs-core/src/repair/mod.rs",
+      "crates/archivefs-core/src/repair/optical_conversion.rs",
+      "crates/archivefs-core/src/repair/optical_conversion/tests.rs",
+      "crates/archivefs-core/tests/cue_preservation_evidence.rs",
+      "crates/archivefs-core/tests/fixtures/homebrew/starter-catalogue.json",
+      "crates/archivefs-core/tests/homebrew_discover_output.py",
+      "crates/archivefs-core/tests/mame_dependency_correctness.rs",
+      "crates/archivefs-core/tests/mame_dependency_review_correction.rs",
+      "crates/archivefs-gui/src/dat_sources_page.rs",
+      "crates/archivefs-gui/src/dat_sources_page/tests.rs",
+      "crates/archivefs-gui/src/gui_v2/pages.rs",
+      "crates/archivefs-gui/src/gui_v2/simple_shell.rs",
+      "crates/archivefs-gui/src/gui_v2/tests/simple_shell_ui.rs",
+      "crates/archivefs-gui/src/optical_conversion_page.rs",
+      "crates/archivefs-gui/src/repair_history_page.rs",
+      "crates/archivefs-gui/src/repair_history_page/tests.rs",
+      "docs/design/HOMEBREW_LOCAL_DISCOVERY.md",
+      "docs/design/cue_bin_preservation_evidence.json",
+      "docs/design/mame_dependency_correctness_evidence.json",
+      "docs/design/mame_dependency_review_correction_evidence.json",
+      "docs/qa/GUI_SLICE2_SPECIFICATION.md"
+    ],
+    "original_stack_files": [
+      "crates/archivefs-core/src/amiga_adf_trainer/media.rs",
+      "crates/archivefs-core/src/amiga_adf_trainer/tests.rs",
+      "crates/archivefs-core/src/amiga_adz.rs",
+      "crates/archivefs-core/src/amiga_adz/tests.rs",
+      "crates/archivefs-core/src/amiga_disk/filesystem.rs",
+      "crates/archivefs-core/src/amiga_disk/mod.rs",
+      "crates/archivefs-core/src/amiga_disk/tests.rs",
+      "crates/archivefs-core/src/database.rs",
+      "crates/archivefs-core/src/ingestion/discovery.rs",
+      "crates/archivefs-core/src/ingestion/tests.rs",
+      "crates/archivefs-core/src/media_set/adapters.rs",
+      "crates/archivefs-core/src/media_set/tests.rs",
+      "crates/archivefs-gui/src/collection_discovery_page.rs",
+      "crates/archivefs-gui/src/selected_evidence_page.rs"
+    ],
+    "stack_overlap_with_main": [],
+    "correction_overlap_with_main": [],
+    "original_stack_merge_tree_exit_code": 0,
+    "original_stack_merge_tree": [
+      "35832c33db4ef2e0f269445f188d0c06dddad267"
+    ],
+    "integration_performed": false,
+    "combined_tree_compiled": false
+  },
+  "compatibility_limit": "The stack and scoped correction are disjoint from later main changes and merge-tree is conflict-free. The combined tree was not integrated or compiled. Exact committed correction merge-tree verification is recorded separately after commit.",
+  "residual_filesystem_limitations": [
+    "The final pathname check is a point-in-time check. Another process can replace the pathname immediately afterward; this is not permanent source locking or an atomic filesystem snapshot.",
+    "Metadata identity checks cannot guarantee detection of every in-place edit when size/timestamps are restored or indistinguishable at filesystem timestamp granularity. Device/inode checks still detect replacement while the inspected descriptor remains open."
+  ],
+  "evidence_contract": "Strong means the existing bounded OFS/FFS boot/root metadata checks passed. It establishes no full filesystem or dump integrity, game identity, launch readiness or trainer availability.",
+  "preserved_review_artifacts": {
+    "reviewed_sha": "0235ded1f95f8322f8b3bb140b452f44f9d99dc6",
+    "verdict": "FAIL",
+    "preserved_artifact_sha256": {
+      "report.json": "cd5596f6aae17aee434b46b76c11905f7173dac019a8dd38f770bcd1fbc1489e",
+      "source_replacement_regression.py": "b4ff38da648780ad855214edcc2b063d3dcd09611d541f5ee3050a6bc542e9d8",
+      "race.c": "e32f6485b67919df85bc7a94d940f106728f6cd1d77d26413f673e5d09bbd061",
+      "bin/race.so": "9c91917b8225d5372dd8812ee5c4b31f4ab1d285f3e1311d19afa6e2fdb559d9",
+      "probe.rs": "1bd440b68a521408cdcb1587b0bc9026483bff3fd5df14abeebdab63ca0e90e8",
+      "after-matrix.tsv": "94c06ace414df9cf58d239385cb37e0634b07910347ef12cd56e644431f6827a"
+    },
+    "source_read_only": true
+  },
+  "artifacts": {
+    "red-supported-unit.log": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/red-supported-unit.log",
+      "sha256": "d6b30d3ca26f4816230e79e1493dd14d2f52e342fd1ca4fe173140fc5f5b9c5c"
+    },
+    "red-supported-test-only.patch": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/red-supported-test-only.patch",
+      "sha256": "aa858fa3ad7a76329cdc321e2568951100fac15310f97e560ab6d17bdaffa148"
+    },
+    "red-supported-source-identity.rs": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/red-supported-source-identity.rs",
+      "sha256": "95ba48b9886e0bedf737069b25e4af2390700e3efa8e498afe9820ffbb31b23c"
+    },
+    "red-independent/replacement-regression-results.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/red-independent/replacement-regression-results.json",
+      "sha256": "1ded493738cb3c9d039f9c153ac05b2c257a8931c226b3412f993799129d1920"
+    },
+    "red-independent/same-size-restored-mtime.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/red-independent/same-size-restored-mtime.json",
+      "sha256": "496cb87d71eb35203aa2ac62e7f417eb02b5c736d5ace3b8090637dcd3059d82"
+    },
+    "green-unit.log": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/green-unit.log",
+      "sha256": "27a8bd19c26f28bd1aa2a9bff8b2248cacc6e38d7dba974470c8607318e757ff"
+    },
+    "green-independent/replacement-regression-results.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/green-independent/replacement-regression-results.json",
+      "sha256": "1bea3c61e8dbc9e3f8aa075be9077606d66232a2904f15fb346bf9840264a312"
+    },
+    "green-same-size-restored-mtime.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/green-same-size-restored-mtime.json",
+      "sha256": "e9a2f6c47efde6069bfce8e4df766baa975372551cc0233d1dbd61c4b4d085ca"
+    },
+    "green-stable-matrix.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/green-stable-matrix.json",
+      "sha256": "c4371e2d20295dd1cf11b665f007fd94f8d70630c8e369076d5acabc712f8c92"
+    },
+    "parser-preservation.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/parser-preservation.json",
+      "sha256": "695a4cb07cf43483b547daa4d222f00ff8a491faa294f3313f18b6fcea8bc839"
+    },
+    "compatibility-before-correction.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/compatibility-before-correction.json",
+      "sha256": "0a35d877467c818571c30447c60a330306bd26d2da7175cee9fb588a58fed904"
+    },
+    "probe-build.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/probe-build.json",
+      "sha256": "6f7d114303395b635706c2a0f3b6dcb6c84db3faf2743579deb3bcc2a24de40e"
+    },
+    "regression-plan.json": {
+      "path": "/tmp/emuwiz-amiga-source-replacement-kb0j1q66/regression-plan.json",
+      "sha256": "8c3823563876976ec1f90acb5334dd9270108cd8b360985a5c376a53f7251618"
+    }
+  },
+  "implementation_attempts": 1,
+  "independent_review": "Required by a different agent on the exact final local commit. No push, merge or promotion performed."
+}
