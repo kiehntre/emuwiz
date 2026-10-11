@@ -19,6 +19,69 @@ pub(crate) const BODY_SIZE: f32 = 16.0;
 pub(crate) const METADATA_SIZE: f32 = 14.0;
 pub(crate) const TECHNICAL_SIZE: f32 = 12.0;
 
+/// The four typography roles. Each is an egui `TextStyle` held in the context
+/// style, so a profile (Classic, Blue) re-sizes a role by overwriting that one
+/// slot and every page that asks for the role follows it. `Body` is egui's own
+/// `TextStyle::Body`; the other three are named styles registered by [`apply`]
+/// and by the Blue profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextRole {
+    PageTitle,
+    SectionTitle,
+    CardTitle,
+    Body,
+}
+
+impl TextRole {
+    pub(crate) fn text_style(self) -> egui::TextStyle {
+        match self {
+            // The page title is egui's heading, so `ui.heading` and the role
+            // can never disagree.
+            Self::PageTitle => egui::TextStyle::Heading,
+            Self::SectionTitle => egui::TextStyle::Name("emuwiz-section-title".into()),
+            Self::CardTitle => egui::TextStyle::Name("emuwiz-card-title".into()),
+            Self::Body => egui::TextStyle::Body,
+        }
+    }
+}
+
+/// Classic role sizes. Card titles keep the size existing cards already use
+/// (egui's heading) so Classic is unchanged at 100%; Blue sets its own scale.
+pub(crate) fn set_role_sizes(style: &mut egui::Style, page: f32, section: f32, card: f32) {
+    let font = |size: f32| egui::FontId::new(size, egui::FontFamily::Proportional);
+    style
+        .text_styles
+        .insert(TextRole::PageTitle.text_style(), font(page));
+    style
+        .text_styles
+        .insert(TextRole::SectionTitle.text_style(), font(section));
+    style
+        .text_styles
+        .insert(TextRole::CardTitle.text_style(), font(card));
+}
+
+/// Page title text: the largest role, once per page.
+pub(crate) fn page_title(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text)
+        .text_style(TextRole::PageTitle.text_style())
+        .strong()
+}
+
+/// A titled block within a page ("Things you can do", "Screenshots").
+pub(crate) fn section_title(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text)
+        .text_style(TextRole::SectionTitle.text_style())
+        .strong()
+}
+
+/// The title of one card or panel. Smaller than a section title in Blue; in
+/// Classic it keeps the size cards have always had.
+pub(crate) fn card_title(text: impl Into<String>) -> egui::RichText {
+    egui::RichText::new(text)
+        .text_style(TextRole::CardTitle.text_style())
+        .strong()
+}
+
 /// Shared v2 application surfaces and semantic colors. Normal routes use this
 /// module rather than page-local chrome tokens.
 pub(crate) const APP_BACKGROUND: egui::Color32 = egui::Color32::from_rgb(13, 21, 19);
@@ -78,6 +141,7 @@ pub(crate) fn apply(context: &egui::Context) {
             egui::TextStyle::Small,
             egui::FontId::new(METADATA_SIZE, egui::FontFamily::Proportional),
         );
+        set_role_sizes(style, PAGE_TITLE_SIZE, SECTION_TITLE_SIZE, PAGE_TITLE_SIZE);
         style.spacing.item_spacing = egui::vec2(SPACE_MD, SPACE_SM);
         style.spacing.button_padding = egui::vec2(SPACE_MD, 7.0);
         style.spacing.interact_size.y = 30.0;

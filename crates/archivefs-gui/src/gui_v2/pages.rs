@@ -357,6 +357,9 @@ impl App {
             self.go(Route::Home);
         }
         egui::TopBottomPanel::bottom("v2_activity_bar").show(context, |ui| {
+            // One row while it fits: summary, the running job, then the
+            // actions. It wraps to a second row only in a narrow window, so
+            // the page body keeps the height.
             ui.horizontal_wrapped(|ui| {
                 let running = self.activity.running();
                 let queued = self.activity.queued();
@@ -370,6 +373,16 @@ impl App {
                         "{} active jobs · {running} running · {queued} waiting",
                         running + queued
                     ));
+                }
+                if let Some(job) = self
+                    .activity
+                    .jobs
+                    .values()
+                    .rev()
+                    .find(|job| job.phase == Phase::Running)
+                    && super::job_card::show_inline(ui, job).cancel
+                {
+                    job.request_cancel();
                 }
                 let failed = self.activity.failed();
                 if failed > 0
@@ -392,17 +405,6 @@ impl App {
                     self.go(Route::Section(Section::Activity));
                 }
             });
-            if let Some(job) = self
-                .activity
-                .jobs
-                .values()
-                .rev()
-                .find(|job| job.phase == Phase::Running)
-            {
-                if super::job_card::show(ui, job, true).cancel {
-                    job.request_cancel();
-                }
-            }
         });
         // Classic: the header spans the window. Simple: the sidebar runs the
         // full height and the header starts beside it, so it is added first.
@@ -583,7 +585,23 @@ impl App {
             // does not, so the selected game and its Play button stay in view.
             if let Route::BrowsePlay | Route::BrowsePlayGame(_) = route {
                 let selected = route.game();
-                self.browse_play(ui, selected);
+                if ui.available_height() < super::browse_play::MIN_BODY_HEIGHT {
+                    // A large size on a small window: keep the application
+                    // layout at a usable height and let the page scroll to it,
+                    // so Play is reachable instead of cut off.
+                    egui::ScrollArea::vertical()
+                        .id_salt("v2_browse_play_page")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let width = ui.available_width();
+                            ui.allocate_ui(
+                                egui::vec2(width, super::browse_play::MIN_BODY_HEIGHT),
+                                |ui| self.browse_play(ui, selected),
+                            );
+                        });
+                } else {
+                    self.browse_play(ui, selected);
+                }
                 return;
             }
             super::simple_shell::show_page_scroll(
@@ -830,23 +848,40 @@ impl App {
                     self.go(Route::Home);
                 }
                 ui.separator();
+                // The trail may use what the right-hand controls leave, so a
+                // long title is cut here rather than pushing Jump to out.
+                let button_font = egui::TextStyle::Button.resolve(ui.style());
+                let pad = 2.0 * ui.spacing().button_padding.x + ui.spacing().item_spacing.x;
+                let mut reserve = super::title_fit::text_width(ui, "Jump to…", &button_font) + pad;
+                if self.simple.enabled {
+                    reserve += super::title_fit::text_width(ui, "Simple view", &button_font) + pad;
+                }
                 ui.push_id("v2_breadcrumbs", |ui| {
                     ui.horizontal(|ui| {
+                        let last_index = breadcrumbs.len().saturating_sub(1);
                         for (index, label) in breadcrumbs.iter().enumerate() {
                             if index > 0 {
                                 ui.label("›");
                             }
-                            let is_game = index + 1 == breadcrumbs.len() && route.game().is_some();
+                            let is_game = index == last_index && route.game().is_some();
+                            let font = egui::TextStyle::Body.resolve(ui.style());
+                            let budget = if index == last_index {
+                                ui.available_width() - reserve - if is_game { pad } else { 0.0 }
+                            } else {
+                                (ui.available_width() * 0.4).max(120.0)
+                            };
+                            let shown = super::title_fit::fit(ui, label, &font, budget);
                             if is_game {
-                                if ui
-                                    .button(egui::RichText::new(label).strong())
-                                    .on_hover_text("Open Game Details.")
-                                    .clicked()
-                                {
+                                let response = ui
+                                    .button(egui::RichText::new(&shown).strong())
+                                    .on_hover_text(format!("{label}\nOpen Game Details."));
+                                if response.clicked() {
                                     if let Some(id) = route.game() {
                                         self.go(Route::Game(id));
                                     }
                                 }
+                            } else if shown != *label {
+                                ui.strong(&shown).on_hover_text(label.as_str());
                             } else {
                                 ui.strong(label);
                             }
@@ -967,7 +1002,7 @@ impl App {
             return;
         }
         ui.push_id("v2_simple_breadcrumbs", |ui| {
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if self.router.can_back()
                     && ui
@@ -978,24 +1013,39 @@ impl App {
                     self.back();
                 }
                 let muted = super::simple_shell::palette::SECONDARY_TEXT;
+                let body = egui::TextStyle::Body.resolve(ui.style());
                 for (index, label) in breadcrumbs.iter().enumerate() {
                     if index > 0 || self.router.can_back() {
                         ui.label(egui::RichText::new("/").color(muted));
                     }
                     let last = index + 1 == breadcrumbs.len();
+                    // Parents keep their natural width up to 40% of the row;
+                    // the current location takes what remains, then elides.
+                    let budget = if last {
+                        ui.available_width() - 4.0
+                    } else {
+                        (ui.available_width() * 0.4).max(120.0)
+                    };
+                    let shown = super::title_fit::fit(ui, label, &body, budget);
                     if last && route.game().is_some() {
                         if ui
-                            .link(egui::RichText::new(label).strong())
-                            .on_hover_text("Open Game Details.")
+                            .link(egui::RichText::new(&shown).strong())
+                            .on_hover_text(format!("{label}\nOpen Game Details."))
                             .clicked()
                             && let Some(id) = route.game()
                         {
                             self.go(Route::Game(id));
                         }
                     } else if last {
-                        ui.label(egui::RichText::new(label).strong());
+                        let response = ui.label(egui::RichText::new(&shown).strong());
+                        if shown != *label {
+                            response.on_hover_text(label.as_str());
+                        }
                     } else {
-                        ui.label(egui::RichText::new(label).color(muted));
+                        let response = ui.label(egui::RichText::new(&shown).color(muted));
+                        if shown != *label {
+                            response.on_hover_text(label.as_str());
+                        }
                     }
                 }
             });
@@ -1044,12 +1094,12 @@ impl App {
     /// Settings controls for the opt-in Simple v1 shell.
     fn simple_shell_settings(&mut self, ui: &mut egui::Ui) {
         // First, so recovery from a too-large size is the first thing reached.
-        ui.heading(format!(
+        ui.label(theme::card_title(format!(
             "Text and interface size: {}%",
             (self.simple.ui_scale * 100.0).round() as u32
-        ));
+        )));
         self.interface_scale_controls(ui);
-        ui.heading("Simple view (preview)");
+        ui.label(theme::card_title("Simple view (preview)"));
         ui.label("A shorter sidebar with seven destinations and a blue colour scheme. It changes how EmuWiz looks, not what it does: every tool stays available through All Tools at the top right.");
         if ui
             .checkbox(&mut self.simple.enabled, "Use the Simple view")
@@ -1162,7 +1212,7 @@ impl App {
     fn home(&mut self, ui: &mut egui::Ui) {
         self.home_hero(ui);
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.heading("Browse & Play");
+            ui.label(theme::card_title("Browse & Play"));
             ui.label("A simple game-first view for platforms, artwork and launching.");
             if primary(ui, "Browse & Play") {
                 self.go(Route::BrowsePlay);
@@ -1184,15 +1234,11 @@ impl App {
             self.home_systems(ui);
             self.home_showcase(ui);
             ui.add_space(theme::SPACE_SM);
-            ui.label(
-                RichText::new("Things you can do")
-                    .size(theme::SECTION_TITLE_SIZE)
-                    .strong(),
-            );
+            ui.label(theme::section_title("Things you can do"));
         }
         for (section, title, purpose, action) in HOME_TASKS {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_width(ui.available_width()); ui.heading(*title); ui.label(*purpose);
+                ui.set_min_width(ui.available_width()); ui.label(theme::card_title(*title)); ui.label(*purpose);
                 if primary(ui, action) { self.go(Route::Section(*section)); }
                 ui.label(match section { Section::Games | Section::Launch | Section::Mods => "Next: choose a platform or game.", _ => "Next: review setup and continue in the existing workflow. Nothing changes by opening it." });
             });
@@ -1623,7 +1669,7 @@ impl App {
             .collect();
         ui.add_space(theme::SPACE_SM);
         ui.horizontal_wrapped(|ui| {
-            ui.heading(&selected_platform);
+            ui.label(theme::card_title(&selected_platform));
             ui.label(format!("{} title(s) in the current catalogue", games.len()));
             if ui.button("Open this platform in Games").clicked() {
                 self.go(Route::Section(Section::Games));
@@ -1719,11 +1765,11 @@ impl App {
             self.go(Route::QuickRename);
         }
         if self.check_platform.is_none() {
-            ui.heading("Choose a platform");
+            ui.label(theme::card_title("Choose a platform"));
             for (platform, count) in self.library.platforms.clone() {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.heading(&platform);
+                    ui.label(theme::card_title(&platform));
                     ui.label(format!("{count} games"));
                     if platform.eq_ignore_ascii_case("Arcade") {
                         ui.label("MAME Arcade verification data ready");
@@ -1739,7 +1785,7 @@ impl App {
             return;
         }
         let platform = self.check_platform.clone().unwrap_or_default();
-        ui.heading(format!("{platform} games"));
+        ui.label(theme::card_title(format!("{platform} games")));
         let summary = self.check_summary(&platform);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
@@ -2457,7 +2503,7 @@ impl App {
                 self.picture(ui, game, Kind::Cover, cover);
                 ui.add_space(theme::SPACE_LG);
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(&game.title).size(theme::PAGE_TITLE_SIZE).strong());
+                    super::title_fit::title_label(ui, &game.title, theme::TextRole::PageTitle, 3);
                     ui.horizontal(|ui| {
                         self.imagery.platform_icon(ui, &game.platform, 28.0);
                         ui.label(RichText::new(format!("{} · {}", game.platform, media_kind_label(&game.archive.archive_kind))).color(theme::muted(ui)));
@@ -2539,7 +2585,7 @@ impl App {
             if matches!(self.artwork.pictures.get(&key), Some(Picture::Failed(_) | Picture::Unavailable { .. })) && ui.button("Retry picture").clicked() { self.artwork.retry(key); }
             if let Some(description) = self.artwork.index.as_ref().and_then(|index| index.descriptions.get(&id)) {
                 ui.add_space(theme::SPACE_MD);
-                ui.label(RichText::new("About this game").size(theme::SECTION_TITLE_SIZE).strong());
+                ui.label(theme::section_title("About this game"));
                 ui.scope(|ui| {
                     // Keep long descriptions at a readable line length.
                     ui.set_max_width(ui.available_width().min(920.0));
@@ -2548,7 +2594,7 @@ impl App {
             }
             let count = self.artwork.index.as_ref().and_then(|index| index.screenshots.get(&id)).map_or(0, Vec::len);
             ui.add_space(theme::SPACE_MD);
-            ui.label(RichText::new("Screenshots").size(theme::SECTION_TITLE_SIZE).strong());
+            ui.label(theme::section_title("Screenshots"));
             if self.artwork.index.is_none() {
                 ui.horizontal(|ui| { ui.spinner(); ui.label("Looking for screenshots…"); });
             } else if count == 0 {
@@ -3364,7 +3410,7 @@ impl App {
         self.setup_portability.render(ui);
         ui.label("Readable text and a permanent sidebar are on by default. The library view and current location are remembered separately from the legacy interface.");
         ui.separator();
-        ui.heading("Beginner guidance");
+        ui.label(theme::card_title("Beginner guidance"));
         ui.label("These hints explain EmuWiz terms and suggest next steps. They never remove controls or advanced routes.");
         if ui
             .checkbox(&mut self.beginner_hints_enabled, "Show beginner hints")
@@ -3381,7 +3427,7 @@ impl App {
         });
         ui.label("Advanced tools remain available in the sidebar and through Advanced Details, even when hints are disabled.");
         ui.separator();
-        ui.heading("Local manuals and guides");
+        ui.label(theme::card_title("Local manuals and guides"));
         ui.label("EmuWiz checks each game's folder and these optional folders for documents. It never searches the whole filesystem.");
         if ui.button("Add documentation root").clicked()
             && let Some(root) = rfd::FileDialog::new().pick_folder()

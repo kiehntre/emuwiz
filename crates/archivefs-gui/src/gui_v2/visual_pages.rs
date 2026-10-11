@@ -22,11 +22,7 @@ const PLATFORM_CARD_MIN_WIDTH: f32 = 440.0;
 
 fn section_title(ui: &mut egui::Ui, title: &str, detail: &str) {
     ui.add_space(theme::SPACE_SM);
-    ui.label(
-        RichText::new(title)
-            .size(theme::SECTION_TITLE_SIZE)
-            .strong(),
-    );
+    ui.label(theme::section_title(title));
     ui.label(RichText::new(detail).color(theme::muted(ui)));
     ui.add_space(theme::SPACE_XS);
 }
@@ -90,11 +86,7 @@ impl App {
                     ui.add_space(theme::SPACE_MD);
                 }
                 ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Your game library")
-                            .size(theme::PAGE_TITLE_SIZE)
-                            .strong(),
-                    );
+                    ui.label(theme::page_title("Your game library"));
                     if self.loaded {
                         ui.label(match attention {
                             Some(count) => format!(

@@ -35,6 +35,15 @@ const SELECTED_COVER_SIZE: egui::Vec2 = egui::vec2(150.0, 196.0);
 const COMPACT_COVER_SIZE: egui::Vec2 = egui::vec2(70.0, 92.0);
 /// Below this width the selected-game panel becomes a strip above the shelf.
 const SIDE_BY_SIDE_MIN_WIDTH: f32 = 900.0;
+/// Narrowest the Library search field is allowed to become before the
+/// List/Grid switch moves to its own row.
+const SEARCH_MIN_WIDTH: f32 = 140.0;
+/// Below this height the selected-game panel uses the compact cover so Play
+/// stays beside it instead of below a tall picture.
+const TIGHT_PANEL_HEIGHT: f32 = 440.0;
+/// The shortest body the Library lays itself out in; a shorter window scrolls
+/// the page to it rather than squeezing the shelf and the selected game.
+pub(super) const MIN_BODY_HEIGHT: f32 = 300.0;
 const ATTENTION_TEXT: Color32 = Color32::from_rgb(232, 170, 62);
 
 /// Cached filter result so typing or scrolling never rescans the catalogue.
@@ -191,7 +200,9 @@ impl App {
         let indices = self.browse_play_indices();
         // Decided before anything is drawn: a widget that overflows widens the
         // parent, and the layout below must not be sized from that.
-        let page_width = ui.available_width();
+        // Leaves the right-hand gutter, so the selected-game panel and the
+        // view switch never sit flush against the window edge.
+        let page_width = ui.available_width() - theme::SPACE_MD;
 
         self.browse_play_toolbar(ui);
         ui.add_space(theme::SPACE_XS);
@@ -254,21 +265,51 @@ impl App {
     }
 
     fn browse_play_toolbar(&mut self, ui: &mut egui::Ui) {
+        // The view switch keeps its width; the search takes what is left and
+        // shrinks before it can run over List/Grid. When even a small search
+        // cannot share the row, the switch drops to its own row.
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let pad = 2.0 * ui.spacing().button_padding.x;
+        let gap = ui.spacing().item_spacing.x;
+        let measure = |text: &str| super::title_fit::text_width(ui, text, &font) + pad;
+        let switch = measure("List") + measure("Grid") + gap;
+        let clear = if self.filter.search.is_empty() {
+            0.0
+        } else {
+            measure("Clear") + gap
+        };
+        let available = ui.available_width();
+        let search = (available - switch - clear - gap).min(300.0);
+        let stacked = search < SEARCH_MIN_WIDTH;
+        let search = if stacked {
+            (available - clear - gap).clamp(SEARCH_MIN_WIDTH.min(available), 300.0)
+        } else {
+            search
+        };
+        let view_switch = |this: &mut Self, ui: &mut egui::Ui| {
+            ui.selectable_value(&mut this.filter.list, false, "Grid");
+            ui.selectable_value(&mut this.filter.list, true, "List");
+        };
         ui.horizontal(|ui| {
             ui.add_sized(
-                [300.0, 34.0],
+                [search, 34.0],
                 egui::TextEdit::singleline(&mut self.filter.search)
                     .hint_text("Search by title or system")
-                    .desired_width(300.0),
+                    .desired_width(search),
             );
             if !self.filter.search.is_empty() && ui.button("Clear").clicked() {
                 self.filter.search.clear();
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.selectable_value(&mut self.filter.list, true, "List");
-                ui.selectable_value(&mut self.filter.list, false, "Grid");
-            });
+            if !stacked {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.selectable_value(&mut self.filter.list, true, "List");
+                    ui.selectable_value(&mut self.filter.list, false, "Grid");
+                });
+            }
         });
+        if stacked {
+            ui.horizontal(|ui| view_switch(self, ui));
+        }
     }
 
     fn browse_play_systems(&mut self, ui: &mut egui::Ui, library: &super::library::Library) {
@@ -659,7 +700,10 @@ impl App {
                     let inner = ui.available_width();
                     ui.set_width(inner);
                     let gap = ui.spacing().item_spacing.x;
-                    let cover = if compact {
+                    // A short panel keeps the small cover and puts Play beside
+                    // it, so Play is on screen without scrolling.
+                    let tight = compact || ui.available_height() < TIGHT_PANEL_HEIGHT;
+                    let cover = if tight {
                         COMPACT_COVER_SIZE
                     } else {
                         SELECTED_COVER_SIZE
@@ -670,22 +714,21 @@ impl App {
                             this.picture_tile(ui, game, Kind::Cover, cover);
                             ui.vertical(|ui| {
                                 ui.set_width(text_width);
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&game.title)
-                                            .size(theme::SECTION_TITLE_SIZE)
-                                            .strong()
-                                            .color(theme::PRIMARY_TEXT),
-                                    )
-                                    .wrap(),
+                                super::title_fit::title_label(
+                                    ui,
+                                    &game.title,
+                                    theme::TextRole::SectionTitle,
+                                    2,
                                 );
                                 ui.label(
                                     RichText::new(&game.platform).color(theme::SECONDARY_TEXT),
                                 );
                                 let (status, colour) = status_text(game);
                                 ui.label(RichText::new(status).strong().color(colour));
-                                if compact {
-                                    Self::play_row(this, ui, id, text_width);
+                                if tight {
+                                    // The detail scroll bar takes 12 points.
+                                    let scrollbar = if compact { 0.0 } else { 12.0 };
+                                    Self::play_row(this, ui, id, text_width - scrollbar);
                                 }
                             });
                         });
@@ -710,7 +753,9 @@ impl App {
                                 .wrap(),
                             );
                             ui.add_space(theme::SPACE_SM);
-                            Self::play_row(self, ui, id, inner - 12.0);
+                            if !tight {
+                                Self::play_row(self, ui, id, inner - 12.0);
+                            }
                             ui.add_space(theme::SPACE_LG);
                             ui.label(RichText::new("More for this game").strong());
                             for (label, route) in browse_play_contextual_routes(id) {
@@ -769,7 +814,7 @@ impl App {
             .inner_margin(egui::Margin::same(14))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(RichText::new("Pick a game").size(theme::SECTION_TITLE_SIZE).strong());
+                ui.label(theme::section_title("Pick a game"));
                 ui.label(
                     RichText::new("Choose a game on the left to see its cover and whether it is ready to play.")
                         .color(theme::SECONDARY_TEXT),
@@ -788,17 +833,17 @@ impl App {
                 if library_empty && !self.loaded {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label(RichText::new("Loading your game list…").size(theme::SECTION_TITLE_SIZE).strong());
+                        ui.label(theme::section_title("Loading your game list…"));
                     });
                     ui.label("This can take a moment for a large library. Nothing is being changed.");
                 } else if library_empty {
-                    ui.label(RichText::new("No games have been added yet").size(theme::SECTION_TITLE_SIZE).strong());
+                    ui.label(theme::section_title("No games have been added yet"));
                     ui.label("Add a game folder in Sources & Providers, then scan it into the existing library.");
                     if browse_primary(ui, "Open Sources") {
                         self.go(Route::Section(Section::Sources));
                     }
                 } else {
-                    ui.label(RichText::new("No games match").size(theme::SECTION_TITLE_SIZE).strong());
+                    ui.label(theme::section_title("No games match"));
                     ui.label("Try a different search or system, or clear what you have chosen.");
                     if ui.button("Clear search and system").clicked() {
                         self.filter = Filter {

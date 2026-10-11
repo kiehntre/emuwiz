@@ -632,6 +632,8 @@ fn blue_style(style: &mut egui::Style) {
             egui::TextStyle::Heading,
             egui::FontId::proportional(PAGE_TITLE_SIZE),
         );
+        // Blue's four-step scale: page 32, section 24, card 20, body 18.
+        crate::ui::theme::set_role_sizes(style, PAGE_TITLE_SIZE, 24.0, 20.0);
         style.spacing.button_padding = egui::vec2(16.0, 11.0);
         style.spacing.interact_size.y = 44.0;
         let visuals = &mut style.visuals;

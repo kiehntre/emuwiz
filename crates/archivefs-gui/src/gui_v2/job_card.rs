@@ -162,6 +162,33 @@ pub(super) fn show(ui: &mut egui::Ui, job: &Job, compact: bool) -> JobCardRespon
     response
 }
 
+/// The running job as part of one status-bar row: title, short progress and
+/// Cancel, with no stacked detail rows. The full card lives on Activity.
+pub(super) fn show_inline(ui: &mut egui::Ui, job: &Job) -> JobCardResponse {
+    let text = describe(job);
+    let mut response = JobCardResponse::default();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let title = super::title_fit::fit(ui, &text.title, &font, 260.0);
+    ui.separator();
+    ui.label(egui::RichText::new(title).strong())
+        .on_hover_text(&text.title);
+    let detail = text.counts.clone().or_else(|| text.phase.clone());
+    if let Some(detail) = detail {
+        let shown = super::title_fit::fit(ui, &detail, &font, 240.0);
+        ui.label(shown).on_hover_text(detail);
+    }
+    if let Some(fraction) = job.fraction() {
+        ui.add(egui::ProgressBar::new(fraction).desired_width(110.0));
+    }
+    if job.cancelling() {
+        ui.label("Stopping at a safe point…");
+    }
+    if job.can_cancel() && ui.button("Cancel").clicked() {
+        response.cancel = true;
+    }
+    response
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

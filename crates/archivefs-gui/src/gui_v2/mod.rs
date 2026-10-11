@@ -48,6 +48,7 @@ mod tape_tests;
 #[cfg(test)]
 mod tests;
 mod thumbnail;
+mod title_fit;
 #[cfg(test)]
 mod verify_journey_tests;
 mod visual_pages;
