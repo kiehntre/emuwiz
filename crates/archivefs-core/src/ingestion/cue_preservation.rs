@@ -442,6 +442,26 @@ fn validate_inspection(inspection: &CuePreservationInspection) -> Result<(), Cue
     validate_relationships(inspection)
 }
 
+fn validate_evidence(evidence: &DiscLayoutEvidence) -> Result<(), CuePreservationError> {
+    validate_inspection(&CuePreservationInspection {
+        cue_text: evidence.cue_text.clone(),
+        cue_identity: evidence.cue_identity.clone(),
+        cue_sha256: evidence.cue_sha256.clone(),
+        layout: evidence.layout.clone(),
+        timeline: evidence.timeline.clone(),
+        sources: evidence
+            .sources
+            .iter()
+            .map(|s| (s.path.clone(), s.identity.clone()))
+            .collect(),
+        source_sha256: evidence
+            .sources
+            .iter()
+            .map(|s| s.physical_sha256.clone())
+            .collect(),
+    })
+}
+
 #[derive(Clone, Copy)]
 enum RangeRole {
     Prefix,
@@ -679,6 +699,19 @@ mod tests {
     }
 
     #[test]
+    fn indistinguishable_metadata_cannot_refresh_captured_evidence() {
+        let (_dir, cue, bin) = fixture();
+        let mut evidence = collect_cue_preservation(&cue).unwrap();
+        std::fs::write(&bin, vec![9; 3 * 2048]).unwrap();
+        evidence.sources[0].identity = identity(&std::fs::metadata(&bin).unwrap()).unwrap();
+        let captured = Ok(evidence);
+        let comparison = compare_cue_evidence(&captured, &captured);
+        assert_eq!(comparison.outcome, CueComparisonOutcome::Indeterminate);
+        assert_eq!(comparison.programs_match, None);
+        assert_eq!(comparison.refusals, vec![changed(&bin), changed(&bin)]);
+    }
+
+    #[test]
     fn inspection_requires_an_independent_content_verification() {
         let (_dir, cue, bin) = fixture();
         let result = inspect_with(&cue, |inspection| {
@@ -849,33 +882,44 @@ fn is_unsupported(error: &CuePreservationError) -> bool {
     }
 }
 
-/// Compare verified snapshots without reopening paths. Absolute paths, file
-/// names and machine-local identities are provenance; FILE partitioning,
-/// aliases, declared boundaries and every stored byte are comparison facts.
-/// Even two identical refusals never establish equivalence.
+/// Revalidate the CUE, FILE resolution, identities and every stored byte before
+/// comparing evidence. Stale or unavailable evidence is indeterminate, even
+/// against itself. Absolute paths, names and machine-local identities remain
+/// provenance, not comparison facts. Validation observes sources sequentially;
+/// no result promises immutability after its last read or an atomic disc snapshot.
 pub fn compare_cue_evidence(
     left: &Result<DiscLayoutEvidence, CuePreservationError>,
     right: &Result<DiscLayoutEvidence, CuePreservationError>,
 ) -> CuePreservationComparison {
-    let (a, b) = match (left, right) {
-        (Ok(a), Ok(b)) => (a, b),
-        _ => {
-            let refusals: Vec<_> = [left, right]
-                .into_iter()
-                .filter_map(|r| r.as_ref().err().cloned())
-                .collect();
-            let outcome = if refusals.iter().any(is_unsupported) {
+    let mut refusals = Vec::new();
+    let mut unsupported = false;
+    for result in [left, right] {
+        match result {
+            Ok(evidence) => {
+                if let Err(error) = validate_evidence(evidence) {
+                    refusals.push(error);
+                }
+            }
+            Err(error) => {
+                unsupported |= is_unsupported(error);
+                refusals.push(error.clone());
+            }
+        }
+    }
+    if !refusals.is_empty() {
+        return CuePreservationComparison {
+            outcome: if unsupported {
                 CueComparisonOutcome::Unsupported
             } else {
                 CueComparisonOutcome::Indeterminate
-            };
-            return CuePreservationComparison {
-                outcome,
-                differences: vec![],
-                refusals,
-                programs_match: None,
-            };
-        }
+            },
+            differences: vec![],
+            refusals,
+            programs_match: None,
+        };
+    }
+    let (Ok(a), Ok(b)) = (left, right) else {
+        unreachable!("all refusals returned above");
     };
     let mut differences = Vec::new();
     if a.sources.len() != b.sources.len()

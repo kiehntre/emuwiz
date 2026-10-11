@@ -92,6 +92,81 @@ fn repeated_restored_mtime_writes_never_publish_later_bytes_as_inspected() {
 }
 
 #[test]
+fn evidence_mutation_after_capture_is_indeterminate_even_against_itself() {
+    let (_dir, cue, bin) = fixture(SINGLE);
+    let captured = collect_cue_preservation(&cue);
+    assert!(captured.is_ok());
+    rewrite_restoring_mtime(&bin, &vec![9; 3 * 2048]);
+    assert_indeterminate(&captured, &captured);
+}
+
+#[test]
+fn cue_mutation_after_capture_is_indeterminate_even_with_same_layout() {
+    let (_dir, cue, _bin) = fixture(SINGLE);
+    let captured = collect_cue_preservation(&cue);
+    assert!(captured.is_ok());
+    // Case changes preserve layout and byte count but change provenance bytes.
+    rewrite_restoring_mtime(&cue, SINGLE.replace("BINARY", "binary").as_bytes());
+    assert_indeterminate(&captured, &captured);
+}
+
+#[test]
+fn atomic_replacement_after_capture_cannot_reuse_old_evidence() {
+    let (dir, cue, bin) = fixture(SINGLE);
+    let captured = collect_cue_preservation(&cue);
+    assert!(captured.is_ok());
+    let replacement = dir.path().join("replacement.bin");
+    std::fs::write(&replacement, vec![1; 3 * 2048]).unwrap();
+    std::fs::rename(replacement, bin).unwrap();
+    assert_indeterminate(&captured, &captured);
+}
+
+#[test]
+fn cue_path_replaced_by_a_symlink_is_indeterminate() {
+    let (dir, cue, _bin) = fixture(SINGLE);
+    let captured = collect_cue_preservation(&cue);
+    assert!(captured.is_ok());
+    let old = dir.path().join("old.cue");
+    std::fs::rename(&cue, &old).unwrap();
+    std::os::unix::fs::symlink(old, cue).unwrap();
+    assert_indeterminate(&captured, &captured);
+}
+
+#[test]
+fn symlink_resolution_after_capture_cannot_reuse_old_evidence() {
+    let (dir, cue, _bin) = fixture(&SINGLE.replace("disc.bin", "link.bin"));
+    std::os::unix::fs::symlink("disc.bin", dir.path().join("link.bin")).unwrap();
+    let captured = collect_cue_preservation(&cue);
+    assert!(captured.is_ok());
+    std::fs::write(dir.path().join("other.bin"), vec![1; 3 * 2048]).unwrap();
+    std::os::unix::fs::symlink("other.bin", dir.path().join("new-link.bin")).unwrap();
+    std::fs::rename(dir.path().join("new-link.bin"), dir.path().join("link.bin")).unwrap();
+    assert_indeterminate(&captured, &captured);
+}
+
+#[test]
+fn directory_replacement_after_capture_cannot_reuse_old_evidence() {
+    let (dir, cue, bin) = fixture(&SINGLE.replace("disc.bin", "source/disc.bin"));
+    std::fs::create_dir(dir.path().join("source")).unwrap();
+    std::fs::rename(bin, dir.path().join("source/disc.bin")).unwrap();
+    let captured = collect_cue_preservation(&cue);
+    assert!(captured.is_ok());
+    std::fs::rename(dir.path().join("source"), dir.path().join("old-source")).unwrap();
+    std::fs::create_dir(dir.path().join("source")).unwrap();
+    std::fs::write(dir.path().join("source/disc.bin"), vec![1; 3 * 2048]).unwrap();
+    assert_indeterminate(&captured, &captured);
+}
+
+#[test]
+fn missing_source_after_capture_is_indeterminate() {
+    let (_dir, cue, bin) = fixture(SINGLE);
+    let captured = collect_cue_preservation(&cue);
+    assert!(captured.is_ok());
+    std::fs::remove_file(bin).unwrap();
+    assert_indeterminate(&captured, &captured);
+}
+
+#[test]
 fn equivalent_evidence_grants_no_conversion_or_source_removal_permission() {
     let text = SINGLE.replace(
         " INDEX 01 00:00:00",
@@ -119,7 +194,3 @@ fn equivalent_evidence_grants_no_conversion_or_source_removal_permission() {
     assert_eq!(std::fs::read_to_string(cue).unwrap(), text);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
 }
-
-// Retired: tests asserting that compare_cue_evidence re-reads source files after capture.
-// Comparison works on captured evidence only (see cue_evidence_trust); freshness is
-// enforced where bytes are read, covered above.
