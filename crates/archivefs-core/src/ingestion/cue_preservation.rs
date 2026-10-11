@@ -383,7 +383,7 @@ fn inspect_with(
     // become an unverified inspection-time expectation.
     for file in &inspection.timeline.files {
         let (_, stamp) = &inspection.sources[file.ordinal as usize];
-        let (digest, _) = read_source(
+        let digest = hash_source(
             &file.path,
             stamp,
             None,
@@ -432,7 +432,7 @@ fn validate_relationships(
 fn validate_inspection(inspection: &CuePreservationInspection) -> Result<(), CuePreservationError> {
     validate_relationships(inspection)?;
     for file in &inspection.timeline.files {
-        read_source(
+        hash_source(
             &file.path,
             &inspection.sources[file.ordinal as usize].1,
             Some(&inspection.source_sha256[file.ordinal as usize]),
@@ -443,7 +443,11 @@ fn validate_inspection(inspection: &CuePreservationInspection) -> Result<(), Cue
 }
 
 fn validate_evidence(evidence: &DiscLayoutEvidence) -> Result<(), CuePreservationError> {
-    validate_inspection(&CuePreservationInspection {
+    validate_inspection(&evidence_inspection(evidence))
+}
+
+fn evidence_inspection(evidence: &DiscLayoutEvidence) -> CuePreservationInspection {
+    CuePreservationInspection {
         cue_text: evidence.cue_text.clone(),
         cue_identity: evidence.cue_identity.clone(),
         cue_sha256: evidence.cue_sha256.clone(),
@@ -459,7 +463,7 @@ fn validate_evidence(evidence: &DiscLayoutEvidence) -> Result<(), CuePreservatio
             .iter()
             .map(|s| s.physical_sha256.clone())
             .collect(),
-    })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -525,7 +529,20 @@ fn read_source(
     expected_sha256: Option<&str>,
     ranges: &[(RangeRole, SourceRange)],
 ) -> Result<(String, Vec<(RangeRole, RangeDigest)>), CuePreservationError> {
-    read_source_with(path, expected, expected_sha256, ranges, |_| {})
+    read_source_with(path, expected, expected_sha256, ranges, true, |_| {})
+}
+
+// Verification needs the complete-file proof, but does not publish range
+// digests. Keep exactly the same reads and identity/content checks without
+// hashing every byte twice on these passes.
+fn hash_source(
+    path: &Path,
+    expected: &CueSourceIdentity,
+    expected_sha256: Option<&str>,
+    ranges: &[(RangeRole, SourceRange)],
+) -> Result<String, CuePreservationError> {
+    read_source_with(path, expected, expected_sha256, ranges, false, |_| {})
+        .map(|(digest, _)| digest)
 }
 
 fn read_source_with(
@@ -533,6 +550,7 @@ fn read_source_with(
     expected: &CueSourceIdentity,
     expected_sha256: Option<&str>,
     ranges: &[(RangeRole, SourceRange)],
+    capture_ranges: bool,
     mut after_chunk: impl FnMut(u64),
 ) -> Result<(String, Vec<(RangeRole, RangeDigest)>), CuePreservationError> {
     let (mut file, stamp) = open_source(path)?;
@@ -551,7 +569,7 @@ fn read_source_with(
         if range.byte_offset != cursor || end > expected.file.size {
             return Err(unsupported("source range is outside the verified file"));
         }
-        let mut digest = Sha256::new();
+        let mut digest = capture_ranges.then(Sha256::new);
         let mut remaining = range.byte_len;
         while remaining > 0 {
             let n = remaining.min(buffer.len() as u64) as usize;
@@ -563,18 +581,24 @@ fn read_source_with(
                 }
             })?;
             whole.update(&buffer[..n]);
-            digest.update(&buffer[..n]);
+            if let Some(digest) = &mut digest {
+                digest.update(&buffer[..n]);
+            }
             remaining -= n as u64;
             after_chunk(end - remaining);
+            #[cfg(all(test, unix))]
+            comparison_tests::after_source_read(path, end - remaining);
         }
         cursor = end;
-        digests.push((
-            *role,
-            RangeDigest {
-                range: *range,
-                physical_sha256: hex(digest.finalize()),
-            },
-        ));
+        if let Some(digest) = digest {
+            digests.push((
+                *role,
+                RangeDigest {
+                    range: *range,
+                    physical_sha256: hex(digest.finalize()),
+                },
+            ));
+        }
     }
     if cursor != expected.file.size {
         return Err(unsupported("source bytes were not completely read"));
@@ -738,6 +762,7 @@ mod tests {
             &inspection.sources[0].1,
             Some(&inspection.source_sha256[0]),
             &source_ranges(&inspection, 0).unwrap(),
+            true,
             |read| {
                 if read == 128 * 1024 {
                     let mut writer = File::options().write(true).open(&bin).unwrap();
@@ -760,6 +785,7 @@ mod tests {
             &inspection.sources[0].1,
             Some(&inspection.source_sha256[0]),
             &source_ranges(&inspection, 0).unwrap(),
+            true,
             |read| {
                 if read == 128 * 1024 {
                     let replacement = dir.path().join("replacement.bin");
@@ -781,6 +807,7 @@ mod tests {
             &inspection.sources[0].1,
             Some(&inspection.source_sha256[0]),
             &source_ranges(&inspection, 0).unwrap(),
+            true,
             |read| {
                 if read == 128 * 1024 {
                     File::options()
@@ -882,14 +909,54 @@ fn is_unsupported(error: &CuePreservationError) -> bool {
     }
 }
 
+fn revalidate_comparison_pair(
+    a: &DiscLayoutEvidence,
+    b: &DiscLayoutEvidence,
+) -> Vec<CuePreservationError> {
+    let mut refusals = Vec::new();
+    // The earlier left validation is not a proof that survives reading
+    // the right operand. Recheck actual content on BOTH sides; timestamps
+    // can remain equal after a same-size write with restored mtime.
+    for evidence in [a, b] {
+        if let Err(error) = validate_evidence(evidence) {
+            refusals.push(error);
+        }
+    }
+    if refusals.is_empty() {
+        // Recheck the whole pair after both final content passes. An
+        // observed replacement/mutation of left during the final right
+        // read must not survive just because left's own read succeeded.
+        for evidence in [a, b] {
+            if let Err(error) = validate_relationships(&evidence_inspection(evidence)) {
+                refusals.push(error);
+            }
+        }
+    }
+    refusals
+}
+
 /// Revalidate the CUE, FILE resolution, identities and every stored byte before
 /// comparing evidence. Stale or unavailable evidence is indeterminate, even
 /// against itself. Absolute paths, names and machine-local identities remain
-/// provenance, not comparison facts. Validation observes sources sequentially;
-/// no result promises immutability after its last read or an atomic disc snapshot.
+/// provenance, not comparison facts. After initial validation, reread both
+/// operands against their captured digests, then check both operands' source
+/// relationships and pathname identities again. This catches changes to one
+/// operand during the other's initial validation, even with equal timestamps.
+///
+/// All observations are sequential. A mutation after a source's final content
+/// read that leaves its final metadata indistinguishable, or after its last
+/// identity check, can still escape. No atomic snapshot or file lock is promised.
 pub fn compare_cue_evidence(
     left: &Result<DiscLayoutEvidence, CuePreservationError>,
     right: &Result<DiscLayoutEvidence, CuePreservationError>,
+) -> CuePreservationComparison {
+    compare_with(left, right, || {})
+}
+
+fn compare_with(
+    left: &Result<DiscLayoutEvidence, CuePreservationError>,
+    right: &Result<DiscLayoutEvidence, CuePreservationError>,
+    before_final_verification: impl FnOnce(),
 ) -> CuePreservationComparison {
     let mut refusals = Vec::new();
     let mut unsupported = false;
@@ -905,6 +972,13 @@ pub fn compare_cue_evidence(
                 refusals.push(error.clone());
             }
         }
+    }
+    if refusals.is_empty() {
+        before_final_verification();
+        let (Ok(a), Ok(b)) = (left, right) else {
+            unreachable!("successful validation requires two evidence objects");
+        };
+        refusals.extend(revalidate_comparison_pair(a, b));
     }
     if !refusals.is_empty() {
         return CuePreservationComparison {
@@ -1020,3 +1094,6 @@ pub fn compare_cue_evidence(
         programs_match,
     }
 }
+
+#[cfg(all(test, unix))]
+mod comparison_tests;
