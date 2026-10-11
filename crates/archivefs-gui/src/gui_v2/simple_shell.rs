@@ -1233,7 +1233,12 @@ fn widgets_created_since(
 
 /// Maximum eligible UI observations for a keyboard reveal, including passes
 /// where the control is already visible. Ineligible requests end immediately.
+/// Observations spent waiting for a nested scroller are counted separately.
 const REVEAL_PASSES: u8 = 8;
+/// Maximum observations a valid target may sit outside this scroller's content
+/// (a card in a nested shelf that has not scrolled yet) before the request ends.
+/// These never consume `REVEAL_PASSES`.
+const REVEAL_WAIT_PASSES: u8 = 8;
 /// Consecutive passes a revealed control must stay inside the viewport before
 /// the reveal is finished. Panels (the status bar) resize one frame late.
 const REVEAL_STABLE_PASSES: u8 = 3;
@@ -1242,7 +1247,10 @@ const REVEAL_STABLE_PASSES: u8 = 3;
 mod focus_reveal_tests;
 
 /// Reveal newly focused controls owned by this scroller. Manual input cancels
-/// the entire pending request; held focus cannot restart it on an idle pass.
+/// the entire pending request; held focus cannot restart it on an idle pass. A
+/// target still outside this scroller's content (inside a nested scroller that
+/// has not moved yet) keeps waiting on its own bounded budget, so waiting never
+/// uses up the scroll attempts.
 fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id, owned: &[egui::Id]) {
     let context = ui.ctx().clone();
     let slot = key.with("last_focus");
@@ -1270,6 +1278,10 @@ fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id, owned: &[egui::Id
     // (control, observations spent, consecutive passes inside the viewport). A
     // control taller than its scroller can never fit entirely, and a panel
     // may resize a frame late, so the reveal is bounded but not one-shot.
+    let waits_slot = key.with("reveal_waits");
+    let mut waits = context
+        .data(|data| data.get_temp::<u8>(waits_slot))
+        .unwrap_or(0);
     let mut pending = context
         .data(|data| data.get_temp::<Option<(egui::Id, u8, u8)>>(pending_slot))
         .flatten();
@@ -1277,30 +1289,37 @@ fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id, owned: &[egui::Id
         pending = None;
     } else if Some(id) != before {
         pending = Some((id, 0, 0));
+        waits = 0;
     } else if pending.map(|(pending_id, _, _)| pending_id) != Some(id) {
         pending = None;
     }
     if let Some((_, spent, stable)) = pending {
-        pending = context
-            .read_response(id)
-            .filter(|response| ui.min_rect().intersects(response.rect))
-            .and_then(|response| {
-                let spent = spent.saturating_add(1);
-                let stable = if ui.clip_rect().contains_rect(response.rect) {
-                    stable.saturating_add(1)
-                } else {
-                    ui.scroll_to_rect(response.rect, None);
-                    context.request_repaint();
-                    0
-                };
-                if spent >= REVEAL_PASSES || stable >= REVEAL_STABLE_PASSES {
-                    None
-                } else {
-                    context.request_repaint();
-                    Some((id, spent, stable))
-                }
-            });
+        // Only a missing response ends the request early. A target outside this
+        // scroller's content is normal for a card in a nested scroller (the game
+        // shelf) that has not moved yet: wait for it on a separate budget.
+        pending = None;
+        if let Some(response) = context.read_response(id) {
+            let (spent, stable) = if ui.clip_rect().contains_rect(response.rect) {
+                (spent.saturating_add(1), stable.saturating_add(1))
+            } else if ui.min_rect().intersects(response.rect) {
+                ui.scroll_to_rect(response.rect, None);
+                context.request_repaint();
+                (spent.saturating_add(1), 0)
+            } else {
+                waits = waits.saturating_add(1);
+                (spent, 0)
+            };
+            if spent < REVEAL_PASSES && stable < REVEAL_STABLE_PASSES && waits < REVEAL_WAIT_PASSES
+            {
+                context.request_repaint();
+                pending = Some((id, spent, stable));
+            }
+        }
     }
+    if pending.is_none() {
+        waits = 0;
+    }
+    context.data_mut(|data| data.insert_temp(waits_slot, waits));
     context.data_mut(|data| data.insert_temp(pending_slot, pending));
 }
 

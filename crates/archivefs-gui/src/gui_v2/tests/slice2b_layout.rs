@@ -461,3 +461,39 @@ fn tab_from_the_top_never_loses_focus_off_screen_before_play() {
         );
     }
 }
+
+/// Cold reverse traversal: with no earlier focus, the first Shift+Tab lands on
+/// the last rendered Library card, below the page, inside the nested shelf. It
+/// must be brought into the visible page body in both profiles.
+#[test]
+fn cold_shift_tab_reveals_the_last_library_card_at_160_percent_in_both_profiles() {
+    let size = points((1024.0, 640.0), 1.6);
+    let mut failures = Vec::new();
+    for blue in [true, false] {
+        let context = egui::Context::default();
+        let mut app = populated(&context, blue, 1.6);
+        app.router.current = Route::BrowsePlayGame(1);
+        let _ = settled(&context, &mut app, size);
+        assert_eq!(context.memory(|memory| memory.focused()), None);
+        let _ = key_gesture(&context, &mut app, size, egui::Key::Tab, true);
+        let mut output = settled(&context, &mut app, size);
+        for _ in 0..12 {
+            output = settled(&context, &mut app, size);
+        }
+        let rect = focused_rect(&context).expect("a card has keyboard focus");
+        let top = text_bounds(&output, "Find a game, check that it is ready, then play.")
+            .first()
+            .map_or(0.0, |text| text.max.y + 4.0);
+        let bottom = text_bounds(&output, "View Activity")
+            .first()
+            .map_or(size[1], |text| text.min.y);
+        let body = egui::Rect::from_min_max(egui::pos2(0.0, top), egui::pos2(size[0], bottom));
+        let shown = rect.intersect(body);
+        if shown.height() < 20.0 {
+            failures.push(format!(
+                "blue={blue}: cold Shift+Tab focus {rect:?} is not in the page body {body:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
