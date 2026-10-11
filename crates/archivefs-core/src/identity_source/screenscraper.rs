@@ -1589,6 +1589,133 @@ mod tests {
         assert!(urls.lock().unwrap().is_empty());
     }
     #[test]
+    fn fail_correction_capitalized_message_challenge_is_not_a_miss() {
+        let (client, urls) = make_client(Ok(ProviderResponse {
+            status: 200,
+            headers: [("content-type".into(), "application/json".into())].into(),
+            body:
+                br#"{"Message":"Please solve CAPTCHA before continuing","jeux":[],"platform":null}"#
+                    .to_vec(),
+            retry_after: None,
+        }));
+        let outcome = client.lookup(
+            LookupKind::Search,
+            &ScreenScraperLookup {
+                title: Some("synthetic".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(outcome, Err(ScreenScraperError::MalformedResponse { .. })),
+            "structured challenge became metadata or a miss: {outcome:?}"
+        );
+        assert_eq!(urls.lock().unwrap().len(), 1);
+        assert!(!outcome.unwrap_err().is_retryable());
+    }
+
+    #[test]
+    fn fail_correction_nested_user_message_challenge_is_not_a_miss() {
+        let (client, urls) = make_client(Ok(ProviderResponse {
+            status: 200,
+            headers: [("content-type".into(), "application/json".into())].into(),
+            body: br#"{"ssuser":{"message":"Verify you are human"},"jeux":[]}"#.to_vec(),
+            retry_after: None,
+        }));
+        let outcome = client.lookup(
+            LookupKind::Search,
+            &ScreenScraperLookup {
+                title: Some("synthetic".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(outcome, Err(ScreenScraperError::MalformedResponse { .. })),
+            "user challenge became metadata or a miss: {outcome:?}"
+        );
+        assert_eq!(urls.lock().unwrap().len(), 1);
+        assert!(!outcome.unwrap_err().is_retryable());
+    }
+
+    #[test]
+    fn fail_correction_structured_challenge_variants_never_retry_or_leak_body() {
+        for body in [
+            r#"{"MESSAGE":"CLOUDFLARE security check private-marker","jeux":[{"id":42}]}"#,
+            r#"{"Detail":"Access denied private-marker","jeux":[]}"#,
+            r#"{"ssuser":{"TiTlE":"CAPTCHA required private-marker"},"jeux":[]}"#,
+            r#"{"SSUSER":{"MeSsAgE":"Verify you are human private-marker"},"jeux":[]}"#,
+        ] {
+            for wait in [None, Some(0), Some(120), Some(u64::MAX)] {
+                let response = ProviderResponse {
+                    status: 200,
+                    headers: [("content-type".into(), "application/json".into())].into(),
+                    body: body.as_bytes().to_vec(),
+                    retry_after: wait.map(Duration::from_secs),
+                };
+                let (mut client, urls) = make_client(Ok(response.clone()));
+                client.config.max_retries = MAX_RETRIES;
+                *client.transport.responses.lock().unwrap() = vec![Ok(response); MAX_RETRIES + 1];
+                let outcome = client.lookup(
+                    LookupKind::Search,
+                    &ScreenScraperLookup {
+                        title: Some("synthetic".into()),
+                        ..Default::default()
+                    },
+                );
+                assert!(matches!(
+                    outcome,
+                    Err(ScreenScraperError::MalformedResponse { .. })
+                ));
+                assert!(!format!("{outcome:?}").contains("private-marker"));
+                assert!(!outcome.unwrap_err().is_retryable());
+                assert_eq!(urls.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn fail_correction_legitimate_empty_results_and_game_titles_survive() {
+        for body in [
+            r#"{"jeux":[]}"#,
+            r#"{"jeux":[],"Message":"Lookup complete","ssuser":{"Message":"Quota information","requeststoday":7}}"#,
+        ] {
+            let (client, urls) = make_client(ok(body));
+            let outcome = client.lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                },
+            );
+            assert!(matches!(outcome, Ok(LookupOutcome::NoResult { .. })));
+            assert_eq!(urls.lock().unwrap().len(), 1);
+        }
+        let (client, _) = make_client(ok(
+            r#"{"jeux":[{"id":42,"name":"CAPTCHA Challenge","synopsis":"A security check adventure","message":"Verify you are human"}],"ssuser":{"Message":"Quota information","requeststoday":7}}"#,
+        ));
+        let LookupOutcome::Candidates { candidates, quota } = client
+            .lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        else {
+            panic!("legitimate metadata was refused")
+        };
+        assert_eq!(
+            candidates[0].title.as_ref().unwrap().value,
+            "CAPTCHA Challenge"
+        );
+        assert_eq!(
+            candidates[0].description.as_ref().unwrap().value,
+            "A security check adventure"
+        );
+        assert_eq!(quota.unwrap().requests_today, Some(7));
+    }
+
+    #[test]
     fn recovery_success_challenges_and_errors_are_never_metadata() {
         for (media, body) in [
             ("text/html", r#"{"jeux":[{"id":42}]}"#),

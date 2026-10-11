@@ -130,38 +130,36 @@ pub fn is_blocking_response(content_type: Option<&str>, body: &[u8]) -> bool {
         return true;
     }
     if let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(body) {
-        let contains_error = |fields: &serde_json::Map<String, serde_json::Value>| {
-            fields.keys().any(|key| {
-                matches!(
-                    key.to_ascii_lowercase().as_str(),
-                    "error" | "errors" | "challenge" | "captcha"
-                )
-            })
-        };
-        let blocking_message = ["message", "detail", "title"].iter().any(|key| {
+        let contains_blocking_fields = |fields: &serde_json::Map<String, serde_json::Value>| {
             fields
-                .get(*key)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| {
-                    let lower = value.to_ascii_lowercase();
-                    [
-                        "captcha",
-                        "challenge",
-                        "cloudflare",
-                        "verify you are human",
-                        "access denied",
-                        "security check",
-                    ]
-                    .iter()
-                    .any(|marker| lower.contains(marker))
+                .iter()
+                .any(|(key, value)| match key.to_ascii_lowercase().as_str() {
+                    "error" | "errors" | "challenge" | "captcha" => true,
+                    "message" | "detail" | "title" => value.as_str().is_some_and(|value| {
+                        let lower = value.to_ascii_lowercase();
+                        [
+                            "captcha",
+                            "challenge",
+                            "cloudflare",
+                            "verify you are human",
+                            "access denied",
+                            "security check",
+                        ]
+                        .iter()
+                        .any(|marker| lower.contains(marker))
+                    }),
+                    _ => false,
                 })
-        });
-        return contains_error(&fields)
-            || blocking_message
-            || fields
-                .get("ssuser")
-                .and_then(serde_json::Value::as_object)
-                .is_some_and(contains_error);
+        };
+        // Both providers tolerate additive metadata fields. Inspect every
+        // casing of message keys, including the ScreenScraper user envelope,
+        // before their parsers can discard explicit challenge evidence. Do
+        // not recurse into game metadata: its titles/descriptions are data.
+        return contains_blocking_fields(&fields)
+            || fields.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("ssuser")
+                    && value.as_object().is_some_and(contains_blocking_fields)
+            });
     }
     false
 }
@@ -372,6 +370,37 @@ mod tests {
                 headers.append("retry-after", value.parse().unwrap());
             }
             assert_eq!(response_retry_after(&headers, now), expected);
+        }
+    }
+
+    #[test]
+    fn fail_correction_structured_challenges_are_scoped_to_provider_envelopes() {
+        for body in [
+            r#"{"Message":"Please solve CAPTCHA before continuing","jeux":[],"platform":null}"#,
+            r#"{"ssuser":{"message":"Verify you are human"},"jeux":[]}"#,
+            r#"{"message":"Lookup complete","MESSAGE":"Cloudflare security check"}"#,
+            r#"{"Detail":"Access denied"}"#,
+            r#"{"TiTlE":"Security check"}"#,
+            r#"{"SSUSER":{"MeSsAgE":"VERIFY YOU ARE HUMAN"}}"#,
+            r#"{"ssuser":{"DETAIL":"CAPTCHA required"}}"#,
+            r#"{"ssuser":{"Title":"Cloudflare challenge"}}"#,
+        ] {
+            for media in [None, Some("application/json")] {
+                assert!(is_blocking_response(media, body.as_bytes()), "{body}");
+            }
+        }
+        for body in [
+            r#"{"jeux":[],"Message":"Lookup complete","ssuser":{"MESSAGE":"Quota information"}}"#,
+            r#"{"jeu":{"id":42,"name":"CAPTCHA Challenge","message":"Verify you are human","synopsis":"Cloudflare security check"}}"#,
+            r#"{"signature":{"game":{"name":"CAPTCHA Challenge"},"rom":{"name":"Cloudflare Challenge.gb"}}}"#,
+            r#"{"ssuser":{"name":"CAPTCHA Challenge"},"platform":null}"#,
+            r#"{"Message":null,"Detail":42,"Title":[],"platform":null}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                !is_blocking_response(Some("application/json"), body.as_bytes()),
+                "{body}"
+            );
         }
     }
 

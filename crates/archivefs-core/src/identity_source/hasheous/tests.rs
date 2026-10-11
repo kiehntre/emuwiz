@@ -1317,6 +1317,137 @@ fn recovery_hasheous_404_challenge_never_establishes_no_match() {
 }
 
 #[test]
+fn fail_correction_hasheous_capitalized_message_is_a_typed_refusal() {
+    let transport = FakeTransport::ok(
+        br#"{"Message":"Please solve CAPTCHA before continuing","platform":null}"#,
+    );
+    let config = enabled_config();
+    let outcome = HasheousClient::new(&config, &transport).lookup(&sha1_only("synthetic"), None);
+    assert!(
+        matches!(outcome, Err(HasheousRequestError::InvalidResponse { .. })),
+        "structured challenge became empty metadata: {outcome:?}"
+    );
+    assert_eq!(transport.call_count(), 1);
+}
+
+#[test]
+fn fail_correction_hasheous_message_challenge_halts_batch_with_cooldown() {
+    let transport = FakeTransport::new(vec![
+        HasheousWireResponse {
+            status: 200,
+            headers: [("content-type".into(), "application/json".into())].into(),
+            body: br#"{"Message":"Please solve CAPTCHA before continuing","platform":null}"#
+                .to_vec(),
+            retry_after_secs: Some(120),
+        },
+        HasheousWireResponse {
+            status: 404,
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+            retry_after_secs: None,
+        },
+    ]);
+    let config = enabled_config();
+    let outcomes = HasheousClient::new(&config, &transport)
+        .lookup_many(&[sha1_only("synthetic-a"), sha1_only("synthetic-b")], None);
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(
+        transport.call_count(),
+        1,
+        "batch bypassed a challenge and its 120-second wait: {outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Err(HasheousRequestError::InvalidResponse { .. })))
+    );
+    assert_eq!(transport.responses.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn fail_correction_hasheous_partial_batch_retains_completed_provenance() {
+    for body in [
+        r#"{"Message":"Please solve CAPTCHA before continuing private-marker","platform":null}"#,
+        r#"{"ssuser":{"MESSAGE":"Verify you are human private-marker"},"platform":null}"#,
+    ] {
+        for wait in [None, Some(0), Some(120), Some(u64::MAX)] {
+            let transport = FakeTransport::new(vec![
+                HasheousWireResponse {
+                    status: 200,
+                    headers: [("content-type".into(), "application/json".into())].into(),
+                    body: br#"{"signatures":{"NoIntros":[{"game":{"name":"CAPTCHA Challenge"},"rom":{"sha1":"synthetic-a"}}]}}"#.to_vec(),
+                    retry_after_secs: None,
+                },
+                HasheousWireResponse {
+                    status: 200,
+                    headers: [("content-type".into(), "application/json".into())].into(),
+                    body: body.as_bytes().to_vec(),
+                    retry_after_secs: wait,
+                },
+                HasheousWireResponse {
+                    status: 404,
+                    headers: BTreeMap::new(),
+                    body: Vec::new(),
+                    retry_after_secs: None,
+                },
+            ]);
+            let config = enabled_config();
+            let hashes = vec![sha1_only("synthetic-a"); MAX_BATCH_SIZE + 1];
+            let outcomes = HasheousClient::new(&config, &transport).lookup_many(&hashes, None);
+            assert_eq!(outcomes.len(), hashes.len());
+            assert_eq!(transport.call_count(), 2);
+            assert_eq!(transport.responses.lock().unwrap().len(), 1);
+            assert!(outcomes[1..].iter().all(|outcome| matches!(
+                outcome,
+                Err(HasheousRequestError::InvalidResponse { .. })
+            )));
+            assert!(!format!("{outcomes:?}").contains("private-marker"));
+            let Ok(HasheousLookupOutcome::Found(completed)) = &outcomes[0] else {
+                panic!("completed metadata was lost")
+            };
+            let observations = observations_from_hash_lookup(
+                completed,
+                Representation::PhysicalFile,
+                "synthetic-a",
+                Some(123),
+            );
+            assert!(!observations.is_empty());
+            assert!(observations.iter().all(|observation| {
+                observation.provenance.channel == EvidenceChannel::Hasheous
+                    && observation.provenance.upstream_source == SourceFamily::NoIntro
+                    && observation.provenance.retrieved_at_unix == Some(123)
+            }));
+        }
+    }
+}
+
+#[test]
+fn fail_correction_hasheous_legitimate_empty_results_remain_successful() {
+    for body in [
+        b"{}".as_slice(),
+        br#"{"platform":null,"Message":"Lookup complete"}"#,
+    ] {
+        let transport = FakeTransport::ok(body);
+        let config = enabled_config();
+        let outcome = HasheousClient::new(&config, &transport)
+            .lookup(&sha1_only("synthetic"), None)
+            .unwrap();
+        let HasheousLookupOutcome::Found(response) = outcome else {
+            panic!("expected empty metadata")
+        };
+        assert_eq!(*response, HashLookupResponse::default());
+        assert_eq!(transport.call_count(), 1);
+    }
+    let transport = FakeTransport::status(404);
+    let config = enabled_config();
+    assert_eq!(
+        HasheousClient::new(&config, &transport).lookup(&sha1_only("synthetic"), None),
+        Ok(HasheousLookupOutcome::NoMatch)
+    );
+    assert_eq!(transport.call_count(), 1);
+}
+
+#[test]
 fn recovery_hasheous_success_challenges_and_404_errors_are_not_results() {
     for (status, media, body) in [
         (200, "text/html", "{}"),
