@@ -42,6 +42,9 @@
 //! refuse them. They are also named explicitly, because "the metadata endpoint
 //! is refused" is a property worth asserting directly rather than inferring.
 
+/// Bounded HTTP response metadata shared by provider transports.
+pub(crate) mod http_metadata;
+
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 

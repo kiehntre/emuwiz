@@ -7,13 +7,17 @@
 //! production implementation, reusing `ureq` (already a workspace
 //! dependency - no second HTTP client was added).
 
+use crate::identity_source::net_policy::http_metadata::{
+    MAX_HEADER_BYTES, is_blocking_response, is_transient_status, refuses_automatic_retry,
+    response_headers, response_retry_after,
+};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 
-use super::dto::{HashLookupResponse, HasheousHashSet, ProblemDetails};
+use super::dto::{HashLookupResponse, HasheousHashSet};
 
 /// The one endpoint this adapter ever calls. Verified against the live
 /// `https://hasheous.org/swagger/v1/swagger.json` document during this
@@ -83,6 +87,16 @@ pub enum HasheousRequestError {
     HttpStatus {
         status: u16,
     },
+    Authentication {
+        status: u16,
+    },
+    PermissionDenied {
+        status: u16,
+    },
+    Temporary {
+        status: u16,
+        retry_after_secs: Option<u64>,
+    },
     RateLimited {
         status: u16,
         retry_after_secs: Option<u64>,
@@ -112,7 +126,22 @@ impl HasheousRequestError {
             Self::Disabled => "the Hasheous adapter is disabled".to_string(),
             Self::Timeout => "Hasheous did not answer in time".to_string(),
             Self::Network { detail } => format!("could not reach Hasheous: {detail}"),
-            Self::HttpStatus { status } => format!("Hasheous answered with status {status}"),
+            Self::HttpStatus { status } => format!("Hasheous refused the request (HTTP {status})"),
+            Self::Authentication { status } => {
+                format!("Hasheous requires authentication (HTTP {status})")
+            }
+            Self::PermissionDenied { status } => {
+                format!("Hasheous denied permission (HTTP {status})")
+            }
+            Self::Temporary {
+                status,
+                retry_after_secs,
+            } => match retry_after_secs {
+                Some(seconds) => format!(
+                    "Hasheous is temporarily unavailable (HTTP {status}); minimum cooldown {seconds} seconds"
+                ),
+                None => format!("Hasheous is temporarily unavailable (HTTP {status})"),
+            },
             Self::RateLimited { status, .. } => {
                 format!("Hasheous asked us to slow down ({status})")
             }
@@ -151,13 +180,76 @@ pub trait HasheousTransport {
         url: &str,
         body: &[u8],
     ) -> Result<HasheousHttpResponse, HasheousRequestError>;
+
+    /// Existing transports remain source-compatible. Production overrides this
+    /// hook to retain allowlisted HTTP metadata alongside bounded error bodies.
+    fn post_json_with_metadata(
+        &self,
+        url: &str,
+        body: &[u8],
+    ) -> Result<HasheousWireResponse, HasheousRequestError> {
+        self.post_json(url, body).map(Into::into)
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Existing transport response shape, retained for caller compatibility.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HasheousHttpResponse {
     pub status: u16,
     pub body: Vec<u8>,
     pub retry_after_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for HasheousHttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HasheousHttpResponse")
+            .field("status", &self.status)
+            .field("body_bytes", &self.body.len())
+            .field("retry_after_secs", &self.retry_after_secs)
+            .finish()
+    }
+}
+
+/// Bounded internal wire evidence. Header values and body bytes are omitted
+/// from diagnostics; callers must not log the raw metadata fields.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HasheousWireResponse {
+    pub status: u16,
+    pub headers: std::collections::BTreeMap<String, String>,
+    pub body: Vec<u8>,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for HasheousWireResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HasheousWireResponse")
+            .field("status", &self.status)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_bytes", &self.body.len())
+            .field("retry_after_secs", &self.retry_after_secs)
+            .finish()
+    }
+}
+
+impl From<HasheousHttpResponse> for HasheousWireResponse {
+    fn from(response: HasheousHttpResponse) -> Self {
+        Self {
+            status: response.status,
+            headers: Default::default(),
+            body: response.body,
+            retry_after_secs: response.retry_after_secs,
+        }
+    }
+}
+
+impl From<HasheousWireResponse> for HasheousHttpResponse {
+    fn from(response: HasheousWireResponse) -> Self {
+        Self {
+            status: response.status,
+            body: response.body,
+            retry_after_secs: response.retry_after_secs,
+        }
+    }
 }
 
 /// The production transport: `ureq`, redirects disabled, both timeouts set,
@@ -174,6 +266,8 @@ impl UreqTransport {
                 .timeout_connect(Some(CONNECT_TIMEOUT))
                 .timeout_global(Some(timeout))
                 .max_redirects(0)
+                .http_status_as_error(false)
+                .max_response_header_size(MAX_HEADER_BYTES)
             // No environment proxy: lookups carry the hashes of the user's
             // files, and EmuWiz never routes provider traffic through a proxy
             // it was not explicitly configured to use.
@@ -196,6 +290,14 @@ impl HasheousTransport for UreqTransport {
         url: &str,
         body: &[u8],
     ) -> Result<HasheousHttpResponse, HasheousRequestError> {
+        self.post_json_with_metadata(url, body).map(Into::into)
+    }
+
+    fn post_json_with_metadata(
+        &self,
+        url: &str,
+        body: &[u8],
+    ) -> Result<HasheousWireResponse, HasheousRequestError> {
         let request = self
             .agent
             .post(url)
@@ -203,13 +305,6 @@ impl HasheousTransport for UreqTransport {
             .header("Accept", "application/json");
         let response = match request.send(body) {
             Ok(response) => response,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Ok(HasheousHttpResponse {
-                    status,
-                    body: Vec::new(),
-                    retry_after_secs: None,
-                });
-            }
             Err(ureq::Error::Timeout(_)) => return Err(HasheousRequestError::Timeout),
             Err(error) => {
                 return Err(HasheousRequestError::Network {
@@ -218,11 +313,8 @@ impl HasheousTransport for UreqTransport {
             }
         };
         let status = response.status().as_u16();
-        let retry_after_secs = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok());
+        let headers = response_headers(response.headers());
+        let retry_after_secs = response_retry_after(response.headers(), SystemTime::now());
         let mut body_out = Vec::new();
         let mut reader = response
             .into_body()
@@ -231,15 +323,19 @@ impl HasheousTransport for UreqTransport {
         reader
             .read_to_end(&mut body_out)
             .map_err(|error| HasheousRequestError::Network {
-                detail: format!("while reading the response: {}", error.kind()),
+                detail: format!(
+                    "HTTP {status}: while reading the response: {}",
+                    error.kind()
+                ),
             })?;
         if body_out.len() > MAX_RESPONSE_BYTES {
             return Err(HasheousRequestError::ResponseTooLarge {
                 limit: MAX_RESPONSE_BYTES,
             });
         }
-        Ok(HasheousHttpResponse {
+        Ok(HasheousWireResponse {
             status,
+            headers,
             body: body_out,
             retry_after_secs,
         })
@@ -252,7 +348,7 @@ fn classify_transport_error(error: &ureq::Error) -> String {
         ureq::Error::HostNotFound => "the host could not be found".to_string(),
         ureq::Error::Io(io) => format!("an I/O error occurred ({})", io.kind()),
         ureq::Error::Tls(_) => "the TLS handshake failed".to_string(),
-        other => format!("an unexpected transport error occurred ({other})"),
+        _ => "an unexpected transport error occurred".to_string(),
     }
 }
 
@@ -303,12 +399,54 @@ impl<'a, T: HasheousTransport> HasheousClient<'a, T> {
             }
         })?;
         let url = self.request_url();
-        let response = self.transport.post_json(&url, &body)?;
+        let response = self.transport.post_json_with_metadata(&url, &body)?;
         if cancelled(cancel) {
             return Err(HasheousRequestError::Cancelled);
         }
+        let media = response.headers.get("content-type").map(String::as_str);
+        // Authentication, permission and quota refusals retain their status
+        // even when the provider sends an HTML explanation. No body is metadata.
+        match response.status {
+            401 => return Err(HasheousRequestError::Authentication { status: 401 }),
+            403 => return Err(HasheousRequestError::PermissionDenied { status: 403 }),
+            429 => {
+                return Err(HasheousRequestError::RateLimited {
+                    status: 429,
+                    retry_after_secs: response.retry_after_secs,
+                });
+            }
+            _ => {}
+        }
+        if matches!(response.status, 200 | 404) && is_blocking_response(media, &response.body) {
+            return Err(HasheousRequestError::InvalidResponse {
+                detail: format!(
+                    "HTTP {}: blocking page or provider error; no metadata accepted",
+                    response.status
+                ),
+            });
+        }
         match response.status {
             200 => {
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&response.body).map_err(|error| {
+                        HasheousRequestError::InvalidResponse {
+                            detail: format!("invalid JSON at line {}", error.line()),
+                        }
+                    })?;
+                let supported = envelope.as_object().is_some_and(|fields| {
+                    fields.is_empty()
+                        || fields.keys().any(|key| {
+                            matches!(
+                                key.as_str(),
+                                "platform" | "publisher" | "signature" | "signatures"
+                            )
+                        })
+                });
+                if !supported {
+                    return Err(HasheousRequestError::InvalidResponse {
+                        detail: "response contained no supported hash lookup envelope".into(),
+                    });
+                }
                 let parsed: HashLookupResponse =
                     serde_json::from_slice(&response.body).map_err(|error| {
                         HasheousRequestError::InvalidResponse {
@@ -317,21 +455,29 @@ impl<'a, T: HasheousTransport> HasheousClient<'a, T> {
                     })?;
                 Ok(HasheousLookupOutcome::Found(Box::new(parsed)))
             }
-            404 => Ok(HasheousLookupOutcome::NoMatch),
-            400 => {
-                let problem: ProblemDetails =
-                    serde_json::from_slice(&response.body).unwrap_or_default();
-                Err(HasheousRequestError::InvalidResponse {
-                    detail: problem
-                        .detail
-                        .or(problem.title)
-                        .unwrap_or_else(|| "the hash was rejected as invalid".to_string()),
+            // The documented no-match status is supported only with an empty
+            // entity. Arbitrary JSON/text errors cannot establish a hash result.
+            404 if response.body.is_empty() => Ok(HasheousLookupOutcome::NoMatch),
+            404 => Err(HasheousRequestError::InvalidResponse {
+                detail: "HTTP 404: response does not satisfy the supported no-match contract"
+                    .into(),
+            }),
+            400 => Err(HasheousRequestError::InvalidResponse {
+                detail: "the provider rejected the hash request (HTTP 400)".into(),
+            }),
+            status if is_transient_status(status) => {
+                if refuses_automatic_retry(media, &response.body) {
+                    return Err(HasheousRequestError::InvalidResponse {
+                        detail: format!(
+                            "HTTP {status}: unclassified provider error; no automatic retry"
+                        ),
+                    });
+                }
+                Err(HasheousRequestError::Temporary {
+                    status,
+                    retry_after_secs: response.retry_after_secs,
                 })
             }
-            429 => Err(HasheousRequestError::RateLimited {
-                status: 429,
-                retry_after_secs: response.retry_after_secs,
-            }),
             status => Err(HasheousRequestError::HttpStatus { status }),
         }
     }
@@ -340,20 +486,37 @@ impl<'a, T: HasheousTransport> HasheousClient<'a, T> {
     /// deterministic chunking - see [`MAX_BATCH_SIZE`]'s doc for why this is
     /// per-item rather than one array HTTP request). Order of the returned
     /// vector always matches the order of `hash_sets`. A single item's
-    /// error does not abort the rest; it is carried in that item's own
-    /// `Result` slot.
+    /// local input error does not abort the rest. A provider refusal, outage,
+    /// rate limit or invalid response stops requests for this batch; remaining
+    /// slots carry the same error without sending more user hashes.
     pub fn lookup_many(
         &self,
         hash_sets: &[HasheousHashSet],
         cancel: Option<&AtomicBool>,
     ) -> Vec<Result<HasheousLookupOutcome, HasheousRequestError>> {
         let mut out = Vec::with_capacity(hash_sets.len());
+        let mut provider_refusal: Option<HasheousRequestError> = None;
         for hash_set in hash_sets.chunks(MAX_BATCH_SIZE).flatten() {
             if cancelled(cancel) {
                 out.push(Err(HasheousRequestError::Cancelled));
                 continue;
             }
-            out.push(self.lookup(hash_set, cancel));
+            if let Some(error) = &provider_refusal {
+                out.push(Err(error.clone()));
+                continue;
+            }
+            let result = self.lookup(hash_set, cancel);
+            if let Err(error) = &result {
+                if !matches!(
+                    error,
+                    HasheousRequestError::Disabled
+                        | HasheousRequestError::UnsupportedHash
+                        | HasheousRequestError::Cancelled
+                ) {
+                    provider_refusal = Some(error.clone());
+                }
+            }
+            out.push(result);
         }
         out
     }

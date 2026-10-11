@@ -15,6 +15,10 @@ use std::fmt;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::net_policy::http_metadata::{
+    MAX_HEADER_BYTES, is_blocking_response, is_transient_status, response_headers,
+    response_retry_after,
+};
 use serde::Deserialize;
 use url::form_urlencoded;
 
@@ -91,9 +95,9 @@ impl fmt::Debug for ScreenScraperCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ScreenScraperCredentials")
-            .field("developer_id", &self.developer_id)
+            .field("developer_id", &"redacted")
             .field("developer_password", &"redacted")
-            .field("user_id", &self.user_id)
+            .field("user_id", &self.user_id.as_ref().map(|_| "redacted"))
             .field(
                 "user_password",
                 &self.user_password.as_ref().map(|_| "redacted"),
@@ -221,11 +225,23 @@ pub struct QuotaSnapshot {
     pub max_negative_requests_per_day: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ProviderResponse {
     pub status: u16,
+    pub headers: std::collections::BTreeMap<String, String>,
     pub body: Vec<u8>,
     pub retry_after: Option<Duration>,
+}
+
+impl std::fmt::Debug for ProviderResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderResponse")
+            .field("status", &self.status)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_bytes", &self.body.len())
+            .field("retry_after", &self.retry_after)
+            .finish()
+    }
 }
 
 pub trait ScreenScraperTransport {
@@ -250,6 +266,7 @@ pub enum ScreenScraperError {
     },
     Temporary {
         status: Option<u16>,
+        retry_after: Option<Duration>,
     },
     NoResult,
     MalformedResponse {
@@ -268,7 +285,13 @@ pub enum ScreenScraperError {
 
 impl ScreenScraperError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Temporary { .. } | Self::Network { .. })
+        matches!(
+            self,
+            Self::Temporary {
+                retry_after: None,
+                ..
+            } | Self::Network { .. }
+        )
     }
 }
 
@@ -290,6 +313,8 @@ impl UreqTransport {
                 .timeout_connect(Some(Duration::from_secs(5)))
                 .timeout_global(Some(DEFAULT_TIMEOUT))
                 .max_redirects(0)
+                .http_status_as_error(false)
+                .max_response_header_size(MAX_HEADER_BYTES)
             // No environment proxy: credentials travel in the query string, and
             // EmuWiz never routes provider traffic through a proxy it was not
             // explicitly configured to use.
@@ -316,13 +341,6 @@ impl ScreenScraperTransport for UreqTransport {
             .build();
         let response = match request.call() {
             Ok(response) => response,
-            Err(ureq::Error::StatusCode(status)) => {
-                return Ok(ProviderResponse {
-                    status,
-                    body: Vec::new(),
-                    retry_after: None,
-                });
-            }
             Err(ureq::Error::Timeout(_)) => {
                 return Err(ScreenScraperError::Network {
                     detail: "request timed out".into(),
@@ -335,25 +353,31 @@ impl ScreenScraperTransport for UreqTransport {
             }
         };
         let status = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(Duration::from_secs);
+        let headers = response_headers(response.headers());
+        let retry_after =
+            response_retry_after(response.headers(), SystemTime::now()).map(Duration::from_secs);
         let body = response
             .into_body()
             .into_with_config()
-            .limit((max_bytes + 1) as u64)
+            .limit((max_bytes as u64).saturating_add(1))
             .read_to_vec()
-            .map_err(|error| ScreenScraperError::Network {
-                detail: error.to_string(),
+            .map_err(|error| match error {
+                ureq::Error::BodyExceedsLimit(_) => {
+                    ScreenScraperError::ResponseTooLarge { limit: max_bytes }
+                }
+                _ if !(200..300).contains(&status) => ScreenScraperError::MalformedResponse {
+                    detail: format!("HTTP {status}: incomplete error body; no automatic retry"),
+                },
+                error => ScreenScraperError::Network {
+                    detail: classify_network_error(&error),
+                },
             })?;
         if body.len() > max_bytes {
             return Err(ScreenScraperError::ResponseTooLarge { limit: max_bytes });
         }
         Ok(ProviderResponse {
             status,
+            headers,
             body,
             retry_after,
         })
@@ -397,14 +421,14 @@ impl<T> ScreenScraperClient<T> {
             .ok_or(ScreenScraperError::MissingCredentials)?;
         let url = build_request_url(&self.config, credentials, kind, input)?;
         let response = self.request_with_bounded_retry(&url)?;
-        if response.status == 404 {
-            return Ok(LookupOutcome::NoResult {
-                quota: parse_quota(&response.body),
-            });
-        }
-        if response.status == 401 || response.status == 403 {
+        if response.status == 401 {
             return Err(ScreenScraperError::Authentication {
                 status: response.status,
+            });
+        }
+        if response.status == 403 {
+            return Err(ScreenScraperError::InvalidRequest {
+                detail: "HTTP 403: provider permission denied; no automatic retry".into(),
             });
         }
         if response.status == 429 || response.status == 430 || response.status == 431 {
@@ -414,14 +438,48 @@ impl<T> ScreenScraperClient<T> {
             });
         }
         if !(200..300).contains(&response.status) {
-            return Err(if matches!(response.status, 408 | 423 | 500..=599) {
+            if crate::identity_source::net_policy::http_metadata::refuses_automatic_retry(
+                response.headers.get("content-type").map(String::as_str),
+                &response.body,
+            ) {
+                return Err(ScreenScraperError::MalformedResponse {
+                    detail: format!(
+                        "HTTP {}: access, challenge or unclassified error response; no automatic retry",
+                        response.status
+                    ),
+                });
+            }
+            // Retry safety does not prove a legitimate negative lookup. A
+            // 404 must independently satisfy our supported no-result contract.
+            if response.status == 404 {
+                return parse_404_no_result(
+                    &response.body,
+                    response.headers.get("content-type").map(String::as_str),
+                );
+            }
+            return Err(if is_transient_status(response.status) {
                 ScreenScraperError::Temporary {
                     status: Some(response.status),
+                    retry_after: response.retry_after,
                 }
             } else {
-                ScreenScraperError::Network {
-                    detail: format!("provider returned HTTP {}", response.status),
+                ScreenScraperError::InvalidRequest {
+                    detail: format!(
+                        "HTTP {}: provider refused the request; no automatic retry",
+                        response.status
+                    ),
                 }
+            });
+        }
+        if is_blocking_response(
+            response.headers.get("content-type").map(String::as_str),
+            &response.body,
+        ) {
+            return Err(ScreenScraperError::MalformedResponse {
+                detail: format!(
+                    "HTTP {}: blocking page or provider error; no metadata accepted",
+                    response.status
+                ),
             });
         }
         parse_outcome(&response.body)
@@ -437,7 +495,16 @@ impl<T> ScreenScraperClient<T> {
             let response = self
                 .transport
                 .get(url, MAX_RESPONSE_BYTES, self.config.timeout)?;
-            if !(matches!(response.status, 408 | 423 | 500..=599)) || attempt >= retries {
+            // A provider minimum or an HTML access/challenge response is
+            // returned to the caller; neither permits an automatic retry.
+            if response.retry_after.is_some()
+                || crate::identity_source::net_policy::http_metadata::refuses_automatic_retry(
+                    response.headers.get("content-type").map(String::as_str),
+                    &response.body,
+                )
+                || !(is_transient_status(response.status))
+                || attempt >= retries
+            {
                 return Ok(response);
             }
             attempt += 1;
@@ -552,8 +619,17 @@ fn build_request_url(
 fn parse_outcome(body: &[u8]) -> Result<LookupOutcome, ScreenScraperError> {
     let response: WireEnvelope =
         serde_json::from_slice(body).map_err(|error| ScreenScraperError::MalformedResponse {
-            detail: format!("invalid JSON: {error}"),
+            detail: format!(
+                "invalid JSON at line {}, column {}",
+                error.line(),
+                error.column()
+            ),
         })?;
+    if response.games.is_none() && response.game.is_none() {
+        return Err(ScreenScraperError::MalformedResponse {
+            detail: "response contained no supported game result envelope".into(),
+        });
+    }
     let quota = response.ssuser.as_ref().map(QuotaSnapshot::from_wire);
     let games = response
         .games
@@ -635,10 +711,71 @@ fn enrichment_from_wire(game: WireGame, retrieved: u64) -> Option<ScreenScraperE
     })
 }
 
-fn parse_quota(body: &[u8]) -> Option<QuotaSnapshot> {
-    serde_json::from_slice::<WireEnvelope>(body)
-        .ok()
-        .and_then(|response| response.ssuser.map(|user| QuotaSnapshot::from_wire(&user)))
+/// Affirmative negative-lookup evidence, independent of retry permission.
+/// Preserve empty JSON/plain-text 404 compatibility and explicit empty `jeux`
+/// JSON with optional valid quota metadata. Unknown/error fields, conflicting
+/// game evidence and free-form text never establish a successful lookup. The
+/// caller first enforces the shared bounded-header/body and challenge gate.
+fn parse_404_no_result(
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<LookupOutcome, ScreenScraperError> {
+    let refusal = || ScreenScraperError::MalformedResponse {
+        detail: "HTTP 404: response does not satisfy the supported no-result contract".into(),
+    };
+    let media = content_type
+        .map(|value| value.split(';').next().unwrap_or("").trim())
+        .ok_or_else(refusal)?;
+    let json = media.eq_ignore_ascii_case("application/json");
+    let plain = media.eq_ignore_ascii_case("text/plain");
+    if (!json && !plain)
+        || body.len() > crate::identity_source::net_policy::http_metadata::ERROR_BODY_LIMIT
+    {
+        return Err(refusal());
+    }
+    if body.is_empty() {
+        return Ok(LookupOutcome::NoResult { quota: None });
+    }
+    if !json {
+        return Err(refusal());
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct NoResultEnvelope {
+        // Required, not defaulted: `{}` is not an affirmative empty result.
+        #[serde(rename = "jeux")]
+        games: Vec<serde_json::Value>,
+        #[serde(default)]
+        ssuser: Option<serde_json::Value>,
+    }
+    let envelope: NoResultEnvelope = serde_json::from_slice(body).map_err(|_| refusal())?;
+    if !envelope.games.is_empty() {
+        return Err(refusal());
+    }
+    let quota = if let Some(value) = envelope.ssuser {
+        let fields = value.as_object().ok_or_else(refusal)?;
+        // Only the quota fields/aliases already understood by WireUser are
+        // supported here; an embedded error must not be silently ignored.
+        if fields.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "requeststoday"
+                    | "requestskotoday"
+                    | "maxrequestspermin"
+                    | "maxrequestsperdmin"
+                    | "maxrequestsperday"
+                    | "maxrequestskoperday"
+                    | "maxrequestskoperd"
+            )
+        }) {
+            return Err(refusal());
+        }
+        let user: WireUser = serde_json::from_value(value).map_err(|_| refusal())?;
+        Some(QuotaSnapshot::from_wire(&user))
+    } else {
+        None
+    };
+    Ok(LookupOutcome::NoResult { quota })
 }
 
 impl QuotaSnapshot {
@@ -728,6 +865,327 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    // Keep endpoint validation in the public client; only this test transport
+    // maps its already validated request to a disposable localhost server.
+    struct LocalhostTransport {
+        url: String,
+        calls: std::sync::atomic::AtomicUsize,
+        inner: UreqTransport,
+    }
+
+    impl ScreenScraperTransport for LocalhostTransport {
+        fn get(
+            &self,
+            url: &str,
+            max_bytes: usize,
+            timeout: Duration,
+        ) -> Result<ProviderResponse, ScreenScraperError> {
+            assert!(url.starts_with("https://api.screenscraper.fr/"));
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = self.inner.get(&self.url, max_bytes, timeout)?;
+            assert!(!format!("{:?}", Some(&response)).contains("wire-secret"));
+            Ok(response)
+        }
+    }
+
+    fn localhost_response(
+        status: u16,
+        media: Option<&str>,
+        body: &str,
+    ) -> (LocalhostTransport, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/synthetic", listener.local_addr().unwrap());
+        let media = media.map(str::to_owned);
+        let body = body.to_owned();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() < 8192);
+            }
+            write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Length: {}\r\nConnection: close\r\nLocation: https://invalid.example/?DeVpAsSwOrD=wire-secret\r\n", body.len()).unwrap();
+            if let Some(media) = media {
+                write!(stream, "Content-Type: {media}\r\n").unwrap();
+            }
+            write!(stream, "\r\n{body}").unwrap();
+        });
+        (
+            LocalhostTransport {
+                url,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                inner: UreqTransport::default(),
+            },
+            server,
+        )
+    }
+
+    #[test]
+    fn localhost_404_challenges_refuse_without_retry_and_legitimate_results_survive() {
+        let oversized = "x".repeat(1100);
+        let challenge = "<html>Access denied: verify you are human wire-secret</html>";
+        for (status, media, body, expected) in [
+            (404, Some("text/html"), challenge, "refused"),
+            (404, None, challenge, "refused"),
+            (404, Some("application/xhtml+xml"), challenge, "refused"),
+            (404, Some("application/json"), challenge, "refused"),
+            (404, Some(oversized.as_str()), challenge, "refused"),
+            (404, None, "", "refused"),
+            (404, Some("application/json"), "{", "refused"),
+            (404, Some("application/json"), r#"{"jeux":[]}"#, "missing"),
+            (404, Some("application/json"), "", "missing"),
+            (404, Some("text/plain; charset=utf-8"), "", "missing"),
+            (
+                404,
+                Some("Application/JSON; charset=utf-8"),
+                r#"{"jeux":[]}"#,
+                "missing",
+            ),
+            (
+                404,
+                Some("application/json"),
+                r#"{"jeux":[],"ssuser":{"requeststoday":7}}"#,
+                "missing",
+            ),
+            (404, Some("application/octet-stream"), "", "refused"),
+            (
+                404,
+                Some("application/json"),
+                r#"{"jeux":[{"id":42}]}"#,
+                "refused",
+            ),
+            (
+                404,
+                Some("application/json"),
+                r#"{"jeux":[],"jeu":{"id":42}}"#,
+                "refused",
+            ),
+            (404, Some("application/json"), r#"{"jeux":null}"#, "refused"),
+            (
+                404,
+                Some("application/json"),
+                r#"{"jeux":[],"ssuser":{"requeststoday":"wire-secret"}}"#,
+                "refused",
+            ),
+            (
+                404,
+                Some("application/json"),
+                r#"{"jeux":[],"jeux":[{"id":42}]}"#,
+                "refused",
+            ),
+            (
+                200,
+                Some("application/json"),
+                r#"{"jeu":{"id":42,"nom":"Game"}}"#,
+                "found",
+            ),
+            (401, Some("text/html"), challenge, "auth"),
+            (403, Some("text/html"), challenge, "permission"),
+            (503, Some("text/html"), challenge, "refused"),
+        ] {
+            let (transport, server) = localhost_response(status, media, body);
+            let client = ScreenScraperClient::new(
+                ScreenScraperConfig {
+                    enabled: true,
+                    max_retries: MAX_RETRIES,
+                    ..Default::default()
+                },
+                Some(
+                    ScreenScraperCredentials::new(
+                        "synthetic-id",
+                        ScreenScraperSecret::parse("synthetic-password").unwrap(),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                transport,
+            );
+            let outcome = client.lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                },
+            );
+            server.join().unwrap();
+            assert_eq!(
+                client
+                    .transport
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(!format!("{outcome:?}").contains("wire-secret"));
+            match expected {
+                "refused" => {
+                    let error = outcome.unwrap_err();
+                    assert!(matches!(
+                        error,
+                        ScreenScraperError::MalformedResponse { .. }
+                    ));
+                    assert!(!error.is_retryable());
+                }
+                "auth" => {
+                    let error = outcome.unwrap_err();
+                    assert!(matches!(error, ScreenScraperError::Authentication { .. }));
+                    assert!(!error.is_retryable());
+                }
+                "permission" => {
+                    let error = outcome.unwrap_err();
+                    assert!(matches!(error, ScreenScraperError::InvalidRequest { .. }));
+                    assert!(!error.is_retryable());
+                }
+                "missing" => {
+                    assert!(matches!(outcome, Ok(LookupOutcome::NoResult { .. })));
+                    if body.contains("requeststoday") {
+                        let Ok(LookupOutcome::NoResult { quota: Some(quota) }) = outcome else {
+                            panic!("negative result lost quota")
+                        };
+                        assert_eq!(quota.requests_today, Some(7));
+                    }
+                }
+                "found" => assert!(matches!(outcome, Ok(LookupOutcome::Candidates { .. }))),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn localhost_404_error_bodies_never_establish_no_result() {
+        let mut failures = Vec::new();
+        for (label, media, body) in [
+            (
+                "authentication JSON",
+                "application/json",
+                r#"{"error":"authentication required wire-secret"}"#,
+            ),
+            (
+                "temporary JSON",
+                "application/json",
+                r#"{"error":"temporary outage wire-secret"}"#,
+            ),
+            (
+                "plain-text failure",
+                "text/plain",
+                "temporary outage wire-secret",
+            ),
+            ("ambiguous JSON", "application/json", "{}"),
+            (
+                "embedded error JSON",
+                "application/json",
+                r#"{"jeux":[],"ssuser":{"error":"wire-secret"}}"#,
+            ),
+            (
+                "conflicting JSON",
+                "application/json",
+                r#"{"jeux":[],"error":"wire-secret"}"#,
+            ),
+        ] {
+            let (transport, server) = localhost_response(404, Some(media), body);
+            let client = ScreenScraperClient::new(
+                ScreenScraperConfig {
+                    enabled: true,
+                    max_retries: MAX_RETRIES,
+                    ..Default::default()
+                },
+                Some(
+                    ScreenScraperCredentials::new(
+                        "synthetic-id",
+                        ScreenScraperSecret::parse("synthetic-password").unwrap(),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                transport,
+            );
+            let outcome = client.lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                },
+            );
+            server.join().unwrap();
+            assert_eq!(
+                client
+                    .transport
+                    .calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            assert!(!format!("{outcome:?}").contains("wire-secret"));
+            match outcome {
+                Err(error) => {
+                    assert!(matches!(
+                        error,
+                        ScreenScraperError::MalformedResponse { .. }
+                    ));
+                    assert!(!error.is_retryable());
+                    assert!(!format!("{error:?}").contains("wire-secret"));
+                }
+                Ok(_) => failures.push(label),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "404 failures misclassified as NoResult: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_challenge_never_retries_or_becomes_metadata() {
+        let response = ProviderResponse {
+            headers: [("content-type".into(), "application/json".into())].into(),
+            status: 503,
+            body: b"<html>captcha private-marker</html>".to_vec(),
+            retry_after: None,
+        };
+        let (mut client, urls) = make_client(Ok(response.clone()));
+        client.config.max_retries = MAX_RETRIES;
+        *client.transport.responses.lock().unwrap() = vec![Ok(response); MAX_RETRIES + 1];
+        let error = client
+            .lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(urls.lock().unwrap().len(), 1);
+        assert!(!error.is_retryable());
+        assert!(!format!("{error:?}").contains("private-marker"));
+    }
+
+    #[test]
+    fn recovery_404_error_never_establishes_no_result() {
+        let (client, _) = make_client(Ok(ProviderResponse {
+            headers: [("content-type".into(), "application/json".into())].into(),
+            status: 404,
+            body: br#"{"error":"temporary outage"}"#.to_vec(),
+            retry_after: None,
+        }));
+        assert!(
+            client
+                .lookup(
+                    LookupKind::Search,
+                    &ScreenScraperLookup {
+                        title: Some("synthetic".into()),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+    }
     #[derive(Clone)]
     struct FakeTransport {
         responses: Arc<Mutex<Vec<Result<ProviderResponse, ScreenScraperError>>>>,
@@ -776,6 +1234,7 @@ mod tests {
     fn ok(body: &str) -> Result<ProviderResponse, ScreenScraperError> {
         Ok(ProviderResponse {
             status: 200,
+            headers: Default::default(),
             body: body.as_bytes().to_vec(),
             retry_after: None,
         })
@@ -861,7 +1320,8 @@ mod tests {
     #[test]
     fn auth_quota_and_no_result_are_distinct() {
         let (client, _) = make_client(Ok(ProviderResponse {
-            status: 403,
+            status: 401,
+            headers: Default::default(),
             body: Vec::new(),
             retry_after: None,
         }));
@@ -877,6 +1337,7 @@ mod tests {
         ));
         let (client, _) = make_client(Ok(ProviderResponse {
             status: 430,
+            headers: Default::default(),
             body: Vec::new(),
             retry_after: Some(Duration::from_secs(60)),
         }));
@@ -892,6 +1353,7 @@ mod tests {
         ));
         let (client, _) = make_client(Ok(ProviderResponse {
             status: 404,
+            headers: [("content-type".into(), "application/json".into())].into(),
             body: Vec::new(),
             retry_after: None,
         }));
@@ -908,12 +1370,113 @@ mod tests {
     }
 
     #[test]
+    fn access_denial_challenge_and_provider_minimum_are_not_automatically_retried() {
+        for (status, headers, retry_after) in [
+            (401, Default::default(), None),
+            (403, Default::default(), None),
+            (429, Default::default(), Some(Duration::from_secs(120))),
+            (503, Default::default(), Some(Duration::from_secs(120))),
+            (
+                503,
+                [("content-type".into(), "text/html; charset=utf-8".into())].into(),
+                None,
+            ),
+        ] {
+            let (mut client, urls) = make_client(Ok(ProviderResponse {
+                status,
+                headers,
+                body: Vec::new(),
+                retry_after,
+            }));
+            client.config.max_retries = MAX_RETRIES;
+            assert!(
+                client
+                    .lookup(
+                        LookupKind::Search,
+                        &ScreenScraperLookup {
+                            title: Some("synthetic".into()),
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(urls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn adversarial_challenges_refuse_retry_and_redact_diagnostics() {
+        for content_type in [
+            None,
+            Some("application/xhtml+xml".to_string()),
+            Some(format!("text/html; boundary={}", "x".repeat(1024))),
+            Some("text/html".into()),
+            Some("application/json".into()),
+        ] {
+            for status in [403, 503] {
+                let headers = content_type
+                    .clone()
+                    .map(|value| [("content-type".into(), value)].into())
+                    .unwrap_or_default();
+                let (mut client, urls) = make_client(Ok(ProviderResponse {
+                    status,
+                    headers,
+                    body: b"<html>captcha fake-secret</html>".to_vec(),
+                    retry_after: None,
+                }));
+                client.config.max_retries = MAX_RETRIES;
+                let error = client
+                    .lookup(
+                        LookupKind::Search,
+                        &ScreenScraperLookup {
+                            title: Some("synthetic".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_err();
+                assert_eq!(urls.lock().unwrap().len(), 1);
+                assert!(!error.is_retryable());
+                assert!(!format!("{error:?}").contains("fake-secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_and_unclassified_error_bodies_do_not_retry() {
+        for body in [
+            vec![b'x'; crate::identity_source::net_policy::http_metadata::ERROR_BODY_LIMIT + 1],
+            b"unclassified fake-secret".to_vec(),
+        ] {
+            let (mut client, urls) = make_client(Ok(ProviderResponse {
+                status: 503,
+                headers: Default::default(),
+                body,
+                retry_after: None,
+            }));
+            client.config.max_retries = MAX_RETRIES;
+            let error = client
+                .lookup(
+                    LookupKind::Search,
+                    &ScreenScraperLookup {
+                        title: Some("synthetic".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(urls.lock().unwrap().len(), 1);
+            assert!(!error.is_retryable());
+            assert!(!format!("{error:?}").contains("fake-secret"));
+        }
+    }
+
+    #[test]
     fn temporary_provider_failure_is_retried_only_within_bound() {
         let urls = Arc::new(Mutex::new(Vec::new()));
         let transport = FakeTransport {
             responses: Arc::new(Mutex::new(vec![
                 Ok(ProviderResponse {
                     status: 503,
+                    headers: [("content-type".into(), "application/json".into())].into(),
                     body: Vec::new(),
                     retry_after: None,
                 }),
@@ -945,6 +1508,23 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, LookupOutcome::Candidates { .. }));
         assert_eq!(urls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn malformed_json_diagnostics_do_not_echo_provider_values() {
+        let (client, urls) = make_client(ok(r#"{"jeu":{"id":"fake-secret"}}"#));
+        let error = client
+            .lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(urls.lock().unwrap().len(), 1);
+        assert!(!format!("{error:?}").contains("fake-secret"));
+        assert!(!error.is_retryable());
     }
 
     #[test]
@@ -1007,5 +1587,168 @@ mod tests {
             Err(ScreenScraperError::Disabled)
         ));
         assert!(urls.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn recovery_success_challenges_and_errors_are_never_metadata() {
+        for (media, body) in [
+            ("text/html", r#"{"jeux":[{"id":42}]}"#),
+            ("application/xhtml+xml", r#"{"jeux":[]}"#),
+            (
+                "application/json",
+                r#"{"challenge":"verify you are human","jeux":[{"id":42}]}"#,
+            ),
+            ("application/json", r#"{"error":"private-marker"}"#),
+            ("application/json", r#"{"captcha":"private-marker"}"#),
+            (
+                "application/json",
+                r#"{"ssuser":{"error":"private-marker"},"jeux":[]}"#,
+            ),
+        ] {
+            let (client, urls) = make_client(Ok(ProviderResponse {
+                status: 200,
+                headers: [("content-type".into(), media.into())].into(),
+                body: body.as_bytes().to_vec(),
+                retry_after: None,
+            }));
+            let outcome = client.lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                outcome.is_err(),
+                "accepted blocking or error response with {media}"
+            );
+            assert_eq!(urls.lock().unwrap().len(), 1);
+            assert!(!format!("{outcome:?}").contains("private-marker"));
+        }
+    }
+
+    #[test]
+    fn recovery_permanent_http_refusal_is_not_a_network_retry() {
+        for status in [400, 402, 405, 410, 451, 501, 505] {
+            let (mut client, urls) = make_client(Ok(ProviderResponse {
+                status,
+                headers: [("content-type".into(), "application/json".into())].into(),
+                body: b"{}".to_vec(),
+                retry_after: None,
+            }));
+            client.config.max_retries = MAX_RETRIES;
+            *client.transport.responses.lock().unwrap() = vec![
+                Ok(ProviderResponse {
+                    status,
+                    headers: [("content-type".into(), "application/json".into())].into(),
+                    body: b"{}".to_vec(),
+                    retry_after: None
+                });
+                MAX_RETRIES + 1
+            ];
+            let error = client
+                .lookup(
+                    LookupKind::Search,
+                    &ScreenScraperLookup {
+                        title: Some("synthetic".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                !error.is_retryable(),
+                "permanent HTTP refusal {status} permits retry"
+            );
+            assert_eq!(urls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn recovery_credential_debug_redacts_account_identifiers() {
+        let credentials = ScreenScraperCredentials::new(
+            "private-developer",
+            ScreenScraperSecret::parse("private-password").unwrap(),
+            Some("private-user"),
+            Some(ScreenScraperSecret::parse("private-user-password").unwrap()),
+        )
+        .unwrap();
+        let debug = format!("{:?}", Some(credentials));
+        for marker in [
+            "private-developer",
+            "private-password",
+            "private-user",
+            "private-user-password",
+        ] {
+            assert!(!debug.contains(marker));
+        }
+    }
+    #[test]
+    fn http_authentication_permission_quota_and_outage_remain_distinct() {
+        for status in [401, 403, 429, 430, 431, 503] {
+            let (mut client, urls) = make_client(Ok(ProviderResponse {
+                status,
+                headers: [("content-type".into(), "application/json".into())].into(),
+                body: b"{}".to_vec(),
+                retry_after: Some(Duration::from_secs(120)),
+            }));
+            client.config.max_retries = MAX_RETRIES;
+            let error = client
+                .lookup(
+                    LookupKind::Search,
+                    &ScreenScraperLookup {
+                        title: Some("synthetic".into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            match status {
+                401 => assert!(matches!(
+                    error,
+                    ScreenScraperError::Authentication { status: 401 }
+                )),
+                403 => match &error {
+                    ScreenScraperError::InvalidRequest { detail } => {
+                        assert!(detail.contains("403") && detail.contains("permission"))
+                    }
+                    _ => panic!("permission denial lost"),
+                },
+                429..=431 => assert!(
+                    matches!(error, ScreenScraperError::QuotaExhausted { retry_after: Some(wait), .. } if wait == Duration::from_secs(120))
+                ),
+                503 => assert!(
+                    matches!(error, ScreenScraperError::Temporary { status: Some(503), retry_after: Some(wait) } if wait == Duration::from_secs(120))
+                ),
+                _ => unreachable!(),
+            }
+            assert!(!error.is_retryable());
+            assert_eq!(urls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn supported_transient_json_error_recovers_within_request_bound() {
+        let (mut client, urls) = make_client(Ok(ProviderResponse {
+            status: 503,
+            headers: [("content-type".into(), "application/json".into())].into(),
+            body: br#"{"error":"temporary outage"}"#.to_vec(),
+            retry_after: None,
+        }));
+        client.config.max_retries = MAX_RETRIES;
+        client
+            .transport
+            .responses
+            .lock()
+            .unwrap()
+            .push(ok(r#"{"jeux":[{"id":42,"name":"CAPTCHA Challenge"}]}"#));
+        assert!(matches!(
+            client.lookup(
+                LookupKind::Search,
+                &ScreenScraperLookup {
+                    title: Some("synthetic".into()),
+                    ..Default::default()
+                }
+            ),
+            Ok(LookupOutcome::Candidates { .. })
+        ));
+        assert_eq!(urls.lock().unwrap().len(), 2);
     }
 }

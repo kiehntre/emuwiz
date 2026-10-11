@@ -16,12 +16,12 @@ use crate::platform_evidence_fusion::evidence_lineage::{
 // ---------------------------------------------------------------------
 
 struct FakeTransport {
-    responses: Mutex<Vec<HasheousHttpResponse>>,
+    responses: Mutex<Vec<HasheousWireResponse>>,
     calls: Mutex<Vec<(String, Vec<u8>)>>,
 }
 
 impl FakeTransport {
-    fn new(responses: Vec<HasheousHttpResponse>) -> Self {
+    fn new(responses: Vec<HasheousWireResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
             calls: Mutex::new(Vec::new()),
@@ -29,16 +29,18 @@ impl FakeTransport {
     }
 
     fn ok(body: &[u8]) -> Self {
-        Self::new(vec![HasheousHttpResponse {
+        Self::new(vec![HasheousWireResponse {
             status: 200,
+            headers: [("content-type".into(), "application/json".into())].into(),
             body: body.to_vec(),
             retry_after_secs: None,
         }])
     }
 
     fn status(status: u16) -> Self {
-        Self::new(vec![HasheousHttpResponse {
+        Self::new(vec![HasheousWireResponse {
             status,
+            headers: [("content-type".into(), "application/json".into())].into(),
             body: Vec::new(),
             retry_after_secs: None,
         }])
@@ -63,6 +65,14 @@ impl HasheousTransport for FakeTransport {
         url: &str,
         body: &[u8],
     ) -> Result<HasheousHttpResponse, HasheousRequestError> {
+        self.post_json_with_metadata(url, body).map(Into::into)
+    }
+
+    fn post_json_with_metadata(
+        &self,
+        url: &str,
+        body: &[u8],
+    ) -> Result<HasheousWireResponse, HasheousRequestError> {
         self.calls
             .lock()
             .unwrap()
@@ -206,8 +216,9 @@ fn sha1_plus_md5_for_the_same_representation_are_sent_together() {
 #[test]
 fn batch_of_fifty_produces_fifty_requests() {
     let responses = (0..50)
-        .map(|_| HasheousHttpResponse {
+        .map(|_| HasheousWireResponse {
             status: 404,
+            headers: [("content-type".into(), "application/json".into())].into(),
             body: Vec::new(),
             retry_after_secs: None,
         })
@@ -224,8 +235,9 @@ fn batch_of_fifty_produces_fifty_requests() {
 #[test]
 fn batch_of_fifty_one_still_issues_fifty_one_individual_requests() {
     let responses = (0..51)
-        .map(|_| HasheousHttpResponse {
+        .map(|_| HasheousWireResponse {
             status: 404,
+            headers: [("content-type".into(), "application/json".into())].into(),
             body: Vec::new(),
             retry_after_secs: None,
         })
@@ -243,8 +255,9 @@ fn batch_of_fifty_one_still_issues_fifty_one_individual_requests() {
 fn batch_boundary_sizes_all_produce_matching_call_counts() {
     for size in [0usize, 1, 49, 50, 51, 100, 137] {
         let responses = (0..size)
-            .map(|_| HasheousHttpResponse {
+            .map(|_| HasheousWireResponse {
                 status: 404,
+                headers: [("content-type".into(), "application/json".into())].into(),
                 body: Vec::new(),
                 retry_after_secs: None,
             })
@@ -270,8 +283,9 @@ fn timeout_is_a_distinct_error_variant() {
 
 #[test]
 fn http_429_is_rate_limited_not_a_generic_status_error() {
-    let transport = FakeTransport::new(vec![HasheousHttpResponse {
+    let transport = FakeTransport::new(vec![HasheousWireResponse {
         status: 429,
+        headers: [("content-type".into(), "application/json".into())].into(),
         body: Vec::new(),
         retry_after_secs: Some(30),
     }]);
@@ -298,7 +312,10 @@ fn http_500_is_a_distinct_status_error_never_conflated_with_no_match() {
     let result = client.lookup(&sha1_only("abc"), None);
     assert!(matches!(
         result,
-        Err(HasheousRequestError::HttpStatus { status: 500 })
+        Err(HasheousRequestError::Temporary {
+            status: 500,
+            retry_after_secs: None
+        })
     ));
 }
 
@@ -958,9 +975,10 @@ fn duplicate_signatures_collapse_via_merge_evidence_dedup() {
 
 #[test]
 fn batch_ordering_is_stable_regardless_of_input_order() {
-    let responses: Vec<HasheousHttpResponse> = (0..5)
-        .map(|_| HasheousHttpResponse {
+    let responses: Vec<HasheousWireResponse> = (0..5)
+        .map(|_| HasheousWireResponse {
             status: 404,
+            headers: [("content-type".into(), "application/json".into())].into(),
             body: Vec::new(),
             retry_after_secs: None,
         })
@@ -1259,4 +1277,234 @@ fn hasheous_module_never_references_combined_identity_or_dat_identity_resolver()
         assert!(!source.contains("combined_identity"));
         assert!(!source.contains("IdentityResult"));
     }
+}
+
+#[test]
+fn bad_request_details_do_not_echo_untrusted_provider_content() {
+    let transport = FakeTransport::new(vec![HasheousWireResponse {
+        status: 400,
+        headers: [("content-type".into(), "application/json".into())].into(),
+        body: br#"{"title":"synthetic","detail":"fake-secret /private/path"}"#.to_vec(),
+        retry_after_secs: None,
+    }]);
+    let config = enabled_config();
+    let error = HasheousClient::new(&config, &transport)
+        .lookup(&sha1_only(&"1".repeat(40)), None)
+        .unwrap_err();
+    let detail = format!("{error:?}");
+    assert!(!detail.contains("fake-secret"));
+    assert!(!detail.contains("/private/path"));
+    assert!(detail.contains("HTTP 400"));
+}
+
+#[test]
+fn recovery_hasheous_404_challenge_never_establishes_no_match() {
+    let transport = FakeTransport::new(vec![HasheousWireResponse {
+        headers: [("content-type".into(), "application/json".into())].into(),
+        status: 404,
+        body: b"<html>captcha private-marker</html>".to_vec(),
+        retry_after_secs: None,
+    }]);
+    let config = enabled_config();
+    let client = HasheousClient::new(&config, &transport);
+    let outcome = client.lookup(&sha1_only("synthetic"), None);
+    assert!(matches!(
+        outcome,
+        Err(HasheousRequestError::InvalidResponse { .. })
+    ));
+    assert_eq!(transport.call_count(), 1);
+    assert!(!format!("{outcome:?}").contains("private-marker"));
+}
+
+#[test]
+fn recovery_hasheous_success_challenges_and_404_errors_are_not_results() {
+    for (status, media, body) in [
+        (200, "text/html", "{}"),
+        (200, "application/json", r#"{"challenge":"private-marker"}"#),
+        (200, "application/json", r#"{"error":"private-marker"}"#),
+        (
+            200,
+            "application/json",
+            r#"{"message":"verify you are human private-marker"}"#,
+        ),
+        (
+            200,
+            "application/json",
+            r#"{"signature":null,"message":"captcha private-marker"}"#,
+        ),
+        (
+            200,
+            "application/json",
+            r#"{"unclassified":"private-marker"}"#,
+        ),
+        (404, "application/json", r#"{"error":"private-marker"}"#),
+        (404, "application/json", "{}"),
+        (404, "text/html", ""),
+        (404, "text/plain", "temporary outage"),
+    ] {
+        let transport = FakeTransport::new(vec![HasheousWireResponse {
+            status,
+            headers: [("content-type".into(), media.into())].into(),
+            body: body.as_bytes().to_vec(),
+            retry_after_secs: None,
+        }]);
+        let config = enabled_config();
+        let outcome =
+            HasheousClient::new(&config, &transport).lookup(&sha1_only("synthetic"), None);
+        assert!(
+            matches!(outcome, Err(HasheousRequestError::InvalidResponse { .. })),
+            "accepted error/challenge HTTP {status}"
+        );
+        assert!(!format!("{outcome:?}").contains("private-marker"));
+        assert_eq!(transport.call_count(), 1);
+    }
+}
+
+#[test]
+fn recovery_hasheous_batch_stops_after_provider_refusal_or_cooldown() {
+    for (status, body, wait) in [
+        (401, "{}", None),
+        (403, "{}", None),
+        (429, "{}", Some(120)),
+        (503, "{}", Some(120)),
+        (404, "<html>captcha private-marker</html>", None),
+        (200, r#"{"challenge":"private-marker"}"#, None),
+    ] {
+        let refused = HasheousWireResponse {
+            status,
+            headers: [("content-type".into(), "application/json".into())].into(),
+            body: body.as_bytes().to_vec(),
+            retry_after_secs: wait,
+        };
+        let transport = FakeTransport::new(vec![refused.clone(), refused.clone(), refused]);
+        let config = enabled_config();
+        let outcomes = HasheousClient::new(&config, &transport).lookup_many(
+            &[
+                sha1_only("synthetic-a"),
+                sha1_only("synthetic-b"),
+                sha1_only("synthetic-c"),
+            ],
+            None,
+        );
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(Result::is_err));
+        assert_eq!(
+            transport.call_count(),
+            1,
+            "continued batch after HTTP {status}"
+        );
+        assert!(!format!("{outcomes:?}").contains("private-marker"));
+    }
+}
+
+#[test]
+fn hasheous_authentication_permission_outage_and_transport_failures_are_distinct() {
+    for status in [401, 403, 429, 503, 501] {
+        let transport = FakeTransport::new(vec![HasheousWireResponse {
+            status,
+            headers: [("content-type".into(), "application/json".into())].into(),
+            body: b"{}".to_vec(),
+            retry_after_secs: Some(120),
+        }]);
+        let config = enabled_config();
+        let error = HasheousClient::new(&config, &transport)
+            .lookup(&sha1_only("synthetic"), None)
+            .unwrap_err();
+        match status {
+            401 => assert!(matches!(
+                error,
+                HasheousRequestError::Authentication { status: 401 }
+            )),
+            403 => assert!(matches!(
+                error,
+                HasheousRequestError::PermissionDenied { status: 403 }
+            )),
+            429 => assert!(matches!(
+                error,
+                HasheousRequestError::RateLimited {
+                    retry_after_secs: Some(120),
+                    ..
+                }
+            )),
+            503 => assert!(matches!(
+                error,
+                HasheousRequestError::Temporary {
+                    status: 503,
+                    retry_after_secs: Some(120)
+                }
+            )),
+            501 => assert!(matches!(
+                error,
+                HasheousRequestError::HttpStatus { status: 501 }
+            )),
+            _ => unreachable!(),
+        }
+        assert_eq!(transport.call_count(), 1);
+    }
+    let config = enabled_config();
+    for error in [
+        HasheousRequestError::Timeout,
+        HasheousRequestError::Network {
+            detail: "synthetic transport failure".into(),
+        },
+    ] {
+        let transport = ErrorTransport(error.clone());
+        assert_eq!(
+            HasheousClient::new(&config, &transport).lookup(&sha1_only("synthetic"), None),
+            Err(error)
+        );
+    }
+}
+
+#[test]
+fn hasheous_temporary_json_error_preserves_provider_cooldown() {
+    let transport = FakeTransport::new(vec![HasheousWireResponse {
+        status: 503,
+        headers: [("content-type".into(), "application/json".into())].into(),
+        body: br#"{"error":"temporary outage"}"#.to_vec(),
+        retry_after_secs: Some(120),
+    }]);
+    let config = enabled_config();
+    assert!(matches!(
+        HasheousClient::new(&config, &transport).lookup(&sha1_only("synthetic"), None),
+        Err(HasheousRequestError::Temporary {
+            status: 503,
+            retry_after_secs: Some(120)
+        })
+    ));
+}
+
+#[test]
+fn legacy_hasheous_transport_preserves_caller_shape_and_refuses_challenges() {
+    struct LegacyTransport(HasheousHttpResponse);
+    impl HasheousTransport for LegacyTransport {
+        fn post_json(
+            &self,
+            _url: &str,
+            _body: &[u8],
+        ) -> Result<HasheousHttpResponse, HasheousRequestError> {
+            Ok(self.0.clone())
+        }
+    }
+    let config = enabled_config();
+    let transport = LegacyTransport(HasheousHttpResponse {
+        status: 200,
+        body: b"{}".to_vec(),
+        retry_after_secs: None,
+    });
+    assert!(matches!(
+        HasheousClient::new(&config, &transport).lookup(&sha1_only("synthetic"), None),
+        Ok(HasheousLookupOutcome::Found(_))
+    ));
+    let transport = LegacyTransport(HasheousHttpResponse {
+        status: 404,
+        body: b"<html>captcha private-marker</html>".to_vec(),
+        retry_after_secs: Some(120),
+    });
+    let outcome = HasheousClient::new(&config, &transport).lookup(&sha1_only("synthetic"), None);
+    assert!(matches!(
+        outcome,
+        Err(HasheousRequestError::InvalidResponse { .. })
+    ));
+    assert!(!format!("{outcome:?} {:?}", transport.0).contains("private-marker"));
 }
