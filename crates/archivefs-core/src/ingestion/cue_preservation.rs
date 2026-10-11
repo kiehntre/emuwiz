@@ -2,6 +2,9 @@
 //! arithmetic remain in cue_bin/cue_timeline; opening remains in safe_read.
 //! Whole FILE bytes and individual stored ranges are hashed in the same pass.
 //! Synthetic declarations have no byte digest and are never materialized.
+//! Metadata equality is not content proof: inspection establishes digests with
+//! independent reads, and reading/comparison revalidate those earlier bytes.
+//! These are bounded read observations, not locked filesystem snapshots.
 //!
 //! Comparisons concern stored source layout/content, not cooked-sector identity,
 //! playability, Redump equivalence, CD-text, or CUE/CHD conversion. They do not
@@ -126,6 +129,7 @@ pub struct CuePreservationInspection {
     layout: CueLayout,
     timeline: DiscTimeline,
     sources: Vec<(PathBuf, CueSourceIdentity)>,
+    source_sha256: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +253,9 @@ fn cue_snapshot(path: &Path) -> Result<(String, CueSourceIdentity, String), CueP
     if identity(&file.metadata().map_err(|e| io(path, e))?)? != stamp {
         return Err(changed(path));
     }
+    if bytes.len() as u64 != stamp.file.size {
+        return Err(changed(path));
+    }
     if bytes.len() as u64 > MAX_CUE_BYTES {
         return Err(CuePreservationError::Cue(CueError::TooLarge));
     }
@@ -295,10 +302,19 @@ fn declaration_coverage(text: &str) -> Result<usize, CuePreservationError> {
     Ok(files)
 }
 
-/// Capture current metadata first; content reading remains explicit. The CUE
+/// Capture metadata and every stored byte, then independently reread the
+/// content before accepting inspection. Timestamp equality alone cannot prove
+/// the earlier bytes, even when change-time exposes nanosecond fields. The CUE
 /// path must satisfy the shared safe-read policy (absolute, normal, no links).
 pub fn inspect_cue_preservation(
     path: &Path,
+) -> Result<CuePreservationInspection, CuePreservationError> {
+    inspect_with(path, |_| {})
+}
+
+fn inspect_with(
+    path: &Path,
+    before_final_verification: impl FnOnce(&mut CuePreservationInspection),
 ) -> Result<CuePreservationInspection, CuePreservationError> {
     let (cue_text, cue_identity, cue_sha256) = cue_snapshot(path)?;
     let file_count = declaration_coverage(&cue_text)?;
@@ -353,19 +369,36 @@ pub fn inspect_cue_preservation(
             .ok_or_else(|| "uninspected source".into())
     })
     .map_err(CuePreservationError::Timeline)?;
-    let inspection = CuePreservationInspection {
+    let mut inspection = CuePreservationInspection {
         cue_text,
         cue_identity,
         cue_sha256,
         layout,
         timeline,
         sources,
+        source_sha256: Vec::new(),
     };
+    // Enforce the total byte limit and validate the timeline before reading
+    // any BIN. Hash prefixes/pregaps as well as programs; no stored byte may
+    // become an unverified inspection-time expectation.
+    for file in &inspection.timeline.files {
+        let (_, stamp) = &inspection.sources[file.ordinal as usize];
+        let (digest, _) = read_source(
+            &file.path,
+            stamp,
+            None,
+            &source_ranges(&inspection, file.ordinal)?,
+        )?;
+        inspection.source_sha256.push(digest);
+    }
+    before_final_verification(&mut inspection);
     validate_inspection(&inspection)?;
     Ok(inspection)
 }
 
-fn validate_inspection(inspection: &CuePreservationInspection) -> Result<(), CuePreservationError> {
+fn validate_relationships(
+    inspection: &CuePreservationInspection,
+) -> Result<(), CuePreservationError> {
     let path = &inspection.layout.cue_path;
     let (_, stamp) = open_source(path)?;
     if stamp != inspection.cue_identity {
@@ -394,6 +427,19 @@ fn validate_inspection(inspection: &CuePreservationInspection) -> Result<(), Cue
         }
     }
     Ok(())
+}
+
+fn validate_inspection(inspection: &CuePreservationInspection) -> Result<(), CuePreservationError> {
+    validate_relationships(inspection)?;
+    for file in &inspection.timeline.files {
+        read_source(
+            &file.path,
+            &inspection.sources[file.ordinal as usize].1,
+            Some(&inspection.source_sha256[file.ordinal as usize]),
+            &source_ranges(inspection, file.ordinal)?,
+        )?;
+    }
+    validate_relationships(inspection)
 }
 
 #[derive(Clone, Copy)]
@@ -456,7 +502,18 @@ fn source_ranges(
 fn read_source(
     path: &Path,
     expected: &CueSourceIdentity,
+    expected_sha256: Option<&str>,
     ranges: &[(RangeRole, SourceRange)],
+) -> Result<(String, Vec<(RangeRole, RangeDigest)>), CuePreservationError> {
+    read_source_with(path, expected, expected_sha256, ranges, |_| {})
+}
+
+fn read_source_with(
+    path: &Path,
+    expected: &CueSourceIdentity,
+    expected_sha256: Option<&str>,
+    ranges: &[(RangeRole, SourceRange)],
+    mut after_chunk: impl FnMut(u64),
 ) -> Result<(String, Vec<(RangeRole, RangeDigest)>), CuePreservationError> {
     let (mut file, stamp) = open_source(path)?;
     if &stamp != expected {
@@ -478,10 +535,17 @@ fn read_source(
         let mut remaining = range.byte_len;
         while remaining > 0 {
             let n = remaining.min(buffer.len() as u64) as usize;
-            file.read_exact(&mut buffer[..n]).map_err(|e| io(path, e))?;
+            file.read_exact(&mut buffer[..n]).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    changed(path)
+                } else {
+                    io(path, e)
+                }
+            })?;
             whole.update(&buffer[..n]);
             digest.update(&buffer[..n]);
             remaining -= n as u64;
+            after_chunk(end - remaining);
         }
         cursor = end;
         digests.push((
@@ -498,11 +562,18 @@ fn read_source(
     if identity(&file.metadata().map_err(|e| io(path, e))?)? != *expected {
         return Err(changed(path));
     }
-    Ok((hex(whole.finalize()), digests))
+    // A replaced path may still leave this open handle reading the old inode.
+    let (_, current) = open_source(path).map_err(|_| changed(path))?;
+    let digest = hex(whole.finalize());
+    if current != *expected || expected_sha256.is_some_and(|expected| expected != digest) {
+        return Err(changed(path));
+    }
+    Ok((digest, digests))
 }
 
-/// Read exactly the previously inspected sources. All identities/relationships
-/// are checked before, after each FILE, and once more before publishing proof.
+/// Read exactly the inspected bytes. Each FILE digest must match the content
+/// independently established at inspection, followed by another complete
+/// content/relationship verification before publishing evidence.
 pub fn read_cue_preservation(
     inspection: &CuePreservationInspection,
 ) -> Result<DiscLayoutEvidence, CuePreservationError> {
@@ -513,13 +584,17 @@ fn read_with(
     inspection: &CuePreservationInspection,
     before_final_verification: impl FnOnce(),
 ) -> Result<DiscLayoutEvidence, CuePreservationError> {
-    validate_inspection(inspection)?;
+    validate_relationships(inspection)?;
     let mut sources: Vec<SourceEvidence> = Vec::new();
     let mut content: BTreeMap<usize, (Option<RangeDigest>, Option<RangeDigest>)> = BTreeMap::new();
     for file in &inspection.timeline.files {
         let stamp = &inspection.sources[file.ordinal as usize].1;
-        let (physical_sha256, digests) =
-            read_source(&file.path, stamp, &source_ranges(inspection, file.ordinal)?)?;
+        let (physical_sha256, digests) = read_source(
+            &file.path,
+            stamp,
+            Some(&inspection.source_sha256[file.ordinal as usize]),
+            &source_ranges(inspection, file.ordinal)?,
+        )?;
         let mut unassigned_prefix = None;
         for (role, digest) in digests {
             match role {
@@ -573,6 +648,148 @@ fn read_with(
 mod tests {
     use super::*;
 
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let cue = dir.path().join("disc.cue");
+        let bin = dir.path().join("disc.bin");
+        std::fs::write(&bin, vec![1; 3 * 2048]).unwrap();
+        std::fs::write(
+            &cue,
+            "FILE \"disc.bin\" BINARY\n TRACK 01 MODE1/2048\n INDEX 01 00:00:00\n",
+        )
+        .unwrap();
+        (dir, cue, bin)
+    }
+
+    #[test]
+    fn indistinguishable_metadata_still_requires_the_inspected_content() {
+        let (_dir, cue, bin) = fixture();
+        let mut inspection = inspect_cue_preservation(&cue).unwrap();
+        std::fs::write(&bin, vec![9; 3 * 2048]).unwrap();
+        // Model a coarse filesystem's equality branch deterministically using
+        // actual metadata from the file. No filesystem timestamp is fabricated
+        // or changed; only the metadata proof is made indistinguishable. The
+        // independently captured earlier content proof must remain decisive.
+        inspection.sources[0].1 = identity(&std::fs::metadata(&bin).unwrap()).unwrap();
+        assert_eq!(open_source(&bin).unwrap().1, inspection.sources[0].1);
+        assert_eq!(
+            read_cue_preservation(&inspection).unwrap_err(),
+            changed(&bin)
+        );
+    }
+
+    #[test]
+    fn inspection_requires_an_independent_content_verification() {
+        let (_dir, cue, bin) = fixture();
+        let result = inspect_with(&cue, |inspection| {
+            assert_eq!(
+                inspection.source_sha256,
+                vec![hex(Sha256::digest(vec![1; 3 * 2048]))]
+            );
+            std::fs::write(&bin, vec![9; 3 * 2048]).unwrap();
+            // Exercise metadata equality with real observed metadata, keeping
+            // the earlier digest intact as in the coarse-filesystem model.
+            inspection.sources[0].1 = identity(&std::fs::metadata(&bin).unwrap()).unwrap();
+        });
+        assert_eq!(result.unwrap_err(), changed(&bin));
+    }
+
+    #[test]
+    fn mutation_of_unread_bytes_during_reading_is_refused() {
+        use std::io::{Seek, SeekFrom, Write};
+        let (_dir, cue, bin) = fixture();
+        std::fs::write(&bin, vec![1; 2 * 128 * 1024]).unwrap();
+        let inspection = inspect_cue_preservation(&cue).unwrap();
+        let result = read_source_with(
+            &bin,
+            &inspection.sources[0].1,
+            Some(&inspection.source_sha256[0]),
+            &source_ranges(&inspection, 0).unwrap(),
+            |read| {
+                if read == 128 * 1024 {
+                    let mut writer = File::options().write(true).open(&bin).unwrap();
+                    writer.seek(SeekFrom::Start(read)).unwrap();
+                    writer.write_all(&vec![9; 2048]).unwrap();
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap(), changed(&bin));
+    }
+
+    #[test]
+    fn atomic_replacement_during_reading_is_refused_even_with_identical_bytes() {
+        let (dir, cue, bin) = fixture();
+        let original = vec![1; 2 * 128 * 1024];
+        std::fs::write(&bin, &original).unwrap();
+        let inspection = inspect_cue_preservation(&cue).unwrap();
+        let result = read_source_with(
+            &bin,
+            &inspection.sources[0].1,
+            Some(&inspection.source_sha256[0]),
+            &source_ranges(&inspection, 0).unwrap(),
+            |read| {
+                if read == 128 * 1024 {
+                    let replacement = dir.path().join("replacement.bin");
+                    std::fs::write(&replacement, &original).unwrap();
+                    std::fs::rename(replacement, &bin).unwrap();
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap(), changed(&bin));
+    }
+
+    #[test]
+    fn truncation_during_reading_is_changed_source() {
+        let (_dir, cue, bin) = fixture();
+        std::fs::write(&bin, vec![1; 2 * 128 * 1024]).unwrap();
+        let inspection = inspect_cue_preservation(&cue).unwrap();
+        let result = read_source_with(
+            &bin,
+            &inspection.sources[0].1,
+            Some(&inspection.source_sha256[0]),
+            &source_ranges(&inspection, 0).unwrap(),
+            |read| {
+                if read == 128 * 1024 {
+                    File::options()
+                        .write(true)
+                        .open(&bin)
+                        .unwrap()
+                        .set_len(read)
+                        .unwrap();
+                }
+            },
+        );
+        assert_eq!(result.err().unwrap(), changed(&bin));
+    }
+
+    #[test]
+    fn final_verification_checks_prefix_pregap_and_program_despite_equal_metadata() {
+        use std::io::{Seek, SeekFrom, Write};
+        for offset in [0, 2048, 4096] {
+            let (_dir, cue, bin) = fixture();
+            std::fs::write(
+                &cue,
+                "FILE \"disc.bin\" BINARY\n TRACK 01 MODE1/2048\n INDEX 00 00:00:01\n INDEX 01 00:00:02\n",
+            )
+            .unwrap();
+            let mut inspection = inspect_cue_preservation(&cue).unwrap();
+            // Simulate the content pass having finished before an edit to
+            // already-consumed bytes; final verification must reread them.
+            read_source(
+                &bin,
+                &inspection.sources[0].1,
+                Some(&inspection.source_sha256[0]),
+                &source_ranges(&inspection, 0).unwrap(),
+            )
+            .unwrap();
+            let mut writer = File::options().write(true).open(&bin).unwrap();
+            writer.seek(SeekFrom::Start(offset)).unwrap();
+            writer.write_all(&vec![9; 2048]).unwrap();
+            inspection.sources[0].1 = identity(&std::fs::metadata(&bin).unwrap()).unwrap();
+            assert_eq!(validate_inspection(&inspection).unwrap_err(), changed(&bin));
+        }
+    }
+
     #[test]
     fn a_source_replaced_after_hashing_is_refused_by_final_verification() {
         let dir = tempfile::tempdir().unwrap();
@@ -603,7 +820,7 @@ mod tests {
             byte_offset: 1,
             byte_len: u64::MAX,
         };
-        let result = read_source(&path, &stamp, &[(RangeRole::Program(0), range)]);
+        let result = read_source(&path, &stamp, None, &[(RangeRole::Program(0), range)]);
         assert!(matches!(
             result,
             Err(CuePreservationError::Unsupported { .. })
