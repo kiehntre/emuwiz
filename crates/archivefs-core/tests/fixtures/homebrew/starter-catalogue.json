@@ -1,0 +1,361 @@
+{
+  "schema_version": 1,
+  "provider": "emuwiz-starter",
+  "records": [
+    {
+      "project": {
+        "id": {
+          "provider": "emuwiz-starter",
+          "provider_id": "tobu-tobu-girl"
+        },
+        "title": "Tobu Tobu Girl",
+        "summary": "Tangram Games arcade platformer for the original Game Boy.",
+        "source_page_url": "https://tangramgames.dk/tobutobugirl/",
+        "links": [],
+        "rights": {
+          "software_licence": {
+            "known": {
+              "value": "MIT",
+              "evidence": "https://github.com/SimonLarsen/tobutobugirl/blob/master/README.md#license; applies to source code."
+            }
+          },
+          "asset_licence": {
+            "known": {
+              "value": "CC-BY-4.0",
+              "evidence": "https://github.com/SimonLarsen/tobutobugirl/blob/master/README.md#license; developer explicitly covers images, text, sound and music. Attribution and licence conditions apply; no claim about Deluxe or packaging."
+            }
+          },
+          "redistribution": "unknown",
+          "source_availability": {
+            "known": {
+              "value": {
+                "available": {
+                  "source_url": "https://github.com/SimonLarsen/tobutobugirl"
+                }
+              },
+              "evidence": "https://tangramgames.dk/tobutobugirl/; developer links the source repository."
+            }
+          }
+        }
+      },
+      "listings": [
+        {
+          "project": {
+            "provider": "emuwiz-starter",
+            "provider_id": "tobu-tobu-girl"
+          },
+          "release": null,
+          "artifacts": [
+            {
+              "provider_asset_id": "dmg-source-build",
+              "filename": "tobu.gb",
+              "size_bytes": null,
+              "provider_digest": null,
+              "acquisition": {
+                "source_page_url": "https://tangramgames.dk/tobutobugirl/",
+                "link_url": null,
+                "mode": "browser_required"
+              },
+              "platform_claims": [
+                {
+                  "platform": "Game Boy",
+                  "evidence": {
+                    "release_metadata": "https://github.com/SimonLarsen/tobutobugirl/blob/master/README.md; developer targets Game Boy and describes flash-cart/emulator use; confidence: unverified developer claim."
+                  }
+                }
+              ],
+              "rights": {
+                "software_licence": {
+                  "known": {
+                    "value": "MIT",
+                    "evidence": "https://github.com/SimonLarsen/tobutobugirl/blob/master/README.md#license; applies to source code."
+                  }
+                },
+                "asset_licence": {
+                  "known": {
+                    "value": "CC-BY-4.0",
+                    "evidence": "https://github.com/SimonLarsen/tobutobugirl/blob/master/README.md#license; developer explicitly covers images, text, sound and music. Attribution and licence conditions apply; no claim about Deluxe or packaging."
+                  }
+                },
+                "redistribution": "unknown",
+                "source_availability": {
+                  "known": {
+                    "value": {
+                      "available": {
+                        "source_url": "https://github.com/SimonLarsen/tobutobugirl"
+                      }
+                    },
+                    "evidence": "https://tangramgames.dk/tobutobugirl/; developer links the source repository."
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "observations": [
+        {
+          "source_url": "https://github.com/SimonLarsen/tobutobugirl/blob/master/README.md",
+          "observed_on": "2026-10-11",
+          "note": "Code and game assets have distinct explicit licences. The documented source-build output is tobu.gb; no binary was inspected. Version is unknown. Binary redistribution remains Unknown because complete downloaded-package coverage was not established."
+        },
+        {
+          "source_url": "https://tangramgames.dk/tobutobugirl/",
+          "observed_on": "2026-10-11",
+          "note": "Developer-controlled site links repository and an explicit future itch.io acquisition. Original monochrome game only; Deluxe and packaging excluded. Compatibility confidence: developer claim, not execution or hardware testing."
+        }
+      ]
+    },
+    {
+      "project": {
+        "id": {
+          "provider": "emuwiz-starter",
+          "provider_id": "nova-the-squirrel"
+        },
+        "title": "Nova the Squirrel",
+        "summary": "NovaSquirrel puzzle platformer for NES, with a level editor.",
+        "source_page_url": "https://github.com/NovaSquirrel/NovaTheSquirrel",
+        "links": [],
+        "rights": {
+          "software_licence": {
+            "known": {
+              "value": "GPL-3.0-or-later",
+              "evidence": "https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/README.md#license; code only."
+            }
+          },
+          "asset_licence": {
+            "known": {
+              "value": "CC-BY-NC-SA-4.0",
+              "evidence": "https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/README.md#license; graphics and levels have separate terms; no selling without permission and no reuse of characters in other games. This is not unconditional redistribution permission."
+            }
+          },
+          "redistribution": "unknown",
+          "source_availability": {
+            "known": {
+              "value": {
+                "available": {
+                  "source_url": "https://github.com/NovaSquirrel/NovaTheSquirrel"
+                }
+              },
+              "evidence": "https://github.com/NovaSquirrel/NovaTheSquirrel; developer source repository."
+            }
+          }
+        }
+      },
+      "listings": [
+        {
+          "project": {
+            "provider": "emuwiz-starter",
+            "provider_id": "nova-the-squirrel"
+          },
+          "release": {
+            "provider_release_id": "v1.0.6a",
+            "version": "1.0.6a",
+            "tag": "v1.0.6a"
+          },
+          "artifacts": [
+            {
+              "provider_asset_id": "v1.0.6a-source-build",
+              "filename": "nova.nes",
+              "size_bytes": null,
+              "provider_digest": null,
+              "acquisition": {
+                "source_page_url": "https://github.com/NovaSquirrel/NovaTheSquirrel/releases/tag/v1.0.6a",
+                "link_url": null,
+                "mode": "browser_required"
+              },
+              "platform_claims": [
+                {
+                  "platform": "NES",
+                  "evidence": {
+                    "release_metadata": "https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/README.md; developer targets NES; confidence: unverified developer claim. Some level-editor functions require NES 2.0 support."
+                  }
+                }
+              ],
+              "rights": {
+                "software_licence": {
+                  "known": {
+                    "value": "GPL-3.0-or-later",
+                    "evidence": "https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/README.md#license; code only."
+                  }
+                },
+                "asset_licence": {
+                  "known": {
+                    "value": "CC-BY-NC-SA-4.0",
+                    "evidence": "https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/README.md#license; graphics and levels have separate terms; no selling without permission and no reuse of characters in other games. This is not unconditional redistribution permission."
+                  }
+                },
+                "redistribution": "unknown",
+                "source_availability": {
+                  "known": {
+                    "value": {
+                      "available": {
+                        "source_url": "https://github.com/NovaSquirrel/NovaTheSquirrel"
+                      }
+                    },
+                    "evidence": "https://github.com/NovaSquirrel/NovaTheSquirrel; developer source repository."
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "observations": [
+        {
+          "source_url": "https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/README.md",
+          "observed_on": "2026-10-11",
+          "note": "Tagged source evidence separates GPL code from noncommercial/share-alike asset terms and character-use restrictions. No blanket redistribution permission is asserted."
+        },
+        {
+          "source_url": "https://github.com/NovaSquirrel/NovaTheSquirrel/releases/tag/v1.0.6a",
+          "observed_on": "2026-10-11",
+          "note": "Developer release tag v1.0.6a is known; this record does not claim that the documented build filename is a verified release-asset identity."
+        },
+        {
+          "source_url": "https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/mk.bat",
+          "observed_on": "2026-10-11",
+          "note": "Tagged build instructions produce nova.nes; metadata only, no compilation or asset retrieval."
+        },
+        {
+          "source_url": "https://github.com/NovaSquirrel/NovaTheSquirrel/releases/tag/v1.0.4",
+          "observed_on": "2026-10-11",
+          "note": "Developer release notes say level-editor slots require NES 2.0 support. This is a retained compatibility caveat, not an EmuWiz verdict."
+        }
+      ]
+    },
+    {
+      "project": {
+        "id": {
+          "provider": "emuwiz-starter",
+          "provider_id": "super-tilt-bro"
+        },
+        "title": "Super Tilt Bro",
+        "summary": "sgadrat NES platform fighting game with networking and offline build variants.",
+        "source_page_url": "https://github.com/sgadrat/super-tilt-bro",
+        "links": [],
+        "rights": {
+          "software_licence": {
+            "known": {
+              "value": "WTFPL-2.0",
+              "evidence": "https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE; repository licence. Separate coverage of all distributed graphics/music was not established."
+            }
+          },
+          "asset_licence": "unknown",
+          "redistribution": "unknown",
+          "source_availability": {
+            "known": {
+              "value": {
+                "available": {
+                  "source_url": "https://github.com/sgadrat/super-tilt-bro"
+                }
+              },
+              "evidence": "https://github.com/sgadrat/super-tilt-bro; developer source repository."
+            }
+          }
+        }
+      },
+      "listings": [
+        {
+          "project": {
+            "provider": "emuwiz-starter",
+            "provider_id": "super-tilt-bro"
+          },
+          "release": null,
+          "artifacts": [
+            {
+              "provider_asset_id": "rainbow-network-source-build",
+              "filename": "Super_Tilt_Bro_(E).nes",
+              "size_bytes": null,
+              "provider_digest": null,
+              "acquisition": {
+                "source_page_url": "https://github.com/sgadrat/super-tilt-bro",
+                "link_url": null,
+                "mode": "browser_required"
+              },
+              "platform_claims": [
+                {
+                  "platform": "NES",
+                  "evidence": {
+                    "release_metadata": "https://github.com/sgadrat/super-tilt-bro/blob/master/README.md; RAINBOW mapper build; developer points to a FCEUX fork. Confidence: unverified developer claim; emulator support not checked."
+                  }
+                }
+              ],
+              "rights": {
+                "software_licence": {
+                  "known": {
+                    "value": "WTFPL-2.0",
+                    "evidence": "https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE; repository licence. Separate coverage of all distributed graphics/music was not established."
+                  }
+                },
+                "asset_licence": "unknown",
+                "redistribution": "unknown",
+                "source_availability": {
+                  "known": {
+                    "value": {
+                      "available": {
+                        "source_url": "https://github.com/sgadrat/super-tilt-bro"
+                      }
+                    },
+                    "evidence": "https://github.com/sgadrat/super-tilt-bro; developer source repository."
+                  }
+                }
+              }
+            },
+            {
+              "provider_asset_id": "unrom-offline-source-build",
+              "filename": "tilt_no_network_unrom_(E).nes",
+              "size_bytes": null,
+              "provider_digest": null,
+              "acquisition": {
+                "source_page_url": "https://github.com/sgadrat/super-tilt-bro",
+                "link_url": null,
+                "mode": "browser_required"
+              },
+              "platform_claims": [
+                {
+                  "platform": "NES",
+                  "evidence": {
+                    "release_metadata": "https://github.com/sgadrat/super-tilt-bro/blob/master/README.md; developer describes an offline UNROM alternative. Confidence: unverified developer claim; broad emulator compatibility was not tested."
+                  }
+                }
+              ],
+              "rights": {
+                "software_licence": {
+                  "known": {
+                    "value": "WTFPL-2.0",
+                    "evidence": "https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE; repository licence. Separate coverage of all distributed graphics/music was not established."
+                  }
+                },
+                "asset_licence": "unknown",
+                "redistribution": "unknown",
+                "source_availability": {
+                  "known": {
+                    "value": {
+                      "available": {
+                        "source_url": "https://github.com/sgadrat/super-tilt-bro"
+                      }
+                    },
+                    "evidence": "https://github.com/sgadrat/super-tilt-bro; developer source repository."
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "observations": [
+        {
+          "source_url": "https://github.com/sgadrat/super-tilt-bro/blob/master/README.md",
+          "observed_on": "2026-10-11",
+          "note": "Two documented build variants share one project but keep distinct asset IDs. Version is unknown. RAINBOW/fork and offline UNROM claims are preserved separately and are not a promise that every emulator works."
+        },
+        {
+          "source_url": "https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE",
+          "observed_on": "2026-10-11",
+          "note": "Repository licence is WTFPL version 2. This observation establishes a software licence only. Independent game-asset coverage and downloaded-package redistribution rights remain Unknown."
+        }
+      ]
+    }
+  ]
+}

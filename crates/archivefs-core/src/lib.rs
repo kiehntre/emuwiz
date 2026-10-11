@@ -80,6 +80,8 @@ pub mod game_firmware_readiness;
 pub mod game_profile_planner;
 /// Provider-neutral homebrew project, release and artifact metadata types.
 pub mod homebrew_artifact;
+/// Offline discovery from an explicitly supplied local metadata catalogue.
+pub mod homebrew_catalogue;
 /// GitHub Releases provider for already-known homebrew repositories.
 pub mod homebrew_github;
 mod http_agent;
