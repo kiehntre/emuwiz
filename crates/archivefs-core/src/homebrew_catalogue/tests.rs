@@ -676,3 +676,190 @@ fn offline_discovery_network_blocked_child() {
         1
     );
 }
+
+// ----------------------------------------------------- review corrections
+
+#[test]
+fn starter_corpus_uses_the_canonical_wtfpl_spdx_identifier() {
+    let bytes = include_bytes!("../../tests/fixtures/homebrew/starter-catalogue.json");
+    let text = std::str::from_utf8(bytes).unwrap();
+    assert!(!text.contains("WTFPL-2.0"), "WTFPL-2.0 is not an SPDX id");
+    let provider = LocalCatalogueProvider::from_json(bytes).unwrap();
+    let tilt = provider
+        .record(&id("emuwiz-starter", "super-tilt-bro"))
+        .unwrap();
+    let licences = std::iter::once(&tilt.project.rights).chain(
+        tilt.listings
+            .iter()
+            .flat_map(|l| l.artifacts.iter().map(|a| &a.rights)),
+    );
+    let mut seen = 0;
+    for rights in licences {
+        assert!(
+            matches!(&rights.software_licence, RightsFact::Known { value, .. } if value == "WTFPL")
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, 3);
+    // The version-2 fact survives in the observation text.
+    assert!(
+        tilt.observations
+            .iter()
+            .any(|o| o.note.contains("WTFPL version 2"))
+    );
+    // No other starter licence was rewritten.
+    let tobu = provider
+        .record(&id("emuwiz-starter", "tobu-tobu-girl"))
+        .unwrap();
+    assert!(
+        matches!(&tobu.project.rights.software_licence, RightsFact::Known { value, .. } if value == "MIT")
+    );
+}
+
+fn with_title(title: &str, summary: Option<&str>) -> Value {
+    let mut value = record("local", "t", "placeholder");
+    value["project"]["title"] = json!(title);
+    value["project"]["summary"] = json!(summary);
+    catalogue("local", vec![value])
+}
+
+#[test]
+fn control_and_spoofing_characters_in_titles_and_summaries_are_refused() {
+    for (name, bad) in [
+        ("terminal escape", "Evil\u{1b}[31mTitle"),
+        ("carriage return", "Line\rOverwrite"),
+        ("newline", "Two\nLines"),
+        ("tab", "Tab\tTitle"),
+        ("C1 CSI", "Csi\u{9b}31m"),
+        ("DEL", "Del\u{7f}"),
+        ("bidi override", "gnp.\u{202e}exe"),
+        ("bidi isolate", "A\u{2066}B"),
+        ("zero width space", "Zero\u{200b}Width"),
+        ("BOM", "\u{feff}Title"),
+        ("line separator", "A\u{2028}B"),
+    ] {
+        for (field, value) in [
+            ("title", with_title(bad, None)),
+            ("summary", with_title("Fine", Some(bad))),
+        ] {
+            match load(&value) {
+                Err(LocalCatalogueError::Invalid { field: f, reason }) => {
+                    assert!(f.ends_with(&format!("project.{field}")), "{name}: {f}");
+                    assert!(reason.contains("U+"), "{name}: {reason}");
+                }
+                other => panic!("{name} in {field} was accepted: {:?}", other.map(|_| ())),
+            }
+        }
+    }
+}
+
+#[test]
+fn legitimate_international_text_is_still_accepted() {
+    for title in [
+        "Äventyr Мир 猫 Straße",
+        "Café e\u{301}",
+        "👩\u{200d}🚀 Space",
+        "❤\u{fe0f} Hearts",
+        "می\u{200c}خواهم",
+        "क्\u{200d}ष Indic",
+        "日本語のタイトル",
+        "עברית \u{5d0}",
+        "Ünïcödé — “quotes” … ©",
+    ] {
+        let provider = load(&with_title(title, Some("Summary with ✓ and ñ"))).unwrap();
+        assert_eq!(provider.discover_projects("").unwrap()[0].title, title);
+    }
+}
+
+fn with_claim(platform: &str) -> Value {
+    let mut value = record("local", "p", "Claimed");
+    value["listings"][0]["artifacts"] = json!([build("a", "g.bin", Some(platform))]);
+    catalogue("local", vec![value])
+}
+
+#[test]
+fn case_and_whitespace_variants_of_registered_platforms_are_refused() {
+    for variant in ["nes", "Nes", " NES", "NES ", "game boy", "GAME BOY"] {
+        match load(&with_claim(variant)) {
+            Err(LocalCatalogueError::Invalid { field, reason }) => {
+                assert!(field.ends_with("platform_claims[0].platform"), "{field}");
+                assert!(reason.contains("registered platform id"), "{reason}");
+            }
+            other => panic!("{variant:?} accepted: {:?}", other.map(|_| ())),
+        }
+    }
+    assert!(load(&with_claim("NES")).is_ok());
+}
+
+#[test]
+fn unregistered_platform_claims_stay_evidence_but_never_match_and_are_listed() {
+    let provider = load(&with_claim("Totally Unknown Console")).unwrap();
+    assert!(
+        provider
+            .discover_for_platform("", "NES")
+            .unwrap()
+            .is_empty()
+    );
+    let claims = provider.unregistered_platform_claims();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].platform, "Totally Unknown Console");
+    assert_eq!(claims[0].project, id("local", "p"));
+    assert_eq!(claims[0].provider_asset_id, "a");
+    // The record itself is unchanged and still discoverable unfiltered.
+    assert_eq!(provider.discover_projects("claimed").unwrap().len(), 1);
+    // A registered claim is not reported.
+    assert!(
+        load(&with_claim("NES"))
+            .unwrap()
+            .unregistered_platform_claims()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_local_permitted_assertion_is_returned_unchanged_and_grants_nothing() {
+    let mut value = record("local", "r", "Rights");
+    let assertion = json!({"known": {"value": "permitted", "evidence": "curator says so"}});
+    value["project"]["rights"] = json!({"redistribution": assertion});
+    value["listings"][0]["artifacts"][0]["rights"] = json!({"redistribution": assertion});
+    let provider = load(&catalogue("local", vec![value])).unwrap();
+    let project = &provider.discover_projects("").unwrap()[0];
+    // Kept as the curator's assertion, with its evidence, not upgraded.
+    assert!(matches!(
+        &project.rights.redistribution,
+        RightsFact::Known { value: crate::homebrew_artifact::RedistributionPermission::Permitted, evidence }
+            if evidence == "curator says so"
+    ));
+    // The stored acquisition handoff is untouched: still a browser handoff
+    // with no link, because nothing here turns an assertion into a download.
+    let listings = provider.artifact_releases(&project.id).unwrap();
+    let acquisition = &listings[0].artifacts[0].acquisition;
+    assert_eq!(
+        acquisition.mode,
+        crate::homebrew_artifact::ArtifactAcquisitionMode::BrowserRequired
+    );
+    assert_eq!(
+        acquisition.link_url.as_deref(),
+        Some("https://example.org/game.nes")
+    );
+    // Structural guard: this module neither reads redistribution to decide an
+    // action nor reaches a download or transport policy.
+    for source in [
+        include_str!("../homebrew_catalogue.rs"),
+        include_str!("validation.rs"),
+    ] {
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "mod_download",
+            "http_agent",
+            "ureq",
+            "RedistributionPermission::Permitted",
+        ] {
+            assert!(!code.contains(forbidden), "{forbidden} referenced");
+        }
+    }
+}

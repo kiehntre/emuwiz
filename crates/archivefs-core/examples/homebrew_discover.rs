@@ -12,6 +12,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let provider = LocalCatalogueProvider::from_path(&args[0])?;
+    for claim in provider.unregistered_platform_claims() {
+        eprintln!(
+            "note: {}/{} build {:?} claims unregistered platform {:?}; it cannot match a platform filter",
+            claim.project.provider,
+            claim.project.provider_id,
+            claim.provider_asset_id,
+            claim.platform
+        );
+    }
     let query = args.get(1).map(String::as_str).unwrap_or("");
     let projects = match args.get(2) {
         Some(platform) => provider.discover_for_platform(query, platform)?,

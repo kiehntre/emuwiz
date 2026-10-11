@@ -237,7 +237,7 @@
         "rights": {
           "software_licence": {
             "known": {
-              "value": "WTFPL-2.0",
+              "value": "WTFPL",
               "evidence": "https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE; repository licence. Separate coverage of all distributed graphics/music was not established."
             }
           },
@@ -284,7 +284,7 @@
               "rights": {
                 "software_licence": {
                   "known": {
-                    "value": "WTFPL-2.0",
+                    "value": "WTFPL",
                     "evidence": "https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE; repository licence. Separate coverage of all distributed graphics/music was not established."
                   }
                 },
@@ -323,7 +323,7 @@
               "rights": {
                 "software_licence": {
                   "known": {
-                    "value": "WTFPL-2.0",
+                    "value": "WTFPL",
                     "evidence": "https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE; repository licence. Separate coverage of all distributed graphics/music was not established."
                   }
                 },

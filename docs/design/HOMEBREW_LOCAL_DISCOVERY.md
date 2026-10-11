@@ -77,7 +77,7 @@ not inspected or verified downloadable assets. Sizes and checksums are unknown.
 | --- | --- | --- | --- |
 | Tobu Tobu Girl / `tobu-tobu-girl` | Game Boy, original monochrome source build | Unknown | Developer [README](https://github.com/SimonLarsen/tobutobugirl#license) explicitly separates MIT code and CC-BY-4.0 game assets; [developer site](https://tangramgames.dk/tobutobugirl/) links source and future acquisition. Deluxe and packaging excluded. |
 | Nova the Squirrel / `nova-the-squirrel` | NES source build, NES 2.0 caveat for level-editor slots | 1.0.6a | Tagged [README](https://github.com/NovaSquirrel/NovaTheSquirrel/blob/v1.0.6a/README.md#license) separates GPL-3.0-or-later code from CC-BY-NC-SA-4.0 assets and character-use restrictions; [release](https://github.com/NovaSquirrel/NovaTheSquirrel/releases/tag/v1.0.6a) establishes the version. |
-| Super Tilt Bro / `super-tilt-bro` | NES RAINBOW networking and separate offline UNROM variants | Unknown | Repository [licence](https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE) is WTFPL-2.0; independent game-asset coverage remains Unknown. [README](https://github.com/sgadrat/super-tilt-bro#building) supplies variant and emulator caveats. |
+| Super Tilt Bro / `super-tilt-bro` | NES RAINBOW networking and separate offline UNROM variants | Unknown | Repository [licence](https://github.com/sgadrat/super-tilt-bro/blob/master/LICENSE) is WTFPL version 2 (SPDX `WTFPL`); independent game-asset coverage remains Unknown. [README](https://github.com/sgadrat/super-tilt-bro#building) supplies variant and emulator caveats. |
 
 All compatibility confidence is explicitly **unverified developer claim**.
 No hardware, emulator or downloaded-package testing was performed. Recorded code
@@ -93,6 +93,32 @@ bypass or import was attempted; its terms and evidence remain unassessed.
 No live search or discovery adapters are provided for Retro-Metro, itch.io,
 developer sites or GitHub repositories. The existing known-repository GitHub
 Releases adapter remains available separately.
+
+## Rights authority
+
+A catalogue file is written by its curator. Every rights field in it, including
+`redistribution: {known: {value: "permitted", ...}}`, is an **unverified
+assertion**, never permission for EmuWiz to download, install, distribute or
+republish anything. Loading accepts such a value so the claim and its evidence
+can be reviewed, and returns it unchanged; nothing in this module acts on it,
+and it has no acquisition path. The existing download and acquisition policies
+remain authoritative. Any future acquisition feature must apply them to the
+artifact and must not read local-catalogue rights as authority.
+
+## Display text and platform claims
+
+Titles and summaries are rejected when they contain control characters (C0,
+DEL, C1: terminal escapes, CR/LF, tabs), bidirectional formatting characters,
+zero-width space, word joiner, BOM, soft hyphen or line/paragraph separators.
+Zero-width joiner and non-joiner, variation selectors and all ordinary
+international text are accepted. The error names the field and code point.
+
+A platform claim that is only a case or whitespace variant of a registered ID
+(for example `nes` for `NES`) is refused at load time, because it would look
+like that platform and silently fail every filter. Genuinely unregistered names
+remain valid evidence and are listed by
+`LocalCatalogueProvider::unregistered_platform_claims()` (the example prints
+them to stderr); they never satisfy a platform filter.
 
 ## Extending providers
 

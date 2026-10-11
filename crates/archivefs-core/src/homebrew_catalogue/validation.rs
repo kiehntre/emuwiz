@@ -79,6 +79,52 @@ pub(super) fn text(value: &str, field: &str, required: bool) -> Result<(), Local
     Ok(())
 }
 
+/// Characters that are control codes or invisible and can spoof, hide or
+/// reformat text when a title is rendered. Zero-width joiner/non-joiner and
+/// variation selectors are deliberately allowed: emoji sequences and Persian,
+/// Indic and other scripts need them.
+fn disallowed_display_char(c: char) -> Option<&'static str> {
+    if c.is_control() {
+        // C0, DEL and C1: escapes, CR/LF, tabs, NEL, CSI and the rest.
+        return Some("control character");
+    }
+    match c {
+        '\u{200B}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}' => Some("invisible character"),
+        '\u{2028}' | '\u{2029}' => Some("line or paragraph separator"),
+        '\u{061C}'
+        | '\u{200E}'
+        | '\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2066}'..='\u{2069}' => Some("bidirectional formatting character"),
+        _ => None,
+    }
+}
+
+/// Titles and summaries are shown to people, so they get the ordinary text
+/// bounds plus a refusal of control and spoofing characters. The error names
+/// the field and the first offending code point.
+pub(super) fn display_text(
+    value: &str,
+    field: &str,
+    required: bool,
+) -> Result<(), LocalCatalogueError> {
+    text(value, field, required)?;
+    if let Some((index, c, kind)) = value
+        .chars()
+        .enumerate()
+        .find_map(|(i, c)| disallowed_display_char(c).map(|kind| (i, c, kind)))
+    {
+        return Err(invalid(
+            field,
+            &format!(
+                "contains a {kind} (U+{:04X}) at character {index}; titles and summaries must be plain visible text",
+                c as u32
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn url(value: &str, field: &str) -> Result<(), LocalCatalogueError> {
     let parsed =
         url::Url::parse(value).map_err(|_| invalid(field, "malformed HTTP(S) source URL"))?;
@@ -203,9 +249,9 @@ pub(super) fn record(
             "does not match catalogue namespace",
         ));
     }
-    text(&project.title, &format!("{field}.project.title"), true)?;
+    display_text(&project.title, &format!("{field}.project.title"), true)?;
     if let Some(summary) = &project.summary {
-        text(summary, &format!("{field}.project.summary"), false)?;
+        display_text(summary, &format!("{field}.project.summary"), false)?;
     }
     url(
         &project.source_page_url,
@@ -310,6 +356,24 @@ pub(super) fn record(
             for (index, claim) in artifact.platform_claims.iter().enumerate() {
                 let field = format!("{field}.platform_claims[{index}]");
                 text(&claim.platform, &format!("{field}.platform"), true)?;
+                // An unregistered name may stay as evidence, but a case or
+                // whitespace variant of a registered ID would look like that
+                // platform to a reader and silently fail every filter.
+                if crate::platform::platform_by_id(&claim.platform).is_none() {
+                    let folded = claim.platform.trim().to_lowercase();
+                    if let Some(registered) = crate::platform::PLATFORMS
+                        .iter()
+                        .find(|platform| platform.id.to_lowercase() == folded)
+                    {
+                        return Err(invalid(
+                            &format!("{field}.platform"),
+                            &format!(
+                                "{:?} is a case or whitespace variant of registered platform id {:?}; use the exact id",
+                                claim.platform, registered.id
+                            ),
+                        ));
+                    }
+                }
                 let evidence = match &claim.evidence {
                     PlatformClaimEvidence::Extension(value)
                     | PlatformClaimEvidence::Filename(value)

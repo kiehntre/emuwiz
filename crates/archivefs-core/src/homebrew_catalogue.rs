@@ -1,4 +1,13 @@
 //! Offline homebrew catalogue discovery. Metadata is evidence, never game identity.
+//!
+//! # Rights authority
+//!
+//! Every rights field in a local catalogue, including a `Known` redistribution
+//! value of `Permitted`, is an unverified assertion by whoever wrote the file.
+//! It is not permission for EmuWiz to download, install, distribute or
+//! republish anything. This module has no acquisition path and never consults
+//! these fields to decide an action; the existing download and acquisition
+//! policies stay authoritative and do not read them from here.
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -113,6 +122,15 @@ impl std::error::Error for LocalCatalogueError {
     }
 }
 
+/// A platform claim whose value is not a registered platform ID. It is kept as
+/// evidence and never satisfies a platform filter.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnregisteredPlatformClaim {
+    pub project: HomebrewProjectId,
+    pub provider_asset_id: String,
+    pub platform: String,
+}
+
 /// Immutable snapshot. Reloading is explicit; discovery never reads a cache,
 /// opens a URL, refreshes metadata, or acquires an artifact.
 pub struct LocalCatalogueProvider {
@@ -187,6 +205,30 @@ impl LocalCatalogueProvider {
             provider: catalogue.provider,
             records,
         })
+    }
+
+    /// Claims naming a platform that is not in the registry, in stable order.
+    /// They stay visible as evidence; this lets a curator find ones that can
+    /// never match a platform filter. Case variants of registered IDs are
+    /// refused at load time, so what remains is a genuinely unknown name.
+    pub fn unregistered_platform_claims(&self) -> Vec<UnregisteredPlatformClaim> {
+        let mut claims = Vec::new();
+        for (project, record) in &self.records {
+            for artifact in record.listings.iter().flat_map(|l| &l.artifacts) {
+                for claim in &artifact.platform_claims {
+                    if claim.registered_platform().is_none() {
+                        claims.push(UnregisteredPlatformClaim {
+                            project: project.clone(),
+                            provider_asset_id: artifact.provider_asset_id.clone(),
+                            platform: claim.platform.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        claims.sort();
+        claims.dedup();
+        claims
     }
 
     /// Filter by recorded claims for an exact registered platform, without
