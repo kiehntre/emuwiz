@@ -1231,16 +1231,18 @@ fn widgets_created_since(
     })
 }
 
-/// A control that takes keyboard focus inside an ordinary page scroller is
-/// brought into view. Pointer presses, wheel scrolling and focus that did not
-/// change never scroll, and only controls this content itself created (`owned`)
-/// are revealed, so status-bar, header and sidebar focus never moves the page.
-/// How many passes a keyboard reveal may take to settle.
+/// Maximum eligible UI observations for a keyboard reveal, including passes
+/// where the control is already visible. Ineligible requests end immediately.
 const REVEAL_PASSES: u8 = 8;
 /// Consecutive passes a revealed control must stay inside the viewport before
 /// the reveal is finished. Panels (the status bar) resize one frame late.
 const REVEAL_STABLE_PASSES: u8 = 3;
 
+#[cfg(test)]
+mod focus_reveal_tests;
+
+/// Reveal newly focused controls owned by this scroller. Manual input cancels
+/// the entire pending request; held focus cannot restart it on an idle pass.
 fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id, owned: &[egui::Id]) {
     let context = ui.ctx().clone();
     let slot = key.with("last_focus");
@@ -1254,37 +1256,50 @@ fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id, owned: &[egui::Id
         context.data_mut(|data| data.insert_temp(pending_slot, None::<(egui::Id, u8, u8)>));
         return;
     };
-    let pointer =
-        context.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
-    // (control, passes spent, consecutive passes inside the viewport). A
+    let manual = context.input(|input| {
+        input.pointer.any_pressed()
+            || input.pointer.any_released()
+            || input.pointer.any_down()
+            // Use actual input, not lingering smooth-scroll deltas, so a new
+            // keyboard focus transition after the wheel can reveal again.
+            || input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+    });
+    // (control, observations spent, consecutive passes inside the viewport). A
     // control taller than its scroller can never fit entirely, and a panel
     // may resize a frame late, so the reveal is bounded but not one-shot.
     let mut pending = context
         .data(|data| data.get_temp::<Option<(egui::Id, u8, u8)>>(pending_slot))
         .flatten();
-    if Some(id) != before && !pointer && owned.contains(&id) {
+    if manual || !owned.contains(&id) {
+        pending = None;
+    } else if Some(id) != before {
         pending = Some((id, 0, 0));
     } else if pending.map(|(pending_id, _, _)| pending_id) != Some(id) {
         pending = None;
     }
-    if let Some((_, spent, stable)) = pending
-        && let Some(response) = context.read_response(id)
-        && ui.min_rect().intersects(response.rect)
-    {
-        if ui.clip_rect().contains_rect(response.rect) {
-            pending = if stable + 1 >= REVEAL_STABLE_PASSES {
-                None
-            } else {
-                context.request_repaint();
-                Some((id, spent, stable + 1))
-            };
-        } else if spent >= REVEAL_PASSES {
-            pending = None;
-        } else {
-            ui.scroll_to_rect(response.rect, None);
-            pending = Some((id, spent + 1, 0));
-            context.request_repaint();
-        }
+    if let Some((_, spent, stable)) = pending {
+        pending = context
+            .read_response(id)
+            .filter(|response| ui.min_rect().intersects(response.rect))
+            .and_then(|response| {
+                let spent = spent.saturating_add(1);
+                let stable = if ui.clip_rect().contains_rect(response.rect) {
+                    stable.saturating_add(1)
+                } else {
+                    ui.scroll_to_rect(response.rect, None);
+                    context.request_repaint();
+                    0
+                };
+                if spent >= REVEAL_PASSES || stable >= REVEAL_STABLE_PASSES {
+                    None
+                } else {
+                    context.request_repaint();
+                    Some((id, spent, stable))
+                }
+            });
     }
     context.data_mut(|data| data.insert_temp(pending_slot, pending));
 }
