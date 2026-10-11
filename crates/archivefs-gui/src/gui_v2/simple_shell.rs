@@ -1170,20 +1170,33 @@ pub(super) fn show_page_scroll<R>(
             content,
         );
     } else {
-        egui::ScrollArea::vertical()
-            .id_salt(salt)
-            .auto_shrink([false, false])
-            // A revealed control must be in view in the pass that finds it.
-            .animated(false)
-            .show(ui, |ui| {
-                let layer = ui.layer_id();
-                let first = widgets_in_layer(ui.ctx(), layer);
-                let inner = content(ui);
-                let owned = widgets_created_since(ui.ctx(), layer, first);
-                reveal_new_keyboard_focus(ui, egui::Id::new(salt), &owned);
-                inner
-            });
+        show_focus_reveal_scroll(ui, salt, [false, false], content);
     }
+}
+
+/// An ordinary vertical scroller whose content is brought into view when a
+/// control in it takes keyboard focus. Pages and the Classic sidebar share it,
+/// so there is one focus-reveal behaviour. Pointer presses and the wheel never
+/// scroll. `shrink` is egui's `auto_shrink`, so a caller keeps its own sizing.
+pub(super) fn show_focus_reveal_scroll<R>(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + Copy,
+    shrink: [bool; 2],
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    egui::ScrollArea::vertical()
+        .id_salt(salt)
+        .auto_shrink(shrink)
+        // A revealed control must be in view in the pass that finds it.
+        .animated(false)
+        .show(ui, |ui| {
+            let layer = ui.layer_id();
+            let first = widgets_in_layer(ui.ctx(), layer);
+            let inner = content(ui);
+            let owned = widgets_created_since(ui.ctx(), layer, first);
+            reveal_new_keyboard_focus(ui, egui::Id::new(salt), &owned);
+            inner
+        });
 }
 
 /// Widgets registered so far in `layer` during this pass. egui only appends,
@@ -1222,27 +1235,58 @@ fn widgets_created_since(
 /// brought into view. Pointer presses, wheel scrolling and focus that did not
 /// change never scroll, and only controls this content itself created (`owned`)
 /// are revealed, so status-bar, header and sidebar focus never moves the page.
+/// How many passes a keyboard reveal may take to settle.
+const REVEAL_PASSES: u8 = 8;
+/// Consecutive passes a revealed control must stay inside the viewport before
+/// the reveal is finished. Panels (the status bar) resize one frame late.
+const REVEAL_STABLE_PASSES: u8 = 3;
+
 fn reveal_new_keyboard_focus(ui: &mut egui::Ui, key: egui::Id, owned: &[egui::Id]) {
     let context = ui.ctx().clone();
     let slot = key.with("last_focus");
+    let pending_slot = key.with("pending_reveal");
     let focused = context.memory(|memory| memory.focused());
     let before = context
         .data(|data| data.get_temp::<Option<egui::Id>>(slot))
         .flatten();
     context.data_mut(|data| data.insert_temp(slot, focused));
     let Some(id) = focused else {
+        context.data_mut(|data| data.insert_temp(pending_slot, None::<(egui::Id, u8, u8)>));
         return;
     };
     let pointer =
         context.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
-    if pointer || Some(id) == before || !owned.contains(&id) {
-        return;
+    // (control, passes spent, consecutive passes inside the viewport). A
+    // control taller than its scroller can never fit entirely, and a panel
+    // may resize a frame late, so the reveal is bounded but not one-shot.
+    let mut pending = context
+        .data(|data| data.get_temp::<Option<(egui::Id, u8, u8)>>(pending_slot))
+        .flatten();
+    if Some(id) != before && !pointer && owned.contains(&id) {
+        pending = Some((id, 0, 0));
+    } else if pending.map(|(pending_id, _, _)| pending_id) != Some(id) {
+        pending = None;
     }
-    if let Some(response) = context.read_response(id)
-        && ui.min_rect().contains_rect(response.rect)
+    if let Some((_, spent, stable)) = pending
+        && let Some(response) = context.read_response(id)
+        && ui.min_rect().intersects(response.rect)
     {
-        ui.scroll_to_rect(response.rect, None);
+        if ui.clip_rect().contains_rect(response.rect) {
+            pending = if stable + 1 >= REVEAL_STABLE_PASSES {
+                None
+            } else {
+                context.request_repaint();
+                Some((id, spent, stable + 1))
+            };
+        } else if spent >= REVEAL_PASSES {
+            pending = None;
+        } else {
+            ui.scroll_to_rect(response.rect, None);
+            pending = Some((id, spent + 1, 0));
+            context.request_repaint();
+        }
     }
+    context.data_mut(|data| data.insert_temp(pending_slot, pending));
 }
 
 #[derive(Clone, Default)]

@@ -498,6 +498,9 @@ impl App {
         let mut area = egui::ScrollArea::vertical()
             .id_salt("v2_browse_play_shelf")
             .auto_shrink([false, false])
+            // A card focused from the keyboard must be in view in the pass
+            // that finds it, not after a scroll animation.
+            .animated(false)
             .max_height(scroll_height);
         if reset {
             area = area.vertical_scroll_offset(0.0);
@@ -563,6 +566,15 @@ impl App {
         ui.add_space(theme::SPACE_XS);
     }
 
+    /// Tab (or Shift+Tab) onto a card scrolls the shelf so the whole card is
+    /// shown. Pointer presses and the wheel never scroll it.
+    fn reveal_keyboard_focus(ui: &egui::Ui, response: &egui::Response) {
+        let pointer = ui.input(|input| input.pointer.any_pressed() || input.pointer.any_released());
+        if response.gained_focus() && !pointer {
+            ui.scroll_to_rect(response.rect, None);
+        }
+    }
+
     fn card_background(ui: &egui::Ui, rect: egui::Rect, selected: bool, response: &egui::Response) {
         let hovered = response.hovered();
         let fill = if selected || hovered {
@@ -605,6 +617,7 @@ impl App {
         ui.push_id(("v2_browse_play_game", id), |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(egui::vec2(card_width, CARD_HEIGHT), egui::Sense::click());
+            Self::reveal_keyboard_focus(ui, &response);
             if !ui.is_rect_visible(rect) {
                 return;
             }
@@ -650,6 +663,7 @@ impl App {
                 egui::vec2(ui.available_width(), LIST_ROW_HEIGHT - 8.0),
                 egui::Sense::click(),
             );
+            Self::reveal_keyboard_focus(ui, &response);
             if !ui.is_rect_visible(rect) {
                 return;
             }

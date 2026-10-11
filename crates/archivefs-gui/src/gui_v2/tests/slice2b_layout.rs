@@ -174,3 +174,290 @@ fn slice2b_matrix_has_no_clipping_overlap_or_hidden_play() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// One physical key gesture (press and release) delivered in a single frame.
+fn key_gesture(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    key: egui::Key,
+    shift: bool,
+) -> egui::FullOutput {
+    let modifiers = egui::Modifiers {
+        shift,
+        ..Default::default()
+    };
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            modifiers,
+            events: [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed,
+                    repeat: false,
+                    modifiers,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        |context| app.show(context),
+    )
+}
+
+/// The rectangle of the keyboard-focused widget, when there is one.
+fn focused_rect(context: &egui::Context) -> Option<egui::Rect> {
+    let id = context.memory(|memory| memory.focused())?;
+    context.read_response(id).map(|response| response.rect)
+}
+
+/// What a person sees of the page body: right of the sidebar, below the
+/// header, above the status bar.
+fn body_band(output: &egui::FullOutput, size: [f32; 2]) -> egui::Rect {
+    let top = text_bounds(output, "Browse & Play")
+        .iter()
+        .map(|rect| rect.min.y)
+        .fold(f32::MAX, f32::min);
+    let bottom = text_bounds(output, "View Activity")
+        .first()
+        .map_or(size[1], |rect| rect.min.y);
+    let left = text_bounds(output, "Find a game, check that it is ready, then play.")
+        .first()
+        .map_or(0.0, |rect| rect.min.x - 4.0);
+    egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(size[0], bottom))
+}
+
+/// The real keyboard path at 1024x640 and 160% in both profiles: Tab walks to
+/// Play, focus is revealed on screen, Enter opens the Launch task (nothing is
+/// started), Shift+Tab leaves Play for a control that is also revealed, and
+/// the wheel still scrolls the page.
+#[test]
+fn keyboard_focus_reveals_library_play_at_160_percent_in_both_profiles() {
+    let size = points((1024.0, 640.0), 1.6);
+    for blue in [true, false] {
+        let context = egui::Context::default();
+        let mut app = populated(&context, blue, 1.6);
+        app.router.current = Route::BrowsePlayGame(1);
+        let mut output = settled(&context, &mut app, size);
+        // Start inside the page, as a person does after clicking the search
+        // field: this keeps the test on the Library body, not the sidebar.
+        let search = text_bounds(&output, "Search by title or system")
+            .first()
+            .copied()
+            .expect("search field painted");
+        let point = search.center();
+        for pressed in [true, false] {
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(size[0], size[1]),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |context| app.show(context),
+            );
+        }
+        output = settled(&context, &mut app, size);
+        let mut play_focused = false;
+        let mut seen_content_focus = 0;
+        for step in 0..40 {
+            output = key_gesture(&context, &mut app, size, egui::Key::Tab, false);
+            // A keyboard reveal may take several passes to settle.
+            for _ in 0..8 {
+                output = frame(&context, &mut app, size);
+            }
+            let band = body_band(&output, size);
+            if let Some(rect) = focused_rect(&context)
+                && rect.min.x >= band.min.x
+                && rect.min.y > band.min.y - 1.0
+            {
+                seen_content_focus += 1;
+                // A game card is taller than the shelf can show at this size,
+                // so require its top (cover and focus ring) on screen with a
+                // useful part of it, rather than all of it.
+                let shown = rect.intersect(band);
+                assert!(
+                    rect.min.y >= band.min.y - 1.0
+                        && rect.max.x <= band.max.x + 1.0
+                        && (rect.max.y <= band.max.y + 1.0 || shown.height() >= 100.0),
+                    "blue={blue} step {step}: focus {rect:?} is outside the visible body {band:?}"
+                );
+                if text_bounds(&output, "Play")
+                    .iter()
+                    .any(|play| rect.contains(play.center()))
+                {
+                    play_focused = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            seen_content_focus > 0 && play_focused,
+            "blue={blue}: Tab never brought Play into focus on screen"
+        );
+
+        // Shift+Tab moves off Play to a control that is revealed too.
+        let play_rect = focused_rect(&context).unwrap();
+        let _ = key_gesture(&context, &mut app, size, egui::Key::Tab, true);
+        output = settled(&context, &mut app, size);
+        let band = body_band(&output, size);
+        let back = focused_rect(&context).expect("focus after Shift+Tab");
+        assert_ne!(back, play_rect, "blue={blue}: Shift+Tab did not move");
+        assert!(
+            back.min.y >= band.min.y - 1.0
+                && (back.max.y <= band.max.y + 1.0 || back.intersect(band).height() >= 100.0),
+            "blue={blue}: Shift+Tab target {back:?} is outside the visible body {band:?}"
+        );
+
+        // Tab forward again to Play and activate it from the keyboard.
+        let _ = key_gesture(&context, &mut app, size, egui::Key::Tab, false);
+        settled(&context, &mut app, size);
+        assert_eq!(focused_rect(&context), Some(play_rect));
+        let _ = key_gesture(&context, &mut app, size, egui::Key::Enter, false);
+        settled(&context, &mut app, size);
+        assert_eq!(
+            app.router.current,
+            Route::Task {
+                section: Section::Launch,
+                game: 1
+            },
+            "blue={blue}: Enter on Play did not open the Launch task"
+        );
+    }
+}
+
+fn wheel_at(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    point: egui::Pos2,
+    delta_y: f32,
+) -> egui::FullOutput {
+    // Settle on the pointer first, as a real pointer move does, then turn the
+    // wheel in a separate frame and let egui finish its scroll.
+    for events in [
+        vec![egui::Event::PointerMoved(point)],
+        vec![egui::Event::MouseWheel {
+            phase: egui::TouchPhase::Move,
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta_y),
+            modifiers: egui::Modifiers::NONE,
+        }],
+    ] {
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(size[0], size[1]),
+                )),
+                events,
+                ..Default::default()
+            },
+            |context| app.show(context),
+        );
+    }
+    settled(context, app, size)
+}
+
+/// Wheel input at 160%: over the page it reaches Play; over the shelf it
+/// scrolls the shelf, and turning back never leaves the person stuck.
+#[test]
+fn wheel_scrolling_still_reaches_library_play_at_160_percent() {
+    let size = points((1024.0, 640.0), 1.6);
+    for blue in [true, false] {
+        let context = egui::Context::default();
+        let mut app = populated(&context, blue, 1.6);
+        app.router.current = Route::BrowsePlayGame(1);
+        settled(&context, &mut app, size);
+        // Beside the toolbar: inside the scrolling body, off the shelf.
+        let page_point = egui::pos2(size[0] * 0.55, size[1] * 0.69);
+        let mut reached = false;
+        let mut output = settled(&context, &mut app, size);
+        for _ in 0..6 {
+            output = wheel_at(&context, &mut app, size, page_point, -100.0);
+            reached |= text_bounds(&output, "Play")
+                .iter()
+                .any(|rect| visible(*rect, size));
+        }
+        assert!(
+            reached,
+            "blue={blue}: wheel over the page never exposed Play"
+        );
+
+        // Over the shelf: wheel down, then back up all the way. The page must
+        // follow once the shelf is at its top, so Play is exposed again.
+        let shelf_point = text_bounds(&output, "Fixture Gba Game 01")
+            .first()
+            .map_or(page_point, |rect| rect.center());
+        for _ in 0..4 {
+            wheel_at(&context, &mut app, size, shelf_point, -100.0);
+        }
+        let mut back = false;
+        for _ in 0..30 {
+            output = wheel_at(&context, &mut app, size, shelf_point, 100.0);
+            back |= text_bounds(&output, "Play")
+                .iter()
+                .any(|rect| visible(*rect, size));
+        }
+        assert!(
+            back,
+            "blue={blue}: wheel up over the shelf left the page stuck"
+        );
+    }
+}
+
+/// Starting at the very top (no click), every Tab stop is on screen - sidebar
+/// entries included - until Play is reached. Blue and Classic, 1024x640 at 160%.
+#[test]
+fn tab_from_the_top_never_loses_focus_off_screen_before_play() {
+    let size = points((1024.0, 640.0), 1.6);
+    for blue in [true, false] {
+        let context = egui::Context::default();
+        let mut app = populated(&context, blue, 1.6);
+        app.router.current = Route::BrowsePlayGame(1);
+        let mut output = settled(&context, &mut app, size);
+        let mut play_focused = false;
+        for step in 0..140 {
+            let _ = key_gesture(&context, &mut app, size, egui::Key::Tab, false);
+            for _ in 0..8 {
+                output = frame(&context, &mut app, size);
+            }
+            let status_top = text_bounds(&output, "View Activity")
+                .first()
+                .map_or(size[1], |rect| rect.min.y - 4.0);
+            let Some(rect) = focused_rect(&context) else {
+                continue;
+            };
+            assert!(
+                rect.min.y >= -1.0 && rect.min.y < status_top && rect.min.x < size[0],
+                "blue={blue} step {step}: focus {rect:?} is off screen (status bar at {status_top})"
+            );
+            if text_bounds(&output, "Play")
+                .iter()
+                .any(|play| rect.contains(play.center()))
+            {
+                play_focused = true;
+                break;
+            }
+        }
+        assert!(
+            play_focused,
+            "blue={blue}: Tab from the top never reached Play"
+        );
+    }
+}

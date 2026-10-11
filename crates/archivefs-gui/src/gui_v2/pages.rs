@@ -374,12 +374,17 @@ impl App {
                         running + queued
                     ));
                 }
-                if let Some(job) = self
-                    .activity
-                    .jobs
-                    .values()
-                    .rev()
-                    .find(|job| job.phase == Phase::Running)
+                // The running job's own title, progress and Cancel only fit
+                // beside the summary in a wide window. In a narrow one they
+                // would wrap the bar to three rows and crush the page, and the
+                // same job is on Activity (View Activity).
+                if ui.available_width() >= 560.0
+                    && let Some(job) = self
+                        .activity
+                        .jobs
+                        .values()
+                        .rev()
+                        .find(|job| job.phase == Phase::Running)
                     && super::job_card::show_inline(ui, job).cancel
                 {
                     job.request_cancel();
@@ -465,9 +470,11 @@ impl App {
                             self.go(Route::BrowsePlay);
                         }
                     });
-                    egui::ScrollArea::vertical()
-                        .id_salt("v2_sidebar_scroll")
-                        .show(ui, |ui| {
+                    super::simple_shell::show_focus_reveal_scroll(
+                        ui,
+                        "v2_sidebar_scroll",
+                        [true, true],
+                        |ui| {
                             // One heading per group, followed by all of its entries;
                             // ungrouped entries keep their position.
                             let mut shown_groups: Vec<&str> = Vec::new();
@@ -522,7 +529,8 @@ impl App {
                                 });
                             }
                             ui.label("Tab: move focus\nEnter: open\nAlt+Left: back");
-                        });
+                        },
+                    );
                 });
         }
         egui::CentralPanel::default().show(context, |ui| {
@@ -589,16 +597,15 @@ impl App {
                     // A large size on a small window: keep the application
                     // layout at a usable height and let the page scroll to it,
                     // so Play is reachable instead of cut off.
-                    egui::ScrollArea::vertical()
-                        .id_salt("v2_browse_play_page")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let width = ui.available_width();
-                            ui.allocate_ui(
-                                egui::vec2(width, super::browse_play::MIN_BODY_HEIGHT),
-                                |ui| self.browse_play(ui, selected),
-                            );
-                        });
+                    // The shared page scroller, so keyboard focus on a game
+                    // card or Play brings it into view like on every page.
+                    super::simple_shell::show_page_scroll(ui, Section::Games, false, |ui| {
+                        let width = ui.available_width();
+                        ui.allocate_ui(
+                            egui::vec2(width, super::browse_play::MIN_BODY_HEIGHT),
+                            |ui| self.browse_play(ui, selected),
+                        );
+                    });
                 } else {
                     self.browse_play(ui, selected);
                 }
