@@ -237,3 +237,191 @@ fn oversized_container_is_refused_before_decompression() {
     let error = inspect_adz(&path).unwrap_err();
     assert!(matches!(error, AdzError::ContainerTooLarge { .. }));
 }
+
+#[test]
+fn concatenated_members_validate_one_logical_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let tiny = minimal_flat_adf(1, b"SplitDisk");
+    let mut adf = vec![0_u8; 901_120];
+    adf[..1024].copy_from_slice(&tiny[..1024]);
+    put32(&mut adf, 8, 880);
+    adf[880 * 512..881 * 512].copy_from_slice(&tiny[64 * 512..65 * 512]);
+    let mut members = gzip(&adf[..adf.len() / 2]);
+    members.extend(gzip(&adf[adf.len() / 2..]));
+    let path = dir.path().join("split.adz");
+    std::fs::write(&path, &members).unwrap();
+    let inspection = inspect_adz(&path).expect("all gzip members form one valid ADF");
+    assert_eq!(inspection.decompressed_bytes, adf.len() as u64);
+    assert!(inspection.floppy.filesystem().is_some());
+    assert_eq!(std::fs::read(path).unwrap(), members);
+}
+
+#[test]
+fn every_gzip_member_and_trailing_byte_must_validate() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = gzip(&minimal_flat_adf(1, b"First"));
+    let second = gzip(&[0_u8; 1024]);
+    let mut bad_crc = second.clone();
+    let crc = bad_crc.len() - 8;
+    bad_crc[crc] ^= 1;
+    let mut bad_size = second.clone();
+    let size = bad_size.len() - 4;
+    bad_size[size] ^= 1;
+    for suffix in [
+        b"garbage".to_vec(),
+        vec![0],
+        second[..second.len() - 1].to_vec(),
+        bad_crc,
+        bad_size,
+    ] {
+        let path = dir.path().join("bad-tail.adz");
+        let mut bytes = first.clone();
+        bytes.extend(suffix);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            inspect_adz(&path),
+            Err(AdzError::MalformedGzip(_))
+        ));
+    }
+}
+
+#[test]
+fn aggregate_member_output_obeys_the_decompression_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = gzip(&minimal_flat_adf(1, b"First"));
+    bytes.extend(gzip(&vec![0_u8; MAX_ADZ_DECOMPRESSED_BYTES as usize]));
+    let path = dir.path().join("aggregate-bomb.adz");
+    std::fs::write(&path, bytes).unwrap();
+    assert!(matches!(
+        inspect_adz(&path),
+        Err(AdzError::DecompressedTooLarge { .. })
+    ));
+}
+
+#[test]
+fn compressed_read_limit_is_enforced_even_after_file_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_adz(dir.path(), "growing.adz", &minimal_flat_adf(1, b"Growing"));
+    let mut file = File::open(&path).unwrap();
+    let before = file.metadata().unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(MAX_ADZ_COMPRESSED_BYTES + 1)
+        .unwrap();
+    assert!(matches!(
+        read_compressed_file(&mut file, &before),
+        Err(AdzError::ContainerTooLarge { .. })
+    ));
+    assert_eq!(
+        std::io::Seek::stream_position(&mut file).unwrap(),
+        MAX_ADZ_COMPRESSED_BYTES + 1
+    );
+}
+
+#[test]
+fn changed_input_and_host_read_failure_are_not_gzip_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_adz(
+        dir.path(),
+        "changing.adz",
+        &minimal_flat_adf(1, b"Changing"),
+    );
+    let mut file = File::open(&path).unwrap();
+    let before = file.metadata().unwrap();
+    File::options()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"extra")
+        .unwrap();
+    assert!(matches!(
+        read_compressed_file(&mut file, &before),
+        Err(AdzError::ChangedWhileReading)
+    ));
+    let mut write_only = File::options().write(true).open(&path).unwrap();
+    let before = write_only.metadata().unwrap();
+    assert!(matches!(
+        read_compressed_file(&mut write_only, &before),
+        Err(AdzError::Io(_))
+    ));
+    assert!(matches!(
+        inspect_adz(&dir.path().join("missing.adz")),
+        Err(AdzError::Io(_))
+    ));
+}
+
+#[test]
+fn staging_failure_preserves_the_environmental_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_adz(dir.path(), "valid.adz", &minimal_flat_adf(1, b"Valid"));
+    assert!(matches!(
+        inspect_adz_in_temp_dir(&path, &dir.path().join("unavailable")),
+        Err(AdzError::TempFileUnavailable(_))
+    ));
+}
+
+#[test]
+fn fifo_without_a_writer_and_directories_are_refused_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pipe.adz");
+    let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a valid NUL-terminated path in our private fixture directory.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || send.send(inspect_adz(&path)).unwrap());
+    let result = receive
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("opening a FIFO with no writer must not block inspection");
+    assert!(matches!(result, Err(AdzError::NotRegularFile)));
+    assert!(matches!(
+        inspect_adz(dir.path()),
+        Err(AdzError::NotRegularFile)
+    ));
+}
+
+#[test]
+fn exact_aggregate_limit_still_validates_the_last_trailer() {
+    let dir = tempfile::tempdir().unwrap();
+    let adf = minimal_flat_adf(1, b"Limit");
+    let mut bytes = gzip(&adf);
+    let mut last = gzip(&vec![0_u8; MAX_ADZ_DECOMPRESSED_BYTES as usize - adf.len()]);
+    let path = dir.path().join("at-limit.adz");
+    bytes.extend(&last);
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        inspect_adz(&path).unwrap().decompressed_bytes,
+        MAX_ADZ_DECOMPRESSED_BYTES
+    );
+    let crc = last.len() - 8;
+    last[crc] ^= 1;
+    let mut bad = gzip(&adf);
+    bad.extend(last);
+    std::fs::write(&path, bad).unwrap();
+    assert!(matches!(
+        inspect_adz(&path),
+        Err(AdzError::MalformedGzip(_))
+    ));
+}
+
+#[test]
+fn long_optional_gzip_fields_are_a_decoder_limit_not_corrupt_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let gzip = gzip(&minimal_flat_adf(1, b"LongHeader"));
+    for flag in [8, 16] {
+        // FNAME and FCOMMENT
+        let mut bytes = gzip[..10].to_vec();
+        bytes[3] = flag;
+        bytes.extend(vec![b'x'; 65_536]);
+        bytes.push(0);
+        bytes.extend(&gzip[10..]);
+        let path = dir.path().join("long-header.adz");
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            inspect_adz(&path),
+            Err(AdzError::UnsupportedGzip(_))
+        ));
+    }
+}

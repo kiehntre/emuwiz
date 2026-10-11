@@ -22,7 +22,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 
 use crate::amiga_disk::{self, AmigaFloppyError, AmigaFloppyInspection};
 
@@ -40,10 +40,9 @@ const MIN_ADF_BYTES: u64 = 512;
 /// Amiga floppy image", not "any size an attacker could construct".
 pub const MAX_ADZ_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Largest compressed `.adz` file this module will read into memory before
-/// even attempting decompression - a real gzipped Amiga floppy is at most a
-/// few hundred KiB; this is defense in depth against a mislabelled/huge
-/// file, independent of the decompressed-output bound above.
+/// Largest compressed `.adz` input this module will read into memory before
+/// attempting decompression. Enforced on actual bytes read, independently
+/// of filesystem metadata and the decompressed-output bound above.
 pub const MAX_ADZ_COMPRESSED_BYTES: u64 = 8 * MAX_ADZ_DECOMPRESSED_BYTES;
 
 /// Why a `.adz` could not be confirmed as a compressed Amiga floppy image.
@@ -53,6 +52,10 @@ pub const MAX_ADZ_COMPRESSED_BYTES: u64 = 8 * MAX_ADZ_DECOMPRESSED_BYTES;
 pub enum AdzError {
     /// The path could not be read.
     Io(String),
+    /// A FIFO, device or directory is not an inspectable disk-image file.
+    NotRegularFile,
+    /// The opened file changed during the bounded read; retry a stable copy.
+    ChangedWhileReading,
     /// The container's own size exceeds [`MAX_ADZ_COMPRESSED_BYTES`] -
     /// refused before any byte is decompressed.
     ContainerTooLarge { limit: u64 },
@@ -63,6 +66,9 @@ pub enum AdzError {
     /// Fail-soft: this is never treated as a hard crash or as evidence the
     /// underlying `.adf` (if any) is itself invalid.
     MalformedGzip(String),
+    /// A gzip header exceeds the decoder's implementation limits. This is
+    /// unsupported inspection, not evidence of an RFC 1952 violation.
+    UnsupportedGzip(String),
     /// Decompressed output exceeded [`MAX_ADZ_DECOMPRESSED_BYTES`] - refused
     /// as a decompression-bomb shape, not decoded further.
     DecompressedTooLarge { limit: u64 },
@@ -70,8 +76,7 @@ pub enum AdzError {
     /// a real ADF.
     DecompressedTooSmall,
     /// A private, unlinked temporary file (required by the existing
-    /// path-based ADF parser) could not be created. Never a named,
-    /// linked file - see [`open_private_temp_file`].
+    /// path-based ADF parser) could not be created or unlinked.
     TempFileUnavailable(String),
     /// The decompressed bytes are not a valid Amiga floppy image -
     /// "compressed data is not a supported ADF", not a guess at what it
@@ -83,6 +88,8 @@ impl std::fmt::Display for AdzError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(detail) => write!(f, "{detail}"),
+            Self::NotRegularFile => f.write_str("ADZ inspection requires a regular file"),
+            Self::ChangedWhileReading => f.write_str("ADZ input changed while it was read"),
             Self::ContainerTooLarge { limit } => {
                 write!(
                     f,
@@ -91,6 +98,7 @@ impl std::fmt::Display for AdzError {
             }
             Self::NotGzip => f.write_str("not a gzip-wrapped file"),
             Self::MalformedGzip(detail) => write!(f, "malformed gzip stream: {detail}"),
+            Self::UnsupportedGzip(detail) => write!(f, "unsupported gzip header: {detail}"),
             Self::DecompressedTooLarge { limit } => write!(
                 f,
                 "decompressed output exceeds the {limit}-byte plausible-ADF limit"
@@ -121,30 +129,52 @@ pub struct AdzInspection {
 
 /// Inspect `path` as a gzip-wrapped Amiga floppy candidate: bounded-decompress,
 /// then reuse [`amiga_disk::inspect_amiga_floppy`] on the result.
-/// Never extracts to a named/linked file, never mutates `path`, and never
+/// Stages bytes only after obtaining an unlinked file, never mutates `path`, and never
 /// claims a decompressed stream is an ADF beyond what the existing parser
 /// itself validates.
 pub fn inspect_adz(path: &Path) -> Result<AdzInspection, AdzError> {
-    let metadata = std::fs::metadata(path).map_err(|error| AdzError::Io(error.to_string()))?;
-    if metadata.len() > MAX_ADZ_COMPRESSED_BYTES {
-        return Err(AdzError::ContainerTooLarge {
-            limit: MAX_ADZ_COMPRESSED_BYTES,
-        });
+    inspect_adz_in_temp_dir(path, &std::env::temp_dir())
+}
+
+pub(crate) fn inspect_adz_in_temp_dir(
+    path: &Path,
+    temp_dir: &Path,
+) -> Result<AdzInspection, AdzError> {
+    // Nonblocking open also protects the type check against a path swapped
+    // to a FIFO. Inspect and read the same descriptor, never reopen the path.
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| AdzError::Io(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| AdzError::Io(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(AdzError::NotRegularFile);
     }
-    let compressed = std::fs::read(path).map_err(|error| AdzError::Io(error.to_string()))?;
+    let compressed = read_compressed_file(&mut file, &metadata)?;
     if compressed.len() < GZIP_MAGIC.len() || compressed[..2] != GZIP_MAGIC {
         return Err(AdzError::NotGzip);
     }
 
-    let decoder = GzDecoder::new(compressed.as_slice());
+    // RFC 1952 defines a gzip file as concatenated members. This decoder
+    // checks every header, CRC and ISIZE, and rejects non-member suffixes.
+    let decoder = MultiGzDecoder::new(compressed.as_slice());
     let mut decoded = Vec::new();
-    // `.take(limit + 1)` is the bomb guard: reading strictly more than the
-    // limit proves the stream would have exceeded it, without ever holding
-    // more than `limit + 1` bytes in memory.
+    // The extra byte bounds aggregate output across all members. Accepted
+    // streams reach EOF, including the final member's trailer validation.
     if let Err(error) = decoder
         .take(MAX_ADZ_DECOMPRESSED_BYTES + 1)
         .read_to_end(&mut decoded)
     {
+        // flate2 1.1.9 bounds optional filename/comment fields to 65535 bytes.
+        // RFC 1952 has no such length restriction; do not call this corruption.
+        if error.kind() == io::ErrorKind::InvalidInput
+            && error.to_string() == "gzip header field too long"
+        {
+            return Err(AdzError::UnsupportedGzip(error.to_string()));
+        }
         return Err(AdzError::MalformedGzip(error.to_string()));
     }
     if decoded.len() as u64 > MAX_ADZ_DECOMPRESSED_BYTES {
@@ -156,20 +186,14 @@ pub fn inspect_adz(path: &Path) -> Result<AdzInspection, AdzError> {
         return Err(AdzError::DecompressedTooSmall);
     }
 
-    let mut temp = open_private_temp_file()
+    let mut temp = open_private_temp_file(temp_dir)
         .map_err(|error| AdzError::TempFileUnavailable(error.to_string()))?;
     temp.write_all(&decoded)
         .map_err(|error| AdzError::Io(error.to_string()))?;
     temp.flush()
         .map_err(|error| AdzError::Io(error.to_string()))?;
-
-    // A fresh `File::open` of the pinned fd's own `/proc/self/fd/N` entry
-    // re-opens the same anonymous/unlinked inode from offset 0 - the
-    // existing path-based ADF parser needs nothing else changed.
     let temp_path = proc_self_fd_path(temp.as_raw_fd());
     let floppy = amiga_disk::inspect_amiga_floppy(&temp_path).map_err(AdzError::NotAdf)?;
-    // `temp` (and the inode it alone references) is dropped and reclaimed
-    // here; nothing named ever existed on disk.
     Ok(AdzInspection {
         container_path: path.to_path_buf(),
         decompressed_bytes: decoded.len() as u64,
@@ -177,22 +201,51 @@ pub fn inspect_adz(path: &Path) -> Result<AdzInspection, AdzError> {
     })
 }
 
+fn read_compressed_file(
+    file: &mut File,
+    metadata: &std::fs::Metadata,
+) -> Result<Vec<u8>, AdzError> {
+    if metadata.len() > MAX_ADZ_COMPRESSED_BYTES {
+        return Err(AdzError::ContainerTooLarge {
+            limit: MAX_ADZ_COMPRESSED_BYTES,
+        });
+    }
+    let mut compressed = Vec::new();
+    (&mut *file)
+        .take(MAX_ADZ_COMPRESSED_BYTES + 1)
+        .read_to_end(&mut compressed)
+        .map_err(|error| AdzError::Io(error.to_string()))?;
+    if compressed.len() as u64 > MAX_ADZ_COMPRESSED_BYTES {
+        return Err(AdzError::ContainerTooLarge {
+            limit: MAX_ADZ_COMPRESSED_BYTES,
+        });
+    }
+    let after = file
+        .metadata()
+        .map_err(|error| AdzError::Io(error.to_string()))?;
+    if metadata.len() != compressed.len() as u64
+        || metadata.len() != after.len()
+        || metadata.modified().ok() != after.modified().ok()
+    {
+        return Err(AdzError::ChangedWhileReading);
+    }
+    Ok(compressed)
+}
+
 fn proc_self_fd_path(fd: RawFd) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{fd}"))
 }
 
-/// Opens a private, read/write-able temporary file that never has a name
-/// in any directory listing. Tries Linux `O_TMPFILE` first (the file is
+/// Opens a private, unlinked read/write temporary file. Tries Linux `O_TMPFILE` first (the file is
 /// anonymous from the instant it is created - there is no window in which
 /// a named entry exists, and no separate delete step that could be skipped
 /// on an error path); falls back to a create-then-immediately-unlink named
 /// file only if the target filesystem does not support `O_TMPFILE`.
-fn open_private_temp_file() -> io::Result<File> {
-    let dir = std::env::temp_dir();
-    if let Ok(file) = open_tmpfile(&dir) {
+fn open_private_temp_file(dir: &Path) -> io::Result<File> {
+    if let Ok(file) = open_tmpfile(dir) {
         return Ok(file);
     }
-    open_unlink_immediately(&dir)
+    open_unlink_immediately(dir)
 }
 
 fn open_tmpfile(dir: &Path) -> io::Result<File> {
@@ -233,7 +286,7 @@ fn open_unlink_immediately(dir: &Path) -> io::Result<File> {
                 // Unlinked immediately after opening: the fd keeps the
                 // inode alive, but no name ever remains for anything else
                 // to see or race against past this point.
-                let _ = std::fs::remove_file(&candidate);
+                std::fs::remove_file(&candidate)?;
                 return Ok(file);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,

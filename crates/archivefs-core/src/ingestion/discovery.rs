@@ -89,6 +89,11 @@ pub enum SkipReason {
     /// failed to parse as that format (e.g. an `.hdf` that is not a valid
     /// RDB image).
     InvalidContent(String),
+    /// No supported media interpretation, or an explicit reader/size limit.
+    /// This is not evidence of damage or an invalid dump.
+    UnsupportedContent(String),
+    /// Host I/O, staging, cancellation or unstable input prevented inspection.
+    InspectionUnavailable(String),
 }
 
 impl SkipReason {
@@ -99,6 +104,8 @@ impl SkipReason {
             Self::MissingPairedFile => "Missing paired file",
             Self::AmbiguousPlatform => "Ambiguous platform",
             Self::InvalidContent(_) => "Could not be read as expected",
+            Self::UnsupportedContent(_) => "Unknown or unsupported media",
+            Self::InspectionUnavailable(_) => "Inspection unavailable",
         }
     }
 
@@ -122,6 +129,14 @@ impl SkipReason {
             Self::InvalidContent(_) => {
                 "The file has a recognised extension but could not be read as that format - \
                  it may be corrupt, partial, or a false match."
+            }
+            Self::UnsupportedContent(_) => {
+                "Keep the original file. This media format or inspection limit is unsupported; \
+                 no corruption or game identity is established."
+            }
+            Self::InspectionUnavailable(_) => {
+                "Retry with a stable, readable regular file and available temporary storage. \
+                 This inspection failure does not establish damaged media."
             }
         }
     }
@@ -253,6 +268,8 @@ pub struct SkipReasonCounts {
     pub missing_paired_file: usize,
     pub ambiguous_platform: usize,
     pub invalid_content: usize,
+    pub unsupported_content: usize,
+    pub inspection_unavailable: usize,
 }
 
 impl SkipReasonCounts {
@@ -262,6 +279,8 @@ impl SkipReasonCounts {
         self.missing_paired_file += other.missing_paired_file;
         self.ambiguous_platform += other.ambiguous_platform;
         self.invalid_content += other.invalid_content;
+        self.unsupported_content += other.unsupported_content;
+        self.inspection_unavailable += other.inspection_unavailable;
     }
 
     pub fn total(&self) -> usize {
@@ -270,6 +289,8 @@ impl SkipReasonCounts {
             + self.missing_paired_file
             + self.ambiguous_platform
             + self.invalid_content
+            + self.unsupported_content
+            + self.inspection_unavailable
     }
 
     fn record(&mut self, reason: &SkipReason) {
@@ -279,6 +300,8 @@ impl SkipReasonCounts {
             SkipReason::MissingPairedFile => self.missing_paired_file += 1,
             SkipReason::AmbiguousPlatform => self.ambiguous_platform += 1,
             SkipReason::InvalidContent(_) => self.invalid_content += 1,
+            SkipReason::UnsupportedContent(_) => self.unsupported_content += 1,
+            SkipReason::InspectionUnavailable(_) => self.inspection_unavailable += 1,
         }
     }
 }
@@ -1591,6 +1614,15 @@ fn discover_amiga_floppy(
             }
         }
         Err(error) => {
+            // Only an unknown boot identifier can use the shared Acorn .adf
+            // extension fallback. Known Amiga metadata and host I/O failures
+            // cannot be overridden by a folder or filename identity hint.
+            if !matches!(
+                error,
+                amiga_disk::AmigaFloppyError::Container(amiga_disk::DiskError::NoRdb)
+            ) {
+                return amiga_floppy_refusal(path, &error);
+            }
             let identity = identity_for(path, source_root);
             match &identity {
                 Some(summary)
@@ -1620,32 +1652,58 @@ fn amiga_floppy_explanation(inspection: &amiga_disk::AmigaFloppyInspection) -> S
     inspection.description()
 }
 
-fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> GameDiscovery {
-    use amiga_disk::AmigaFloppyError;
+pub(super) fn amiga_floppy_refusal(
+    path: &Path,
+    error: &amiga_disk::AmigaFloppyError,
+) -> GameDiscovery {
+    use amiga_disk::{AmigaFloppyError, DiskError, FilesystemError};
     let (reason, explanation) = match error {
-        AmigaFloppyError::Container(inner) => (
-            SkipReason::InvalidContent(format!("{inner:?}")),
+        AmigaFloppyError::Container(DiskError::TooManyPartitions) => (
+            SkipReason::UnsupportedContent(error.to_string()),
             format!(
-                "This file is named .adf but its contents are not a readable Amiga \
-                 floppy image: {inner}."
+                "Amiga RDB inspection exceeded the {}-partition reader limit. No content-integrity conclusion was made.",
+                amiga_disk::MAX_PARTITIONS
             ),
         ),
-        AmigaFloppyError::NoPartition => (
-            SkipReason::InvalidContent("no Amiga partition present".to_string()),
-            "This .adf parsed as a container but held no traversable AmigaDOS filesystem."
-                .to_string(),
+        AmigaFloppyError::Container(DiskError::InvalidBlockSize(bytes))
+            if *bytes >= 512 && bytes.is_multiple_of(512) =>
+        {
+            (
+                SkipReason::UnsupportedContent(error.to_string()),
+                format!(
+                    "The declared RDB logical block size ({bytes} bytes) exceeds the supported reader range. No content-integrity conclusion was made."
+                ),
+            )
+        }
+        AmigaFloppyError::Container(
+            DiskError::Io(_) | DiskError::NotRegularFile | DiskError::ChangedWhileReading,
+        )
+        | AmigaFloppyError::Filesystem(FilesystemError::Io(_) | FilesystemError::Cancelled) => (
+            SkipReason::InspectionUnavailable(error.to_string()),
+            format!(
+                "Amiga media inspection could not complete: {error}. No content-integrity conclusion was made."
+            ),
         ),
-        // `inspect_amiga_floppy` only reaches the weaker plausible-media state
-        // for an unpartitioned standard DD/HD-size image. Every other image
-        // whose OFS/FFS structures failed to validate - truncated, over- or
-        // under-sized, root block missing - is not Amiga floppy evidence, so a
-        // DOS boot signature alone must not make it recognised content.
+        AmigaFloppyError::Container(DiskError::NoRdb)
+        | AmigaFloppyError::NoPartition
+        | AmigaFloppyError::Filesystem(
+            FilesystemError::UnsupportedFilesystem(_)
+            | FilesystemError::UnsupportedBlockSize { .. },
+        ) => (
+            SkipReason::UnsupportedContent(error.to_string()),
+            format!(
+                "Unknown or unsupported Amiga media interpretation: {error}. No supported filesystem metadata was validated; damage is not established."
+            ),
+        ),
+        AmigaFloppyError::Container(inner) => (
+            SkipReason::InvalidContent(format!("{inner:?}")),
+            format!("Amiga image container structure did not validate: {inner}."),
+        ),
         AmigaFloppyError::Filesystem(inner) => (
             SkipReason::InvalidContent(format!("{inner:?}")),
             format!(
-                "This .adf carries an Amiga boot signature but is not a standard-size \
-                 Amiga floppy image and its OFS/FFS structures did not validate \
-                 (truncated, wrongly sized or damaged): {inner}."
+                "AmigaDOS boot/root metadata or its partition range did not validate: {inner}. \
+                 No filesystem or dump integrity is established."
             ),
         ),
     };
@@ -1667,7 +1725,7 @@ fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> Ga
 /// extension alone.
 fn discover_amiga_adz_floppy(
     path: &Path,
-    source_root: &Path,
+    _source_root: &Path,
     structural_evidence: &mut Vec<DiscoveredStructuralEvidence>,
 ) -> GameDiscovery {
     match crate::amiga_adz::inspect_adz(path) {
@@ -1702,38 +1760,42 @@ fn discover_amiga_adz_floppy(
                 },
             }
         }
-        Err(error) => {
-            let identity = identity_for(path, source_root);
-            match &identity {
-                Some(summary)
-                    if summary
-                        .platform
-                        .as_deref()
-                        .is_some_and(|platform| platform != "Amiga") =>
-                {
-                    accepted(
-                        path.to_path_buf(),
-                        ContainerKind::DirectFile,
-                        ContentKind::ComputerDisk,
-                        identity,
-                        "Disk image (.adz did not verify as a compressed Amiga floppy, but \
-                         the platform is otherwise identified)."
-                            .to_string(),
-                    )
-                }
-                _ => skipped(
-                    path.to_path_buf(),
-                    ContainerKind::DirectFile,
-                    Some(ContentKind::AmigaImage),
-                    SkipReason::InvalidContent(error.to_string()),
-                    format!(
-                        "This file is named .adz but its contents did not verify as a \
-                         compressed Amiga floppy image: {error}."
-                    ),
-                ),
-            }
-        }
+        Err(error) => amiga_adz_refusal(path, &error),
     }
+}
+
+pub(super) fn amiga_adz_refusal(path: &Path, error: &crate::amiga_adz::AdzError) -> GameDiscovery {
+    use crate::amiga_adz::AdzError;
+    if let AdzError::NotAdf(inner) = error {
+        let mut item = amiga_floppy_refusal(path, inner);
+        item.explanation = format!("Decompressed ADZ media: {}", item.explanation);
+        return item;
+    }
+    let reason = match error {
+        AdzError::Io(_) | AdzError::TempFileUnavailable(_) | AdzError::ChangedWhileReading => {
+            SkipReason::InspectionUnavailable(error.to_string())
+        }
+        AdzError::NotRegularFile
+        | AdzError::NotGzip
+        | AdzError::UnsupportedGzip(_)
+        | AdzError::ContainerTooLarge { .. }
+        | AdzError::DecompressedTooLarge { .. } => {
+            SkipReason::UnsupportedContent(error.to_string())
+        }
+        AdzError::MalformedGzip(_) | AdzError::DecompressedTooSmall => {
+            SkipReason::InvalidContent(error.to_string())
+        }
+        AdzError::NotAdf(_) => unreachable!(),
+    };
+    skipped(
+        path.to_path_buf(),
+        ContainerKind::DirectFile,
+        Some(ContentKind::AmigaImage),
+        reason,
+        format!(
+            "ADZ inspection result: {error}. No game identity or dump-integrity claim is established."
+        ),
+    )
 }
 
 /// `.lha`/`.lzh` are not registered as [`ContainerKind::Archive`] (LHA has

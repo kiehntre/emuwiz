@@ -580,8 +580,17 @@ pub(crate) const STRUCTURAL_PREFIX_BYTES: u64 = 1 << 20;
 
 fn read_structural_prefix(path: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let file = std::fs::File::open(path)
-        .map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let file = if path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("adf") || value.eq_ignore_ascii_case("adz"))
+    {
+        archivefs_core::amiga_disk::open_amiga_media_file(path)
+            .map_err(|error| format!("could not inspect {}: {error}", path.display()))?
+    } else {
+        std::fs::File::open(path)
+            .map_err(|error| format!("could not open {}: {error}", path.display()))?
+    };
     let mut prefix = Vec::new();
     file.take(STRUCTURAL_PREFIX_BYTES)
         .read_to_end(&mut prefix)
@@ -1704,14 +1713,13 @@ mod tests {
                 assert!(
                     details
                         .integrity
-                        .starts_with("AmigaDOS filesystem validated")
+                        .starts_with("AmigaDOS boot/root metadata validated")
                 );
                 assert!(details.filesystem.is_some());
             } else {
-                assert_eq!(
-                    details.integrity,
+                assert!(details.integrity.starts_with(
                     "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
-                );
+                ));
                 assert_eq!(details.filesystem, None);
                 assert_eq!(details.volume_label, None);
             }
@@ -1750,6 +1758,56 @@ mod tests {
             assert!(details.integrity.contains("Rejected / unsupported"));
             assert_eq!(details.filesystem, None);
             assert!(!details.warnings.is_empty());
+        }
+    }
+
+    #[test]
+    fn amiga_floppy_cropped_metadata_evidence_does_not_claim_dump_integrity_or_bootability() {
+        let bytes = amiga_floppy_bytes(1, true);
+        let dir = write_temp_rom("Cropped.adf", &bytes[..600_064]);
+        let report =
+            gather_selected_evidence_fast(&dir.path().join("Cropped.adf"), Some("Amiga")).unwrap();
+        let Some(StructuralMediaDetails::Disk(details)) = report.structural_media else {
+            panic!("readable boot/root metadata must be described with its limits");
+        };
+        assert!(details.filesystem.is_some());
+        assert!(
+            details
+                .integrity
+                .starts_with("AmigaDOS boot/root metadata validated")
+        );
+        assert!(details.integrity.contains(
+            "Full filesystem integrity, dump integrity and bootability are not established"
+        ));
+        assert_eq!(
+            report
+                .game_identity_report
+                .verified_value(archivefs_core::game_identity::IdentityKind::AmigaWHDLoad),
+            None
+        );
+    }
+
+    #[test]
+    fn amiga_floppy_fifo_cannot_block_the_selected_evidence_prefix_read() {
+        for extension in ["adf", "adz"] {
+            let dir = FixtureDir::new();
+            let path = dir.0.join(format!("pipe.{extension}"));
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                send.send(gather_selected_evidence_fast(&path, Some("Amiga")))
+                    .unwrap()
+            });
+            let result = receive
+                .recv_timeout(Duration::from_secs(2))
+                .expect("Amiga special files must be refused before the generic prefix read");
+            assert!(result.unwrap_err().contains("NotRegularFile"));
         }
     }
 

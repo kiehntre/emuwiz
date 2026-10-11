@@ -3089,6 +3089,10 @@ pub enum DiscoveryDetailFilter {
     Unverified,
     /// [`crate::ingestion::SkipReason::UnsupportedExtension`].
     Unsupported,
+    /// Unknown media interpretation or an unsupported reader limit.
+    UnsupportedContent,
+    /// Host I/O or temporary storage prevented inspection.
+    InspectionUnavailable,
     /// [`crate::ingestion::SkipReason::MissingPairedFile`].
     MissingPairedFile,
     /// [`crate::ingestion::SkipReason::AmbiguousPlatform`].
@@ -3199,8 +3203,7 @@ fn validation_state_from_db_str(value: &str) -> crate::ingestion::ValidationStat
     }
 }
 
-/// `(stable machine name, detail text)` - `detail` is only ever populated
-/// for [`crate::ingestion::SkipReason::InvalidContent`], carried in the
+/// `(stable machine name, diagnostic text)` - diagnostics are carried in the
 /// separate `skip_reason_detail` column so filtering never has to parse it
 /// back out of a combined string.
 fn skip_reason_db_parts(reason: &crate::ingestion::SkipReason) -> (&'static str, Option<&str>) {
@@ -3211,6 +3214,10 @@ fn skip_reason_db_parts(reason: &crate::ingestion::SkipReason) -> (&'static str,
         SkipReason::MissingPairedFile => ("missing_paired_file", None),
         SkipReason::AmbiguousPlatform => ("ambiguous_platform", None),
         SkipReason::InvalidContent(detail) => ("invalid_content", Some(detail.as_str())),
+        SkipReason::UnsupportedContent(detail) => ("unsupported_content", Some(detail.as_str())),
+        SkipReason::InspectionUnavailable(detail) => {
+            ("inspection_unavailable", Some(detail.as_str()))
+        }
     }
 }
 
@@ -3225,6 +3232,12 @@ fn skip_reason_from_db_parts(
         "missing_paired_file" => SkipReason::MissingPairedFile,
         "ambiguous_platform" => SkipReason::AmbiguousPlatform,
         "invalid_content" => SkipReason::InvalidContent(detail.unwrap_or_default().to_string()),
+        "unsupported_content" => {
+            SkipReason::UnsupportedContent(detail.unwrap_or_default().to_string())
+        }
+        "inspection_unavailable" => {
+            SkipReason::InspectionUnavailable(detail.unwrap_or_default().to_string())
+        }
         _ => return None,
     })
 }
@@ -8303,6 +8316,10 @@ impl Database {
             DiscoveryDetailFilter::Recognised => "validation_state = 'accepted'",
             DiscoveryDetailFilter::Unverified => "skip_reason = 'no_identity_match'",
             DiscoveryDetailFilter::Unsupported => "skip_reason = 'unsupported_extension'",
+            DiscoveryDetailFilter::UnsupportedContent => "skip_reason = 'unsupported_content'",
+            DiscoveryDetailFilter::InspectionUnavailable => {
+                "skip_reason = 'inspection_unavailable'"
+            }
             DiscoveryDetailFilter::MissingPairedFile => "skip_reason = 'missing_paired_file'",
             DiscoveryDetailFilter::AmbiguousPlatform => "skip_reason = 'ambiguous_platform'",
             DiscoveryDetailFilter::InvalidContent => "skip_reason = 'invalid_content'",
@@ -16682,6 +16699,71 @@ mod tests {
     }
 
     // --- Collection Discovery paging (persisted `discovery_details`) ---------------------------
+
+    #[test]
+    fn unsupported_media_and_inspection_failures_survive_persistence_separately_from_damage() {
+        use crate::amiga_adz::{AdzError, inspect_adz};
+        use crate::ingestion::{
+            ContainerKind, ContentKind, GameDiscovery, SkipReason, ValidationState,
+        };
+
+        let root = temp_dir("amiga-neutral-diagnostics");
+        let source = root.join("roms");
+        let mut unsupported = vec![0_u8; 64 * 1024];
+        unsupported[..4].copy_from_slice(b"PFS\x03");
+        write_archive_file(&source, "Unsupported.adf", &unsupported);
+        write_archive_file(&source, "Malformed.adf", b"DOS\x01 short");
+        let database_path = root.join("library.sqlite3");
+        let config = config_for(&source, &root.join("mount"));
+        let mut database = Database::open_or_create(&database_path).unwrap();
+        let summary = scan_and_persist(&mut database, &config, "initial").unwrap();
+        // An actual host open failure must remain separate after serialization.
+        let missing_path = source.join("Missing.adz");
+        let error = inspect_adz(&missing_path).unwrap_err();
+        assert!(matches!(error, AdzError::Io(_)));
+        let unavailable = GameDiscovery {
+            path: missing_path,
+            container: ContainerKind::DirectFile,
+            content: Some(ContentKind::AmigaImage),
+            platform_hint: None,
+            identity_candidate: None,
+            validation_state: ValidationState::Skipped,
+            explanation: "Host inspection failed; content integrity is unknown.".into(),
+            skip_reason: Some(SkipReason::InspectionUnavailable(error.to_string())),
+        };
+        database
+            .insert_discovery_detail(summary.scan_run_id, &unavailable)
+            .unwrap();
+        drop(database);
+        let database = Database::open_or_create(&database_path).unwrap();
+        for (filter, name) in [
+            (DiscoveryDetailFilter::UnsupportedContent, "Unsupported.adf"),
+            (DiscoveryDetailFilter::InspectionUnavailable, "Missing.adz"),
+            (DiscoveryDetailFilter::InvalidContent, "Malformed.adf"),
+        ] {
+            let page = database
+                .query_discovery_details(summary.scan_run_id, 0, 10, filter)
+                .unwrap();
+            assert_eq!(page.total_matching, 1, "{filter:?}");
+            let row = &page.rows[0];
+            assert!(row.path.ends_with(name));
+            assert_eq!(row.platform_hint, None);
+            assert_eq!(row.identity_display_name, None);
+            assert_eq!(row.identity_platform, None);
+            match (&row.skip_reason, filter) {
+                (
+                    Some(SkipReason::UnsupportedContent(detail)),
+                    DiscoveryDetailFilter::UnsupportedContent,
+                ) => assert!(detail.contains("UnsupportedFilesystem")),
+                (
+                    Some(SkipReason::InspectionUnavailable(detail)),
+                    DiscoveryDetailFilter::InspectionUnavailable,
+                ) => assert!(!detail.is_empty()),
+                (Some(SkipReason::InvalidContent(_)), DiscoveryDetailFilter::InvalidContent) => {}
+                unexpected => panic!("wrong persisted diagnostic: {unexpected:?}"),
+            }
+        }
+    }
 
     fn write_n_unsupported_extension_files(source: &Path, count: usize) {
         for index in 0..count {

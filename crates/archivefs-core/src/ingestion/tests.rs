@@ -927,10 +927,17 @@ fn zip_and_truncated_files_renamed_adf_fail_closed() {
     for item in &report.items {
         assert_eq!(item.validation_state, ValidationState::Skipped, "{item:?}");
         assert_eq!(item.platform_hint, None);
-        assert!(matches!(
-            item.skip_reason,
-            Some(SkipReason::InvalidContent(_))
-        ));
+        if item.path.ends_with("Game A.adf") {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::UnsupportedContent(_))
+            ));
+        } else {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::InvalidContent(_))
+            ));
+        }
     }
     assert!(report.structural_evidence.is_empty());
 }
@@ -1049,7 +1056,53 @@ fn incorrectly_sized_adz_output_with_dos_signature_is_invalid_not_recognized() {
 }
 
 #[test]
-fn plausible_ndos_media_is_not_identified_as_valid_amigados() {
+fn extra_cylinder_adf_and_adz_media_keep_only_weak_platform_evidence() {
+    use crate::platform_evidence_fusion::evidence_lineage::ClaimStrength;
+    let dir = source_dir("amiga-extra-cylinders");
+    for cylinders in 81..=83 {
+        let mut bytes = dos_signature_image(cylinders * 2 * 11 * 512);
+        bytes[12..14].copy_from_slice(&[0x60, 0xfe]);
+        let sum = bytes[..1024].chunks_exact(4).fold(0_u32, |sum, word| {
+            let (sum, carry) = sum.overflowing_add(u32::from_be_bytes(word.try_into().unwrap()));
+            sum.wrapping_add(u32::from(carry))
+        });
+        put32(&mut bytes, 4, !sum);
+        std::fs::write(
+            dir.path().join(format!("Known Game {cylinders}.adf")),
+            &bytes,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(format!("Known Game {cylinders}.adz")),
+            gzip_bytes(&bytes),
+        )
+        .unwrap();
+    }
+    let report = discover_source(dir.path()).unwrap();
+    assert_eq!(report.items.len(), 6);
+    assert_eq!(report.structural_evidence.len(), 6);
+    for item in report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert_eq!(
+            item.skip_reason,
+            Some(SkipReason::RecognizedContentNoIdentityMatch)
+        );
+        assert_eq!(item.platform_hint.as_deref(), Some("Amiga"));
+        assert_eq!(item.identity_candidate, None);
+        assert!(
+            item.explanation
+                .contains("dump integrity and bootability are not established")
+        );
+    }
+    for evidence in report.structural_evidence {
+        assert_eq!(evidence.observation.claim_strength, ClaimStrength::Weak);
+        assert_eq!(evidence.observation.release_candidate, None);
+        assert_eq!(evidence.observation.hash_or_value, None);
+    }
+}
+
+#[test]
+fn unknown_ndos_identifier_is_not_filesystem_validation_or_damage_evidence() {
     for (label, ext) in [("adf", "adf"), ("adz", "adz")] {
         let dir = source_dir(&format!("ndos-{label}"));
         let mut img = vec![0_u8; 901_120];
@@ -1058,7 +1111,15 @@ fn plausible_ndos_media_is_not_identified_as_valid_amigados() {
         let bytes = if ext == "adz" { gzip_bytes(&img) } else { img };
         std::fs::write(dir.path().join(format!("Game.{ext}")), bytes).unwrap();
         let report = discover_source(dir.path()).unwrap();
-        assert_refused_as_invalid_amiga_content(&report);
+        let item = &report.items[0];
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::UnsupportedContent(_))
+        ));
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
     }
 }
 
@@ -1069,6 +1130,169 @@ fn truncated_valid_adf_loses_its_validation() {
     let img = minimal_flat_adf(1, b"Cut");
     std::fs::write(dir.path().join("Cut.adf"), &img[..32 * 512]).unwrap();
     assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+}
+
+#[test]
+fn unsupported_amiga_filesystems_are_not_described_as_corrupt_content() {
+    for header in [b"PFS\x03", b"SFS\0", b"MuFS"] {
+        let dir = source_dir("unsupported-amiga-fs");
+        let mut bytes = vec![0_u8; 128 * 512];
+        bytes[..4].copy_from_slice(header);
+        std::fs::write(dir.path().join("Unknown.adf"), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        let item = &report.items[0];
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(!matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+        assert!(item.explanation.contains("unsupported"));
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
+    }
+}
+
+fn ffs_with_1024_byte_blocks() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 128 * 512];
+    bytes[..4].copy_from_slice(b"DOS\x01");
+    put32(&mut bytes, 8, 32);
+    let root = &mut bytes[32 * 1024..33 * 1024];
+    put32(root, 0, 2);
+    put32(root, 12, 200);
+    put32(root, 1020, 1);
+    let sum = root.chunks_exact(4).fold(0_u32, |s, w| {
+        s.wrapping_add(u32::from_be_bytes(w.try_into().unwrap()))
+    });
+    put32(root, 20, 0_u32.wrapping_sub(sum));
+    bytes
+}
+
+#[test]
+fn unsupported_block_size_is_a_reader_limit_for_adf_and_adz() {
+    for ext in ["adf", "adz"] {
+        let dir = source_dir("amiga-large-blocks");
+        let raw = ffs_with_1024_byte_blocks();
+        let bytes = if ext == "adz" { gzip_bytes(&raw) } else { raw };
+        std::fs::write(dir.path().join(format!("Unknown.{ext}")), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        let item = &report.items[0];
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(!matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+        assert!(item.explanation.contains("UnsupportedBlockSize"));
+        assert!(!item.explanation.contains("damaged"));
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
+    }
+}
+
+#[test]
+fn environmental_errors_do_not_become_media_corruption_or_game_identity() {
+    use crate::amiga_adz::{AdzError, inspect_adz_in_temp_dir};
+    use crate::amiga_disk::{AmigaFloppyError, DiskError, FilesystemError};
+    let dir = source_dir("amiga-unavailable");
+    let path = dir.path().join("Known Game.adz");
+    std::fs::write(&path, gzip_bytes(&minimal_flat_adf(1, b"DisplayLabel"))).unwrap();
+    let staging = inspect_adz_in_temp_dir(&path, &dir.path().join("missing-temp")).unwrap_err();
+    for error in [
+        staging,
+        AdzError::Io("host read failed".into()),
+        AdzError::ChangedWhileReading,
+    ] {
+        let item = super::discovery::amiga_adz_refusal(&path, &error);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InspectionUnavailable(_))
+        ));
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+        assert!(
+            !item
+                .skip_reason
+                .unwrap()
+                .suggested_action()
+                .contains("may be corrupt")
+        );
+    }
+    for error in [
+        AmigaFloppyError::Container(DiskError::Io("host read failed".into())),
+        AmigaFloppyError::Filesystem(FilesystemError::Io("positional read failed".into())),
+        AmigaFloppyError::Filesystem(FilesystemError::Cancelled),
+    ] {
+        let item = super::discovery::amiga_floppy_refusal(&path, &error);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InspectionUnavailable(_))
+        ));
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+    }
+}
+
+#[test]
+fn rdb_reader_limits_are_unsupported_but_zero_block_geometry_is_invalid() {
+    use crate::amiga_disk::{AmigaFloppyError, DiskError};
+    for (block_size, invalid) in [(65_536, false), (0, true)] {
+        let dir = source_dir("rdb-block-limit");
+        let mut bytes = vec![0_u8; 65_536];
+        bytes[..4].copy_from_slice(b"RDSK");
+        put32(&mut bytes, 16, block_size);
+        put32(&mut bytes, 28, u32::MAX);
+        std::fs::write(dir.path().join("Disk.adf"), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        let item = &report.items[0];
+        if invalid {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::InvalidContent(_))
+            ));
+        } else {
+            assert!(matches!(
+                item.skip_reason,
+                Some(SkipReason::UnsupportedContent(_))
+            ));
+        }
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+        assert!(report.structural_evidence.is_empty());
+    }
+    let item = super::discovery::amiga_floppy_refusal(
+        std::path::Path::new("Disk.adf"),
+        &AmigaFloppyError::Container(DiskError::TooManyPartitions),
+    );
+    assert!(matches!(
+        item.skip_reason,
+        Some(SkipReason::UnsupportedContent(_))
+    ));
+    assert!(item.explanation.contains("128-partition reader limit"));
+    assert_eq!(item.platform_hint, None);
+    assert_eq!(item.identity_candidate, None);
+}
+
+#[test]
+fn malformed_adz_and_amiga_metadata_cannot_use_a_non_amiga_folder_override() {
+    let dir = source_dir("amiga-format-failure");
+    let alias = dir.path().join("Acorn Archimedes");
+    std::fs::create_dir(&alias).unwrap();
+    let mut gzip = gzip_bytes(&minimal_flat_adf(1, b"Disk"));
+    gzip.extend_from_slice(b"garbage");
+    std::fs::write(alias.join("Bad.adz"), gzip).unwrap();
+    std::fs::write(alias.join("Bad.adf"), dos_signature_image(819_200)).unwrap();
+    let report = discover_source(&alias).unwrap();
+    assert_eq!(report.items.len(), 2);
+    for item in report.items {
+        assert_eq!(item.validation_state, ValidationState::Skipped);
+        assert!(matches!(
+            item.skip_reason,
+            Some(SkipReason::InvalidContent(_))
+        ));
+        assert_eq!(item.platform_hint, None);
+        assert_eq!(item.identity_candidate, None);
+    }
+    assert!(report.structural_evidence.is_empty());
 }
 
 /// A random blob of the same size as a real floppy image, named `.adf`:
@@ -1450,7 +1674,7 @@ fn adz_that_is_not_gzip_is_refused_not_guessed() {
     assert_eq!(item.validation_state, ValidationState::Skipped);
     assert!(matches!(
         item.skip_reason,
-        Some(SkipReason::InvalidContent(_))
+        Some(SkipReason::UnsupportedContent(_))
     ));
     assert!(report.structural_evidence.is_empty());
 }

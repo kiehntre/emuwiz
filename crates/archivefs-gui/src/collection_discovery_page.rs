@@ -162,6 +162,8 @@ pub(super) fn show_skipped_files_window(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NeedsAttentionFilter {
     UnsupportedExtension,
+    UnsupportedContent,
+    InspectionUnavailable,
     MissingPairedFile,
     AmbiguousPlatform,
     NoIdentityMatch,
@@ -173,6 +175,11 @@ impl NeedsAttentionFilter {
         matches!(
             (self, reason),
             (Self::UnsupportedExtension, SkipReason::UnsupportedExtension)
+                | (Self::UnsupportedContent, SkipReason::UnsupportedContent(_))
+                | (
+                    Self::InspectionUnavailable,
+                    SkipReason::InspectionUnavailable(_)
+                )
                 | (Self::MissingPairedFile, SkipReason::MissingPairedFile)
                 | (Self::AmbiguousPlatform, SkipReason::AmbiguousPlatform)
                 | (
@@ -355,6 +362,14 @@ fn needs_attention_wording(filter: NeedsAttentionFilter, count: usize) -> (Strin
                  count, so what's left here is genuinely unfamiliar file types.",
             )
         }
+        NeedsAttentionFilter::UnsupportedContent => (
+            format!("{n} {items} have unknown or unsupported media"),
+            "Keep the original. Use a reader that supports this format or image size.",
+        ),
+        NeedsAttentionFilter::InspectionUnavailable => (
+            format!("{n} {items} could not be inspected"),
+            "File access, changing input or temporary storage prevented inspection. Retry a stable, readable copy.",
+        ),
         NeedsAttentionFilter::MissingPairedFile => {
             let is_are = if count == 1 { "is" } else { "are" };
             let its_their = if count == 1 { "its" } else { "their" };
@@ -401,6 +416,14 @@ fn show_needs_attention_summary(ui: &mut egui::Ui, skip: &SkipReasonCounts) {
             (
                 NeedsAttentionFilter::UnsupportedExtension,
                 skip.unsupported_extension,
+            ),
+            (
+                NeedsAttentionFilter::UnsupportedContent,
+                skip.unsupported_content,
+            ),
+            (
+                NeedsAttentionFilter::InspectionUnavailable,
+                skip.inspection_unavailable,
             ),
             (
                 NeedsAttentionFilter::MissingPairedFile,
@@ -646,6 +669,8 @@ fn discovery_detail_filter_label(filter: DiscoveryDetailFilter) -> &'static str 
         DiscoveryDetailFilter::Recognised => "Recognised",
         DiscoveryDetailFilter::Unverified => "Unverified",
         DiscoveryDetailFilter::Unsupported => "Unsupported",
+        DiscoveryDetailFilter::UnsupportedContent => "Unsupported media",
+        DiscoveryDetailFilter::InspectionUnavailable => "Inspection unavailable",
         DiscoveryDetailFilter::MissingPairedFile => "Missing pair",
         DiscoveryDetailFilter::AmbiguousPlatform => "Ambiguous platform",
         DiscoveryDetailFilter::InvalidContent => "Could not be read",
@@ -743,6 +768,8 @@ fn show_item_details_paged(ui: &mut egui::Ui, database_path: &Path, run_id: i64)
                 DiscoveryDetailFilter::Recognised,
                 DiscoveryDetailFilter::Unverified,
                 DiscoveryDetailFilter::Unsupported,
+                DiscoveryDetailFilter::UnsupportedContent,
+                DiscoveryDetailFilter::InspectionUnavailable,
                 DiscoveryDetailFilter::MissingPairedFile,
                 DiscoveryDetailFilter::AmbiguousPlatform,
                 DiscoveryDetailFilter::InvalidContent,
@@ -854,6 +881,8 @@ fn fetch_discovery_page(
 fn needs_attention_count(filter: NeedsAttentionFilter, skip: &SkipReasonCounts) -> usize {
     match filter {
         NeedsAttentionFilter::UnsupportedExtension => skip.unsupported_extension,
+        NeedsAttentionFilter::UnsupportedContent => skip.unsupported_content,
+        NeedsAttentionFilter::InspectionUnavailable => skip.inspection_unavailable,
         NeedsAttentionFilter::MissingPairedFile => skip.missing_paired_file,
         NeedsAttentionFilter::AmbiguousPlatform => skip.ambiguous_platform,
         NeedsAttentionFilter::NoIdentityMatch => skip.no_identity_match,
@@ -1008,6 +1037,43 @@ mod tests {
 
         let (singular, _) = needs_attention_wording(NeedsAttentionFilter::UnsupportedExtension, 1);
         assert_eq!(singular, "1 item wasn't recognised");
+    }
+
+    #[test]
+    fn media_limitations_and_host_failures_have_separate_neutral_attention_filters() {
+        let counts = SkipReasonCounts {
+            unsupported_content: 3,
+            inspection_unavailable: 2,
+            invalid_content: 1,
+            ..Default::default()
+        };
+        let reasons = [
+            SkipReason::UnsupportedContent("UnsupportedBlockSize { bytes: 1024 }".into()),
+            SkipReason::InspectionUnavailable("temporary file could not be created".into()),
+            SkipReason::InvalidContent("gzip checksum mismatch".into()),
+        ];
+        for (filter, count, matching_index) in [
+            (NeedsAttentionFilter::UnsupportedContent, 3, 0),
+            (NeedsAttentionFilter::InspectionUnavailable, 2, 1),
+        ] {
+            assert_eq!(needs_attention_count(filter, &counts), count);
+            for (index, reason) in reasons.iter().enumerate() {
+                assert_eq!(filter.matches(reason), index == matching_index);
+            }
+            let (headline, action) = needs_attention_wording(filter, count);
+            for word in ["corrupt", "damaged", "malformed"] {
+                assert!(!headline.contains(word));
+                assert!(!action.contains(word));
+            }
+        }
+        assert_eq!(
+            discovery_detail_filter_label(DiscoveryDetailFilter::UnsupportedContent),
+            "Unsupported media"
+        );
+        assert_eq!(
+            discovery_detail_filter_label(DiscoveryDetailFilter::InspectionUnavailable),
+            "Inspection unavailable"
+        );
     }
 
     /// Clicking a "Needs attention" row's action button ("View unknown

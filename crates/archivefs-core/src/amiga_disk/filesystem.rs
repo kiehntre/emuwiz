@@ -17,6 +17,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const SECTOR_BYTES: u64 = 512;
@@ -111,6 +112,8 @@ pub struct HdfSlaveDiscovery {
 /// Read-only filesystem inspection refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesystemError {
+    /// Host file access failed; no assertion about media contents is made.
+    Io(String),
     /// PFS, SFS, MuFS, and unknown filesystems remain detection-only.
     UnsupportedFilesystem(FileSystem),
     /// `affs-read`'s file streaming API is limited to 512-byte filesystem
@@ -330,9 +333,9 @@ fn reader_metadata(
         ref other => return Err(FilesystemError::UnsupportedFilesystem(other.clone())),
     };
     let mut boot = [0_u8; 512];
-    device.read_block(0, &mut boot).map_err(|()| {
-        FilesystemError::InvalidFilesystem("cannot read partition boot block".to_string())
-    })?;
+    device
+        .read_block(0, &mut boot)
+        .map_err(|()| device.inspection_failure("cannot read partition boot block".into()))?;
     if boot[..3] != *b"DOS" || boot[3] != dos_type || dos_type > 7 {
         return Err(FilesystemError::InvalidFilesystem(
             "partition boot block does not match a supported DOS\\0..DOS\\7 type".to_string(),
@@ -343,6 +346,9 @@ fn reader_metadata(
     let reader = match AffsReader::with_size(device, sectors) {
         Ok(reader) => reader,
         Err(error) => {
+            if let Some(error) = device.io_failure.lock().unwrap().clone() {
+                return Err(FilesystemError::Io(error));
+            }
             // The upstream variable-block reader can safely identify a larger
             // FFS block size, but it has no file-streaming API. Report that
             // limitation rather than pretending directory listing alone is
@@ -354,8 +360,8 @@ fn reader_metadata(
                     bytes: probe.block_size(),
                 });
             }
-            return Err(FilesystemError::InvalidFilesystem(format!(
-                "512-byte OFS/FFS reader rejected filesystem: {error:?}"
+            return Err(device.inspection_failure(format!(
+                "512-byte OFS/FFS reader rejected boot/root metadata: {error:?}"
             )));
         }
     };
@@ -405,6 +411,7 @@ struct PartitionRangeDevice {
     length: u64,
     max_reads: u64,
     reads: AtomicU64,
+    io_failure: Mutex<Option<String>>,
 }
 
 impl PartitionRangeDevice {
@@ -414,14 +421,11 @@ impl PartitionRangeDevice {
         length: u64,
         max_reads: u64,
     ) -> Result<Self, FilesystemError> {
-        let file = File::open(path).map_err(|error| {
-            FilesystemError::InvalidFilesystem(format!("cannot open HDF: {error}"))
-        })?;
+        let file = File::open(path)
+            .map_err(|error| FilesystemError::Io(format!("cannot open image: {error}")))?;
         let image_size = file
             .metadata()
-            .map_err(|error| {
-                FilesystemError::InvalidFilesystem(format!("cannot stat HDF: {error}"))
-            })?
+            .map_err(|error| FilesystemError::Io(format!("cannot stat image: {error}")))?
             .len();
         if offset
             .checked_add(length)
@@ -435,7 +439,15 @@ impl PartitionRangeDevice {
             length,
             max_reads,
             reads: AtomicU64::new(0),
+            io_failure: Mutex::new(None),
         })
+    }
+
+    fn inspection_failure(&self, detail: String) -> FilesystemError {
+        match self.io_failure.lock().unwrap().clone() {
+            Some(error) => FilesystemError::Io(error),
+            None => FilesystemError::InvalidFilesystem(detail),
+        }
     }
 
     fn read_budget_exhausted(&self) -> bool {
@@ -453,7 +465,9 @@ impl PartitionRangeDevice {
             return Err(());
         }
         let absolute = self.offset.checked_add(relative).ok_or(())?;
-        read_exact_at(&self.file, absolute, out).map_err(|_| ())
+        read_exact_at(&self.file, absolute, out).map_err(|error| {
+            *self.io_failure.lock().unwrap() = Some(error.to_string());
+        })
     }
 }
 

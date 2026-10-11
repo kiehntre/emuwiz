@@ -8,6 +8,8 @@ use crate::platform_evidence_fusion::evidence_lineage::{
 };
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 const RDSK: &[u8; 4] = b"RDSK";
@@ -20,6 +22,8 @@ const MAX_BLOCK: usize = 32768;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiskError {
     Io(String),
+    NotRegularFile,
+    ChangedWhileReading,
     TooSmall,
     InvalidBlockSize(u32),
     Truncated,
@@ -153,10 +157,9 @@ pub fn inspect_hdf(path: &Path) -> Result<AmigaDisk, DiskError> {
         if offset.checked_add(length).ok_or(DiskError::Overflow)? > len {
             return Err(DiskError::PartitionOutsideImage);
         }
-        let boot = read_at(&mut f, len, offset, 4)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .map(u32::from_be_bytes);
+        let boot = Some(u32::from_be_bytes(
+            read_at(&mut f, len, offset, 4)?.try_into().unwrap(),
+        ));
         let fs = boot.map(classify).unwrap_or_else(|| classify(dos));
         r.partitions.push(Partition {
             block_index: current,
@@ -211,11 +214,7 @@ fn inspect_flat_amigados(path: &Path) -> Result<AmigaDisk, DiskError> {
     if len < 512 {
         return Err(DiskError::TooSmall);
     }
-    let boot = read_at(&mut f, len, 0, 4)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .map(u32::from_be_bytes)
-        .ok_or(DiskError::NoRdb)?;
+    let boot = u32::from_be_bytes(read_at(&mut f, len, 0, 4)?.try_into().unwrap());
     let filesystem = classify(boot);
     if matches!(filesystem, FileSystem::Unknown(_)) {
         return Err(DiskError::NoRdb);
@@ -258,7 +257,7 @@ fn inspect_flat_amigados(path: &Path) -> Result<AmigaDisk, DiskError> {
 pub enum AmigaFloppyEvidence {
     /// Boot/root structures passed the existing bounded OFS/FFS reader.
     AmigaDosValidated(AmigaFilesystem),
-    /// Standard DD/HD size plus an existing recognized Amiga boot
+    /// Supported DD/HD geometry plus an existing recognized Amiga boot
     /// identifier (DOS\0..DOS\7, PFS, SFS or MuFS), but no readable
     /// AmigaDOS filesystem. Neither size nor a filename alone suffices.
     Plausible { filesystem_error: FilesystemError },
@@ -284,15 +283,21 @@ impl AmigaFloppyInspection {
 
     pub fn description(&self) -> String {
         let Some(filesystem) = self.filesystem() else {
-            return "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
-                .into();
+            let AmigaFloppyEvidence::Plausible { filesystem_error } = &self.evidence else {
+                unreachable!();
+            };
+            return format!(
+                "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found. \
+                 Filesystem inspection detail: {filesystem_error}. \
+                 Game identity, dump integrity and bootability are not established."
+            );
         };
         let family = match filesystem.family {
             AmigaDosFamily::Ofs => "OFS",
             AmigaDosFamily::Ffs => "FFS",
         };
         let mut notes = format!(
-            "AmigaDOS filesystem validated: DOS\\{} ({family}), {}-byte logical blocks",
+            "AmigaDOS boot/root metadata validated: DOS\\{} ({family}), {}-byte logical blocks",
             filesystem.dos_type, filesystem.block_size
         );
         if filesystem.international {
@@ -309,6 +314,9 @@ impl AmigaFloppyInspection {
         {
             notes.push_str(&format!(", volume {label:?}"));
         }
+        notes.push_str(
+            ". Full filesystem integrity, dump integrity and bootability are not established.",
+        );
         notes
     }
 }
@@ -355,12 +363,53 @@ impl std::error::Error for AmigaFloppyError {}
 /// existing bounded reader and its traversal limits.
 ///
 /// Validated OFS/FFS remains the stronger state, including existing flat
-/// images with nonstandard sizes. When traversal fails, only an unpartitioned
-/// 80-cylinder, two-sided DD/HD image size (11/22 512-byte sectors per track)
-/// with a recognized Amiga boot identifier gets the weaker state. This does not
+/// images with nonstandard sizes. When metadata validation fails, an unpartitioned
+/// 80-83-cylinder, two-sided DD/HD geometry (11/22 512-byte sectors per track)
+/// with a recognized Amiga boot identifier can get the weaker state. DOS boot
+/// code must have a valid checksum. This does not
 /// verify boot code, game content or a dump. Custom loaders without such an
 /// identifier stay unknown; arbitrary 880 KiB data is never admitted by size.
 pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
+    let file = open_amiga_media_file(path).map_err(AmigaFloppyError::Container)?;
+    let before = file
+        .metadata()
+        .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?;
+    // Keep every parser reopen on the pinned regular inode, including ADZ's
+    // anonymous staging file. A path replacement cannot turn a read into a FIFO.
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let result = inspect_amiga_floppy_pinned(&pinned);
+    let after = file
+        .metadata()
+        .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return Err(AmigaFloppyError::Container(DiskError::ChangedWhileReading));
+    }
+    let mut inspection = result?;
+    inspection.disk.path = path.into();
+    Ok(inspection)
+}
+
+/// Open an Amiga media candidate read-only, refusing nonregular inputs without
+/// blocking on a FIFO. The GUI prefix pass uses the same descriptor check as
+/// the floppy inspector so it cannot block before the full inspection starts.
+/// This establishes an input boundary only; it supplies no media evidence.
+pub fn open_amiga_media_file(path: &Path) -> Result<std::fs::File, DiskError> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| DiskError::Io(error.to_string()))?;
+    if !file
+        .metadata()
+        .map_err(|error| DiskError::Io(error.to_string()))?
+        .is_file()
+    {
+        return Err(DiskError::NotRegularFile);
+    }
+    Ok(file)
+}
+
+fn inspect_amiga_floppy_pinned(path: &Path) -> Result<AmigaFloppyInspection, AmigaFloppyError> {
     let disk = inspect_amiga_image(path).map_err(AmigaFloppyError::Container)?;
     let partition = disk
         .rdb
@@ -370,8 +419,11 @@ pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaF
         .ok_or(AmigaFloppyError::NoPartition)?;
     let evidence = match inspect_amiga_filesystem(&disk, &partition) {
         Ok(filesystem) => AmigaFloppyEvidence::AmigaDosValidated(filesystem),
+        Err(error @ (FilesystemError::Io(_) | FilesystemError::Cancelled)) => {
+            return Err(AmigaFloppyError::Filesystem(error));
+        }
         Err(filesystem_error)
-            if matches!(disk.image_size, 901_120 | 1_802_240)
+            if supported_floppy_geometry(disk.image_size)
                 && disk.rdb.partition_head == NONE
                 && disk.rdb.partitions.len() == 1
                 && partition.byte_offset == 0
@@ -386,11 +438,45 @@ pub fn inspect_amiga_floppy(path: &Path) -> Result<AmigaFloppyInspection, AmigaF
                     )
                 ) =>
         {
+            validate_plausible_boot(&disk)?;
             AmigaFloppyEvidence::Plausible { filesystem_error }
         }
         Err(error) => return Err(AmigaFloppyError::Filesystem(error)),
     };
     Ok(AmigaFloppyInspection { disk, evidence })
+}
+
+fn supported_floppy_geometry(bytes: u64) -> bool {
+    (80..=83).any(|cylinders| {
+        [11, 22]
+            .into_iter()
+            .any(|sectors| bytes == cylinders * 2 * sectors * 512)
+    })
+}
+
+fn validate_plausible_boot(disk: &AmigaDisk) -> Result<(), AmigaFloppyError> {
+    let mut file = std::fs::File::open(&disk.path)
+        .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?;
+    let mut boot = [0_u8; 1024];
+    file.read_exact(&mut boot)
+        .map_err(|error| AmigaFloppyError::Container(DiskError::Io(error.to_string())))?;
+    // Preserve uninstalled/nonbootable DOS disks, as the existing reader does.
+    // Other recognized filesystems have their own boot layout; detection only.
+    if &boot[..3] != b"DOS" || boot[12] == 0 {
+        return Ok(());
+    }
+    let sum = boot.chunks_exact(4).fold(0_u32, |sum, word| {
+        let (sum, carry) = sum.overflowing_add(u32::from_be_bytes(word.try_into().unwrap()));
+        sum.wrapping_add(u32::from(carry))
+    });
+    if sum != u32::MAX {
+        return Err(AmigaFloppyError::Filesystem(
+            FilesystemError::InvalidFilesystem(
+                "DOS boot code has a mismatched boot-block checksum".into(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Local, structural Amiga *platform* evidence for a `.adf` / flat image:
@@ -454,10 +540,10 @@ pub fn structural_hdf_observation(_: &AmigaDisk) -> EvidenceObservation {
 }
 fn find_rdb(f: &mut std::fs::File, len: u64) -> Result<(u64, Vec<u8>), DiskError> {
     for i in 0..MAX_RDB_SCAN_BLOCKS {
-        if let Ok(b) = read_block(f, len, i, 512)
-            && &b[..4] == RDSK
-        {
-            return Ok((i, b));
+        match read_block(f, len, i, 512) {
+            Ok(b) if &b[..4] == RDSK => return Ok((i, b)),
+            Err(error @ DiskError::Io(_)) => return Err(error),
+            _ => {}
         }
     }
     Err(DiskError::NoRdb)

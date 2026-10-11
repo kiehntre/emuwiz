@@ -301,9 +301,13 @@ fn standard_floppy_with_dos_boot_and_missing_root_is_not_rejected_as_media() {
     assert_eq!(evidence.claim_strength, ClaimStrength::Weak);
     assert_eq!(evidence.release_candidate, None);
     assert_eq!(evidence.hash_or_value, None);
-    assert_eq!(
-        inspection.description(),
+    assert!(inspection.description().starts_with(
         "Structurally plausible Amiga floppy; no readable AmigaDOS filesystem was found."
+    ));
+    assert!(
+        inspection
+            .description()
+            .contains("Filesystem inspection detail")
     );
 }
 
@@ -326,7 +330,7 @@ fn standard_ofs_and_ffs_adfs_keep_validated_filesystem_evidence_without_writes()
         assert!(
             inspection
                 .description()
-                .starts_with("AmigaDOS filesystem validated")
+                .starts_with("AmigaDOS boot/root metadata validated")
         );
         assert_eq!(
             structural_amiga_floppy_observation(&inspection).claim_strength,
@@ -460,4 +464,147 @@ fn structural_amiga_floppy_observation_is_platform_only_never_a_release() {
     assert!(notes.contains("FFS"));
     assert!(notes.contains("international"));
     assert!(notes.contains("IntlFfsDisk"));
+}
+
+#[test]
+fn supported_extra_cylinders_preserve_boot_only_media_evidence() {
+    for cylinders in 81..=83 {
+        for sectors in [11, 22] {
+            let mut bytes = vec![0_u8; cylinders * 2 * sectors * 512];
+            bytes[..4].copy_from_slice(b"DOS\0");
+            p32(&mut bytes, 8, 880);
+            bytes[12..14].copy_from_slice(&[0x60, 0xfe]);
+            let sum = bytes[..1024].chunks_exact(4).fold(0_u32, |sum, word| {
+                let (sum, carry) =
+                    sum.overflowing_add(u32::from_be_bytes(word.try_into().unwrap()));
+                sum.wrapping_add(u32::from(carry))
+            });
+            p32(&mut bytes, 4, !sum);
+            let (_dir, path) = file(&bytes);
+            let inspection =
+                inspect_amiga_floppy(&path).expect("supported geometry with valid boot checksum");
+            assert!(inspection.filesystem().is_none());
+            let observation = structural_amiga_floppy_observation(&inspection);
+            assert_eq!(observation.claim_strength, ClaimStrength::Weak);
+            assert_eq!(observation.release_candidate, None);
+            assert_eq!(observation.hash_or_value, None);
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn boot_checksum_failure_and_incomplete_cylinders_are_not_plausible_media() {
+    let mut bytes = vec![0_u8; 81 * 2 * 11 * 512];
+    bytes[..4].copy_from_slice(b"DOS\0");
+    p32(&mut bytes, 8, 880);
+    bytes[12..14].copy_from_slice(&[0x60, 0xfe]);
+    let (_dir, path) = file(&bytes);
+    assert!(matches!(
+        inspect_amiga_floppy(&path),
+        Err(AmigaFloppyError::Filesystem(
+            FilesystemError::InvalidFilesystem(_)
+        ))
+    ));
+    for size in [901_120 + 512, 81 * 2 * 11 * 512 - 1, 84 * 2 * 11 * 512] {
+        let mut bytes = vec![0_u8; size];
+        bytes[..4].copy_from_slice(b"DOS\x01");
+        p32(&mut bytes, 8, 880);
+        let (_dir, path) = file(&bytes);
+        assert!(
+            inspect_amiga_floppy(&path).is_err(),
+            "unsupported/incomplete geometry {size}"
+        );
+    }
+}
+
+#[test]
+fn rdb_filesystems_keep_metadata_validation_separate_from_container_geometry() {
+    let mut bytes = image(&[(2, 3, NONE, 0x444f5301)]);
+    let offset = 2 * 2 * 10 * 512;
+    let tiny = flat_adf(1, b"RdbVolume");
+    bytes[offset..offset + 1024].copy_from_slice(&tiny[..1024]);
+    p32(&mut bytes, offset + 8, 20);
+    bytes[offset + 20 * 512..offset + 21 * 512].copy_from_slice(&tiny[64 * 512..65 * 512]);
+    let (_dir, path) = file(&bytes);
+    assert!(inspect_amiga_floppy(&path).unwrap().filesystem().is_some());
+    p32(&mut bytes, offset + 20 * 512, 0xdead_beef);
+    let (_dir, path) = file(&bytes);
+    assert!(matches!(
+        inspect_amiga_floppy(&path),
+        Err(AmigaFloppyError::Filesystem(
+            FilesystemError::InvalidFilesystem(_)
+        ))
+    ));
+    bytes[offset..offset + 4].copy_from_slice(b"PFS\x03");
+    let (_dir, path) = file(&bytes);
+    assert!(matches!(
+        inspect_amiga_floppy(&path),
+        Err(AmigaFloppyError::Filesystem(
+            FilesystemError::UnsupportedFilesystem(FileSystem::Pfs)
+        ))
+    ));
+    p32(&mut bytes, 512 + 140, 0);
+    let (_dir, path) = file(&bytes);
+    assert!(matches!(
+        inspect_amiga_floppy(&path),
+        Err(AmigaFloppyError::Container(DiskError::BadGeometry))
+    ));
+}
+
+#[test]
+fn metadata_validation_does_not_claim_a_complete_disk() {
+    let tiny = flat_adf(1, b"MetadataOnly");
+    let mut dd = vec![0_u8; 901_120];
+    dd[..1024].copy_from_slice(&tiny[..1024]);
+    p32(&mut dd, 8, 880);
+    dd[880 * 512..881 * 512].copy_from_slice(&tiny[64 * 512..65 * 512]);
+    for bytes in [&dd[..], &dd[..600_064]] {
+        let (_dir, path) = file(bytes);
+        let inspection = inspect_amiga_floppy(&path).unwrap();
+        assert!(inspection.filesystem().is_some());
+        assert!(
+            inspection
+                .description()
+                .starts_with("AmigaDOS boot/root metadata validated")
+        );
+        assert!(
+            inspection
+                .description()
+                .contains("dump integrity and bootability are not established")
+        );
+        assert_eq!(
+            structural_amiga_floppy_observation(&inspection).release_candidate,
+            None
+        );
+    }
+}
+
+#[test]
+fn floppy_fifo_without_a_writer_does_not_block_or_supply_evidence() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pipe.adf");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is a valid NUL-terminated path in our private fixture directory.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || send.send(inspect_amiga_floppy(&path)).unwrap());
+    assert!(matches!(
+        receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        Err(AmigaFloppyError::Container(DiskError::NotRegularFile))
+    ));
+}
+
+#[test]
+fn filesystem_host_open_failure_remains_an_io_error() {
+    let (_dir, path) = file(&flat_adf(1, b"HostIO"));
+    let mut disk = inspect_amiga_image(&path).unwrap();
+    disk.path = path.with_extension("missing");
+    assert!(matches!(
+        inspect_amiga_filesystem(&disk, &disk.rdb.partitions[0]),
+        Err(FilesystemError::Io(_))
+    ));
 }
