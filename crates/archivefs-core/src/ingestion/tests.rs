@@ -2,7 +2,8 @@ use super::container::{ContainerKind, FolderRole};
 use super::content_registry::ContentKind;
 use super::content_registry::recognized_extensions;
 use super::discovery::{
-    SkipReason, ValidationState, discover_source, discover_source_with_fingerprints,
+    SkipReason, SourceDiscoveryReport, ValidationState, discover_source,
+    discover_source_with_fingerprints,
 };
 use crate::{
     ARCHIVE_PARSER_VERSION, Archive, ArchiveKind, IngestionFingerprint, SCAN_CACHE_VERSION,
@@ -977,9 +978,97 @@ fn malformed_root_block_adf_fails_closed_with_no_structural_evidence() {
     assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
     assert!(matches!(
         item.skip_reason,
-        Some(SkipReason::RecognizedContentNoIdentityMatch)
+        Some(SkipReason::InvalidContent(_))
     ));
     assert!(report.structural_evidence.is_empty());
+}
+
+fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A DOS-signature image whose length is not a standard floppy size. Root
+/// pointer is the usual 880 so only the length is wrong.
+fn dos_signature_image(len: usize) -> Vec<u8> {
+    let mut img = vec![0_u8; len];
+    img[..4].copy_from_slice(b"DOS\x01");
+    put32(&mut img, 8, 880);
+    img
+}
+
+fn assert_refused_as_invalid_amiga_content(report: &SourceDiscoveryReport) {
+    assert_eq!(report.items.len(), 1);
+    let item = &report.items[0];
+    assert_eq!(item.validation_state, ValidationState::Skipped);
+    assert!(
+        matches!(item.skip_reason, Some(SkipReason::InvalidContent(_))),
+        "must be InvalidContent, got {:?}",
+        item.skip_reason
+    );
+    assert_ne!(item.platform_hint.as_deref(), Some("Amiga"));
+    assert_eq!(item.identity_candidate, None);
+    assert!(report.structural_evidence.is_empty());
+}
+
+#[test]
+fn truncated_adf_with_dos_signature_is_invalid_not_recognized() {
+    let dir = source_dir("adf-truncated-dos");
+    // Half a standard DD floppy: the root block (block 880) is missing.
+    std::fs::write(dir.path().join("Cut.adf"), dos_signature_image(450_560)).unwrap();
+    assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+}
+
+#[test]
+fn incorrectly_sized_adf_with_dos_signature_is_invalid_not_recognized() {
+    for (name, len) in [
+        ("Short", 819_200_usize),
+        ("OneOver", 901_121),
+        ("Odd", 1_000_000),
+    ] {
+        let dir = source_dir("adf-wrong-length-dos");
+        std::fs::write(
+            dir.path().join(format!("{name}.adf")),
+            dos_signature_image(len),
+        )
+        .unwrap();
+        assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+    }
+}
+
+#[test]
+fn incorrectly_sized_adz_output_with_dos_signature_is_invalid_not_recognized() {
+    let dir = source_dir("adz-wrong-length-dos");
+    std::fs::write(
+        dir.path().join("Wrong.adz"),
+        gzip_bytes(&dos_signature_image(819_200)),
+    )
+    .unwrap();
+    assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
+}
+
+#[test]
+fn plausible_ndos_media_is_not_identified_as_valid_amigados() {
+    for (label, ext) in [("adf", "adf"), ("adz", "adz")] {
+        let dir = source_dir(&format!("ndos-{label}"));
+        let mut img = vec![0_u8; 901_120];
+        img[..4].copy_from_slice(b"NDOS");
+        put32(&mut img, 8, 880);
+        let bytes = if ext == "adz" { gzip_bytes(&img) } else { img };
+        std::fs::write(dir.path().join(format!("Game.{ext}")), bytes).unwrap();
+        let report = discover_source(dir.path()).unwrap();
+        assert_refused_as_invalid_amiga_content(&report);
+    }
+}
+
+#[test]
+fn truncated_valid_adf_loses_its_validation() {
+    // A genuinely valid image, then cut below its root block.
+    let dir = source_dir("adf-valid-then-cut");
+    let img = minimal_flat_adf(1, b"Cut");
+    std::fs::write(dir.path().join("Cut.adf"), &img[..32 * 512]).unwrap();
+    assert_refused_as_invalid_amiga_content(&discover_source(dir.path()).unwrap());
 }
 
 /// A random blob of the same size as a real floppy image, named `.adf`:

@@ -1635,11 +1635,17 @@ fn amiga_floppy_refusal(path: &Path, error: &amiga_disk::AmigaFloppyError) -> Ga
             "This .adf parsed as a container but held no traversable AmigaDOS filesystem."
                 .to_string(),
         ),
+        // `inspect_amiga_floppy` only reaches the weaker plausible-media state
+        // for an unpartitioned standard DD/HD-size image. Every other image
+        // whose OFS/FFS structures failed to validate - truncated, over- or
+        // under-sized, root block missing - is not Amiga floppy evidence, so a
+        // DOS boot signature alone must not make it recognised content.
         AmigaFloppyError::Filesystem(inner) => (
-            SkipReason::RecognizedContentNoIdentityMatch,
+            SkipReason::InvalidContent(format!("{inner:?}")),
             format!(
-                "This .adf has recognized Amiga boot evidence but its OFS/FFS structures \
-                 did not validate: {inner}."
+                "This .adf carries an Amiga boot signature but is not a standard-size \
+                 Amiga floppy image and its OFS/FFS structures did not validate \
+                 (truncated, wrongly sized or damaged): {inner}."
             ),
         ),
     };
