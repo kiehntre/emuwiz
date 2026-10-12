@@ -132,8 +132,27 @@ pub(super) struct DatKnowledge {
 
 impl DatKnowledge {
     pub(super) fn from_summary(summary: &LibraryDatIdentitySummary) -> Self {
+        let mut catalogue_provenance = String::new();
+        for name in summary
+            .source
+            .catalogue_names
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            catalogue_provenance.push_str(&format!("DAT catalogue: {name}\n"));
+        }
+        if let Some(author) = summary
+            .source
+            .author
+            .as_deref()
+            .map(str::trim)
+            .filter(|author| !author.is_empty())
+        {
+            catalogue_provenance.push_str(&format!("Catalogue author: {author}\n"));
+        }
         let technical = format!(
-            "Source: {} ({})\nDAT file: {}\nCatalogue revision: {}\nMatched with: {} {}\nHashes held: {}\nAudit state: {:?}\nFreshness: {:?}",
+            "Source: {} ({})\n{catalogue_provenance}DAT file: {}\nCatalogue revision: {}\nMatched with: {} {}\nHashes held: {}\nAudit state: {:?}\nFreshness: {:?}",
             summary.source.source_name,
             summary.source.source_id,
             summary.source.dat_path,

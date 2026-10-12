@@ -286,14 +286,11 @@ fn the_most_decisive_source_wins_among_several() {
     assert!(matches!(best.state, State::VerifiedSingleMatch { .. }));
 }
 
-#[test]
-fn a_summary_from_the_core_model_carries_trust_and_technical_detail() {
+fn summary(state: State) -> LibraryDatIdentitySummary {
     use archivefs_core::dat::library_identity_summary::*;
     use archivefs_core::dat::model::DatEcosystem;
-    let summary = LibraryDatIdentitySummary {
-        verification_state: State::VerifiedSingleMatch {
-            algorithm: "SHA-1".into(),
-        },
+    LibraryDatIdentitySummary {
+        verification_state: state,
         source: DatSourceProvenance {
             source_id: "s".into(),
             source_name: "No-Intro Atari 2600".into(),
@@ -321,9 +318,365 @@ fn a_summary_from_the_core_model_carries_trust_and_technical_detail() {
         set_dependency: DatSetDependencySummary::Pending {
             reason: "test".into(),
         },
-    };
+    }
+}
+
+#[test]
+fn a_summary_from_the_core_model_carries_trust_and_technical_detail() {
+    let summary = summary(State::VerifiedSingleMatch {
+        algorithm: "SHA-1".into(),
+    });
     let knowledge = DatKnowledge::from_summary(&summary);
     assert!(knowledge.trusted_source && !knowledge.stale);
     assert!(knowledge.technical.contains("abc") && knowledge.technical.contains("/dats/a.dat"));
     assert!(review_for(&game(1, "x.zip", "Atari2600"), &ctx(), Some(&knowledge)).is_verified());
+}
+
+// The native identity-review page displays this presentation in one wrapped
+// label inside its existing Technical details disclosure. Exercise that same
+// text/layout without starting the app, a worker, or a database read.
+fn technical_frame(
+    context: &eframe::egui::Context,
+    knowledge: &DatKnowledge,
+    size: eframe::egui::Vec2,
+    events: Vec<eframe::egui::Event>,
+) -> eframe::egui::FullOutput {
+    use eframe::egui;
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        },
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.collapsing("Technical details", |ui| {
+                    ui.label(&knowledge.technical);
+                });
+            });
+        },
+    )
+}
+
+fn rendered_text(output: &eframe::egui::FullOutput) -> String {
+    use eframe::egui::Shape;
+    fn walk(shape: &Shape, text: &mut String) {
+        match shape {
+            Shape::Text(value) => {
+                text.push_str(value.galley.text());
+                text.push('\n');
+            }
+            Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut text = String::new();
+    for clipped in &output.shapes {
+        walk(&clipped.shape, &mut text);
+    }
+    text
+}
+
+fn expand_technical_details(
+    context: &eframe::egui::Context,
+    knowledge: &DatKnowledge,
+    size: eframe::egui::Vec2,
+) -> eframe::egui::FullOutput {
+    use eframe::egui;
+    let closed = technical_frame(context, knowledge, size, vec![]);
+    let header = closed
+        .shapes
+        .iter()
+        .find_map(|clipped| {
+            if let egui::Shape::Text(text) = &clipped.shape
+                && text.galley.text() == "Technical details"
+            {
+                Some(text.pos + text.galley.size() * 0.5)
+            } else {
+                None
+            }
+        })
+        .expect("existing Technical details disclosure is rendered");
+    for pressed in [true, false] {
+        let _ = technical_frame(
+            context,
+            knowledge,
+            size,
+            vec![
+                egui::Event::PointerMoved(header),
+                egui::Event::PointerButton {
+                    pos: header,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+    }
+    technical_frame(context, knowledge, size, vec![])
+}
+
+#[test]
+fn catalogue_metadata_renders_in_the_existing_native_technical_details_disclosure() {
+    use eframe::egui;
+    let mut summary = summary(State::VerifiedSingleMatch {
+        algorithm: "SHA-1".into(),
+    });
+    summary.source.catalogue_names = vec!["Atari - 2600".into()];
+    summary.source.author = Some("DAT Team".into());
+    let knowledge = DatKnowledge::from_summary(&summary);
+    let context = egui::Context::default();
+    context.style_mut(|style| style.animation_time = 0.0);
+    let size = egui::vec2(800.0, 1600.0);
+    let closed = rendered_text(&technical_frame(&context, &knowledge, size, vec![]));
+    assert!(!closed.contains("Atari - 2600") && !closed.contains("DAT Team"));
+    let open = rendered_text(&expand_technical_details(&context, &knowledge, size));
+    assert!(
+        open.contains("Matched with: SHA-1 abc"),
+        "disclosure did not open: {open}"
+    );
+    for expected in [
+        "DAT catalogue: Atari - 2600",
+        "Catalogue author: DAT Team",
+        "Source: No-Intro Atari 2600",
+        "Matched with: SHA-1 abc",
+    ] {
+        assert!(open.contains(expected), "missing {expected:?}: {open}");
+    }
+    assert_eq!(knowledge.title.as_deref(), Some("Amidar (USA)"));
+}
+
+#[test]
+fn catalogue_metadata_reaches_native_review_from_a_saved_synthetic_audit() {
+    use crate::gui_v2::{dat_exact_tests, identity_review_page::knowledge_at};
+    let fixture = dat_exact_tests::fixture(&["Synthetic Game (USA)".into()]);
+    dat_exact_tests::audit_and_save(&fixture);
+    let before = std::fs::read(&fixture.db).unwrap();
+    let knowledge = knowledge_at(&fixture.db, 1).unwrap().unwrap();
+    assert!(
+        knowledge
+            .technical
+            .contains("DAT catalogue: Nintendo - Game Boy Color\n")
+    );
+    assert!(knowledge.technical.contains("Catalogue author: No-Intro\n"));
+    assert_eq!(knowledge.title.as_deref(), Some("Synthetic Game (USA)"));
+    assert!(matches!(knowledge.state, State::VerifiedSingleMatch { .. }));
+    assert_eq!(
+        std::fs::read(&fixture.db).unwrap(),
+        before,
+        "native review remains read-only"
+    );
+}
+
+#[test]
+fn catalogue_metadata_omits_missing_or_blank_values_and_never_infers_an_author() {
+    let mut summary = summary(State::Probable);
+    for author in [None, Some(String::new()), Some(" \t\n ".into())] {
+        summary.source.catalogue_names = vec![String::new(), " \t ".into()];
+        summary.source.author = author;
+        let knowledge = DatKnowledge::from_summary(&summary);
+        assert!(!knowledge.technical.contains("DAT catalogue:"));
+        assert!(!knowledge.technical.contains("Catalogue author:"));
+    }
+    summary.source.catalogue_names = vec![" Atari - 2600 ".into()];
+    let knowledge = DatKnowledge::from_summary(&summary);
+    assert!(
+        knowledge
+            .technical
+            .contains("DAT catalogue: Atari - 2600\n")
+    );
+    assert!(!knowledge.technical.contains("Catalogue author:"));
+    summary.source.catalogue_names.clear();
+    summary.source.author = Some(" DAT Team ".into());
+    let knowledge = DatKnowledge::from_summary(&summary);
+    assert!(knowledge.technical.contains("Catalogue author: DAT Team\n"));
+    assert!(!knowledge.technical.contains("DAT catalogue:"));
+}
+
+#[test]
+fn catalogue_metadata_lists_all_names_without_resolving_an_ambiguous_game() {
+    let mut summary = summary(State::AmbiguousMultipleCandidates {
+        algorithm: "SHA-1".into(),
+        candidate_count: 2,
+    });
+    summary.canonical.canonical_dat_name = None;
+    summary.ambiguous_candidates = vec!["Amidar (USA)".into(), "Amidar (Europe)".into()];
+    summary.source.catalogue_names =
+        vec!["Atari - 2600 (USA)".into(), "Atari - 2600 (Europe)".into()];
+    summary.source.author = Some("DAT Team".into());
+    let knowledge = DatKnowledge::from_summary(&summary);
+    for name in &summary.source.catalogue_names {
+        assert!(
+            knowledge
+                .technical
+                .contains(&format!("DAT catalogue: {name}\n"))
+        );
+    }
+    let review = review_for(&game(1, "x.zip", "Atari2600"), &ctx(), Some(&knowledge));
+    assert!(!review.is_verified());
+    assert_eq!(
+        review.state,
+        ReviewState::Ambiguous {
+            candidates: summary.ambiguous_candidates
+        }
+    );
+    assert_eq!(knowledge.title, None);
+}
+
+#[test]
+fn catalogue_metadata_preserves_verification_freshness_confidence_and_other_facts() {
+    use archivefs_core::dat::model::DatEcosystem;
+    for state in [
+        State::VerifiedSingleMatch {
+            algorithm: "SHA-1".into(),
+        },
+        State::Probable,
+        State::AmbiguousMultipleCandidates {
+            algorithm: "SHA-1".into(),
+            candidate_count: 2,
+        },
+        State::Conflicting {
+            detail: "Sources disagree".into(),
+        },
+        State::FilenameOnlyNotVerified,
+        State::NoUsableEvidence,
+        State::NoMatch,
+    ] {
+        for freshness in [
+            DatProvenanceFreshness::Current,
+            DatProvenanceFreshness::Stale,
+            DatProvenanceFreshness::Unknown,
+        ] {
+            for ecosystem in [Some(DatEcosystem::NoIntro), None] {
+                let mut summary = summary(state.clone());
+                summary.provenance_freshness = freshness;
+                summary.source.ecosystem = ecosystem;
+                let before = DatKnowledge::from_summary(&summary);
+                let review_before =
+                    review_for(&game(1, "x.zip", "Atari2600"), &ctx(), Some(&before));
+                summary.source.catalogue_names = vec!["Catalogue A".into(), "Catalogue B".into()];
+                summary.source.author = Some("DAT Team".into());
+                let mut after = DatKnowledge::from_summary(&summary);
+                assert_eq!(
+                    review_before,
+                    review_for(&game(1, "x.zip", "Atari2600"), &ctx(), Some(&after))
+                );
+                for line in before.technical.lines() {
+                    assert!(
+                        after.technical.lines().any(|new_line| new_line == line),
+                        "lost existing detail {line:?}"
+                    );
+                }
+                after.technical = before.technical.clone();
+                assert_eq!(
+                    before, after,
+                    "metadata must only change technical presentation"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn catalogue_metadata_remains_with_its_source_and_does_not_change_source_selection() {
+    let mut first = summary(State::Probable);
+    first.source.source_id = "a".into();
+    first.source.source_name = "Source A".into();
+    first.source.catalogue_names = vec!["Catalogue A".into()];
+    first.source.author = Some("Author A".into());
+    let mut second = summary(State::VerifiedSingleMatch {
+        algorithm: "SHA-1".into(),
+    });
+    second.source.source_id = "b".into();
+    second.source.source_name = "Source B".into();
+    second.source.catalogue_names = vec!["Catalogue B1".into(), "Catalogue B2".into()];
+    second.source.author = None;
+    for second_freshness in [
+        DatProvenanceFreshness::Current,
+        DatProvenanceFreshness::Stale,
+    ] {
+        second.provenance_freshness = second_freshness;
+        let best = DatKnowledge::best(vec![
+            DatKnowledge::from_summary(&first),
+            DatKnowledge::from_summary(&second),
+        ])
+        .unwrap();
+        if second_freshness == DatProvenanceFreshness::Current {
+            assert_eq!(best.source_name, "Source B");
+            assert!(
+                best.technical.contains("Catalogue B1") && best.technical.contains("Catalogue B2")
+            );
+            assert!(
+                !best.technical.contains("Catalogue A") && !best.technical.contains("Author A")
+            );
+            assert!(!best.technical.contains("Catalogue author:"));
+        } else {
+            assert_eq!(best.source_name, "Source A");
+            assert!(best.technical.contains("Catalogue A") && best.technical.contains("Author A"));
+            assert!(
+                !best.technical.contains("Catalogue B1")
+                    && !best.technical.contains("Catalogue B2")
+            );
+            assert_eq!(best.state, State::Probable);
+        }
+    }
+}
+
+#[test]
+fn catalogue_metadata_wraps_long_unicode_values_at_narrow_width_and_large_scale() {
+    use eframe::egui;
+    let mut summary = summary(State::Probable);
+    summary.source.catalogue_names = vec![
+        "Atari - 2600 (Europe, accented édition française)".into(),
+        "任天堂 カタログ 第二版".into(),
+    ];
+    summary.source.author = Some("Équipe de préservation des jeux et manuels".into());
+    let knowledge = DatKnowledge::from_summary(&summary);
+    for zoom in [1.0, 1.6] {
+        let context = egui::Context::default();
+        crate::gui_v2::readable_style(&context);
+        context.set_zoom_factor(zoom);
+        context.style_mut(|style| style.animation_time = 0.0);
+        let output = expand_technical_details(&context, &knowledge, egui::vec2(420.0, 2200.0));
+        let text = rendered_text(&output);
+        for value in summary
+            .source
+            .catalogue_names
+            .iter()
+            .chain(summary.source.author.iter())
+        {
+            assert!(
+                text.contains(value),
+                "missing {value:?} at zoom {zoom}: {text}"
+            );
+        }
+        let metadata = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape
+                    && text.galley.text().contains("édition")
+                {
+                    Some((clipped, text))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(!metadata.is_empty(), "metadata must actually render");
+        for (clipped, text) in metadata {
+            assert!(text.pos.x >= clipped.clip_rect.min.x - 1.0);
+            assert!(
+                text.pos.x + text.galley.size().x <= clipped.clip_rect.max.x + 1.0,
+                "metadata clipped at zoom {zoom}"
+            );
+        }
+        assert!(
+            !review_for(&game(1, "x.zip", "Atari2600"), &ctx(), Some(&knowledge)).is_verified()
+        );
+    }
 }
