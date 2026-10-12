@@ -468,6 +468,56 @@ pub fn copy_zip_member_to(
     request: &ZipMemberRequest,
     destination: &Path,
 ) -> Result<ZipMemberCopy, ZipMemberError> {
+    copy_zip_member_with(path, trusted, limits, cancel, request, || {
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| ZipMemberError::Open(e.to_string()))?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .map_err(|e| ZipMemberError::Open(e.to_string()))
+    })
+}
+
+/// Copy a checksum-selected member into a caller-owned empty regular handle.
+/// The caller supplies ownership (MAME uses anonymous scratch); this function
+/// never creates, reopens, removes or renames an output pathname. The same
+/// archive limits, exact-name selection and before/after hashes apply.
+pub(crate) fn copy_zip_member_into(
+    path: &Path,
+    trusted: &TrustedRoots,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+    request: &ZipMemberRequest,
+    output: &mut File,
+) -> Result<ZipMemberCopy, ZipMemberError> {
+    let m = output
+        .metadata()
+        .map_err(|e| ZipMemberError::Open(e.to_string()))?;
+    if !m.is_file() || m.len() != 0 {
+        return Err(ZipMemberError::Open(
+            "owned member output must be an empty regular file".into(),
+        ));
+    }
+    output
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| ZipMemberError::Open(e.to_string()))?;
+    copy_zip_member_with(path, trusted, limits, cancel, request, || {
+        output
+            .try_clone()
+            .map_err(|e| ZipMemberError::Open(e.to_string()))
+    })
+}
+
+fn copy_zip_member_with(
+    path: &Path,
+    trusted: &TrustedRoots,
+    limits: &ArchiveLimits,
+    cancel: &AtomicBool,
+    request: &ZipMemberRequest,
+    create_output: impl FnOnce() -> Result<File, ZipMemberError>,
+) -> Result<ZipMemberCopy, ZipMemberError> {
     if request.sha1.is_none() && request.crc32.is_none() {
         return Err(ZipMemberError::BadChecksum);
     }
@@ -582,14 +632,7 @@ pub fn copy_zip_member_to(
         return Err(ZipMemberError::Ambiguous);
     }
     let (entry, member_name, sha1, crc32) = matches.pop().unwrap();
-    if let Some(parent) = destination.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| ZipMemberError::Open(error.to_string()))?;
-    }
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|error| ZipMemberError::Open(error.to_string()))?;
+    let mut output = create_output()?;
     let (staged_sha1, staged_crc32) =
         decode_entry_to(&mut source.file, &entry, limits, cancel, &mut output)?;
     if staged_sha1 != sha1 || staged_crc32 != crc32 {
@@ -1856,6 +1899,96 @@ mod tests {
             before_metadata.modified().unwrap()
         );
         assert!(!dir.path().join("actual.bin").exists());
+    }
+
+    #[test]
+    fn targeted_member_copy_into_an_owned_handle_preserves_checks_and_foreign_names() {
+        use sha1::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.zip");
+        write_zip(
+            &path,
+            &[("member.bin", b"payload", CompressionMethod::Stored)],
+        );
+        let before = bytes(&path);
+        let request = ZipMemberRequest {
+            require_exact_name: true,
+            member_name: Some("member.bin".into()),
+            size_bytes: Some(7),
+            sha1: Some(
+                sha1::Sha1::digest(b"payload")
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            ),
+            crc32: None,
+        };
+        let foreign = dir.path().join("0.member");
+        std::fs::write(&foreign, b"foreign").unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        let result = copy_zip_member_into(
+            &path,
+            &trusted(dir.path()),
+            &ArchiveLimits::default(),
+            &AtomicBool::new(false),
+            &request,
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(result.sha1, request.sha1.unwrap());
+        output.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut body = Vec::new();
+        output.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"payload");
+        assert_eq!(bytes(&foreign), b"foreign");
+        assert_eq!(bytes(&path), before);
+    }
+
+    #[test]
+    fn targeted_member_copy_into_a_handle_refuses_bad_checksums_and_nonempty_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.zip");
+        write_zip(
+            &path,
+            &[("member.bin", b"payload", CompressionMethod::Stored)],
+        );
+        let request = ZipMemberRequest {
+            require_exact_name: true,
+            member_name: Some("member.bin".into()),
+            size_bytes: Some(7),
+            sha1: Some("0".repeat(40)),
+            crc32: None,
+        };
+        let mut output = tempfile::tempfile().unwrap();
+        assert_eq!(
+            copy_zip_member_into(
+                &path,
+                &trusted(dir.path()),
+                &ArchiveLimits::default(),
+                &AtomicBool::new(false),
+                &request,
+                &mut output
+            )
+            .unwrap_err(),
+            ZipMemberError::BadChecksum
+        );
+        assert_eq!(output.metadata().unwrap().len(), 0);
+        output.write_all(b"foreign contents").unwrap();
+        assert!(matches!(
+            copy_zip_member_into(
+                &path,
+                &trusted(dir.path()),
+                &ArchiveLimits::default(),
+                &AtomicBool::new(false),
+                &request,
+                &mut output
+            ),
+            Err(ZipMemberError::Open(_))
+        ));
+        output.seek(std::io::SeekFrom::Start(0)).unwrap();
+        let mut body = Vec::new();
+        output.read_to_end(&mut body).unwrap();
+        assert_eq!(body, b"foreign contents");
     }
 
     #[test]

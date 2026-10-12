@@ -141,6 +141,35 @@ impl Lab {
         assert!(!staged.exists(), "a half-built staging ZIP was left behind");
         assert!(!self.stage_root().join("source-members").exists());
         assert!(!self.journal().exists());
+        // The approved retention design keeps a failed exclusive attempt and
+        // its diagnostic. Every such artifact must remain unpublished and
+        // bind its own inode; a bare, unexplained partial stage is a failure.
+        if let Ok(entries) = std::fs::read_dir(self.stage_root()) {
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if !path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".zip.staged")
+                {
+                    continue;
+                }
+                let note = path.with_file_name(format!(
+                    "{}.note-0.json",
+                    path.file_name().unwrap().to_str().unwrap()
+                ));
+                let v: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&note).unwrap()).unwrap();
+                assert_eq!(v["staged_path"].as_str(), path.to_str());
+                assert_eq!(v["detail"]["state"], "refused");
+                assert!(!v["detail"]["reason"].as_str().unwrap().is_empty());
+                assert_eq!(
+                    v["created_ino"].as_u64().unwrap(),
+                    std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap())
+                );
+            }
+        }
     }
 }
 
@@ -154,6 +183,517 @@ fn read_back(zip_path: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         out.insert(entry.name().to_string(), bytes);
     }
     out
+}
+
+fn repair_plan(lab: &Lab) -> MameMergedReconstructionPlan {
+    let donor = lab.zip("donor.zip", &[("a.bin", b"repair fixture")]);
+    lab.plan(&[Member {
+        target: "a.bin",
+        bytes: b"repair fixture",
+        from: From::Zip(&donor, "a.bin"),
+    }])
+}
+
+#[test]
+fn staging_repair_foreign_scratch_is_preserved() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let scratch = lab.stage_root().join("source-members");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let foreign = scratch.join("0.member");
+    std::fs::write(&foreign, b"foreign scratch").unwrap();
+    let _ = lab.stage(&plan);
+    assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign scratch");
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_repair_symlinked_scratch_is_preserved() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let outside = lab.root().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(lab.stage_root()).unwrap();
+    std::fs::write(outside.join("0.member"), b"foreign scratch").unwrap();
+    std::os::unix::fs::symlink(&outside, lab.stage_root().join("source-members")).unwrap();
+    let _ = lab.stage(&plan);
+    assert_eq!(
+        std::fs::read(outside.join("0.member")).unwrap(),
+        b"foreign scratch"
+    );
+    assert!(
+        std::fs::symlink_metadata(lab.stage_root().join("source-members"))
+            .unwrap()
+            .is_symlink()
+    );
+}
+
+#[test]
+fn staging_repair_malformed_journal_refuses_before_staging() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    std::fs::create_dir_all(lab.journal()).unwrap();
+    let broken = lab.journal().join("broken.json");
+    std::fs::write(&broken, b"{ malformed journal").unwrap();
+    let result = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal());
+    assert!(result.is_err(), "malformed recovery journal was bypassed");
+    assert!(!plan.destination.exists());
+    assert_eq!(std::fs::read(broken).unwrap(), b"{ malformed journal");
+}
+
+#[test]
+fn staging_repair_journal_appearing_during_staging_is_checked_before_reservation() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let journal = lab.journal();
+    let journal_hook = journal.clone();
+    let _hook = repair_hook(move |event, _| {
+        if event == "before_publish" {
+            std::fs::create_dir_all(&journal_hook).unwrap();
+            std::fs::write(journal_hook.join("broken.json"), b"{ broken").unwrap();
+        }
+        Ok(())
+    });
+    let error = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &journal).unwrap_err();
+    assert!(
+        error.contains("recovery journal") && error.contains("Recovery"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(journal.join("broken.json")).unwrap(),
+        b"{ broken"
+    );
+    assert!(!plan.destination.exists());
+}
+
+#[test]
+fn staging_repair_long_names_undo_and_republish() {
+    use crate::dat::rename_apply::{journal, model::TransactionState, rollback};
+    for parent in [
+        "x".repeat(239),
+        "é".repeat(112),
+        "x".repeat(251),
+        format!("{}x", "é".repeat(125)),
+    ] {
+        let lab = Lab::new();
+        let mut plan = repair_plan(&lab);
+        plan.parent = parent.clone();
+        plan.destination = lab.root().join("out").join(format!("{parent}.zip"));
+        let mut first =
+            apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+                .unwrap()
+                .transaction;
+        rollback::rollback_transaction_confined(
+            &mut first,
+            &lab.journal(),
+            &AtomicBool::new(false),
+            &TrustedRoots::from_paths([lab.root()]),
+        )
+        .unwrap();
+        assert_eq!(first.state, TransactionState::RolledBack);
+        let retained = first.entries[0].source_path.clone();
+        let bytes = std::fs::read(&retained).unwrap();
+        let old_journal = journal::journal_path(&lab.journal(), &first.transaction_id).unwrap();
+        let old_bytes = std::fs::read(&old_journal).unwrap();
+        let second =
+            apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+        assert_eq!(second.transaction.state, TransactionState::Applied);
+        assert_ne!(retained, second.transaction.entries[0].source_path);
+        assert_eq!(std::fs::read(retained).unwrap(), bytes);
+        assert_eq!(std::fs::read(old_journal).unwrap(), old_bytes);
+    }
+}
+
+struct RepairHook;
+impl Drop for RepairHook {
+    fn drop(&mut self) {
+        owned_attempt::HOOK.with(|h| *h.borrow_mut() = None);
+        owned_attempt::TOKENS.with(|t| t.borrow_mut().clear());
+    }
+}
+fn repair_hook(hook: impl FnMut(&str, &Path) -> Result<(), String> + 'static) -> RepairHook {
+    owned_attempt::HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    RepairHook
+}
+
+#[test]
+fn staging_repair_swapped_leaf_never_deleted_or_adopted() {
+    use std::os::unix::fs::MetadataExt;
+    for checkpoint in ["created", "before_verify", "before_publish"] {
+        for matching_zip in [false, true] {
+            let lab = Lab::new();
+            let plan = repair_plan(&lab);
+            let retained = lab.root().join("retained-owned");
+            let foreign = if matching_zip {
+                std::fs::read(&plan.sources[0].archive_path).unwrap()
+            } else {
+                b"foreign unrelated bytes".to_vec()
+            };
+            let retained_hook = retained.clone();
+            let foreign_hook = foreign.clone();
+            let swapped = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let swapped_hook = swapped.clone();
+            let _hook = repair_hook(move |event, path| {
+                if event == checkpoint {
+                    std::fs::rename(path, &retained_hook).unwrap();
+                    std::fs::write(path, &foreign_hook).unwrap();
+                    *swapped_hook.borrow_mut() =
+                        Some((path.to_owned(), std::fs::metadata(path).unwrap().ino()));
+                }
+                Ok(())
+            });
+            let error =
+                apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+                    .unwrap_err();
+            assert!(error.contains("binding changed"), "{error}");
+            let (path, inode) = swapped.borrow().clone().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), foreign);
+            assert_eq!(std::fs::metadata(path).unwrap().ino(), inode);
+            assert!(retained.exists());
+            assert!(!plan.destination.exists());
+            assert_eq!(
+                crate::dat::rename_apply::journal::list_journals(&lab.journal())
+                    .0
+                    .len(),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+fn staging_repair_swapped_parent_never_follows_or_cleans_foreign_directory() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    for checkpoint in ["created", "before_verify", "before_publish"] {
+        let lab = Lab::new();
+        let plan = repair_plan(&lab);
+        let stage = lab.stage_root();
+        let parked = lab.root().join("parked-owned-directory");
+        let outside = lab.root().join("foreign-directory");
+        std::fs::create_dir_all(&outside).unwrap();
+        let stage_hook = stage.clone();
+        let parked_hook = parked.clone();
+        let outside_hook = outside.clone();
+        let foreign = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let foreign_hook = foreign.clone();
+        let _hook = repair_hook(move |event, path| {
+            if event == checkpoint {
+                std::fs::rename(&stage_hook, &parked_hook).unwrap();
+                let target = outside_hook.join(path.file_name().unwrap());
+                std::fs::write(&target, b"foreign file").unwrap();
+                let note = outside_hook.join(format!(
+                    "{}.note-0.json",
+                    path.file_name().unwrap().to_str().unwrap()
+                ));
+                std::fs::write(&note, b"foreign diagnostic").unwrap();
+                let inode = std::fs::metadata(&target).unwrap().ino();
+                *foreign_hook.borrow_mut() = Some((target, note, inode));
+                symlink(&outside_hook, &stage_hook).unwrap();
+            }
+            Ok(())
+        });
+        let error = apply_staged_reconstruction_output(&plan, &stage, &lab.journal()).unwrap_err();
+        assert!(error.contains("directory binding changed"), "{error}");
+        let (target, note, inode) = foreign.borrow().clone().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"foreign file");
+        assert_eq!(std::fs::metadata(target).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(note).unwrap(), b"foreign diagnostic");
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 2);
+        assert!(std::fs::read_dir(parked).unwrap().next().is_some());
+        assert!(!plan.destination.exists());
+    }
+}
+
+#[test]
+fn staging_repair_diagnostic_collisions_and_swaps_preserve_foreign_entries() {
+    use std::os::unix::fs::symlink;
+    for is_link in [false, true] {
+        let lab = Lab::new();
+        let plan = repair_plan(&lab);
+        let retained_note = lab.root().join("owned-note");
+        let victim = lab.root().join("foreign-target");
+        std::fs::write(&victim, b"foreign note target").unwrap();
+        let destination = plan.destination.clone();
+        let victim_hook = victim.clone();
+        let retained_hook = retained_note.clone();
+        let note_path = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let note_hook = note_path.clone();
+        let _hook = repair_hook(move |event, path| {
+            if event == "before_publish" {
+                let note = path.with_file_name(format!(
+                    "{}.note-0.json",
+                    path.file_name().unwrap().to_str().unwrap()
+                ));
+                std::fs::rename(&note, &retained_hook).unwrap();
+                if is_link {
+                    symlink(&victim_hook, &note).unwrap();
+                } else {
+                    std::fs::write(&note, b"foreign diagnostic").unwrap();
+                }
+                *note_hook.borrow_mut() = Some(note);
+                std::fs::write(&destination, b"foreign destination").unwrap();
+            }
+            Ok(())
+        });
+        assert!(
+            apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+                .unwrap_err()
+                .contains("destination collision")
+        );
+        let note = note_path.borrow().clone().unwrap();
+        assert!(retained_note.exists());
+        if is_link {
+            assert_eq!(std::fs::read_link(&note).unwrap(), victim);
+        } else {
+            assert_eq!(std::fs::read(&note).unwrap(), b"foreign diagnostic");
+        }
+        assert_eq!(std::fs::read(&victim).unwrap(), b"foreign note target");
+        assert_eq!(
+            std::fs::read(&plan.destination).unwrap(),
+            b"foreign destination"
+        );
+    }
+}
+
+#[test]
+fn staging_repair_diagnostic_swap_while_handle_is_open_refuses_truthfully() {
+    use std::os::unix::fs::symlink;
+    for is_link in [false, true] {
+        let lab = Lab::new();
+        let plan = repair_plan(&lab);
+        let parked = lab.root().join("owned-note-parked");
+        let victim = lab.root().join("foreign-target");
+        std::fs::write(&victim, b"foreign target").unwrap();
+        let parked_hook = parked.clone();
+        let victim_hook = victim.clone();
+        let replaced = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let replaced_hook = replaced.clone();
+        let _hook = repair_hook(move |event, path| {
+            if event == "diagnostic_written"
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("note-0.json")
+            {
+                std::fs::rename(path, &parked_hook).unwrap();
+                if is_link {
+                    symlink(&victim_hook, path).unwrap();
+                } else {
+                    std::fs::write(path, b"foreign diagnostic").unwrap();
+                }
+                *replaced_hook.borrow_mut() = Some(path.to_owned());
+            }
+            Ok(())
+        });
+        let error = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+            .unwrap_err();
+        assert!(
+            error.contains("diagnostic/journal binding changed"),
+            "{error}"
+        );
+        let path = replaced.borrow().clone().unwrap();
+        if is_link {
+            assert_eq!(std::fs::read_link(path).unwrap(), victim);
+        } else {
+            assert_eq!(std::fs::read(path).unwrap(), b"foreign diagnostic");
+        }
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(parked).unwrap()).is_ok()
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"foreign target");
+        assert!(!plan.destination.exists());
+        assert!(!lab.journal().exists());
+    }
+}
+
+#[test]
+fn staging_repair_symlinked_root_and_journal_never_create_outside_artifacts() {
+    use std::os::unix::fs::symlink;
+    for journal_link in [false, true] {
+        let lab = Lab::new();
+        let plan = repair_plan(&lab);
+        let outside = lab.root().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"foreign").unwrap();
+        let link = if journal_link {
+            lab.journal()
+        } else {
+            lab.stage_root()
+        };
+        symlink(&outside, link).unwrap();
+        let error = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+            .unwrap_err();
+        assert!(
+            error.contains("unsafe staging/recovery ancestor"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 1);
+        assert!(!plan.destination.exists());
+    }
+}
+
+#[test]
+fn staging_repair_applying_without_stage_is_not_bypassed() {
+    use crate::dat::rename_apply::{
+        journal,
+        model::{EntryState, TransactionState},
+        rollback,
+    };
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let mut first = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+        .unwrap()
+        .transaction;
+    rollback::rollback_transaction_confined(
+        &mut first,
+        &lab.journal(),
+        &AtomicBool::new(false),
+        &TrustedRoots::from_paths([lab.root()]),
+    )
+    .unwrap();
+    std::fs::rename(&first.entries[0].source_path, lab.root().join("held-stage")).unwrap();
+    first.state = TransactionState::Applying;
+    first.entries[0].state = EntryState::Applying;
+    journal::write_journal(&lab.journal(), &first).unwrap();
+    let old_path = journal::journal_path(&lab.journal(), &first.transaction_id).unwrap();
+    let before = std::fs::read(&old_path).unwrap();
+    let error =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap_err();
+    assert!(
+        error.contains(&first.transaction_id) && error.contains("Recovery"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(old_path).unwrap(), before);
+    assert!(!plan.destination.exists());
+    assert_eq!(journal::list_journals(&lab.journal()).0.len(), 1);
+}
+
+#[test]
+fn staging_repair_in_flight_entry_cannot_hide_in_a_settled_journal() {
+    use crate::dat::rename_apply::{journal, model::EntryState, rollback};
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let mut first = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+        .unwrap()
+        .transaction;
+    rollback::rollback_transaction_confined(
+        &mut first,
+        &lab.journal(),
+        &AtomicBool::new(false),
+        &TrustedRoots::from_paths([lab.root()]),
+    )
+    .unwrap();
+    first.entries[0].state = EntryState::Applying;
+    journal::write_journal(&lab.journal(), &first).unwrap();
+    let before =
+        std::fs::read(journal::journal_path(&lab.journal(), &first.transaction_id).unwrap())
+            .unwrap();
+    let error =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap_err();
+    assert!(
+        error.contains("Recovery") && error.contains(&first.transaction_id),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(journal::journal_path(&lab.journal(), &first.transaction_id).unwrap())
+            .unwrap(),
+        before
+    );
+    assert!(!plan.destination.exists());
+}
+
+#[test]
+fn staging_repair_unjournalled_interruption_refuses_without_destroying_stage() {
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let hook = repair_hook(|event, _| {
+        if event == "created" {
+            Err("synthetic interruption".into())
+        } else {
+            Ok(())
+        }
+    });
+    assert!(apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).is_err());
+    drop(hook);
+    let stage = std::fs::read_dir(lab.stage_root())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let before = std::fs::read(&stage).unwrap();
+    let error =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap_err();
+    assert!(
+        error.contains("unrecorded") && error.contains("Recovery"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(stage).unwrap(), before);
+    assert!(!plan.destination.exists());
+}
+
+#[test]
+fn staging_repair_exclusive_journal_collision_keeps_earlier_journal() {
+    use crate::dat::rename_apply::{journal, rollback};
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    let mut first = apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal())
+        .unwrap()
+        .transaction;
+    rollback::rollback_transaction_confined(
+        &mut first,
+        &lab.journal(),
+        &AtomicBool::new(false),
+        &TrustedRoots::from_paths([lab.root()]),
+    )
+    .unwrap();
+    let old_path = journal::journal_path(&lab.journal(), &first.transaction_id).unwrap();
+    let bytes = std::fs::read(&old_path).unwrap();
+    let nonce = first
+        .transaction_id
+        .strip_prefix("mame-")
+        .unwrap()
+        .to_owned();
+    let _hook = repair_hook(move |event, _| {
+        if event == "before_publish" {
+            owned_attempt::TOKENS.with(|t| t.borrow_mut().push_back(nonce.clone()));
+        }
+        Ok(())
+    });
+    let second =
+        apply_staged_reconstruction_output(&plan, &lab.stage_root(), &lab.journal()).unwrap();
+    assert_ne!(first.transaction_id, second.transaction.transaction_id);
+    assert_eq!(std::fs::read(old_path).unwrap(), bytes);
+    assert_eq!(journal::list_journals(&lab.journal()).0.len(), 2);
+}
+
+#[test]
+fn staging_repair_exclusive_stage_collisions_preserve_regular_and_symlink_entries() {
+    use std::os::unix::fs::symlink;
+    let lab = Lab::new();
+    let plan = repair_plan(&lab);
+    std::fs::create_dir_all(lab.stage_root()).unwrap();
+    let regular = lab
+        .stage_root()
+        .join(format!("mame-{}.zip.staged", "a".repeat(32)));
+    let link = lab
+        .stage_root()
+        .join(format!("mame-{}.zip.staged", "b".repeat(32)));
+    let victim = lab.root().join("foreign-target");
+    std::fs::write(&regular, b"foreign regular").unwrap();
+    std::fs::write(&victim, b"foreign target").unwrap();
+    symlink(&victim, &link).unwrap();
+    let _reset = RepairHook;
+    owned_attempt::TOKENS.with(|t| t.borrow_mut().extend(["a".repeat(32), "b".repeat(32)]));
+    let staged = lab.stage(&plan).unwrap();
+    assert_ne!(staged, regular);
+    assert_ne!(staged, link);
+    assert_eq!(std::fs::read(regular).unwrap(), b"foreign regular");
+    assert_eq!(std::fs::read_link(link).unwrap(), victim);
+    assert_eq!(std::fs::read(victim).unwrap(), b"foreign target");
+    verify_staged_output(&plan, &staged).unwrap();
 }
 
 fn patch(path: &Path, change: impl FnOnce(&mut Vec<u8>)) {

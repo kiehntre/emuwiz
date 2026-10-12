@@ -161,8 +161,16 @@ impl ReviewedReconstructionPublication {
         ) {
             return Ok(None);
         }
-        let staged = stage_reconstruction_output(&self.plan, staging_root)?;
-        self.revalidate()?;
+        let mut guard = owned_attempt::PublicationGuard::new(staging_root, journal_dir)?;
+        guard.check_leftovers(&self.plan.parent)?;
+        let staged = stage_owned_output_with(
+            &self.plan,
+            staging_root,
+            &free_space_bytes,
+            Some(std::sync::Arc::clone(&guard.staging)),
+        )?;
+        self.revalidate()
+            .map_err(|e| staged.failure(&self.plan.parent, e))?;
         let operation = match &self.action {
             ReconstructionPublicationAction::ReplaceExisting { original } => {
                 super::rename_apply::model::TransactionOperation::ReplaceExisting {
@@ -177,7 +185,16 @@ impl ReviewedReconstructionPublication {
             }
             _ => Default::default(),
         };
-        publish_staged(&self.plan, &staged, staging_root, journal_dir, operation).map(Some)
+        publish_staged(
+            &self.plan,
+            &staged,
+            staging_root,
+            journal_dir,
+            operation,
+            &mut guard,
+        )
+        .map_err(|e| staged.failure(&self.plan.parent, e))
+        .map(Some)
     }
 }
 
@@ -820,6 +837,15 @@ pub fn stage_reconstruction_output_with(
     staging_root: &Path,
     free_space: &dyn Fn(&Path) -> Option<u64>,
 ) -> Result<PathBuf, String> {
+    stage_owned_output_with(plan, staging_root, free_space, None).map(|staged| staged.path)
+}
+
+fn stage_owned_output_with(
+    plan: &MameMergedReconstructionPlan,
+    staging_root: &Path,
+    free_space: &dyn Fn(&Path) -> Option<u64>,
+    root: Option<std::sync::Arc<owned_attempt::Directory>>,
+) -> Result<owned_attempt::StagedOutput, String> {
     if !plan.ready_to_apply {
         return Err("reconstruction plan is blocked; no staged output was created".into());
     }
@@ -894,45 +920,46 @@ pub fn stage_reconstruction_output_with(
         ));
     }
 
-    std::fs::create_dir_all(staging_root).map_err(|e| e.to_string())?;
-    let staged = staging_root.join(format!("{}.zip.staged", plan.parent));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged)
-        .map_err(|e| e.to_string())?;
-    let temp_root = staging_root.join("source-members");
-    let mut temporaries = Vec::new();
-    let result = stage_members(plan, file, &temp_root, &mut temporaries);
-    // The staging ZIP is ours (create_new succeeded) and disposable on failure:
-    // nothing was published, and no half-built set is left behind.
-    if result.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    for temporary in temporaries {
-        let _ = std::fs::remove_file(temporary);
-    }
-    let _ = std::fs::remove_dir(&temp_root);
-    result?;
-    verify_staged_output(plan, &staged).inspect_err(|_| {
-        let _ = std::fs::remove_file(&staged);
-    })?;
+    let root = match root {
+        Some(root) => root,
+        None => owned_attempt::staging_root(staging_root)?,
+    };
+    let staged = owned_attempt::StagedOutput::create(root)?;
+    let result = (|| {
+        stage_members(
+            plan,
+            staged.file.try_clone().map_err(|e| e.to_string())?,
+            &staged.root,
+        )?;
+        owned_attempt::event("before_verify", &staged.path)?;
+        let before = staged.identity()?;
+        verify_staged_output(plan, &staged.path)?;
+        let after = staged.identity()?;
+        if !crate::dat::rename_apply::identity::identity_matches(&before, &after) {
+            return Err("owned stage changed during ZIP verification".into());
+        }
+        staged.note(
+            &plan.parent,
+            serde_json::json!({"state": "verified", "identity": after}),
+        )?;
+        Ok(())
+    })();
+    result.map_err(|e| staged.failure(&plan.parent, e))?;
     Ok(staged)
 }
 
 fn stage_members(
     plan: &MameMergedReconstructionPlan,
     file: std::fs::File,
-    temp_root: &Path,
-    temporaries: &mut Vec<PathBuf>,
+    root: &owned_attempt::Directory,
 ) -> Result<(), String> {
     let mut writer = zip::ZipWriter::new(file);
     let cancel = AtomicBool::new(false);
-    for (index, source) in plan.sources.iter().enumerate() {
+    for source in &plan.sources {
         let requirement = plan
             .required_members
             .iter()
-            .find(|requirement| requirement.member_name == source.target_name)
+            .find(|r| r.member_name == source.target_name)
             .ok_or_else(|| {
                 format!(
                     "source has no reviewed requirement for {}",
@@ -942,36 +969,33 @@ fn stage_members(
         let member_size = requirement
             .size_bytes
             .unwrap_or(MAX_RECONSTRUCTION_STAGED_BYTES.saturating_add(1));
-        let source_file = if source.archive_path.is_dir() {
-            std::fs::File::open(&source.member_path).map_err(|e| {
-                format!(
-                    "could not read staged source member {}: {e}",
-                    source.member_path.display()
-                )
-            })?
+        let mut source_file = if source.archive_path.is_dir() {
+            let trusted = TrustedRoots::from_paths([source.archive_path.as_path()]);
+            crate::safe_read::open_bounded_read(&source.member_path, &trusted)
+                .map_err(|e| format!("source member refused: {e:?}"))?
+                .into_file()
         } else {
-            let temporary = temp_root.join(format!("{index}.member"));
+            let mut temporary = root.anonymous()?;
             let trusted = TrustedRoots::from_paths(source.archive_path.parent().into_iter());
-            // Exactly the entry the plan chose, by exact name and by every
-            // authoritative checksum: never "something similar".
-            let requirement_request = crate::dat::archive::zip::ZipMemberRequest {
+            let request = crate::dat::archive::zip::ZipMemberRequest {
                 member_name: Some(source.current_name.clone()),
                 require_exact_name: true,
                 size_bytes: requirement.size_bytes,
                 sha1: requirement.sha1.clone(),
                 crc32: requirement.crc32.clone(),
             };
-            temporaries.push(temporary.clone());
-            crate::dat::archive::zip::copy_zip_member_to(
+            crate::dat::archive::zip::copy_zip_member_into(
                 &source.archive_path,
                 &trusted,
                 &crate::dat::archive::limits::ArchiveLimits::default(),
                 &cancel,
-                &requirement_request,
-                &temporary,
+                &request,
+                &mut temporary,
             )
-            .map_err(|error| format!("ZIP member {} refused: {error}", source.current_name))?;
-            std::fs::File::open(&temporary).map_err(|e| e.to_string())?
+            .map_err(|e| format!("ZIP member {} refused: {e}", source.current_name))?;
+            use std::io::Seek;
+            temporary.rewind().map_err(|e| e.to_string())?;
+            temporary
         };
         writer
             .start_file(
@@ -979,16 +1003,11 @@ fn stage_members(
                 zip::write::SimpleFileOptions::default(),
             )
             .map_err(|e| e.to_string())?;
-        let mut source_file = source_file;
         use std::io::Read;
         let copied = std::io::copy(&mut (&mut source_file).take(member_size + 1), &mut writer)
             .map_err(|e| e.to_string())?;
         if copied != member_size {
             return Err("source member size changed while staging".into());
-        }
-        drop(source_file);
-        if let Some(temporary) = temporaries.last().filter(|_| !source.archive_path.is_dir()) {
-            let _ = std::fs::remove_file(temporary);
         }
     }
     writer
@@ -1093,21 +1112,39 @@ pub fn apply_staged_reconstruction_output(
     staging_root: &Path,
     journal_dir: &Path,
 ) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
-    let staged = stage_reconstruction_output(plan, staging_root)?;
-    publish_staged(plan, &staged, staging_root, journal_dir, Default::default())
+    if !plan.ready_to_apply {
+        return Err("reconstruction plan is blocked; no staged output was created".into());
+    }
+    let mut guard = owned_attempt::PublicationGuard::new(staging_root, journal_dir)?;
+    guard.check_leftovers(&plan.parent)?;
+    let staged = stage_owned_output_with(
+        plan,
+        staging_root,
+        &free_space_bytes,
+        Some(std::sync::Arc::clone(&guard.staging)),
+    )?;
+    publish_staged(
+        plan,
+        &staged,
+        staging_root,
+        journal_dir,
+        Default::default(),
+        &mut guard,
+    )
+    .map_err(|e| staged.failure(&plan.parent, e))
 }
 
 fn publish_staged(
     plan: &MameMergedReconstructionPlan,
-    staged: &Path,
+    staged: &owned_attempt::StagedOutput,
     staging_root: &Path,
     journal_dir: &Path,
     operation: crate::dat::rename_apply::model::TransactionOperation,
+    guard: &mut owned_attempt::PublicationGuard,
 ) -> Result<crate::dat::rename_apply::executor::ApplyOutcome, String> {
     use crate::dat::rename_apply::executor::{
         ApplyError, ApplyExecution, HardConflictMode, apply_transaction,
     };
-    use crate::dat::rename_apply::identity::capture_identity;
     use crate::dat::rename_apply::model::{
         EntryState, RenameTransaction, TransactionEntry, TransactionState,
     };
@@ -1116,10 +1153,12 @@ fn publish_staged(
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicBool;
 
-    let identity = capture_identity(staged).map_err(|e| e.to_string())?;
-    let staged_members = verified_staged_members(plan, staged)?;
+    owned_attempt::event("before_publish", &staged.path)?;
+    guard.check_recovery()?;
+    let identity = staged.identity()?;
+    let staged_members = verified_staged_members(plan, &staged.path)?;
     let provenance = reconstruction_provenance(plan, &staged_members)?;
-    let after = capture_identity(staged).map_err(|e| e.to_string())?;
+    let after = staged.identity()?;
     if !crate::dat::rename_apply::identity::identity_matches(&identity, &after) {
         return Err("staged reconstruction changed during verification".into());
     }
@@ -1134,11 +1173,12 @@ fn publish_staged(
             "destination collision or missing destination directory; nothing was published".into(),
         );
     }
-    let source_key = staged.to_string_lossy().into_owned();
+    let source_key = staged.path.to_string_lossy().into_owned();
     let entry = TransactionEntry {
-        source_path: staged.to_path_buf(),
+        source_path: staged.path.clone(),
         destination_path: destination.clone(),
         original_basename: staged
+            .path
             .file_name()
             .map(|v| v.to_string_lossy().into_owned())
             .unwrap_or_default(),
@@ -1157,9 +1197,7 @@ fn publish_staged(
         unknown: Default::default(),
     };
     let mut transaction = RenameTransaction {
-        transaction_id: crate::dat::rename_apply::journal::new_transaction_id(
-            crate::dat::sources::now_unix(),
-        ),
+        transaction_id: String::new(),
         plan_generation: 1,
         classifier_version: Some(crate::dat::classification::CLASSIFIER_VERSION.to_string()),
         created_at_unix: crate::dat::sources::now_unix(),
@@ -1182,10 +1220,13 @@ fn publish_staged(
     transaction
         .unknown
         .insert(MAME_RECONSTRUCTION_PROVENANCE_KEY.into(), provenance);
+    staged.require_owned()?;
+    guard.reserve(&mut transaction)?;
+    staged.note(&plan.parent, serde_json::json!({"state": "journal_reserved", "transaction_id": transaction.transaction_id}))?;
     let mut approved = BTreeSet::new();
     approved.insert(source_key);
     let cancel = AtomicBool::new(false);
-    apply_transaction(&mut ApplyExecution {
+    let result = apply_transaction(&mut ApplyExecution {
         transaction: &mut transaction,
         approved_paths: approved,
         current_generation: 1,
@@ -1207,7 +1248,27 @@ fn publish_staged(
                 .join("; ")
         ),
         other => other.to_string(),
-    })
+    });
+    if let Err(reason) = &result {
+        // AbortAll preflight refused before mutation. Do not leave an
+        // unexplained Planned reservation, and never relabel an Applying
+        // transaction after an uncertain journal/rename failure.
+        if transaction.state == TransactionState::Planned
+            && transaction
+                .entries
+                .iter()
+                .all(|e| e.state == EntryState::Planned)
+        {
+            transaction.state = TransactionState::ApplyFailed;
+            for e in &mut transaction.entries {
+                e.state = EntryState::ApplyFailed;
+                e.failure_reason = Some(reason.clone());
+            }
+            crate::dat::rename_apply::journal::write_journal(journal_dir, &transaction)
+                .map_err(|e| format!("{reason}; reservation requires Recovery: {e}"))?;
+        }
+    }
+    result
 }
 
 /// A destination ZIP member name: no absolute path, traversal, backslash,
@@ -1257,6 +1318,8 @@ fn evidence_identity(sha1: Option<&str>, crc32: Option<&str>) -> Option<String> 
     sha1.map(|v| format!("sha1:{}", v.to_ascii_lowercase()))
         .or_else(|| crc32.map(|v| format!("crc32:{}", v.to_ascii_lowercase())))
 }
+
+mod owned_attempt;
 
 #[cfg(test)]
 mod packed_tests;
