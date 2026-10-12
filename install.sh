@@ -1421,8 +1421,9 @@ fi
 # it does not claim atomic ownership-checked pathname deletion.
 # No named-file fallback: missing O_TMPFILE/filesystem support, procfs or linkat
 # fails closed. The pinned directory may be renamed by another directory writer;
-# publication remains in that directory, not a substituted pathname. This is
-# not protection against another process modifying a successfully published file.
+# publication remains in that directory, not a substituted pathname. Before
+# success, verify the configured path still reaches that object and our inode.
+# This observation cannot prevent a later external pathname or file change.
 # States: none -> attempted/unproven -> owned regular -> published -> closed.
 # Ownership is established by O_TMPFILE plus fstat, never an inherited descriptor.
 # An unproven descriptor is closed only; no filesystem name needs cleanup.
@@ -1440,7 +1441,8 @@ fi
 #     3 published, then a signal arrived    4 a signal arrived and publication
 #                                             could not be established
 #     5 unsupported environment (nothing    6 refused before publication
-#       attempted)                          130 signal before publication
+#       attempted)                          7 published, configured path unverified
+#     130 signal before publication
 # Any other status (for example SIGKILL or an interpreter crash) proves nothing
 # about the filesystem; it is reported as unconfirmed, never as "nothing changed".
 # starter_config_changed: no (provably not published) | unknown (not provable).
@@ -1460,14 +1462,38 @@ publish_starter_config() {
         starter_config_result="configuration directory is a dangling symlink"
         return 1
     fi
-    # Any directory created here is private (0700) whatever the caller's umask:
-    # the mode is fixed at creation by umask 077 in a subshell, never by a later
-    # chmod, so there is no window and the caller's umask is not changed. An
-    # existing directory (and every existing parent) is left exactly as found;
-    # its ownership and permissions are judged on the pinned descriptor by the
-    # worker, which refuses an unsafe one rather than altering it.
-    if ! (umask 077 && mkdir -p -- "$psc_dir") 2>/dev/null; then
-        starter_config_result="cannot create the configuration directory"
+    # Request 0700 for EVERY missing component. A default ACL replaces umask,
+    # but the explicit mode clears its access mask, including named users/groups.
+    # Existing components are only inspected, never chmod-ed or re-owned.
+    if ! python3 - "$psc_dir" <<'PSC_MKDIR_PY'
+import os
+import stat
+import sys
+
+try:
+    current = "/"
+    for component in sys.argv[1].split("/"):
+        if not component:
+            continue
+        current = os.path.join(current, component)
+        try:
+            os.mkdir(current, 0o700)
+        except FileExistsError:
+            if not os.path.isdir(current):
+                raise NotADirectoryError(current)
+        else:
+            fd = os.open(current, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                if stat.S_IMODE(os.fstat(fd).st_mode) & 0o777 != 0o700:
+                    raise ValueError("new directory does not have private effective access: " + current)
+            finally:
+                os.close(fd)
+except (OSError, ValueError) as error:
+    print("install.sh: cannot create a private configuration directory: " + str(error), file=sys.stderr)
+    sys.exit(1)
+PSC_MKDIR_PY
+    then
+        starter_config_result="cannot create the configuration directory privately"
         return 1
     fi
     # A signal before pid assignment records interruption; immediately after
@@ -1549,11 +1575,99 @@ def explain(error):
           ". No starter config was published.", file=sys.stderr)
 
 
+def configured_directory(expected=None):
+    """Observe each binding without following a substituted component.
+
+    Existing symlinks are resolved explicitly through their O_PATH descriptors.
+    On verification, compare every object before traversing it or its target.
+    """
+    current = None
+    entry = None
+    bindings = []
+    pending = directory.split("/")
+    links = 0
+    try:
+        current = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        root_info = os.fstat(current)
+        root_binding = ("/", root_info.st_dev, root_info.st_ino, stat.S_IFMT(root_info.st_mode))
+        if expected is not None and root_binding != expected[0]:
+            raise ValueError("configuration root binding changed")
+        bindings.append(root_binding)
+        if expected is None:
+            directory_refs.append(os.dup(current))
+        while pending:
+            name = pending.pop(0)
+            if not name or name == ".":
+                continue
+            entry = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=current)
+            info = os.fstat(entry)
+            binding = (name, info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+            index = len(bindings)
+            if expected is not None and (index >= len(expected) or binding != expected[index]):
+                raise ValueError("configured directory binding changed at " + name)
+            bindings.append(binding)
+            if expected is None:
+                # Keep the observed object alive: device/inode IDs cannot be
+                # recycled into a substituted component during this check.
+                directory_refs.append(os.dup(entry))
+            if stat.S_ISLNK(info.st_mode):
+                links += 1
+                if links > 40:
+                    raise OSError(errno.ELOOP, "too many configuration-directory symlinks")
+                target = os.readlink("", dir_fd=entry)
+                if target.startswith("/"):
+                    root = os.dup(directory_refs[0])
+                    os.close(current)
+                    current = root
+                pending = target.split("/") + pending
+                os.close(entry)
+                entry = None
+            elif stat.S_ISDIR(info.st_mode):
+                os.close(current)
+                current = entry
+                entry = None
+            else:
+                raise NotADirectoryError(name)
+        if expected is not None and len(bindings) != len(expected):
+            raise ValueError("configured directory resolution changed")
+        result = current
+        current = None
+        return result, bindings
+    finally:
+        for fd in (entry, current):
+            if fd is not None:
+                os.close(fd)
+
+
+def verify_configured_publication():
+    checked, _ = configured_directory(directory_bindings)
+    config_fd = None
+    try:
+        actual = os.fstat(checked)
+        if (actual.st_dev, actual.st_ino) != (dir_info.st_dev, dir_info.st_ino):
+            raise ValueError("configured path no longer reaches the pinned directory")
+        # O_NONBLOCK avoids waiting on a substituted FIFO; O_NOFOLLOW retains
+        # substituted symlinks. Opening for read proves effective path access.
+        config_fd = os.open(os.path.basename(destination), os.O_RDONLY | os.O_NOFOLLOW |
+                            os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=checked)
+        actual = os.fstat(config_fd)
+        owned = os.fstat(stage_fd)
+        if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino) != (owned.st_dev, owned.st_ino):
+            raise ValueError("configured file no longer resolves to the published inode")
+    finally:
+        if config_fd is not None:
+            os.close(config_fd)
+        os.close(checked)
+
+
 src, directory, destination = sys.argv[1:]
 state = "none"
 stage_fd = None
 directory_fd = None
 published = False
+reachable = False
+directory_bindings = None
+directory_refs = []
 rc = 6
 try:
     if os.path.normpath(os.path.dirname(destination)) != os.path.normpath(directory):
@@ -1581,6 +1695,13 @@ try:
         print("install.sh: warning: the configuration directory is group-writable (mode " +
               format(stat.S_IMODE(dir_info.st_mode), "04o") + "); members of its group can "
               "replace config.toml. It was left unchanged.", file=sys.stderr)
+    observed, directory_bindings = configured_directory()
+    try:
+        observed_info = os.fstat(observed)
+        if (observed_info.st_dev, observed_info.st_ino) != (dir_info.st_dev, dir_info.st_ino):
+            raise ValueError("configuration directory changed while acquiring its bindings")
+    finally:
+        os.close(observed)
     # ANONYMOUS-OPEN-WINDOW: O_TMPFILE has no pre-existing pathname to follow.
     checkpoint()
     stage_fd = os.open(".", os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600,
@@ -1639,7 +1760,17 @@ finally:
             published = os.fstat(stage_fd).st_nlink > 0
         except OSError:
             rc = 4
-    for fd in (stage_fd, directory_fd):
+    if published:
+        try:
+            verify_configured_publication()
+            reachable = True
+        except (OSError, ValueError, AttributeError) as error:
+            print("install.sh: UNCERTAIN: the config was linked in the pinned directory, but "
+                  "its configured pathname could not be verified (" + str(error) + "). "
+                  "Already installed assets remain. Inspect " + destination + " and the original "
+                  "directory before retrying; no path was replaced or removed.", file=sys.stderr)
+            rc = 7
+    for fd in (stage_fd, directory_fd, *directory_refs):
         if fd is not None:
             try:
                 os.close(fd)
@@ -1648,7 +1779,7 @@ finally:
             # CLOSE-LOOP-WINDOW: a signal here changes nothing about the outcome.
     state = "closed"
 if published:
-    rc = 3 if received else 0
+    rc = (3 if received else 0) if reachable else (4 if received else 7)
 elif received and rc != 4:
     rc = 130
 sys.exit(rc)
@@ -1673,6 +1804,7 @@ PSC_PY
     case "$psc_rc" in
         3) psc_outcome=published ;;
         4) psc_outcome=uncertain ;;
+        7) if [ "$psc_interrupted" = yes ]; then psc_outcome=uncertain; fi ;;
         130) psc_outcome=unpublished ;;
         0) if [ "$psc_interrupted" = yes ]; then psc_outcome=published; fi ;;
         2|5|6) if [ "$psc_interrupted" = yes ]; then psc_outcome=unpublished; fi ;;
@@ -1694,6 +1826,11 @@ PSC_PY
     case "$psc_rc" in
         0) starter_config_result=""; return 0 ;;
         2) starter_config_result="exists"; return 1 ;;
+        7)
+            starter_config_changed=unknown
+            starter_config_result="UNCERTAIN: configured pathname could not be verified after publication"
+            return 1
+            ;;
         5)
             starter_config_result="unsupported environment, see the explanation above"
             return 1

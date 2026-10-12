@@ -137,6 +137,16 @@ replaced. There is no staging pathname and nothing is ever unlinked, and there
 is no fallback to a named temporary file, to overwriting, or to elevated
 privileges.
 
+After linking, the installer verifies that the configured pathname remains
+readable and reaches the same pinned directory and published inode. It compares
+each directory/symlink binding before traversing it, retaining existing safe
+symlink paths while refusing to traverse a substituted component. Missing,
+different or unverifiable bindings produce an **UNCERTAIN** incomplete-install
+outcome, never success; already installed assets and the linked config remain
+untouched. Inspect the configured path and original directory before retrying.
+These post-publication observations cannot guarantee that a pathname stays
+unchanged against a concurrent external writer after it has been checked.
+
 If the environment is unsupported, or the step fails before publication, the
 starter-config step is refused with an explicit message (never a Python
 traceback), `install.sh` exits 1, and everything already installed - binaries,
@@ -154,10 +164,18 @@ never modified, replaced or re-permissioned. (A umask that removes the owner's
 own write or search bit, such as `0277`, breaks directory creation for the whole
 installer, not only the config.)
 
-**Configuration directory.** Any configuration directory the installer has to
-create (and any missing parent) is created mode `0700` at creation, under
-whatever umask the caller has: the creation runs under `umask 077` in a
-subshell, so there is no later `chmod` and no window. This matters because the
+**Configuration directory.** Each missing configuration directory or parent is requested with private
+`0700` access bits at creation, under
+whatever umask the caller has: every missing component is passed an explicit
+`0700` creation mode, so there is no later `chmod` and no window. Relying only
+on `umask 077` is insufficient when a parent has a default ACL. The explicit
+mode gives inherited named-user/group access entries an empty effective mask;
+the installer checks the new directory's mode bits and refuses if the ACL also
+restricts its owner below `0700`. Regression validation also
+uses `getfacl` to check effective permissions, including named entries, on each
+new parent/leaf and confirms existing ACLs remain unchanged. If `setfacl` or
+`getfacl` is absent, the test explicitly reports that ACL coverage is unavailable;
+those tools are not production installer requirements. This matters because the
 file's `0600` does not protect it against a directory that other users can write
 to: they could delete and replace `config.toml`, or plant one first. An
 **existing** directory is never chmod-ed, re-owned or moved. Before publishing,
@@ -176,6 +194,22 @@ If a config already exists the installer leaves it untouched and, on stderr
 only, warns when its directory is writable by every user or not owned by you, or
 the file is not owned by you.
 
+
+**Installer test watchdog.** The complete controlling-terminal re-invocation
+retains every assertion and uses a finite 1800-second overall budget for loaded
+runs, plus a 120-second no-output progress watchdog. A no-progress timeout,
+exhausted overall budget and functional failure are reported distinctly. The
+complete inner log is retained in disposable TMPDIR; inner and outer outcomes
+include exit codes and elapsed times. Watchdog regressions cover slow progress,
+no progress, continuing progress at the total bound and ordinary nonzero exits.
+Output is a progress signal, not proof of useful work; the overall bound remains
+finite even if a stuck subprocess emits output. No assertion is weakened.
+
+**Known validation limits.** The remaining reviewed error-reporting defects
+(combined fsync/cleanup errors misattributed to interruption, missing-interface
+tracebacks and an existing-config symlink warning) are unchanged. Crash durability
+of the directory entry is not established, and there is no real unsupported
+filesystem/host matrix; injected syscall refusals do not establish that coverage.
 
 Release-candidate checks are orchestrated by
 `scripts/release/run-rc-acceptance.py`. The release gate does not silently

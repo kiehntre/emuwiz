@@ -7,6 +7,7 @@
 #   sh tests/test_install.sh
 # Exits 0 if every test passes, 1 if any test fails.
 set -eu
+suite_started_seconds=$(date +%s)
 
 # Never inherit the caller's TTY on stdin. install.sh's fresh-install first-
 # source prompt is deliberately offered only when `[ -t 0 ]` (stdin is a
@@ -291,12 +292,123 @@ echo "=== test: this suite does not block on stdin when launched from a real con
 if [ "${TEST_INSTALL_TTY_REGRESSION_GUARD:-}" = 1 ]; then
     printf 'SKIP - already running under the controlling-terminal regression re-invocation; not recursing further\n'
 elif command -v script >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
-    # Descriptor publication adds Python processes; include the ownership suite
-    # in the watchdog budget too. This is a hang bound, not a timing assertion.
-    if TEST_INSTALL_TTY_REGRESSION_GUARD=1 timeout 300 script -qec "sh '$repo_root/tests/test_install.sh'" /dev/null >/dev/null 2>&1; then
+    # Keep all inner assertions. Allow 30 minutes of progressing loaded work,
+    # but stop a run with no output for two minutes and report that separately.
+    # Preserve the complete inner log and its actual exit/duration.
+    pty_work=$(mktemp -d)
+    cat >"$pty_work/watchdog.py" <<'PTY_WATCHDOG'
+import os
+from pathlib import Path
+import selectors
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import unittest
+
+
+def run_pty(command, log, idle=120, total=1800):
+    """A finite overall bound plus an independent no-output progress bound."""
+    started = progress = time.monotonic()
+    outcome = "completed"
+    process = subprocess.Popen(["timeout", "--kill-after=5", str(total), "script", "-qec", command,
+                                "/dev/null"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    with Path(log).open("wb") as output:
+        while process.poll() is None:
+            for key, _ in selector.select(0.5):
+                data = os.read(key.fd, 65536)
+                if data:
+                    output.write(data)
+                    output.flush()
+                    progress = time.monotonic()
+                else:
+                    selector.unregister(key.fileobj)
+            if outcome == "completed" and time.monotonic() - progress >= idle:
+                outcome = "no-progress timeout"
+                # GNU timeout forwards TERM and enforces --kill-after for this
+                # early bound as well. Always wait for its final exit status.
+                try:
+                    process.send_signal(signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        rest, _ = process.communicate(timeout=10)
+        output.write(rest)
+    selector.close()
+    elapsed = time.monotonic() - started
+    if outcome == "completed" and process.returncode == 124:
+        outcome = "overall timeout (slow progress exhausted the finite budget)"
+    status = 124 if outcome != "completed" else process.returncode
+    print("PTY inner: exit=%s process_exit=%s elapsed=%.3fs outcome=%s idle_limit=%ss total_limit=%ss log=%s" %
+          (status, process.returncode, elapsed, outcome, idle, total, log), flush=True)
+    if status:
+        print(Path(log).read_text(errors="replace"), end="", flush=True)
+    return status, outcome, elapsed
+
+
+class WatchdogTests(unittest.TestCase):
+    def command(self, code):
+        return shlex.join([sys.executable, "-u", "-c", code])
+
+    def run_case(self, code, idle, total, name):
+        return run_pty(self.command(code), str(Path(sys.argv[0]).parent / (name + ".log")), idle, total)
+
+    def assert_child_gone(self, name):
+        lines = (Path(sys.argv[0]).parent / (name + ".log")).read_text().splitlines()
+        pid = int(next(line for line in lines if line.startswith("child_pid=")).split("=", 1)[1])
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= deadline:
+                self.fail("watchdog left its PTY child alive: " + str(pid))
+            time.sleep(0.05)
+
+    def test_slow_progress_outlives_idle_budget(self):
+        result, outcome, elapsed = self.run_case(
+            "import time; [(print('progress', flush=True), time.sleep(1)) for _ in range(5)]", 3, 15, "progress")
+        self.assertEqual(result, 0)
+        self.assertEqual(outcome, "completed")
+        self.assertGreater(elapsed, 3)
+
+    def test_no_progress_has_a_distinct_failure(self):
+        result, outcome, elapsed = self.run_case("import os,time; print('child_pid='+str(os.getpid()), flush=True); time.sleep(30)", 2, 15, "idle")
+        self.assertEqual(result, 124)
+        self.assertEqual(outcome, "no-progress timeout")
+        self.assertLess(elapsed, 15)
+        self.assert_child_gone("idle")
+
+    def test_continuing_progress_still_has_a_finite_bound(self):
+        result, outcome, elapsed = self.run_case(
+            "import os,time; print('child_pid='+str(os.getpid()), flush=True); [(print('progress', flush=True), time.sleep(1)) for _ in range(30)]", 3, 4, "total")
+        self.assertEqual(result, 124)
+        self.assertIn("overall timeout", outcome)
+        self.assertLess(elapsed, 15)
+        self.assert_child_gone("total")
+
+    def test_functional_exit_is_preserved(self):
+        result, outcome, _ = self.run_case("raise SystemExit(9)", 3, 15, "functional")
+        self.assertEqual(result, 9)
+        self.assertEqual(outcome, "completed")
+
+
+if sys.argv[1] == "self-test":
+    unittest.main(argv=[sys.argv[0]], verbosity=2)
+else:
+    command = "sh " + shlex.quote(str(Path(sys.argv[1]) / "tests/test_install.sh"))
+    sys.exit(run_pty(command, sys.argv[2])[0])
+PTY_WATCHDOG
+    assert_success "PTY watchdog distinguishes progress, hangs, total bound and functional errors" \
+        python3 -B "$pty_work/watchdog.py" self-test
+    if TEST_INSTALL_TTY_REGRESSION_GUARD=1 python3 -B "$pty_work/watchdog.py" "$repo_root" "$pty_work/inner.log"; then
         ok "the full suite completes under a real controlling terminal (does not block on /dev/tty)"
     else
-        bad "the full suite completes under a real controlling terminal (blocked, or failed - see timeout/exit status)"
+        bad "the full suite completes under a real controlling terminal (see inner exit, duration and log above)"
     fi
 else
     printf 'SKIP - script and/or timeout unavailable; cannot prove the controlling-terminal case directly\n'
@@ -1278,6 +1390,117 @@ class AnonymousStagingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.destination.read_bytes(), example.read_bytes())
         self.no_stage()
+
+    def test_directory_substitution_cannot_report_success(self):
+        # Both sides of linkat, including ancestor replacement and unreadable
+        # ancestry. Only disposable installer copies acquire these test seams.
+        for after in (False, True):
+            for action in ("directory", "symlink", "ancestor", "inaccessible"):
+                with self.subTest(after_publication=after, action=action):
+                    prefix = "        # PUBLISHED-WINDOW:" if after else "    # PUBLISH-WINDOW:"
+                    indent = "        " if after else "    "
+                    statements = ["from pathlib import Path", "d = Path(directory)"]
+                    if action == "ancestor":
+                        statements += ["d.parent.rename(str(d.parent) + '.pinned')", "d.mkdir(parents=True)"]
+                    elif action == "inaccessible":
+                        statements += ["vault = d.parent / 'vault'", "vault.mkdir()", "d.rename(vault / 'pinned')",
+                                       "vault.chmod(0)", "d.mkdir()"]
+                    else:
+                        statements += ["d.rename(str(d) + '.pinned')"]
+                        if action == "symlink":
+                            statements += ["outside = d.parent / 'outside'", "outside.mkdir()",
+                                           "(outside / 'canary').write_bytes(b'KEEP')", "d.symlink_to(outside)"]
+                        else:
+                            statements += ["d.mkdir()"]
+                    mutation = "\n".join(indent + line for line in statements)
+                    script = self.mutated_installer(prefix, mutation)
+                    result, home, bundle = self.install_bundle(script, name="binding-%s-%s" % (after, action))
+                    directory = home / "config/emuwiz"
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("UNCERTAIN", result.stderr)
+                    self.assertIn("remain in place", result.stderr)
+                    self.assertNotIn("Wrote a starter config", result.stdout)
+                    self.assertNotIn("nothing was changed", result.stderr)
+                    self.assertFalse((directory / "config.toml").exists())
+                    self.assertTrue((bundle / "installed/emuwiz-cli").is_file())
+                    self.assertTrue((home / "data/emuwiz-installer/manifest").is_file())
+                    if action == "ancestor":
+                        pinned = home / "config.pinned/emuwiz/config.toml"
+                    elif action == "inaccessible":
+                        with self.assertRaises(PermissionError):
+                            (directory.parent / "vault/pinned/config.toml").read_bytes()
+                        # Intrinsic fixture teardown needs access to its own vault.
+                        (directory.parent / "vault").chmod(0o700)
+                        pinned = directory.parent / "vault/pinned/config.toml"
+                    else:
+                        pinned = directory.parent / "emuwiz.pinned/config.toml"
+                    self.assertEqual(pinned.read_bytes(), example.read_bytes())
+                    if action == "symlink":
+                        self.assertTrue(directory.is_symlink())
+                        self.assertEqual((directory.parent / "outside/canary").read_bytes(), b"KEEP")
+                        self.assertFalse((directory.parent / "outside/config.toml").exists())
+
+    def test_post_publication_config_substitution_is_uncertain(self):
+        line = next(line for line in helper.splitlines() if line.startswith("        # PUBLISHED-WINDOW:"))
+        for kind in ("symlink", "fifo", "missing"):
+            with self.subTest(kind=kind):
+                mutation = "        os.rename(destination, destination + '.pinned')\n"
+                if kind == "symlink":
+                    mutation += "        os.symlink(" + repr(str(self.foreign)) + ", destination)"
+                elif kind == "fifo":
+                    mutation += "        os.mkfifo(destination)"
+                result = self.run_helper(line, mutation)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("UNCERTAIN", result.stderr)
+                self.assertNotIn("nothing was changed", result.stderr)
+                self.assertEqual(Path(str(self.destination) + ".pinned").read_bytes(), example.read_bytes())
+                self.unchanged()
+                if kind != "missing":
+                    self.destination.unlink()
+                Path(str(self.destination) + ".pinned").unlink()
+
+    def test_unverifiable_post_publication_path_is_uncertain(self):
+        line = next(line for line in helper.splitlines() if line.startswith("        # PUBLISHED-WINDOW:"))
+        for failure, signalled in (("EACCES", False), ("EIO", False), ("EACCES", True), ("EIO", True)):
+            with self.subTest(failure=failure, signalled=signalled):
+                mutation = "        def verify_configured_publication():\n            raise OSError(errno.%s, 'verification unavailable')" % failure
+                if signalled:
+                    mutation += "\n        os.kill(os.getpid(), signal.SIGTERM)"
+                result = self.run_helper(line, mutation)
+                self.assertEqual(result.returncode, 130 if signalled else 1, result.stderr)
+                if signalled:
+                    self.assertIn("installation interrupted", result.stderr)
+                self.assertNotIn("published and is complete", result.stderr)
+                self.assertIn("UNCERTAIN", result.stderr)
+                self.assertNotIn("nothing was changed", result.stderr)
+                self.assert_published_and_complete()
+                self.destination.unlink()
+
+    def test_private_creation_masks_inherited_named_acl_entries(self):
+        if not shutil.which("setfacl") or not shutil.which("getfacl"):
+            self.skipTest("setfacl/getfacl unavailable: default-ACL effective-access coverage not established")
+        self.directory.rmdir()
+        subprocess.run(["setfacl", "-m", "d:u::rwx,d:u:65534:rwx,d:g::rwx,d:g:65534:rwx,d:m::rwx,d:o::---",
+                        str(self.root)], check=True)
+        before = subprocess.check_output(["getfacl", "-cpn", str(self.root)], text=True)
+        self.directory = self.root / "missing/config"
+        self.destination = self.directory / "config.toml"
+        result = self.run_helper(umask=0o077)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for created in (self.directory.parent, self.directory):
+            self.assertEqual(stat.S_IMODE(created.stat().st_mode) & 0o777, 0o700)
+            acl = subprocess.check_output(["getfacl", "-cpn", str(created)], text=True)
+            print("ACL evidence: %s mode=%04o\n%s" % (created, stat.S_IMODE(created.stat().st_mode), acl))
+            access = [line for line in acl.splitlines() if line and not line.startswith(("#", "default:"))]
+            self.assertIn("mask::---", access)
+            self.assertIn("other::---", access)
+            self.assertTrue(any(line.startswith("user:65534:") for line in access))
+            self.assertTrue(any(line.startswith("group:65534:") for line in access))
+            for line in access:
+                if line.startswith(("user:65534:", "group:65534:", "group::")):
+                    self.assertIn("#effective:---", line)
+        self.assertEqual(subprocess.check_output(["getfacl", "-cpn", str(self.root)], text=True), before)
+        self.assert_published_and_complete()
 
     def test_no_named_cleanup_or_unsafe_fallback(self):
         self.assertNotIn("rm -", helper)
@@ -2545,7 +2768,12 @@ rm -rf -- "$work"
 
 echo
 printf 'Results: %s passed, %s failed\n' "$pass_count" "$fail_count"
-[ "$fail_count" -eq 0 ]
+suite_rc=0
+[ "$fail_count" -eq 0 ] || suite_rc=1
 
 # Separate deterministic seams instrument disposable installer copies only.
-python3 -B "$repo_root/tests/test_installer_ownership.py" -v
+python3 -B "$repo_root/tests/test_installer_ownership.py" -v || suite_rc=1
+suite_role=outer
+[ "${TEST_INSTALL_TTY_REGRESSION_GUARD:-}" != 1 ] || suite_role=inner
+printf 'Suite outcome: role=%s exit=%s elapsed=%ss\n' "$suite_role" "$suite_rc" "$(( $(date +%s) - suite_started_seconds ))"
+exit "$suite_rc"
