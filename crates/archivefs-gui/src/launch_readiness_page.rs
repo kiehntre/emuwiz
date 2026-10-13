@@ -387,6 +387,127 @@ pub(crate) enum GamerPlayAction {
     BlockedTyped(GamerBlocker),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GamerResolverNoticeKind {
+    /// The preferred DuckStation was bypassed; a healthy alternative is used.
+    PreferredFallback,
+    /// The resolver refused: the pinned (or only) choice is unavailable and
+    /// nothing else is substituted.
+    Blocked,
+    /// The selection is what was asked for, but the resolver raised a warning.
+    Warning,
+}
+
+/// What the shared DuckStation resolver decided, in terms Gamer must show
+/// beside Play. `lines` is the resolver's own text (selected installation and
+/// profile, why, that the preference was bypassed, and its warnings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GamerResolverNotice {
+    pub(crate) kind: GamerResolverNoticeKind,
+    pub(crate) lines: Vec<String>,
+}
+
+impl GamerResolverNotice {
+    pub(crate) fn heading(&self) -> &'static str {
+        match self.kind {
+            GamerResolverNoticeKind::PreferredFallback => {
+                "Using a different DuckStation than you preferred"
+            }
+            GamerResolverNoticeKind::Blocked => {
+                "DuckStation is blocked: your choice is unavailable"
+            }
+            GamerResolverNoticeKind::Warning => "About this DuckStation choice",
+        }
+    }
+}
+
+fn plan_targets_duckstation(plan: &LaunchPlan) -> bool {
+    plan.candidates.iter().any(|candidate| {
+        matches!(
+            &candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "duckstation",
+                ..
+            }
+        )
+    })
+}
+
+/// The resolver's fallback or refusal for the game on screen, or `None` when
+/// the selection was exactly what the user chose (or AUTO found), when the
+/// plan has no DuckStation candidate, or when a different emulator is what
+/// Play would actually start.
+pub(crate) fn gamer_resolver_notice(
+    input: &LaunchReadinessInput,
+    play_action: &GamerPlayAction,
+) -> Option<GamerResolverNotice> {
+    use crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority as Authority;
+    let LaunchReadinessInput::Plan {
+        plan, duckstation, ..
+    } = input
+    else {
+        return None;
+    };
+    let context = duckstation.as_ref()?;
+    if !plan_targets_duckstation(plan) {
+        return None;
+    }
+    if let GamerPlayAction::Launch(request) = play_action
+        && request.adapter_name() != "DuckStation"
+    {
+        return None;
+    }
+    // Gamer's own wording; the facts are the resolver's, untranslated: the
+    // selected installation and profile, why, that the preference was
+    // bypassed, and the resolver's warnings.
+    let notice = match &context.authority {
+        Authority::Refused { reason } => GamerResolverNotice {
+            kind: GamerResolverNoticeKind::Blocked,
+            lines: vec![
+                reason.clone(),
+                "EmuWiz will not use any other DuckStation installation.".into(),
+            ],
+        },
+        Authority::Authorised {
+            executable,
+            profile_root,
+            fallback,
+            why,
+            notes,
+            ..
+        } => {
+            let mut lines = Vec::new();
+            if *fallback {
+                lines.push(format!(
+                    "Your preferred DuckStation is unavailable, so EmuWiz is using {} with settings in {}.",
+                    executable.display(),
+                    profile_root.display()
+                ));
+                lines.extend(why.iter().cloned());
+                lines.push("Your saved preference was not changed.".into());
+            }
+            lines.extend(
+                notes
+                    .iter()
+                    .filter(|note| note.contains("preferred") || note.contains("could not be read"))
+                    .cloned(),
+            );
+            if lines.is_empty() {
+                return None;
+            }
+            GamerResolverNotice {
+                kind: if *fallback {
+                    GamerResolverNoticeKind::PreferredFallback
+                } else {
+                    GamerResolverNoticeKind::Warning
+                },
+                lines,
+            }
+        }
+    };
+    Some(notice)
+}
+
 /// Projects the same shared launch plan used by Advanced View into Gamer
 /// View's single primary action. This is presentation only: a Ready result
 /// carries the exact typed request that the selected adapter preflights again
@@ -474,11 +595,29 @@ pub(crate) fn gamer_play_action(input: &LaunchReadinessInput) -> GamerPlayAction
             "More than one safe emulator choice is available; choose one explicitly.",
         ));
     }
-    GamerPlayAction::BlockedTyped(gamer_blocker_for_plan(
-        plan,
-        *retroarch_scanned,
-        *standalone_scans_complete,
-    ))
+    let mut blocker = gamer_blocker_for_plan(plan, *retroarch_scanned, *standalone_scans_complete);
+    // The generic plan blocker only says "ineligible". When the shared
+    // resolver refused DuckStation, Gamer shows the resolver's own reason and
+    // keeps the Emulator Setup handoff, whichever generic kind the plan chose.
+    if let Some(DuckStationLaunchContext {
+        authority:
+            crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority::Refused { reason },
+        ..
+    }) = duckstation.as_ref()
+        && plan_targets_duckstation(plan)
+        && matches!(
+            blocker.kind,
+            GamerBlockerKind::EmulatorNotInstalled
+                | GamerBlockerKind::EmulatorSetupIncomplete
+                | GamerBlockerKind::NoSafeEmulator
+                | GamerBlockerKind::LaunchPlanInvalid
+        )
+    {
+        blocker.kind = GamerBlockerKind::EmulatorSetupIncomplete;
+        blocker.emulator = Some("DuckStation".into());
+        blocker.detail = reason.clone();
+    }
+    GamerPlayAction::BlockedTyped(blocker)
 }
 
 pub(crate) struct DuckStationLaunchContext {

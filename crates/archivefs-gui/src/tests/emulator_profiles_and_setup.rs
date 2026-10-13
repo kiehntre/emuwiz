@@ -146,6 +146,7 @@ fn non_empty_gamer_view_scan_button_returns_the_shared_scan_request() {
                         member_choices: None,
                         preparation_message: None,
                         play_action: &play_action,
+                        resolver_notice: None,
                         retroarch_launch_state: &mut launch_state,
                         dolphin_launch_state: &mut app.launch_dolphin,
                         pcsx2_launch_state: &mut app.launch_pcsx2,
@@ -250,6 +251,7 @@ fn gamer_view_selected_card_renders_play_from_the_shared_ready_launch_action() {
                         member_choices: None,
                         preparation_message: None,
                         play_action: &play_action,
+                        resolver_notice: None,
                         retroarch_launch_state: &mut launch_state,
                         dolphin_launch_state: &mut app.launch_dolphin,
                         pcsx2_launch_state: &mut app.launch_pcsx2,
@@ -361,6 +363,7 @@ fn render_gamer_card_with_launch_state(
                     member_choices: None,
                     preparation_message: None,
                     play_action,
+                    resolver_notice: None,
                     retroarch_launch_state: launch_state,
                     dolphin_launch_state: &mut app.launch_dolphin,
                     pcsx2_launch_state: &mut app.launch_pcsx2,
@@ -586,6 +589,7 @@ fn gamer_view_no_safe_emulator_action_runs_emulator_check() {
                         member_choices: None,
                         preparation_message: None,
                         play_action: &play_action,
+                        resolver_notice: None,
                         retroarch_launch_state: &mut launch_state,
                         dolphin_launch_state: &mut app.launch_dolphin,
                         pcsx2_launch_state: &mut app.launch_pcsx2,
@@ -4630,3 +4634,5 @@ fn managed_appimage_explicit_executables_projects_the_new_standalone_adapters() 
     // Wrong-emulator query never leaks another adapter's install.
     assert!(managed_appimage_explicit_executables(&installs, "PPSSPP").is_empty());
 }
+
+mod duckstation_gamer_notices;

@@ -55,6 +55,7 @@ pub(crate) struct StageContext<'a> {
     pub(crate) member_choices: Option<&'a [PreparedMemberCandidate]>,
     pub(crate) preparation_message: Option<&'a str>,
     pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
+    pub(crate) resolver_notice: Option<&'a launch_readiness_page::GamerResolverNotice>,
     pub(crate) retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
     pub(crate) screen: &'a mut GamerViewScreen,
     pub(crate) layout: GamerStageLayout,
@@ -83,6 +84,7 @@ pub(crate) fn show_selected_game_stage(
         member_choices,
         preparation_message,
         play_action,
+        resolver_notice,
         retroarch_launch_state,
         screen,
         layout,
@@ -115,6 +117,7 @@ pub(crate) fn show_selected_game_stage(
                         member_choices,
                         preparation_message,
                         play_action,
+                        resolver_notice,
                         retroarch_launch_state,
                         screen,
                         layout,
@@ -210,6 +213,7 @@ struct SelectedArgs<'a> {
     member_choices: Option<&'a [PreparedMemberCandidate]>,
     preparation_message: Option<&'a str>,
     play_action: &'a launch_readiness_page::GamerPlayAction,
+    resolver_notice: Option<&'a launch_readiness_page::GamerResolverNotice>,
     retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
     screen: &'a mut GamerViewScreen,
     layout: GamerStageLayout,
@@ -235,6 +239,7 @@ fn render_selected_stage(
         member_choices,
         preparation_message,
         play_action,
+        resolver_notice,
         retroarch_launch_state,
         screen,
         layout,
@@ -312,6 +317,7 @@ fn render_selected_stage(
                 member_choices,
                 preparation_message,
                 play_action,
+                resolver_notice,
                 retroarch_launch_state,
                 screen,
             },
@@ -368,6 +374,7 @@ struct StageTextArgs<'a> {
     member_choices: Option<&'a [PreparedMemberCandidate]>,
     preparation_message: Option<&'a str>,
     play_action: &'a launch_readiness_page::GamerPlayAction,
+    resolver_notice: Option<&'a launch_readiness_page::GamerResolverNotice>,
     retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
     screen: &'a mut GamerViewScreen,
 }
@@ -393,6 +400,7 @@ fn render_stage_text(
         member_choices,
         preparation_message,
         play_action,
+        resolver_notice,
         retroarch_launch_state,
         screen,
     } = args;
@@ -466,6 +474,25 @@ fn render_stage_text(
     ui.add_space(theme::SPACE_LG);
 
     // --- Primary action --------------------------------------------------
+    // Which DuckStation will run (or why none will) sits directly above the
+    // primary action, so it is read before Play and never hidden behind
+    // technical details.
+    if let Some(notice) = resolver_notice {
+        ui.add_space(theme::SPACE_XS);
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            egui::RichText::new(notice.heading()).strong(),
+        );
+        for line in &notice.lines {
+            ui.label(
+                egui::RichText::new(line)
+                    .size(theme::TECHNICAL_SIZE)
+                    .color(theme::SECONDARY_TEXT),
+            );
+        }
+    }
+    ui.add_space(theme::SPACE_SM);
+
     render_primary_action(
         ui,
         PrimaryArgs {

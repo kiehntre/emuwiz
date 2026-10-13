@@ -306,6 +306,10 @@ pub(crate) fn show_pages(
                 let gamer_launch_input = app.build_launch_readiness_input(data);
                 let gamer_play_action =
                     launch_readiness_page::gamer_play_action(&gamer_launch_input);
+                let gamer_resolver_notice = launch_readiness_page::gamer_resolver_notice(
+                    &gamer_launch_input,
+                    &gamer_play_action,
+                );
                 let gamer_identity_status = match &app.selected_evidence_ui.selected_evidence {
                     selected_evidence_page::SelectedEvidenceState::Ready { report, .. } => {
                         Some(gamer_identity_status_from_verdict(report.identity.status))
@@ -350,6 +354,7 @@ pub(crate) fn show_pages(
                         member_choices,
                         preparation_message,
                         play_action: &gamer_play_action,
+                        resolver_notice: gamer_resolver_notice.as_ref(),
                         retroarch_launch_state: &mut app.launch_retroarch,
                         dolphin_launch_state: &mut app.launch_dolphin,
                         pcsx2_launch_state: &mut app.launch_pcsx2,

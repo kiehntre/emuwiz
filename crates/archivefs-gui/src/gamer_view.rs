@@ -1018,6 +1018,9 @@ pub(crate) struct GamerViewViewState<'a> {
     pub(crate) member_choices: Option<&'a [archivefs_core::PreparedMemberCandidate]>,
     pub(crate) preparation_message: Option<&'a str>,
     pub(crate) play_action: &'a launch_readiness_page::GamerPlayAction,
+    /// The shared DuckStation resolver's fallback or refusal, shown beside
+    /// the primary action. `None` for every ordinary selection.
+    pub(crate) resolver_notice: Option<&'a launch_readiness_page::GamerResolverNotice>,
     pub(crate) retroarch_launch_state: &'a mut launch_readiness_page::RetroArchLaunchState,
     pub(crate) dolphin_launch_state: &'a mut launch_readiness_page::DolphinLaunchState,
     pub(crate) pcsx2_launch_state: &'a mut launch_readiness_page::Pcsx2LaunchState,
@@ -1572,6 +1575,7 @@ pub(crate) fn show_gamer_view(
         member_choices,
         preparation_message,
         play_action,
+        resolver_notice,
         retroarch_launch_state,
         dolphin_launch_state,
         pcsx2_launch_state,
@@ -1824,6 +1828,7 @@ pub(crate) fn show_gamer_view(
             member_choices,
             preparation_message,
             play_action,
+            resolver_notice,
             retroarch_launch_state,
             screen,
             layout: stage_layout,
