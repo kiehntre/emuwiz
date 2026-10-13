@@ -888,8 +888,8 @@ fn gui_v2_sidebar_shows_the_distinct_labels() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     // Tall enough that the whole sidebar list is laid out.
-    frame(&context, &mut app, [1280.0, 4000.0]);
-    let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+    frame(&context, &mut app, [1280.0, 12000.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 12000.0]));
     for label in [
         "Saves & States overview",
         "Organisation overview",
@@ -5021,8 +5021,8 @@ fn sidebar_shows_each_group_heading_once_before_its_entries() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Games);
-    frame(&context, &mut app, [1280.0, 4000.0]);
-    let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+    frame(&context, &mut app, [1280.0, 12000.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 12000.0]));
     for group in ["LIBRARY", "PLAY", "TOOLS", "FAMILIES"] {
         assert_eq!(
             strings.iter().filter(|v| *v == group).count(),
@@ -5150,8 +5150,8 @@ fn hackhash_normal_view_is_plain_english_and_keeps_internals_under_advanced() {
     let context = egui::Context::default();
     let mut app = fixture(&context);
     app.router.current = Route::Section(Section::Sources);
-    frame(&context, &mut app, [1280.0, 4000.0]);
-    let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+    frame(&context, &mut app, [1280.0, 12000.0]);
+    let strings = text(&frame(&context, &mut app, [1280.0, 12000.0]));
     for jargon in [
         "Fetch candidate",
         "Choose detailed JSON",
@@ -5483,8 +5483,8 @@ fn no_route_shows_its_title_more_often_than_the_chrome_explains() {
         let context = egui::Context::default();
         let mut app = fixture(&context);
         app.router.current = Route::Section(section);
-        frame(&context, &mut app, [1280.0, 4000.0]);
-        let strings = text(&frame(&context, &mut app, [1280.0, 4000.0]));
+        frame(&context, &mut app, [1280.0, 12000.0]);
+        let strings = text(&frame(&context, &mut app, [1280.0, 12000.0]));
         let seen = strings.iter().filter(|value| *value == title).count();
         // Sidebar entries + breadcrumb + page heading. Hero copy complements
         // the page title; no page is exempt from the duplicate-title guard.
@@ -9269,5 +9269,154 @@ mod duckstation_profile_resolution {
         app.router.current = Route::Section(Section::Emulators);
         let again = text(&frame(&context, &mut app, [1280.0, 820.0]));
         assert!(again.iter().any(|text| text == "Emulators"));
+    }
+}
+
+mod ppsspp_profile_resolution {
+    use super::*;
+    use crate::emulator_setup::profile_resolution::ppsspp::PpssppResolutionState;
+    use crate::emulator_setup::profile_resolution::{DuckStationResolutionState, ResolutionView};
+    use archivefs_core::emulator_profile_resolver::{EmulatorSelectionMode, ResolutionOutcome};
+
+    fn nothing_found() -> ResolutionView {
+        ResolutionView {
+            mode: EmulatorSelectionMode::Auto,
+            selection_note: None,
+            outcome: ResolutionOutcome::NoInstallation {
+                assessments: Vec::new(),
+            },
+        }
+    }
+
+    fn bridge<'a>(
+        app: &'a mut App,
+        context: &egui::Context,
+    ) -> &'a mut native_workflows::NativeWorkflows {
+        app.native_workflows
+            .get_or_insert_with(|| native_workflows::NativeWorkflows::new(context.clone()))
+    }
+
+    fn readiness(app: &mut App) -> &mut crate::emulator_readiness_state::EmulatorReadinessState {
+        &mut app
+            .native_workflows
+            .as_mut()
+            .unwrap()
+            .app
+            .emulator_readiness
+    }
+
+    #[test]
+    fn a_result_for_an_older_request_is_discarded_after_a_newer_one() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        bridge(&mut app, &context)
+            .app
+            .start_ppsspp_resolution_with(Err("first".into()), None);
+        let older = readiness(&mut app).ppsspp_resolution_generation;
+        bridge(&mut app, &context)
+            .app
+            .start_ppsspp_resolution_with(Err("second".into()), None);
+        let newer = readiness(&mut app).ppsspp_resolution_generation;
+        assert!(newer > older);
+        assert!(
+            !bridge(&mut app, &context)
+                .app
+                .accept_ppsspp_resolution(older, nothing_found())
+        );
+        assert!(matches!(
+            readiness(&mut app).ppsspp_resolution,
+            PpssppResolutionState::Error(ref message) if message == "second"
+        ));
+        assert!(
+            bridge(&mut app, &context)
+                .app
+                .accept_ppsspp_resolution(newer, nothing_found())
+        );
+        assert!(matches!(
+            readiness(&mut app).ppsspp_resolution,
+            PpssppResolutionState::Ready { generation, .. } if generation == newer
+        ));
+    }
+
+    #[test]
+    fn invalidation_discards_an_answer_that_was_in_flight_and_leaves_duckstation_alone() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        bridge(&mut app, &context)
+            .app
+            .start_ppsspp_resolution_with(Err("x".into()), None);
+        readiness(&mut app).duckstation_resolution_generation = 5;
+        readiness(&mut app).duckstation_resolution = DuckStationResolutionState::Error("d".into());
+        let in_flight = readiness(&mut app).ppsspp_resolution_generation;
+        bridge(&mut app, &context)
+            .app
+            .invalidate_ppsspp_resolution();
+        assert!(
+            !bridge(&mut app, &context)
+                .app
+                .accept_ppsspp_resolution(in_flight, nothing_found())
+        );
+        assert!(matches!(
+            readiness(&mut app).ppsspp_resolution,
+            PpssppResolutionState::NotScanned
+        ));
+        assert_eq!(readiness(&mut app).duckstation_resolution_generation, 5);
+        assert!(matches!(
+            readiness(&mut app).duckstation_resolution,
+            DuckStationResolutionState::Error(ref message) if message == "d"
+        ));
+    }
+
+    #[test]
+    fn the_ppsspp_card_is_labelled_a_preview_and_sits_after_the_main_controls() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(Section::Emulators);
+        bridge(&mut app, &context);
+        readiness(&mut app).duckstation_resolution_generation = 7;
+        readiness(&mut app).duckstation_resolution = DuckStationResolutionState::Ready {
+            generation: 7,
+            view: Box::new(nothing_found()),
+        };
+        readiness(&mut app).ppsspp_resolution_generation = 9;
+        readiness(&mut app).ppsspp_resolution = PpssppResolutionState::Ready {
+            generation: 9,
+            view: Box::new(nothing_found()),
+        };
+        // Tall viewport: the card is below the page's main controls and is
+        // reached by normal scrolling on a short window.
+        let strings = text(&frame(&context, &mut app, [1280.0, 12000.0]));
+        assert!(
+            strings
+                .iter()
+                .any(|t| t == "PPSSPP: shared resolver recommendation (preview)")
+        );
+        assert!(
+            strings
+                .iter()
+                .any(|t| t == "No PPSSPP installation was found")
+        );
+        assert!(strings.iter().any(|t| t == "Re-check PPSSPP"));
+        assert!(
+            strings
+                .iter()
+                .any(|t| t.contains("not connected to it yet"))
+        );
+        // The DuckStation card is unchanged and still present.
+        assert!(
+            strings
+                .iter()
+                .any(|t| t == "DuckStation: shared resolver recommendation (preview)")
+        );
+        assert!(
+            strings
+                .iter()
+                .any(|t| t == "No DuckStation installation was found")
+        );
+        // Rendering a current answer does not restart either scan.
+        assert_eq!(readiness(&mut app).ppsspp_resolution_generation, 9);
+        assert_eq!(readiness(&mut app).duckstation_resolution_generation, 7);
+        // No wording promises a launch executable.
+        assert!(!strings.iter().any(|t| t.contains("PPSSPP will launch")));
     }
 }

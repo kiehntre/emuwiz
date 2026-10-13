@@ -1,8 +1,12 @@
 use crate::*;
 
+use super::profile_resolution::ppsspp::{
+    PpssppResolutionInputs, PpssppResolutionState, spawn_ppsspp_resolution,
+};
 use super::profile_resolution::{
     DuckStationResolutionInputs, DuckStationResolutionState, DuckStationResolutionView,
-    present_resolution, show_profile_resolution, spawn_duckstation_resolution,
+    ResolutionView, ResolverSubject, present_resolution, present_resolution_for,
+    show_profile_resolution, spawn_duckstation_resolution,
 };
 
 impl ArchiveFsApp {
@@ -329,7 +333,11 @@ impl ArchiveFsApp {
         self.handle_emulator_setup_action(setup_action, context);
         if setup_changed {
             self.invalidate_duckstation_resolution();
+            self.invalidate_ppsspp_resolution();
         }
+        // Below the main controls on purpose: the preview must never push the
+        // page's primary actions further down.
+        self.show_ppsspp_profile_resolution(ui, context);
         ui.add_space(theme::SECTION_GAP);
         // The managed-emulator download catalogue is always shown: a beginner
         // must be able to see whether an emulator is installed, available to
@@ -2169,6 +2177,112 @@ impl ArchiveFsApp {
         });
         if recheck {
             self.invalidate_duckstation_resolution();
+        }
+    }
+
+    /// Forgets the PPSSPP resolver answer and bumps the generation so a result
+    /// still in flight for the earlier request is discarded.
+    pub(crate) fn invalidate_ppsspp_resolution(&mut self) {
+        self.emulator_readiness.ppsspp_resolution_generation += 1;
+        self.emulator_readiness.ppsspp_resolution = PpssppResolutionState::NotScanned;
+    }
+
+    /// Starts the read-only PPSSPP resolution off the GUI thread.
+    pub(crate) fn start_ppsspp_resolution(&mut self, context: Option<egui::Context>) {
+        let inputs = PpssppResolutionInputs::from_environment(
+            &self.emulator_readiness.emulator_setup_overrides,
+        );
+        self.start_ppsspp_resolution_with(inputs, context);
+    }
+
+    pub(crate) fn start_ppsspp_resolution_with(
+        &mut self,
+        inputs: Result<PpssppResolutionInputs, String>,
+        context: Option<egui::Context>,
+    ) {
+        self.emulator_readiness.ppsspp_resolution_generation += 1;
+        let generation = self.emulator_readiness.ppsspp_resolution_generation;
+        self.emulator_readiness.ppsspp_resolution = match inputs {
+            Ok(inputs) => PpssppResolutionState::Scanning {
+                receiver: spawn_ppsspp_resolution(generation, inputs, context),
+            },
+            Err(message) => PpssppResolutionState::Error(message),
+        };
+    }
+
+    /// Accepts a finished resolution only if it answers the current request.
+    pub(crate) fn accept_ppsspp_resolution(
+        &mut self,
+        generation: u64,
+        view: ResolutionView,
+    ) -> bool {
+        if generation != self.emulator_readiness.ppsspp_resolution_generation {
+            return false;
+        }
+        self.emulator_readiness.ppsspp_resolution = PpssppResolutionState::Ready {
+            generation,
+            view: Box::new(view),
+        };
+        true
+    }
+
+    pub(crate) fn poll_ppsspp_resolution(&mut self) {
+        let PpssppResolutionState::Scanning { receiver } =
+            &self.emulator_readiness.ppsspp_resolution
+        else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, view)) => {
+                self.accept_ppsspp_resolution(generation, view);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.emulator_readiness.ppsspp_resolution = PpssppResolutionState::Error(
+                    "PPSSPP profile resolution stopped unexpectedly.".to_string(),
+                );
+            }
+        }
+    }
+
+    fn show_ppsspp_profile_resolution(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        if matches!(
+            self.emulator_readiness.ppsspp_resolution,
+            PpssppResolutionState::NotScanned
+        ) {
+            self.start_ppsspp_resolution(Some(context.clone()));
+        }
+        ui.add_space(theme::SECTION_GAP);
+        let mut recheck = false;
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("PPSSPP: shared resolver recommendation (preview)");
+                recheck = ui.button("Re-check PPSSPP").clicked();
+            });
+            ui.label(
+                egui::RichText::new(
+                    "This is what EmuWiz's shared resolver recommends. Launch and Cheats & Mods are not connected to it yet, so it does not guarantee which installation they use. Changing saved preferences is not supported here yet.",
+                )
+                .small()
+                .color(theme::muted(ui)),
+            );
+            match &self.emulator_readiness.ppsspp_resolution {
+                PpssppResolutionState::NotScanned | PpssppResolutionState::Scanning { .. } => {
+                    ui.label("Checking PPSSPP installations…");
+                }
+                PpssppResolutionState::Error(message) => {
+                    ui.colored_label(ui.visuals().error_fg_color, message);
+                }
+                PpssppResolutionState::Ready { view, .. } => {
+                    show_profile_resolution(
+                        ui,
+                        &present_resolution_for(view, ResolverSubject::Ppsspp),
+                    );
+                }
+            }
+        });
+        if recheck {
+            self.invalidate_ppsspp_resolution();
         }
     }
 

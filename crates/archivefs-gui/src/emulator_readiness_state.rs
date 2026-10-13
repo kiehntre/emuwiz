@@ -32,6 +32,10 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) duckstation_resolution:
         crate::emulator_setup::profile_resolution::DuckStationResolutionState,
     pub(crate) duckstation_resolution_generation: u64,
+    /// Read-only resolver view for PPSSPP; see `emulator_setup::profile_resolution::ppsspp`.
+    pub(crate) ppsspp_resolution:
+        crate::emulator_setup::profile_resolution::ppsspp::PpssppResolutionState,
+    pub(crate) ppsspp_resolution_generation: u64,
     pub(crate) pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState,
     pub(crate) xenia_profiles: XeniaProfilesState,
     pub(crate) remembered_emulator_profiles: Vec<RememberedEmulatorProfile>,
@@ -63,6 +67,9 @@ impl Default for EmulatorReadinessState {
             duckstation_resolution:
                 crate::emulator_setup::profile_resolution::DuckStationResolutionState::NotScanned,
             duckstation_resolution_generation: 0,
+            ppsspp_resolution:
+                crate::emulator_setup::profile_resolution::ppsspp::PpssppResolutionState::NotScanned,
+            ppsspp_resolution_generation: 0,
             pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
             xenia_profiles: XeniaProfilesState::NotScanned,
             remembered_emulator_profiles: Vec::new(),

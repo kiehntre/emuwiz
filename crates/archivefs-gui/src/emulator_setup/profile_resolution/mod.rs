@@ -94,6 +94,40 @@ pub(crate) fn compute_duckstation_resolution(
     }
 }
 
+/// Which emulator a resolution view is about. Only wording differs; the
+/// outcome types and the presentation rules are shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolverSubject {
+    DuckStation,
+    Ppsspp,
+}
+
+impl ResolverSubject {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::DuckStation => "DuckStation",
+            Self::Ppsspp => "PPSSPP",
+        }
+    }
+
+    fn main_config_file(self) -> &'static str {
+        match self {
+            Self::DuckStation => "settings.ini",
+            Self::Ppsspp => "ppsspp.ini",
+        }
+    }
+
+    fn details_id(self) -> &'static str {
+        match self {
+            Self::DuckStation => "duckstation-resolution-candidates",
+            Self::Ppsspp => "ppsspp-resolution-candidates",
+        }
+    }
+}
+
+/// A resolution view is emulator-neutral; PPSSPP reuses it unchanged.
+pub(crate) type ResolutionView = DuckStationResolutionView;
+
 pub(crate) type ResolutionMessage = (u64, DuckStationResolutionView);
 
 /// Starts the worker. The result is tagged with `generation`.
@@ -154,6 +188,8 @@ pub(crate) struct ProfileResolutionPresentation {
     pub(crate) next_steps: Vec<String>,
     /// One line per candidate the resolver considered.
     pub(crate) candidates: Vec<String>,
+    /// Stable id of the collapsible "technical details" block.
+    pub(crate) details_id: &'static str,
 }
 
 fn mode_label(kind: SelectionModeKind) -> &'static str {
@@ -185,7 +221,20 @@ fn factor_label(factor: RankFactor) -> &'static str {
     }
 }
 
-fn unusable_text(reason: UnusableReason) -> &'static str {
+fn unusable_text(reason: UnusableReason, subject: ResolverSubject) -> String {
+    match reason {
+        UnusableReason::MainConfigMissing => {
+            return format!("{} is missing", subject.main_config_file());
+        }
+        UnusableReason::MainConfigUnreadable => {
+            return format!("{} cannot be read", subject.main_config_file());
+        }
+        _ => {}
+    }
+    unusable_fixed_text(reason).to_string()
+}
+
+fn unusable_fixed_text(reason: UnusableReason) -> &'static str {
     match reason {
         UnusableReason::ExecutableMissing => "the program file is missing",
         UnusableReason::ExecutableNotARegularFile => "the program is not a plain file",
@@ -202,13 +251,13 @@ fn unusable_text(reason: UnusableReason) -> &'static str {
     }
 }
 
-fn reasons_text(reasons: &[UnusableReason]) -> String {
+fn reasons_text(reasons: &[UnusableReason], subject: ResolverSubject) -> String {
     if reasons.is_empty() {
         return "it is not installed any more".to_string();
     }
     reasons
         .iter()
-        .map(|reason| unusable_text(*reason))
+        .map(|reason| unusable_text(*reason, subject))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -273,14 +322,14 @@ fn configuration_warning_text(warning: &ConfigurationWarning) -> String {
     }
 }
 
-fn bypass_text(why: &PreferenceBypassReason) -> String {
+fn bypass_text(why: &PreferenceBypassReason, subject: ResolverSubject) -> String {
     match why {
         PreferenceBypassReason::NoLongerPresent => "it is no longer installed".to_string(),
-        PreferenceBypassReason::Unusable(reasons) => reasons_text(reasons),
+        PreferenceBypassReason::Unusable(reasons) => reasons_text(reasons, subject),
     }
 }
 
-fn standing_text(assessment: &CandidateAssessment) -> String {
+fn standing_text(assessment: &CandidateAssessment, subject: ResolverSubject) -> String {
     let what = pair_text(&assessment.identity);
     let layout = layout_label(assessment.layout);
     match &assessment.standing {
@@ -295,23 +344,44 @@ fn standing_text(assessment: &CandidateAssessment) -> String {
         ),
         Standing::Tied => format!("Tied — {what} [{layout}]"),
         Standing::Unusable(reasons) => {
-            format!("Unusable — {what} [{layout}]: {}", reasons_text(reasons))
+            format!(
+                "Unusable — {what} [{layout}]: {}",
+                reasons_text(reasons, subject)
+            )
         }
     }
 }
 
-fn candidate_lines(assessments: &[CandidateAssessment]) -> Vec<String> {
-    assessments.iter().map(standing_text).collect()
+fn candidate_lines(assessments: &[CandidateAssessment], subject: ResolverSubject) -> Vec<String> {
+    assessments
+        .iter()
+        .map(|assessment| standing_text(assessment, subject))
+        .collect()
 }
 
-const NOTHING_FOUND_STEPS: &[&str] = &[
-    "Install DuckStation from the Emulators section below, or point EmuWiz at an existing program with the DuckStation executable override.",
-    "Start DuckStation once so it creates its settings, then re-check. EmuWiz will not create the folder for you.",
-];
+fn nothing_found_steps(subject: ResolverSubject) -> [String; 2] {
+    let name = subject.name();
+    [
+        format!(
+            "Install {name} from the Emulators section below, or point EmuWiz at an existing program with the {name} executable override."
+        ),
+        format!(
+            "Start {name} once so it creates its settings, then re-check. EmuWiz will not create the folder for you."
+        ),
+    ]
+}
 
 pub(crate) fn present_resolution(
     view: &DuckStationResolutionView,
 ) -> ProfileResolutionPresentation {
+    present_resolution_for(view, ResolverSubject::DuckStation)
+}
+
+pub(crate) fn present_resolution_for(
+    view: &DuckStationResolutionView,
+    subject: ResolverSubject,
+) -> ProfileResolutionPresentation {
+    let name = subject.name();
     let mode = view.mode.kind();
     let mut presentation = ProfileResolutionPresentation {
         health: ResolutionHealth::NothingUsable,
@@ -324,6 +394,7 @@ pub(crate) fn present_resolution(
         warnings: Vec::new(),
         next_steps: Vec::new(),
         candidates: Vec::new(),
+        details_id: subject.details_id(),
     };
     if let Some(note) = &view.selection_note {
         presentation.warnings.push(note.clone());
@@ -335,7 +406,7 @@ pub(crate) fn present_resolution(
             presentation.profile_directory = Some(profile.profile_root.clone());
             presentation.layout = Some(layout_label(profile.layout));
             presentation.why.push(reason_text(&profile.reason));
-            presentation.candidates = candidate_lines(&resolution.assessments);
+            presentation.candidates = candidate_lines(&resolution.assessments, subject);
             let mut notes = false;
             for warning in &profile.warnings {
                 notes = true;
@@ -346,7 +417,7 @@ pub(crate) fn present_resolution(
                     ResolutionWarning::PreferredProfileBypassed { preferred, why } => format!(
                         "Your preferred choice ({}) was not used because {}. EmuWiz fell back to the installation above; your preference was kept, not erased.",
                         pair_text(preferred),
-                        bypass_text(why)
+                        bypass_text(why, subject)
                     ),
                     ResolutionWarning::EquivalentExecutables { others } => format!(
                         "{} other program(s) share this configuration and are equivalent.",
@@ -361,9 +432,9 @@ pub(crate) fn present_resolution(
                 ResolutionHealth::Healthy
             };
             presentation.headline = if bypassed {
-                "Recommending a fallback — your preferred DuckStation is unavailable".to_string()
+                format!("Recommending a fallback — your preferred {name} is unavailable")
             } else {
-                "Recommended DuckStation installation".to_string()
+                format!("Recommended {name} installation")
             };
             if bypassed {
                 presentation.next_steps.push(
@@ -377,34 +448,33 @@ pub(crate) fn present_resolution(
         } => {
             presentation.health = ResolutionHealth::Ambiguous;
             presentation.headline =
-                "More than one DuckStation looks equally good — EmuWiz will not guess".to_string();
+                format!("More than one {name} looks equally good — EmuWiz will not guess");
             presentation.why.push(
                 "The installations below tie on every factor EmuWiz weighs, so no single pair is selected."
                     .to_string(),
             );
-            presentation.candidates = candidate_lines(if choices.is_empty() {
-                assessments
-            } else {
-                choices
-            });
+            presentation.candidates = candidate_lines(
+                if choices.is_empty() {
+                    assessments
+                } else {
+                    choices
+                },
+                subject,
+            );
             presentation.next_steps.push(
                 "Pin the installation you want (a preferred or forced choice), or remove the one you do not use.".into(),
             );
         }
         ResolutionOutcome::NoInstallation { assessments } => {
-            presentation.headline = "No DuckStation installation was found".to_string();
-            presentation.candidates = candidate_lines(assessments);
-            presentation
-                .next_steps
-                .extend(NOTHING_FOUND_STEPS.iter().map(|s| s.to_string()));
+            presentation.headline = format!("No {name} installation was found");
+            presentation.candidates = candidate_lines(assessments, subject);
+            presentation.next_steps.extend(nothing_found_steps(subject));
         }
         ResolutionOutcome::NoUsableProfile { assessments } => {
             presentation.headline =
-                "DuckStation was found, but no configuration profile is usable".to_string();
-            presentation.candidates = candidate_lines(assessments);
-            presentation
-                .next_steps
-                .extend(NOTHING_FOUND_STEPS.iter().map(|s| s.to_string()));
+                format!("{name} was found, but no configuration profile is usable");
+            presentation.candidates = candidate_lines(assessments, subject);
+            presentation.next_steps.extend(nothing_found_steps(subject));
         }
         ResolutionOutcome::Refused(refusal) => {
             presentation.health = ResolutionHealth::Unavailable;
@@ -413,12 +483,11 @@ pub(crate) fn present_resolution(
                 | ForcedRefusal::ForcedProfileInvalid { pinned, reasons } => (pinned, reasons),
             };
             presentation.headline =
-                "Your forced DuckStation choice is unavailable — nothing else was substituted"
-                    .to_string();
+                format!("Your forced {name} choice is unavailable — nothing else was substituted");
             presentation.why.push(format!(
                 "You pinned {}, but {}.",
                 pair_text(pinned),
-                reasons_text(reasons)
+                reasons_text(reasons, subject)
             ));
             presentation.next_steps.push(
                 "Restore that exact installation and configuration, or clear the forced choice to let EmuWiz choose automatically.".into(),
@@ -465,13 +534,15 @@ pub(crate) fn show_profile_resolution(
         ui.label(format!("Next: {step}"));
     }
     if !presentation.candidates.is_empty() {
-        widgets::technical_details(ui, "duckstation-resolution-candidates", |ui| {
+        widgets::technical_details(ui, presentation.details_id, |ui| {
             for line in &presentation.candidates {
                 ui.label(egui::RichText::new(line).small().color(theme::muted(ui)));
             }
         });
     }
 }
+
+pub(crate) mod ppsspp;
 
 #[cfg(test)]
 mod tests;
