@@ -50,7 +50,10 @@ HASH_NAME_RE = re.compile(r"^(?P<base>.+)-(?P<hash>[0-9a-f]{12})$")
 # Enumerated Cargo compiler-output subtrees of a profile directory.
 ARTIFACT_DIRS = (".fingerprint", "build", "deps", "examples", "incremental")
 ARTIFACT_FILE_SUFFIXES = (".d", ".rlib", ".rmeta", ".so", ".a", ".dylib", ".dll", ".pdb")
-ARTIFACT_META_FILES = (".cargo-lock",)
+# Cargo's own lock files are never selected: removing a held lock inode would let
+# a second cargo create a new one and defeat its exclusion.
+CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+ARTIFACT_META_FILES = ()
 TOP_META_FILES = (".rustc_info.json",)
 # Anything that looks like data worth keeping stops selection of its subtree.
 DATA_SUFFIXES = (
@@ -164,6 +167,55 @@ def atomic_write(path, data):
         raise
 
 
+class RegistryRecordInvalid(Exception):
+    """A registry file exists but is unreadable or does not have a valid shape."""
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def valid_active_entry(entry):
+    return (
+        isinstance(entry, dict)
+        and _is_int(entry.get("pid"))
+        and (entry.get("starttime") is None or _is_int(entry.get("starttime")))
+        and isinstance(entry.get("boot_id"), (str, type(None)))
+    )
+
+
+def valid_target_record(record):
+    """Shape check for targets/<key>.json; anything else is treated as unknown."""
+    if not isinstance(record, dict):
+        return False
+    if not isinstance(record.get("target"), str) or not record["target"]:
+        return False
+    active = record.get("active", [])
+    if not isinstance(active, list) or not all(valid_active_entry(e) for e in active):
+        return False
+    for field in ("owner", "worktree", "head"):
+        if record.get(field) is not None and not isinstance(record[field], str):
+            return False
+    for field in ("last_use", "last_end", "last_start", "first_seen"):
+        if record.get(field) is not None and not isinstance(record[field], (int, float)):
+            return False
+    identity = record.get("identity")
+    if identity is not None and not (
+        isinstance(identity, dict) and _is_int(identity.get("dev")) and _is_int(identity.get("ino"))
+    ):
+        return False
+    return True
+
+
+def valid_pin_file(data):
+    if not isinstance(data, dict) or not isinstance(data.get("pins"), list):
+        return False
+    return all(
+        isinstance(p, dict) and isinstance(p.get("owner"), str) and isinstance(p.get("reason"), str)
+        for p in data["pins"]
+    )
+
+
 class Registry:
     """Records, pins and lifecycle locks, all outside the cargo targets."""
 
@@ -184,6 +236,24 @@ class Registry:
         except (OSError, ValueError):
             return None
 
+    def read_checked(self, kind, key, validate):
+        """(state, data): "absent" only when the file genuinely does not exist,
+        "ok" for a valid record, otherwise "invalid" (unreadable, corrupt or the
+        wrong shape).  A read failure is never evidence that nothing is there."""
+        try:
+            with open(self.path(kind, key)) as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return "absent", None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return "invalid", None
+        return ("ok", data) if validate(data) else ("invalid", None)
+
+    def pin_state(self, key):
+        """(state, pins) for a target; state is absent, ok or invalid."""
+        state, data = self.read_checked("pins", key, valid_pin_file)
+        return state, (data["pins"] if state == "ok" else [])
+
     def all_records(self):
         out = {}
         directory = os.path.join(self.root, "targets")
@@ -193,8 +263,8 @@ class Registry:
             return out
         for name in names:
             if name.endswith(".json"):
-                record = self.read("targets", name[:-5])
-                if isinstance(record, dict) and record.get("target"):
+                state, record = self.read_checked("targets", name[:-5], valid_target_record)
+                if state == "ok":
                     out[name[:-5]] = record
         return out
 
@@ -266,11 +336,22 @@ def cmd_run(args):
                 time.sleep(0.2)
         token = f"{os.getpid()}-{int(time.time() * 1000)}"
         begin_record(registry, key, args, token, cmd)
-    except OSError as error:
-        # A broken registry must never block a build.
-        print(f"cargo-iso: build tracking unavailable ({error}); building untracked", file=sys.stderr)
+    except Exception as error:  # noqa: BLE001 - this is the tracking boundary only
+        # A broken or malformed registry must never block a build.  Nothing was
+        # registered: the lock is released, the record (if any) is left exactly as
+        # found, and cargo runs with its original arguments.  An untracked target
+        # has no (valid) lifecycle record, so it stays ineligible for retirement.
+        print(
+            f"cargo-iso: build tracking unavailable ({type(error).__name__}: {error}); "
+            "building untracked (this build is not registered and the target stays "
+            "ineligible for retirement)",
+            file=sys.stderr,
+        )
         if lock_fd is not None:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
         os.execvp(cmd[0], cmd)
 
     masked = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}
@@ -329,7 +410,13 @@ def begin_record(registry, key, args, token, cmd):
     sub = next((word for word in cmd[1:] if not word.startswith("-")), "")
     meta = registry.meta_lock()
     try:
-        record = registry.read("targets", key) or {
+        state, existing = registry.read_checked("targets", key, valid_target_record)
+        if state == "invalid":
+            raise RegistryRecordInvalid(
+                f"registry record {registry.path('targets', key)} is unreadable or malformed; "
+                "left unchanged as evidence"
+            )
+        record = existing or {
             "schema": 1,
             "key": key,
             "target": target,
@@ -371,9 +458,9 @@ def finish_record(registry, key, token, rc, status):
     try:
         meta = registry.meta_lock()
         try:
-            record = registry.read("targets", key)
-            if record is None:
-                return
+            state, record = registry.read_checked("targets", key, valid_target_record)
+            if state != "ok":
+                return  # absent or malformed: never overwrite evidence
             record["active"] = [e for e in record.get("active", []) if e.get("token") != token]
             record["last_end"] = now()
             record["last_use"] = now()
@@ -382,7 +469,7 @@ def finish_record(registry, key, token, rc, status):
             atomic_write(registry.path("targets", key), record)
         finally:
             meta.close()
-    except OSError:
+    except Exception:  # noqa: BLE001 - cargo's exit status must survive bookkeeping
         pass
 
 
@@ -618,8 +705,10 @@ def evaluate(items, registry, args, census, measured):
         holds, info = [], []
         item["holds"] = holds
         item["info"] = info
-        pins = (registry.read("pins", item["key"]) or {}).get("pins", []) if item["key"] else []
+        pin_state, pins = registry.pin_state(item["key"]) if item["key"] else ("absent", [])
         item["pins"] = pins
+        if pin_state == "invalid":
+            holds.append("PIN_STATE_UNKNOWN")
         if pins:
             holds.append("PINNED")
         if item.get("symlink") or not os.path.isdir(path) or os.path.islink(path):
@@ -680,7 +769,7 @@ def evaluate(items, registry, args, census, measured):
         if m.get("cross_device"):
             holds.append("CONTAINS_MOUNT_POINT")
         item["protected_reasons"] = [h for h in holds if h in (
-            "PINNED", "BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE",
+            "PINNED", "PIN_STATE_UNKNOWN", "BUILD_LOCK_HELD", "RECORDED_BUILD_ALIVE", "LIVE_PROCESS_REFERENCE",
             "RECENT_ACTIVITY", "DIRECTORY_IDENTITY_CHANGED", "CONTAINS_MOUNT_POINT",
         )]
         item["eligible"] = not holds
@@ -847,15 +936,42 @@ def resolve_target(spec, args):
     return item
 
 
+def effective_owner(args):
+    """The acting owner is the caller's own identity.  --owner may only restate it:
+    owner names are advisory labels within one Unix account (anyone in the account
+    can set EMUWIZ_OWNER or edit the registry), not an authenticated identity."""
+    me = owner_name()
+    if args.owner and args.owner != me:
+        raise SystemExit(
+            f"emuwiz-cargo-retention: --owner {args.owner!r} differs from your owner {me!r}; "
+            "owner names are advisory labels, not an access control, and a pin is only "
+            "released by the owner label that created it (set EMUWIZ_OWNER to act under "
+            "a different label deliberately)"
+        )
+    return me
+
+
+def checked_pin_data(registry, item, default):
+    """Existing pin data, a default when genuinely absent, otherwise refuse."""
+    state, data = registry.read_checked("pins", item["key"], valid_pin_file)
+    if state == "invalid":
+        raise SystemExit(
+            f"emuwiz-cargo-retention: PIN_STATE_UNKNOWN: the pin record for {item['name']} "
+            f"({registry.path('pins', item['key'])}) is unreadable or malformed; refusing to "
+            "change it. The target is held. Inspect and repair or move the file by hand."
+        )
+    return data if state == "ok" else default
+
+
 def cmd_pin(args):
     if args.reason not in PIN_REASONS:
         raise SystemExit(f"--reason must be one of: {', '.join(PIN_REASONS)}")
     item = resolve_target(args.target, args)
     registry = Registry(create=True)
-    owner = args.owner or owner_name()
+    owner = effective_owner(args)
     meta = registry.meta_lock()
     try:
-        data = registry.read("pins", item["key"]) or {"target": item["target"], "pins": []}
+        data = checked_pin_data(registry, item, {"target": item["target"], "pins": []})
         for pin in data["pins"]:
             if pin["owner"] == owner and pin["reason"] == args.reason:
                 print(f"already pinned by {owner} for {args.reason}: {item['name']}")
@@ -872,10 +988,10 @@ def cmd_pin(args):
 def cmd_release(args):
     item = resolve_target(args.target, args)
     registry = Registry(create=True)
-    owner = args.owner or owner_name()
+    owner = effective_owner(args)
     meta = registry.meta_lock()
     try:
-        data = registry.read("pins", item["key"]) or {"pins": []}
+        data = checked_pin_data(registry, item, {"pins": []})
         mine = [p for p in data["pins"] if p["owner"] == owner and (not args.reason or p["reason"] == args.reason)]
         if not mine:
             others = sorted({p["owner"] for p in data["pins"]})
@@ -902,7 +1018,14 @@ def cmd_adopt(args):
     meta = registry.meta_lock()
     try:
         st = os.lstat(item["target"])
-        record = registry.read("targets", item["key"]) or {
+        state, existing = registry.read_checked("targets", item["key"], valid_target_record)
+        if state == "invalid":
+            raise SystemExit(
+                f"emuwiz-cargo-retention: the registry record for {item['name']} "
+                f"({registry.path('targets', item['key'])}) is unreadable or malformed; "
+                "refusing to overwrite it. Inspect and repair or move it by hand."
+            )
+        record = existing or {
             "schema": 1, "key": item["key"], "target": item["target"],
             "target_name": item["name"], "first_seen": now(), "active": [],
         }

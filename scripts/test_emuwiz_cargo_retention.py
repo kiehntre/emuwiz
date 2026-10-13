@@ -494,5 +494,168 @@ class Planning(Env):
         self.assertEqual(sorted(os.listdir(self.targets)), before)
 
 
+class Corrections(Planning):
+    """Regressions for the independent review of 6b10debd (B1, B2, C1)."""
+
+    def pin_path(self, t):
+        return os.path.join(self.reg, "pins", self.key_of(t) + ".json")
+
+    def rec_path(self, t):
+        return os.path.join(self.reg, "targets", self.key_of(t) + ".json")
+
+    def write_pin(self, t, body):
+        os.makedirs(os.path.join(self.reg, "pins"), exist_ok=True)
+        path = self.pin_path(t)
+        if os.path.exists(path):
+            os.chmod(path, 0o600)
+        with open(path, "w") as handle:
+            handle.write(body)
+        return path
+
+    GOOD_PIN = '{"target": "x", "pins": [{"owner": "o", "reason": "independent-review", "note": "", "since": 1}]}'
+
+    def test_b1_unknown_pin_state_always_holds_and_selects_nothing(self):
+        wt, t = self.eligible_cache("wt-b1")
+        name = os.path.basename(t)
+        bad = {
+            "truncated": '{"pins": [',
+            "empty file": "",
+            "list root": "[]",
+            "string root": '"pinned"',
+            "pins not a list": '{"pins": 5}',
+            "pin entry not an object": '{"pins": [1]}',
+            "pin entry missing owner": '{"pins": [{"reason": "independent-review"}]}',
+            "pin owner wrong type": '{"pins": [{"owner": 7, "reason": "independent-review"}]}',
+        }
+        for label, body in bad.items():
+            path = self.write_pin(t, body)
+            plan = self.plan()
+            held = self.held(plan, name)
+            self.assertIsNotNone(held, label)
+            self.assertIn("PIN_STATE_UNKNOWN", held["holds"], label)
+            self.assertEqual(self.selected_under(plan, t), [], label)
+            with open(path) as handle:
+                self.assertEqual(handle.read(), body, label + ": evidence must not be rewritten")
+        # permission failure (inaccessible record)
+        path = self.write_pin(t, self.GOOD_PIN)
+        os.chmod(path, 0)
+        try:
+            plan = self.plan()
+            self.assertIn("PIN_STATE_UNKNOWN", self.held(plan, name)["holds"])
+            self.assertEqual(self.selected_under(plan, t), [])
+        finally:
+            os.chmod(path, 0o600)
+
+    def test_b1_valid_absent_and_empty_pin_records_are_distinguished(self):
+        wt, t = self.eligible_cache("wt-b1-ok")
+        name = os.path.basename(t)
+        self.assertIsNone(self.held(self.plan(), name))  # genuinely absent: eligible
+        self.write_pin(t, self.GOOD_PIN)
+        held = self.held(self.plan(), name)
+        self.assertIn("PINNED", held["holds"])
+        self.assertNotIn("PIN_STATE_UNKNOWN", held["holds"])
+        self.write_pin(t, '{"target": "x", "pins": []}')  # valid, nothing applicable
+        plan = self.plan()
+        self.assertIsNone(self.held(plan, name))
+        self.assertNotEqual(self.selected_under(plan, t), [])
+
+    def test_b1_pin_and_release_refuse_to_touch_an_unreadable_pin_record(self):
+        wt, t = self.eligible_cache("wt-b1-cmd")
+        path = self.write_pin(t, '{"pins": [')
+        for args in (("pin", wt, "--reason", "release-build"), ("release", wt)):
+            r = self.ret(*args)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("PIN_STATE_UNKNOWN", r.stderr + r.stdout)
+        with open(path) as handle:
+            self.assertEqual(handle.read(), '{"pins": [')
+
+    def logging_cargo(self):
+        fake = os.path.join(self.tmp, "logging-cargo")
+        with open(fake, "w") as f:
+            f.write(
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$*" >>"$ARGS_LOG"\n'
+                'if [ -n "${CORRUPT_ME:-}" ]; then printf "[1]" >"$CORRUPT_ME"; fi\n'
+                'exit "${FAKE_EXIT:-0}"\n'
+            )
+        os.chmod(fake, 0o755)
+        return fake
+
+    def test_b2_malformed_registry_records_never_block_a_build(self):
+        wt = self.worktree("wt-b2")
+        t = self.target_of(wt)
+        self.assertEqual(self.iso(wt, "check").returncode, 0)
+        args_log = os.path.join(self.tmp, "args.log")
+        env = dict(self.env, EMUWIZ_CARGO=self.logging_cargo(), ARGS_LOG=args_log, FAKE_EXIT="7")
+        shapes = [
+            '"x"', '[1]', '42', 'null', '{"active": 5}', '{"active": [1]}',
+            '{"target": "t", "active": [{"pid": "a", "starttime": 1, "boot_id": "b"}]}',
+            '{"target": "t", "active": [{"pid": 1, "starttime": [], "boot_id": 3}]}',
+            '{"target": 5, "active": []}', '{', '',
+        ]
+        for body in shapes:
+            with open(self.rec_path(t), "w") as handle:
+                handle.write(body)
+            before = os.path.getsize(args_log) if os.path.exists(args_log) else 0
+            r = self.iso(wt, "test", "-p", "x", "--lib", env=env)
+            self.assertEqual(r.returncode, 7, (body, r.stderr))
+            self.assertNotIn("Traceback", r.stderr, body)
+            self.assertIn("building untracked", r.stderr, body)
+            with open(args_log) as handle:
+                handle.seek(before)
+                self.assertEqual(handle.read().strip(), "test -p x --lib", body)
+            with open(self.rec_path(t)) as handle:
+                self.assertEqual(handle.read(), body, "malformed evidence must be preserved")
+            # the lock was released and the target stays ineligible
+            self.assertFalse(self.lock_held(t), body)
+            self.assertIn("NO_LIFECYCLE_RECORD", self.held(self.plan(), os.path.basename(t))["holds"], body)
+
+    def lock_held(self, t):
+        import fcntl
+        lk = os.path.join(self.reg, "locks", self.key_of(t) + ".lock")
+        if not os.path.exists(lk):
+            return False
+        fd = os.open(lk, os.O_RDONLY)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            return False
+        finally:
+            os.close(fd)
+
+    def test_b2_record_corrupted_while_building_keeps_cargo_exit_status(self):
+        wt = self.worktree("wt-b2-end")
+        t = self.target_of(wt)
+        self.assertEqual(self.iso(wt, "check").returncode, 0)
+        env = dict(self.env, EMUWIZ_CARGO=self.logging_cargo(), ARGS_LOG=os.path.join(self.tmp, "a.log"),
+                   CORRUPT_ME=self.rec_path(t), FAKE_EXIT="3")
+        r = self.iso(wt, "check", env=env)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        with open(self.rec_path(t)) as handle:
+            self.assertEqual(handle.read(), "[1]")
+        self.assertFalse(self.lock_held(t))
+
+    def test_c1_release_cannot_impersonate_another_owner(self):
+        wt, t = self.eligible_cache("wt-c1")
+        env_a = dict(self.env, EMUWIZ_OWNER="reviewer-A")
+        env_b = dict(self.env, EMUWIZ_OWNER="agent-B")
+        self.assertEqual(self.ret("pin", wt, "--reason", "independent-review", env=env_a).returncode, 0)
+        for args in (("release", wt, "--owner", "reviewer-A"),
+                     ("pin", wt, "--reason", "release-build", "--owner", "reviewer-A")):
+            r = self.ret(*args, env=env_b)
+            self.assertNotEqual(r.returncode, 0, args)
+            self.assertIn("advisory", r.stderr + r.stdout)
+        plan = self.plan()
+        self.assertIn("PINNED", self.held(plan, os.path.basename(t))["holds"])
+        with open(self.pin_path(t)) as handle:
+            self.assertEqual(len(json.load(handle)["pins"]), 1)
+        # the effective owner can still release its own pin, with or without --owner
+        self.assertEqual(self.ret("release", wt, "--owner", "reviewer-A", env=env_a).returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

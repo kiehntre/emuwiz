@@ -16,7 +16,10 @@ Every build runs under `emuwiz-cargo-retention run`, which
   registry (`~/.cache/emuwiz-cargo-retention`, override `EMUWIZ_RETENTION_DIR`);
 * runs cargo with unchanged arguments and environment, forwards signals, returns its exit
   code (or dies by the same signal);
-* never blocks a build when the registry is unusable. `EMUWIZ_RETENTION=0` disables it.
+* never blocks a build when the registry is unusable or a record is malformed: it reports the
+  tracking failure, releases the lock, leaves the malformed evidence untouched and runs cargo
+  untracked (the target then has no valid lifecycle record and stays ineligible).
+  `EMUWIZ_RETENTION=0` disables tracking the same way.
 
 `--print-target`, the 8 GiB free-space guard and all target isolation are unchanged.
 
@@ -34,6 +37,14 @@ scripts/emuwiz-cargo-retention adopt TARGET --owner NAME     # record an owner f
 
 `TARGET` is a target name, directory, or the worktree path it belongs to. The owner is
 `$EMUWIZ_OWNER`, else `$USER`. Pins survive restarts and are never released by age.
+
+Owner names are **advisory labels inside one Unix account**, not a security boundary: anyone
+with the account can set `EMUWIZ_OWNER` or edit the registry. `--owner` may only restate your
+own label; naming another owner is refused so a pin is not released by accident or by
+supplying someone else's name. Pin state that is unreadable, corrupt or of the wrong shape is
+`PIN_STATE_UNKNOWN`: the target is held, nothing is selected, `pin`/`release` refuse to touch
+the file and it is never rewritten. A malformed target record is likewise preserved and the
+target has no lifecycle record.
 `status`, `list` and `plan` are read-only and create nothing.
 
 ## What makes a target retirable (all must hold, otherwise HOLD)
