@@ -471,7 +471,29 @@ impl RenameTransaction {
     }
 }
 
+/// One entry whose outcome is not known to be settled: it is still in flight
+/// (`Applying`/`RollingBack`) or its rollback failed. It is reported
+/// explicitly so it is never mistaken for a success, a clean failure or an
+/// untouched file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEntry {
+    pub source_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub state: EntryState,
+    /// Where it stopped, e.g. "directory synchronisation after rename".
+    pub stage: String,
+    /// The journalled reason, when one was recorded (it may be absent after a
+    /// crash; absence never means the entry is safe).
+    pub detail: Option<String>,
+    /// What must happen before anything else touches this entry.
+    pub required_action: String,
+}
+
 /// A human-readable summary of an apply or rollback run.
+///
+/// Every entry is counted in exactly one of `applied`, `skipped`, `failed`,
+/// `rolled_back`, `pending` (not yet attempted) or `unresolved`, so
+/// [`TransactionSummary::accounted`] always equals `requested`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TransactionSummary {
     pub transaction_id: String,
@@ -479,11 +501,13 @@ pub struct TransactionSummary {
     pub applied: usize,
     pub skipped: usize,
     pub failed: usize,
-    /// Entries whose filesystem outcome is not established: still `Applying`
-    /// or `RollingBack` (for example a rename that succeeded but whose
-    /// directory sync failed). Never counted as applied, failed or skipped,
-    /// and never allowed to vanish from the totals.
+    /// Entries whose rename was reversed.
+    pub rolled_back: usize,
+    /// Entries not yet attempted (`Planned`/`PreflightPassed`).
+    pub pending: usize,
+    /// Entries in flight or with a failed rollback: outcome not established.
     pub unresolved: usize,
+    pub unresolved_entries: Vec<UnresolvedEntry>,
     pub rollback: RollbackStatus,
     /// Seconds since the Unix epoch when the run started/ended, when known.
     pub started_at_unix: Option<u64>,
@@ -492,13 +516,37 @@ pub struct TransactionSummary {
 
 impl TransactionSummary {
     pub fn from_transaction(transaction: &RenameTransaction) -> Self {
+        let unresolved_entries: Vec<UnresolvedEntry> = transaction
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    EntryState::Applying | EntryState::RollingBack | EntryState::RollbackFailed
+                )
+            })
+            .map(unresolved_entry)
+            .collect();
+        let pending = transaction
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    EntryState::Planned | EntryState::PreflightPassed
+                )
+            })
+            .count();
         Self {
             transaction_id: transaction.transaction_id.clone(),
             requested: transaction.entries.len(),
             applied: transaction.applied_count(),
             skipped: transaction.skipped_count(),
             failed: transaction.failed_count(),
-            unresolved: transaction.unresolved_count(),
+            rolled_back: transaction.rolled_back_count(),
+            pending,
+            unresolved: unresolved_entries.len(),
+            unresolved_entries,
             rollback: match transaction.state {
                 TransactionState::RolledBack => RollbackStatus::FullyRolledBack,
                 TransactionState::RollbackFailed => RollbackStatus::RollbackFailed,
@@ -514,6 +562,60 @@ impl TransactionSummary {
             started_at_unix: None,
             ended_at_unix: None,
         }
+    }
+
+    /// Sum of every disjoint bucket; equals `requested` for a summary built by
+    /// [`Self::from_transaction`].
+    pub fn accounted(&self) -> usize {
+        self.applied
+            + self.skipped
+            + self.failed
+            + self.rolled_back
+            + self.pending
+            + self.unresolved
+    }
+
+    /// True only when nothing is in flight, nothing failed and nothing is
+    /// still pending: the only state in which a run may be called complete.
+    pub fn fully_resolved(&self) -> bool {
+        self.unresolved == 0 && self.pending == 0 && self.failed == 0
+    }
+}
+
+fn unresolved_entry(entry: &TransactionEntry) -> UnresolvedEntry {
+    let sync_failed = entry.state == EntryState::Applying
+        && entry
+            .failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains(super::dirsync::SYNC_FAILURE_MARKER));
+    let (stage, required_action) = match entry.state {
+        EntryState::Applying if sync_failed => (
+            "directory synchronisation after rename",
+            "Run recovery reconciliation: the rename happened but its directory entries are not \
+             proven durable. Do not repeat the rename.",
+        ),
+        EntryState::Applying => (
+            "rename in flight (completion not recorded)",
+            "Run recovery reconciliation against the filesystem before any further action; do \
+             not replay the rename.",
+        ),
+        EntryState::RollingBack => (
+            "reverse rename in flight (completion not recorded)",
+            "Run recovery reconciliation against the filesystem before any further action; do \
+             not repeat the reverse rename.",
+        ),
+        _ => (
+            "rollback failed",
+            "Review the journalled reason; the file may still be at the destination.",
+        ),
+    };
+    UnresolvedEntry {
+        source_path: entry.source_path.clone(),
+        destination_path: entry.destination_path.clone(),
+        state: entry.state,
+        stage: stage.to_string(),
+        detail: entry.failure_reason.clone(),
+        required_action: required_action.to_string(),
     }
 }
 

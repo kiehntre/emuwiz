@@ -1098,8 +1098,13 @@ fn show_transaction_row(
 
         ui.label(
             egui::RichText::new(format!(
-                "Requested {} · Applied {} · Failed {} · Skipped {}",
-                summary.requested, summary.applied, summary.failed, summary.skipped
+                "Requested {} · Applied {} · Failed {} · Skipped {} · Unresolved {} · Pending {}",
+                summary.requested,
+                summary.applied,
+                summary.failed,
+                summary.skipped,
+                summary.unresolved,
+                summary.pending
             ))
             .small()
             .color(theme::muted(ui)),

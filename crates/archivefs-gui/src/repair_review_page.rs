@@ -1499,6 +1499,18 @@ fn show_transaction_result_body(ui: &mut egui::Ui, result: &RepairTransactionRes
             "Unresolved (in flight)",
             &result.summary.unresolved.to_string(),
         );
+        for entry in &result.summary.unresolved_entries {
+            detail_label(
+                ui,
+                "Needs recovery",
+                &format!(
+                    "{} ({}): {}",
+                    entry.destination_path.display(),
+                    entry.stage,
+                    entry.required_action
+                ),
+            );
+        }
     }
     detail_label(ui, "Rollback", result.summary.rollback.label());
     if !result.reverify.is_empty() {
@@ -1549,7 +1561,7 @@ fn quarantine_group_headline(result: &RepairTransactionResult) -> &'static str {
         "Quarantine group has unresolved in-flight changes - review before continuing"
     } else if summary.applied == 0 {
         "Quarantine group produced no applied changes"
-    } else if summary.failed > 0 || summary.skipped > 0 {
+    } else if summary.failed > 0 || summary.skipped > 0 || summary.pending > 0 {
         "Quarantine group partially applied"
     } else {
         "Quarantine group complete"

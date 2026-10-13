@@ -481,3 +481,243 @@ fn completion_checkpoint_is_never_written_after_a_failed_sync() {
     assert_ne!(persisted(&f).entries[0].state, EntryState::Applied);
     assert_ne!(persisted(&f).state, TransactionState::Applied);
 }
+
+// ---------------------------------------------------------------------------
+// R3 sync-failure safety: recovery classification and truthful reporting.
+// ---------------------------------------------------------------------------
+
+mod sync_safety {
+    use super::*;
+    use crate::platform_evidence_fusion::plan_transaction::{RecoveryAssessment, assess_recovery};
+    use std::os::unix::fs::MetadataExt;
+
+    fn inode(path: &Path) -> (u64, u64) {
+        let m = std::fs::metadata(path).unwrap();
+        (m.dev(), m.ino())
+    }
+
+    /// The recovery verdict must never be SAFE_TO_RESUME while an entry is in flight,
+    /// whatever findings were (or were not) persisted.
+    fn assert_blocked(t: &RenameTransaction, why: &str) {
+        for issues in [&[][..]] {
+            assert_eq!(
+                assess_recovery(t, issues),
+                RecoveryAssessment::ManualRecoveryRequired,
+                "{why}: an unresolved Applying entry must block automatic replay"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_sync_with_no_recorded_findings_is_never_safe_to_resume() {
+        let f = fx(&["a.bin", "b.bin"], false);
+        install(&f, Some(f.roms.clone()), None);
+        let out = run(&f).unwrap();
+        clear();
+        assert_eq!(out.transaction.entries[0].state, EntryState::Applying);
+        // Transaction-level state is ApplyFailed with zero Applied entries: the
+        // shape that used to fall through to SAFE_TO_RESUME.
+        assert_eq!(out.transaction.state, TransactionState::ApplyFailed);
+        assert_eq!(out.transaction.applied_count(), 0);
+        assert_blocked(&out.transaction, "in-memory outcome, no issues");
+        // The sync-failure reason was never durably recorded.
+        let mut p = persisted(&f);
+        p.entries[0].failure_reason = None;
+        assert_blocked(&p, "persisted, reason lost");
+        // Even a persisted DirectorySyncFailed finding is conservative, not resumable.
+        let issue = RecoveryIssue {
+            entry_index: 0,
+            kind: RecoveryIssueKind::DirectorySyncFailed,
+            detail: "x".into(),
+        };
+        assert_eq!(
+            assess_recovery(&p, &[issue]),
+            RecoveryAssessment::ManualRecoveryRequired
+        );
+    }
+
+    #[test]
+    fn a_settled_failure_without_in_flight_entries_is_still_resumable() {
+        // Guard against over-blocking: a preflight failure leaves nothing in flight.
+        let f = fx(&["a.bin"], false);
+        let mut tx = f.tx.clone();
+        tx.entries[0].state = EntryState::ApplyFailed;
+        tx.state = TransactionState::ApplyFailed;
+        assert_eq!(assess_recovery(&tx, &[]), RecoveryAssessment::SafeToResume);
+    }
+
+    #[test]
+    fn crash_points_never_yield_safe_to_resume() {
+        // 1+2: immediately after the rename, before any directory fsync.
+        let f = fx(&["a.bin"], false);
+        install(&f, None, Some((false, f.roms.clone())));
+        assert!(catch_unwind(AssertUnwindSafe(|| run(&f))).is_err());
+        clear();
+        assert_blocked(&persisted(&f), "crash after rename, before fsync");
+        assert!(f.roms.join("A.bin").exists() && !f.roms.join("a.bin").exists());
+
+        // 3: after the destination-directory fsync, before the source-directory fsync.
+        let f = fx(&["a.bin"], true);
+        install(&f, None, Some((true, f.sub.clone())));
+        assert!(catch_unwind(AssertUnwindSafe(|| run(&f))).is_err());
+        clear();
+        let p = persisted(&f);
+        assert_eq!(p.entries[0].state, EntryState::Applying);
+        assert_blocked(&p, "crash between destination and source fsync");
+
+        // 4: the fsync failed but the journal never recorded the failure: the journal
+        // exactly as it stood when the failing fsync was issued is what survives.
+        let f = fx(&["a.bin"], false);
+        let journal = journal_path(&f.journal, &f.tx.transaction_id).unwrap();
+        let snapshot = Rc::new(RefCell::new(Vec::new()));
+        {
+            let snapshot = snapshot.clone();
+            let journal = journal.clone();
+            set_test_hook(Some(Box::new(move |event| {
+                if let DirSyncEvent::Before(_) = event {
+                    *snapshot.borrow_mut() = std::fs::read(&journal).unwrap();
+                    return Err(io::Error::from_raw_os_error(libc::EIO));
+                }
+                Ok(())
+            })));
+        }
+        let _ = run(&f).unwrap();
+        clear();
+        std::fs::write(&journal, &*snapshot.borrow()).unwrap(); // the error marker did not survive
+        let p = persisted(&f);
+        assert_eq!(p.entries[0].state, EntryState::Applying);
+        assert!(p.entries[0].failure_reason.is_none());
+        assert_blocked(&p, "failed fsync, error never recorded");
+
+        // 5: fsync succeeded but the completion checkpoint was never written.
+        let f = fx(&["a.bin"], false);
+        install(&f, None, Some((true, f.roms.clone())));
+        assert!(catch_unwind(AssertUnwindSafe(|| run(&f))).is_err());
+        clear();
+        let mut p = persisted(&f);
+        assert_eq!(p.entries[0].state, EntryState::Applying);
+        assert_blocked(&p, "fsync ok, completion checkpoint missing");
+        // Reconciliation (positive filesystem identity + a successful sync) is what
+        // may settle it - never a replay.
+        let before = inode(&f.roms.join("A.bin"));
+        let issues = reconcile_recovery(&mut p, &f.journal).unwrap();
+        assert_eq!(issues[0].kind, RecoveryIssueKind::RenameConfirmed);
+        assert_eq!(inode(&f.roms.join("A.bin")), before);
+        assert_ne!(
+            assess_recovery(&p, &issues),
+            RecoveryAssessment::SafeToResume
+        );
+    }
+
+    #[test]
+    fn restart_cannot_repeat_an_unverified_rename_or_record_completion() {
+        let f = fx(&["a.bin", "b.bin"], false);
+        install(&f, Some(f.roms.clone()), None);
+        let _ = run(&f).unwrap();
+        clear();
+        let renamed = f.roms.join("A.bin");
+        let before = inode(&renamed);
+        // Restart: reconciliation with the sync still failing leaves it unresolved ...
+        let mut p = persisted(&f);
+        install(&f, Some(f.roms.clone()), None);
+        let issues = reconcile_recovery(&mut p, &f.journal).unwrap();
+        clear();
+        assert_eq!(issues[0].kind, RecoveryIssueKind::DirectorySyncFailed);
+        assert_eq!(p.entries[0].state, EntryState::Applying);
+        // ... and replaying the batch neither renames again nor records completion.
+        let mut replay = persisted(&f);
+        let result = apply_transaction(&mut ApplyExecution {
+            transaction: &mut replay,
+            approved_paths: f.approved.clone(),
+            current_generation: 1,
+            trusted: TrustedRoots::from_paths([&f.roms]),
+            journal_dir: f.journal.clone(),
+            hard_conflict_mode: HardConflictMode::AbortAll,
+            cancel: &no_cancel(),
+            directory_policy: super::super::preflight::DirectoryPolicy::SameFilesystem,
+            allow_symlink_source: false,
+        });
+        if let Ok(out) = result {
+            assert_ne!(out.transaction.state, TransactionState::Applied);
+            assert_eq!(out.summary.applied, 0);
+        }
+        assert_eq!(inode(&renamed), before, "no second rename");
+        let p = persisted(&f);
+        assert_ne!(p.state, TransactionState::Applied);
+        assert!(p.entries.iter().all(|e| e.state != EntryState::Applied));
+    }
+
+    #[test]
+    fn summary_reports_the_unresolved_entry_and_reconciles() {
+        let f = fx(&["a.bin", "b.bin", "c.bin"], true);
+        install(&f, Some(f.sub.clone()), None);
+        let out = run(&f).unwrap();
+        clear();
+        let s = &out.summary;
+        assert_eq!(s.requested, 3);
+        assert_eq!(s.applied, 0, "never reported as applied");
+        assert_eq!(s.failed, 0, "not a failure either: the rename happened");
+        assert_eq!(s.unresolved, 1);
+        assert_eq!(s.pending, 2, "later entries were never attempted");
+        assert_eq!(
+            s.accounted(),
+            s.requested,
+            "no entry is lost or double-counted"
+        );
+        assert!(!s.fully_resolved());
+        let u = &s.unresolved_entries[0];
+        assert_eq!(u.state, EntryState::Applying);
+        assert_eq!(u.source_path, f.roms.join("a.bin"));
+        assert_eq!(u.destination_path, f.sub.join("A.bin"));
+        assert!(u.stage.contains("directory"), "stage: {}", u.stage);
+        assert!(u.detail.as_deref().unwrap_or("").contains("synchronised"));
+        assert!(
+            u.required_action.to_lowercase().contains("recover"),
+            "{}",
+            u.required_action
+        );
+        // And nothing recorded a successful completion.
+        let p = persisted(&f);
+        assert_ne!(p.state, TransactionState::Applied);
+    }
+
+    #[test]
+    fn every_entry_state_is_counted_exactly_once() {
+        let f = fx(&["a.bin"], false);
+        let states = [
+            EntryState::Planned,
+            EntryState::PreflightPassed,
+            EntryState::Applying,
+            EntryState::Applied,
+            EntryState::ApplyFailed,
+            EntryState::RollingBack,
+            EntryState::RolledBack,
+            EntryState::RollbackFailed,
+            EntryState::Skipped,
+        ];
+        let mut tx = f.tx.clone();
+        let template = tx.entries[0].clone();
+        tx.entries = states
+            .iter()
+            .map(|state| TransactionEntry {
+                state: *state,
+                ..template.clone()
+            })
+            .collect();
+        let s = TransactionSummary::from_transaction(&tx);
+        assert_eq!(s.requested, states.len());
+        assert_eq!(s.accounted(), s.requested);
+        assert_eq!(
+            (
+                s.applied,
+                s.skipped,
+                s.failed,
+                s.rolled_back,
+                s.pending,
+                s.unresolved
+            ),
+            (1, 1, 1, 1, 2, 3)
+        );
+        assert_eq!(s.unresolved_entries.len(), 3);
+    }
+}

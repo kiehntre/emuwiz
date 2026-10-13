@@ -75,6 +75,7 @@ pub use model::{
     EntryState, ExactResumeEnvelope, ExactResumeOperation, ExactResumeState, ObjectFreshness,
     ObjectIdentity, ObjectKind, RecoveryResolution, RenameTransaction, RollbackResult,
     RollbackStatus, TransactionEntry, TransactionOperation, TransactionState, TransactionSummary,
+    UnresolvedEntry,
 };
 pub use noclobber::{NoClobberError, rename_noreplace};
 pub use preflight::{

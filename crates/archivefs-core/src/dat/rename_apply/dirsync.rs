@@ -35,13 +35,23 @@ pub(crate) fn sync_rename_parents(source: &Path, destination: &Path) -> io::Resu
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| missing(source))?;
-    let first = sync_directory(destination_parent);
+    let first = sync_directory(destination_parent)
+        .map_err(|e| staged("destination directory", destination_parent, e));
     let second = if same_directory(source_parent, destination_parent) {
         Ok(())
     } else {
-        sync_directory(source_parent)
+        sync_directory(source_parent).map_err(|e| staged("source directory", source_parent, e))
     };
     first.and(second)
+}
+
+/// Marker the executor puts in an entry's `failure_reason` when the rename
+/// completed but its directory entries could not be synchronised. Used only
+/// for REPORTING; recovery decisions never depend on this text.
+pub(crate) const SYNC_FAILURE_MARKER: &str = "could not be synchronised";
+
+fn staged(stage: &str, dir: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{stage} {}: {error}", dir.display()))
 }
 
 fn same_directory(a: &Path, b: &Path) -> bool {
