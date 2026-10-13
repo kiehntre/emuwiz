@@ -1417,6 +1417,29 @@ def cmd_plan(args):
 # ----------------------------------------------------------------------- main
 
 
+_BUDGET_WARNED = set()
+
+
+def budget_from_env(name, default):
+    """A byte budget from the environment.  A malformed, non-positive or absurd value is
+    reported once on stderr and the documented default is used, so a bad optional
+    setting can never stop a build, a release or `--finish-task`."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw.strip())
+        if not 0 < value <= 10 ** 15:
+            raise ValueError("out of range")
+        return value
+    except ValueError:
+        if name not in _BUDGET_WARNED:
+            _BUDGET_WARNED.add(name)
+            print(f"emuwiz-cargo-retention: ignoring invalid {name}={raw!r} (need a positive integer byte count "
+                  f"up to 10^15); using the default {default}", file=sys.stderr)
+        return default
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="emuwiz-cargo-retention", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -1424,8 +1447,8 @@ def build_parser():
     def common(sp):
         sp.add_argument("--repo", help="repository whose worktrees are enumerated (default: this script's)")
         sp.add_argument("--extra-target", action="append", help="additional target directory to inventory")
-        sp.add_argument("--soft-budget", type=int, default=int(os.environ.get("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET)))
-        sp.add_argument("--hard-budget", type=int, default=int(os.environ.get("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET)))
+        sp.add_argument("--soft-budget", type=int, default=budget_from_env("EMUWIZ_SOFT_BUDGET_BYTES", SOFT_BUDGET))
+        sp.add_argument("--hard-budget", type=int, default=budget_from_env("EMUWIZ_HARD_BUDGET_BYTES", HARD_BUDGET))
         sp.add_argument("--min-idle-hours", type=float, default=MIN_IDLE_HOURS)
         sp.add_argument("--accept-foreign-process-gap", action="store_true",
                         help="do not HOLD for other users' processes this user cannot inspect (recorded in output)")

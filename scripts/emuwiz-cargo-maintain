@@ -148,8 +148,11 @@ def ensure_state():
 def append_history(event, at=None):
     ensure_state()
     event = dict(event, at=now() if at is None else at, by=F.owner_name())
-    fd = os.open(history_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(history_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or _unsafe_mode(st) or st.st_uid not in trusted_policy_uids():
+            raise OSError("history file is not a safe authority file; refusing to append")
         os.write(fd, (json.dumps(event, sort_keys=True) + "\n").encode())
         os.fsync(fd)
     finally:
@@ -209,6 +212,75 @@ def _trusted_file(path, trusted, want_dir=False):
     return True, ""
 
 
+def _unsafe_mode(st):
+    return bool(st.st_mode & 0o022)
+
+
+def read_trusted_text(path, trusted):
+    """Contents of an authority file, or None.  Never follows a symlink; requires a regular
+    file with a trusted owner and no group/world write; the identity seen by lstat, by
+    fstat on the opened descriptor and by lstat after reading must agree (a replacement
+    during the read makes the file unreadable).  Parsing alone never makes a file trusted."""
+    try:
+        before = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(before.st_mode) or _unsafe_mode(before) or before.st_uid not in trusted:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISREG(st.st_mode) \
+                or _unsafe_mode(st) or st.st_uid not in trusted:
+            return None
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        after = os.lstat(path)
+    except OSError:
+        return None
+    if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+        return None
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def authority_dirs_ok(trusted):
+    """(ok, why): the maintenance directory is a real directory owned by a trusted account
+    and not group/world writable, and the registry directory above it is a real directory
+    owned by a trusted account and not world-writable.  The registry directory is
+    group-writable by default (umask 002); that cannot substitute the maintenance
+    directory with one owned by the approving account, and the maintenance directory's
+    own owner/mode are checked here, so only world-writability is refused above it."""
+    ok, why = _trusted_file(state_dir(), trusted, want_dir=True)
+    if not ok:
+        return False, why
+    try:
+        st = os.lstat(F.registry_dir())
+    except OSError as error:
+        return False, f"registry directory unreadable: {error.strerror}"
+    if not stat.S_ISDIR(st.st_mode):
+        return False, "registry directory is not a real directory"
+    if st.st_uid not in trusted:
+        return False, f"registry directory is owned by uid {st.st_uid}, not an approving account"
+    if st.st_mode & 0o002:
+        return False, "registry directory is world writable"
+    return True, ""
+
+
 def _is_count(value, minimum=0):
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
@@ -243,25 +315,74 @@ def _generation(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
 
-def last_transition():
-    """The newest policy transition in the append-only history (None if none)."""
-    last = None
-    for event in read_history():
-        if event.get("event") in TRANSITIONS:
-            last = event
-    return last
+def read_authority_history(trusted):
+    """(events, why): the COMPLETE history, or (None, why) when it cannot be trusted:
+    unsafe file or directory, not newline-terminated (truncated), or any line that is not
+    a JSON object.  Every line must parse; a torn or garbage line is not skipped."""
+    text = read_trusted_text(history_path(), trusted)
+    if text is None:
+        return None, "history is missing, unreadable or not a safe authority file"
+    if text and not text.endswith("\n"):
+        return None, "history is truncated (no final newline)"
+    events = []
+    for number, line in enumerate(text.split("\n")[:-1] if text else [], 1):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            return None, f"history line {number} is not valid JSON"
+        if not isinstance(value, dict):
+            return None, f"history line {number} is not an object"
+        events.append(value)
+    return events, ""
+
+
+def transitions_of(events):
+    """(transitions, why): the policy transitions in file order, each fully validated, with
+    strictly increasing generations.  Duplicate, conflicting, malformed or out-of-order
+    generations make the sequence unreconcilable."""
+    out, last_gen = [], -1
+    for event in events:
+        if event.get("event") not in TRANSITIONS:
+            continue
+        gen = _generation(event.get("generation"))
+        digest = event.get("digest")
+        if gen is None or not isinstance(digest, str) or not digest:
+            return None, "a policy transition record is malformed"
+        if gen <= last_gen:
+            return None, f"policy generations are duplicated or out of order (generation {gen} after {last_gen})"
+        last_gen = gen
+        out.append(event)
+    return out, ""
+
+
+def reconcile_enablement(trans, rec, policy_digest):
+    """True iff the whole transition history agrees with the state record and the policy:
+    the state generation is the highest recorded one, the final transition is the matching
+    `policy_enabled`, and every transition since the latest approval names this digest."""
+    if not trans:
+        return False
+    last = trans[-1]
+    if last.get("event") != "policy_enabled" or last.get("digest") != policy_digest \
+            or last.get("generation") != rec["generation"]:
+        return False
+    since = 0
+    for index, event in enumerate(trans):
+        if event.get("event") == "policy_approved":
+            since = index
+    if trans[since].get("event") != "policy_approved":
+        return False
+    return all(e.get("digest") == policy_digest for e in trans[since:])
 
 
 def read_state_record(trusted):
     """(record or None): the single persistent enablement state, or None when it is
-    missing, unsafe (symlink, wrong owner/mode) or malformed."""
-    ok, _ = _trusted_file(enable_path(), trusted)
-    if not ok:
+    missing, unsafe (symlink, wrong owner/mode, replaced while read) or malformed."""
+    text = read_trusted_text(enable_path(), trusted)
+    if text is None:
         return None
     try:
-        with open(enable_path()) as handle:
-            rec = json.load(handle)
-    except (OSError, ValueError):
+        rec = json.loads(text)
+    except ValueError:
         return None
     if not isinstance(rec, dict) or rec.get("schema") != 2 or rec.get("state") not in ("ENABLED", "DISABLED") \
             or _generation(rec.get("generation")) is None or not isinstance(rec.get("policy_digest"), str):
@@ -270,20 +391,26 @@ def read_state_record(trusted):
 
 
 def verify_enablement(policy, trusted):
-    """True only when ALL of: the single state record says ENABLED for THIS policy
-    digest; and the newest transition in the append-only history is the matching
-    `policy_enabled` with the same generation and digest.  Generations only increase, so
-    an older ENABLED record can never override a newer DISABLED/approved transition, and
-    an interrupted transition (record and history disagree) leaves the policy disabled.
-    The `enabled` flag inside the policy file is informational and never counts.  This is
-    structural verification: unkeyed records cannot stop an attacker who controls the
-    approving account."""
+    """True only when authority can be fully reconciled: safe directories; a safe state
+    record that is ENABLED for THIS policy digest; a complete, safe, well-formed history
+    with strictly increasing generations whose highest generation equals the record's and
+    whose final transition is the matching `policy_enabled`.  Anything else, including a
+    replayed older ENABLED record, is disabled.  The `enabled` flag inside the policy file
+    is informational and never counts.
+
+    This is STRUCTURAL verification inside one account.  There is no independent trusted
+    anchor (no key, no root-owned counter): a writer who rewrites the state record AND the
+    whole history consistently is not detected."""
+    if not authority_dirs_ok(trusted)[0]:
+        return False
     rec = read_state_record(trusted)
     if rec is None or rec["state"] != "ENABLED" or rec["policy_digest"] != policy["digest"]:
         return False
-    last = last_transition()
-    return bool(last and last.get("event") == "policy_enabled" and last.get("digest") == policy["digest"]
-                and last.get("generation") == rec["generation"])
+    events, _ = read_authority_history(trusted)
+    if events is None:
+        return False
+    trans, _ = transitions_of(events)
+    return trans is not None and reconcile_enablement(trans, rec, policy["digest"])
 
 
 def load_policy(trusted_uids=None):
@@ -298,14 +425,18 @@ def load_policy(trusted_uids=None):
         return "absent", None, "no policy has been approved"
     except OSError as error:
         return "invalid", None, f"policy unreadable: {error.strerror}"
-    for target, want_dir in ((state_dir(), True), (path, False)):
-        ok, why = _trusted_file(target, trusted, want_dir)
-        if not ok:
-            return "invalid", None, "policy " + why
+    ok, why = authority_dirs_ok(trusted)
+    if not ok:
+        return "invalid", None, "policy directory " + why
+    ok, why = _trusted_file(path, trusted)
+    if not ok:
+        return "invalid", None, "policy " + why
+    text = read_trusted_text(path, trusted)
+    if text is None:
+        return "invalid", None, "policy is not a stable, safe authority file"
     try:
-        with open(path) as handle:
-            policy = json.load(handle)
-    except (OSError, ValueError) as error:
+        policy = json.loads(text)
+    except ValueError as error:
         return "invalid", None, f"policy unreadable: {error}"
     if not isinstance(policy, dict) or not validate_policy(policy):
         return "invalid", None, "policy is malformed or its integrity digest does not match"
@@ -370,6 +501,7 @@ def cmd_policy(args):
             # new policy => DISABLED state at a new generation, then the policy itself:
             # a crash in between leaves the old policy with a newer DISABLED generation
             gen = next_generation()
+            rotate_unreconciled_history()
             record_transition("policy_approved", gen, policy["digest"], "DISABLED", scope=policy["scope"])
             write_policy(policy)
         print("policy recorded and left DISABLED; enable it explicitly with `policy enable`")
@@ -405,15 +537,20 @@ def transition_lock():
     ensure_state()
     fd = os.open(os.path.join(state_dir(), ".policy-transition.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("emuwiz-cargo-maintain: waiting for an in-flight maintenance cycle or policy transition "
+                  "to finish (a running executor transaction is never interrupted)", file=sys.stderr, flush=True)
+            fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)
 
 
 def next_generation():
-    """One more than the highest generation seen in the state record or the history,
-    whichever is higher, so generations never repeat or go backwards."""
+    """One more than the highest generation seen anywhere (state record or any transition
+    line, tolerant of a damaged history), so generations never repeat or go backwards."""
     seen = [0]
     rec = read_state_record(trusted_policy_uids())
     if rec is not None:
@@ -422,6 +559,23 @@ def next_generation():
         if event.get("event") in TRANSITIONS and _generation(event.get("generation")) is not None:
             seen.append(event["generation"])
     return max(seen) + 1
+
+
+def rotate_unreconciled_history():
+    """Approval over a history that cannot be reconciled: move it aside (rename, never
+    delete) so the new policy starts from a clean, verifiable log; generations continue
+    from the highest value seen.  Returns the new name or None."""
+    trusted = trusted_policy_uids()
+    path = history_path()
+    if not os.path.lexists(path):
+        return None
+    events, _ = read_authority_history(trusted)
+    if events is not None and transitions_of(events)[0] is not None:
+        return None
+    aside = f"{path}.unreconciled-{int(now())}-{os.getpid()}"
+    os.replace(path, aside)
+    fsync_directory(state_dir())
+    return aside
 
 
 def record_transition(event, gen, digest, state, **extra):
@@ -793,39 +947,67 @@ def mark_retired(registry, item, freed, receipt):
 
 
 def cmd_run(args):
+    """One maintenance cycle.
+
+    Linearisation point: a destructive cycle holds the policy-transition lock from the
+    moment it re-reads authority until the executor has returned.  `policy disable`,
+    `enable` and `approve` take the same lock, so (a) none of them returns while an
+    executor transaction is running (they wait, and say so; the transaction is never
+    interrupted, which would break its journal), and (b) once one has returned, a cycle
+    that starts afterwards re-reads the new state under the lock and cannot delete.
+    Authority is checked again immediately before the executor is entered."""
     st, policy, why = load_policy()
     cycle_id = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now())) + f"-{os.getpid()}"
     if st == "invalid":
         append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "why": why})
         print(f"REFUSED: automatic retirement policy is invalid ({why})")
         return 1
+    if args.dry_run or not (policy and policy["enabled"]):
+        return plan_only_cycle(args, policy, cycle_id)
+    with transition_lock():
+        return locked_cycle(args, cycle_id)
+
+
+def plan_only_cycle(args, policy, cycle_id):
     ns, items, census, measured, s = snapshot(policy)
     plan = plan_cycle(policy, items, s, census)
     selected = plan["selected"]
-    enabled = bool(policy and policy["enabled"])
     write_usage(s, items)
-    if args.dry_run or not enabled:
-        mode = "dry-run" if args.dry_run else "disabled"
-        append_history({"event": "cycle", "id": cycle_id, "outcome": "DRY_RUN" if args.dry_run else "DISABLED",
-                        "would_select": [e["item"]["name"] for e in selected],
-                        "would_reclaim_bytes": plan.get("estimated_total", 0), "blocked": plan["blocked"]})
-        print(f"{mode}: automatic retirement did not delete anything "
-              f"(would select {len(selected)} target(s), ~{gb(plan.get('estimated_total', 0))}"
-              f"{'; ' + plan['blocked'] if plan['blocked'] else ''})")
-        return 0
+    mode = "dry-run" if args.dry_run else "disabled"
+    append_history({"event": "cycle", "id": cycle_id, "outcome": "DRY_RUN" if args.dry_run else "DISABLED",
+                    "would_select": [e["item"]["name"] for e in selected],
+                    "would_reclaim_bytes": plan.get("estimated_total", 0), "blocked": plan["blocked"]})
+    print(f"{mode}: automatic retirement did not delete anything "
+          f"(would select {len(selected)} target(s), ~{gb(plan.get('estimated_total', 0))}"
+          f"{'; ' + plan['blocked'] if plan['blocked'] else ''})")
+    return 0
+
+
+def authority_snapshot(policy):
+    """(digest, generation) of the authority a cycle is acting under, or None."""
+    rec = read_state_record(trusted_policy_uids())
+    return (policy["digest"], rec["generation"]) if rec else None
+
+
+def locked_cycle(args, cycle_id):
+    st, policy, why = load_policy()                      # re-read under the lock
+    if st != "ok":
+        append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED", "why": why})
+        print(f"REFUSED: automatic retirement policy is not valid ({why})")
+        return 1
+    if not policy["enabled"]:
+        return plan_only_cycle(args, policy, cycle_id)   # disabled before the cycle began
+    authority = authority_snapshot(policy)
+    ns, items, census, measured, s = snapshot(policy)
+    plan = plan_cycle(policy, items, s, census)
+    selected = plan["selected"]
+    write_usage(s, items)
     if plan["blocked"] or not selected:
         append_history({"event": "cycle", "id": cycle_id, "outcome": "NOTHING_TO_DO",
                         "why": plan["blocked"] or "no eligible released targets", "total_allocated": s["total_allocated"]})
         print(f"nothing to do: {plan['blocked'] or 'no eligible released targets'}")
         return 0
     ensure_state()
-    # authority is re-read from disk at the moment of use, never carried from planning
-    st2, policy2, why2 = load_policy()
-    if st2 != "ok" or not policy2["enabled"] or policy2["digest"] != policy["digest"]:
-        append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED",
-                        "why": "policy changed or lost approval during the cycle"})
-        print("REFUSED: policy changed or lost approval during the cycle")
-        return 1
     manifest = build_manifest(policy, plan, measured)
     verify_manifest_against_policy(manifest, policy, plan)
     mpath = os.path.join(state_dir(), "manifests", f"cycle-{cycle_id}.json")
@@ -833,7 +1015,15 @@ def cmd_run(args):
     with open(mpath, "rb") as handle:
         digest = hashlib.sha256(handle.read()).hexdigest()
     append_history({"event": "cycle_start", "id": cycle_id, "manifest": mpath, "manifest_sha256": digest,
-                    "policy_digest": policy["digest"], "targets": [e["item"]["name"] for e in selected]})
+                    "policy_digest": policy["digest"], "generation": authority[1] if authority else None,
+                    "targets": [e["item"]["name"] for e in selected]})
+    # final revalidation, immediately before the destructive executor is entered
+    st2, policy2, why2 = load_policy()
+    if st2 != "ok" or not policy2["enabled"] or authority_snapshot(policy2) != authority:
+        append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED",
+                        "why": "policy changed, replaced or lost approval before the executor was entered"})
+        print("REFUSED: policy changed, replaced or lost approval before the executor was entered")
+        return 1
     receipts = os.path.join(state_dir(), "receipts")
     rc, receipt, err = run_executor(mpath, digest, receipts)
     registry = F.Registry(create=True)
@@ -888,6 +1078,28 @@ def target_for_worktree(path):
     name = F.sanitized(os.path.basename(wt))
     digest = hashlib.sha256(wt.encode()).hexdigest()[:12]
     return wt, os.path.join(F.target_root(), f"{name}-{digest}")
+
+
+def trusted_history_events(trusted):
+    """Events from the current history and any rotated (`.unreconciled-*`) logs, each read
+    only if it is a safe authority file; unreadable files contribute nothing."""
+    names = [history_path()]
+    try:
+        names += sorted(os.path.join(state_dir(), n) for n in os.listdir(state_dir())
+                        if n.startswith("history.jsonl.unreconciled-"))
+    except OSError:
+        pass
+    out = []
+    for path in names:
+        text = read_trusted_text(path, trusted)
+        for line in (text or "").splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                out.append(value)
+    return out
 
 
 def _read_json_file(path):
@@ -973,7 +1185,7 @@ def verify_retirement(record, target):
         if ident and (ident.get("dev"), ident.get("ino")) != (st.st_dev, st.st_ino):
             return False, "directory was replaced after retirement"
         if not any(h.get("event") == "cycle_start" and h.get("manifest_sha256") == msha
-                   and os.path.basename(target) in (h.get("targets") or []) for h in read_history()):
+                   and os.path.basename(target) in (h.get("targets") or []) for h in trusted_history_events(trusted)):
             return False, "no matching cycle in the maintenance history"
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
         return False, f"evidence unreadable or inconsistent ({type(error).__name__})"

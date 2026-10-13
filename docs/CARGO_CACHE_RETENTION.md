@@ -219,6 +219,35 @@ worktree-local targets too), an atomic reservation so simultaneous cold builds c
 the same cached total, durable recording of configuration changes, and tests for all of them.
 Until then nothing can cap running builds; nothing is ever killed or evicted to meet a number.
 
+### Policy state, ordering and cancellation (R2)
+- **State machine.** `enable.json` (single state record: ENABLED/DISABLED, generation, policy digest)
+  plus the append-only `history.jsonl`. Enablement is accepted only if the *whole* history parses
+  (every line a JSON object, newline-terminated), policy transitions have strictly increasing
+  generations, the record's generation is the highest, the final transition is the matching
+  `policy_enabled`, and every transition since the latest approval names this policy digest.
+  A replayed older ENABLED record or event, a duplicate/out-of-order/malformed generation, a torn or
+  garbage line, or a missing history all leave the policy disabled. `policy approve` over an
+  unreconcilable history renames it to `history.jsonl.unreconciled-<time>-<pid>` (never deletes it)
+  and continues the generation counter.
+- **Provenance.** policy, state record and history are read with `O_NOFOLLOW`, must be regular files
+  owned by the effective user, the registry owner or root, not group/world-writable, and unchanged
+  between lstat, fstat and a post-read lstat. The maintenance directory must be owned/trusted and
+  not group/world-writable; the registry directory must be trusted and not world-writable.
+- **Ordering.** approve, enable and disable take `.policy-transition.lock`. A destructive cycle
+  holds the same lock from re-reading authority until the executor returns, so the linearisation
+  point is that re-read under the lock. `disable`/`approve` called during a cycle WAIT (and print
+  that they are waiting); a transaction already in the executor is never interrupted (that would
+  break its journal) and completes whole. Once disable has returned, no cycle can start or continue:
+  a later cycle re-reads DISABLED under the lock. Authority (policy digest + generation) is checked
+  once more immediately before the executor is entered; a replaced policy, or a disable written
+  directly into the state files, makes that check REFUSE the cycle.
+- **Limits.** There is no independent trusted anchor: someone who can rewrite the policy, the state
+  record and the entire history consistently (or root) is not detected. Cancellation of a running
+  executor is not offered.
+- **Budget variables.** `EMUWIZ_SOFT_BUDGET_BYTES`/`EMUWIZ_HARD_BUDGET_BYTES` must be positive
+  integers up to 10^15; anything else is reported once and the default is used, so a bad value never
+  blocks a build or `--finish-task`. Automatic retirement uses only the validated policy limits.
+
 ### Scheduled operation (opt-in)
 `emuwiz-cargo-maintain units` prints a systemd service/timer pair (root, for a complete census;
 `ConditionPathExists` on the policy). Nothing is installed or enabled by default.
