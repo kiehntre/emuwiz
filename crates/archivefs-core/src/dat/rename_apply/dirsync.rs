@@ -12,11 +12,24 @@
 //!     trusted roots (`RenameDirs::open_in`: root once, then `openat(O_NOFOLLOW)` per
 //!     component), so a substituted ancestor is refused rather than followed. With NO
 //!     trusted roots (legacy callers/tests) only the final component is protected.
-//!   * Recovery (`reconcile_recovery`) has no trusted-root input: it binds the two parents
-//!     with `O_NOFOLLOW` + an identity check, classifies the entry THROUGH those
-//!     descriptors against the journalled identity, then syncs and re-verifies them. A
-//!     higher ancestor swapped between the path-based open and the descriptor walk is
-//!     only caught by the identity checks, not by a root anchor.
+//!   * Recovery (`reconcile_recovery`) anchors at the journalled collection root
+//!     (`source_scan_root`) when both parents lie below it, using the same per-component
+//!     `O_NOFOLLOW` walk; otherwise the parents must be their own real paths. A redirected,
+//!     moved or symlink-substituted ancestor cannot bind, so the entry stays unresolved and
+//!     is never promoted to Applied on file identity alone.
+//!   * CONCURRENT EXTERNAL WRITERS (documented limitation, not a guarantee): containment is
+//!     proved at the moment of the final verification. A process with write access to the
+//!     collection that relocates an ancestor AFTER that check but BEFORE the journal is
+//!     published can leave a durable `Applied` record for an object that is no longer
+//!     where it was verified. This is indistinguishable from the same relocation after a
+//!     normal completion. `Applied` records what happened and was verified; it does not
+//!     promise the path stays contained. Later operations (undo, restore, cleanup
+//!     classification) re-check identity and containment themselves and do not trust the
+//!     journalled state alone.
+//!   * TRUSTED-ROOT ASSUMPTION: the trusted root path itself is opened by following links,
+//!     so a root that is (or is later replaced by) a symlink is accepted as the anchor and
+//!     is not re-proved. Everything BELOW the root is walked without following symlinks.
+//!     Callers must supply roots they control.
 //!   * Any parent replaced after binding is detected after the fact (`verify_bound`): the
 //!     entry stays in flight; completion is never recorded.
 //!   * Creating destination directories (`create_dir` in plan apply and quarantine) and
