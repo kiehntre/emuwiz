@@ -116,6 +116,8 @@ jobs:
       # never actually checked in CI.
       - name: Install desktop-file-utils
         run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
+      - run: bash tests/test_install_environment_isolation.sh
+      - run: bash scripts/test-check-version-consistency.sh
       - run: bash tests/test_install.sh
       - run: python3 tests/test_installer_asset_races.py
 

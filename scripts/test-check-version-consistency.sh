@@ -69,6 +69,33 @@ expect_reject unknown-word "## v0.8.0-alpha (draft)" "0.8.0-alpha"
 
 release_note "check-version-consistency CHANGELOG-heading tests passed"
 
+# The shipped GUI prints its native-v2 identity, not the bare CLI-style line.
+# Drive --binary-dir with stub binaries: the exact line must pass, and a wrong
+# version, a bare "emuwiz <version>", or a wrong generation must still fail.
+WORKSPACE_VERSION="$(release_workspace_version "$(release_repo_root)")"
+stub_binaries() {
+    local dir=$1 gui_line=$2
+    mkdir -p -- "$dir"
+    printf '#!/bin/sh\necho "emuwiz-cli %s"\n' "$WORKSPACE_VERSION" >"$dir/emuwiz-cli"
+    printf '#!/bin/sh\necho "%s"\n' "$gui_line" >"$dir/emuwiz"
+    chmod +x -- "$dir/emuwiz-cli" "$dir/emuwiz"
+}
+expect_binaries() {
+    local label=$1 want=$2 gui_line=$3 dir="$TEMP_ROOT/bin-$1"
+    stub_binaries "$dir" "$gui_line"
+    local status=0
+    "$SCRIPT_DIR/check-version-consistency.sh" --binary-dir "$dir" >/dev/null 2>&1 || status=$?
+    if [[ "$want" == ok && $status -ne 0 ]] || [[ "$want" == reject && $status -eq 0 ]]; then
+        release_die "binary check $label: expected $want (exit $status)"
+    fi
+}
+expect_binaries gui-v2-identity ok "emuwiz $WORKSPACE_VERSION · GUI v2 (native-v2)"
+expect_binaries bare-version reject "emuwiz $WORKSPACE_VERSION"
+expect_binaries wrong-version reject "emuwiz 0.0.1 · GUI v2 (native-v2)"
+expect_binaries wrong-generation reject "emuwiz $WORKSPACE_VERSION · GUI v2 (legacy)"
+expect_binaries missing-generation reject "emuwiz $WORKSPACE_VERSION · GUI v2"
+release_note "check-version-consistency binary identity tests passed"
+
 # Sanity: the real script, run against this actual repository's real
 # CHANGELOG.md/README.md (no --binary-dir/--artifact/--checksum, so only
 # the documentation checks run), must currently pass end to end.

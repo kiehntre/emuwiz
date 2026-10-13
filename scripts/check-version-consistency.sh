@@ -57,7 +57,10 @@ if [[ -n "$BINARY_DIR" ]]; then
     [[ -x "$BINARY_DIR/emuwiz" ]] || release_die "GUI binary missing in $BINARY_DIR"
     [[ "$($BINARY_DIR/emuwiz-cli --version)" == "emuwiz-cli $VERSION" ]] ||
         release_die "CLI --version disagrees with workspace version"
-    [[ "$($BINARY_DIR/emuwiz --version)" == "emuwiz $VERSION" ]] ||
+    # The shipped GUI is the native v2 entrypoint, whose full identity is
+    # "emuwiz <version> · GUI v2 (native-v2)" (crates/archivefs-gui gui_v2::run).
+    # The whole line is required: version and generation must both agree.
+    [[ "$($BINARY_DIR/emuwiz --version)" == "emuwiz $VERSION · GUI v2 (native-v2)" ]] ||
         release_die "GUI --version disagrees with workspace version"
 fi
 

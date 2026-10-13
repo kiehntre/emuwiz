@@ -27,6 +27,20 @@ suite_started_seconds=$(date +%s)
 # TTY on stdin, which is exactly why this bug never reproduced there.
 exec </dev/null
 
+# Never inherit the caller's configuration/data location overrides. install.sh
+# honours EMUWIZ_CONFIG_HOME, XDG_CONFIG_HOME and XDG_DATA_HOME (correctly), so
+# a runner or developer shell that exports one would redirect every install
+# below away from the scratch $HOME these tests inspect, and would let the
+# installer read or write the caller's real configuration. Tests that need an
+# override set it explicitly for that one invocation with `env`.
+unset EMUWIZ_CONFIG_HOME XDG_CONFIG_HOME XDG_DATA_HOME
+# Test seam for tests/test_install_environment_isolation.sh.
+if [ "${EMUWIZ_INSTALL_TEST_ENV_PROBE:-}" = 1 ]; then
+    printf 'EMUWIZ_CONFIG_HOME=%s\nXDG_CONFIG_HOME=%s\nXDG_DATA_HOME=%s\n' \
+        "${EMUWIZ_CONFIG_HOME+set}" "${XDG_CONFIG_HOME+set}" "${XDG_DATA_HOME+set}"
+    exit 0
+fi
+
 script_dir=$(dirname -- "$0")
 script_dir=$(CDPATH= cd -- "$script_dir" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
