@@ -2144,9 +2144,16 @@ impl ArchiveFsApp {
         let mut recheck = false;
         widgets::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("DuckStation: which installation and profile EmuWiz will use");
+                ui.strong("DuckStation: shared resolver recommendation (preview)");
                 recheck = ui.button("Re-check").clicked();
             });
+            ui.label(
+                egui::RichText::new(
+                    "This is what EmuWiz's shared resolver recommends. Launch and Cheats & Mods are not connected to it yet, so it does not guarantee which installation they use. Changing saved preferences is not supported here yet.",
+                )
+                .small()
+                .color(theme::muted(ui)),
+            );
             match &self.emulator_readiness.duckstation_resolution {
                 DuckStationResolutionState::NotScanned
                 | DuckStationResolutionState::Scanning { .. } => {

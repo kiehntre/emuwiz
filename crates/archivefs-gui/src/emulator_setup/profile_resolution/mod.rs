@@ -361,9 +361,9 @@ pub(crate) fn present_resolution(
                 ResolutionHealth::Healthy
             };
             presentation.headline = if bypassed {
-                "Using a fallback — your preferred DuckStation is unavailable".to_string()
+                "Recommending a fallback — your preferred DuckStation is unavailable".to_string()
             } else {
-                "DuckStation will use this installation".to_string()
+                "Recommended DuckStation installation".to_string()
             };
             if bypassed {
                 presentation.next_steps.push(

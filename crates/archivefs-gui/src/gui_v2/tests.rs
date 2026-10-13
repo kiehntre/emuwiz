@@ -9247,7 +9247,7 @@ mod duckstation_profile_resolution {
         assert!(
             strings
                 .iter()
-                .any(|text| text.contains("which installation and profile EmuWiz will use"))
+                .any(|text| text.contains("shared resolver recommendation (preview)"))
         );
         assert!(
             strings
@@ -9255,6 +9255,12 @@ mod duckstation_profile_resolution {
                 .any(|text| text == "No DuckStation installation was found")
         );
         assert!(strings.iter().any(|text| text.starts_with("Next:")));
+        assert!(
+            strings
+                .iter()
+                .any(|text| text.contains("not connected to it yet")
+                    && text.contains("Changing saved preferences is not supported"))
+        );
         // Rendering does not restart the scan for a current answer.
         assert_eq!(readiness(&mut app).duckstation_resolution_generation, 7);
 
