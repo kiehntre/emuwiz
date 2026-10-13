@@ -170,7 +170,15 @@ fn missing_checksums_are_unverifiable_not_confirmed_absent() {
             rom("hashed", Some(1), None, Some(S3)),
         ],
     )]);
-    let b = ni(vec![]);
+    let b = ni(vec![game(
+        "Z",
+        vec![rom(
+            "z",
+            Some(1),
+            None,
+            Some("ffffffffffffffffffffffffffffffffffffffff"),
+        )],
+    )]);
     let r = cmp(&a, &b);
     let by: BTreeMap<_, _> = r
         .only_in_a
@@ -274,7 +282,9 @@ fn incompatible_catalogues_are_refused_unless_explicitly_allowed() {
     assert_eq!(cmp(&v1, &v2).compatibility, Compatibility::VariantDiffers);
     let unknown = dat(DatEcosystem::NoIntro, None, vec![]);
     assert_eq!(
-        cmp(&unknown, &v1).compatibility,
+        compare(&unknown, &v1, [None, None], DuelOptions::default())
+            .unwrap_err()
+            .compatibility,
         Compatibility::UnverifiedNamespace
     );
 }
@@ -327,8 +337,140 @@ fn section_listing_is_capped_but_counts_stay_complete() {
         max_items_per_section: 3,
         ..Default::default()
     };
-    let r = compare(&a, &ni(vec![]), [None, None], opt).unwrap();
+    let r = compare(
+        &a,
+        &ni(vec![game(
+            "Z",
+            vec![rom(
+                "z",
+                Some(1),
+                None,
+                Some("ffffffffffffffffffffffffffffffffffffffff"),
+            )],
+        )]),
+        [None, None],
+        opt,
+    )
+    .unwrap();
     assert_eq!(r.only_in_a.len(), 3);
     assert_eq!(r.summary.only_in_a_no_counterpart, 10);
     assert_eq!(r.truncated_sections, vec!["only_in_a"]);
+}
+
+#[test]
+fn crc_size_only_pairs_are_probable_not_verified_even_when_name_paired() {
+    let two = |g: &str| {
+        game(
+            g,
+            vec![
+                rom("r1", Some(4), Some("aaaaaaaa"), None),
+                rom("r2", Some(4), Some("aaaaaaaa"), None),
+            ],
+        )
+    };
+    let r = cmp(&ni(vec![two("g")]), &ni(vec![two("g")]));
+    assert_eq!(r.summary.verified_same_name, 0);
+    assert_eq!(r.summary.probable_same_name, 2);
+}
+
+#[test]
+fn name_paired_multi_record_group_keeps_bios_difference_visible() {
+    let mk = |bios: bool| {
+        let mut r1 = rom("r1", Some(4), None, Some(S1));
+        if bios {
+            r1.bios = Some("yes".into());
+        }
+        vec![
+            game("g1", vec![r1]),
+            game("g2", vec![rom("r1", Some(4), None, Some(S1))]),
+        ]
+    };
+    let r = cmp(&ni(mk(true)), &ni(mk(false)));
+    assert_eq!(r.summary.bios_flag_differences, 1);
+    assert_eq!(r.summary.verified_by_sha1, 2);
+}
+
+#[test]
+fn capped_bucket_cannot_hide_the_same_name_match() {
+    let junk = |p: &str| -> Vec<DatRomEntry> {
+        (0..8)
+            .map(|i| {
+                rom(
+                    &format!("{p}{i}"),
+                    Some(9),
+                    Some(&format!("{i:08x}")),
+                    Some(S1),
+                )
+            })
+            .collect()
+    };
+    let mut ga = junk("a");
+    ga.push(rom("x", Some(4), None, Some(S1)));
+    let mut gb = junk("b");
+    gb.push(rom("x", Some(4), None, Some(S1)));
+    let r = cmp(&ni(vec![game("g", ga)]), &ni(vec![game("g", gb)]));
+    assert!(r.summary.candidate_buckets_truncated > 0);
+    assert!(r.summary.verified_same_name >= 1, "{:?}", r.summary);
+    assert!(!r.same_name_unverified.iter().any(|p| p.a.rom == "x"));
+}
+
+#[test]
+fn incomparable_algorithms_are_unverifiable_not_confirmed_absent() {
+    let md5 = DatRomEntry {
+        name: "q".into(),
+        size_bytes: Some(4),
+        md5: Some("a".repeat(32)),
+        ..Default::default()
+    };
+    let a = ni(vec![game("G", vec![rom("p", Some(4), None, Some(S1))])]);
+    let b = ni(vec![game("H", vec![md5])]);
+    let r = cmp(&a, &b);
+    assert_eq!(r.summary.only_in_a_unverifiable, 1);
+    assert_eq!(r.summary.only_in_b_unverifiable, 1);
+    assert_eq!(
+        r.summary.only_in_a_no_counterpart + r.summary.only_in_b_no_counterpart,
+        0
+    );
+}
+
+#[test]
+fn duplicate_same_name_record_is_not_silently_dropped() {
+    let a = ni(vec![game("G", vec![rom("r", Some(4), None, Some(S1))])]);
+    let b = ni(vec![game(
+        "G",
+        vec![
+            rom("r", Some(4), None, Some(S1)),
+            rom("r", Some(4), None, Some(S1)),
+        ],
+    )]);
+    let r = cmp(&a, &b);
+    assert_eq!(r.ambiguous.len(), 1);
+    assert_eq!(r.ambiguous[0].b.len(), 2);
+}
+
+#[test]
+fn missing_header_name_requires_explicit_override() {
+    let a = dat(DatEcosystem::NoIntro, None, vec![]);
+    let b = ni(vec![]);
+    assert!(compare(&a, &b, [None, None], DuelOptions::default()).is_err());
+    let opt = DuelOptions {
+        allow_incompatible: true,
+        ..Default::default()
+    };
+    assert!(
+        !compare(&a, &b, [None, None], opt)
+            .unwrap()
+            .naming_comparable
+    );
+}
+
+#[test]
+fn same_name_different_hashes_order_by_evidence_not_input_position() {
+    let g = |s: &str| game("G", vec![rom("r", Some(1), None, Some(s))]);
+    let (b1, b2) = (ni(vec![g(S1), g(S2)]), ni(vec![g(S2), g(S1)]));
+    let other = ni(vec![game("G", vec![rom("r", Some(2), None, Some(S3))])]);
+    assert_eq!(
+        serde_json::to_string(&cmp(&b1, &other)).unwrap(),
+        serde_json::to_string(&cmp(&b2, &other)).unwrap()
+    );
 }

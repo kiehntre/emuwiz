@@ -38,6 +38,9 @@ fn execute(
             .ok_or("--limit requires a number")?
             .parse::<usize>()
             .map_err(|_| "--limit must be a non-negative integer")?;
+        if value == 0 {
+            return Err("--limit must be at least 1".into());
+        }
         limit = value.min(DEFAULT_MAX_ITEMS_PER_SECTION);
         args.drain(pos..=pos + 1);
     }

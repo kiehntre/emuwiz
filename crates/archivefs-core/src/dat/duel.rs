@@ -84,7 +84,7 @@ impl Compatibility {
     fn is_incompatible(self) -> bool {
         matches!(
             self,
-            Self::IncompatibleEcosystem | Self::IncompatibleCatalogue
+            Self::IncompatibleEcosystem | Self::IncompatibleCatalogue | Self::UnverifiedNamespace
         )
     }
 }
@@ -546,8 +546,39 @@ fn basis_of(t: &Tier) -> Option<MatchBasis> {
     }
 }
 
+/// Comparable key classes a record carries, as (kind, class). Absence is only a
+/// confirmed difference when the other catalogue has records in one of them.
+fn key_classes(e: &RomEvidence) -> Vec<(&'static str, &'static str)> {
+    let mut v = Vec::new();
+    if e.sha256.is_some() {
+        v.push((e.kind, "sha256"));
+    }
+    if e.sha1.is_some() {
+        v.push((e.kind, "sha1"));
+    }
+    if e.md5.is_some() {
+        v.push((e.kind, "md5"));
+    }
+    if e.crc32.is_some() && e.size_bytes.is_some() {
+        v.push((e.kind, "crc32_size"));
+    }
+    v
+}
+
+fn class_set(recs: &[Rec]) -> BTreeSet<(&'static str, &'static str)> {
+    recs.iter().flat_map(|r| key_classes(&r.ev)).collect()
+}
+
 fn candidates(rec: &RomEvidence, other: &Index, truncated: &mut usize) -> BTreeSet<usize> {
     let mut found = BTreeSet::new();
+    // Same-name records are always inspected, so a capped hash bucket can never
+    // hide the one record the catalogues most plausibly agree on.
+    if let Some(same) = other
+        .by_name
+        .get(&(rec.game.clone(), rec.rom.clone(), rec.kind))
+    {
+        found.extend(same.iter().take(MAX_CANDIDATES_PER_RECORD).copied());
+    }
     let mut take = |bucket: Option<&Vec<usize>>| {
         if let Some(bucket) = bucket {
             if bucket.len() > MAX_CANDIDATES_PER_RECORD {
@@ -652,8 +683,28 @@ fn summarise(
     }
 }
 
-fn sort_key(e: &RomEvidence) -> (String, String, &'static str) {
-    (e.game.clone(), e.rom.clone(), e.kind)
+type SortKey = (
+    String,
+    String,
+    &'static str,
+    Option<u64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn sort_key(e: &RomEvidence) -> SortKey {
+    (
+        e.game.clone(),
+        e.rom.clone(),
+        e.kind,
+        e.size_bytes,
+        e.sha256.clone(),
+        e.sha1.clone(),
+        e.md5.clone(),
+        e.crc32.clone(),
+    )
 }
 
 fn capped<T>(
@@ -682,7 +733,7 @@ pub fn compare(
         return Err(DuelRefusal {
             compatibility,
             detail: format!(
-                "refusing to compare incompatible catalogues: A is {:?} / {:?}, B is {:?} / {:?}. \
+                "refusing to compare catalogues whose namespace is incompatible or unverified (a missing header name counts): A is {:?} / {:?}, B is {:?} / {:?}. \
                  Different ecosystems or platform catalogues are not interchangeable; pass \
                  --allow-incompatible to see hash evidence only.",
                 a.source.ecosystem.label(),
@@ -772,42 +823,60 @@ pub fn compare(
             tier_of.contains_key(&(i, j))
                 && name_relation(&ra[i].ev, &rb[j].ev) == NameRelation::Identical
         };
-        let all_paired = ai.iter().all(|&i| bj.iter().any(|&j| ident(i, j)))
-            && bj.iter().all(|&j| ai.iter().any(|&i| ident(i, j)));
-        if ai.len() == 1 && bj.len() == 1 {
-            let t = tier_of[&(ai[0], bj[0])].clone();
-            let p = make_pairing(ai[0], bj[0], Vec::new(), Some(&t));
-            if p.bios_differs {
-                summary.bios_flag_differences += 1;
-            }
-            if let Tier::Verified(f) = &t {
-                match *f {
-                    "sha256" => summary.verified_by_sha256 += 1,
-                    "sha1" => summary.verified_by_sha1 += 1,
-                    _ => summary.verified_by_md5 += 1,
+        // A clean pairing is one-to-one: a single record on each side, or the
+        // same number of records where each has exactly one identically-named
+        // counterpart. Anything else (duplicates, extras) stays visible below.
+        let clean: Option<Vec<(usize, usize)>> = if ai.len() == 1 && bj.len() == 1 {
+            Some(vec![(ai[0], bj[0])])
+        } else if ai.len() == bj.len() {
+            let mut out = Vec::new();
+            let mut ok = true;
+            for &i in &ai {
+                let idents: Vec<usize> = bj.iter().copied().filter(|&j| ident(i, j)).collect();
+                if idents.len() != 1 || ai.iter().filter(|&&k| ident(k, idents[0])).count() != 1 {
+                    ok = false;
+                    break;
                 }
+                out.push((i, idents[0]));
             }
-            let verified = matches!(t, Tier::Verified(_));
-            if p.name_relation == NameRelation::Identical {
-                if verified {
-                    summary.verified_same_name += 1;
-                } else {
-                    summary.probable_same_name += 1;
-                }
+            ok.then_some(out)
+        } else {
+            None
+        };
+        if let Some(pairs) = clean {
+            for (i, j) in pairs {
+                let t = tier_of[&(i, j)].clone();
+                let p = make_pairing(i, j, Vec::new(), Some(&t));
                 if p.bios_differs {
-                    // surfaced as a rename-style finding so it stays visible
+                    summary.bios_flag_differences += 1;
+                }
+                if let Tier::Verified(f) = &t {
+                    match *f {
+                        "sha256" => summary.verified_by_sha256 += 1,
+                        "sha1" => summary.verified_by_sha1 += 1,
+                        _ => summary.verified_by_md5 += 1,
+                    }
+                }
+                let verified = matches!(t, Tier::Verified(_));
+                if p.name_relation == NameRelation::Identical {
+                    if verified {
+                        summary.verified_same_name += 1;
+                    } else {
+                        summary.probable_same_name += 1;
+                    }
+                    if p.bios_differs {
+                        // surfaced as a rename-style finding so it stays visible
+                        renamed.push(p);
+                    }
+                } else {
+                    if verified {
+                        summary.renamed_verified += 1;
+                    } else {
+                        summary.renamed_probable += 1;
+                    }
                     renamed.push(p);
                 }
-            } else {
-                if verified {
-                    summary.renamed_verified += 1;
-                } else {
-                    summary.renamed_probable += 1;
-                }
-                renamed.push(p);
             }
-        } else if all_paired {
-            summary.verified_same_name += ai.len();
         } else {
             summary.ambiguous_groups += 1;
             let truncated = ai.len() > MAX_GROUP_MEMBERS || bj.len() > MAX_GROUP_MEMBERS;
@@ -905,14 +974,18 @@ pub fn compare(
     // the unmatched side's view; covered above because only unmatched records
     // seed the loops and `j`/`i` may be matched.
 
-    let only = |recs: &[Rec], matched: &[bool], named: &[bool]| -> Vec<OnlyEntry> {
+    let only = |recs: &[Rec],
+                matched: &[bool],
+                named: &[bool],
+                other: &BTreeSet<(&'static str, &'static str)>|
+     -> Vec<OnlyEntry> {
         let mut out: Vec<OnlyEntry> = recs
             .iter()
             .enumerate()
             .filter(|(i, _)| !matched[*i] && !named[*i])
             .map(|(_, r)| OnlyEntry {
                 record: r.ev.clone(),
-                absence: if r.ev.strength >= Strength::Crc32AndSize {
+                absence: if key_classes(&r.ev).iter().any(|c| other.contains(c)) {
                     Absence::NoCounterpart
                 } else {
                     Absence::Unverifiable
@@ -922,8 +995,9 @@ pub fn compare(
         out.sort_by_key(|e| sort_key(&e.record));
         out
     };
-    let only_in_a = only(&ra, &matched_a, &named_a);
-    let only_in_b = only(&rb, &matched_b, &named_b);
+    let (classes_a, classes_b) = (class_set(&ra), class_set(&rb));
+    let only_in_a = only(&ra, &matched_a, &named_a, &classes_b);
+    let only_in_b = only(&rb, &matched_b, &named_b, &classes_a);
     for e in &only_in_a {
         match e.absence {
             Absence::NoCounterpart => summary.only_in_a_no_counterpart += 1,
@@ -1015,6 +1089,19 @@ pub fn render_text(report: &DuelReport, per_section: usize) -> String {
         );
     }
     let _ = writeln!(out, "Namespace: {:?}", report.compatibility);
+    if report.compatibility == Compatibility::VariantDiffers {
+        let _ = writeln!(
+            out,
+            "  NOTE: same platform, different variant tags; hash differences are expected."
+        );
+    }
+    if report.summary.candidate_buckets_truncated > 0 {
+        let _ = writeln!(
+            out,
+            "  INCOMPLETE: {} shared-hash buckets exceeded the candidate cap; same-name records were still inspected, other relations in those buckets may be unlisted.",
+            report.summary.candidate_buckets_truncated
+        );
+    }
     if !report.naming_comparable {
         let _ = writeln!(
             out,
@@ -1058,6 +1145,14 @@ pub fn render_text(report: &DuelReport, per_section: usize) -> String {
             s.only_in_b_unverifiable,
         ),
         ("BIOS flag differences", s.bios_flag_differences),
+        (
+            "duplicate-checksum groups in A",
+            s.duplicate_checksum_groups_a,
+        ),
+        (
+            "duplicate-checksum groups in B",
+            s.duplicate_checksum_groups_b,
+        ),
     ] {
         let _ = writeln!(out, "  {v:>8}  {k}");
     }
