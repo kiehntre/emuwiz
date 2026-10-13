@@ -483,18 +483,19 @@ fn render_stage_text(
             ui.visuals().warn_fg_color,
             egui::RichText::new(notice.heading()).strong(),
         );
-        // One truncated row per summary line, so long paths can never push
-        // Play out of view; hovering a row shows it whole.
+        // A fallback or warning is one truncated row per summary line, so long
+        // paths can never push Play out of view; hovering shows it whole. A
+        // refusal has no Play to protect and its pinned target and reasons
+        // are the point, so it wraps and is never elided.
+        let wrap = notice.kind == launch_readiness_page::GamerResolverNoticeKind::Blocked;
         for line in &notice.summary {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(line)
-                        .size(theme::TECHNICAL_SIZE)
-                        .color(theme::SECONDARY_TEXT),
-                )
-                .truncate(),
-            )
-            .on_hover_text(line);
+            let label = egui::Label::new(
+                egui::RichText::new(line)
+                    .size(theme::TECHNICAL_SIZE)
+                    .color(theme::SECONDARY_TEXT),
+            );
+            let label = if wrap { label.wrap() } else { label.truncate() };
+            ui.add(label).on_hover_text(line);
         }
         egui::CollapsingHeader::new("Full paths and reason")
             .id_salt("duckstation_resolver_notice_details")

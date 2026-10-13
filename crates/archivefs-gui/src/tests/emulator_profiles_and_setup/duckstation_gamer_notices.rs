@@ -167,8 +167,14 @@ fn texts(output: &egui::FullOutput) -> Vec<(String, egui::Rect, egui::Rect)> {
         out: &mut Vec<(String, egui::Rect, egui::Rect)>,
     ) {
         match shape {
+            // What is actually drawn: an elided galley keeps its whole backing
+            // string, so use the rendered rows (which end in the ellipsis).
             egui::Shape::Text(t) => out.push((
-                t.galley.text().into(),
+                if t.galley.elided {
+                    t.galley.rows.iter().map(|row| row.text()).collect()
+                } else {
+                    t.galley.text().into()
+                },
                 egui::Rect::from_min_size(t.pos, t.galley.size()),
                 clip,
             )),
@@ -396,6 +402,20 @@ fn forced_unavailable_shows_the_resolver_reason_and_keeps_the_setup_handoff() {
             assert!(
                 visible(&drawn, "Gone"),
                 "unavailable target named: {drawn:#?}"
+            );
+            // The pinned target and the actual refusal reasons are on screen
+            // by default (no hover, no disclosure).
+            assert!(
+                visible(&drawn, "Gone/DuckStation.AppImage"),
+                "pinned target displayed: {drawn:#?}"
+            );
+            assert!(
+                visible(&drawn, "the program file is missing"),
+                "refusal reason displayed: {drawn:#?}"
+            );
+            assert!(
+                visible(&drawn, "the configuration folder is missing"),
+                "refusal reason displayed: {drawn:#?}"
             );
             assert!(
                 visible(&drawn, "will not use any other DuckStation installation"),
