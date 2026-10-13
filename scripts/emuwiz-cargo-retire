@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+"""emuwiz-cargo-retire: manifest-authorised retirement of Cargo compiler artifacts.
+
+DRY RUN by default.  Nothing is deleted unless --execute is given together with
+the approved manifest digest.  It deletes only the exact compiler-artifact paths
+named by the approved manifest, and only when every gate below passes; anything
+unknown, uncertain or failed is HOLD (left in place, with a reason).
+
+Gates (all required, per cache):
+  * the manifest's SHA-256 equals --approved-sha256;
+  * the cache is a real directory reached without symlinks, with the manifest's
+    device/inode, and no mount point inside the deleted subtrees;
+  * a lifecycle record whose adoption is VERIFIED against the source (path hash or
+    source path + exact HEAD) - an adoption record alone never authorises deletion;
+  * the exclusive lifecycle lock is obtained (builds hold it shared), then a fresh
+    process census shows no reference (cwd, exe, fds, maps, CARGO_TARGET_DIR) to
+    the cache or its source, with COMPLETE process visibility;
+  * no write or recorded build within 48 h and none since the manifest was made;
+  * caches that no wrapper-managed build ever recorded need
+    --maintenance-window-attested (see docs/CARGO_CACHE_RETENTION.md: advisory
+    locks cannot exclude a plain `cargo` that does not use cargo-iso).
+
+Each selected path is re-checked (device/inode/mode, artifact class, no symlink,
+no data-looking file) and removed through directory descriptors opened with
+O_NOFOLLOW; a changed or rebound path stops that entry.  Cargo's own lock files
+(.cargo-lock, .cargo-build-lock, .cargo-artifact-lock) are never removed.
+"""
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import stat
+import sys
+import time
+
+CARGO_LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
+_hook = None  # test seam: called with a stage name; may mutate the filesystem
+
+
+def load_foundation():
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "emuwiz-cargo-retention")
+    loader = importlib.machinery.SourceFileLoader("emuwiz_cargo_retention", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+F = load_foundation()
+
+
+class Refusal(Exception):
+    def __init__(self, code, detail=""):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
+
+
+def hook(stage):
+    if _hook is not None:
+        _hook(stage)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def real_now():
+    return time.time()
+
+
+def parse_iso(text):
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+# ------------------------------------------------------- descriptor-bound I/O
+
+
+def open_dir_nofollow(path):
+    """Open an absolute directory with every component opened O_NOFOLLOW."""
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise Refusal("PATH_NOT_CANONICAL", path)
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in [p for p in path.split("/") if p]:
+            try:
+                nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as error:
+                raise Refusal("SYMLINK_OR_MISSING_COMPONENT", f"{part}: {error.strerror}") from error
+            os.close(fd)
+            fd = nxt
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def lstat_at(name, dir_fd):
+    return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+
+class Counters:
+    def __init__(self):
+        self.freed = 0
+        self.retained = 0
+        self.files = 0
+        self.dirs = 0
+
+
+def remove_entry(dir_fd, name, expect, root_dev, counters, top=True):
+    """Remove `name` below dir_fd without following links; refuse anything odd."""
+    try:
+        st = lstat_at(name, dir_fd)
+    except FileNotFoundError:
+        raise Refusal("ALREADY_ABSENT", name)
+    if top and expect is not None:
+        if (st.st_dev, st.st_ino, st.st_mode) != expect:
+            raise Refusal("PATH_IDENTITY_MISMATCH", name)
+    if st.st_dev != root_dev:
+        raise Refusal("CROSSES_FILESYSTEM", name)
+    if stat.S_ISLNK(st.st_mode):
+        raise Refusal("SYMLINK_FOUND", name)
+    if stat.S_ISDIR(st.st_mode):
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        try:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        except OSError as error:
+            raise Refusal("OPEN_FAILED", f"{name}: {error.strerror}") from error
+        try:
+            fst = os.fstat(fd)
+            if (fst.st_dev, fst.st_ino) != (st.st_dev, st.st_ino):
+                raise Refusal("PATH_IDENTITY_MISMATCH", f"{name} rebound while opening")
+            for child in os.listdir(fd):
+                remove_entry(fd, child, None, root_dev, counters, top=False)
+        finally:
+            os.close(fd)
+        os.rmdir(name, dir_fd=dir_fd)
+        counters.dirs += 1
+        return
+    if not stat.S_ISREG(st.st_mode):
+        raise Refusal("SPECIAL_FILE", name)
+    if st.st_nlink == 1:
+        counters.freed += st.st_blocks * 512
+    else:
+        counters.retained += st.st_blocks * 512
+    os.unlink(name, dir_fd=dir_fd)
+    counters.files += 1
+
+
+# -------------------------------------------------------------- evaluation
+
+
+def entry_class_problem(rel_parts, parent_path):
+    """Why a manifest path is not an enumerated compiler artifact, else None."""
+    if not rel_parts or any(p in ("", ".", "..") for p in rel_parts):
+        return "PATH_OUTSIDE_TARGET"
+    name = rel_parts[-1]
+    if name in CARGO_LOCK_NAMES:
+        return "CARGO_INTERNAL_LOCK_FILE"
+    if len(rel_parts) == 1:
+        return None if name in F.TOP_META_FILES else "NOT_A_COMPILER_ARTIFACT"
+    if len(rel_parts) > 3 or any(p in F.ALWAYS_PRESERVE for p in rel_parts):
+        return "NOT_A_COMPILER_ARTIFACT"
+    profile = parent_path
+    has_marker = any(
+        os.path.isdir(os.path.join(profile, marker)) and not os.path.islink(os.path.join(profile, marker))
+        for marker in (".fingerprint", "deps")
+    )
+    if not has_marker:
+        return "NOT_A_COMPILER_ARTIFACT"
+    if name in F.ARTIFACT_DIRS:
+        return None
+    if name.endswith(F.ARTIFACT_FILE_SUFFIXES):
+        return None
+    full = os.path.join(profile, name)
+    try:
+        st = os.lstat(full)
+    except OSError:
+        return None  # absence is handled by the identity check
+    if stat.S_ISREG(st.st_mode) and st.st_mode & 0o111 and os.path.exists(full + ".d"):
+        return None
+    return "NOT_A_COMPILER_ARTIFACT"
+
+
+def path_has_symlink_component(path):
+    cur = "/"
+    for part in [p for p in path.split("/") if p]:
+        cur = os.path.join(cur, part)
+        try:
+            if stat.S_ISLNK(os.lstat(cur).st_mode):
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def load_manifest(path, approved):
+    actual = sha256_file(path)
+    if approved is None or actual != approved.lower():
+        raise Refusal("MANIFEST_DIGEST_MISMATCH", f"manifest is {actual}, approved {approved}")
+    with open(path) as handle:
+        data = json.load(handle)
+    groups = []
+    for group in data.get("cargo_artifact_groups", []):
+        paths = json.loads(group.get("deletion_paths_json") or "[]")
+        sources = json.loads(group.get("associated_source_paths") or "[]")
+        groups.append({"group": group, "paths": paths, "sources": sources})
+    return data, actual, groups
+
+
+def verified_owner(group, record, source_paths, target):
+    """Adoption is only a claim; this is the evidence that makes it count."""
+    if not record or not record.get("owner"):
+        return "NOT_ADOPTED", "no lifecycle record with an owner"
+    if not group.get("source_exists") or not source_paths:
+        return "SOURCE_MISSING", "the owning source checkout is not present to verify"
+    name = os.path.basename(target)
+    recorded = os.path.realpath(record["worktree"]) if record.get("worktree") else None
+    matched = False
+    for src in source_paths:
+        real = os.path.realpath(src)
+        if not os.path.isdir(real):
+            return "SOURCE_MISSING", real
+        head = F.head_of(real)
+        if group.get("source_head") and head != group["source_head"]:
+            return "OWNER_UNVERIFIED", f"source HEAD {head} differs from the manifest's {group['source_head']}"
+        digest = hashlib.sha256(real.encode()).hexdigest()[:12]
+        if name.endswith("-" + digest) or recorded == real:
+            matched = True
+    if not matched:
+        return "OWNER_UNVERIFIED", "neither the target's path hash nor the recorded worktree matches the source"
+    return None, ""
+
+
+def evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=False):
+    """Group-level holds (read-only). Returns (holds, context)."""
+    group, paths, sources = entry["group"], entry["paths"], entry["sources"]
+    target = group["directory"]
+    holds = []
+    ctx = {"target": target, "key": None, "record": None}
+
+    def hold(code, detail=""):
+        holds.append({"code": code, "detail": detail})
+
+    if not os.path.isabs(target) or os.path.normpath(target) != target:
+        hold("TARGET_PATH_NOT_CANONICAL", target)
+        return holds, ctx
+    if path_has_symlink_component(target):
+        hold("TARGET_PATH_HAS_SYMLINK", target)
+        return holds, ctx
+    try:
+        st = os.lstat(target)
+    except OSError as error:
+        hold("TARGET_NOT_FOUND", error.strerror or "")
+        return holds, ctx
+    if not stat.S_ISDIR(st.st_mode):
+        hold("TARGET_NOT_A_DIRECTORY")
+        return holds, ctx
+    if (st.st_dev, st.st_ino) != (group.get("device"), group.get("inode")):
+        hold("DIRECTORY_IDENTITY_CHANGED", f"now {st.st_dev}:{st.st_ino}")
+    key = F.key_for(target)
+    ctx["key"] = key
+    rec_state, record = registry.read_checked("targets", key, F.valid_target_record)
+    if rec_state == "invalid":
+        hold("REGISTRY_RECORD_INVALID", "the lifecycle record is unreadable or malformed; treated as unknown")
+        record = None
+    ctx["record"] = record
+    if not record and rec_state == "absent" and args.assume_adopted and not execute:
+        record = {"owner": "ASSUMED-FOR-DRY-RUN", "adopted_at": now_ts, "worktree": sources[0] if sources else None}
+        ctx["record"] = record
+        ctx["assumed"] = True
+    problem, detail = verified_owner(group, record, sources, target)
+    if problem:
+        hold(problem, detail)
+    if record and record.get("identity"):
+        ident = record["identity"]
+        if (ident.get("dev"), ident.get("ino")) != (st.st_dev, st.st_ino):
+            hold("DIRECTORY_IDENTITY_CHANGED", "differs from the identity recorded at first build/adoption")
+    pin_state, pins = registry.pin_state(key)
+    if pin_state == "invalid":
+        hold("PIN_STATE_UNKNOWN", "the pin record is unreadable or malformed; a corrupt pin is never 'no pin'")
+    elif pins:
+        hold("PINNED", ",".join(sorted({p["reason"] for p in pins})))
+    locked = False if own_lock else registry.probe_lock(key)
+    if locked:
+        hold("BUILD_LOCK_HELD")
+    elif locked is None:
+        hold("LOCK_STATE_UNKNOWN", "the lifecycle lock could not be probed")
+    if record:
+        live = [e for e in record.get("active", [])
+                if e.get("boot_id") == F.boot_id() and F.proc_starttime(e.get("pid")) == e.get("starttime")]
+        if live:
+            hold("RECORDED_BUILD_ALIVE", f"{len(live)} build(s)")
+    refs = census.refs.get(os.path.realpath(target), []) if census else []
+    if refs:
+        hold("LIVE_PROCESS_REFERENCE", ", ".join(f"{r['comm']}[{r['pid']}] {r['kind']}" for r in refs[:5]))
+    for src in sources:
+        real = os.path.realpath(src)
+        srefs = census.refs.get(real, []) if census else []
+        if srefs:
+            hold("LIVE_PROCESS_IN_SOURCE", ", ".join(f"{r['comm']}[{r['pid']}] {r['kind']}" for r in srefs[:5]))
+    if census is None or census.unreadable_foreign:
+        hold("INCOMPLETE_PROCESS_VISIBILITY",
+             f"{census.unreadable_foreign if census else '?'} process(es) of other users are not inspectable")
+    # activity
+    seen = set()
+    m = F.measure_tree(target, seen)
+    ctx["measured"] = m
+    activity = [v for v in ((record or {}).get("last_use"), (record or {}).get("last_end"), m["newest_mtime"] or None) if v]
+    newest = max(activity) if activity else None
+    if newest is None:
+        hold("UNKNOWN_ACTIVITY")
+    elif now_ts - newest < max(F.MIN_IDLE_HOURS, args.min_idle_hours) * 3600:
+        hold("RECENT_ACTIVITY", f"{(now_ts - newest) / 3600:.1f} h ago")
+    approved_mtime = parse_iso(group.get("latest_mtime_utc"))
+    if approved_mtime is not None and m["newest_mtime"] and m["newest_mtime"] > approved_mtime + 1:
+        hold("ACTIVITY_SINCE_MANIFEST", "files were written after the manifest was made")
+    if m["cross_device"]:
+        hold("CONTAINS_MOUNT_POINT")
+    participating = bool(record and record.get("last_start"))
+    ctx["participating"] = participating
+    if not participating and not args.maintenance_window_attested:
+        hold("NONPARTICIPATING_WRITERS_NOT_EXCLUDED",
+             "no cargo-iso build was ever recorded here; plain cargo is not locked - needs an attested maintenance window")
+    return holds, ctx
+
+
+def evaluate_entry(entry_path, group, dev_expect):
+    """Per-path checks, read-only. Returns (reason or None, normalized parts)."""
+    target = group["directory"]
+    norm = os.path.normpath(entry_path["path"])
+    if norm != entry_path["path"] or not (norm + "/").startswith(target + "/") or norm == target:
+        return "PATH_OUTSIDE_TARGET", None
+    rel = os.path.relpath(norm, target).split("/")
+    parent = os.path.dirname(norm)
+    if path_has_symlink_component(parent):
+        return "SYMLINK_COMPONENT", rel
+    reason = entry_class_problem(rel, parent)
+    if reason:
+        return reason, rel
+    try:
+        st = os.lstat(norm)
+    except FileNotFoundError:
+        return "ALREADY_ABSENT", rel
+    except OSError:
+        return "UNREADABLE", rel
+    if (st.st_dev, st.st_ino, st.st_mode) != dev_expect:
+        return "PATH_IDENTITY_MISMATCH", rel
+    if stat.S_ISLNK(st.st_mode):
+        return "SYMLINK", rel
+    if stat.S_ISDIR(st.st_mode):
+        problem = F.subtree_problem(norm, st.st_dev)
+        if problem:
+            return "SUBTREE_REFUSED: " + problem, rel
+    elif not stat.S_ISREG(st.st_mode):
+        return "SPECIAL_FILE", rel
+    elif rel[-1].lower().endswith(F.DATA_SUFFIXES):
+        return "SUBTREE_REFUSED: looks like data", rel
+    return None, rel
+
+
+# ------------------------------------------------------------------- run
+
+
+def run(args):
+    execute = args.execute
+    if execute:
+        if args.assume_adopted:
+            raise SystemExit("--assume-adopted is for dry runs only")
+        if os.environ.get("EMUWIZ_RETENTION_NOW"):
+            raise SystemExit("--execute refuses EMUWIZ_RETENTION_NOW: it needs real time")
+        if not args.receipt_dir:
+            raise SystemExit("--execute requires --receipt-dir (outside every cache)")
+        if args.min_idle_hours < F.MIN_IDLE_HOURS:
+            raise SystemExit(f"--min-idle-hours cannot go below {F.MIN_IDLE_HOURS} when executing")
+    now_ts = real_now()
+    receipt = {
+        "mode": "EXECUTE" if execute else "DRY RUN (nothing deleted)",
+        "started": now_ts,
+        "manifest": os.path.realpath(args.manifest),
+        "approved_sha256": args.approved_sha256,
+        "host": os.uname().nodename,
+        "policy": {
+            "min_idle_hours": max(F.MIN_IDLE_HOURS, args.min_idle_hours),
+            "visibility": "complete required",
+            "maintenance_window_attested": bool(args.maintenance_window_attested),
+            "assume_adopted": bool(args.assume_adopted),
+        },
+        "groups": [],
+        "totals": {},
+    }
+    try:
+        data, digest, groups = load_manifest(args.manifest, args.approved_sha256)
+    except Refusal as refusal:
+        receipt["refused"] = {"code": refusal.code, "detail": refusal.detail}
+        finish(args, receipt)
+        return 3
+    receipt["manifest_sha256"] = digest
+    registry = F.Registry(create=execute)
+    directories = [os.path.realpath(g["group"]["directory"]) for g in groups]
+    sources = [os.path.realpath(s) for g in groups for s in g["sources"]]
+    census = F.Census(directories + sources)
+    receipt["process_census"] = {"examined": census.examined, "unreadable_foreign": census.unreadable_foreign}
+    total_selected = total_held = 0
+    freed_all = retained_all = 0
+    for entry in groups:
+        result = process_group(entry, registry, args, census, now_ts, execute)
+        receipt["groups"].append(result)
+        total_selected += result["paths_selected"]
+        total_held += result["paths_held"]
+        freed_all += result["accounted_freed_bytes"]
+        retained_all += result["retained_hardlink_bytes"]
+    receipt["totals"] = {
+        "paths_in_manifest": sum(len(g["paths"]) for g in groups),
+        "paths_selected": total_selected,
+        "paths_held": total_held,
+        "paths_individually_eligible": sum(g["paths_individually_eligible"] for g in receipt["groups"]),
+        "estimated_recoverable_if_group_gates_pass": sum(g["estimated_recoverable_bytes"] for g in receipt["groups"]),
+        "accounted_freed_bytes": freed_all,
+        "retained_hardlink_bytes": retained_all,
+    }
+    receipt["finished"] = real_now()
+    finish(args, receipt)
+    return 0
+
+
+def process_group(entry, registry, args, census, now_ts, execute):
+    group = entry["group"]
+    target = group["directory"]
+    out = {
+        "directory": target, "key": None, "holds": [], "paths": [],
+        "paths_selected": 0, "paths_held": 0, "estimated_recoverable_bytes": 0,
+        "paths_individually_eligible": 0,
+        "accounted_freed_bytes": 0, "retained_hardlink_bytes": 0, "outcome": "HELD",
+    }
+    lock_fd = None
+    try:
+        if execute:
+            # Exclusive lifecycle lock BEFORE the final census: a wrapper-managed
+            # build starting now blocks on it instead of racing the deletion.
+            key = F.key_for(target)
+            lock_fd = os.open(registry.lifecycle_lock_path(key), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                F.fcntl.flock(lock_fd, F.fcntl.LOCK_EX | F.fcntl.LOCK_NB)
+            except OSError:
+                os.close(lock_fd)
+                lock_fd = None
+                out["holds"].append({"code": "LIFECYCLE_LOCK_UNAVAILABLE", "detail": "a build holds the target"})
+                return hold_all(entry, out, "LIFECYCLE_LOCK_UNAVAILABLE")
+            # a fresh census once the lock is ours
+            fresh = F.Census([os.path.realpath(target)] + [os.path.realpath(s) for s in entry["sources"]])
+            census = fresh
+        holds, ctx = evaluate_group(entry, registry, args, census, now_ts, execute, own_lock=lock_fd is not None)
+        out["key"] = ctx.get("key")
+        if ctx.get("assumed"):
+            out["note"] = "ownership ASSUMED for this dry run; execution would hold on NOT_ADOPTED"
+        out["holds"] = holds
+        selected = []
+        for item in entry["paths"]:
+            expect = (item.get("device"), item.get("inode"), item.get("mode"))
+            reason, rel = evaluate_entry(item, group, expect)
+            if reason == "ALREADY_ABSENT":
+                out["paths"].append({"path": item["path"], "outcome": "ABSENT", "reason": reason})
+            elif reason:
+                out["paths"].append({"path": item["path"], "outcome": "HELD", "reason": reason})
+            elif holds:
+                out["paths"].append({"path": item["path"], "outcome": "HELD", "reason": holds[0]["code"],
+                                     "individually_eligible": True})
+            else:
+                out["paths"].append({"path": item["path"], "outcome": "SELECTED", "reason": ""})
+            if not reason:
+                selected.append((item, expect))
+        if selected:
+            est, retained = F.reclaim_estimate(
+                [{"path": i["path"], "type": "dir" if stat.S_ISDIR(e[2]) else "file"} for i, e in selected]
+            )
+            out["estimated_recoverable_bytes"] = est
+            out["retained_hardlink_bytes"] = retained
+        out["paths_individually_eligible"] = len(selected)
+        if execute and not holds:
+            chosen = [(i, e) for i, e in selected]
+            if chosen:
+                execute_group(entry, chosen, out)
+        out["paths_selected"] = sum(1 for p in out["paths"] if p["outcome"] in ("SELECTED", "REMOVED"))
+        out["paths_would_be_eligible_if_group_gates_pass"] = out["paths_individually_eligible"]
+        out["paths_held"] = sum(1 for p in out["paths"] if p["outcome"] in ("HELD", "REFUSED"))
+        if holds:
+            out["outcome"] = "HELD"
+        elif execute:
+            out["outcome"] = "RETIRED" if any(p["outcome"] == "REMOVED" for p in out["paths"]) else "NOTHING_REMOVED"
+        else:
+            out["outcome"] = "WOULD_RETIRE" if selected else "NOTHING_SELECTED"
+        return out
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
+def hold_all(entry, out, code):
+    for item in entry["paths"]:
+        out["paths"].append({"path": item["path"], "outcome": "HELD", "reason": code})
+    out["paths_held"] = len(out["paths"])
+    return out
+
+
+def execute_group(entry, selected, out):
+    group = entry["group"]
+    target = group["directory"]
+    counters = Counters()
+    try:
+        root_fd = open_dir_nofollow(target)
+    except Refusal as refusal:
+        out["holds"].append({"code": refusal.code, "detail": refusal.detail})
+        for p in out["paths"]:
+            if p["outcome"] == "SELECTED":
+                p.update(outcome="REFUSED", reason=refusal.code)
+        return
+    try:
+        rst = os.fstat(root_fd)
+        if (rst.st_dev, rst.st_ino) != (group.get("device"), group.get("inode")):
+            out["holds"].append({"code": "DIRECTORY_IDENTITY_CHANGED", "detail": "after opening"})
+            for p in out["paths"]:
+                if p["outcome"] == "SELECTED":
+                    p.update(outcome="REFUSED", reason="DIRECTORY_IDENTITY_CHANGED")
+            return
+        before = statvfs_free(target)
+        hook("after-open-target")
+        by_path = {p["path"]: p for p in out["paths"]}
+        for item, expect in selected:
+            record = by_path[item["path"]]
+            rel = os.path.relpath(item["path"], target).split("/")
+            hook("before-entry:" + item["path"])
+            parent_fd = None
+            try:
+                # walk the parent chain from the already-open, identity-checked root
+                parent_fd = os.dup(root_fd)
+                for part in rel[:-1]:
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    os.close(parent_fd)
+                    parent_fd = nxt
+                # the open root must still be what the path names
+                try:
+                    now_st = os.lstat(target)
+                except OSError:
+                    raise Refusal("DIRECTORY_IDENTITY_CHANGED", "target path vanished")
+                if (now_st.st_dev, now_st.st_ino) != (rst.st_dev, rst.st_ino):
+                    raise Refusal("DIRECTORY_IDENTITY_CHANGED", "target path was rebound")
+                one = Counters()
+                remove_entry(parent_fd, rel[-1], expect, rst.st_dev, one)
+                counters.freed += one.freed
+                counters.retained += one.retained
+                counters.files += one.files
+                counters.dirs += one.dirs
+                record.update(outcome="REMOVED", reason="", freed_bytes=one.freed, files=one.files, dirs=one.dirs)
+            except Refusal as refusal:
+                record.update(outcome="REFUSED", reason=refusal.code, detail=refusal.detail)
+            except OSError as error:
+                record.update(outcome="REFUSED", reason="OS_ERROR", detail=f"{error.strerror}")
+            finally:
+                if parent_fd is not None:
+                    os.close(parent_fd)
+        after = statvfs_free(target)
+        out["accounted_freed_bytes"] = counters.freed
+        out["retained_hardlink_bytes"] = counters.retained
+        out["filesystem_free_before"] = before
+        out["filesystem_free_after"] = after
+    finally:
+        os.close(root_fd)
+
+
+def statvfs_free(path):
+    try:
+        v = os.statvfs(path)
+        return v.f_bavail * v.f_frsize
+    except OSError:
+        return None
+
+
+def finish(args, receipt):
+    text = json.dumps(receipt, indent=1, sort_keys=True)
+    if args.receipt_dir:
+        os.makedirs(args.receipt_dir, mode=0o700, exist_ok=True)
+        name = "retire-%s-%s.json" % ("execute" if args.execute else "dryrun", time.strftime("%Y%m%dT%H%M%S"))
+        F.atomic_write(os.path.join(args.receipt_dir, name), receipt)
+        receipt["receipt_file"] = os.path.join(args.receipt_dir, name)
+    if args.json:
+        print(json.dumps(receipt, indent=1, sort_keys=True))
+        return
+    t = receipt.get("totals", {})
+    print(receipt["mode"])
+    if receipt.get("refused"):
+        print(f"REFUSED: {receipt['refused']['code']}: {receipt['refused']['detail']}")
+        return
+    print(f"  manifest sha256 {receipt['manifest_sha256']}")
+    print(f"  census: {receipt['process_census']['examined']} processes examined; "
+          f"{receipt['process_census']['unreadable_foreign']} of other users not inspectable")
+    for g in receipt["groups"]:
+        codes = sorted({h['code'] for h in g["holds"]})
+        print(f"  {g['outcome']:<14} {os.path.basename(g['directory'])}: "
+              f"{g['paths_selected']} selected, {g['paths_held']} held"
+              + (f"  [{','.join(codes)}]" if codes else "")
+              + (f"  ~{g['estimated_recoverable_bytes'] / 1e9:.2f} GB" if g["estimated_recoverable_bytes"] else ""))
+    print(f"  paths: {t.get('paths_selected', 0)} selected, {t.get('paths_held', 0)} held of {t.get('paths_in_manifest', 0)}")
+    print(f"  individually eligible paths (if every cache-level gate passed): "
+          f"{t.get('paths_individually_eligible', 0)}, about "
+          f"{t.get('estimated_recoverable_if_group_gates_pass', 0) / 1e9:.2f} GB")
+    print(f"  actually freed (accounted) {t.get('accounted_freed_bytes', 0) / 1e9:.2f} GB")
+    if receipt.get("receipt_file"):
+        print(f"  receipt: {receipt['receipt_file']}")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="emuwiz-cargo-retire", description=__doc__.split("\n\n")[0])
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--approved-sha256", required=True, help="digest of the manifest you approved")
+    p.add_argument("--execute", action="store_true", help="actually delete (default is a dry run)")
+    p.add_argument("--receipt-dir", help="where the receipt JSON goes (required with --execute)")
+    p.add_argument("--maintenance-window-attested", action="store_true",
+                   help="you attest no non-cargo-iso build can write these targets right now")
+    p.add_argument("--assume-adopted", action="store_true",
+                   help="DRY RUN ONLY: pretend verified ownership exists, to size the remaining holds")
+    p.add_argument("--min-idle-hours", type=float, default=F.MIN_IDLE_HOURS)
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args(argv)
+    return run(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

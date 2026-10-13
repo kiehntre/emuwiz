@@ -76,6 +76,51 @@ device holding the target root; other devices are reported separately. `status` 
 protected targets that stop further reduction. Active or protected caches are never
 evicted.
 
+## Manifest-authorised retirement (`scripts/emuwiz-cargo-retire`)
+
+Dry run by default; deletes only with `--execute --approved-sha256 <digest> --receipt-dir DIR`.
+
+```
+scripts/emuwiz-cargo-retire --manifest RETIREMENT_BATCH.json --approved-sha256 <digest>          # dry run
+scripts/emuwiz-cargo-retire ... --execute --receipt-dir <outside-any-cache> [--maintenance-window-attested]
+```
+
+Per cache, ALL of these must hold or the cache's paths are HELD with a reason:
+
+1. manifest digest equals the approved digest (a modified manifest is refused whole);
+2. canonical target path with no symlink component, manifest device/inode, real directory;
+3. a lifecycle record whose ownership is *verified*: the source checkout exists, its HEAD
+   equals the manifest's, and the target's path hash (or the recorded worktree) names that
+   source. An adoption record alone never authorises deletion;
+4. exclusive lifecycle lock obtained (non-blocking; a running build holds it shared, and a
+   build that starts during retirement blocks on it), then a **fresh** census: no cwd, exe,
+   open file, mapped file or `CARGO_TARGET_DIR` reference to the cache or its source, with
+   complete process visibility;
+5. no pin, no recorded live build, no write within 48 h or since the manifest was made;
+6. cache never built through `cargo-iso` (no lock participation recorded) additionally
+   needs `--maintenance-window-attested`.
+
+Per path: inside the target, an enumerated compiler artifact (never `emuwiz-test-env`,
+`tmp`, unknown files, Cargo's own `.cargo-lock` / `.cargo-build-lock` /
+`.cargo-artifact-lock`), manifest device/inode/mode unchanged, no symlink, mount point or
+data/journal/database/ROM/save-looking file in the subtree. Removal uses directory
+descriptors opened `O_NOFOLLOW` (`openat`/`unlinkat` via `dir_fd`), re-checks identity
+immediately before each entry and that the target path still names the open directory, and
+stops the entry on anything unexpected. The receipt records per-path outcome and reason,
+accounted freed bytes (inodes whose last link was removed) and free space before/after.
+
+### What advisory locks do NOT protect
+
+Locks bind only processes that run through `cargo-iso`. A plain `cargo`/`rustc` started
+with `CARGO_TARGET_DIR` pointing at a cache does not take the lock and cannot be excluded
+by this design. The census narrows the window (and `--execute` does one fresh census while
+holding the lock) but is a point-in-time observation. Required operational prerequisite
+for any cache that was not built through `cargo-iso`: a **controlled maintenance window**
+in which no agent runs Cargo against it (e.g. all agents idle, or the target's source
+checkout is quiescent), attested with `--maintenance-window-attested`. The flag is an
+attestation, not enforcement. Complete process visibility also needs sufficient privilege
+(root, or a `/proc` mounted without `hidepid`): without it every cache is HELD.
+
 ## Required before hard enforcement or deletion (phase 2+)
 
 1. A manifest-authorised executor that takes the **exclusive** lifecycle lock
