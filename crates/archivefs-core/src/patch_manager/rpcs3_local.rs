@@ -249,13 +249,6 @@ pub fn resolve_rpcs3_native_launch_binding(
     if profile.installation_type == Rpcs3InstallationType::Portable
         && let Some(selected) = &profile.selected_executable
     {
-        let listed = profile.executable_candidates.iter().any(|candidate| {
-            candidate.path == *selected
-                && matches!(
-                    candidate.installation_type,
-                    Rpcs3InstallationType::Portable | Rpcs3InstallationType::Explicit
-                )
-        });
         let remedy = "choose another RPCS3 executable in Emulator Setup, or clear the \
                       selection to detect one automatically";
         if let Err(error) = validate_rpcs3_executable(selected) {
@@ -268,21 +261,36 @@ pub fn resolve_rpcs3_native_launch_binding(
                 ),
             ));
         }
-        if !listed {
+        // The selection is always added to discovery's candidate pool, so a
+        // valid one is listed regardless of how it was classified (Portable by
+        // extension, Explicit when managed, Native otherwise). Doctor and launch
+        // therefore agree. The launch kind follows the file, as for any binding.
+        if !profile
+            .executable_candidates
+            .iter()
+            .any(|candidate| candidate.path == *selected)
+        {
             return Err(rpcs3_launch_blocker(
                 Rpcs3LaunchBlockerKind::ExecutableMissing,
                 format!(
-                    "the RPCS3 executable you selected ({}) is not an AppImage this \
-                     profile can launch; {remedy}",
+                    "the RPCS3 executable you selected ({}) was not found by discovery; {remedy}",
                     selected.display()
                 ),
             ));
         }
+        let installation = if selected
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("appimage"))
+        {
+            crate::launch::installation::LaunchInstallation::AppImage {
+                extract_and_run: false,
+            }
+        } else {
+            crate::launch::installation::LaunchInstallation::Native
+        };
         return Ok(Rpcs3LaunchBinding {
             executable: selected.clone(),
-            installation: crate::launch::installation::LaunchInstallation::AppImage {
-                extract_and_run: false,
-            },
+            installation,
         });
     }
     let matching: Vec<&Rpcs3Executable> = profile
@@ -631,6 +639,16 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
     });
 
     let executables = discover_executables(roots);
+    // The user's selection only exists to decide a Portable profile. Every other
+    // profile kind is offered exactly what discovery found without it, so a
+    // selection can never add a candidate to (or make ambiguous) a Native one.
+    let executables_without_selection = if roots.selected_executable.is_some() {
+        let mut plain = roots.clone();
+        plain.selected_executable = None;
+        discover_executables(&plain)
+    } else {
+        executables.clone()
+    };
     let mut profiles = Vec::new();
     let mut warnings = Vec::new();
     for candidate in candidates {
@@ -645,8 +663,16 @@ pub fn discover_rpcs3_profiles(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profi
         if !candidate.configuration_path.exists() && candidate.scope == Rpcs3ProfileScope::User {
             continue;
         }
-        let mut profile = validate_profile(candidate, &executables);
-        if profile.installation_type == Rpcs3InstallationType::Portable {
+        let portable = candidate.installation_type == Rpcs3InstallationType::Portable;
+        let mut profile = validate_profile(
+            candidate,
+            if portable {
+                &executables
+            } else {
+                &executables_without_selection
+            },
+        );
+        if portable {
             profile.selected_executable = roots.selected_executable.clone();
         }
         profiles.push(profile);
@@ -3074,7 +3100,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // choosing the one that does NOT sort first proves nothing is first-sorted
         let (probe, first, second) = two_appimages(&dir, None);
-        assert!(first < second || second < first);
         let later = std::cmp::max(first.clone(), second.clone());
         let earlier = std::cmp::min(first, second);
         drop(probe);
@@ -3118,13 +3143,13 @@ mod tests {
             second
         );
         // other profile kinds never carry the selection
-        assert!(
-            discover_rpcs3_profiles(&roots)
-                .profiles
-                .iter()
-                .filter(|p| p.installation_type != Rpcs3InstallationType::Portable)
-                .all(|p| p.selected_executable.is_none())
-        );
+        let others: Vec<_> = discover_rpcs3_profiles(&roots)
+            .profiles
+            .into_iter()
+            .filter(|p| p.installation_type != Rpcs3InstallationType::Portable)
+            .collect();
+        assert!(!others.is_empty());
+        assert!(others.iter().all(|p| p.selected_executable.is_none()));
     }
 
     #[test]
@@ -3184,6 +3209,78 @@ mod tests {
                 .unwrap()
                 .executable,
             elsewhere
+        );
+    }
+
+    #[test]
+    fn an_extracted_native_selection_binds_the_same_way_the_doctor_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let extracted = dir.path().join("my-games/rpcs3-extracted/rpcs3");
+        appimage(&extracted);
+        let (profile, _, _) = two_appimages(&dir, Some(extracted.clone()));
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, extracted);
+        assert_eq!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Native
+        );
+        // the doctor also lists the same path as an explicit executable: same answer
+        let mut doctor = profile.clone();
+        doctor.executable_candidates = vec![Rpcs3Executable {
+            path: extracted.clone(),
+            installation_type: Rpcs3InstallationType::Explicit,
+            version: None,
+        }];
+        assert_eq!(
+            resolve_rpcs3_native_launch_binding(&doctor).unwrap(),
+            binding
+        );
+    }
+
+    #[test]
+    fn a_selection_never_changes_native_or_explicit_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut profile, first, second) = two_appimages(&dir, Some(PathBuf::from("/nope")));
+        for kind in [
+            Rpcs3InstallationType::Native,
+            Rpcs3InstallationType::Explicit,
+        ] {
+            profile.installation_type = kind;
+            // Portable AppImages are not acceptable candidates for these kinds
+            let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+            assert_eq!(error.kind, Rpcs3LaunchBlockerKind::ExecutableMissing);
+            assert!(!error.detail.contains("you selected"), "{error:?}");
+        }
+        let _ = (first, second);
+    }
+
+    #[test]
+    fn a_selection_adds_no_candidate_to_a_native_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_path = dir.path().join("bin/rpcs3");
+        appimage(&on_path);
+        let chosen = dir.path().join("my-games/rpcs3-extracted/rpcs3");
+        appimage(&chosen);
+        write_file(&dir.path().join("rpcs3/config.yml"), b"Core:\n");
+        let mut roots = discovery_roots(dir.path(), &dir.path().join(".local/share"));
+        roots.path_override = Some(vec![dir.path().join("bin")]);
+        let native = |roots: &Rpcs3ProfileDiscoveryRoots| {
+            discover_rpcs3_profiles(roots)
+                .profiles
+                .into_iter()
+                .find(|p| p.installation_type == Rpcs3InstallationType::Native)
+                .unwrap()
+        };
+        let before = native(&roots);
+        roots.selected_executable = Some(chosen.clone());
+        let after = native(&roots);
+        assert_eq!(before.executable_candidates, after.executable_candidates);
+        assert!(after.executable_candidates.iter().all(|c| c.path != chosen));
+        assert_eq!(
+            resolve_rpcs3_native_launch_binding(&after)
+                .unwrap()
+                .executable,
+            on_path
         );
     }
 }
