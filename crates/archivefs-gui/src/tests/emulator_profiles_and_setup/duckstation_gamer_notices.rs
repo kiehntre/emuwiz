@@ -52,9 +52,17 @@ struct Machine {
 }
 impl Machine {
     fn new() -> Self {
+        Self::with_names(false)
+    }
+    fn with_names(long: bool) -> Self {
+        let pad = if long {
+            "-".to_string() + &"deeply-nested-long-name-".repeat(6)
+        } else {
+            String::new()
+        };
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
-        let config = dir.path().join("xdg-config");
+        let config = dir.path().join(format!("xdg-config{pad}"));
         let data = dir.path().join("xdg-data");
         let appconfig = dir.path().join("app-config");
         for p in [&home, &config, &data, &appconfig] {
@@ -67,7 +75,9 @@ impl Machine {
             ("EMUWIZ_CONFIG_HOME", &appconfig),
             ("PATH", Path::new("")),
         ]);
-        let executable = home.join("Applications/Healthy/DuckStation.AppImage");
+        let executable = home.join(format!(
+            "Applications{pad}/Healthy{pad}/DuckStation.AppImage"
+        ));
         fs::create_dir_all(executable.parent().unwrap()).unwrap();
         fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
@@ -415,96 +425,126 @@ fn forced_unavailable_shows_the_resolver_reason_and_keeps_the_setup_handoff() {
     );
 }
 
+fn fallback_case(long: bool) {
+    let m = Machine::with_names(long);
+    m.remember(false);
+    let saved = fs::read(&m.selection).unwrap();
+    let mut app = m.app();
+    let mut input = m.input(&app);
+    let launch_readiness_page::LaunchReadinessInput::Plan {
+        plan,
+        duckstation: Some(context),
+        ..
+    } = &mut input
+    else {
+        panic!("controller did not build a real plan")
+    };
+    assert!(
+        matches!(&context.authority, DuckStationLaunchAuthority::Authorised { executable, profile_root, fallback: true, .. } if executable == &m.executable && profile_root == &m.root),
+        "{:?}",
+        context.authority
+    );
+    let c = plan
+        .candidates
+        .iter_mut()
+        .find(|c| {
+            matches!(
+                c.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "duckstation",
+                    ..
+                }
+            )
+        })
+        .expect("real controller candidate");
+    // The synthetic profile has no BIOS: model a passed firmware preflight so
+    // the ready-plan branch renders, keeping the real resolver authority.
+    c.readiness = LaunchReadiness::Ready;
+    c.firmware = FirmwareReadiness::NotRequired;
+    c.blockers.clear();
+    c.warnings.clear();
+    c.preference = archivefs_core::launch::CandidatePreference::SoleEligible;
+    let play = launch_readiness_page::gamer_play_action(&input);
+    assert!(matches!(
+        &play,
+        launch_readiness_page::GamerPlayAction::Launch(_)
+    ));
+    let notice = launch_readiness_page::gamer_resolver_notice(&input, &play)
+        .expect("a fallback is a notice");
+    assert_eq!(
+        notice.kind,
+        launch_readiness_page::GamerResolverNoticeKind::PreferredFallback
+    );
+    let (ctx, drawn) = settled(&mut app, &play, Some(&notice));
+    let exe = m.executable.display().to_string();
+    const REASON: &str = "It is the only installation with a usable configuration.";
+    assert!(
+        visible(&drawn, "preferred DuckStation is unavailable"),
+        "bypass stated: {drawn:#?}"
+    );
+    assert!(
+        visible(&drawn, "DuckStation.AppImage"),
+        "chosen installation named compactly: {drawn:#?}"
+    );
+    assert!(
+        visible(&drawn, "Your saved preference was not changed."),
+        "{drawn:#?}"
+    );
+    // Full paths and the exact reason are behind one disclosure, not
+    // in the way of Play.
+    assert!(
+        !visible(&drawn, &exe),
+        "full path is not forced into the stage"
+    );
+    let header = drawn
+        .iter()
+        .find(|(s, r, clip)| s == "Full paths and reason" && clip.contains_rect(*r))
+        .expect("disclosure visible")
+        .1
+        .center();
+    let pos = drawn
+        .iter()
+        .find(|(s, r, clip)| s == "Play with DuckStation" && clip.contains_rect(*r))
+        .expect("Play visible at 1024x600 without scrolling")
+        .1
+        .center();
+    let action = click(&ctx, &mut app, &play, Some(&notice), pos);
+    let Some(GamerViewAction::Play(request)) = action else {
+        panic!("Play must return the launch request")
+    };
+    assert_eq!(request.adapter_name(), "DuckStation");
+    // Open the disclosure: the whole executable, profile and reason.
+    click(&ctx, &mut app, &play, Some(&notice), header);
+    let (_, opened) = {
+        let out = gamer_frame(&ctx, &mut app, &play, Some(&notice), vec![]).0;
+        (ctx.clone(), texts(&out))
+    };
+    assert!(visible(&opened, &exe), "full executable path: {opened:#?}");
+    assert!(
+        visible(&opened, &m.root.display().to_string()),
+        "full profile path: {opened:#?}"
+    );
+    assert!(visible(&opened, REASON), "exact reason: {opened:#?}");
+    assert_eq!(
+        fs::read(&m.selection).unwrap(),
+        saved,
+        "saved preference untouched"
+    );
+}
+
 #[test]
 fn preferred_fallback_shows_selection_reason_and_bypass_before_play() {
     in_isolated_process(
         "preferred_fallback_shows_selection_reason_and_bypass_before_play",
-        || {
-            let m = Machine::new();
-            m.remember(false);
-            let saved = fs::read(&m.selection).unwrap();
-            let mut app = m.app();
-            let mut input = m.input(&app);
-            let launch_readiness_page::LaunchReadinessInput::Plan {
-                plan,
-                duckstation: Some(context),
-                ..
-            } = &mut input
-            else {
-                panic!("controller did not build a real plan")
-            };
-            assert!(
-                matches!(&context.authority, DuckStationLaunchAuthority::Authorised { executable, profile_root, fallback: true, .. } if executable == &m.executable && profile_root == &m.root),
-                "{:?}",
-                context.authority
-            );
-            let c = plan
-                .candidates
-                .iter_mut()
-                .find(|c| {
-                    matches!(
-                        c.target,
-                        LaunchTarget::Standalone {
-                            adapter_id: "duckstation",
-                            ..
-                        }
-                    )
-                })
-                .expect("real controller candidate");
-            // The synthetic profile has no BIOS: model a passed firmware preflight so
-            // the ready-plan branch renders, keeping the real resolver authority.
-            c.readiness = LaunchReadiness::Ready;
-            c.firmware = FirmwareReadiness::NotRequired;
-            c.blockers.clear();
-            c.warnings.clear();
-            c.preference = archivefs_core::launch::CandidatePreference::SoleEligible;
-            let play = launch_readiness_page::gamer_play_action(&input);
-            assert!(matches!(
-                &play,
-                launch_readiness_page::GamerPlayAction::Launch(_)
-            ));
-            let notice = launch_readiness_page::gamer_resolver_notice(&input, &play)
-                .expect("a fallback is a notice");
-            assert_eq!(
-                notice.kind,
-                launch_readiness_page::GamerResolverNoticeKind::PreferredFallback
-            );
-            let (ctx, drawn) = settled(&mut app, &play, Some(&notice));
-            let exe = m.executable.display().to_string();
-            assert!(
-                visible(&drawn, "preferred DuckStation is unavailable"),
-                "bypass stated: {drawn:#?}"
-            );
-            assert!(
-                visible(&drawn, &exe),
-                "selected installation named: {drawn:#?}"
-            );
-            assert!(
-                visible(&drawn, &m.root.display().to_string()),
-                "selected profile named"
-            );
-            assert!(
-                visible(&drawn, "only installation with a usable configuration")
-                    || drawn.iter().any(|(s, ..)| s.contains("usable")),
-                "reason shown: {drawn:#?}"
-            );
-            let pos = drawn
-                .iter()
-                .find(|(s, r, clip)| s == "Play with DuckStation" && clip.contains_rect(*r))
-                .expect("Play visible at 1024x600 without scrolling")
-                .1
-                .center();
-            let action = click(&ctx, &mut app, &play, Some(&notice), pos);
-            assert!(
-                matches!(action, Some(GamerViewAction::Play(_))),
-                "Play must return the launch request"
-            );
-            assert_eq!(
-                fs::read(&m.selection).unwrap(),
-                saved,
-                "saved preference untouched"
-            );
-        },
+        || fallback_case(false),
+    );
+}
+
+#[test]
+fn preferred_fallback_with_long_paths_keeps_play_visible_and_launchable_at_1024x600() {
+    in_isolated_process(
+        "preferred_fallback_with_long_paths_keeps_play_visible_and_launchable_at_1024x600",
+        || fallback_case(true),
     );
 }
 

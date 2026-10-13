@@ -156,9 +156,13 @@ fn attach_duckstation_resolver_notices(
     if !has_duckstation {
         return;
     }
+    // The summary shows only its first warnings, so the resolver's notice goes
+    // first; the general warnings stay, in order, behind it.
+    let mut at = 0;
     for notice in context.notices() {
         if !summary.warnings.contains(&notice) {
-            summary.warnings.push(notice);
+            summary.warnings.insert(at, notice);
+            at += 1;
         }
     }
 }
@@ -1406,6 +1410,48 @@ mod tests {
             text.contains("only installation with a usable configuration"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_preferred_fallback_survives_the_two_warning_display_limit() {
+        use crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority as A;
+        let mut input = duckstation_input(A::Authorised {
+            executable: PathBuf::from("/apps/DuckStation.AppImage"),
+            profile_root: PathBuf::from("/apps"),
+            layout: archivefs_core::emulator_profile_resolver::ProfileLayout::Portable,
+            mode: "PREFERRED",
+            fallback: true,
+            why: vec!["It is the only installation with a usable configuration.".into()],
+            notes: Vec::new(),
+        });
+        if let LaunchReadinessInput::Plan { plan, .. } = &mut input {
+            let candidate = plan.candidates.first_mut().expect("candidate");
+            candidate.warnings = vec![
+                LaunchWarning::new(
+                    LaunchWarningKind::OptionalFirmwareMissing,
+                    "First general warning.",
+                ),
+                LaunchWarning::new(
+                    LaunchWarningKind::OptionalFirmwareMissing,
+                    "Second general warning.",
+                ),
+                LaunchWarning::new(
+                    LaunchWarningKind::OptionalFirmwareMissing,
+                    "Third general warning.",
+                ),
+            ];
+        }
+        let summary = project(&input, ReadinessFreshness::Current);
+        // Exactly what the summary draws: its first two warnings.
+        let shown: Vec<&String> = summary.warnings.iter().take(2).collect();
+        assert!(
+            shown[0].contains("preferred DuckStation is unavailable"),
+            "{shown:?}"
+        );
+        let all = summary.warnings.join("\n");
+        for general in ["First general", "Second general", "Third general"] {
+            assert!(all.contains(general), "general warning kept: {all}");
+        }
     }
 
     #[test]

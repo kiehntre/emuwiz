@@ -404,7 +404,29 @@ pub(crate) enum GamerResolverNoticeKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GamerResolverNotice {
     pub(crate) kind: GamerResolverNoticeKind,
+    /// Compact one-row-each lines shown beside Play: the bypass and the chosen
+    /// installation by its last path components, or the refusal.
+    pub(crate) summary: Vec<String>,
+    /// The resolver's full text (complete paths and reason), reached through
+    /// the notice's "Full paths and reason" disclosure.
     pub(crate) lines: Vec<String>,
+}
+
+/// The last two path components, so a deep path stays recognisable in one row.
+fn compact_path(path: &std::path::Path) -> String {
+    let parts: Vec<_> = path
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let tail = &parts[parts.len().saturating_sub(2)..];
+    if tail.is_empty() {
+        path.display().to_string()
+    } else {
+        tail.join("/")
+    }
 }
 
 impl GamerResolverNotice {
@@ -463,6 +485,10 @@ pub(crate) fn gamer_resolver_notice(
     let notice = match &context.authority {
         Authority::Refused { reason } => GamerResolverNotice {
             kind: GamerResolverNoticeKind::Blocked,
+            summary: vec![
+                reason.clone(),
+                "EmuWiz will not use any other DuckStation installation.".into(),
+            ],
             lines: vec![
                 reason.clone(),
                 "EmuWiz will not use any other DuckStation installation.".into(),
@@ -477,7 +503,16 @@ pub(crate) fn gamer_resolver_notice(
             ..
         } => {
             let mut lines = Vec::new();
+            let mut summary = Vec::new();
             if *fallback {
+                summary.push(format!(
+                    "Your preferred DuckStation is unavailable, so EmuWiz is using {}.",
+                    compact_path(executable)
+                ));
+                summary.push(format!(
+                    "{} Your saved preference was not changed.",
+                    why.join(" ")
+                ));
                 lines.push(format!(
                     "Your preferred DuckStation is unavailable, so EmuWiz is using {} with settings in {}.",
                     executable.display(),
@@ -486,16 +521,18 @@ pub(crate) fn gamer_resolver_notice(
                 lines.extend(why.iter().cloned());
                 lines.push("Your saved preference was not changed.".into());
             }
-            lines.extend(
-                notes
-                    .iter()
-                    .filter(|note| note.contains("preferred") || note.contains("could not be read"))
-                    .cloned(),
-            );
+            let notes: Vec<String> = notes
+                .iter()
+                .filter(|note| note.contains("preferred") || note.contains("could not be read"))
+                .cloned()
+                .collect();
+            lines.extend(notes.iter().cloned());
+            summary.extend(notes);
             if lines.is_empty() {
                 return None;
             }
             GamerResolverNotice {
+                summary,
                 kind: if *fallback {
                     GamerResolverNoticeKind::PreferredFallback
                 } else {

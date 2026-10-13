@@ -483,13 +483,34 @@ fn render_stage_text(
             ui.visuals().warn_fg_color,
             egui::RichText::new(notice.heading()).strong(),
         );
-        for line in &notice.lines {
-            ui.label(
-                egui::RichText::new(line)
-                    .size(theme::TECHNICAL_SIZE)
-                    .color(theme::SECONDARY_TEXT),
-            );
+        // One truncated row per summary line, so long paths can never push
+        // Play out of view; hovering a row shows it whole.
+        for line in &notice.summary {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(line)
+                        .size(theme::TECHNICAL_SIZE)
+                        .color(theme::SECONDARY_TEXT),
+                )
+                .truncate(),
+            )
+            .on_hover_text(line);
         }
+        egui::CollapsingHeader::new("Full paths and reason")
+            .id_salt("duckstation_resolver_notice_details")
+            .default_open(false)
+            .show(ui, |ui| {
+                for line in &notice.lines {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(line)
+                                .size(theme::TECHNICAL_SIZE)
+                                .color(theme::SECONDARY_TEXT),
+                        )
+                        .selectable(true),
+                    );
+                }
+            });
     }
     ui.add_space(theme::SPACE_SM);
 
