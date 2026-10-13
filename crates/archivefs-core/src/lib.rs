@@ -3288,7 +3288,7 @@ pub fn review_source_rebind_at(
     database_path: &Path,
     target: &Path,
 ) -> Result<catalogue_health::SourceRebindReview> {
-    let database = Database::open_or_create(database_path)?;
+    let database = Database::open_read_only(database_path)?;
     let record = database
         .list_source_folders()?
         .into_iter()
@@ -3330,12 +3330,12 @@ pub fn set_source_role_default(target: &Path, role: SourceRole) -> Result<()> {
     )
 }
 
-/// Saves an explicit platform default for a configured source. The returned
+/// Read-only preview of assigning a platform default to a configured source. The returned
 /// count is the number of currently visible Unknown rows that a subsequent
 /// rescan may safely recover; callers must show it before invoking this
 /// mutating action.
 pub fn preview_source_platform_assignment_at(database_path: &Path, target: &Path) -> Result<i64> {
-    let database = Database::open_or_create(database_path)?;
+    let database = Database::open_read_only(database_path)?;
     let record = database
         .list_source_folders()?
         .into_iter()

@@ -589,6 +589,7 @@ fn migration_23_preserves_history_binds_nothing_and_is_idempotent() {
     downgrade_to_21(&Connection::open(&path).unwrap());
     let history = everything_but_bindings(&Connection::open(&path).unwrap());
 
+    archivefs_core::upgrade_library_database(&path).unwrap();
     let db = Database::open_or_create(&path).unwrap();
     assert_eq!(db.schema_version().unwrap(), 24);
     let sql = Connection::open(&path).unwrap();
@@ -793,6 +794,7 @@ fn independent_migrated_catalogue_without_success_timestamp_needs_review() {
     let path = f.db.path().to_path_buf();
     drop(f.db);
     downgrade_to_21(&Connection::open(&path).unwrap());
+    archivefs_core::upgrade_library_database(&path).unwrap();
     f.db = Database::open_or_create(&path).unwrap();
     f.replace_root(0, "old-storage");
     let result = f.scan();
@@ -939,6 +941,7 @@ fn migrated(names: &[&str]) -> (Fixture, Vec<(i64, PathBuf)>) {
     let path = f.db.path().to_path_buf();
     drop(f.db);
     downgrade_to_21(&Connection::open(&path).unwrap());
+    archivefs_core::upgrade_library_database(&path).unwrap();
     f.db = Database::open_or_create(&path).unwrap();
     (f, rows)
 }
