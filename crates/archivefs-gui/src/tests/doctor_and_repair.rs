@@ -93,10 +93,10 @@ fn cheats_mods_page_routes_retroarch_to_shared_preview_without_stale_wording() {
     });
 
     for expected in [
-        "Choose a RetroArch profile",
-        // Forward-port (3580b2d): the profile picker now labels profiles in
-        // plain words instead of the raw internal id.
-        "RetroArch — Native (User)",
+        // A single eligible profile is Quick Start: it is selected and shown
+        // as a summary (with Change) rather than as a chooser.
+        "Using RetroArch",
+        "Native (User)",
         "Cheat source",
         "Available cheats",
         source_name.as_str(),
@@ -496,6 +496,175 @@ fn cheat_workflow_step1_shows_blockers_and_requires_explicit_profile_choice() {
         workflow.selected_profile_id, None,
         "a stale profile selection must be cleared, never silently kept"
     );
+}
+
+fn fresh_quick_start_workflow() -> CheatWorkflowState {
+    let mut workflow = app_with_cheats_mods_context()
+        .cheat_workflow
+        .take()
+        .unwrap();
+    workflow.selected_profile_id = None;
+    workflow.existing_library_profile_id = None;
+    workflow
+}
+
+fn render_step1(
+    ctx: &egui::Context,
+    workflow: &mut CheatWorkflowState,
+    profiles: &RetroArchProfilesState,
+    input: egui::RawInput,
+) -> (egui::FullOutput, Option<CheatWorkflowAction>) {
+    let mut action = None;
+    let output = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            action = show_cheat_workflow_step1(ui, workflow, profiles, false);
+        });
+    });
+    (output, action)
+}
+
+#[test]
+fn retroarch_quick_start_selects_the_only_eligible_profile_and_offers_change() {
+    let ctx = egui::Context::default();
+    let mut workflow = fresh_quick_start_workflow();
+    let profiles =
+        RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
+
+    let (output, _) = render_step1(&ctx, &mut workflow, &profiles, egui::RawInput::default());
+    assert_eq!(workflow.selected_profile_id.as_deref(), Some("native-user"));
+    assert!(rendered_text_contains(&output, "Using RetroArch"));
+    assert!(rendered_text_contains(&output, "Change"));
+    // Diagnostics are behind the disclosure, not on the surface.
+    assert!(rendered_text_contains(&output, "Technical details"));
+    assert!(!rendered_text_contains(&output, "Profile ID: native-user"));
+    assert!(!rendered_text_contains(
+        &output,
+        "Choose a RetroArch profile"
+    ));
+
+    // Change reveals the explicit chooser and keeps the selection until a
+    // profile is picked.
+    let change = find_exact_text_center(&output, "Change").unwrap();
+    let click = |pressed| egui::Event::PointerButton {
+        pos: change,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    };
+    let input = egui::RawInput {
+        events: vec![egui::Event::PointerMoved(change), click(true), click(false)],
+        ..Default::default()
+    };
+    let _ = render_step1(&ctx, &mut workflow, &profiles, input);
+    let (output, _) = render_step1(&ctx, &mut workflow, &profiles, egui::RawInput::default());
+    assert!(rendered_text_contains(
+        &output,
+        "Choose a RetroArch profile"
+    ));
+    assert!(!rendered_text_contains(&output, "Using RetroArch"));
+    assert_eq!(workflow.selected_profile_id.as_deref(), Some("native-user"));
+}
+
+#[test]
+fn retroarch_quick_start_never_selects_for_zero_blocked_or_multiple_profiles() {
+    let ctx = egui::Context::default();
+    for (name, profiles) in [
+        ("none", cheat_discovery(Vec::new())),
+        (
+            "blocked",
+            cheat_discovery(vec![cheat_profile("blocked", false)]),
+        ),
+        (
+            "two",
+            cheat_discovery(vec![
+                cheat_profile("native-user", true),
+                cheat_profile("flatpak-user", true),
+            ]),
+        ),
+        (
+            "one-plus-blocked-is-single",
+            cheat_discovery(vec![
+                cheat_profile("blocked", false),
+                cheat_profile("native-user", true),
+            ]),
+        ),
+    ] {
+        let mut workflow = fresh_quick_start_workflow();
+        let state = RetroArchProfilesState::Ready(profiles);
+        let (output, _) = render_step1(&ctx, &mut workflow, &state, egui::RawInput::default());
+        if name == "one-plus-blocked-is-single" {
+            assert_eq!(workflow.selected_profile_id.as_deref(), Some("native-user"));
+            // The blocked profile's detail stays behind Details.
+            assert!(!rendered_text_contains(
+                &output,
+                "cheats_destination_unresolved"
+            ));
+        } else {
+            assert_eq!(workflow.selected_profile_id, None, "{name}");
+            assert!(
+                !rendered_text_contains(&output, "Using RetroArch"),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn retroarch_quick_start_respects_existing_choices_and_active_work() {
+    let ctx = egui::Context::default();
+    let two = RetroArchProfilesState::Ready(cheat_discovery(vec![
+        cheat_profile("native-user", true),
+        cheat_profile("flatpak-user", true),
+    ]));
+    // An existing explicit choice among several is never replaced.
+    let mut workflow = fresh_quick_start_workflow();
+    workflow.selected_profile_id = Some("flatpak-user".to_string());
+    let _ = render_step1(&ctx, &mut workflow, &two, egui::RawInput::default());
+    assert_eq!(
+        workflow.selected_profile_id.as_deref(),
+        Some("flatpak-user")
+    );
+
+    // A bound existing-library inspection is not rebound by auto-selection.
+    let one =
+        RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
+    let mut workflow = fresh_quick_start_workflow();
+    workflow.existing_library_profile_id = Some("other-profile".to_string());
+    let _ = render_step1(&ctx, &mut workflow, &one, egui::RawInput::default());
+    assert_eq!(workflow.selected_profile_id, None);
+
+    // A chosen profile that disappears is cleared and NOT silently replaced
+    // by the one remaining eligible profile, even on later frames.
+    let ctx = egui::Context::default();
+    let mut workflow = fresh_quick_start_workflow();
+    workflow.selected_profile_id = Some("gone-profile".to_string());
+    for _ in 0..3 {
+        let (output, _) = render_step1(&ctx, &mut workflow, &one, egui::RawInput::default());
+        assert_eq!(workflow.selected_profile_id, None);
+        assert!(rendered_text_contains(&output, "no longer eligible"));
+    }
+}
+
+#[test]
+fn retroarch_quick_start_summary_fits_small_and_1024x600_screens() {
+    let profiles =
+        RetroArchProfilesState::Ready(cheat_discovery(vec![cheat_profile("native-user", true)]));
+    for (width, height) in [(320.0_f32, 480.0_f32), (1024.0, 600.0)] {
+        let ctx = egui::Context::default();
+        let mut workflow = fresh_quick_start_workflow();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, height),
+            )),
+            ..Default::default()
+        };
+        let (output, _) = render_step1(&ctx, &mut workflow, &profiles, input);
+        assert!(rendered_text_contains(&output, "Using RetroArch"));
+        let change = find_exact_text_center(&output, "Change").expect("Change stays reachable");
+        assert!(change.x >= 0.0 && change.x <= width, "{width}: {change:?}");
+        assert!(change.y >= 0.0 && change.y <= height, "{width}: {change:?}");
+    }
 }
 
 #[test]

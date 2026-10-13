@@ -3166,7 +3166,7 @@ fn cheats_mods_page_renders_the_new_hierarchy_headings() {
     });
     for expected in [
         "Selected game: a",
-        "Choose a RetroArch profile",
+        "Using RetroArch",
         "Cheat source",
         "Workflow diagnostics",
         "Recent related activity",

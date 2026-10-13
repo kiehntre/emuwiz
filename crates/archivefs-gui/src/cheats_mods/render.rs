@@ -8544,6 +8544,89 @@ pub(crate) fn show_cheat_workflow_step1(
     widgets::card(ui, |ui| {
         show_cheat_activation_status(ui, "RetroArch", CheatActivationReadiness::Unknown);
     });
+
+    // Quick Start. 0 = nothing pending, 1 = the user pressed Change, 2 = a
+    // previous choice vanished. Any non-zero value keeps the explicit chooser
+    // visible and suppresses auto-selection, so a user's decision (or a lost
+    // one) is never replaced silently.
+    let change_id = egui::Id::new(("cheat-retroarch-change-profile", &workflow.archive_path));
+    let mut change_state: u8 = ui.data(|data| data.get_temp(change_id)).unwrap_or(0);
+    if let RetroArchProfilesState::Ready(discovery) = profiles {
+        let eligible = eligible_profile_ids(discovery);
+        if let Some(selected) = workflow.selected_profile_id.clone()
+            && !eligible.contains(&selected.as_str())
+        {
+            workflow.selected_profile_id = None;
+            workflow.existing_library_profile_id = None;
+            workflow.existing_library = CheatStepResource::NotLoaded;
+            change_state = 2;
+            ui.data_mut(|data| data.insert_temp(change_id, change_state));
+        }
+        let unbound = matches!(workflow.transaction, CheatTransactionState::Idle)
+            && workflow.preview_request.is_none()
+            && workflow.existing_library_profile_id.is_none();
+        if eligible.len() == 1
+            && workflow.selected_profile_id.is_none()
+            && change_state == 0
+            && unbound
+        {
+            workflow.selected_profile_id = Some(eligible[0].to_string());
+            clear_cheat_candidate_state(workflow);
+        }
+    }
+    let quick_profile = match profiles {
+        RetroArchProfilesState::Ready(discovery) if change_state == 0 => {
+            let eligible = eligible_profile_ids(discovery);
+            let selected = workflow.selected_profile_id.as_deref();
+            discovery.profiles.iter().find(|profile| {
+                eligible.len() == 1
+                    && profile.eligible
+                    && Some(profile.profile_id.as_str()) == selected
+            })
+        }
+        _ => None,
+    };
+    if let (Some(profile), RetroArchProfilesState::Ready(discovery)) = (quick_profile, profiles) {
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Using RetroArch");
+                ui.label(format!(
+                    "{} ({})",
+                    profile_kind_label(&profile.installation_type),
+                    profile_scope_label(&profile.scope)
+                ));
+                if widgets::action_button(ui, "Change", widgets::ActionStyle::Quiet, !busy)
+                    .clicked()
+                {
+                    ui.data_mut(|data| data.insert_temp(change_id, 1_u8));
+                }
+            });
+            widgets::technical_details(ui, "retroarch_quickstart_details", |ui| {
+                for candidate in &discovery.profiles {
+                    ui.label(format!(
+                        "Profile ID: {} — {}",
+                        candidate.profile_id,
+                        if candidate.eligible {
+                            "eligible"
+                        } else {
+                            "blocked"
+                        }
+                    ));
+                    for blocker in &candidate.blockers {
+                        ui.label(format!("{} — {}", blocker.code, blocker.detail));
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+        if widgets::action_button(ui, "Rescan profiles", widgets::ActionStyle::Quiet, !busy)
+            .clicked()
+        {
+            action = Some(CheatWorkflowAction::RescanProfiles);
+        }
+        return action;
+    }
+
     widgets::section_header(
         ui,
         "Choose a RetroArch profile",
@@ -8570,12 +8653,7 @@ pub(crate) fn show_cheat_workflow_step1(
         }
         RetroArchProfilesState::Ready(discovery) => {
             let eligible = eligible_profile_ids(discovery);
-            if let Some(selected) = workflow.selected_profile_id.clone()
-                && !eligible.contains(&selected.as_str())
-            {
-                workflow.selected_profile_id = None;
-                workflow.existing_library_profile_id = None;
-                workflow.existing_library = CheatStepResource::NotLoaded;
+            if change_state == 2 && workflow.selected_profile_id.is_none() {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
                     "The previously selected profile is no longer eligible; choose again.",
@@ -8608,6 +8686,7 @@ pub(crate) fn show_cheat_workflow_step1(
                                 profile_scope_label(&profile.scope)
                             );
                             if ui.radio(selected, label).clicked() {
+                                ui.data_mut(|data| data.insert_temp(change_id, 0_u8));
                                 workflow.selected_profile_id = Some(profile.profile_id.clone());
                                 workflow.existing_library_profile_id = None;
                                 workflow.existing_library = CheatStepResource::NotLoaded;
