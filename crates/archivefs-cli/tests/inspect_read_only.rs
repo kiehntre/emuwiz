@@ -559,11 +559,11 @@ fn sockets_devices_links_to_them_and_unreadable_targets_are_refused_or_survived(
     // Inaccessible targets: a clean error or a report, never a panic.
     let locked = w.library.join("locked.nes");
     nes(&locked);
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o0)).unwrap();
     let locked_dir = w.library.join("locked dir");
     fs::create_dir(&locked_dir).unwrap();
     fs::write(locked_dir.join("inner.nes"), b"x").unwrap();
-    fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o0)).unwrap();
     for path in [
         locked.clone(),
         locked_dir.clone(),

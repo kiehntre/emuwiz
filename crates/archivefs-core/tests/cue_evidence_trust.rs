@@ -343,7 +343,7 @@ fn unreadable_source_is_not_promoted_to_supported_or_matching() {
     }
     let (dir, cue) = fixture(SINGLE, &[1, 2, 3]);
     let bin = dir.path().join("disc.bin");
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o0)).unwrap();
     assert!(File::open(&bin).is_err());
     let unreadable = collect_cue_preservation(&cue);
     assert!(unreadable.is_err());
