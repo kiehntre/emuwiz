@@ -1349,7 +1349,73 @@ pub(crate) struct ApplyOutcomeView {
     pub(crate) applied: usize,
     pub(crate) skipped: usize,
     pub(crate) failed: usize,
+    /// Entries still in flight (a rename may have happened but its completion or
+    /// directory durability was not recorded). Never counted as applied or failed.
+    pub(crate) unresolved: usize,
+    /// Entries never attempted (the batch stopped before them).
+    pub(crate) pending: usize,
+    /// One actionable line per unresolved entry: path, stage and required action.
+    pub(crate) recovery: Vec<String>,
     pub(crate) rows: Vec<ApplyRowView>,
+}
+
+impl ApplyOutcomeView {
+    /// Builds the view's counts from the core summary so the GUI can never
+    /// show a total that omits in-flight or pending entries.
+    pub(crate) fn from_summary(
+        summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+        transaction_id: String,
+        state: TransactionState,
+        rows: Vec<ApplyRowView>,
+    ) -> Self {
+        Self {
+            transaction_id,
+            state,
+            requested: summary.requested,
+            applied: summary.applied,
+            skipped: summary.skipped,
+            failed: summary.failed,
+            unresolved: summary.unresolved,
+            pending: summary.pending,
+            recovery: summary
+                .unresolved_entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{} ({}): {}",
+                        entry.destination_path.display(),
+                        entry.stage,
+                        entry.required_action
+                    )
+                })
+                .collect(),
+            rows,
+        }
+    }
+
+    /// True only when nothing is in flight, pending or failed.
+    pub(crate) fn fully_resolved(&self) -> bool {
+        self.unresolved == 0 && self.pending == 0 && self.failed == 0
+    }
+
+    /// The headline: "complete" is reserved for a fully resolved batch.
+    pub(crate) fn headline(&self) -> &'static str {
+        if self.unresolved > 0 {
+            "Quick Rename NOT complete: recovery required"
+        } else if self.failed > 0 || self.pending > 0 {
+            "Quick Rename finished with problems"
+        } else {
+            "Quick Rename complete"
+        }
+    }
+
+    /// The history line, with every bucket so the numbers reconcile.
+    pub(crate) fn history_message(&self) -> String {
+        format!(
+            "requested {}, applied {}, skipped {}, failed {}, unresolved {}, pending {}",
+            self.requested, self.applied, self.skipped, self.failed, self.unresolved, self.pending
+        )
+    }
 }
 
 /// One per-file apply result.
@@ -3583,8 +3649,13 @@ impl DatSourcesPageState {
                         action: RenameHistoryAction::Apply,
                         transaction_id,
                         message: format!(
-                            "requested {}, applied {}, skipped {}, failed {}",
-                            summary.requested, summary.applied, summary.skipped, summary.failed
+                            "requested {}, applied {}, skipped {}, failed {}, unresolved {}, pending {}",
+                            summary.requested,
+                            summary.applied,
+                            summary.skipped,
+                            summary.failed,
+                            summary.unresolved,
+                            summary.pending
                         ),
                     });
                     self.apply_outcome = Some(*outcome);
@@ -7194,24 +7265,23 @@ impl DatSourcesPageState {
                     .then(|| typed_confirmation_phrase(count)),
             }
         });
-        let outcome = self.apply_outcome.as_ref().map(|outcome| ApplyOutcomeView {
-            transaction_id: outcome.transaction.transaction_id.clone(),
-            state: outcome.transaction.state,
-            requested: outcome.summary.requested,
-            applied: outcome.summary.applied,
-            skipped: outcome.summary.skipped,
-            failed: outcome.summary.failed,
-            rows: outcome
-                .transaction
-                .entries
-                .iter()
-                .map(|entry| ApplyRowView {
-                    current_basename: entry.original_basename.clone(),
-                    proposed_basename: entry.proposed_basename.clone(),
-                    state: entry.state,
-                    failure_reason: entry.failure_reason.clone(),
-                })
-                .collect(),
+        let outcome = self.apply_outcome.as_ref().map(|outcome| {
+            ApplyOutcomeView::from_summary(
+                &outcome.summary,
+                outcome.transaction.transaction_id.clone(),
+                outcome.transaction.state,
+                outcome
+                    .transaction
+                    .entries
+                    .iter()
+                    .map(|entry| ApplyRowView {
+                        current_basename: entry.original_basename.clone(),
+                        proposed_basename: entry.proposed_basename.clone(),
+                        state: entry.state,
+                        failure_reason: entry.failure_reason.clone(),
+                    })
+                    .collect(),
+            )
         });
         let rollback_result = self.rollback_result.as_ref().map(|result| match result {
             RollbackResult::FullyRolledBack => RollbackResultView {
@@ -13957,11 +14027,7 @@ fn show_quick_rename_success(
         .count();
     ui.add_space(10.0);
     widgets::card(ui, |ui| {
-        ui.label(
-            egui::RichText::new("Quick Rename complete")
-                .strong()
-                .size(18.0),
-        );
+        ui.label(egui::RichText::new(outcome.headline()).strong().size(18.0));
         ui.add_space(6.0);
         ui.label(format!(
             "{} file{} renamed",
@@ -13970,6 +14036,15 @@ fn show_quick_rename_success(
         ));
         ui.label(format!("{} left unchanged", outcome.skipped));
         ui.label(format!("{} failed", outcome.failed));
+        if outcome.unresolved > 0 || outcome.pending > 0 {
+            ui.label(format!(
+                "{} unresolved (in flight), {} not attempted",
+                outcome.unresolved, outcome.pending
+            ));
+        }
+        for line in &outcome.recovery {
+            ui.label(egui::RichText::new(format!("Recovery needed: {line}")).strong());
+        }
         ui.label(format!(
             "{collisions} collision{}",
             if collisions == 1 { "" } else { "s" }

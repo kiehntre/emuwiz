@@ -104,9 +104,17 @@ pub fn reconcile_recovery(
         };
         if mutated {
             let e = &transaction.entries[index];
+            // Applying + confirmed: the entry is at the destination.
+            // RollingBack + not happened is the reverse: the entry is back at
+            // the source. The expected entry must be present INSIDE the opened,
+            // identity-checked directory before it is synced.
+            let entry_at_destination = state == EntryState::Applying;
             if matches!(e.operation, TransactionOperation::RenameMove)
-                && let Err(error) =
-                    super::dirsync::sync_rename_parents(&e.source_path, &e.destination_path)
+                && let Err(error) = super::dirsync::sync_observed_rename(
+                    &e.source_path,
+                    &e.destination_path,
+                    entry_at_destination,
+                )
             {
                 issue = RecoveryIssue {
                     entry_index: index,

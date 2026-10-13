@@ -486,10 +486,22 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
     {
         return apply_copy_mutation(entry, expected_source, destination_root);
     }
-    // Re-prove the source immediately before the path-based rename. Preflight
-    // validated an earlier moment; a changed or swapped source is refused
-    // without touching it.
-    match capture_identity(&entry.source_path) {
+    // Bind BOTH parent directories (O_NOFOLLOW + identity checked) before anything
+    // is touched. The rename below is issued against these descriptors, the source
+    // is re-proved inside the bound source directory, and the same descriptors are
+    // fsynced, so a directory replaced after this point cannot redirect the
+    // rename or receive the durability sync in place of the real one.
+    let dirs = super::dirsync::RenameDirs::open(&entry.source_path, &entry.destination_path)
+        .map_err(|error| {
+            (
+                EntryState::ApplyFailed,
+                format!("could not bind the parent directories before the rename: {error}; nothing was moved"),
+            )
+        })?;
+    // Re-prove the source immediately before the rename. Preflight validated
+    // an earlier moment; a changed or swapped source is refused without
+    // touching it.
+    match capture_identity(&dirs.source_entry()) {
         Ok(current) if super::identity::identity_matches(&entry.identity, &current) => {}
         Ok(_) => {
             return Err((
@@ -505,28 +517,29 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
         }
     }
     run_test_before_rename(&entry.source_path, &entry.destination_path);
-    match rename_noreplace(&entry.source_path, &entry.destination_path) {
+    match dirs.rename_noreplace(false) {
         Ok(()) => {
-            // The filesystem must confirm the rename before Applied.
-            match confirm_rename(entry) {
+            // The filesystem must confirm the rename (inside the bound
+            // directories) before Applied.
+            match confirm_rename_bound(entry, &dirs) {
                 Ok(()) => {
-                    // The directory entries must be durable before success is
-                    // recorded. The rename has already happened, so a failure
-                    // leaves the entry in flight (`Applying`), never `Applied`
-                    // and never reported as unchanged; it is not retried.
-                    super::dirsync::sync_rename_parents(&entry.source_path, &entry.destination_path)
-                        .map_err(|error| {
-                            (
-                                EntryState::Applying,
-                                format!(
-                                    "the rename completed but its directory entries could not be \
+                    // The bound directories must be durable, and must still be
+                    // the directories the paths name, before success is recorded.
+                    // The rename has already happened, so a failure leaves the
+                    // entry in flight (`Applying`), never `Applied` and never
+                    // reported as unchanged; it is not retried.
+                    dirs.sync_and_verify(false).map_err(|error| {
+                        (
+                            EntryState::Applying,
+                            format!(
+                                "the rename completed but its directory entries could not be \
                                  synchronised ({error}); the file is at the destination and the \
                                  completion was not recorded - review before any further action"
-                                ),
-                            )
-                        })
+                            ),
+                        )
+                    })
                 }
-                Err(reason) => restore_failed_rename(entry, reason),
+                Err(reason) => restore_failed_rename(entry, &dirs, reason),
             }
         }
         Err(NoClobberError::DestinationExists) => Err((
@@ -537,28 +550,24 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
     }
 }
 
-/// The path-based rename cannot bind an inode (Linux has no source-fd
-/// `renameat2`), so a swap landing between the re-proof and the rename can
-/// still move the replacement. Never report that as success: if the object now
-/// at the destination is not the reviewed one and the source name is free, put
-/// it back without overwriting anything. A restore failure is reported, not
-/// hidden.
+/// A swap landing between the source re-proof and the rename can still move a
+/// replacement object. Never report that as success: if the object now at the
+/// destination is not the reviewed one and the source name is free, put it back
+/// (descriptor-bound, no overwrite). A restore failure is reported, not hidden.
 fn restore_failed_rename(
     entry: &TransactionEntry,
+    dirs: &super::dirsync::RenameDirs,
     reason: String,
 ) -> Result<(), (EntryState, String)> {
-    let moved_foreign_object = std::fs::symlink_metadata(&entry.source_path).is_err()
+    let moved_foreign_object = std::fs::symlink_metadata(dirs.source_entry()).is_err()
         && matches!(
-            capture_identity(&entry.destination_path),
+            capture_identity(&dirs.destination_entry()),
             Ok(current) if !super::identity::identity_matches(&entry.identity, &current)
         );
     if moved_foreign_object {
-        return match rename_noreplace(&entry.destination_path, &entry.source_path) {
+        return match dirs.rename_noreplace(true) {
             Ok(()) => {
-                let durability = super::dirsync::sync_rename_parents(
-                    &entry.destination_path,
-                    &entry.source_path,
-                );
+                let durability = dirs.sync_and_verify(true);
                 Err((
                     EntryState::ApplyFailed,
                     match durability {
@@ -670,17 +679,23 @@ fn apply_copy_mutation(
     let result = (|| {
         std::fs::copy(&entry.source_path, &temporary)
             .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
-        rename_noreplace(&temporary, &entry.destination_path)
-            .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
-        published = true;
-        super::dirsync::sync_rename_parents(&temporary, &entry.destination_path).map_err(
+        let dirs = super::dirsync::RenameDirs::open(&temporary, &entry.destination_path).map_err(
             |error| {
                 (
                     EntryState::ApplyFailed,
-                    format!("the copy was published but its directory entry could not be synchronised: {error}"),
+                    format!("could not bind the copy's parent directories: {error}"),
                 )
             },
         )?;
+        dirs.rename_noreplace(false)
+            .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
+        published = true;
+        dirs.sync_and_verify(false).map_err(|error| {
+            (
+                EntryState::ApplyFailed,
+                format!("the copy was published but its directory entry could not be synchronised: {error}"),
+            )
+        })?;
         let source_after = capture_identity(&entry.source_path)
             .map_err(|_| (EntryState::ApplyFailed, "copy source disappeared".into()))?;
         let destination_after = capture_identity(&entry.destination_path).map_err(|_| {
@@ -860,13 +875,17 @@ fn apply_symlink_mutation(
     }
 }
 
-/// Confirms, from the filesystem, that a rename actually happened: the source
-/// is gone and the destination exists with the recorded identity.
-fn confirm_rename(entry: &TransactionEntry) -> Result<(), String> {
-    if std::fs::symlink_metadata(&entry.source_path).is_ok() {
+/// Confirms, from the filesystem and INSIDE the bound directories, that a rename
+/// actually happened: the source is gone and the destination exists with the
+/// recorded identity.
+fn confirm_rename_bound(
+    entry: &TransactionEntry,
+    dirs: &super::dirsync::RenameDirs,
+) -> Result<(), String> {
+    if std::fs::symlink_metadata(dirs.source_entry()).is_ok() {
         return Err("the source still exists after the rename".to_string());
     }
-    match capture_identity(&entry.destination_path) {
+    match capture_identity(&dirs.destination_entry()) {
         Err(_) => Err("the destination does not exist after the rename".to_string()),
         Ok(current) => {
             if super::identity::identity_matches(&entry.identity, &current) {

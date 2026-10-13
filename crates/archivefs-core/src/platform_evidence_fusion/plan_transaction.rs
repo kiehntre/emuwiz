@@ -845,12 +845,16 @@ pub fn assess_recovery(
     // An entry still in flight after reconciliation has no established
     // filesystem outcome (even with no recorded issue, e.g. a persisted
     // `Applying` after a restart). Resuming would repeat a rename that may
-    // already have happened, so it is never resumable without review.
+    // already have happened, so it is never resumable without review. A
+    // `RollbackFailed` entry is likewise unresolved: the object is still at
+    // the destination (or in an unknown place), so neither a fresh apply nor an
+    // automatic rollback may be offered on the transaction's say-so.
     let in_flight = transaction.entries.iter().any(|entry| {
         matches!(
             entry.state,
             crate::dat::rename_apply::EntryState::Applying
                 | crate::dat::rename_apply::EntryState::RollingBack
+                | crate::dat::rename_apply::EntryState::RollbackFailed
         )
     });
     if unresolved || in_flight {

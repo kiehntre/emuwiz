@@ -721,3 +721,212 @@ mod sync_safety {
         assert_eq!(s.unresolved_entries.len(), 3);
     }
 }
+
+/// R3 blockers from the e6cd48dd review: descriptor-bound directory durability and
+/// `RollbackFailed` classification.  Synthetic fixtures only.
+mod r3_blockers {
+    use super::*;
+    use crate::platform_evidence_fusion::plan_transaction::{RecoveryAssessment, assess_recovery};
+    use std::cell::Cell;
+
+    thread_local! { static SWAP: RefCell<Option<(PathBuf, PathBuf, PathBuf)>> = const { RefCell::new(None) }; }
+
+    /// Replaces `parent` by a symlink to `elsewhere`, keeping the real directory at `moved`.
+    fn swap_parent(parent: &Path, moved: &Path, elsewhere: &Path) {
+        std::fs::rename(parent, moved).unwrap();
+        std::os::unix::fs::symlink(elsewhere, parent).unwrap();
+    }
+
+    fn swap_before_rename(_source: &Path) {
+        SWAP.with(|s| {
+            if let Some((parent, moved, elsewhere)) = s.borrow_mut().take() {
+                swap_parent(&parent, &moved, &elsewhere);
+            }
+        });
+    }
+
+    struct Dirs {
+        moved: PathBuf,
+        elsewhere: PathBuf,
+    }
+
+    fn dirs(f: &Fx) -> Dirs {
+        let base = f.roms.parent().unwrap();
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        Dirs {
+            moved: base.join("roms.moved"),
+            elsewhere,
+        }
+    }
+
+    fn swap_on_first_sync(parent: PathBuf, d: &Dirs) -> Rc<Cell<bool>> {
+        let done = Rc::new(Cell::new(false));
+        let flag = done.clone();
+        let (moved, elsewhere) = (d.moved.clone(), d.elsewhere.clone());
+        set_test_hook(Some(Box::new(move |event| {
+            if let DirSyncEvent::Before(p) = event
+                && p == parent
+                && !flag.get()
+            {
+                flag.set(true);
+                swap_parent(&parent, &moved, &elsewhere);
+            }
+            Ok(())
+        })));
+        done
+    }
+
+    #[test]
+    fn parent_replaced_by_a_symlink_before_the_fsync_is_never_recorded_applied() {
+        // The reviewer's exact attack (p1): swap the destination parent after the rename.
+        let f = fx(&["a.bin"], false);
+        let d = dirs(&f);
+        let done = swap_on_first_sync(f.roms.clone(), &d);
+        let out = run(&f).unwrap();
+        clear();
+        assert!(done.get());
+        assert_eq!(
+            out.transaction.entries[0].state,
+            EntryState::Applying,
+            "never Applied"
+        );
+        assert_ne!(out.transaction.state, TransactionState::Applied);
+        let reason = out.transaction.entries[0]
+            .failure_reason
+            .as_deref()
+            .unwrap();
+        assert!(reason.contains("replaced"), "{reason}");
+        assert_eq!(out.summary.applied, 0);
+        assert_eq!(out.summary.unresolved, 1);
+        // The rename acted on the verified directory, not on whatever the path became.
+        assert!(d.moved.join("A.bin").exists());
+        assert!(!d.elsewhere.join("A.bin").exists());
+        let p = persisted(&f);
+        assert_eq!(p.entries[0].state, EntryState::Applying);
+    }
+
+    #[test]
+    fn cross_directory_source_parent_swap_is_detected_too() {
+        let f = fx(&["a.bin"], true);
+        let d = dirs(&f);
+        // Source parent (roms) is swapped when the SOURCE directory is synced.
+        let done = swap_on_first_sync(f.roms.clone(), &d);
+        let out = run(&f).unwrap();
+        clear();
+        assert!(done.get());
+        assert_eq!(out.transaction.entries[0].state, EntryState::Applying);
+        // `sub` lives inside the swapped `roms`: the entry is in the real, moved tree.
+        assert!(d.moved.join("sub").join("A.bin").exists());
+    }
+
+    #[test]
+    fn parent_swapped_between_binding_and_rename_cannot_redirect_the_rename() {
+        let f = fx(&["a.bin"], false);
+        let d = dirs(&f);
+        SWAP.with(|s| {
+            *s.borrow_mut() = Some((f.roms.clone(), d.moved.clone(), d.elsewhere.clone()))
+        });
+        super::super::executor::set_test_before_rename_hook(Some(swap_before_rename));
+        let out = run(&f).unwrap();
+        super::super::executor::set_test_before_rename_hook(None);
+        // The rename went through the bound descriptors: the file is in the real
+        // (moved) directory and NOTHING landed in the substituted target.
+        assert!(
+            d.moved.join("A.bin").exists(),
+            "rename acted on the bound directory"
+        );
+        assert!(!d.elsewhere.join("A.bin").exists());
+        assert!(!d.elsewhere.join("a.bin").exists());
+        assert_ne!(out.transaction.entries[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn a_parent_that_is_already_a_symlink_is_refused_before_any_mutation() {
+        let f = fx(&["a.bin"], false);
+        let d = dirs(&f);
+        // Source and destination live in `roms`; make `roms` itself a symlink to the real
+        // directory so a path-based rename would follow it.
+        swap_parent(&f.roms, &d.moved, &d.moved);
+        let entry = f.tx.entries[0].clone();
+        let source = d.moved.join("a.bin");
+        assert!(source.exists());
+        let error = super::super::executor::apply_mutation(&entry).unwrap_err();
+        assert_eq!(error.0, EntryState::ApplyFailed);
+        assert!(error.1.contains("nothing was moved"), "{}", error.1);
+        assert!(source.exists(), "the file was not touched");
+    }
+
+    #[test]
+    fn undo_parent_swap_leaves_the_entry_in_flight() {
+        let f = fx(&["a.bin"], false);
+        let out = run(&f).unwrap();
+        let mut tx = out.transaction;
+        assert_eq!(tx.entries[0].state, EntryState::Applied);
+        let d = dirs(&f);
+        let done = swap_on_first_sync(f.roms.clone(), &d);
+        let outcome = rollback_transaction(&mut tx, &f.journal, &no_cancel()).unwrap();
+        clear();
+        assert!(done.get());
+        assert_eq!(
+            tx.entries[0].state,
+            EntryState::RollingBack,
+            "never RolledBack"
+        );
+        assert_ne!(outcome.result, RollbackResult::FullyRolledBack);
+        assert_ne!(tx.state, TransactionState::RolledBack);
+    }
+
+    #[test]
+    fn recovery_does_not_sync_or_promote_through_a_replaced_parent() {
+        let f = fx(&["a.bin"], false);
+        install(&f, None, Some((false, f.roms.clone())));
+        let _ = catch_unwind(AssertUnwindSafe(|| run(&f)));
+        clear();
+        let d = dirs(&f);
+        swap_parent(&f.roms, &d.moved, &d.elsewhere);
+        let mut p = persisted(&f);
+        let issues = reconcile_recovery(&mut p, &f.journal).unwrap();
+        assert_ne!(issues[0].kind, RecoveryIssueKind::RenameConfirmed);
+        assert_ne!(p.entries[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn rollback_failed_entry_requires_manual_recovery() {
+        // The reviewer's exact case (p2).
+        let f = fx(&["a.bin"], false);
+        let mut tx = f.tx.clone();
+        tx.entries[0].state = EntryState::RollbackFailed;
+        tx.entries[0].failure_reason = Some("reverse rename failed".into());
+        tx.state = TransactionState::RollbackFailed;
+        assert_eq!(
+            assess_recovery(&tx, &[]),
+            RecoveryAssessment::ManualRecoveryRequired
+        );
+        // Mixed: one entry still Applied, one RollbackFailed - still manual.
+        let f2 = fx(&["a.bin", "b.bin"], false);
+        let mut tx2 = f2.tx.clone();
+        tx2.entries[0].state = EntryState::Applied;
+        tx2.entries[1].state = EntryState::RollbackFailed;
+        tx2.state = TransactionState::RollbackFailed;
+        assert_eq!(
+            assess_recovery(&tx2, &[]),
+            RecoveryAssessment::ManualRecoveryRequired
+        );
+        // Settled transactions keep their existing verdicts.
+        let mut settled = f.tx.clone();
+        settled.entries[0].state = EntryState::RolledBack;
+        settled.state = TransactionState::RolledBack;
+        assert_eq!(
+            assess_recovery(&settled, &[]),
+            RecoveryAssessment::AlreadyRolledBack
+        );
+        let mut done = f.tx.clone();
+        done.entries[0].state = EntryState::Applied;
+        done.state = TransactionState::Applied;
+        assert_eq!(
+            assess_recovery(&done, &[]),
+            RecoveryAssessment::SafeToRollback
+        );
+    }
+}

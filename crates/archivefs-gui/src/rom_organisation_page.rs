@@ -61,6 +61,9 @@ pub(crate) struct RomOrganisationPageState {
     applied: Option<archivefs_core::dat::rename_apply::RenameTransaction>,
     applied_journal: PathBuf,
     result_message: Option<String>,
+    /// False when the last apply/rollback was not fully resolved (failed, pending
+    /// or in-flight entries): the banner must not look like success.
+    result_complete: bool,
     error: Option<String>,
     /// The last apply stopped at a safe point because it was cancelled.
     stopped: bool,
@@ -192,6 +195,7 @@ impl Default for RomOrganisationPageState {
                 archivefs_core::dat::rename_apply::journal::default_rename_transaction_dir()
                     .unwrap_or_else(|_| PathBuf::from("rename-transactions")),
             result_message: None,
+            result_complete: true,
             error: None,
             stopped: false,
             pending_apply: None,
@@ -529,18 +533,9 @@ impl RomOrganisationPageState {
         ) {
             Ok(outcome) => {
                 self.applied = Some(outcome.transaction.clone());
-                self.result_message = Some(if self.mode == OrganisationMode::BuildLinkedLibrary {
-                    format!(
-                        "Created {} library link(s); your original files were not touched. \
-                         Roll back is available for this transaction.",
-                        outcome.transaction.applied_count()
-                    )
-                } else {
-                    format!(
-                        "Applied {} organisation(s). Roll back is available for this transaction.",
-                        outcome.transaction.applied_count()
-                    )
-                });
+                let (message, complete) = apply_result_report(self.mode, &outcome.summary);
+                self.result_message = Some(message);
+                self.result_complete = complete;
             }
             Err(error) => {
                 self.stopped = matches!(
@@ -571,10 +566,23 @@ impl RomOrganisationPageState {
         ) {
             Ok(outcome) => {
                 let dirs = outcome.directories_removed.len();
-                self.result_message = Some(format!(
-                    "Rolled back organisation; {} empty platform director(ies) removed.",
-                    dirs
-                ));
+                let fully = matches!(
+                    outcome.rollback.result,
+                    archivefs_core::dat::rename_apply::RollbackResult::FullyRolledBack
+                );
+                self.result_complete = fully;
+                self.result_message = Some(if fully {
+                    format!(
+                        "Rolled back organisation; {} empty platform director(ies) removed.",
+                        dirs
+                    )
+                } else {
+                    format!(
+                        "Rollback is NOT complete: some entries were not reversed or are \
+                         unresolved. Review the transaction before any further action \
+                         ({dirs} empty platform director(ies) removed)."
+                    )
+                });
                 self.plan = None;
                 self.approved.clear();
                 // The rollback cleared the plan and the approvals; persist
@@ -587,6 +595,43 @@ impl RomOrganisationPageState {
             }
         }
     }
+}
+
+/// The apply result banner text and whether the batch is genuinely complete.
+/// "Applied"/"Created" is only said for a fully resolved batch; anything in
+/// flight, failed or not attempted is reported as such with the recovery step.
+fn apply_result_report(
+    mode: OrganisationMode,
+    summary: &archivefs_core::dat::rename_apply::TransactionSummary,
+) -> (String, bool) {
+    if summary.fully_resolved() {
+        let message = if mode == OrganisationMode::BuildLinkedLibrary {
+            format!(
+                "Created {} library link(s); your original files were not touched. \
+                 Roll back is available for this transaction.",
+                summary.applied
+            )
+        } else {
+            format!(
+                "Applied {} organisation(s). Roll back is available for this transaction.",
+                summary.applied
+            )
+        };
+        return (message, true);
+    }
+    let mut message = format!(
+        "Not complete: {} applied, {} failed, {} unresolved (in flight), {} not attempted.",
+        summary.applied, summary.failed, summary.unresolved, summary.pending
+    );
+    for entry in &summary.unresolved_entries {
+        message.push_str(&format!(
+            " Recovery needed for {} ({}): {}",
+            entry.destination_path.display(),
+            entry.stage,
+            entry.required_action
+        ));
+    }
+    (message, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1414,11 +1459,25 @@ fn show_rom_organisation_page_with_options(
 
     if let Some(message) = &state.result_message {
         ui.add_space(8.0);
-        widgets::banner(ui, "Result", message, widgets::StatusTone::Success);
+        let tone = if state.result_complete {
+            widgets::StatusTone::Success
+        } else {
+            widgets::StatusTone::Warning
+        };
+        widgets::banner(ui, "Result", message, tone);
         if quick_only && let Some(transaction) = state.applied() {
             ui.label(format!("Renamed: {}", transaction.applied_count()));
             ui.label(format!("Skipped: {}", transaction.skipped_count()));
             ui.label(format!("Failed: {}", transaction.failed_count()));
+            let summary = archivefs_core::dat::rename_apply::TransactionSummary::from_transaction(
+                transaction,
+            );
+            if summary.unresolved > 0 || summary.pending > 0 {
+                ui.label(format!(
+                    "Unresolved (in flight): {} - Not attempted: {}",
+                    summary.unresolved, summary.pending
+                ));
+            }
             ui.horizontal_wrapped(|ui| {
                 if widgets::action_button(ui, "View changes", widgets::ActionStyle::Secondary, true)
                     .clicked()
@@ -2019,6 +2078,65 @@ impl ArchiveFsApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use archivefs_core::dat::rename_apply::{EntryState, TransactionSummary, UnresolvedEntry};
+
+    fn summary(
+        applied: usize,
+        failed: usize,
+        unresolved: usize,
+        pending: usize,
+    ) -> TransactionSummary {
+        TransactionSummary {
+            requested: applied + failed + unresolved + pending,
+            applied,
+            failed,
+            unresolved,
+            pending,
+            unresolved_entries: (0..unresolved)
+                .map(|i| UnresolvedEntry {
+                    source_path: PathBuf::from(format!("/roms/a{i}.bin")),
+                    destination_path: PathBuf::from(format!("/roms/A{i}.bin")),
+                    state: EntryState::Applying,
+                    stage: "directory synchronisation after rename".into(),
+                    detail: None,
+                    required_action: "Run recovery reconciliation; do not repeat the rename."
+                        .into(),
+                })
+                .collect(),
+            ..TransactionSummary::default()
+        }
+    }
+
+    #[test]
+    fn apply_banner_says_applied_only_for_a_fully_resolved_batch() {
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(3, 0, 0, 0));
+        assert!(complete);
+        assert!(
+            message.starts_with("Applied 3 organisation(s)"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn apply_banner_reports_unresolved_pending_and_failed_with_recovery() {
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(1, 0, 1, 1));
+        assert!(!complete);
+        assert!(!message.starts_with("Applied"), "{message}");
+        assert!(message.contains("1 unresolved"), "{message}");
+        assert!(message.contains("1 not attempted"), "{message}");
+        assert!(
+            message.contains("Recovery needed for /roms/A0.bin"),
+            "{message}"
+        );
+        let (message, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(2, 1, 0, 0));
+        assert!(!complete && message.contains("1 failed"), "{message}");
+        let (_, complete) =
+            apply_result_report(OrganisationMode::RenameInPlace, &summary(0, 0, 0, 2));
+        assert!(!complete, "pending entries are never complete");
+    }
 
     #[test]
     fn unavailable_source_is_not_presented_as_an_empty_library() {

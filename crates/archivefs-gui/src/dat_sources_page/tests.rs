@@ -7871,6 +7871,9 @@ fn quick_rename_success_summary_counts_a_conflicting_batch_target_as_a_collision
         applied: 1,
         skipped: 1,
         failed: 0,
+        unresolved: 0,
+        pending: 0,
+        recovery: Vec::new(),
         rows: vec![
             ApplyRowView {
                 current_basename: "a.bin".to_string(),
@@ -9254,4 +9257,93 @@ fn dat_sources_tests_never_reach_the_production_audit_cache() {
     // ...and even a request for the default cache is refused in a test binary.
     assert!(!AuditHashCache::from_config(&AuditCacheConfig::Default).is_enabled());
     assert!(!AuditHashCache::load_default().is_enabled());
+}
+
+// ---- R3: completion reporting never hides in-flight / pending / failed entries ----
+
+fn summary_for_view(
+    applied: usize,
+    failed: usize,
+    unresolved: usize,
+    pending: usize,
+) -> archivefs_core::dat::rename_apply::TransactionSummary {
+    use archivefs_core::dat::rename_apply::{TransactionSummary, UnresolvedEntry};
+    TransactionSummary {
+        transaction_id: "tx".into(),
+        requested: applied + failed + unresolved + pending,
+        applied,
+        failed,
+        unresolved,
+        pending,
+        unresolved_entries: (0..unresolved)
+            .map(|i| UnresolvedEntry {
+                source_path: PathBuf::from(format!("/roms/a{i}.bin")),
+                destination_path: PathBuf::from(format!("/roms/A{i}.bin")),
+                state: EntryState::Applying,
+                stage: "directory synchronisation after rename".into(),
+                detail: None,
+                required_action: "Run recovery reconciliation; do not repeat the rename.".into(),
+            })
+            .collect(),
+        ..TransactionSummary::default()
+    }
+}
+
+#[test]
+fn quick_rename_headline_is_complete_only_for_a_fully_resolved_batch() {
+    let view =
+        |s| ApplyOutcomeView::from_summary(&s, "tx".into(), TransactionState::Applied, Vec::new());
+    let done = view(summary_for_view(3, 0, 0, 0));
+    assert!(done.fully_resolved());
+    assert_eq!(done.headline(), "Quick Rename complete");
+
+    let in_flight = view(summary_for_view(0, 0, 1, 1));
+    assert!(!in_flight.fully_resolved());
+    assert!(
+        in_flight.headline().contains("NOT complete"),
+        "{}",
+        in_flight.headline()
+    );
+    assert_eq!(in_flight.unresolved, 1);
+    assert_eq!(in_flight.pending, 1);
+    assert!(in_flight.recovery[0].contains("/roms/A0.bin"));
+    assert!(in_flight.recovery[0].contains("do not repeat the rename"));
+    assert_eq!(
+        in_flight.history_message(),
+        "requested 2, applied 0, skipped 0, failed 0, unresolved 1, pending 1"
+    );
+
+    let failed = view(summary_for_view(1, 1, 0, 0));
+    assert!(!failed.fully_resolved());
+    assert_eq!(failed.headline(), "Quick Rename finished with problems");
+
+    let pending = view(summary_for_view(1, 0, 0, 2));
+    assert!(!pending.fully_resolved());
+    assert_eq!(pending.headline(), "Quick Rename finished with problems");
+}
+
+#[test]
+fn quick_rename_card_renders_recovery_information_for_an_unresolved_batch() {
+    let outcome = ApplyOutcomeView::from_summary(
+        &summary_for_view(0, 0, 1, 0),
+        "tx".into(),
+        TransactionState::ApplyFailed,
+        Vec::new(),
+    );
+    let mut ui_state = DatSourcesPageUi::default();
+    let context = egui::Context::default();
+    let output = context.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = show_quick_rename_success(ui, &outcome, &mut ui_state);
+        });
+    });
+    assert!(rendered_text_contains(
+        &output,
+        "NOT complete: recovery required"
+    ));
+    assert!(rendered_text_contains(
+        &output,
+        "Recovery needed: /roms/A0.bin"
+    ));
+    assert!(!rendered_text_contains(&output, "Quick Rename complete"));
 }

@@ -199,23 +199,7 @@ fn rollback_transaction_inner(
         // (`RollingBack`): the file may already be back at the source, so it
         // is neither retried nor reported as unchanged; a later reconcile
         // decides from the filesystem and re-attempts the sync first.
-        let attempted = rollback_mutation(&transaction.entries[index], trusted).and_then(|()| {
-            let entry = &transaction.entries[index];
-            if matches!(entry.operation, TransactionOperation::RenameMove) {
-                super::dirsync::sync_rename_parents(&entry.destination_path, &entry.source_path)
-                    .map_err(|error| {
-                        IN_FLIGHT_MARK.to_string()
-                            + &format!(
-                                "the reverse rename completed but its directory entries could \
-                                 not be synchronised ({error}); the file is back at the original \
-                                 path and the rollback was not recorded - review before any \
-                                 further action"
-                            )
-                    })
-            } else {
-                Ok(())
-            }
-        });
+        let attempted = rollback_mutation(&transaction.entries[index], trusted);
         match attempted {
             Ok(()) => {
                 transaction.entries[index].state = EntryState::RolledBack;
@@ -482,11 +466,32 @@ fn rollback_mutation(
         }
     }
 
-    match rename_noreplace(&entry.destination_path, &entry.source_path) {
+    // Bind both parents (O_NOFOLLOW + identity) and rename between the descriptors.
+    let dirs = super::dirsync::RenameDirs::open(&entry.source_path, &entry.destination_path)
+        .map_err(|error| {
+            format!("rollback refused: could not bind the parent directories ({error}); nothing was moved")
+        })?;
+    match dirs.rename_noreplace(true) {
         Ok(()) => {
-            // Confirm the source was restored with the recorded identity.
-            match capture_identity(&entry.source_path) {
-                Ok(current) if identity_matches(&entry.identity, &current) => Ok(()),
+            // Confirm the source was restored with the recorded identity,
+            // inside the bound source directory.
+            match capture_identity(&dirs.source_entry()) {
+                Ok(current) if identity_matches(&entry.identity, &current) => {
+                    // The bound directories must be durable, and still the ones
+                    // the paths name, before `RolledBack` may be recorded. A
+                    // failure leaves the entry in flight: the file is back at
+                    // the original path, so it is never retried nor reported
+                    // as unchanged.
+                    dirs.sync_and_verify(true).map_err(|error| {
+                        IN_FLIGHT_MARK.to_string()
+                            + &format!(
+                                "the reverse rename completed but its directory entries could \
+                                 not be synchronised ({error}); the file is back at the original \
+                                 path and the rollback was not recorded - review before any \
+                                 further action"
+                            )
+                    })
+                }
                 Ok(_) => Err(
                     "rollback renamed but the restored source identity does not match".to_string(),
                 ),
