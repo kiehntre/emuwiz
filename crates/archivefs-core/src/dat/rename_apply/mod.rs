@@ -90,3 +90,6 @@ mod tests;
 
 #[cfg(test)]
 mod integrity_audit_tests;
+
+/// Read-only evidence inspection; never grants recovery authority.
+pub mod compact_recovery;
