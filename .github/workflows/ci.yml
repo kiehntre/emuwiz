@@ -98,6 +98,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: false
+      - name: Test credential-URL classification
+        run: bash scripts/test-security-scan.sh
       - name: Scan tracked files for credential-shaped secrets
         run: scripts/security-scan.sh
       - name: Install cargo-audit
