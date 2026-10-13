@@ -21,6 +21,9 @@
 #   * refuses to build when the build disk has less than EMUWIZ_MIN_FREE_GB free;
 #   * passes every cargo argument through unchanged and exits with cargo's status.
 #
+# It also records each build in a registry outside the targets and holds a shared
+# lifecycle lock while cargo runs (see scripts/emuwiz-cargo-retention --help).
+#
 # What it never does: delete, clean or prune anything.
 #
 # Options (before the cargo arguments):
@@ -39,7 +42,7 @@
 # 4 not enough free disk. Anything else is cargo's own exit status.
 set -euo pipefail
 
-usage() { sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'; }
 
 print_only=0
 low_debug="${EMUWIZ_CARGO_LOW_DEBUG:-0}"
@@ -142,5 +145,13 @@ export CARGO_TARGET_DIR="$target"
 unset CARGO_BUILD_TARGET_DIR
 if [ "$low_debug" = "1" ]; then
   export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+fi
+# Lifecycle tracking (scripts/emuwiz-cargo-retention): holds a shared lock for
+# the whole build so the cache cannot be retired under it, and records who built
+# what. It preserves cargo's arguments, exit status and signals, and never blocks
+# a build if the registry is unusable. EMUWIZ_RETENTION=0 turns it off.
+retention="$(dirname "$0")/emuwiz-cargo-retention"
+if [ "${EMUWIZ_RETENTION:-1}" != "0" ] && [ -f "$retention" ] && command -v python3 >/dev/null 2>&1; then
+  exec python3 -I "$retention" run --target "$target" --worktree "$top" -- "${EMUWIZ_CARGO:-cargo}" "$@"
 fi
 exec "${EMUWIZ_CARGO:-cargo}" "$@"
