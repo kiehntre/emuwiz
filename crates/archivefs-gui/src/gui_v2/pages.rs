@@ -619,7 +619,10 @@ impl App {
                     }
                     // Settings leads with its size controls, so there the
                     // strip follows the page rather than preceding it.
-                    let guidance_last = route == Route::Section(Section::Settings);
+                    // Organisation's one primary action must not sit under a
+                    // multi-line strip on a short window; the strip follows it.
+                    let guidance_last =
+                        matches!(route, Route::Section(Section::Settings | Section::Build));
                     if !guidance_last && let Some(guidance) = pinned_guidance.clone() {
                         super::guidance::show(ui, &mut self.guidance, guidance);
                         ui.add_space(theme::SPACE_SM);

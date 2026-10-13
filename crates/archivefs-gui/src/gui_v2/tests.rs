@@ -1661,64 +1661,220 @@ fn organisation_label_is_visible(output: &egui::FullOutput, label: &str) -> bool
         .any(|shape| contains(&shape.shape, shape.clip_rect, label))
 }
 
-/// 1024x600 physical pixels at 160% scaling is a 640x375 point window; there the
-/// primary action must be reachable by scrolling. At 1024x600 it is also reached and
-/// activated by keyboard alone (egui does not focus widgets outside the clip).
-#[test]
-fn gui_v2_organisation_primary_action_is_scroll_reachable_at_160_percent_and_keyboard_activatable()
-{
-    let size = [640.0, 375.0];
-    let context = egui::Context::default();
-    context.set_pixels_per_point(1.6);
-    let mut app = fixture(&context);
-    app.router.current = Route::Section(Section::Build);
-    frame(&context, &mut app, size);
-    let first = frame(&context, &mut app, size);
-    assert!(
-        organisation_label_is_visible(&first, "Preview Playing Library")
-            || organisation_label_is_visible(
-                &scroll_page(&context, &mut app, size),
-                "Preview Playing Library"
-            ),
-        "primary action unreachable by scrolling at 160%"
-    );
+// ---- Organisation primary action on small and high-DPI windows ----------
+//
+// egui lays out in points, so 1024x600 physical pixels at 160% scaling is a
+// 640x375 point viewport. These tests use that logical size (and the app's own
+// 160% UI-scale setting with the matching point size, as the layout matrix in
+// `slice2b_layout` does). They do NOT drive physical DPI: calling
+// `Context::set_pixels_per_point(1.6)` inside a test makes egui ignore the
+// supplied screen rect, so that route proves nothing - see
+// `a_test_context_pixels_per_point_ignores_the_supplied_viewport`.
 
-    // Keyboard only, at the normal 1024x600 size where the action is on screen.
-    let size = [1024.0, 600.0];
-    let context = egui::Context::default();
-    let mut app = fixture(&context);
-    app.router.current = Route::Section(Section::Build);
-    frame(&context, &mut app, size);
-    let output = frame(&context, &mut app, size);
-    let target = text_bounds(&output, "Preview Playing Library")[0];
-    let key = |key, pressed| egui::Event::Key {
+fn org_key_event(key: egui::Key, pressed: bool) -> egui::Event {
+    egui::Event::Key {
         key,
         physical_key: Some(key),
         pressed,
         repeat: false,
         modifiers: egui::Modifiers::NONE,
-    };
-    let mut focused_on_target = false;
+    }
+}
+
+/// The viewport the app really laid out into, and the clip bounds it painted
+/// with, must be the constrained size - never a silently larger canvas.
+fn assert_viewport_is(context: &egui::Context, output: &egui::FullOutput, size: [f32; 2]) {
+    let content = context.content_rect();
+    assert!(
+        (content.width() - size[0]).abs() < 0.5 && (content.height() - size[1]).abs() < 0.5,
+        "effective viewport {:?} is not the constrained {size:?}",
+        content.size()
+    );
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+    for clipped in &output.shapes {
+        assert!(
+            screen.expand(1.0).contains_rect(clipped.clip_rect),
+            "clip rect {:?} escapes the {size:?} viewport",
+            clipped.clip_rect
+        );
+    }
+}
+
+/// Tab until the focused widget is the primary action, then Enter.
+fn keyboard_activates_primary_action(context: &egui::Context, app: &mut App, size: [f32; 2]) {
+    let output = frame(context, app, size);
+    let target = text_bounds(&output, "Preview Playing Library")[0];
+    let mut focused = false;
     for _ in 0..60 {
-        frame_with(&context, &mut app, size, vec![key(egui::Key::Tab, true)]);
-        frame_with(&context, &mut app, size, vec![key(egui::Key::Tab, false)]);
-        let rect = context
+        frame_with(
+            context,
+            app,
+            size,
+            vec![org_key_event(egui::Key::Tab, true)],
+        );
+        frame_with(
+            context,
+            app,
+            size,
+            vec![org_key_event(egui::Key::Tab, false)],
+        );
+        focused = context
             .memory(|memory| memory.focused())
             .and_then(|id| context.read_response(id))
-            .map(|response| response.rect);
-        if rect.is_some_and(|rect| rect.contains_rect(target)) {
-            focused_on_target = true;
+            .is_some_and(|response| response.rect.contains_rect(target));
+        if focused {
             break;
         }
     }
-    assert!(focused_on_target, "Tab never focused the primary action");
-    frame_with(&context, &mut app, size, vec![key(egui::Key::Enter, true)]);
-    frame_with(&context, &mut app, size, vec![key(egui::Key::Enter, false)]);
+    assert!(focused, "Tab never focused the primary action at {size:?}");
+    frame_with(
+        context,
+        app,
+        size,
+        vec![org_key_event(egui::Key::Enter, true)],
+    );
+    frame_with(
+        context,
+        app,
+        size,
+        vec![org_key_event(egui::Key::Enter, false)],
+    );
+    frame(context, app, size);
+    assert_eq!(
+        app.organisation.view,
+        super::organisation::OrganisationView::PlayingLibrary,
+        "Enter did not open Playing Library at {size:?}"
+    );
+}
+
+fn organisation_app(context: &egui::Context) -> App {
+    let mut app = fixture(context);
+    app.router.current = Route::Section(Section::Build);
+    app
+}
+
+/// Documents the harness limitation behind the invalid test this replaces. If
+/// egui ever honours the screen rect here, retire this test and prefer true
+/// physical-DPI tests; until then it keeps the proxy honest.
+#[test]
+fn a_test_context_pixels_per_point_ignores_the_supplied_viewport() {
+    let size = [640.0, 375.0];
+    let context = egui::Context::default();
+    context.set_pixels_per_point(1.6);
+    let mut app = organisation_app(&context);
     frame(&context, &mut app, size);
+    frame(&context, &mut app, size);
+    assert!(
+        context.content_rect().height() > size[1] * 2.0,
+        "the 1.6 pixels-per-point route is now constrained ({:?}); replace the logical-size proxy",
+        context.content_rect().size()
+    );
+}
+
+/// 640x375 points: 1024x600 at 160%. The action is on screen without
+/// scrolling, is activated by pointer, and the viewport is really that size.
+#[test]
+fn gui_v2_organisation_primary_action_is_on_screen_at_640x375_points() {
+    let size = [640.0, 375.0];
+    let context = egui::Context::default();
+    let mut app = organisation_app(&context);
+    frame(&context, &mut app, size);
+    let output = frame(&context, &mut app, size);
+    assert_viewport_is(&context, &output, size);
+    assert!(
+        organisation_label_is_visible(&output, "Preview Playing Library"),
+        "not visible without scrolling"
+    );
+    click_label(&context, &mut app, size, "Preview Playing Library");
     assert_eq!(
         app.organisation.view,
         super::organisation::OrganisationView::PlayingLibrary
     );
+}
+
+/// The same constrained layout through the app's own 160% UI-scale setting,
+/// at the matching point size.
+#[test]
+fn gui_v2_organisation_primary_action_is_on_screen_at_the_160_percent_ui_scale() {
+    let size = [1024.0 / 1.6, 600.0 / 1.6];
+    let context = egui::Context::default();
+    let mut app = organisation_app(&context);
+    app.simple.set_ui_scale(1.6);
+    for _ in 0..3 {
+        frame(&context, &mut app, size);
+    }
+    let output = frame(&context, &mut app, size);
+    assert_viewport_is(&context, &output, size);
+    assert!(organisation_label_is_visible(
+        &output,
+        "Preview Playing Library"
+    ));
+    keyboard_activates_primary_action(&context, &mut app, size);
+}
+
+/// Where the action starts clipped, scrolling must bring it into view and it
+/// must then activate. Fails if the viewport silently grows or scrolling breaks.
+#[test]
+fn gui_v2_organisation_primary_action_scrolls_into_reach_when_clipped() {
+    let size = [640.0, 250.0];
+    let context = egui::Context::default();
+    let mut app = organisation_app(&context);
+    frame(&context, &mut app, size);
+    let before = frame(&context, &mut app, size);
+    assert_viewport_is(&context, &before, size);
+    assert!(
+        !organisation_label_is_visible(&before, "Preview Playing Library"),
+        "fixture no longer starts clipped; pick a shorter viewport"
+    );
+    // The pointer must be over the page body for the wheel to scroll it.
+    let body = egui::pos2(size[0] * 0.7, size[1] - 70.0);
+    let mut after = before;
+    for _ in 0..12 {
+        after = frame_with(
+            &context,
+            &mut app,
+            size,
+            vec![
+                egui::Event::PointerMoved(body),
+                egui::Event::MouseWheel {
+                    phase: egui::TouchPhase::Move,
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -40.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        if organisation_label_is_visible(&after, "Preview Playing Library") {
+            break;
+        }
+    }
+    assert_viewport_is(&context, &after, size);
+    assert!(
+        organisation_label_is_visible(&after, "Preview Playing Library"),
+        "scrolling did not bring the primary action into view"
+    );
+    click_label(&context, &mut app, size, "Preview Playing Library");
+    assert_eq!(
+        app.organisation.view,
+        super::organisation::OrganisationView::PlayingLibrary
+    );
+}
+
+/// Normal-resolution keyboard path, independent of the small-viewport tests.
+#[test]
+fn gui_v2_organisation_primary_action_is_keyboard_activatable_at_normal_sizes() {
+    for size in [[1024.0, 600.0], [1280.0, 800.0], [1920.0, 1080.0]] {
+        let context = egui::Context::default();
+        let mut app = organisation_app(&context);
+        frame(&context, &mut app, size);
+        let output = frame(&context, &mut app, size);
+        assert_viewport_is(&context, &output, size);
+        assert!(organisation_label_is_visible(
+            &output,
+            "Preview Playing Library"
+        ));
+        keyboard_activates_primary_action(&context, &mut app, size);
+    }
 }
 
 #[test]

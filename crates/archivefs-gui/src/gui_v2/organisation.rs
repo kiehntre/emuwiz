@@ -245,6 +245,10 @@ struct ActionCard {
     kind: CardKind,
 }
 
+/// Below this window height (in points) the landing page drops its hero so the
+/// primary action stays on screen.
+const COMPACT_HERO_VIEWPORT_HEIGHT: f32 = 580.0;
+
 const ACTIONS: [ActionCard; 5] = [
     ActionCard {
         title: "Rename verified games",
@@ -1041,22 +1045,36 @@ impl App {
             .auto_shrink([false, false])
             .show(ui, |ui| match self.organisation.view {
                 OrganisationView::Landing => {
-                    widgets::page_hero(
-                        ui,
-                        |ui, size| {
-                            let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                            CardKind::PlayingLibrary.paint(ui, rect);
-                        },
-                        "Choose what you want to organise",
-                        "Turn a verified collection into something tidy, understandable and ready to use.",
-                        Some((
+                    let compact = ui.ctx().content_rect().height() < COMPACT_HERO_VIEWPORT_HEIGHT;
+                    // On a short window (for example 1024x600 at 160% scaling is
+                    // 640x375 points) the hero would push the primary action
+                    // below the fold, where it cannot be focused. Keep the page
+                    // title and the safety statement, drop the illustration.
+                    if compact {
+                        widgets::status_badge(
+                            ui,
                             "Nothing changes until you preview and confirm",
                             widgets::StatusTone::Info,
-                        )),
-                        None,
-                        |_ui| {},
-                        |_ui| {},
-                    );
+                        );
+                        ui.add_space(theme::SPACE_SM);
+                    } else {
+    widgets::page_hero(
+                            ui,
+                            |ui, size| {
+                                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                                CardKind::PlayingLibrary.paint(ui, rect);
+                            },
+                            "Choose what you want to organise",
+                            "Turn a verified collection into something tidy, understandable and ready to use.",
+                            Some((
+                                "Nothing changes until you preview and confirm",
+                                widgets::StatusTone::Info,
+                            )),
+                            None,
+                            |_ui| {},
+                            |_ui| {},
+                        );
+                    }
                     if self.playing_library.attention_snapshot().items().next().is_some() {
                         widgets::banner(
                             ui,
@@ -1086,9 +1104,13 @@ impl App {
                         }
                         ui.add_space(theme::SPACE_SM);
                     }
-                    ui.label("Review your collection, understand the recommendation, then preview before applying.");
+                    if !compact {
+                        ui.label("Review your collection, understand the recommendation, then preview before applying.");
+                    }
                     widgets::workflow_card(ui, theme::TEAL, |ui| {
-                        ui.heading("Playing Library");
+                        if !compact {
+                            ui.heading("Playing Library");
+                        }
                         if primary(ui, "Preview Playing Library") {
                             selected = Some(Some(PlayingLibraryDestination::Generic));
                         }
