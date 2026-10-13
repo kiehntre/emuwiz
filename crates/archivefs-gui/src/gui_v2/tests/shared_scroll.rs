@@ -114,10 +114,7 @@ fn wheel(context: &egui::Context, app: &mut App, size: [f32; 2], delta: f32) -> 
 }
 fn targets(section: Section) -> Vec<&'static str> {
     match section {
-        Section::Emulators => vec![
-            "DuckStation: shared resolver recommendation (preview)",
-            "Check Emulators",
-        ],
+        Section::Emulators => vec!["Check Emulators"],
         Section::Sources => vec!["Add source", "ROM hack identification (HackHash)"],
         Section::Dat => vec!["Import DAT…", "No-Intro pack import"],
         Section::Check => vec![
@@ -262,8 +259,7 @@ fn native_primary_actions_receive_visible_tab_and_reverse_tab_focus() {
 // Placement after the candidate grid belongs to the Launch integration lane.
 // Keep the distance visible in evidence while proving the single viewport can
 // reach the card with ordinary wheel input at every supported test size.
-#[test]
-fn ppsspp_card_remains_reachable_with_deferred_placement() {
+fn assert_card_reachable_with_deferred_placement(title: &str) {
     for simple in [false, true] {
         for (window, scale) in CASES {
             let context = egui::Context::default();
@@ -272,14 +268,8 @@ fn ppsspp_card_remains_reachable_with_deferred_placement() {
             let mut output = settled(&context, &mut app, size);
             let mut reached = false;
             for step in 0..=240 {
-                if visible(
-                    &output,
-                    size,
-                    "PPSSPP: shared resolver recommendation (preview)",
-                )
-                .is_some()
-                {
-                    eprintln!("PPSSPP {window:?} {scale} simple={simple}: wheel_steps={step}");
+                if visible(&output, size, title).is_some() {
+                    eprintln!("{title} {window:?} {scale} simple={simple}: wheel_steps={step}");
                     reached = true;
                     break;
                 }
@@ -287,10 +277,24 @@ fn ppsspp_card_remains_reachable_with_deferred_placement() {
             }
             assert!(
                 reached,
-                "PPSSPP unreachable: {window:?} {scale} simple={simple}"
+                "{title} unreachable: {window:?} {scale} simple={simple}"
             );
         }
     }
+}
+
+#[test]
+fn ppsspp_card_remains_reachable_with_deferred_placement() {
+    assert_card_reachable_with_deferred_placement(
+        "PPSSPP: shared resolver recommendation (preview)",
+    );
+}
+
+// DuckStation's card now sits below the candidate grid too (so the page's
+// primary action stays visible at 1024x600); it is reached the same way.
+#[test]
+fn duckstation_card_remains_reachable_with_deferred_placement() {
+    assert_card_reachable_with_deferred_placement("DuckStation: shared resolver selection");
 }
 
 #[test]
