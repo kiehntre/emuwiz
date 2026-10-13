@@ -2106,7 +2106,10 @@ mod tests {
         fs::write(&base_path, &base).unwrap();
         fs::write(&target_path, &target).unwrap();
 
-        let status = Command::new("/usr/bin/xdelta3")
+        let tool = find_xdelta3().expect(
+            "real round-trip test requires xdelta3 on PATH (Ubuntu: apt-get install xdelta3)",
+        );
+        let status = Command::new(tool)
             .args([
                 "-e",
                 "-s",

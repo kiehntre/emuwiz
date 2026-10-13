@@ -65,6 +65,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Install Xdelta3 for real patch round-trip tests
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xdelta3
+      - name: Verify Xdelta3 is available
+        run: |
+          test -x /usr/bin/xdelta3
+          command -v xdelta3
+          xdelta3 -V
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
