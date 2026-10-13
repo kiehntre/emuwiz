@@ -141,6 +141,17 @@ class Base(T.Env):
         return os.path.lexists(os.path.join(target, rel))
 
 
+class NoRepoWrites(unittest.TestCase):
+    def test_executor_never_writes_bytecode_into_the_scripts_directory(self):
+        cache = os.path.join(HERE, "__pycache__")
+        before = set(os.listdir(cache)) if os.path.isdir(cache) else set()
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+        r = subprocess.run([sys.executable, RETIRE, "--help"], env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        after = set(os.listdir(cache)) if os.path.isdir(cache) else set()
+        self.assertEqual({n for n in after - before if "cargo-retention" in n}, set())
+
+
 class Retirement(Base):
     def test_synthetic_retirement_removes_artifacts_and_preserves_evidence(self):
         wt, t = self.managed_cache()

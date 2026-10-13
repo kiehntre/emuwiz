@@ -41,6 +41,9 @@ _hook = None  # test seam: called with a stage name; may mutate the filesystem
 
 def load_foundation():
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "emuwiz-cargo-retention")
+    # Never write bytecode next to the scripts: a retirement tool must not add
+    # files to the repository tree it runs from.
+    sys.dont_write_bytecode = True
     loader = importlib.machinery.SourceFileLoader("emuwiz_cargo_retention", path)
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
