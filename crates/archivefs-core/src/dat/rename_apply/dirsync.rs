@@ -63,6 +63,10 @@ pub(crate) struct RenameDirs {
     destination_name: std::ffi::OsString,
     source_id: (u64, u64),
     destination_id: (u64, u64),
+    /// The trusted root each parent was resolved from (None: anchor-less bind, which
+    /// requires the path to be its own real path).  Used to RE-PROVE containment.
+    source_root: Option<std::path::PathBuf>,
+    destination_root: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
@@ -82,6 +86,14 @@ impl RenameDirs {
         };
         let (source_parent, source_name) = split(source)?;
         let (destination_parent, destination_name) = split(destination)?;
+        // With no trusted root to anchor to, containment cannot be re-proved from
+        // an anchor, so the journalled path must BE its own real path: no symlink
+        // or redirected ancestor anywhere above the parent. (A legitimately
+        // symlinked prefix is refused rather than guessed at; pass a trusted root
+        // via `open_in` / `open_anchored` to allow it.)
+        for parent in [&source_parent, &destination_parent] {
+            require_own_real_path(parent)?;
+        }
         let (source_dir, source_id) = open_verified(&source_parent)?;
         let (destination_dir, destination_id) = if source_parent == destination_parent {
             (source_dir.try_clone()?, source_id)
@@ -97,7 +109,30 @@ impl RenameDirs {
             destination_name,
             source_id,
             destination_id,
+            source_root: None,
+            destination_root: None,
         })
+    }
+
+    /// Binds for RECOVERY: when both parents are lexically below `anchor` (the
+    /// journalled collection root) they are resolved from it with the
+    /// per-component `O_NOFOLLOW` walk of [`Self::open_in`], so an ancestor
+    /// replaced by a symlink or a moved subtree is refused; otherwise the
+    /// anchor-less rule of [`Self::open`] applies (the path must be its own
+    /// real path). Never "succeeds" on a path that resolves outside the anchor.
+    pub(crate) fn open_anchored(
+        source: &Path,
+        destination: &Path,
+        anchor: Option<&Path>,
+    ) -> io::Result<Self> {
+        if let Some(anchor) = anchor.filter(|a| a.is_absolute() && !a.as_os_str().is_empty()) {
+            let below = |p: &Path| p.parent().is_some_and(|parent| parent.starts_with(anchor));
+            if below(source) && below(destination) {
+                let roots = crate::safe_read::TrustedRoots::from_paths([anchor]);
+                return Self::open_in(source, destination, &roots);
+            }
+        }
+        Self::open(source, destination)
     }
 
     /// Like [`Self::open`], but with the parents resolved FROM a trusted root: the
@@ -129,12 +164,13 @@ impl RenameDirs {
         };
         let (source_parent, source_name) = split(source)?;
         let (destination_parent, destination_name) = split(destination)?;
-        let (source_dir, source_id) = open_under_root(&source_parent, trusted)?;
-        let (destination_dir, destination_id) = if source_parent == destination_parent {
-            (source_dir.try_clone()?, source_id)
-        } else {
-            open_under_root(&destination_parent, trusted)?
-        };
+        let (source_dir, source_id, source_root) = open_under_root(&source_parent, trusted)?;
+        let (destination_dir, destination_id, destination_root) =
+            if source_parent == destination_parent {
+                (source_dir.try_clone()?, source_id, source_root.clone())
+            } else {
+                open_under_root(&destination_parent, trusted)?
+            };
         Ok(Self {
             source_dir,
             destination_dir,
@@ -144,6 +180,8 @@ impl RenameDirs {
             destination_name,
             source_id,
             destination_id,
+            source_root: Some(source_root),
+            destination_root: Some(destination_root),
         })
     }
 
@@ -244,14 +282,35 @@ impl RenameDirs {
     /// The parent paths must still resolve (without following a final symlink)
     /// to the directories this value holds descriptors for.
     pub(crate) fn verify_bound(&self) -> io::Result<()> {
-        for (path, id, stage) in [
+        for (path, id, stage, root) in [
             (
                 &self.destination_parent,
                 self.destination_id,
                 "destination directory",
+                &self.destination_root,
             ),
-            (&self.source_parent, self.source_id, "source directory"),
+            (
+                &self.source_parent,
+                self.source_id,
+                "source directory",
+                &self.source_root,
+            ),
         ] {
+            // Containment first: matching device/inode alone is not enough - a whole
+            // subtree can be moved elsewhere and reached through a substituted ancestor
+            // with its identities unchanged.
+            let contained = match root {
+                Some(root) => plain_below_root(root, path),
+                None => require_own_real_path(path),
+            };
+            if let Err(error) = contained {
+                return Err(io::Error::other(format!(
+                    "{stage} {} is no longer contained where it was bound ({error}); the \
+                     path was redirected or its ancestry replaced while the operation was \
+                     in progress",
+                    path.display()
+                )));
+            }
             match path_identity(path) {
                 Ok(current) if current == id => {}
                 other => {
@@ -270,6 +329,21 @@ impl RenameDirs {
         }
         Ok(())
     }
+}
+
+/// The path must equal its own canonical form (no symlinked or redirected component).
+#[cfg(unix)]
+fn require_own_real_path(path: &Path) -> io::Result<()> {
+    let real = std::fs::canonicalize(path)?;
+    if real != path {
+        return Err(io::Error::other(format!(
+            "{} is not its own real path (it resolves to {}): an ancestor is a symlink or was \
+             redirected, so containment cannot be established",
+            path.display(),
+            real.display()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -299,7 +373,7 @@ fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
 fn open_under_root(
     parent: &Path,
     trusted: &crate::safe_read::TrustedRoots,
-) -> io::Result<(std::fs::File, (u64, u64))> {
+) -> io::Result<(std::fs::File, (u64, u64), std::path::PathBuf)> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -370,7 +444,27 @@ fn open_under_root(
             parent.display()
         )));
     }
-    Ok((current, id))
+    Ok((current, id, root.to_path_buf()))
+}
+
+/// Every component of `parent` below `root` is (still) a real directory, never a
+/// symlink: containment under the root re-proved NOW, not just when it was opened.
+#[cfg(unix)]
+fn plain_below_root(root: &Path, parent: &Path) -> io::Result<()> {
+    let relative = parent.strip_prefix(root).map_err(io::Error::other)?;
+    let mut walked = root.to_path_buf();
+    for component in relative.components() {
+        walked.push(component);
+        let metadata = std::fs::symlink_metadata(&walked)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::other(format!(
+                "{} is no longer a plain directory below the trusted root {}",
+                walked.display(),
+                root.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

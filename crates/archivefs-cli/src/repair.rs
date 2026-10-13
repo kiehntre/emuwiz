@@ -260,6 +260,8 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
+                "status": apply_status_label(&combined),
+                "complete": apply_incomplete_reason(&combined).is_none(),
                 "still_needs_review": still_needs_review,
                 "still_needs_review_duplicate_groups": still_needs_review_duplicate_groups,
                 "rename": combined.rename.as_ref().map(transaction_result_json),
@@ -275,7 +277,13 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             }))?
         );
     } else {
-        println!("Repair apply complete:");
+        match apply_status_label(&combined) {
+            "complete" => println!("Repair apply complete:"),
+            "incomplete_recovery_required" => {
+                println!("Repair apply INCOMPLETE - recovery required (see Unresolved below):")
+            }
+            _ => println!("Repair apply INCOMPLETE:"),
+        }
         println!("  Still NeedsReview: {still_needs_review}");
         println!("  Still NeedsReview duplicate groups: {still_needs_review_duplicate_groups}");
         if let Some(rename) = &combined.rename {
@@ -297,7 +305,66 @@ fn run_apply(mut args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             println!("  (nothing was applied)");
         }
     }
-    Ok(())
+    // The full result (text or JSON, transaction ids, counts, journal evidence) is
+    // printed above; only the exit status signals the outcome. An apply with
+    // in-flight, failed or not-attempted entries is never reported as success.
+    match apply_incomplete_reason(&combined) {
+        None => Ok(()),
+        Some(reason) => Err(reason.into()),
+    }
+}
+
+/// Why an apply result is not a complete success (None when it is).
+fn apply_incomplete_reason(combined: &CombinedApplyResult) -> Option<String> {
+    let summaries = combined
+        .rename
+        .iter()
+        .map(|r| &r.summary)
+        .chain(combined.quarantine.iter().map(|q| &q.result.summary));
+    let (mut unresolved, mut failed, mut pending, mut ids) = (0, 0, 0, Vec::new());
+    for summary in summaries {
+        if summary.unresolved > 0 || summary.failed > 0 || summary.pending > 0 {
+            ids.push(summary.transaction_id.clone());
+        }
+        unresolved += summary.unresolved;
+        failed += summary.failed;
+        pending += summary.pending;
+    }
+    if unresolved + failed + pending == 0 {
+        return None;
+    }
+    let mut reason = format!(
+        "repair apply did not complete: {unresolved} unresolved (in flight), {failed} failed, \
+         {pending} not attempted (transaction {})",
+        ids.join(", ")
+    );
+    if unresolved > 0 {
+        reason.push_str(
+            "; run `repair history` / recovery before any further action and do not repeat the apply",
+        );
+    }
+    Some(reason)
+}
+
+fn apply_status_label(combined: &CombinedApplyResult) -> &'static str {
+    let unresolved: usize = combined
+        .rename
+        .iter()
+        .map(|r| r.summary.unresolved)
+        .chain(
+            combined
+                .quarantine
+                .iter()
+                .map(|q| q.result.summary.unresolved),
+        )
+        .sum();
+    if unresolved > 0 {
+        "incomplete_recovery_required"
+    } else if apply_incomplete_reason(combined).is_some() {
+        "incomplete"
+    } else {
+        "complete"
+    }
 }
 
 /// Whether a journaled transaction is an ordinary repair rename or a

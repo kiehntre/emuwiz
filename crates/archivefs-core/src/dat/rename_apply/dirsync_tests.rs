@@ -1202,3 +1202,140 @@ mod r3_independent_review {
         );
     }
 }
+
+/// Reproduces the independent review's recovery containment failure (963d1290):
+/// the journalled destination subtree is moved outside the collection and its
+/// ancestor replaced by a symlink; file identity still matches, which is not enough.
+mod r3_final_review {
+    use super::*;
+
+    struct Escape {
+        outside: PathBuf,
+        symlink_at: PathBuf,
+    }
+
+    /// Journal says Applying; the object is at roms/ancestor/target/A.bin.
+    fn in_flight_nested(f: &mut Fx) -> (PathBuf, Escape) {
+        let base = f.roms.parent().unwrap().to_path_buf();
+        let ancestor = f.roms.join("ancestor");
+        let target = ancestor.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let destination = target.join("A.bin");
+        f.tx.entries[0].destination_path = destination.clone();
+        std::fs::rename(&f.tx.entries[0].source_path, &destination).unwrap();
+        f.tx.entries[0].state = EntryState::Applying;
+        f.tx.state = TransactionState::Applying;
+        write_journal(&f.journal, &f.tx).unwrap();
+        (
+            destination,
+            Escape {
+                outside: base.join("outside"),
+                symlink_at: ancestor,
+            },
+        )
+    }
+
+    fn escape(e: &Escape) {
+        std::fs::rename(&e.symlink_at, &e.outside).unwrap();
+        std::os::unix::fs::symlink(&e.outside, &e.symlink_at).unwrap();
+    }
+
+    #[test]
+    fn control_an_untouched_nested_destination_is_still_confirmed() {
+        let mut f = fx(&["a.bin"], false);
+        in_flight_nested(&mut f);
+        let mut tx = f.tx.clone();
+        let issues = reconcile_recovery(&mut tx, &f.journal).unwrap();
+        assert_eq!(
+            issues[0].kind,
+            RecoveryIssueKind::RenameConfirmed,
+            "{:?}",
+            issues[0]
+        );
+        assert_eq!(tx.entries[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn subtree_moved_outside_the_collection_is_never_confirmed() {
+        let mut f = fx(&["a.bin"], false);
+        let (destination, e) = in_flight_nested(&mut f);
+        escape(&e);
+        // File identity still matches through the symlink ...
+        let through = capture_identity(&destination).unwrap();
+        assert!(identity_matches(&f.tx.entries[0].identity, &through));
+        // ... which must not authorise completion.
+        let mut tx = f.tx.clone();
+        let issues = reconcile_recovery(&mut tx, &f.journal).unwrap();
+        assert_ne!(
+            issues[0].kind,
+            RecoveryIssueKind::RenameConfirmed,
+            "{:?}",
+            issues[0]
+        );
+        assert_ne!(tx.entries[0].state, EntryState::Applied);
+        assert_ne!(tx.state, TransactionState::Applied);
+        assert_eq!(persisted(&f).entries[0].state, EntryState::Applying);
+        assert!(
+            e.outside.join("target").join("A.bin").exists(),
+            "nothing replayed or moved"
+        );
+    }
+
+    #[test]
+    fn same_attack_without_an_anchor_in_range_is_refused_by_the_real_path_rule() {
+        // Journalled scan root unrelated to the destination: no anchor applies, so the
+        // path must be its own real path - a symlinked ancestor is refused.
+        let mut f = fx(&["a.bin"], false);
+        let (_, e) = in_flight_nested(&mut f);
+        f.tx.source_scan_root = f
+            .roms
+            .parent()
+            .unwrap()
+            .join("unrelated")
+            .display()
+            .to_string();
+        write_journal(&f.journal, &f.tx).unwrap();
+        escape(&e);
+        let mut tx = f.tx.clone();
+        let issues = reconcile_recovery(&mut tx, &f.journal).unwrap();
+        assert_ne!(
+            issues[0].kind,
+            RecoveryIssueKind::RenameConfirmed,
+            "{:?}",
+            issues[0]
+        );
+        assert_ne!(tx.entries[0].state, EntryState::Applied);
+    }
+
+    #[test]
+    fn ancestor_replaced_between_binding_and_sync_is_not_confirmed() {
+        let mut f = fx(&["a.bin"], false);
+        let (destination, e) = in_flight_nested(&mut f);
+        let parent = destination.parent().unwrap().to_path_buf();
+        let done = Rc::new(std::cell::Cell::new(false));
+        let flag = done.clone();
+        let (outside, link) = (e.outside.clone(), e.symlink_at.clone());
+        set_test_hook(Some(Box::new(move |event| {
+            if let DirSyncEvent::Before(p) = event
+                && p == parent
+                && !flag.get()
+            {
+                flag.set(true);
+                std::fs::rename(&link, &outside).unwrap();
+                std::os::unix::fs::symlink(&outside, &link).unwrap();
+            }
+            Ok(())
+        })));
+        let mut tx = f.tx.clone();
+        let issues = reconcile_recovery(&mut tx, &f.journal).unwrap();
+        clear();
+        assert!(done.get());
+        assert_eq!(
+            issues[0].kind,
+            RecoveryIssueKind::DirectorySyncFailed,
+            "{:?}",
+            issues[0]
+        );
+        assert_ne!(tx.entries[0].state, EntryState::Applied);
+    }
+}

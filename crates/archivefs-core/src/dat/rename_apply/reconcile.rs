@@ -104,9 +104,15 @@ pub fn reconcile_recovery(
             TransactionOperation::RenameMove
         );
         let bound = if rename_move {
-            super::dirsync::RenameDirs::open(
+            // Anchored at the journalled collection root when the entry lies below
+            // it; otherwise the path must be its own real path. A redirected,
+            // moved or symlink-substituted ancestor cannot bind, so the entry stays
+            // unresolved and is never promoted on file identity alone.
+            let anchor = std::path::Path::new(&transaction.source_scan_root);
+            super::dirsync::RenameDirs::open_anchored(
                 &transaction.entries[index].source_path,
                 &transaction.entries[index].destination_path,
+                Some(anchor),
             )
             .ok()
         } else {
@@ -116,6 +122,21 @@ pub fn reconcile_recovery(
             Some(dirs) => classify_entry_bound(&transaction.entries[index], index, dirs),
             None => classify_entry(&transaction.entries[index], index),
         };
+        // A rename's directories that could not be bound (redirected or moved
+        // ancestor, symlink substitution, outside the anchor) never promote an
+        // entry: "the object looks right" through an unverified path proves
+        // nothing about where it is.  Applying and RollingBack alike.
+        if rename_move && bound.is_none() && issue.kind == RecoveryIssueKind::RenameConfirmed {
+            issue = RecoveryIssue {
+                entry_index: index,
+                kind: RecoveryIssueKind::DirectorySyncFailed,
+                detail: "the parent directories could not be bound inside the journalled \
+                         collection root (redirected, moved or substituted ancestor, or the \
+                         path is not its own real path); containment is unproven so the \
+                         entry is left unresolved"
+                    .to_string(),
+            };
+        }
         // Promoting an entry on the strength of a rename the filesystem shows
         // must not outrun the durability of that rename's directory entries.
         // Nothing was mutated for "did not happen" while Applying.
