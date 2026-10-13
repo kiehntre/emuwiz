@@ -1797,6 +1797,10 @@ mod tests {
         std::fs::set_permissions(&flatpak, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut roots = roots_for(root);
         roots.path_override = Some(vec![flatpak.parent().unwrap().to_path_buf()]);
+        // The deployment below lives under `root/.local/share`, so discovery must be
+        // pointed at it. Leaving `xdg_data_home` elsewhere only passed on hosts that
+        // happen to have a system-wide RPCS3 Flatpak under /var/lib.
+        roots.xdg_data_home = root.join(".local/share");
         let config = root.join(".var/app").join(app_id).join("config/rpcs3");
         write_file(&config.join("config.yml"), b"Core:\n");
         write_file(
@@ -1837,6 +1841,92 @@ mod tests {
                 extract_and_run: false
             }
         );
+    }
+
+    /// A Flatpak deployment and profile under `root`, with the fake `flatpak` on the
+    /// discovery PATH only when `with_flatpak` is set.
+    fn flatpak_fixture(root: &Path, with_flatpak: bool) -> (Rpcs3ProfileDiscoveryRoots, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let app_id = crate::launch::installation_known::RPCS3.flatpak_ids[0];
+        let flatpak = root.join("bin/flatpak");
+        let mut roots = roots_for(root);
+        roots.xdg_data_home = root.join(".local/share");
+        if with_flatpak {
+            write_file(&flatpak, b"flatpak executable");
+            std::fs::set_permissions(&flatpak, std::fs::Permissions::from_mode(0o755)).unwrap();
+            roots.path_override = Some(vec![root.join("bin")]);
+        }
+        write_file(
+            &root
+                .join(".var/app")
+                .join(app_id)
+                .join("config/rpcs3/config.yml"),
+            b"Core:\n",
+        );
+        write_file(
+            &root
+                .join(".local/share/flatpak/app")
+                .join(app_id)
+                .join("current/active/metadata"),
+            b"[Application]\n",
+        );
+        (roots, flatpak)
+    }
+
+    fn flatpak_profile(roots: &Rpcs3ProfileDiscoveryRoots) -> Rpcs3Profile {
+        discover_rpcs3_profiles(roots)
+            .profiles
+            .into_iter()
+            .find(|profile| profile.installation_type == Rpcs3InstallationType::FlatpakUser)
+            .unwrap()
+    }
+
+    #[test]
+    fn flatpak_profile_without_a_flatpak_executable_is_blocked_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (roots, _) = flatpak_fixture(dir.path(), false);
+        let error = resolve_rpcs3_native_launch_binding(&flatpak_profile(&roots)).unwrap_err();
+        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::ExecutableMissing);
+    }
+
+    #[test]
+    fn flatpak_binding_ignores_native_and_explicit_candidates() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (roots, flatpak) = flatpak_fixture(dir.path(), true);
+        let mut profile = flatpak_profile(&roots);
+        let native = dir.path().join("chosen/rpcs3");
+        write_file(&native, b"native executable");
+        std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o755)).unwrap();
+        profile.executable_candidates.push(Rpcs3Executable {
+            path: native,
+            installation_type: Rpcs3InstallationType::Explicit,
+            version: None,
+        });
+        let binding = resolve_rpcs3_native_launch_binding(&profile).unwrap();
+        assert_eq!(binding.executable, flatpak);
+        assert!(matches!(
+            binding.installation,
+            crate::launch::installation::LaunchInstallation::Flatpak { .. }
+        ));
+    }
+
+    #[test]
+    fn two_flatpak_executables_are_ambiguous() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (roots, _) = flatpak_fixture(dir.path(), true);
+        let mut profile = flatpak_profile(&roots);
+        let second = dir.path().join("other/flatpak");
+        write_file(&second, b"flatpak executable");
+        std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o755)).unwrap();
+        profile.executable_candidates.push(Rpcs3Executable {
+            path: second,
+            installation_type: Rpcs3InstallationType::FlatpakUser,
+            version: None,
+        });
+        let error = resolve_rpcs3_native_launch_binding(&profile).unwrap_err();
+        assert_eq!(error.kind, Rpcs3LaunchBlockerKind::AmbiguousExecutable);
     }
 
     #[test]
