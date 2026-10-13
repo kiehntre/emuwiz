@@ -1661,6 +1661,66 @@ fn organisation_label_is_visible(output: &egui::FullOutput, label: &str) -> bool
         .any(|shape| contains(&shape.shape, shape.clip_rect, label))
 }
 
+/// 1024x600 physical pixels at 160% scaling is a 640x375 point window; there the
+/// primary action must be reachable by scrolling. At 1024x600 it is also reached and
+/// activated by keyboard alone (egui does not focus widgets outside the clip).
+#[test]
+fn gui_v2_organisation_primary_action_is_scroll_reachable_at_160_percent_and_keyboard_activatable()
+{
+    let size = [640.0, 375.0];
+    let context = egui::Context::default();
+    context.set_pixels_per_point(1.6);
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    frame(&context, &mut app, size);
+    let first = frame(&context, &mut app, size);
+    assert!(
+        organisation_label_is_visible(&first, "Preview Playing Library")
+            || organisation_label_is_visible(
+                &scroll_page(&context, &mut app, size),
+                "Preview Playing Library"
+            ),
+        "primary action unreachable by scrolling at 160%"
+    );
+
+    // Keyboard only, at the normal 1024x600 size where the action is on screen.
+    let size = [1024.0, 600.0];
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.router.current = Route::Section(Section::Build);
+    frame(&context, &mut app, size);
+    let output = frame(&context, &mut app, size);
+    let target = text_bounds(&output, "Preview Playing Library")[0];
+    let key = |key, pressed| egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let mut focused_on_target = false;
+    for _ in 0..60 {
+        frame_with(&context, &mut app, size, vec![key(egui::Key::Tab, true)]);
+        frame_with(&context, &mut app, size, vec![key(egui::Key::Tab, false)]);
+        let rect = context
+            .memory(|memory| memory.focused())
+            .and_then(|id| context.read_response(id))
+            .map(|response| response.rect);
+        if rect.is_some_and(|rect| rect.contains_rect(target)) {
+            focused_on_target = true;
+            break;
+        }
+    }
+    assert!(focused_on_target, "Tab never focused the primary action");
+    frame_with(&context, &mut app, size, vec![key(egui::Key::Enter, true)]);
+    frame_with(&context, &mut app, size, vec![key(egui::Key::Enter, false)]);
+    frame(&context, &mut app, size);
+    assert_eq!(
+        app.organisation.view,
+        super::organisation::OrganisationView::PlayingLibrary
+    );
+}
+
 #[test]
 fn gui_v2_organisation_review_tasks_route_without_starting_an_operation() {
     for (label, destination) in [

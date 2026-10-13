@@ -1088,13 +1088,6 @@ impl App {
                     }
                     ui.label("Review your collection, understand the recommendation, then preview before applying.");
                     widgets::workflow_card(ui, theme::TEAL, |ui| {
-                        ui.heading("MAME Collection Health");
-                        ui.label("Read-only arcade set inspection: ROM checksums, shared support files and preservation gaps. Storage completeness does not prove game runnability.");
-                        if ui.button("Check MAME collection health").clicked() {
-                            self.organisation.view = OrganisationView::MameHealth;
-                        }
-                    });
-                    widgets::workflow_card(ui, theme::TEAL, |ui| {
                         ui.heading("Playing Library");
                         if primary(ui, "Preview Playing Library") {
                             selected = Some(Some(PlayingLibraryDestination::Generic));
@@ -1131,6 +1124,16 @@ impl App {
                                     });
                                 });
                             });
+                        }
+                    });
+                    ui.add_space(theme::SPACE_SM);
+                    // Read-only inspection: kept below the primary action and
+                    // the destinations so it never pushes them off-screen.
+                    widgets::workflow_card(ui, theme::TEAL, |ui| {
+                        ui.heading("MAME Collection Health");
+                        ui.label("Read-only arcade set inspection: ROM checksums, shared support files and preservation gaps. Storage completeness does not prove game runnability.");
+                        if ui.button("Check MAME collection health").clicked() {
+                            self.organisation.view = OrganisationView::MameHealth;
                         }
                     });
                     ui.add_space(theme::SPACE_SM);
