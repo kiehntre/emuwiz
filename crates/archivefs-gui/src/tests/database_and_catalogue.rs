@@ -56,8 +56,11 @@ fn database_upgrade_backups(database_path: &Path) -> Vec<PathBuf> {
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                // the ownership receipt is a sidecar of the backup, not a backup
+                name.starts_with(&prefix) && !name.ends_with(".receipt.json")
+            })
         })
         .collect()
 }

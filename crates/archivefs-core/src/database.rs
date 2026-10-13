@@ -57,6 +57,10 @@ mod attention;
 #[path = "database/attention_tests.rs"]
 mod attention_tests;
 mod authority;
+mod backup_ownership;
+#[cfg(test)]
+#[path = "database/backup_ownership_tests.rs"]
+mod backup_ownership_tests;
 mod catalogue_health;
 #[cfg(test)]
 #[path = "database/catalogue_health_tests.rs"]
@@ -482,6 +486,11 @@ fn trusted_persistable_topology(set: &MediaSet) -> bool {
                 })
         })
 }
+
+pub use backup_ownership::{
+    BACKUP_CAPACITY_HEADROOM_BYTES, BACKUP_RECEIPT_SUFFIX, MAX_RETAINED_UPGRADE_BACKUPS,
+    UpgradeBackupInspection, UpgradeBackupState, inspect_upgrade_backups, receipt_path_for,
+};
 
 /// The durable result of an explicitly requested library-database upgrade.
 /// The backup is retained after success so the user can recover the exact
@@ -1636,6 +1645,10 @@ fn upgrade_library_database_with_migrations(
             path.display()
         )));
     }
+    // Fail closed on identity: a symlink or special file is never upgraded, and
+    // only one upgrade of a database may run at a time.
+    let source_identity = backup_ownership::SourceIdentity::capture(path)?;
+    let _upgrade_lock = backup_ownership::UpgradeLock::acquire(path)?;
 
     let source = open_read_only_connection(path)?;
     let from_version = schema_version(&source)?;
@@ -1664,9 +1677,25 @@ fn upgrade_library_database_with_migrations(
         ))
     })?;
 
-    let backup_path = reserve_database_backup_path(path, from_version, to_version)?;
+    // Capacity and retention are checked before any file is created; the
+    // reservation claims the backup name and its ownership receipt together.
+    let wal_bytes = {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        fs::metadata(PathBuf::from(wal))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    backup_ownership::preflight(path, source_metadata.len().saturating_add(wal_bytes))?;
+    let mut reservation = backup_ownership::BackupReservation::reserve(
+        path,
+        from_version,
+        to_version,
+        &source_identity,
+    )?;
+    let backup_path = reservation.backup_path.clone();
     if let Err(error) = source.backup(MAIN_DB, &backup_path, None) {
-        let _ = fs::remove_file(&backup_path);
+        reservation.discard();
         return Err(ArchiveFsError::Database(format!(
             "Could not create a safe pre-upgrade database backup. The library database was not \
              changed: {error}"
@@ -1675,15 +1704,34 @@ fn upgrade_library_database_with_migrations(
     drop(source);
 
     if let Err(error) = verify_database_backup(&backup_path, from_version) {
-        let _ = fs::remove_file(&backup_path);
+        reservation.discard();
         return Err(ArchiveFsError::Database(format!(
             "Could not verify the pre-upgrade database backup. The library database was not \
              changed: {error}"
         )));
     }
     let backup_sha256 = sha256_file(&backup_path)?;
+    let backup_len = fs::metadata(&backup_path)
+        .map(|m| m.len())
+        .map_err(|error| {
+            ArchiveFsError::Database(format!(
+                "could not measure the pre-upgrade backup. The library database was not changed: \
+             {error}"
+            ))
+        })?;
+    // The backup earns authority only once its ownership receipt is published
+    // and the pair re-verifies through freshly opened handles.
+    if let Err(error) = reservation.complete(backup_len, &backup_sha256) {
+        reservation.discard();
+        return Err(ArchiveFsError::Database(format!(
+            "The pre-upgrade backup could not be bound to an ownership receipt. The library \
+             database was not changed: {error}"
+        )));
+    }
 
     let migration_result = (|| {
+        // The path must still name the file that was backed up.
+        source_identity.recheck(path)?;
         let mut connection = open_connection(path)?;
         let observed_version = schema_version(&connection)?;
         if observed_version != from_version {
@@ -1746,54 +1794,6 @@ fn sha256_file(path: &Path) -> Result<String> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
-}
-
-fn reserve_database_backup_path(
-    path: &Path,
-    from_version: i64,
-    to_version: i64,
-) -> Result<PathBuf> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().ok_or_else(|| {
-        ArchiveFsError::Database(format!(
-            "could not derive a backup name for {}. Nothing was changed.",
-            path.display()
-        ))
-    })?;
-
-    for sequence in 0..1_000_u16 {
-        let mut backup_name = file_name.to_os_string();
-        backup_name.push(format!(".schema-{from_version}-before-{to_version}.backup"));
-        if sequence > 0 {
-            backup_name.push(format!(".{sequence}"));
-        }
-        let candidate = parent.join(backup_name);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                drop(file);
-                return Ok(candidate);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(ArchiveFsError::Database(format!(
-                    "Could not reserve a pre-upgrade database backup beside {}. The library \
-                     database was not changed: {error}",
-                    path.display()
-                )));
-            }
-        }
-    }
-
-    Err(ArchiveFsError::Database(format!(
-        "Could not choose an unused pre-upgrade backup name beside {}. The library database was \
-         not changed.",
-        path.display()
-    )))
 }
 
 fn verify_database_backup(path: &Path, expected_version: i64) -> Result<()> {
