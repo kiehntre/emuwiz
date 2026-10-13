@@ -65,15 +65,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Xdelta3 for real patch round-trip tests
+      - name: Install tools for real patch and optical-conversion tests
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xdelta3
+          sudo apt-get install -y --no-install-recommends xdelta3 mame-tools
       - name: Verify Xdelta3 is available
         run: |
           test -x /usr/bin/xdelta3
           command -v xdelta3
           xdelta3 -V
+      - name: Verify CHDman is available
+        run: |
+          test -x /usr/bin/chdman
+          # CHDman returns 1 after printing help; still reject execution failures.
+          chdman_help=$(/usr/bin/chdman help 2>&1) || test "$?" -eq 1
+          printf '%s\n' "$chdman_help"
+          grep -Fq 'MAME Compressed Hunks of Data' <<< "$chdman_help"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97.1"
