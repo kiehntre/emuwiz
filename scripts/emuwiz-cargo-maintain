@@ -32,8 +32,10 @@ A generated manifest's hash is never the authorisation: the persistent policy is
 """
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import io
+import math
 import importlib.machinery
 import importlib.util
 import json
@@ -53,7 +55,8 @@ DEFAULT_HARD = 240_000_000_000
 DEFAULT_COLD_ALLOWANCE = 3 * GIB       # expected first-build size of a new target
 USAGE_TTL_SECONDS = 600
 MIN_IDLE_HOURS = 48
-EXIT_REFUSED = 5
+EXIT_REFUSED = 5               # reserved for a future enforce mode; admit never returns it today
+ADMISSION_MODES = ("advisory", "off")   # "enforce" is deliberately unavailable (see cmd_admit)
 
 EXPLANATIONS = {
     "NO_LIFECYCLE_RECORD": "legacy or untracked target: never auto-retired; needs a human `adopt` and a maintenance window",
@@ -124,6 +127,10 @@ def policy_path():
     return os.path.join(state_dir(), "policy.json")
 
 
+def enable_path():
+    return os.path.join(state_dir(), "enable.json")
+
+
 def history_path():
     return os.path.join(state_dir(), "history.jsonl")
 
@@ -138,15 +145,16 @@ def ensure_state():
         os.makedirs(os.path.join(state_dir(), sub), mode=0o700, exist_ok=True)
 
 
-def append_history(event):
+def append_history(event, at=None):
     ensure_state()
-    event = dict(event, at=now(), by=F.owner_name())
+    event = dict(event, at=now() if at is None else at, by=F.owner_name())
     fd = os.open(history_path(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(fd, (json.dumps(event, sort_keys=True) + "\n").encode())
         os.fsync(fd)
     finally:
         os.close(fd)
+    fsync_directory(state_dir())
 
 
 def read_history():
@@ -173,50 +181,160 @@ def policy_digest(policy):
     return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()
 
 
-def load_policy():
-    """(state, policy, why): state is absent, ok or invalid.  Invalid is never
-    treated as absent-and-harmless: automatic retirement fails closed."""
-    path = policy_path()
+def trusted_policy_uids():
+    """Accounts whose files may carry approval: the effective user and the owner of the
+    registry directory (the account that approved).  Root is NOT a wildcard: running as
+    root accepts only root's own files and the registry owner's."""
+    uids = {os.geteuid()}
+    try:
+        uids.add(os.lstat(F.registry_dir()).st_uid)
+    except OSError:
+        pass
+    return uids
+
+
+def _trusted_file(path, trusted, want_dir=False):
+    """(ok, why): lstat-based, never follows a symlink, owner trusted, not group/world writable."""
     try:
         st = os.lstat(path)
+    except OSError as error:
+        return False, f"{os.path.basename(path)} unreadable: {error.strerror}"
+    kind_ok = stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)
+    if not kind_ok:
+        return False, f"{os.path.basename(path)} is not a regular {'directory' if want_dir else 'file'}"
+    if st.st_mode & 0o022:
+        return False, f"{os.path.basename(path)} is group/world writable"
+    if st.st_uid not in trusted:
+        return False, f"{os.path.basename(path)} is owned by uid {st.st_uid}, not an approving account"
+    return True, ""
+
+
+def _is_count(value, minimum=0):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def validate_policy(policy):
+    try:
+        scope, limits = policy["scope"], policy["limits"]
+        return (
+            policy.get("schema") == POLICY_VERSION
+            and isinstance(scope["target_root"], str) and os.path.isabs(scope["target_root"])
+            and isinstance(scope["owners"], list) and scope["owners"]
+            and all(isinstance(o, str) and o for o in scope["owners"])
+            and isinstance(scope["kinds"], list) and scope["kinds"]
+            and all(k == "per-worktree" for k in scope["kinds"])
+            and _is_count(limits["soft_budget_bytes"], 1) and _is_count(limits["hard_budget_bytes"], 1)
+            and limits["soft_budget_bytes"] < limits["hard_budget_bytes"]
+            and _is_count(limits["max_targets_per_cycle"], 1) and _is_count(limits["max_bytes_per_cycle"], 0)
+            and isinstance(limits["min_idle_hours"], (int, float)) and not isinstance(limits["min_idle_hours"], bool)
+            and math.isfinite(limits["min_idle_hours"]) and limits["min_idle_hours"] >= MIN_IDLE_HOURS
+            and isinstance(policy["approved_by"], str) and isinstance(policy["approved_at"], (int, float))
+            and isinstance(policy["enabled"], bool)
+            and policy["digest"] == policy_digest(policy)
+        )
+    except (KeyError, TypeError, AttributeError):
+        return False
+
+
+TRANSITIONS = ("policy_approved", "policy_enabled", "policy_disabled")
+
+
+def _generation(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def last_transition():
+    """The newest policy transition in the append-only history (None if none)."""
+    last = None
+    for event in read_history():
+        if event.get("event") in TRANSITIONS:
+            last = event
+    return last
+
+
+def read_state_record(trusted):
+    """(record or None): the single persistent enablement state, or None when it is
+    missing, unsafe (symlink, wrong owner/mode) or malformed."""
+    ok, _ = _trusted_file(enable_path(), trusted)
+    if not ok:
+        return None
+    try:
+        with open(enable_path()) as handle:
+            rec = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("schema") != 2 or rec.get("state") not in ("ENABLED", "DISABLED") \
+            or _generation(rec.get("generation")) is None or not isinstance(rec.get("policy_digest"), str):
+        return None
+    return rec
+
+
+def verify_enablement(policy, trusted):
+    """True only when ALL of: the single state record says ENABLED for THIS policy
+    digest; and the newest transition in the append-only history is the matching
+    `policy_enabled` with the same generation and digest.  Generations only increase, so
+    an older ENABLED record can never override a newer DISABLED/approved transition, and
+    an interrupted transition (record and history disagree) leaves the policy disabled.
+    The `enabled` flag inside the policy file is informational and never counts.  This is
+    structural verification: unkeyed records cannot stop an attacker who controls the
+    approving account."""
+    rec = read_state_record(trusted)
+    if rec is None or rec["state"] != "ENABLED" or rec["policy_digest"] != policy["digest"]:
+        return False
+    last = last_transition()
+    return bool(last and last.get("event") == "policy_enabled" and last.get("digest") == policy["digest"]
+                and last.get("generation") == rec["generation"])
+
+
+def load_policy(trusted_uids=None):
+    """(state, policy, why): state is absent, ok or invalid.  Invalid is never
+    treated as absent-and-harmless: automatic retirement fails closed.  The returned
+    policy's `enabled` is the VERIFIED enablement, not the file's own flag."""
+    trusted = set(trusted_uids) if trusted_uids is not None else trusted_policy_uids()
+    path = policy_path()
+    try:
+        os.lstat(path)
     except FileNotFoundError:
         return "absent", None, "no policy has been approved"
     except OSError as error:
         return "invalid", None, f"policy unreadable: {error.strerror}"
-    if not stat.S_ISREG(st.st_mode):
-        return "invalid", None, "policy is not a regular file"
-    if st.st_mode & 0o022:
-        return "invalid", None, "policy file is group/world writable"
-    if st.st_uid not in (os.getuid(), 0) and os.getuid() != 0:
-        return "invalid", None, "policy file is owned by another user"
+    for target, want_dir in ((state_dir(), True), (path, False)):
+        ok, why = _trusted_file(target, trusted, want_dir)
+        if not ok:
+            return "invalid", None, "policy " + why
     try:
         with open(path) as handle:
             policy = json.load(handle)
     except (OSError, ValueError) as error:
         return "invalid", None, f"policy unreadable: {error}"
-    try:
-        ok = (
-            isinstance(policy, dict) and policy.get("schema") == POLICY_VERSION
-            and isinstance(policy["scope"]["target_root"], str)
-            and isinstance(policy["scope"]["owners"], list) and policy["scope"]["owners"]
-            and all(isinstance(o, str) and o for o in policy["scope"]["owners"])
-            and isinstance(policy["limits"]["soft_budget_bytes"], int)
-            and isinstance(policy["limits"]["hard_budget_bytes"], int)
-            and isinstance(policy["limits"]["max_targets_per_cycle"], int)
-            and isinstance(policy["limits"]["max_bytes_per_cycle"], int)
-            and isinstance(policy["enabled"], bool)
-            and policy["digest"] == policy_digest(policy)
-        )
-    except (KeyError, TypeError):
-        ok = False
-    if not ok:
+    if not isinstance(policy, dict) or not validate_policy(policy):
         return "invalid", None, "policy is malformed or its integrity digest does not match"
-    return "ok", policy, ""
+    claimed = policy["enabled"]
+    policy["enabled"] = verify_enablement(policy, trusted)
+    why = ""
+    if claimed and not policy["enabled"]:
+        why = "policy file claims enabled but there is no verified `policy enable` approval; treated as disabled"
+    return "ok", policy, why
+
+
+def fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durable_write(path, data):
+    """Atomic replace with file fsync (F.atomic_write) and parent-directory fsync, so a
+    completed transition survives a crash and a torn one is never half-visible."""
+    F.atomic_write(path, data)
+    fsync_directory(os.path.dirname(path))
 
 
 def write_policy(policy):
     ensure_state()
-    F.atomic_write(policy_path(), policy)
+    durable_write(policy_path(), policy)
 
 
 def cmd_policy(args):
@@ -247,24 +365,74 @@ def cmd_policy(args):
         if policy["limits"]["soft_budget_bytes"] >= policy["limits"]["hard_budget_bytes"]:
             raise SystemExit("soft budget must be below the hard budget")
         policy["digest"] = policy_digest(policy)
-        write_policy(policy)
-        append_history({"event": "policy_approved", "digest": policy["digest"], "scope": policy["scope"]})
+        ensure_state()
+        with transition_lock():
+            # new policy => DISABLED state at a new generation, then the policy itself:
+            # a crash in between leaves the old policy with a newer DISABLED generation
+            gen = next_generation()
+            record_transition("policy_approved", gen, policy["digest"], "DISABLED", scope=policy["scope"])
+            write_policy(policy)
         print("policy recorded and left DISABLED; enable it explicitly with `policy enable`")
         return 0
     state, policy, why = load_policy()
     if state != "ok":
         raise SystemExit(f"policy {args.action}: {why}")
     want = args.action == "enable"
-    if policy["enabled"] == want:
-        print(f"policy already {'enabled' if want else 'disabled'}")
-        return 0
-    policy["enabled"] = want
-    policy["enabled_by" if want else "disabled_by"] = F.owner_name()
-    policy["enabled_at" if want else "disabled_at"] = now()
-    write_policy(policy)
-    append_history({"event": "policy_enabled" if want else "policy_disabled", "digest": policy["digest"]})
+    ensure_state()
+    with transition_lock():
+        state, policy, why = load_policy()          # re-read under the lock
+        if state != "ok":
+            raise SystemExit(f"policy {args.action}: {why}")
+        if policy["enabled"] == want:
+            print(f"policy already {'enabled' if want else 'disabled'}")
+            return 0
+        gen = next_generation()
+        if want:
+            # state record first, history second: an interruption between them is NOT enabled
+            write_state({"schema": 2, "generation": gen, "state": "ENABLED", "policy_digest": policy["digest"],
+                         "by": F.owner_name(), "at": now(), "uid": os.geteuid()})
+            append_history({"event": "policy_enabled", "digest": policy["digest"], "generation": gen})
+        else:
+            # history first, state second: an interruption leaves a newer DISABLED transition
+            record_transition("policy_disabled", gen, policy["digest"], "DISABLED")
     print(f"automatic retirement {'ENABLED' if want else 'DISABLED'}")
     return 0
+
+
+@contextlib.contextmanager
+def transition_lock():
+    """Serialises policy transitions (approve/enable/disable) across processes."""
+    ensure_state()
+    fd = os.open(os.path.join(state_dir(), ".policy-transition.lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def next_generation():
+    """One more than the highest generation seen in the state record or the history,
+    whichever is higher, so generations never repeat or go backwards."""
+    seen = [0]
+    rec = read_state_record(trusted_policy_uids())
+    if rec is not None:
+        seen.append(rec["generation"])
+    for event in read_history():
+        if event.get("event") in TRANSITIONS and _generation(event.get("generation")) is not None:
+            seen.append(event["generation"])
+    return max(seen) + 1
+
+
+def record_transition(event, gen, digest, state, **extra):
+    """History event (fsynced) first, then the state record (atomic, fsynced, dir fsynced)."""
+    append_history(dict(extra, event=event, digest=digest, generation=gen))
+    write_state({"schema": 2, "generation": gen, "state": state, "policy_digest": digest,
+                 "by": F.owner_name(), "at": now(), "uid": os.geteuid()})
+
+
+def write_state(record):
+    durable_write(enable_path(), record)
 
 
 # --------------------------------------------------------------- inventory
@@ -363,7 +531,7 @@ def plan_cycle(policy, items, summ, census):
     max_b = limits.get("max_bytes_per_cycle", 100_000_000_000)
     got = 0
     for item in cands:
-        if got >= need or len(plan["selected"]) >= max_t or got >= max_b:
+        if got >= need or len(plan["selected"]) >= max_t:
             break
         selected, preserved = artifacts_of(item)
         if not selected:
@@ -372,6 +540,12 @@ def plan_cycle(policy, items, summ, census):
         est, retained = F.reclaim_estimate(selected)
         if est <= 0:
             plan["skipped"].append({"name": item["name"], "reason": "NO_ARTIFACTS"})
+            continue
+        if got + est > max_b:
+            # the per-cycle byte cap is an upper bound: a candidate that would cross it is
+            # skipped (a younger, smaller one may still fit); oldest-first order is kept
+            plan["skipped"].append({"name": item["name"], "reason": "BYTE_CAP_WOULD_BE_EXCEEDED",
+                                    "estimated": est, "remaining_allowance": max(0, max_b - got)})
             continue
         plan["selected"].append({"item": item, "paths": selected, "preserved": preserved, "estimated": est})
         got += est
@@ -412,14 +586,23 @@ def build_manifest(policy, plan, measured):
     }
 
 
-def verify_manifest_against_policy(manifest, policy):
+def verify_manifest_against_policy(manifest, policy, plan=None):
     """The policy, not the manifest hash, is the authorisation: refuse any group
-    the approved scope does not cover."""
+    the approved scope does not cover, a manifest naming another policy, and (given
+    the plan) any group that was not selected by this cycle's own planning."""
     scope = policy["scope"]
+    auth = manifest.get("authorisation") or {}
+    if auth.get("policy_digest") != policy["digest"]:
+        raise SystemExit("manifest does not name the approved policy digest; refusing")
+    planned = None if plan is None else {e["item"]["target"] for e in plan["selected"]}
     for g in manifest["cargo_artifact_groups"]:
         d = g["directory"]
         if os.path.dirname(os.path.realpath(d)) != scope["target_root"] or os.path.realpath(d) != d:
             raise SystemExit(f"manifest group outside the approved policy scope: {d}")
+        if planned is not None and d not in planned:
+            raise SystemExit(f"manifest group was not selected by this cycle's plan: {d}")
+        if g.get("disposition") != "AUTO_POLICY":
+            raise SystemExit(f"manifest group has a disposition the policy does not grant: {d}")
 
 
 # ------------------------------------------------------------- commands
@@ -464,10 +647,20 @@ def write_usage(summary_, items):
     """Cache for the cargo-iso admission check; best effort, outside every cache."""
     try:
         ensure_state()
-        F.atomic_write(usage_path(), {
-            "at": now(), "total": summary_["total_allocated"],
+        # `total` is deliberately not written here: admission measures with quick_total
+        # only, so a status/run can never change what admission sees.
+        try:
+            with open(usage_path()) as handle:
+                usage = json.load(handle)
+            if not isinstance(usage, dict):
+                usage = {}
+        except (OSError, ValueError):
+            usage = {}
+        usage.update({
+            "status_at": now(), "status_total": summary_["total_allocated"],
             "auto_eligible_allocated": sum(i["allocated"] for i in items if i.get("auto_eligible")),
         })
+        F.atomic_write(usage_path(), usage)
     except OSError:
         pass
 
@@ -560,14 +753,40 @@ def run_executor(manifest_path, digest, receipts):
         return rc, None, err.getvalue() + out.getvalue()
 
 
-def mark_retired(registry, item, freed, receipt_file):
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mark_retired(registry, item, freed, receipt):
+    """Record where the evidence is and what it hashed to when it was written, so the
+    worktree gate can later check provenance (structural: see verify_retirement)."""
     key = item["key"]
+    receipt_file = receipt.get("receipt_file")
+    journal_file = receipt.get("journal_file")
+    try:
+        st = os.lstat(item["target"])
+        identity = {"dev": st.st_dev, "ino": st.st_ino}
+    except OSError:
+        identity = None
     meta = registry.meta_lock()
     try:
         state, record = registry.read_checked("targets", key, F.valid_target_record)
         if state != "ok":
             return
-        record["last_retired"] = {"at": now(), "bytes": freed, "receipt": receipt_file}
+        try:
+            receipt_sha = file_sha256(receipt_file) if receipt_file else None
+            journal_sha = file_sha256(journal_file) if journal_file else None
+        except OSError:
+            receipt_sha = journal_sha = None
+        record["last_retired"] = {
+            "at": now(), "bytes": freed, "receipt": receipt_file, "receipt_sha256": receipt_sha,
+            "journal": journal_file, "journal_sha256": journal_sha,
+            "manifest_sha256": receipt.get("manifest_sha256"), "identity": identity,
+        }
         F.atomic_write(registry.path("targets", key), record)
     finally:
         meta.close()
@@ -600,8 +819,15 @@ def cmd_run(args):
         print(f"nothing to do: {plan['blocked'] or 'no eligible released targets'}")
         return 0
     ensure_state()
+    # authority is re-read from disk at the moment of use, never carried from planning
+    st2, policy2, why2 = load_policy()
+    if st2 != "ok" or not policy2["enabled"] or policy2["digest"] != policy["digest"]:
+        append_history({"event": "cycle", "id": cycle_id, "outcome": "REFUSED",
+                        "why": "policy changed or lost approval during the cycle"})
+        print("REFUSED: policy changed or lost approval during the cycle")
+        return 1
     manifest = build_manifest(policy, plan, measured)
-    verify_manifest_against_policy(manifest, policy)
+    verify_manifest_against_policy(manifest, policy, plan)
     mpath = os.path.join(state_dir(), "manifests", f"cycle-{cycle_id}.json")
     F.atomic_write(mpath, manifest)
     with open(mpath, "rb") as handle:
@@ -623,7 +849,7 @@ def cmd_run(args):
                                "freed": g.get("accounted_freed_bytes", 0),
                                "holds": [h["code"] for h in g.get("holds", [])]})
             if g.get("outcome") in ("RETIRED", "PARTIAL") and g.get("accounted_freed_bytes", 0):
-                mark_retired(registry, e["item"], g["accounted_freed_bytes"], receipt.get("receipt_file"))
+                mark_retired(registry, e["item"], g["accounted_freed_bytes"], receipt)
         outs = {t["outcome"] for t in per_target}
         outcome = ("RETIRED" if outs == {"RETIRED"} else "PARTIAL" if outs & {"RETIRED", "PARTIAL"} else
                    "HELD" if outs <= {"HELD", None} else "PARTIAL")
@@ -664,23 +890,94 @@ def target_for_worktree(path):
     return wt, os.path.join(F.target_root(), f"{name}-{digest}")
 
 
+def _read_json_file(path):
+    with open(path) as handle:
+        return json.load(handle)
+
+
 def verify_retirement(record, target):
-    """True when the recorded retirement receipt and its journal verify."""
+    """(ok, why): the recorded retirement is backed by canonical, structurally consistent
+    evidence.  Checks: receipt, journal and manifest live directly in the registry's
+    receipts/manifests directories (no symlink, trusted owner, not group/world writable);
+    the recorded SHA-256 of receipt and journal still match; the receipt is a successful
+    EXECUTE with no refusal/interruption, no attestation, and names this target with a
+    RETIRED/PARTIAL outcome; the journal has begin (same manifest/exec) -> group_plan for
+    this directory and its identity -> end; the manifest file is the one executed and a
+    `cycle_start` event with the same manifest digest exists in the history; and the
+    target directory is still the one retired.  This is STRUCTURAL verification: the
+    digests are unkeyed, so an attacker who controls the approving account could forge a
+    consistent set.  It rejects accidents, stale or foreign files and casual edits."""
     last = record.get("last_retired") or {}
-    receipt_path = last.get("receipt")
-    if not receipt_path:
-        return False
+    trusted = trusted_policy_uids()
+    receipts, manifests = os.path.join(state_dir(), "receipts"), os.path.join(state_dir(), "manifests")
+    for d in (state_dir(), receipts, manifests):
+        ok, why = _trusted_file(d, trusted, want_dir=True)
+        if not ok:
+            return False, why
+
+    def canonical(path, directory, suffix=None):
+        if not isinstance(path, str) or os.path.normpath(path) != path or os.path.dirname(path) != directory:
+            return False, "evidence path is not directly inside the canonical evidence directory"
+        if suffix and not path.endswith(suffix):
+            return False, "evidence file has an unexpected name"
+        return _trusted_file(path, trusted)
+
     try:
-        with open(receipt_path) as handle:
-            receipt = json.load(handle)
+        ok, why = canonical(last.get("receipt"), receipts, ".json")
+        if not ok:
+            return False, why
+        journal_suffix = executor().JOURNAL_SUFFIX
+        ok, why = canonical(last.get("journal"), receipts, journal_suffix)
+        if not ok:
+            return False, why
+        if file_sha256(last["receipt"]) != last.get("receipt_sha256") or \
+                file_sha256(last["journal"]) != last.get("journal_sha256"):
+            return False, "evidence was modified after it was recorded"
+        receipt = _read_json_file(last["receipt"])
+        if receipt.get("mode") != "EXECUTE" or receipt.get("refused") or receipt.get("interrupted"):
+            return False, "receipt does not describe a completed execution"
+        if (receipt.get("policy") or {}).get("maintenance_window_attested"):
+            return False, "receipt is from an attested manual window, not an automatic cycle"
+        msha = receipt.get("manifest_sha256")
+        if not msha or msha != receipt.get("approved_sha256") or msha != last.get("manifest_sha256"):
+            return False, "manifest identity disagrees between receipt and record"
+        if receipt.get("journal_file") != last["journal"]:
+            return False, "receipt names a different journal"
         groups = [g for g in receipt.get("groups", []) if g.get("directory") == target]
-        if not groups or groups[0].get("outcome") not in ("RETIRED", "PARTIAL"):
-            return False
-        journal = receipt.get("journal_file")
-        events = [json.loads(line).get("event") for line in open(journal) if line.strip()]
-        return "end" in events
-    except (OSError, ValueError, TypeError, AttributeError):
-        return False
+        if len(groups) != 1 or groups[0].get("outcome") not in ("RETIRED", "PARTIAL"):
+            return False, "receipt has no successful outcome for this target"
+        manifest_path = receipt.get("manifest")
+        ok, why = canonical(manifest_path, manifests, ".json")
+        if not ok:
+            return False, why
+        if file_sha256(manifest_path) != msha:
+            return False, "the executed manifest no longer matches its digest"
+        manifest = _read_json_file(manifest_path)
+        if manifest.get("mode") != "AUTOMATIC_POLICY_CYCLE" or not any(
+                g.get("directory") == target for g in manifest.get("cargo_artifact_groups", [])):
+            return False, "manifest does not authorise this target"
+        events = []
+        with open(last["journal"]) as handle:
+            for line in handle:
+                if line.strip():
+                    events.append(json.loads(line))
+        kinds = [e.get("event") for e in events]
+        if not events or kinds[0] != "begin" or events[0].get("manifest_sha256") != msha or \
+                "interrupted" in kinds or "receipt_publication_failed" in kinds or kinds[-1] != "end":
+            return False, "journal is not a complete, matching execution"
+        st = os.lstat(target)
+        plans = [e for e in events if e.get("event") == "group_plan" and e.get("directory") == target]
+        if len(plans) != 1 or (plans[0].get("device"), plans[0].get("inode")) != (st.st_dev, st.st_ino):
+            return False, "journal does not match this directory's identity"
+        ident = last.get("identity")
+        if ident and (ident.get("dev"), ident.get("ino")) != (st.st_dev, st.st_ino):
+            return False, "directory was replaced after retirement"
+        if not any(h.get("event") == "cycle_start" and h.get("manifest_sha256") == msha
+                   and os.path.basename(target) in (h.get("targets") or []) for h in read_history()):
+            return False, "no matching cycle in the maintenance history"
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return False, f"evidence unreadable or inconsistent ({type(error).__name__})"
+    return True, ""
 
 
 def worktree_gate(path):
@@ -698,8 +995,6 @@ def worktree_gate(path):
         res.update(status="CLEAR", code="CLEAR", explanation=why)
         return res
 
-    if not os.path.isdir(target):
-        return clear("no Cargo cache exists for this worktree")
     if os.path.islink(target):
         return hold("SYMLINK_OR_MISSING_TARGET", "the cache directory is a symlink; resolve it by hand")
     key = F.key_for(F.canon(target))
@@ -707,6 +1002,17 @@ def worktree_gate(path):
     rec_state, record = registry.read_checked("targets", key, F.valid_target_record)
     if rec_state == "invalid":
         return hold("REGISTRY_RECORD_INVALID", "the lifecycle record is malformed; repair it by hand before removing the worktree")
+    if not os.path.isdir(target):
+        # absent directory: proof of "never created" needs a record that never built
+        if record and (record.get("last_retired") or record.get("last_start")):
+            ok, why = verify_retirement(record, target) if record.get("last_retired") else (False, "")
+            if ok:
+                return clear("the cache directory is gone after a verified retirement")
+            return hold("ARTIFACTS_MISSING_UNVERIFIED",
+                        "this worktree was built through cargo-iso but its cache directory is missing and no verified "
+                        "retirement receipt exists" + (f" ({why})" if why else "")
+                        + "; the output was removed outside the maintenance workflow. Keep the worktree and review by hand")
+        return clear("no Cargo cache exists for this worktree and none was ever built through cargo-iso")
     pin_state, pins = registry.pin_state(key)
     if pin_state == "invalid":
         return hold("PIN_STATE_UNKNOWN", "the pin record is unreadable or malformed")
@@ -732,10 +1038,23 @@ def worktree_gate(path):
                     "refuses them. Review by hand and keep the worktree until resolved"
                     % (len(remnants), os.path.relpath(remnants[0]["path"], target), remnants[0]["why"]))
     if not selected:
-        if record and record.get("last_retired") and not verify_retirement(record, target):
-            return hold("RECEIPT_UNVERIFIED", "artifacts are gone but the retirement receipt/journal could not be verified")
-        return clear("no compiler artifacts remain" + (" (retirement receipt verified)" if record and record.get("last_retired") else "")
-                     + "; preserved evidence stays in the cache directory")
+        if record and record.get("last_retired"):
+            ok, why = verify_retirement(record, target)
+            if not ok:
+                return hold("RECEIPT_UNVERIFIED", "artifacts are gone but the retirement evidence could not be verified: "
+                            + why + ". Keep the worktree and review the receipt and journal by hand")
+            return clear("no compiler artifacts remain (retirement receipt verified); "
+                         "preserved evidence stays in the cache directory")
+        try:
+            empty = not os.listdir(target)
+        except OSError:
+            empty = False
+        if empty and not (record and record.get("last_start")):
+            return clear("the cache directory is empty and nothing was ever built through cargo-iso here")
+        return hold("ARTIFACTS_MISSING_UNVERIFIED",
+                    "no compiler artifacts are present but there is no verified retirement receipt and no proof that "
+                    "none were ever created; they may have been removed outside the maintenance workflow. "
+                    "Keep the worktree and review by hand")
     # artifacts remain: the source worktree is what proves ownership at retirement time
     if not record:
         return hold("NO_LIFECYCLE_RECORD", "legacy cache with no lifecycle record: it cannot be retired automatically; "
@@ -815,78 +1134,142 @@ def cmd_task_complete(args):
 
 
 def quick_total(root):
-    """Allocated bytes below the target root (hardlinks counted once per du run)."""
+    """(allocated bytes below the target root, complete).  `complete` is False when the
+    listing or any `du` run failed, in which case the number is only a lower bound."""
     try:
         names = [os.path.join(root, n) for n in sorted(os.listdir(root))]
+    except FileNotFoundError:
+        return 0, True
     except OSError:
-        return 0
+        return 0, False
     names = [n for n in names if os.path.isdir(n) and not os.path.islink(n)]
     if not names:
-        return 0
-    total = 0
+        return 0, True
+    total, complete = 0, True
     for i in range(0, len(names), 200):
-        proc = subprocess.run(["du", "-sxB1", "--"] + names[i:i + 200], capture_output=True, text=True)
+        try:
+            proc = subprocess.run(["du", "-sxB1", "--"] + names[i:i + 200], capture_output=True, text=True)
+        except OSError:
+            return total, False
+        if proc.returncode != 0:
+            complete = False
         for line in proc.stdout.splitlines():
             try:
                 total += int(line.split("\t", 1)[0])
             except ValueError:
-                pass
-    return total
+                complete = False
+    return total, complete
+
+
+def _env_number(name, default, kind, problems, minimum=0, maximum=None):
+    """Strict parse of an optional environment number: finite, within bounds, else the
+    default is used and the problem is reported (never a crash, never a silent change)."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = kind(raw)
+        if not math.isfinite(value) or value <= minimum or (maximum is not None and value > maximum):
+            raise ValueError("out of range")
+    except (ValueError, OverflowError):
+        problems.append(f"{name}={raw!r}")
+        return default
+    return value
+
+
+def _record_admission(event):
+    try:
+        append_history(event)
+    except OSError:
+        pass
 
 
 def cmd_admit(args):
-    """Admission check for a COLD target (called by cargo-iso).  Exit 0 = admit,
-    5 = refuse.  It cannot guarantee an absolute disk cap: running builds keep
-    growing; it only decides whether to start another cold target."""
+    """Budget admission for a new or re-created cargo-iso target.
+
+    ADVISORY ONLY.  It warns and records; it never refuses a build (exit 0 always, so
+    cargo-iso's 8 GiB physical free-space guard remains the only blocker).  An enforcing
+    mode is intentionally NOT available: it needs one trusted measurement shared with
+    status/run, an atomic reservation for concurrent cold builds and validated
+    configuration, none of which exist yet (see docs/CARGO_CACHE_RETENTION.md)."""
     target = os.path.realpath(args.target)
-    if os.path.isdir(target) and os.listdir(target):
-        return 0  # warm target: no new allocation
+    raw_mode = (os.environ.get("EMUWIZ_ADMISSION") or "advisory").strip().lower()
+    notes = []
+    if raw_mode in ("0", "off", "false", "no"):
+        reason = os.environ.get("EMUWIZ_ADMISSION_REASON", "")
+        print("cargo-iso: note: Cargo cache budget advisory is switched off (EMUWIZ_ADMISSION=0); recorded", file=sys.stderr)
+        _record_admission({"event": "admission_disabled", "target": target, "reason": reason})
+        return 0
+    if raw_mode == "enforce":
+        notes.append("EMUWIZ_ADMISSION=enforce was requested but enforce mode is not available in this release; "
+                     "running advisory only (nothing is refused)")
+    elif raw_mode not in ("advisory", "1", "on", "true", "yes"):
+        notes.append(f"unknown EMUWIZ_ADMISSION={raw_mode!r} ignored; running advisory only")
+    # An existing directory that still holds compiler output allocates nothing new; a
+    # missing, empty or artifact-free (retired) directory is a cold start.
+    try:
+        if os.path.isdir(target) and F.select_artifacts(target, None)[0]:
+            if notes:
+                print("cargo-iso: note: " + "; ".join(notes), file=sys.stderr)
+            return 0
+    except OSError:
+        pass
     st, policy, why = load_policy()
     limits = (policy or {}).get("limits", {})
-    hard = int(os.environ.get("EMUWIZ_HARD_BUDGET_BYTES", limits.get("hard_budget_bytes", DEFAULT_HARD)))
-    allowance = int(float(os.environ.get("EMUWIZ_COLD_TARGET_GB", 0)) * 1e9) or DEFAULT_COLD_ALLOWANCE
+    problems = []
+    hard = _env_number("EMUWIZ_HARD_BUDGET_BYTES", limits.get("hard_budget_bytes", DEFAULT_HARD), int, problems)
+    allow_gb = _env_number("EMUWIZ_COLD_TARGET_GB", None, float, problems, maximum=10_000)
+    allowance = int(allow_gb * 1e9) if allow_gb else DEFAULT_COLD_ALLOWANCE
+    if problems:
+        notes.append("ignored invalid setting(s) " + ", ".join(problems) + "; using the defaults")
+        _record_admission({"event": "admission_config_invalid", "target": target, "settings": problems})
     root = F.target_root()
     usage = None
     try:
         with open(usage_path()) as handle:
             usage = json.load(handle)
-        if now() - usage["at"] > USAGE_TTL_SECONDS:
+        if not isinstance(usage, dict) or now() - usage["measured_at"] > USAGE_TTL_SECONDS \
+                or not _is_count(usage["total"]) or usage.get("complete") is not True:
             usage = None
     except (OSError, ValueError, KeyError, TypeError):
         usage = None
     if usage is None:
-        usage = {"at": now(), "total": quick_total(root)}
+        total, complete = quick_total(root)
+        usage = {"measured_at": now(), "total": total, "complete": complete}
         try:
+            prior = {}
+            try:
+                with open(usage_path()) as handle:
+                    prior = json.load(handle)
+            except (OSError, ValueError):
+                pass
+            keep = {k: prior[k] for k in ("auto_eligible_allocated", "status_at", "status_total") if k in prior} \
+                if isinstance(prior, dict) else {}
             ensure_state()
-            F.atomic_write(usage_path(), usage)
+            F.atomic_write(usage_path(), dict(keep, **usage))
         except OSError:
             pass
-    total = usage["total"]
-    if total + allowance <= hard:
-        return 0
-    override = os.environ.get("EMUWIZ_ALLOW_OVER_BUDGET", "")
-    reclaimable = usage.get("auto_eligible_allocated")
-    msg = [
-        f"cargo-iso: Cargo cache budget: {gb(total)} allocated + {gb(allowance)} for a new target "
-        f"exceeds the hard budget {gb(hard)}.",
-    ]
-    if reclaimable:
-        msg.append(f"           about {gb(reclaimable)} of released output is auto-eligible: run "
-                   "`sudo -n emuwiz-cargo-maintain run` (or wait for the timer) first.")
-    else:
-        msg.append("           no released output is known to be reclaimable: protected or active caches alone "
-                   "exceed the budget. Release finished tasks with `scripts/cargo-iso --finish-task`.")
-    if override:
-        msg.append(f"           EMUWIZ_ALLOW_OVER_BUDGET is set ({override}): admitting this cold target explicitly.")
-        print("\n".join(msg), file=sys.stderr)
-        try:
-            append_history({"event": "admission_override", "target": target, "total": total, "reason": override})
-        except OSError:
-            pass
-        return 0
-    msg.append("           To allocate it anyway set EMUWIZ_ALLOW_OVER_BUDGET=<reason> (recorded). Nothing was built.")
-    print("\n".join(msg), file=sys.stderr)
-    return EXIT_REFUSED
+    reclaimable = None
+    try:
+        with open(usage_path()) as handle:
+            reclaimable = json.load(handle).get("auto_eligible_allocated")
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not usage["complete"]:
+        notes.append("the cache allocation could not be measured completely; no budget conclusion drawn")
+    elif usage["total"] + allowance > hard:
+        notes.append(f"Cargo cache budget advisory: {gb(usage['total'])} allocated + {gb(allowance)} for a new target "
+                     f"would exceed the hard budget {gb(hard)}")
+        if reclaimable:
+            notes.append(f"about {gb(reclaimable)} of released output is auto-eligible for the maintenance cycle")
+        else:
+            notes.append("no released output is known to be reclaimable; release finished tasks with "
+                         "`scripts/cargo-iso --finish-task`")
+        _record_admission({"event": "admission_advisory", "target": target, "total": usage["total"],
+                           "allowance": allowance, "hard": hard})
+    if notes:
+        print("cargo-iso: advisory: " + "; ".join(notes) + " (not enforced; the build continues)", file=sys.stderr)
+    return 0
 
 
 # --------------------------------------------------------------- systemd

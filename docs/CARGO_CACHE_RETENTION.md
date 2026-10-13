@@ -172,9 +172,10 @@ scripts/emuwiz-cargo-maintain worktree-check <wt>  # CLEAR only after verified r
 
 Retirement verifies ownership from the source worktree and needs 48 h of inactivity, so the
 worktree must stay until `worktree-check` reports CLEAR (artifacts retired with a verified
-receipt/journal, or none ever existed). HOLD reasons: `NOT_RELEASED`, `WAITING_INACTIVITY`
+receipt/journal, or none was ever created: no record of a cargo-iso build and an absent or empty cache
+directory). Missing artifacts alone prove nothing: they HOLD as `ARTIFACTS_MISSING_UNVERIFIED`. HOLD reasons: `NOT_RELEASED`, `WAITING_INACTIVITY`
 (with the eligibility time), `AWAITING_RETIREMENT`, `ACTIVE`, `PINNED`, `PROTECTED_REMNANTS`,
-`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`. A release record alone never
+`SOURCE_MISSING`, `NO_LIFECYCLE_RECORD`, `RECEIPT_UNVERIFIED`, `ARTIFACTS_MISSING_UNVERIFIED`. A release record alone never
 clears the gate or authorises deletion; releasing does not stop builds, remove pins or claim
 processes have exited. The gate never removes anything, and there is no hook into
 `git worktree remove`: a cleanup workflow must call `worktree-check` itself. `AGENTS.md` and
@@ -183,8 +184,14 @@ processes have exited. The gate never removes anything, and there is no hook int
 ### Policy, budgets, cycle
 `emuwiz-cargo-maintain policy approve --owners a,b [--soft-gb 220 --hard-gb 240 --max-targets N
 --max-gb N]` records a persistent, digest-protected, bounded policy (target root, owner labels,
-per-cycle limits; idle floor 48 h). It is **disabled** until `policy enable`; a group/world-writable,
-malformed or tampered policy fails closed. A generated manifest hash is never the authorisation.
+per-cycle limits; idle floor 48 h). It is **disabled** until `policy enable`, which writes a separate
+enable record bound to the policy digest plus a history event; the `enabled` flag inside the policy
+file is ignored, and re-approving requires a fresh enable. A malformed policy, one missing fields
+(`scope.kinds`, limits), one owned by an account other than the effective user or registry owner
+(root is not a wildcard), or a group/world-writable file or state directory fails closed. A generated
+manifest hash is never the authorisation: the manifest must name the live policy digest and only
+groups the cycle itself planned. `max-gb` is a hard upper bound on a cycle's estimated reclaim: a
+candidate that would cross it is skipped (a smaller, younger one may still be taken).
 `run` (one cycle) acts only when the policy is approved and enabled, the process census is
 complete (run as root: `sudo -n`; a partial census blocks the cycle), the total is over the soft
 budget, and only for RETIRABLE targets with a wrapper-recorded build (`last_start`) in the policy
@@ -194,13 +201,23 @@ non-participating targets stay held with an explanation. Incomplete journals are
 auto-acknowledged. `status`, `plan`, `run --dry-run` and `history` report decisions, held reasons
 (actionable), reclaimed space and the last cleanup.
 
-### Admission and the minimum-free guard
-`cargo-iso` asks `emuwiz-cargo-maintain admit` before creating a COLD target: if allocated storage
-plus an allowance (3 GB, `EMUWIZ_COLD_TARGET_GB`) would exceed the hard budget it refuses (exit 5),
-naming the reclaimable released output or stating that protected/active output alone exceeds the
-budget; `EMUWIZ_ALLOW_OVER_BUDGET=<reason>` allocates explicitly and is recorded. The 8 GiB
-free-space guard is unchanged. This is an admission rule, not a disk cap: running builds can still
-grow, and nothing is ever killed or evicted to meet a number. Tool errors never block a build.
+### Admission and the minimum-free guard (ADVISORY ONLY)
+`cargo-iso` calls `emuwiz-cargo-maintain admit` for a new or re-created (artifact-free) target.
+The check is **advisory**: if allocated storage plus an allowance (3 GB default;
+`EMUWIZ_COLD_TARGET_GB`) would exceed the hard budget it prints a warning, names the reclaimable
+released output (or says protected/active output alone exceeds the budget) and records an
+`admission_advisory` event. It **never refuses a build**; exit 5 is reserved and unused.
+`EMUWIZ_ADMISSION=0` switches the advisory off and is recorded (`admission_disabled`).
+`EMUWIZ_ADMISSION=enforce` is not available: it prints that it is unavailable and stays advisory.
+Malformed, negative, zero or non-finite budget/allowance settings are reported ("ignored invalid")
+and the defaults are used; an incomplete measurement draws no conclusion.
+The separate 8 GiB physical free-space guard in `cargo-iso` is unchanged and still blocks (exit 4).
+
+Not yet available (required before an enforcing mode may be exposed): one trusted allocation
+measurement shared by status/run/admit (admit uses only `du` over the target root; status counts
+worktree-local targets too), an atomic reservation so simultaneous cold builds cannot both pass on
+the same cached total, durable recording of configuration changes, and tests for all of them.
+Until then nothing can cap running builds; nothing is ever killed or evicted to meet a number.
 
 ### Scheduled operation (opt-in)
 `emuwiz-cargo-maintain units` prints a systemd service/timer pair (root, for a complete census;
@@ -209,8 +226,11 @@ grow, and nothing is ever killed or evicted to meet a number. Tool errors never 
 ### Limits
 Plain `cargo` that bypasses `cargo-iso` is not excluded by any lock: such targets are never
 retired automatically. Caches whose worktree was removed first are held (`SOURCE_MISSING`).
-Admission cannot guarantee a physical cap. The policy file is protected by permissions and a
-digest, not by cryptography: anyone with the owner's account can change it.
+Admission is advisory and cannot guarantee a physical cap. The policy, enable record and retirement
+evidence are protected by ownership, permissions and unkeyed SHA-256 digests plus a cross-checked
+history: this is structural verification, not authenticity. Anyone controlling the approving account
+(or root) can forge a self-consistent set. Worktrees whose build produced no output are held rather
+than guessed clear (`ARTIFACTS_MISSING_UNVERIFIED`) and need a human review.
 
 ## Required before hard enforcement or deletion (phase 2+)
 
@@ -219,7 +239,7 @@ digest, not by cryptography: anyone with the owner's account can change it.
    device/inode, then deletes with directory-file-descriptor operations
    (`openat`/`unlinkat`, no pathname re-resolution).
 2. Registry records for every target (use `adopt` for legacy ones) and a task-end release.
-3. A new-cold-target admission check against the hard budget with a declared allowance.
+3. An ENFORCING new-cold-target admission check (the current one is advisory only; see above).
 4. Process visibility with sufficient privilege, or an explicit accepted exception.
 5. Receipts: before/after allocated blocks, refusals, manifest digest.
 

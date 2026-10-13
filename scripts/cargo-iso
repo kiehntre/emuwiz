@@ -42,8 +42,8 @@
 #   EMUWIZ_CARGO             cargo executable to run (default: cargo)
 #
 # Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
-# 4 not enough free disk, 5 cold target refused by the cache budget (see
-# scripts/emuwiz-cargo-maintain; override: EMUWIZ_ALLOW_OVER_BUDGET=<reason>).
+# 4 not enough free disk, 5 reserved (an enforcing budget mode is not available: the
+# budget check in scripts/emuwiz-cargo-maintain is advisory and never refuses a build).
 # Anything else is cargo's own exit status.
 set -euo pipefail
 
@@ -157,17 +157,17 @@ if [ -n "${CARGO_TARGET_DIR:-}" ] && is_legacy "$CARGO_TARGET_DIR"; then
   echo "cargo-iso: note: inherited CARGO_TARGET_DIR points at the legacy shared target; overriding it with $target" >&2
 fi
 
-# Budget admission for a COLD target only (an existing target allocates nothing new).
-# It cannot cap running builds; it decides whether to start another cold target.
-# Tool errors never block a build; only an explicit budget refusal (exit 5) does.
+# Budget admission is ADVISORY ONLY: it warns and records, and never refuses a build.
+# (Exit 5 is reserved for a future enforcing mode that is intentionally not available.)
+# It also covers a re-created, artifact-free (retired) directory.  Tool errors never block.
 maintain="$(dirname "$0")/emuwiz-cargo-maintain"
-if [ ! -d "$target" ] && [ "${EMUWIZ_ADMISSION:-1}" != "0" ] && [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1; then
+if [ -f "$maintain" ] && command -v python3 >/dev/null 2>&1; then
   admit_rc=0
   python3 -I "$maintain" admit --target "$target" || admit_rc=$?
   if [ "$admit_rc" -eq 5 ]; then
     exit 5
   elif [ "$admit_rc" -ne 0 ]; then
-    echo "cargo-iso: note: budget admission check unavailable (status $admit_rc); continuing" >&2
+    echo "cargo-iso: note: budget advisory unavailable (status $admit_rc); continuing" >&2
   fi
 fi
 

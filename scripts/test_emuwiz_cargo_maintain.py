@@ -435,22 +435,20 @@ class Holds(MaintBase):
 
 
 class Admission(MaintBase):
-    def test_cold_target_is_refused_over_budget_and_override_is_recorded(self):
+    def test_cold_target_over_budget_is_advised_never_refused(self):
+        # Phase 3 remediation: admission is ADVISORY ONLY.  The refusal (exit 5) and the
+        # EMUWIZ_ALLOW_OVER_BUDGET override were removed; see test_..._remediation.py.
         wt, t = self.cache("big")           # existing cache gives a non-zero total
         new_wt = self.worktree("fresh")
         env = dict(self.env, EMUWIZ_HARD_BUDGET_BYTES="1000")
         r = self.iso(new_wt, "check", env=env)
-        self.assertEqual(r.returncode, 5, r.stderr)
-        self.assertIn("hard budget", r.stderr)
-        self.assertFalse(os.path.exists(self.target_of(new_wt)))   # nothing was allocated
-        # protected/active output is named when nothing is reclaimable
-        self.assertIn("Release finished tasks", r.stderr)
-        # explicit, recorded allocation
-        env["EMUWIZ_ALLOW_OVER_BUDGET"] = "needed for urgent review"
-        r = self.iso(new_wt, "check", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("hard budget", r.stderr)
+        self.assertIn("not enforced", r.stderr)
+        self.assertIn("finish-task", r.stderr)     # protected/active output is named when nothing is reclaimable
+        self.assertTrue(os.path.isdir(self.target_of(new_wt)))
         events = open(os.path.join(self.reg, "maintenance", "history.jsonl")).read()
-        self.assertIn("admission_override", events)
+        self.assertIn("admission_advisory", events)
 
     def test_warm_targets_and_the_free_space_guard_are_unchanged(self):
         wt, t = self.cache("warm")
@@ -475,7 +473,7 @@ class Admission(MaintBase):
         self.status()      # refreshes the usage cache with the eligible total
         env = dict(self.env, EMUWIZ_HARD_BUDGET_BYTES="1000")
         r = self.iso(self.worktree("cold"), "check", env=env)
-        self.assertEqual(r.returncode, 5)
+        self.assertEqual(r.returncode, 0, r.stderr)      # advisory only
         self.assertIn("auto-eligible", r.stderr)
 
 
