@@ -28,6 +28,10 @@ pub(crate) struct EmulatorReadinessState {
     pub(crate) dolphin_local_profiles: DolphinLocalProfilesState,
     pub(crate) pcsx2_launch_profiles: Pcsx2LaunchProfilesState,
     pub(crate) flycast_profiles: FlycastProfilesState,
+    /// Read-only resolver view for DuckStation; see `emulator_setup::profile_resolution`.
+    pub(crate) duckstation_resolution:
+        crate::emulator_setup::profile_resolution::DuckStationResolutionState,
+    pub(crate) duckstation_resolution_generation: u64,
     pub(crate) pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState,
     pub(crate) xenia_profiles: XeniaProfilesState,
     pub(crate) remembered_emulator_profiles: Vec<RememberedEmulatorProfile>,
@@ -56,6 +60,9 @@ impl Default for EmulatorReadinessState {
             dolphin_local_profiles: DolphinLocalProfilesState::NotScanned,
             pcsx2_launch_profiles: Pcsx2LaunchProfilesState::NotScanned,
             flycast_profiles: FlycastProfilesState::NotScanned,
+            duckstation_resolution:
+                crate::emulator_setup::profile_resolution::DuckStationResolutionState::NotScanned,
+            duckstation_resolution_generation: 0,
             pcsx2_firmware_evidence: Pcsx2FirmwareEvidenceState::NotLoaded,
             xenia_profiles: XeniaProfilesState::NotScanned,
             remembered_emulator_profiles: Vec::new(),

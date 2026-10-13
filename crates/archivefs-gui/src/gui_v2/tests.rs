@@ -9125,3 +9125,143 @@ mod history_page {
 
 mod simple_shell_ui;
 mod slice2b_layout;
+
+mod duckstation_profile_resolution {
+    use super::*;
+    use crate::emulator_setup::profile_resolution::{
+        DuckStationResolutionState, DuckStationResolutionView,
+    };
+    use archivefs_core::emulator_profile_resolver::{EmulatorSelectionMode, ResolutionOutcome};
+
+    fn view(outcome: ResolutionOutcome) -> DuckStationResolutionView {
+        DuckStationResolutionView {
+            mode: EmulatorSelectionMode::Auto,
+            selection_note: None,
+            outcome,
+        }
+    }
+
+    fn bridge<'a>(
+        app: &'a mut App,
+        context: &egui::Context,
+    ) -> &'a mut native_workflows::NativeWorkflows {
+        app.native_workflows
+            .get_or_insert_with(|| native_workflows::NativeWorkflows::new(context.clone()))
+    }
+
+    fn readiness(app: &mut App) -> &mut crate::emulator_readiness_state::EmulatorReadinessState {
+        &mut app
+            .native_workflows
+            .as_mut()
+            .unwrap()
+            .app
+            .emulator_readiness
+    }
+
+    fn nothing_found() -> DuckStationResolutionView {
+        view(ResolutionOutcome::NoInstallation {
+            assessments: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_result_for_an_older_request_is_discarded_after_a_newer_one() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        // Request 1 starts; a re-check supersedes it as request 2.
+        bridge(&mut app, &context)
+            .app
+            .start_duckstation_resolution_with(Err("first".into()), None);
+        let older = readiness(&mut app).duckstation_resolution_generation;
+        bridge(&mut app, &context)
+            .app
+            .start_duckstation_resolution_with(Err("second".into()), None);
+        let newer = readiness(&mut app).duckstation_resolution_generation;
+        assert!(newer > older);
+
+        // The late answer to request 1 must not be shown as the current one.
+        assert!(
+            !bridge(&mut app, &context)
+                .app
+                .accept_duckstation_resolution(older, nothing_found())
+        );
+        assert!(matches!(
+            readiness(&mut app).duckstation_resolution,
+            DuckStationResolutionState::Error(ref message) if message == "second"
+        ));
+        // The current request's own answer is accepted.
+        assert!(
+            bridge(&mut app, &context)
+                .app
+                .accept_duckstation_resolution(newer, nothing_found())
+        );
+        assert!(matches!(
+            readiness(&mut app).duckstation_resolution,
+            DuckStationResolutionState::Ready { generation, .. } if generation == newer
+        ));
+    }
+
+    #[test]
+    fn invalidation_discards_an_answer_that_was_in_flight() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        bridge(&mut app, &context)
+            .app
+            .start_duckstation_resolution_with(Err("x".into()), None);
+        let in_flight = readiness(&mut app).duckstation_resolution_generation;
+        bridge(&mut app, &context)
+            .app
+            .invalidate_duckstation_resolution();
+        assert!(
+            !bridge(&mut app, &context)
+                .app
+                .accept_duckstation_resolution(in_flight, nothing_found())
+        );
+        assert!(matches!(
+            readiness(&mut app).duckstation_resolution,
+            DuckStationResolutionState::NotScanned
+        ));
+    }
+
+    #[test]
+    fn emulator_setup_shows_the_resolver_panel_with_next_steps_and_stays_navigable() {
+        let context = egui::Context::default();
+        let mut app = fixture(&context);
+        app.router.current = Route::Section(Section::Emulators);
+        bridge(&mut app, &context);
+        // Deterministic content: a finished answer for the current request.
+        readiness(&mut app).duckstation_resolution_generation = 7;
+        readiness(&mut app).duckstation_resolution = DuckStationResolutionState::Ready {
+            generation: 7,
+            view: Box::new(nothing_found()),
+        };
+        let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+        // Existing Setup page is unchanged...
+        assert!(strings.iter().any(|text| text == "Emulators"));
+        assert!(
+            strings
+                .iter()
+                .any(|text| text.contains("Check which emulators"))
+        );
+        // ...and the new read-only panel sits in it.
+        assert!(
+            strings
+                .iter()
+                .any(|text| text.contains("which installation and profile EmuWiz will use"))
+        );
+        assert!(
+            strings
+                .iter()
+                .any(|text| text == "No DuckStation installation was found")
+        );
+        assert!(strings.iter().any(|text| text.starts_with("Next:")));
+        // Rendering does not restart the scan for a current answer.
+        assert_eq!(readiness(&mut app).duckstation_resolution_generation, 7);
+
+        app.router.current = Route::Home;
+        let _ = frame(&context, &mut app, [1280.0, 820.0]);
+        app.router.current = Route::Section(Section::Emulators);
+        let again = text(&frame(&context, &mut app, [1280.0, 820.0]));
+        assert!(again.iter().any(|text| text == "Emulators"));
+    }
+}

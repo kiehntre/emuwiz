@@ -21,6 +21,7 @@
 //! `main.rs`, so Part 2 does not need to move it.
 
 mod controller;
+pub(crate) mod profile_resolution;
 mod state;
 
 #[allow(unused_imports)]

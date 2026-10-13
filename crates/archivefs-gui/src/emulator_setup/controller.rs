@@ -1,5 +1,10 @@
 use crate::*;
 
+use super::profile_resolution::{
+    DuckStationResolutionInputs, DuckStationResolutionState, DuckStationResolutionView,
+    present_resolution, show_profile_resolution, spawn_duckstation_resolution,
+};
+
 impl ArchiveFsApp {
     /// Emulator Adapter Batch B: starts the one real, background RPCS3
     /// environment check. Explicit only (a button press); never called
@@ -287,6 +292,8 @@ impl ArchiveFsApp {
             "Emulators",
             "Check which emulators are installed and ready.",
         );
+        // The resolver's answer comes first so it is visible without scrolling.
+        self.show_duckstation_profile_resolution(ui, context);
         let setup_action = emulator_setup_page::show(
             ui,
             &mut self.emulator_readiness.emulator_setup_page,
@@ -316,7 +323,13 @@ impl ArchiveFsApp {
             focus_emulator.as_deref(),
             &self.emulator_readiness.emulator_setup_overrides,
         );
+        // Any setup action may have changed what the resolver would see
+        // (an override, a re-check); the read-only view re-resolves.
+        let setup_changed = setup_action.is_some();
         self.handle_emulator_setup_action(setup_action, context);
+        if setup_changed {
+            self.invalidate_duckstation_resolution();
+        }
         ui.add_space(theme::SECTION_GAP);
         // The managed-emulator download catalogue is always shown: a beginner
         // must be able to see whether an emulator is installed, available to
@@ -2052,6 +2065,103 @@ impl ArchiveFsApp {
                     );
                 }
             }
+        }
+    }
+
+    /// Forgets the DuckStation resolver answer and bumps the generation so a
+    /// result still in flight for the earlier request is discarded.
+    pub(crate) fn invalidate_duckstation_resolution(&mut self) {
+        self.emulator_readiness.duckstation_resolution_generation += 1;
+        self.emulator_readiness.duckstation_resolution = DuckStationResolutionState::NotScanned;
+    }
+
+    /// Starts the read-only DuckStation resolution off the GUI thread.
+    pub(crate) fn start_duckstation_resolution(&mut self, context: Option<egui::Context>) {
+        let inputs = DuckStationResolutionInputs::from_environment(
+            &self.emulator_readiness.emulator_setup_overrides,
+        );
+        self.start_duckstation_resolution_with(inputs, context);
+    }
+
+    pub(crate) fn start_duckstation_resolution_with(
+        &mut self,
+        inputs: Result<DuckStationResolutionInputs, String>,
+        context: Option<egui::Context>,
+    ) {
+        self.emulator_readiness.duckstation_resolution_generation += 1;
+        let generation = self.emulator_readiness.duckstation_resolution_generation;
+        self.emulator_readiness.duckstation_resolution = match inputs {
+            Ok(inputs) => DuckStationResolutionState::Scanning {
+                receiver: spawn_duckstation_resolution(generation, inputs, context),
+            },
+            Err(message) => DuckStationResolutionState::Error(message),
+        };
+    }
+
+    /// Accepts a finished resolution only if it answers the current request.
+    pub(crate) fn accept_duckstation_resolution(
+        &mut self,
+        generation: u64,
+        view: DuckStationResolutionView,
+    ) -> bool {
+        if generation != self.emulator_readiness.duckstation_resolution_generation {
+            return false;
+        }
+        self.emulator_readiness.duckstation_resolution = DuckStationResolutionState::Ready {
+            generation,
+            view: Box::new(view),
+        };
+        true
+    }
+
+    pub(crate) fn poll_duckstation_resolution(&mut self) {
+        let DuckStationResolutionState::Scanning { receiver } =
+            &self.emulator_readiness.duckstation_resolution
+        else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok((generation, view)) => {
+                self.accept_duckstation_resolution(generation, view);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.emulator_readiness.duckstation_resolution = DuckStationResolutionState::Error(
+                    "DuckStation profile resolution stopped unexpectedly.".to_string(),
+                );
+            }
+        }
+    }
+
+    fn show_duckstation_profile_resolution(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        if matches!(
+            self.emulator_readiness.duckstation_resolution,
+            DuckStationResolutionState::NotScanned
+        ) {
+            self.start_duckstation_resolution(Some(context.clone()));
+        }
+        ui.add_space(theme::SECTION_GAP);
+        let mut recheck = false;
+        widgets::card(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("DuckStation: which installation and profile EmuWiz will use");
+                recheck = ui.button("Re-check").clicked();
+            });
+            match &self.emulator_readiness.duckstation_resolution {
+                DuckStationResolutionState::NotScanned
+                | DuckStationResolutionState::Scanning { .. } => {
+                    ui.label("Checking DuckStation installations…");
+                }
+                DuckStationResolutionState::Error(message) => {
+                    ui.colored_label(ui.visuals().error_fg_color, message);
+                }
+                DuckStationResolutionState::Ready { view, .. } => {
+                    show_profile_resolution(ui, &present_resolution(view));
+                }
+            }
+        });
+        if recheck {
+            self.invalidate_duckstation_resolution();
         }
     }
 

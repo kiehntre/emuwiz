@@ -88,6 +88,7 @@ pub(crate) fn poll_and_reconcile(app: &mut ArchiveFsApp, context: &egui::Context
     app.poll_dolphin_local_profiles();
     app.poll_pcsx2_launch_profiles();
     app.poll_flycast_profiles();
+    app.poll_duckstation_resolution();
     app.poll_pcsx2_firmware_evidence();
     app.poll_cheat_workflow(context);
     app.cheatbase_page.poll(context);
