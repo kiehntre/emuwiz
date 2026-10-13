@@ -18,8 +18,9 @@ use crate::dat::model::{
 };
 use crate::dat::parser::{ParseError, ParseOutcome, ParseWarning};
 
-/// Version that preserves BIOS defaults and declared empty dependency markers.
-pub const MAME_LISTXML_PARSER_SCHEMA_VERSION: u32 = 2;
+/// Version that validates complete documents and all declared supported checksums.
+/// Older cached evidence must be reparsed before it can establish completeness.
+pub const MAME_LISTXML_PARSER_SCHEMA_VERSION: u32 = 3;
 
 pub fn parse_mame_listxml(path: &Path, limits: DatLimits) -> Result<ParseOutcome, ParseError> {
     parse_mame_listxml_with_sink(path, limits, super::EntrySink::collect())
@@ -49,6 +50,7 @@ pub(super) fn parse_mame_listxml_with_sink(
     let mut warnings = Vec::new();
     let mut buf = Vec::new();
     let mut depth = 0usize;
+    let mut root_seen = false;
     let mut in_machine = false;
     let mut text = String::new();
     let mut current: Option<Machine> = None;
@@ -56,6 +58,12 @@ pub(super) fn parse_mame_listxml_with_sink(
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
+                validate_attributes(&e)?;
+                let tag = tag(&e)?;
+                validate_element(&tag, depth, root_seen)?;
+                if depth == 0 {
+                    root_seen = true;
+                }
                 depth += 1;
                 if depth > limits.max_xml_depth {
                     return Err(ParseError::XmlDepthExceeded {
@@ -63,7 +71,6 @@ pub(super) fn parse_mame_listxml_with_sink(
                         limit: limits.max_xml_depth,
                     });
                 }
-                let tag = tag(&e)?;
                 if depth == 1 && tag == "mame" {
                     for attribute in e.attributes() {
                         let attribute = attribute.map_err(|err| ParseError::MalformedXml {
@@ -101,7 +108,18 @@ pub(super) fn parse_mame_listxml_with_sink(
                 text.clear();
             }
             Ok(Event::Empty(e)) => {
+                validate_attributes(&e)?;
                 let tag = tag(&e)?;
+                validate_element(&tag, depth, root_seen)?;
+                if depth + 1 > limits.max_xml_depth {
+                    return Err(ParseError::XmlDepthExceeded {
+                        depth: depth + 1,
+                        limit: limits.max_xml_depth,
+                    });
+                }
+                if depth == 0 {
+                    root_seen = true;
+                }
                 if tag == "machine" {
                     if games.len() >= limits.max_entries {
                         return Err(ParseError::EntryLimitExceeded {
@@ -126,6 +144,9 @@ pub(super) fn parse_mame_listxml_with_sink(
                 }
             }
             Ok(Event::Text(e)) => {
+                if depth == 0 && e.iter().any(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+                    return Err(malformed("Text outside the MAME document root"));
+                }
                 if in_machine {
                     text.push_str(&e.decode().map_err(xml_error)?);
                 }
@@ -169,7 +190,27 @@ pub(super) fn parse_mame_listxml_with_sink(
                 depth = depth.saturating_sub(1);
                 text.clear();
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                if !root_seen {
+                    return Err(malformed("Missing MAME document root"));
+                }
+                if depth != 0 || current.is_some() {
+                    let context = current.as_ref().and_then(|m| m.name.as_deref());
+                    return Err(malformed(format!(
+                        "Unexpected EOF: unclosed MAME document or machine {:?} (depth {depth})",
+                        context
+                    )));
+                }
+                break;
+            }
+            Ok(Event::CData(_) | Event::GeneralRef(_)) if depth == 0 => {
+                return Err(malformed("Content outside the MAME document root"));
+            }
+            Ok(Event::Decl(_) | Event::DocType(_)) if root_seen => {
+                return Err(malformed(
+                    "XML declaration or doctype after MAME root started",
+                ));
+            }
             Ok(_) => {}
             Err(e) => {
                 return Err(ParseError::MalformedXml {
@@ -200,6 +241,64 @@ pub(super) fn parse_mame_listxml_with_sink(
             games: games.into_games(),
         },
         warnings: Vec::new(),
+    })
+}
+
+fn malformed(detail: impl Into<String>) -> ParseError {
+    ParseError::MalformedXml {
+        detail: detail.into(),
+        byte_offset: None,
+    }
+}
+
+// Track document structure without buffering the catalogue. quick-xml checks
+// matching end tags, but token-boundary EOF and multiple roots need this guard.
+fn validate_element(tag: &str, depth: usize, root_seen: bool) -> Result<(), ParseError> {
+    if depth == 0 {
+        if root_seen {
+            return Err(malformed("Multiple document roots in MAME catalogue"));
+        }
+        if tag != "mame" {
+            return Err(malformed("Expected a MAME document root"));
+        }
+    } else if tag == "mame" {
+        return Err(malformed("Nested MAME document root"));
+    }
+    if tag == "machine" && depth != 1 {
+        return Err(malformed(
+            "MAME machine must be a direct child of the document root",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attributes(e: &quick_xml::events::BytesStart<'_>) -> Result<(), ParseError> {
+    for attribute in e.attributes() {
+        let attribute = attribute.map_err(|err| malformed(err.to_string()))?;
+        attribute
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(|err| malformed(err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn checksum(
+    e: &quick_xml::events::BytesStart<'_>,
+    machine: &Machine,
+    algorithm: &[u8],
+    normalize: fn(&str) -> Option<String>,
+) -> Result<Option<String>, ParseError> {
+    let Some(raw) = declared_attr(e, algorithm) else {
+        return Ok(None);
+    };
+    normalize(&raw).map(Some).ok_or_else(|| {
+        malformed(format!(
+            "MAME machine {:?}, {} member {:?}: malformed {} checksum declaration",
+            machine.name.as_deref().unwrap_or("<unnamed>"),
+            String::from_utf8_lossy(e.name().as_ref()),
+            attr(e, b"name").as_deref().unwrap_or("<unnamed>"),
+            String::from_utf8_lossy(algorithm),
+        ))
     })
 }
 
@@ -342,9 +441,9 @@ fn handle_empty_like(
                 });
             }
             let status = declared_attr(e, b"status");
-            let crc = attr(e, b"crc").and_then(|v| normalise_crc32(&v));
-            let md5 = attr(e, b"md5").and_then(|v| normalise_md5(&v));
-            let sha1 = attr(e, b"sha1").and_then(|v| normalise_sha1(&v));
+            let crc = checksum(e, m, b"crc", normalise_crc32)?;
+            let md5 = checksum(e, m, b"md5", normalise_md5)?;
+            let sha1 = checksum(e, m, b"sha1", normalise_sha1)?;
             if status
                 .as_deref()
                 .is_some_and(|v| v.eq_ignore_ascii_case("nodump"))
@@ -381,7 +480,7 @@ fn handle_empty_like(
         }
         "disk" => m.disks.push(DatDiskEntry {
             name: attr(e, b"name"),
-            sha1: attr(e, b"sha1").and_then(|v| normalise_sha1(&v)),
+            sha1: checksum(e, m, b"sha1", normalise_sha1)?,
             status: attr(e, b"status"),
             merge: declared_attr(e, b"merge"),
             ..Default::default()
@@ -483,7 +582,7 @@ mod tests {
     #[test]
     fn parses_machine_attributes_and_children() {
         let dir = tempfile::tempdir().unwrap();
-        let xml = r#"<mame build="0.280"><machine name="pacman" cloneof="puckman" romof="puckman" sampleof="pacman" isbios="no" isdevice="no" runnable="yes" sourcefile="pacman.cpp"><description>Pac-Man</description><year>1980</year><manufacturer>Namco</manufacturer><rom name="pacman.6e" size="4096" crc="c1e6ab10" sha1="e87e059c5be45753f7e9f17dc8d1d3b96ff8fe0d"/><disk name="pacman" sha1="0000000000000000000000000000000000000a"/><device_ref name="z80"/></machine></mame>"#;
+        let xml = r#"<mame build="0.280"><machine name="pacman" cloneof="puckman" romof="puckman" sampleof="pacman" isbios="no" isdevice="no" runnable="yes" sourcefile="pacman.cpp"><description>Pac-Man</description><year>1980</year><manufacturer>Namco</manufacturer><rom name="pacman.6e" size="4096" crc="c1e6ab10" sha1="e87e059c5be45753f7e9f17dc8d1d3b96ff8fe0d"/><disk name="pacman" sha1="000000000000000000000000000000000000000a"/><device_ref name="z80"/></machine></mame>"#;
         let path = write(dir.path(), "pacman.xml", xml);
         let outcome = parse_mame_listxml(&path, DatLimits::default()).unwrap();
         assert_eq!(outcome.dat.source.ecosystem, DatEcosystem::MAMEArcade);
@@ -495,6 +594,10 @@ mod tests {
         assert_eq!(game.runnable.as_deref(), Some("yes"));
         assert_eq!(game.roms.len(), 1);
         assert_eq!(game.disks.len(), 1);
+        assert_eq!(
+            game.disks[0].sha1.as_deref(),
+            Some("000000000000000000000000000000000000000a")
+        );
         assert_eq!(game.device_refs.len(), 1);
         assert_eq!(game.roms[0].crc32.as_deref(), Some("c1e6ab10"));
     }
@@ -605,3 +708,7 @@ mod tests {
         assert_eq!(game.original_metadata.fields["mame.input"], "");
     }
 }
+
+#[cfg(test)]
+#[path = "mame_listxml_validation_tests.rs"]
+mod validation_tests;

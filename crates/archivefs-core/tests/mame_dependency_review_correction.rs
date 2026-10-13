@@ -3,7 +3,9 @@ use archivefs_core::arcade_mame_compatibility::*;
 use archivefs_core::dat::dependency::{DependencyKind, DependencyTarget};
 use archivefs_core::dat::limits::DatLimits;
 use archivefs_core::dat::model::ParsedDat;
-use archivefs_core::dat::parsers::mame_listxml::parse_mame_listxml;
+use archivefs_core::dat::parsers::mame_listxml::{
+    MAME_LISTXML_PARSER_SCHEMA_VERSION, parse_mame_listxml,
+};
 use archivefs_core::identity_source::mame_listxml::import_mame_listxml;
 
 fn metadata(xml: &str) -> ParsedDat {
@@ -295,7 +297,7 @@ fn old_parsed_cache_is_stale_even_when_evidence_claims_schema_two() {
                 result.mismatches
             );
             assert_ne!(
-                result.mame.parser_schema_version, 2,
+                result.mame.parser_schema_version, MAME_LISTXML_PARSER_SCHEMA_VERSION,
                 "stale input must not be relabelled current"
             );
         }
@@ -336,7 +338,10 @@ fn existing_importer_reparses_retained_xml_to_recover_bios_defaults() {
             .unwrap(),
     );
     assert_eq!(new_result.state, MameSetCompatibilityState::Compatible);
-    assert_eq!(new_result.mame.parser_schema_version, 2);
+    assert_eq!(
+        new_result.mame.parser_schema_version,
+        MAME_LISTXML_PARSER_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -398,12 +403,21 @@ fn fresh_cache_round_trip_preserves_provenance_without_relabelling_old_pins() {
         r#"<machine name="variant"><rom name="main" size="13" crc="1a2b3c4d"/></machine>"#,
     );
     let dat: ParsedDat = serde_json::from_slice(&serde_json::to_vec(&fresh).unwrap()).unwrap();
-    assert_eq!(dat.games[0].mame_listxml_schema_version, Some(2));
+    assert_eq!(
+        dat.games[0].mame_listxml_schema_version,
+        Some(MAME_LISTXML_PARSER_SCHEMA_VERSION)
+    );
     let e = evidence(
         vec![rom("variant", "main", "1a2b3c4d")],
         ObservedEvidenceCompleteness::Complete,
     );
-    for schema in [0, 1, 2, 3] {
+    for schema in [
+        0,
+        1,
+        2,
+        MAME_LISTXML_PARSER_SCHEMA_VERSION,
+        MAME_LISTXML_PARSER_SCHEMA_VERSION + 1,
+    ] {
         let mut pin = pin();
         pin.parser_schema_version = schema;
         let result = e.audit(
@@ -412,9 +426,12 @@ fn fresh_cache_round_trip_preserves_provenance_without_relabelling_old_pins() {
                 .expectation_for("variant")
                 .unwrap(),
         );
-        if schema == 0 || schema == 2 {
+        if schema == 0 || schema == MAME_LISTXML_PARSER_SCHEMA_VERSION {
             assert_eq!(result.state, MameSetCompatibilityState::Compatible);
-            assert_eq!(result.mame.parser_schema_version, 2);
+            assert_eq!(
+                result.mame.parser_schema_version,
+                MAME_LISTXML_PARSER_SCHEMA_VERSION
+            );
         } else {
             assert_eq!(result.state, MameSetCompatibilityState::Unknown);
             assert_eq!(result.mame.parser_schema_version, schema);
@@ -453,5 +470,29 @@ fn incomplete_disk_identity_is_unknown_but_observed_wrong_identity_is_incompatib
             });
             assert_layouts(&dat, &e, expected);
         }
+    }
+}
+
+#[test]
+fn pre_validation_schema_two_cache_cannot_claim_current_completeness() {
+    let mut old = metadata(
+        r#"<machine name="variant"><rom name="main" size="13" crc="1a2b3c4d"/></machine>"#,
+    );
+    old.games[0].mame_listxml_schema_version = Some(2);
+    for schema in [0, MAME_LISTXML_PARSER_SCHEMA_VERSION] {
+        let mut mame = pin();
+        mame.parser_schema_version = schema;
+        let result = evidence(
+            vec![rom("variant", "main", "1a2b3c4d")],
+            ObservedEvidenceCompleteness::Complete,
+        )
+        .audit(
+            &mame,
+            MameExpectationIndex::new(&old)
+                .expectation_for("variant")
+                .unwrap(),
+        );
+        assert_eq!(result.state, MameSetCompatibilityState::Unknown);
+        assert!(result.mismatches.iter().any(|m| m.detail.contains("stale")));
     }
 }
