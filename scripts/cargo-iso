@@ -32,6 +32,8 @@
 #                    EMUWIZ_CARGO_LOW_DEBUG=1
 #   --incremental    enable incremental compilation for dev/test builds (see below);
 #                    also set by EMUWIZ_CARGO_INCREMENTAL=1
+#   --sccache        route rustc through sccache with a dedicated, size-capped cache
+#                    shared by all worktrees (see below); also EMUWIZ_CARGO_SCCACHE=1
 #   --help           this text
 #
 # Environment (all optional):
@@ -39,6 +41,10 @@
 #   EMUWIZ_MIN_FREE_GB       minimum free GiB on the build disk (default 8)
 #   EMUWIZ_CARGO_LOW_DEBUG   1 = same as --low-debug
 #   EMUWIZ_CARGO_INCREMENTAL 1 = same as --incremental
+#   EMUWIZ_CARGO_SCCACHE     1 = same as --sccache
+#   EMUWIZ_SCCACHE_DIR       sccache directory (default ~/.cache/emuwiz-sccache)
+#   EMUWIZ_SCCACHE_SIZE      cache size cap, e.g. 2G (default 2G)
+#   EMUWIZ_SCCACHE_PORT      private sccache server port (default 4241)
 #   EMUWIZ_CARGO             cargo executable to run (default: cargo)
 #
 # Incremental builds: a shell that exports CARGO_INCREMENTAL=0 (older ~/.bashrc
@@ -48,20 +54,31 @@
 # build), at the cost of roughly doubling that worktree's target size. Nothing is
 # changed unless you ask; keep one choice per worktree so the cache stays warm.
 #
+# sccache (--sccache): shares compiled dependency artefacts between worktrees
+# while every worktree keeps its own target directory. It sets RUSTC_WRAPPER for
+# this run only, uses its own cache directory and server port (so a developer's
+# own sccache is untouched), caps the cache (default 2G; sccache evicts its own
+# least-recently-used entries, never anything in a target), and forces
+# CARGO_INCREMENTAL=0 because sccache cannot cache incremental builds. It cannot be
+# combined with --incremental. It never starts or stops a server you did not need;
+# it never deletes anything itself.
+#
 # Exit codes of its own: 2 usage/not a git worktree, 3 refused target,
 # 4 not enough free disk. Anything else is cargo's own exit status.
 set -euo pipefail
 
-usage() { sed -n '2,52p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,70p' "$0" | sed 's/^# \{0,1\}//'; }
 
 print_only=0
 low_debug="${EMUWIZ_CARGO_LOW_DEBUG:-0}"
 incremental="${EMUWIZ_CARGO_INCREMENTAL:-0}"
+use_sccache="${EMUWIZ_CARGO_SCCACHE:-0}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --print-target) print_only=1; shift ;;
     --low-debug) low_debug=1; shift ;;
     --incremental) incremental=1; shift ;;
+    --sccache) use_sccache=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) break ;;
   esac
@@ -158,7 +175,26 @@ unset CARGO_BUILD_TARGET_DIR
 if [ "$low_debug" = "1" ]; then
   export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
 fi
-if [ "$incremental" = "1" ]; then
+if [ "$use_sccache" = "1" ]; then
+  if [ "$incremental" = "1" ]; then
+    echo "cargo-iso: --sccache and --incremental are mutually exclusive (sccache cannot cache incremental builds)" >&2
+    exit 2
+  fi
+  sccache_bin=$(command -v sccache 2>/dev/null) || {
+    echo "cargo-iso: --sccache requested but sccache is not installed" >&2
+    exit 2
+  }
+  sccache_size="${EMUWIZ_SCCACHE_SIZE:-2G}"
+  case "$sccache_size" in
+    [0-9]*[MG]) ;;
+    *) echo "cargo-iso: EMUWIZ_SCCACHE_SIZE must look like 512M or 2G, got '$sccache_size'" >&2; exit 2 ;;
+  esac
+  export RUSTC_WRAPPER="$sccache_bin"
+  export SCCACHE_DIR="${EMUWIZ_SCCACHE_DIR:-$home/.cache/emuwiz-sccache}"
+  export SCCACHE_CACHE_SIZE="$sccache_size"
+  export SCCACHE_SERVER_PORT="${EMUWIZ_SCCACHE_PORT:-4241}"
+  export CARGO_INCREMENTAL=0
+elif [ "$incremental" = "1" ]; then
   export CARGO_INCREMENTAL=1
 fi
 # Lifecycle tracking (scripts/emuwiz-cargo-retention): holds a shared lock for

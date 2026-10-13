@@ -28,6 +28,10 @@ cat >"$fake" <<'E'
   echo "dev_debug=${CARGO_PROFILE_DEV_DEBUG-<unset>}"
   echo "test_debug=${CARGO_PROFILE_TEST_DEBUG-<unset>}"
   echo "incremental=${CARGO_INCREMENTAL-<unset>}"
+  echo "wrapper=${RUSTC_WRAPPER-<unset>}"
+  echo "sccache_dir=${SCCACHE_DIR-<unset>}"
+  echo "sccache_size=${SCCACHE_CACHE_SIZE-<unset>}"
+  echo "sccache_port=${SCCACHE_SERVER_PORT-<unset>}"
   echo "argc=$#"
   i=0; for a in "$@"; do i=$((i + 1)); echo "arg$i=$a"; done
 } >"${FAKE_CARGO_LOG:?}"
@@ -47,7 +51,7 @@ export EMUWIZ_TARGET_ROOT="$tmp/targets"
 export EMUWIZ_CARGO="$fake"
 export FAKE_CARGO_LOG="$tmp/log"
 legacy="$HOME/.cache/emuwiz-cargo-target"
-unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_INCREMENTAL
+unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG EMUWIZ_CARGO_LOW_DEBUG EMUWIZ_CARGO_INCREMENTAL EMUWIZ_CARGO_SCCACHE EMUWIZ_SCCACHE_DIR EMUWIZ_SCCACHE_SIZE EMUWIZ_SCCACHE_PORT RUSTC_WRAPPER SCCACHE_DIR
 
 target_of() { (cd "$1" && "$iso" --print-target | sed -n 's/^target: *//p'); }
 logged() { sed -n "s/^$1=//p" "$FAKE_CARGO_LOG"; }
@@ -151,6 +155,28 @@ check "--incremental sets CARGO_INCREMENTAL=1" test "$(logged incremental)" = 1
 check "--incremental is not passed on to cargo" bash -c "! grep -q 'incremental' <(grep '^arg' '$FAKE_CARGO_LOG')"
 (cd "$tmp/wt-one" && CARGO_INCREMENTAL=0 EMUWIZ_CARGO_INCREMENTAL=1 "$iso" check >/dev/null 2>&1)
 check "EMUWIZ_CARGO_INCREMENTAL=1 does the same" test "$(logged incremental)" = 1
+
+# ---- sccache mode (opt-in)
+fakebin="$tmp/fakebin"; mkdir -p "$fakebin"; printf '#!/bin/sh\nexit 0\n' >"$fakebin/sccache"; chmod +x "$fakebin/sccache"
+(cd "$tmp/wt-one" && "$iso" check >/dev/null 2>&1)
+check "sccache is not used by default" test "$(logged wrapper)" = "<unset>"
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" CARGO_INCREMENTAL=1 "$iso" --sccache check >/dev/null 2>&1); rc=$?
+check "--sccache runs" test "$rc" = 0
+check "--sccache sets RUSTC_WRAPPER" test "$(logged wrapper)" = "$fakebin/sccache"
+check "--sccache forces incremental off" test "$(logged incremental)" = 0
+check "--sccache caps the cache at 2G by default" test "$(logged sccache_size)" = 2G
+check "--sccache uses a dedicated dir under HOME" test "$(logged sccache_dir)" = "$HOME/.cache/emuwiz-sccache"
+check "--sccache uses a private server port" test "$(logged sccache_port)" = 4241
+check "--sccache keeps the per-worktree target" test "$(logged target)" = "$t1"
+check "--sccache is not passed on to cargo" bash -c "! grep -q 'sccache' <(grep '^arg' '$FAKE_CARGO_LOG')"
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" "$iso" --sccache --incremental check >/dev/null 2>&1); rc=$?
+check "--sccache with --incremental is refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && PATH="/usr/bin-none:$PATH" EMUWIZ_CARGO_SCCACHE=0 "$iso" check >/dev/null 2>&1); rc=$?
+check "EMUWIZ_CARGO_SCCACHE=0 is the default" test "$rc" = 0
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_SCCACHE_SIZE=lots "$iso" --sccache check >/dev/null 2>&1); rc=$?
+check "a malformed cache size is refused (2)" test "$rc" = 2
+(cd "$tmp/wt-one" && PATH="$fakebin:$PATH" EMUWIZ_SCCACHE_SIZE=512M EMUWIZ_SCCACHE_DIR="$tmp/sc" "$iso" --sccache check >/dev/null 2>&1)
+check "size and dir overrides are honoured" test "$(logged sccache_size)/$(logged sccache_dir)" = "512M/$tmp/sc"
 
 # ---- never deletes
 mkdir -p "$t1/debug" && : >"$t1/debug/precious-artifact"

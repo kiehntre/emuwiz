@@ -101,7 +101,13 @@ Keeping builds warm (a target is only reused by the same worktree path):
   archivefs-gui tests: edit-to-rebuild ~92-104 s without, ~26-33 s with, after a one-off
   ~390 s priming build, and the target roughly doubles in size. Use it in long-lived
   worktrees with plenty of free disk.
-- `sccache` is not installed here and is not required.
+- `scripts/cargo-iso --sccache ...` (opt-in; or `EMUWIZ_CARGO_SCCACHE=1`) routes rustc
+  through sccache with its own 2 GiB-capped cache (`~/.cache/emuwiz-sccache`, port 4241),
+  keeps each worktree's own target, and forces incremental off (it cannot be combined with
+  `--incremental`). Measured on `build -p archivefs-core` across two worktrees at different
+  commits: 139 hits / 352 compiles on the second worktree and 173.7 s against 183.3 s with
+  no cache, so about 5% - modest. A cold sccache run adds some overhead. Do not expect
+  it to replace reusing a worktree's own warm target.
 
 Shells that still carry the old shared target: some long-lived shells and agent
 sessions started before this change inherited
