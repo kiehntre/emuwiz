@@ -545,3 +545,68 @@ fn dump_fixtures_for_external_validation() {
         }
     }
 }
+
+#[test]
+fn dos_reparse_point_members_are_treated_as_links() {
+    let dir = tempfile::tempdir().unwrap();
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let mut builder = Builder::new(version);
+        builder
+            .add_bytes(b"p.png".to_vec(), png(4, 4, 1), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"l.png".to_vec(), png(4, 4, 2), None, None)
+            .unwrap();
+        builder.set_dos_attributes(b"l.png", 0x400).unwrap();
+        let path = write(dir.path(), "r.cbr", &builder.to_bytes().unwrap());
+        let error = inspect_manual(&path, &ManualLimits::default()).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ManualViewerError::UnsafeMember {
+                    reason: UnsafeMemberReason::Symlink,
+                    ..
+                }
+            ),
+            "{version:?}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn decoder_errors_map_to_accurate_user_facing_reasons() {
+    use rars::Error as E;
+    let cases: Vec<(E, ArchiveLimitation)> = vec![
+        (
+            E::FeatureDisabled {
+                feature: "encryption",
+            },
+            ArchiveLimitation::Encrypted,
+        ),
+        (
+            E::HeaderBytesLimitExceeded {
+                limit: 1,
+                required: 2,
+            },
+            ArchiveLimitation::Resources,
+        ),
+        (
+            E::Rar50DictionaryLimitExceeded {
+                limit: 1,
+                required: 2,
+            },
+            ArchiveLimitation::Resources,
+        ),
+    ];
+    for (error, want) in cases {
+        assert_eq!(
+            super::map_error(&error, None),
+            ManualViewerError::UnsupportedArchive(want),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        super::map_error(&E::Cancelled, None),
+        ManualViewerError::Cancelled
+    );
+}

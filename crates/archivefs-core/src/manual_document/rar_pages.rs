@@ -125,6 +125,13 @@ fn map_error(error: &rars::Error, name: Option<&str>) -> ManualViewerError {
         E::UnsupportedCompression { .. } => {
             return ManualViewerError::UnsupportedArchive(ArchiveLimitation::Compression);
         }
+        E::HeaderBytesLimitExceeded { .. }
+        | E::Rar50DictionaryLimitExceeded { .. }
+        | E::Rar50BufferedDecodeLimitExceeded { .. }
+        | E::Rar50FilterMemoryLimitExceeded { .. }
+        | E::MemoryLimitExceeded { .. } => {
+            return ManualViewerError::UnsupportedArchive(ArchiveLimitation::Resources);
+        }
         _ => {}
     }
     match error.kind() {
@@ -136,24 +143,42 @@ fn map_error(error: &rars::Error, name: Option<&str>) -> ManualViewerError {
         K::UnsupportedFormat => {
             ManualViewerError::UnsupportedArchive(ArchiveLimitation::FormatVersion)
         }
-        K::UnsupportedFeature => {
-            ManualViewerError::UnsupportedArchive(ArchiveLimitation::Compression)
-        }
+        K::UnsupportedFeature => ManualViewerError::UnsupportedArchive(ArchiveLimitation::Feature),
         K::ResourceLimit => ManualViewerError::UnsupportedArchive(ArchiveLimitation::Resources),
+        K::UnsafePath => ManualViewerError::UnsafeMember {
+            name: name(),
+            reason: UnsafeMemberReason::Traversal,
+        },
         K::Io => ManualViewerError::Io(error.to_string()),
         _ => ManualViewerError::Malformed(format!("not a readable RAR archive: {error}")),
     }
 }
 
-/// Unix `st_mode` type bits for hosts whose attributes carry them.
-fn unix_type_bits(meta: &rars::ArchiveMemberMeta) -> Option<u32> {
-    let unix_host = match meta.family {
-        rars::ArchiveFamily::Rar50Plus => 1,
-        _ => 3,
-    };
-    (meta.host_os == Some(unix_host))
-        .then(|| (meta.file_attr & u64::from(u32::MAX)) as u32 & S_IFMT)
-        .filter(|bits| *bits != 0)
+/// Windows reparse-point attribute: how DOS-host RAR archives mark links.
+const DOS_REPARSE_POINT: u64 = 0x400;
+
+/// How the member's attributes should be read, using the decoder's own host
+/// grouping (RAR 1.5-4: hosts 3 and 5 are Unix; RAR 5: host 1 is Unix).
+enum MemberKind {
+    Plain,
+    Link,
+    Special,
+}
+
+fn member_kind(meta: &rars::ArchiveMemberMeta) -> MemberKind {
+    match meta.attr_source() {
+        rars::AttrSource::Unix => {
+            let bits = (meta.file_attr & u64::from(u32::MAX)) as u32 & S_IFMT;
+            match bits {
+                0 | S_IFREG | S_IFDIR => MemberKind::Plain,
+                S_IFLNK => MemberKind::Link,
+                _ => MemberKind::Special,
+            }
+        }
+        rars::AttrSource::Dos if meta.file_attr & DOS_REPARSE_POINT != 0 => MemberKind::Link,
+        // Unknown hosts carry no usable attributes; nothing is ever extracted.
+        _ => MemberKind::Plain,
+    }
 }
 
 fn archive_flags(archive: &rars::Archive) -> (bool, bool) {
@@ -222,14 +247,15 @@ pub(super) fn inspect(
                 reason: UnsafeMemberReason::Symlink,
             });
         }
-        if let Some(kind) = unix_type_bits(meta) {
-            if kind == S_IFLNK {
+        match member_kind(meta) {
+            MemberKind::Plain => {}
+            MemberKind::Link => {
                 return Err(ManualViewerError::UnsafeMember {
                     name,
                     reason: UnsafeMemberReason::Symlink,
                 });
             }
-            if kind != S_IFREG && kind != S_IFDIR {
+            MemberKind::Special => {
                 return Err(ManualViewerError::UnsafeMember {
                     name,
                     reason: UnsafeMemberReason::SpecialFile,

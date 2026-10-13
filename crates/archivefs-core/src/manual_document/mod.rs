@@ -236,6 +236,8 @@ pub enum ArchiveLimitation {
     SelfExtracting,
     /// A compression method or filter this reader does not implement.
     Compression,
+    /// Some other RAR feature this reader does not implement.
+    Feature,
     /// An archive format version this reader does not implement.
     FormatVersion,
     /// A decoder resource budget (dictionary, workspace, headers) was exceeded.
@@ -296,7 +298,9 @@ impl fmt::Display for ManualViewerError {
             }
             Self::SourceChanged => f.write_str("the file changed after it was opened"),
             Self::CapabilityUnavailable(gap) => write!(f, "unavailable: {}", gap.detail()),
-            Self::UnsupportedArchive(reason) => write!(f, "unsupported RAR archive: {reason:?}"),
+            Self::UnsupportedArchive(reason) => {
+                write!(f, "unsupported RAR archive: {}", reason.user_message())
+            }
             Self::Cancelled => f.write_str("the read was cancelled"),
         }
     }
@@ -359,11 +363,14 @@ impl ArchiveLimitation {
             Self::Compression => {
                 "This comic uses a compression method EmuWiz cannot read. Re-save it as CBZ or a standard RAR archive."
             }
+            Self::Feature => {
+                "This comic uses a RAR feature EmuWiz cannot read. Re-save it as CBZ or a standard RAR archive."
+            }
             Self::FormatVersion => {
-                "This is an archive version EmuWiz cannot read. Re-save it as CBZ or a standard RAR archive."
+                "This is an archive version or variant EmuWiz cannot read. Re-save it as CBZ or a standard RAR archive."
             }
             Self::Resources => {
-                "This comic needs more memory to decode than EmuWiz allows, so it was refused."
+                "This comic is structured or compressed in a way that needs more memory or space than EmuWiz allows, so it was refused."
             }
         }
     }
