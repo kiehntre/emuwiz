@@ -207,6 +207,12 @@ fn rollback_transaction_inner(
                     Some(crate::dat::sources::now_unix());
                 transaction.entries[index].failure_reason = None;
                 rolled_back.push(transaction.entries[index].source_path.clone());
+                #[cfg(test)]
+                AFTER_REVERSAL.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook(rolled_back.len());
+                    }
+                });
             }
             Err(reason) => {
                 let in_flight = reason.starts_with(IN_FLIGHT_MARK);
@@ -546,6 +552,16 @@ fn ancestor_chain_is_confined(path: &Path, trusted: &TrustedRoots) -> bool {
             None => return false,
         }
     }
+}
+
+/// Test-only, per-thread: invoked with the number of entries reversed so far
+/// immediately after each reversal. It lets a test cancel at an exact point
+/// instead of racing a second thread against the rollback worker. Compiled out
+/// of production builds.
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_REVERSAL: std::cell::RefCell<Option<Box<dyn FnMut(usize)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn cancelled(cancel: &AtomicBool) -> bool {

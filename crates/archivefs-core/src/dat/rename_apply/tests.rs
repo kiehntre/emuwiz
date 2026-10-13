@@ -1683,6 +1683,15 @@ fn a_completed_transaction_cannot_be_applied_twice() {
 fn apply_three_and_cancel_after_first_reverse_rename(
     dir: &Path,
 ) -> (RollbackOutcome, std::path::PathBuf) {
+    apply_three_and_cancel_after_reversals(dir, 1)
+}
+
+/// Applies three renames, then rolls back with cancellation raised right after
+/// `cancel_after` reverse renames (1..=2 leave the transaction partial).
+fn apply_three_and_cancel_after_reversals(
+    dir: &Path,
+    cancel_after: usize,
+) -> (RollbackOutcome, std::path::PathBuf) {
     let roms = dir.join("roms");
     std::fs::create_dir_all(&roms).unwrap();
     let a = write(&roms, "a.bin");
@@ -1724,60 +1733,24 @@ fn apply_three_and_cancel_after_first_reverse_rename(
     assert_eq!(outcome.summary.applied, 3, "three renames applied");
 
     let mut tx = outcome.transaction;
-    let rollback_cancel = Arc::new(AtomicBool::new(false));
-    let worker_cancel = rollback_cancel.clone();
-    let journal_for_thread = journal.clone();
-    let handle = std::thread::spawn(move || {
-        rollback_transaction(&mut tx, &journal_for_thread, &worker_cancel).unwrap()
+    // Cancel at an exact, deterministic point: the hook fires on this thread
+    // immediately after the `cancel_after`-th reversal, so the next loop
+    // iteration sees the flag. This replaces a second thread polling the
+    // filesystem and racing the worker, which on a loaded runner could observe
+    // the first reversal late and let a second (or third) one through, making
+    // "exactly one entry reversed" a scheduling guess rather than a fact.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let hook_cancel = cancel.clone();
+    super::rollback::AFTER_REVERSAL.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |reversed| {
+            if reversed == cancel_after {
+                hook_cancel.store(true, Ordering::Relaxed);
+            }
+        }));
     });
-
-    // Rollback runs in reverse order: index 2 is reversed first, restoring
-    // c.bin. Wait for that reverse rename's durable, observable side effect,
-    // then cancel: the durable journal write after the reversal gives this
-    // thread the window.
-    //
-    // This used to be a fixed 200_000-iteration `spin_loop()` budget with no
-    // wall-clock bound. `spin_loop()` is a CPU hint only - it never yields
-    // the OS timeslice - so under CI's parallel-test-thread contention (many
-    // `cargo test` worker threads sharing few vCPUs), the busy-spinning main
-    // thread could exhaust its whole iteration budget without the scheduler
-    // ever giving the rollback worker thread a slice to run the rename, all
-    // without spending enough *wall-clock* time for that to be unreasonable.
-    // A fixed iteration count is a proxy for time that only holds when the
-    // machine is otherwise idle, which is exactly what a local run is and a
-    // loaded CI runner is not.
-    //
-    // The fix keeps the same observable condition (the same fact the test is
-    // actually proving: the first reverse rename ran) but waits on wall-clock
-    // time instead of a CPU-hint budget, and actively yields the thread once
-    // a short initial spin hasn't resolved it - so the OS scheduler has a
-    // real, repeated opportunity to run the worker thread regardless of core
-    // count or contention. The 30s ceiling is generous enough that only a
-    // genuine hang (not scheduling variance) would ever hit it, at which
-    // point this still fails loudly with the same diagnostic as before,
-    // never silently.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut seen = false;
-    let mut spins: u32 = 0;
-    while std::time::Instant::now() < deadline {
-        if roms.join("c.bin").exists() {
-            seen = true;
-            break;
-        }
-        spins += 1;
-        if spins < 10_000 {
-            std::hint::spin_loop();
-        } else {
-            std::thread::yield_now();
-        }
-    }
-    assert!(
-        seen,
-        "the first reverse rename should run before cancellation"
-    );
-    rollback_cancel.store(true, Ordering::Relaxed);
-    let outcome = handle.join().unwrap();
-    (outcome, journal)
+    let result = rollback_transaction(&mut tx, &journal, &cancel);
+    super::rollback::AFTER_REVERSAL.with(|hook| *hook.borrow_mut() = None);
+    (result.unwrap(), journal)
 }
 
 #[test]
@@ -1884,6 +1857,32 @@ fn cancelled_mid_rollback_is_partial_with_remaining_applied() {
         .map(|entry| entry.source_path.file_name().unwrap().to_str().unwrap())
         .collect();
     assert_eq!(eligible, vec!["a.bin", "b.bin"]);
+}
+
+#[test]
+fn cancelled_after_two_reversals_is_partial_with_the_last_entry_still_applied() {
+    // The outcome CI once produced by accident (two entries reversed before the
+    // cancel landed) is a valid partial rollback and must be reported exactly.
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, _journal) = apply_three_and_cancel_after_reversals(dir.path(), 2);
+    let roms = dir.path().join("roms");
+
+    assert_eq!(outcome.result.rolled_back_paths().len(), 2);
+    assert!(matches!(
+        outcome.result,
+        RollbackResult::PartiallyRolledBack { .. }
+    ));
+    assert_eq!(outcome.transaction.state, TransactionState::RollbackFailed);
+    let applied: Vec<&str> = outcome
+        .transaction
+        .entries
+        .iter()
+        .filter(|entry| entry.state == EntryState::Applied)
+        .map(|entry| entry.source_path.file_name().unwrap().to_str().unwrap())
+        .collect();
+    assert_eq!(applied, vec!["a.bin"]);
+    assert!(roms.join("c.bin").exists() && roms.join("b.bin").exists());
+    assert!(roms.join("A.bin").exists() && !roms.join("a.bin").exists());
 }
 
 #[test]
