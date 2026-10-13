@@ -23,6 +23,22 @@ pub(super) struct Directory {
     bindings: Vec<(PathBuf, u64, u64)>,
 }
 
+impl Drop for Directory {
+    fn drop(&mut self) {
+        // The publication flock belongs to this open file description. A fork()
+        // elsewhere in the process (any helper spawn) gives its child another
+        // reference until exec, so merely closing our descriptor would keep the
+        // lock held and falsely block the next attempt. LOCK_UN acts on the
+        // shared description and releases it for every copy; it never affects
+        // another attempt's separately opened description. The lock is
+        // advisory EmuWiz coordination only, never proof of leaf ownership.
+        // SAFETY: self.file is a valid open descriptor until after this drop.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 fn owned(fd: i32) -> Result<File, String> {
     if fd < 0 {
         return Err(std::io::Error::last_os_error().to_string());

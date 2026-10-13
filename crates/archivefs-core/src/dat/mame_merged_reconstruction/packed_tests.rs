@@ -1636,3 +1636,274 @@ fn a_second_packed_member_failing_leaves_the_first_unpublished_and_the_source_in
     lab.nothing_was_staged_or_published(&plan);
     assert_eq!(std::fs::read(&zip).unwrap(), before);
 }
+
+// Publication-lock lifecycle. The staging-directory flock belongs to an open
+// file description, and a concurrent fork() (any thread in this process that
+// spawns a helper) gives the child a second reference to it until its exec.
+// The lock must be released when the attempt ends, not whenever every stray
+// copy of the descriptor happens to be closed.
+mod publication_lock_lifecycle {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn refused_attempts_never_block_a_later_valid_attempt_while_other_threads_spawn() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("/bin/true").status();
+                    }
+                })
+            })
+            .collect();
+        for round in 0..40 {
+            let lab = Lab::new();
+            let zip = lab.zip("source.zip", &[("a", b"payload")]);
+            let good = lab.plan(&[Member {
+                target: "a",
+                bytes: b"payload",
+                from: From::Zip(&zip, "a"),
+            }]);
+            for tweak in 0..3 {
+                let mut plan = good.clone();
+                match tweak {
+                    0 => plan.required_members[0].crc32 = Some("deadbeef".into()),
+                    1 => plan.required_members[0].sha1 = Some("0".repeat(40)),
+                    _ => plan.required_members[0].size_bytes = Some(8),
+                }
+                let error = lab.stage(&plan).unwrap_err();
+                assert!(
+                    error.contains("refused"),
+                    "round {round} case {tweak}: {error}"
+                );
+            }
+            lab.stage(&good)
+                .unwrap_or_else(|e| panic!("round {round}: a valid attempt was blocked: {e}"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for handle in spawners {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_genuinely_overlapping_publisher_is_still_refused_until_the_holder_ends() {
+        let lab = Lab::new();
+        let zip = lab.zip("source.zip", &[("a", b"payload")]);
+        let plan = lab.plan(&[Member {
+            target: "a",
+            bytes: b"payload",
+            from: From::Zip(&zip, "a"),
+        }]);
+        let holder = owned_attempt::staging_root(&lab.stage_root()).unwrap();
+        // another thread and a full staging attempt both overlap the holder
+        let path = lab.stage_root();
+        let overlapped = std::thread::spawn(move || owned_attempt::staging_root(&path).err())
+            .join()
+            .unwrap()
+            .expect("an overlapping publisher must be refused");
+        assert!(
+            overlapped.contains("another MAME publication is in progress"),
+            "{overlapped}"
+        );
+        let error = lab.stage(&plan).unwrap_err();
+        assert!(
+            error.contains("another MAME publication is in progress"),
+            "{error}"
+        );
+        lab.nothing_was_staged_or_published(&plan);
+        // the holder ending (its last reference dropped) frees the lock at once
+        drop(holder);
+        lab.stage(&plan)
+            .expect("lock released when the holder ended");
+    }
+
+    // ---- independent processes -------------------------------------------
+    // Child half: re-executed copy of this test binary acting as a separate
+    // publisher. Modes: "hold" acquires, announces "held" on stdout, then
+    // holds until its stdin closes; "try" reports "acquired"/"refused".
+    #[test]
+    fn publication_lock_child() {
+        let Some(mode) = std::env::var_os("EMUWIZ_MAME_LOCK_CHILD") else {
+            return;
+        };
+        let path = PathBuf::from(std::env::var_os("EMUWIZ_MAME_LOCK_PATH").unwrap());
+        match mode.to_str().unwrap() {
+            "hold" => {
+                let _held = owned_attempt::staging_root(&path).unwrap();
+                println!("LOCK-STATE:held");
+                let mut sink = Vec::new();
+                let _ = std::io::stdin().read_to_end(&mut sink); // blocks until the parent closes it
+            }
+            _ => match owned_attempt::staging_root(&path) {
+                Ok(_) => println!("LOCK-STATE:acquired"),
+                Err(e) => {
+                    assert!(e.contains("another MAME publication is in progress"), "{e}");
+                    println!("LOCK-STATE:refused");
+                }
+            },
+        }
+    }
+
+    fn child(mode: &str, path: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "dat::mame_merged_reconstruction::packed_tests::publication_lock_lifecycle::publication_lock_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("EMUWIZ_MAME_LOCK_CHILD", mode)
+            .env("EMUWIZ_MAME_LOCK_PATH", path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        command
+    }
+    fn run_try(path: &Path) -> String {
+        let out = child("try", path).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let text = String::from_utf8_lossy(&out.stdout);
+        ["acquired", "refused"]
+            .into_iter()
+            .find(|w| {
+                text.lines()
+                    .any(|l| l.ends_with(&format!("LOCK-STATE:{w}")))
+            })
+            .unwrap_or_else(|| panic!("child gave no verdict: {text}"))
+            .to_string()
+    }
+    // Returns the child and its stdout reader; the reader must outlive the child so
+    // the harness never hits a broken pipe on exit.
+    fn start_holder(
+        path: &Path,
+    ) -> (
+        std::process::Child,
+        std::io::BufReader<std::process::ChildStdout>,
+    ) {
+        let mut holder = child("hold", path).spawn().unwrap();
+        let mut lines = std::io::BufReader::new(holder.stdout.take().unwrap());
+        let mut line = String::new();
+        use std::io::BufRead;
+        while !line.trim_end().ends_with("LOCK-STATE:held") {
+            line.clear();
+            assert!(
+                lines.read_line(&mut line).unwrap() > 0,
+                "holder exited early"
+            );
+        }
+        (holder, lines)
+    }
+
+    #[test]
+    fn independent_processes_compete_exactly_one_owns_the_lock() {
+        let lab = Lab::new();
+        let path = lab.stage_root();
+        std::fs::create_dir_all(&path).unwrap();
+        let (mut holder, _holder_out) = start_holder(&path);
+        // two further independent publishers, concurrently, and this process
+        let a = std::thread::spawn({
+            let path = path.clone();
+            move || run_try(&path)
+        });
+        let b = std::thread::spawn({
+            let path = path.clone();
+            move || run_try(&path)
+        });
+        assert_eq!(a.join().unwrap(), "refused");
+        assert_eq!(b.join().unwrap(), "refused");
+        assert!(owned_attempt::staging_root(&path).is_err());
+        // a full staging attempt is refused and stages nothing
+        let zip = lab.zip("source.zip", &[("a", b"payload")]);
+        let plan = lab.plan(&[Member {
+            target: "a",
+            bytes: b"payload",
+            from: From::Zip(&zip, "a"),
+        }]);
+        assert!(
+            lab.stage(&plan)
+                .unwrap_err()
+                .contains("another MAME publication")
+        );
+        lab.nothing_was_staged_or_published(&plan);
+        // normal end of the holder (stdin closed) releases for the next publisher
+        drop(holder.stdin.take());
+        assert!(holder.wait().unwrap().success());
+        assert_eq!(run_try(&path), "acquired");
+        lab.stage(&plan).unwrap();
+    }
+
+    #[test]
+    fn a_killed_holder_releases_the_lock_for_reacquisition() {
+        let lab = Lab::new();
+        let path = lab.stage_root();
+        std::fs::create_dir_all(&path).unwrap();
+        let (mut holder, _holder_out) = start_holder(&path);
+        assert_eq!(run_try(&path), "refused");
+        holder.kill().unwrap(); // SIGKILL: no Drop runs; the kernel releases it
+        holder.wait().unwrap();
+        assert_eq!(run_try(&path), "acquired");
+    }
+
+    #[test]
+    fn explicit_unlock_cannot_release_another_live_publishers_lock() {
+        use std::os::fd::AsRawFd;
+        let lab = Lab::new();
+        let path = lab.stage_root();
+        let holder = owned_attempt::staging_root(&path).unwrap();
+        // Refused publishers open their own descriptions and drop them (which
+        // runs LOCK_UN on that description only); the live lock must survive
+        // any number of them, including ones holding duplicated directory fds.
+        let stray = std::fs::File::open(&path).unwrap();
+        let duplicated = unsafe { libc::fcntl(stray.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        assert!(duplicated >= 0);
+        for _ in 0..16 {
+            assert!(owned_attempt::staging_root(&path).is_err());
+            assert!(
+                unsafe { libc::flock(duplicated, libc::LOCK_EX | libc::LOCK_NB) } != 0
+                    || unsafe { libc::flock(duplicated, libc::LOCK_UN) } == 0
+            );
+        }
+        assert!(
+            owned_attempt::staging_root(&path).is_err(),
+            "live lock was released"
+        );
+        unsafe { libc::close(duplicated) };
+        drop(holder);
+        assert!(owned_attempt::staging_root(&path).is_ok());
+    }
+
+    #[test]
+    fn early_errors_panics_and_completion_all_release_the_lock() {
+        let lab = Lab::new();
+        let path = lab.stage_root();
+        // early error inside an attempt (the Arc/guard is dropped on the error path)
+        let zip = lab.zip("source.zip", &[("a", b"payload")]);
+        let good = lab.plan(&[Member {
+            target: "a",
+            bytes: b"payload",
+            from: From::Zip(&zip, "a"),
+        }]);
+        let mut bad = good.clone();
+        bad.required_members[0].crc32 = Some("deadbeef".into());
+        assert!(lab.stage(&bad).unwrap_err().contains("refused"));
+        assert!(owned_attempt::staging_root(&path).is_ok());
+        // panic/unwind while holding the lock
+        let panicked = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let _held = owned_attempt::staging_root(&path).unwrap();
+                panic!("synthetic unwind while holding the publication lock");
+            }
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(owned_attempt::staging_root(&path).is_ok());
+        // normal completion, then reacquisition
+        lab.stage(&good).unwrap();
+        assert!(owned_attempt::staging_root(&path).is_ok());
+    }
+}
