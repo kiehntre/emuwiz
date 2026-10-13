@@ -2113,7 +2113,11 @@ fn rollback_through_a_substituted_destination_grandparent_symlink_targeting_outs
 fn rollback_refusal_via_ancestor_symlink_is_reported_as_a_specific_reason_not_a_vague_missing_file_message()
  {
     let fx = fixture();
-    let (_, mut transaction, source, _destination) = apply_a_single_move(&fx);
+    let (_, mut transaction, source, destination) = apply_a_single_move(&fx);
+    let original_transaction = transaction.clone();
+    let journal = journal_path(&fx.journal_dir, &transaction.transaction_id).unwrap();
+    let original_journal = std::fs::read(&journal).unwrap();
+    let original_bytes = std::fs::read(&destination).unwrap();
     let source_parent = source.parent().unwrap().to_path_buf();
     std::fs::remove_dir(&source_parent).unwrap();
     let elsewhere = fx.root.join("elsewhere");
@@ -2121,29 +2125,32 @@ fn rollback_refusal_via_ancestor_symlink_is_reported_as_a_specific_reason_not_a_
     std::os::unix::fs::symlink(&elsewhere, &source_parent).unwrap();
 
     let cancel = AtomicBool::new(false);
-    rollback_plan_transaction(
+    let refusal = rollback_plan_transaction(
         &mut transaction,
         &fx.journal_dir,
         &cancel,
         &TrustedRoots::from_paths([fx.root.as_path()]),
     )
-    .unwrap();
-    assert_eq!(transaction.state, TransactionState::RollbackFailed);
-
-    let issues = reconcile_recovery(&mut transaction, &fx.journal_dir).unwrap();
-    let assessment = assess_recovery(&transaction, &issues);
-    let report = render_recovery_report(&transaction, &issues, assessment);
+    .unwrap_err();
 
     assert!(
-        report.contains("ancestor directory has been replaced")
-            && report.contains("manual recovery required"),
-        "report must name the actual cause, not just \"missing\": {report}"
+        refusal.contains("redirected") && refusal.contains("current containment is unverified"),
+        "refusal must name the actual cause, not just \"missing\": {refusal}"
     );
     assert!(
-        !report.to_lowercase().contains("missing file"),
+        !refusal.to_lowercase().contains("missing file"),
         "the real cause (a substituted ancestor) is detectable, so a generic \
-         \"missing file\" message would be misleading: {report}"
+         \"missing file\" message would be misleading: {refusal}"
     );
+    // R3 refuses before mutation or publication, including on reload/retry.
+    assert_eq!(transaction, original_transaction);
+    assert!(read_journal(&journal).is_err());
+    assert!(reconcile_recovery(&mut transaction, &fx.journal_dir).is_err());
+    assert_eq!(transaction, original_transaction);
+    assert_eq!(std::fs::read(&journal).unwrap(), original_journal);
+    assert_eq!(std::fs::read(&destination).unwrap(), original_bytes);
+    assert!(!source.exists());
+    assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
 }
 
 #[cfg(unix)]
