@@ -68,6 +68,13 @@ quick-xml = { version = "0.41", default-features = false, features = ["serialize
 # codec feature (deflate/bzip2/lzma/zstd/aes-crypto/...) is enabled here;
 # see the `[dev-dependencies]` entry below for why tests need more.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# Internal CBR (RAR4/RAR5) page reader (manual_document::rar_pages). Pure Rust,
+# no `unsafe`, no C code, no build script, no runtime download or spawned tool.
+# Pinned exactly: 0.10.2 is the first release carrying the parse/output/
+# workspace limits and cancellation the reader relies on. Default features
+# (write, parallel, recovery, encryption) are off: read-only, sequential, and
+# no crypto or rayon. Licence Apache-2.0; ship its COPYING/NOTICE text with any binary release.
+rars = { version = "=0.10.2", default-features = false }
 # ZIP member streams are decoded from preflight-validated packed ranges rather
 # than `ZipArchive`'s name-keyed index (which collapses duplicate names).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
@@ -202,6 +209,9 @@ sevenz-rust2 = { version = "0.21.4", default-features = false, features = [
 # --release` (no test targets) never links any codec this crate does not
 # itself need.
 zip = { version = "8.6", features = ["deflate", "aes-crypto"] }
+# Test builds only: synthesise small RAR4/RAR5 CBR fixtures (no proprietary rar
+# tool, no third-party archives). The reader under test never uses this feature.
+rars = { version = "=0.10.2", default-features = false, features = ["write", "encryption"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # PDF rasterization runs only in an independently resource-limited process.

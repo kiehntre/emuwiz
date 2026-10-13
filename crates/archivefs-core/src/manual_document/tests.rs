@@ -1525,7 +1525,9 @@ fn inspection_never_modifies_the_source() {
 // ------------------------------------------------------------------ CBR ----
 
 #[test]
-fn cbr_is_recognised_by_signature_and_reported_unsupported() {
+fn cbr_is_recognised_by_signature_not_extension() {
+    // Detection is by content signature. These bodies are not real archives, so
+    // the reader refuses them as damaged; they must never be "unrecognised".
     let dir = tempfile::tempdir().unwrap();
     for (name, magic, sig) in [
         (
@@ -1545,37 +1547,22 @@ fn cbr_is_recognised_by_signature_and_reported_unsupported() {
             ManualSignature::Rar5,
         ),
     ] {
-        let inspection = inspect(&write(dir.path(), name, magic)).unwrap();
-        assert_eq!(inspection.kind, ManualDocumentKind::Cbr, "{name}");
-        assert_eq!(inspection.evidence.signature, sig);
-        assert_eq!(
-            inspection.readiness,
-            ManualReadiness::Unsupported {
-                missing: ManualCapabilityGap::RarReader
-            }
+        let path = write(dir.path(), name, magic);
+        let (mut file, _) = open_regular(&path).unwrap();
+        let evidence = detect::detect(&mut file, &path).unwrap();
+        assert_eq!(evidence.kind, ManualDocumentKind::Cbr, "{name}");
+        assert_eq!(evidence.signature, sig, "{name}");
+        let error = inspect(&path).expect_err(name);
+        assert_ne!(error, ManualViewerError::UnrecognisedFormat, "{name}");
+        assert!(
+            matches!(error, ManualViewerError::Malformed(_)),
+            "{name}: {error:?}"
         );
-        assert_eq!(inspection.page_count, None);
-        assert!(inspection.pages.is_empty());
     }
-    let lies = inspect(&write(dir.path(), "l.cbz", b"Rar!\x1A\x07\x00x")).unwrap();
-    assert!(
-        lies.warnings
-            .iter()
-            .any(|w| matches!(w, ManualWarning::ExtensionMismatch { .. }))
-    );
 }
 
 #[test]
-fn cbr_pages_cannot_be_read_and_the_gap_is_named() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write(dir.path(), "c.cbr", b"Rar!\x1A\x07\x00data");
-    let document = ManualDocument::open(&path, &ManualLimits::default()).unwrap();
-    assert_eq!(
-        document.read_page_bytes(0),
-        Err(ManualViewerError::CapabilityUnavailable(
-            ManualCapabilityGap::RarReader
-        ))
-    );
+fn the_rar_reader_gap_is_no_longer_reported_by_inspection() {
     assert!(ManualCapabilityGap::RarReader.detail().contains("RAR"));
     assert!(
         !ManualReadiness::Unsupported {

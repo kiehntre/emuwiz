@@ -13,14 +13,18 @@
 //! * PDF is inspected structurally (page count, metadata, encryption, active
 //!   content flags). Inspection alone is [`ManualReadiness::InspectOnly`];
 //!   the separately isolated [`pdf_render`] backend renders on supported hosts.
-//! * CBR is recognised by signature but reported as unsupported: reading RAR
-//!   needs a decompressor that is not a dependency, and no unsupervised tool is
-//!   spawned.
+//! * CBR (RAR 1.3 - 7) is recognised by signature and read in-process by the
+//!   pure-Rust `rars` reader under the same member, size, ratio and image
+//!   limits as CBZ plus decoder output, workspace and dictionary budgets. One
+//!   page is decoded at a time into memory (solid predecessors are decoded and
+//!   discarded); nothing is extracted, no tool is spawned, and encrypted,
+//!   multi-volume and self-extracting archives are refused with a reason.
 
 mod detect;
 mod order;
 mod pdf;
 pub mod pdf_render;
+mod rar_pages;
 mod viewer_state;
 mod zip_pages;
 
@@ -34,6 +38,7 @@ use std::path::{Path, PathBuf};
 
 pub use detect::{ManualFormatEvidence, ManualSignature};
 pub use order::{PageGroup, compare_page_names, page_group};
+pub use rar_pages::ManualCancellation;
 pub use viewer_state::{ManualViewerAction, ManualViewerState, ManualZoom};
 pub use zip_pages::ManualPageImage;
 
@@ -214,6 +219,27 @@ pub enum ManualViewerError {
     SourceChanged,
     /// The format is recognised but cannot be read (see [`ManualCapabilityGap`]).
     CapabilityUnavailable(ManualCapabilityGap),
+    /// A RAR archive EmuWiz deliberately does not read; see [`ArchiveLimitation`].
+    UnsupportedArchive(ArchiveLimitation),
+    /// The read was cancelled before it finished; no partial page is returned.
+    Cancelled,
+}
+
+/// Why a particular (otherwise recognised) RAR archive cannot be shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveLimitation {
+    /// Encrypted headers or file data. Never decrypted, never prompted for.
+    Encrypted,
+    /// One volume of a multi-volume set (or a member continuing across volumes).
+    MultiVolume,
+    /// A self-extracting executable wrapper.
+    SelfExtracting,
+    /// A compression method or filter this reader does not implement.
+    Compression,
+    /// An archive format version this reader does not implement.
+    FormatVersion,
+    /// A decoder resource budget (dictionary, workspace, headers) was exceeded.
+    Resources,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,6 +296,8 @@ impl fmt::Display for ManualViewerError {
             }
             Self::SourceChanged => f.write_str("the file changed after it was opened"),
             Self::CapabilityUnavailable(gap) => write!(f, "unavailable: {}", gap.detail()),
+            Self::UnsupportedArchive(reason) => write!(f, "unsupported RAR archive: {reason:?}"),
+            Self::Cancelled => f.write_str("the read was cancelled"),
         }
     }
 }
@@ -308,6 +336,35 @@ impl ManualViewerError {
             Self::PageOutOfRange { .. } => "That page does not exist.",
             Self::SourceChanged => "This file changed while it was open. Open it again.",
             Self::CapabilityUnavailable(_) => "EmuWiz cannot show this kind of document yet.",
+            Self::UnsupportedArchive(reason) => reason.user_message(),
+            Self::Cancelled => "Loading this page was cancelled.",
+        }
+    }
+}
+
+impl ArchiveLimitation {
+    /// Plain wording that says what is wrong and what the person can do.
+    #[must_use]
+    pub const fn user_message(self) -> &'static str {
+        match self {
+            Self::Encrypted => {
+                "This comic archive is password-protected. EmuWiz does not open encrypted archives; extract it with your archive tool first."
+            }
+            Self::MultiVolume => {
+                "This comic is split across several archive parts. Join the parts into one archive, then open it again."
+            }
+            Self::SelfExtracting => {
+                "This is a self-extracting program, not a plain comic archive, so EmuWiz will not open it."
+            }
+            Self::Compression => {
+                "This comic uses a compression method EmuWiz cannot read. Re-save it as CBZ or a standard RAR archive."
+            }
+            Self::FormatVersion => {
+                "This is an archive version EmuWiz cannot read. Re-save it as CBZ or a standard RAR archive."
+            }
+            Self::Resources => {
+                "This comic needs more memory to decode than EmuWiz allows, so it was refused."
+            }
         }
     }
 }
@@ -317,8 +374,8 @@ impl ManualViewerError {
 pub enum ManualCapabilityGap {
     /// This structural/content reader cannot rasterize PDF pages itself.
     PdfRenderer,
-    /// No RAR reader/decompressor is a workspace dependency, and no tool is
-    /// spawned without a supervised EmuWiz execution primitive.
+    /// Retained for API compatibility: CBR is now read in-process and inspection
+    /// no longer reports this gap.
     RarReader,
 }
 
@@ -329,9 +386,7 @@ impl ManualCapabilityGap {
             Self::PdfRenderer => {
                 "PDF rasterization uses the separate resource-limited rendering backend"
             }
-            Self::RarReader => {
-                "reading RAR archives needs a RAR decompressor (a vetted crate or a supervised unrar tool), which is not available"
-            }
+            Self::RarReader => "the in-process RAR reader is not available in this build",
         }
     }
 }
@@ -495,7 +550,7 @@ pub struct ManualInspection {
     pub evidence: ManualFormatEvidence,
     pub readiness: ManualReadiness,
     pub page_count: Option<usize>,
-    /// Pages in reading order. Filled for CBZ; empty for PDF and CBR.
+    /// Pages in reading order. Filled for CBZ and CBR; empty for PDF.
     pub pages: Vec<ManualPage>,
     pub metadata: ManualMetadata,
     pub active_content: Vec<ManualActiveContent>,
@@ -547,19 +602,7 @@ pub fn inspect_manual(
     let mut inspection = match kind {
         ManualDocumentKind::Pdf => pdf::inspect(&mut file, id, evidence, &limits)?,
         ManualDocumentKind::Cbz => zip_pages::inspect(file, id, evidence, &limits)?,
-        ManualDocumentKind::Cbr => ManualInspection {
-            id,
-            kind,
-            evidence,
-            readiness: ManualReadiness::Unsupported {
-                missing: ManualCapabilityGap::RarReader,
-            },
-            page_count: None,
-            pages: Vec::new(),
-            metadata: ManualMetadata::default(),
-            active_content: Vec::new(),
-            warnings: Vec::new(),
-        },
+        ManualDocumentKind::Cbr => rar_pages::inspect(file, id, evidence, &limits)?,
     };
     warnings.append(&mut inspection.warnings);
     inspection.warnings = warnings;
@@ -630,13 +673,44 @@ impl ManualDocument {
 
     /// Raw bytes of one page image, bounded and size-checked.
     pub fn read_page_bytes(&self, index: usize) -> Result<Vec<u8>, ManualViewerError> {
+        self.read_page_bytes_cancellable(index, None)
+    }
+
+    /// As [`Self::read_page_bytes`], stopping at the next decoder checkpoint
+    /// once `cancellation` fires. A cancelled read returns no partial page.
+    pub fn read_page_bytes_cancellable(
+        &self,
+        index: usize,
+        cancellation: Option<&ManualCancellation>,
+    ) -> Result<Vec<u8>, ManualViewerError> {
         self.require_viewable()?;
-        zip_pages::read_page_bytes(&self.inspection, index, &self.limits)
+        if cancellation.is_some_and(ManualCancellation::is_cancelled) {
+            return Err(ManualViewerError::Cancelled);
+        }
+        match self.inspection.kind {
+            ManualDocumentKind::Cbr => {
+                rar_pages::read_page_bytes(&self.inspection, index, &self.limits, cancellation)
+            }
+            _ => zip_pages::read_page_bytes(&self.inspection, index, &self.limits),
+        }
     }
 
     /// Decode one page to RGBA, refusing absurd dimensions before decoding.
     pub fn decode_page(&self, index: usize) -> Result<ManualPageImage, ManualViewerError> {
-        let bytes = self.read_page_bytes(index)?;
+        self.decode_page_cancellable(index, None)
+    }
+
+    /// As [`Self::decode_page`] with cooperative cancellation (see
+    /// [`Self::read_page_bytes_cancellable`]).
+    pub fn decode_page_cancellable(
+        &self,
+        index: usize,
+        cancellation: Option<&ManualCancellation>,
+    ) -> Result<ManualPageImage, ManualViewerError> {
+        let bytes = self.read_page_bytes_cancellable(index, cancellation)?;
+        if cancellation.is_some_and(ManualCancellation::is_cancelled) {
+            return Err(ManualViewerError::Cancelled);
+        }
         zip_pages::decode_image(&bytes, &self.limits)
     }
 

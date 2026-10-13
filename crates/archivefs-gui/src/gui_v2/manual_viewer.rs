@@ -4,8 +4,9 @@ use super::documents::{
     GameDocumentAssociation,
 };
 use archivefs_core::manual_document::{
-    ManualDocument, ManualDocumentId, ManualDocumentKind, ManualLimits, ManualPageImage,
-    ManualReadiness, ManualViewerAction as Action, ManualViewerState, ManualZoom, pdf_render,
+    ManualCancellation, ManualDocument, ManualDocumentId, ManualDocumentKind, ManualLimits,
+    ManualPageImage, ManualReadiness, ManualViewerAction as Action, ManualViewerState, ManualZoom,
+    pdf_render,
 };
 use eframe::egui;
 use std::{
@@ -66,6 +67,9 @@ fn open_buttons(ui: &mut egui::Ui, document: &GameDocument) -> (egui::Response, 
 #[derive(Default)]
 struct Mailbox {
     generation: u64,
+    /// Fired when a newer request supersedes the one being decoded, so a long
+    /// archive read stops at its next checkpoint instead of running to the end.
+    cancel: ManualCancellation,
     request: Option<Work>,
     result: Option<(u64, Reply)>,
     shutdown: bool,
@@ -125,6 +129,7 @@ impl Worker {
                         break;
                     }
                     let generation = mailbox.generation;
+                    let cancel = mailbox.cancel.clone();
                     let Some(work) = mailbox.request.take() else {
                         continue;
                     };
@@ -149,7 +154,7 @@ impl Worker {
                                     })
                             } else {
                                 document
-                                    .decode_page(page)
+                                    .decode_page_cancellable(page, Some(&cancel))
                                     .map_err(|error| error.user_message().to_owned())
                             },
                         ),
@@ -170,6 +175,8 @@ impl Worker {
         let (lock, wake) = &*self.0;
         let mut mailbox = lock.lock().unwrap_or_else(|error| error.into_inner());
         mailbox.generation = mailbox.generation.wrapping_add(1);
+        mailbox.cancel.cancel();
+        mailbox.cancel = ManualCancellation::new();
         mailbox.request = work;
         mailbox.result = None;
         wake.notify_one();
@@ -187,6 +194,7 @@ impl Drop for Worker {
         let (lock, wake) = &*self.0;
         let mut mailbox = lock.lock().unwrap_or_else(|error| error.into_inner());
         mailbox.shutdown = true;
+        mailbox.cancel.cancel();
         mailbox.request = None;
         mailbox.result = None;
         wake.notify_one();

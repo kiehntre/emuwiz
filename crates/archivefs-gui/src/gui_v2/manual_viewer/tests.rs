@@ -14,6 +14,20 @@ pub(in crate::gui_v2) fn cbz(path: &Path) {
     cbz_with_size(path, 8, 12);
 }
 
+/// Synthetic three-page RAR5 CBR; same page names and colours as [`cbz`].
+pub(in crate::gui_v2) fn cbr(path: &Path) {
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).solid(true);
+    for (name, color) in [("page10.png", 10), ("page2.png", 2), ("page1.png", 1)] {
+        let image = image::RgbaImage::from_pixel(8, 12, image::Rgba([color, 0, 0, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        builder
+            .add_bytes(name.as_bytes().to_vec(), bytes.into_inner(), None, None)
+            .unwrap();
+    }
+    fs::write(path, builder.to_bytes().unwrap()).unwrap();
+}
+
 fn cbz_with_size(path: &Path, width: u32, height: u32) {
     let mut writer = zip::ZipWriter::new(fs::File::create(path).unwrap());
     for (name, color) in [("page10.png", 10), ("page2.png", 2), ("page1.png", 1)] {
@@ -458,16 +472,25 @@ fn malformed_container_returns_an_open_error() {
 
 #[test]
 fn content_signature_is_rechecked_even_when_extension_says_cbz() {
+    // A genuine RAR named .cbz opens as the CBR it is.
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("fake.cbz");
-    fs::write(&path, b"Rar!\x1a\x07\x00").unwrap();
+    cbr(&path);
     let ctx = egui::Context::default();
     let mut viewer = ManualViewer::default();
     viewer.open(&ctx, path, "Fake CBZ".into(), None);
     wait(&mut viewer, &ctx);
     let session = viewer.session.as_ref().unwrap();
+    assert!(session.error.is_none(), "{:?}", session.error);
+    assert!(session.state.is_open());
+    // A bare RAR signature is recognised as RAR and refused as damaged.
+    let junk = root.path().join("junk.cbz");
+    fs::write(&junk, b"Rar!\x1a\x07\x00").unwrap();
+    viewer.open(&ctx, junk, "Junk".into(), None);
+    wait(&mut viewer, &ctx);
+    let session = viewer.session.as_ref().unwrap();
     assert!(!session.state.is_open());
-    assert!(session.error.as_ref().unwrap().contains("RAR reader"));
+    assert!(session.error.as_ref().unwrap().contains("damaged"));
 }
 
 #[test]

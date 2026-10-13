@@ -1,5 +1,5 @@
 use super::*;
-use crate::gui_v2::manual_viewer::tests::cbz;
+use crate::gui_v2::manual_viewer::tests::{cbr, cbz};
 
 #[test]
 fn manual_viewer_opens_from_existing_artwork_manual_panel_without_desktop_handler() {
@@ -200,5 +200,78 @@ fn manual_viewer_reading_state_uses_existing_atomic_preferences_file() {
     assert_eq!(
         restored.document_reading[&path].document_id,
         app.document_preferences.reading[&path].document_id
+    );
+}
+
+#[test]
+fn manual_viewer_reads_cbr_pages_inside_the_app_at_1024_by_600() {
+    const SIZE: [f32; 2] = [1024.0, 600.0];
+    let context = egui::Context::default();
+    let mut app = fixture(&context);
+    app.go(Route::Game(42));
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("guide.cbr");
+    cbr(&path);
+    let before = fs::read(&path).unwrap();
+    let saved = documents::DocumentReadingState {
+        last_page: Some(2),
+        zoom_percent: Some(150),
+        document_id: Some(
+            archivefs_core::manual_document::ManualDocument::open(
+                &path,
+                &archivefs_core::manual_document::ManualLimits::default(),
+            )
+            .unwrap()
+            .id()
+            .clone(),
+        ),
+        ..Default::default()
+    };
+    app.document_preferences
+        .reading
+        .insert(path.clone(), saved.clone());
+    app.manual_viewer
+        .open(&context, path.clone(), "Strategy guide".into(), Some(saved));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let strings = loop {
+        let strings = text(&frame(&context, &mut app, SIZE));
+        // Natural order: page1, page2, page10 -> resumed page 2 is "page2.png".
+        if strings.iter().any(|s| s == "Page 2 of 3") && strings.iter().any(|s| s == "page2.png") {
+            break strings;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CBR never became viewable: {strings:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    for label in [
+        "Strategy guide",
+        "First",
+        "Previous",
+        "Next",
+        "Last",
+        "Close",
+        "150%",
+    ] {
+        assert!(strings.iter().any(|s| s == label), "missing {label}");
+    }
+    assert!(
+        !strings.iter().any(|s| s.contains("cannot show")),
+        "CBR must not be reported unsupported: {strings:?}"
+    );
+    frame_with(&context, &mut app, SIZE, vec![key_event(egui::Key::End)]);
+    assert_eq!(app.document_preferences.reading[&path].last_page, Some(3));
+    frame_with(&context, &mut app, SIZE, vec![key_event(egui::Key::Equals)]);
+    assert_eq!(
+        app.document_preferences.reading[&path].zoom_percent,
+        Some(200)
+    );
+    frame_with(&context, &mut app, SIZE, vec![key_event(egui::Key::Escape)]);
+    assert_eq!(app.router.current, Route::Game(42));
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "the CBR must stay untouched"
     );
 }

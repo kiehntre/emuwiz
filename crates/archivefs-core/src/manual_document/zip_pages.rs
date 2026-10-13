@@ -14,10 +14,10 @@ use super::{
     UnsafeMemberReason, open_regular, read_bounded,
 };
 
-const S_IFMT: u32 = 0o170_000;
-const S_IFREG: u32 = 0o100_000;
-const S_IFDIR: u32 = 0o040_000;
-const S_IFLNK: u32 = 0o120_000;
+pub(super) const S_IFMT: u32 = 0o170_000;
+pub(super) const S_IFREG: u32 = 0o100_000;
+pub(super) const S_IFDIR: u32 = 0o040_000;
+pub(super) const S_IFLNK: u32 = 0o120_000;
 
 /// A decoded page, ready for a texture upload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub struct ManualPageImage {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Classified {
+pub(super) enum Classified {
     Page(ManualPageFormat),
     UnsupportedImage,
     NestedArchive,
@@ -76,7 +76,7 @@ pub(super) fn validate_member_name(
     Ok(kept.join("/"))
 }
 
-fn classify(name: &str) -> Classified {
+pub(super) fn classify(name: &str) -> Classified {
     let file = name.rsplit('/').next().unwrap_or(name);
     // macOS resource-fork debris carries image extensions but is not an image.
     if name.starts_with("__MACOSX/") || file.starts_with('.') {
@@ -278,7 +278,7 @@ pub(super) fn within_expansion_ratio(size: u64, packed: u64, ratio: u64) -> bool
 }
 
 /// Names go into error text; keep them printable and short.
-fn sanitise_for_error(name: &str) -> String {
+pub(super) fn sanitise_for_error(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .take(120)
