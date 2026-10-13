@@ -1725,7 +1725,7 @@ fn gui_v2_mods_page_is_native_and_keeps_cheats_separate() {
     let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
     assert!(strings.iter().any(|value| value == "Mods & Cheats"));
     assert!(strings.iter().any(|value| value == "Available packages"));
-    assert!(strings.iter().any(|value| value == "Active stack"));
+    assert!(strings.iter().any(|value| value == "Recorded changes"));
     assert!(strings.iter().any(|value| value == "Conflicts"));
     assert!(strings.iter().any(|value| value == "Cheats"));
     assert!(!strings.iter().any(|value| value.contains("legacy handoff")));

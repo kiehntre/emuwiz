@@ -121,7 +121,7 @@ pub(super) fn show_mods_page(
             let tabs = [
                 (Tab::Installed, "Installed"),
                 (Tab::Add, "Available packages"),
-                (Tab::Stack, "Active stack"),
+                (Tab::Stack, "Recorded changes"),
                 (Tab::Conflicts, "Conflicts"),
                 (Tab::Cheats, "Cheats"),
             ];
@@ -169,6 +169,15 @@ pub(super) fn show_mods_page(
                 destination = workflows.show_cheats(ui, selected_game, activity).or(destination.take());
             } else {
                 selected_game_strip(ui, selected_game);
+                glance_card(
+                    ui,
+                    &glance(
+                        state.history.as_ref(),
+                        &game_scope(selected_game),
+                        state.history_worker.is_some(),
+                        state.history_error.is_some(),
+                    ),
+                );
                 workshop_lanes(ui, &mut state.tab);
                 match state.tab {
                     Tab::Installed => installed(ui, state.history.as_ref(), selected_game),
@@ -217,6 +226,149 @@ pub(super) fn show_mods_page(
         state.refresh_history(ui.ctx());
     }
     destination
+}
+
+/// Which part of the history can be attributed to the selected game.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GameScope {
+    NoGame,
+    IdentityUnavailable,
+    Identified(String),
+}
+
+fn game_scope(game: Option<&crate::gui_v2::library::Game>) -> GameScope {
+    match (game, selected_identity(game)) {
+        (None, _) => GameScope::NoGame,
+        (Some(_), None) => GameScope::IdentityUnavailable,
+        (Some(_), Some(identity)) => GameScope::Identified(identity),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlanceCaveat {
+    /// Some records could not be read: counts are a lower bound.
+    Incomplete,
+    /// A refresh is running or failed: counts may be out of date.
+    MayBeStale,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Glance {
+    NeedGame,
+    NeedIdentity,
+    Loading,
+    Unavailable,
+    Counts {
+        recorded: usize,
+        undo_candidates: usize,
+        with_conflicts: usize,
+        caveat: Option<GlanceCaveat>,
+    },
+}
+
+/// Summarises existing ModHistory evidence for the selected game. Never turns
+/// "unknown" into a zero: without a game, a usable game identity or loaded
+/// history there are no counts at all.
+fn glance(
+    history: Option<&ModHistory>,
+    scope: &GameScope,
+    loading: bool,
+    refresh_failed: bool,
+) -> Glance {
+    let identity = match scope {
+        GameScope::NoGame => return Glance::NeedGame,
+        GameScope::IdentityUnavailable => return Glance::NeedIdentity,
+        GameScope::Identified(identity) => identity,
+    };
+    let Some(history) = history else {
+        return if loading {
+            Glance::Loading
+        } else {
+            Glance::Unavailable
+        };
+    };
+    let receipts: Vec<&ModReceiptSummary> = history
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.verified_identity.as_deref() == Some(identity.as_str()))
+        .collect();
+    let caveat = if !history.complete {
+        Some(GlanceCaveat::Incomplete)
+    } else if loading || refresh_failed {
+        Some(GlanceCaveat::MayBeStale)
+    } else {
+        None
+    };
+    Glance::Counts {
+        recorded: receipts.len(),
+        undo_candidates: receipts
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.rollback,
+                    archivefs_core::mod_history::ModRollbackStatus::ReadyToUndo
+                )
+            })
+            .count(),
+        with_conflicts: receipts
+            .iter()
+            .filter(|r| !r.conflicts.is_empty() || !r.conflict_kinds.is_empty())
+            .count(),
+        caveat,
+    }
+}
+
+fn glance_card(ui: &mut egui::Ui, glance: &Glance) {
+    widgets::card(ui, |ui| {
+        ui.strong("Mods at a glance");
+        match glance {
+            Glance::NeedGame => {
+                ui.label("Choose a game to see which changes EmuWiz has recorded for it.");
+            }
+            Glance::NeedIdentity => {
+                ui.label("This game's identity is unavailable, so recorded changes cannot be matched to it. No counts are shown.");
+            }
+            Glance::Loading => {
+                ui.label("Reading change history… counts will appear when it has loaded.");
+            }
+            Glance::Unavailable => {
+                ui.label("Change history is not available, so counts are unknown. Use Refresh history below.");
+            }
+            Glance::Counts {
+                recorded,
+                undo_candidates,
+                with_conflicts,
+                caveat,
+            } => {
+                let prefix = if *caveat == Some(GlanceCaveat::Incomplete) {
+                    "at least "
+                } else {
+                    ""
+                };
+                ui.horizontal_wrapped(|ui| {
+                    widgets::info_chip(ui, &format!("Recorded changes: {prefix}{recorded}"));
+                    widgets::info_chip(ui, &format!("Undo candidates: {prefix}{undo_candidates}"));
+                    widgets::info_chip(
+                        ui,
+                        &format!("With recorded conflicts: {prefix}{with_conflicts}"),
+                    );
+                });
+                match caveat {
+                    Some(GlanceCaveat::Incomplete) => {
+                        ui.colored_label(
+                            theme::WARNING,
+                            "Some change records could not be read, so these are minimum counts.",
+                        );
+                    }
+                    Some(GlanceCaveat::MayBeStale) => {
+                        ui.colored_label(theme::WARNING, "History is refreshing or could not be refreshed; these counts may be out of date.");
+                    }
+                    None => {}
+                }
+                ui.label("These are records of changes EmuWiz made, not proof that a mod is active or loaded by an emulator. An undo candidate still needs review and confirmation.");
+            }
+        }
+    });
 }
 
 fn selected_game_strip(ui: &mut egui::Ui, game: Option<&crate::gui_v2::library::Game>) {
@@ -636,5 +788,145 @@ mod tests {
             });
         });
         assert_eq!(state.tab, Tab::Installed);
+    }
+
+    fn receipt(
+        id: &str,
+        identity: &str,
+        rollback: archivefs_core::mod_history::ModRollbackStatus,
+        conflicted: bool,
+    ) -> ModReceiptSummary {
+        let mut r: ModReceiptSummary = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "transaction_id": id, "kind": "local_package",
+            "platform": null, "emulator": null, "game_title": null,
+            "verified_identity": identity, "source_package": null, "source_fingerprint": null,
+            "installed_at_unix": 0, "files_created": 0, "files_replaced": 0, "files_unchanged": 0,
+            "destination_root": null, "journal_path": null, "backup_root": null,
+            "rollback": "ReadyToUndo", "conflicts": [], "notes": []
+        }))
+        .expect("receipt fixture");
+        r.rollback = rollback;
+        if conflicted {
+            r.conflict_kinds = vec!["same destination".into()];
+        }
+        r
+    }
+
+    fn scope() -> GameScope {
+        GameScope::Identified("game-a".into())
+    }
+
+    #[test]
+    fn glance_never_turns_unknown_into_zero() {
+        let empty = ModHistory {
+            complete: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            glance(Some(&empty), &GameScope::NoGame, false, false),
+            Glance::NeedGame
+        );
+        assert_eq!(
+            glance(Some(&empty), &GameScope::IdentityUnavailable, false, false),
+            Glance::NeedIdentity
+        );
+        assert_eq!(glance(None, &scope(), true, false), Glance::Loading);
+        assert_eq!(glance(None, &scope(), false, true), Glance::Unavailable);
+        assert!(matches!(
+            glance(Some(&empty), &scope(), false, false),
+            Glance::Counts {
+                recorded: 0,
+                caveat: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn glance_counts_only_the_selected_games_recorded_evidence() {
+        use archivefs_core::mod_history::ModRollbackStatus as R;
+        let history = ModHistory {
+            complete: true,
+            receipts: vec![
+                receipt("1", "game-a", R::ReadyToUndo, false),
+                receipt("2", "game-a", R::AlreadyUndone, true),
+                receipt("3", "game-a", R::NeedsReview { reason: "x".into() }, false),
+                receipt("4", "game-b", R::ReadyToUndo, true),
+            ],
+            problems: vec![],
+        };
+        assert_eq!(
+            glance(Some(&history), &scope(), false, false),
+            Glance::Counts {
+                recorded: 3,
+                undo_candidates: 1,
+                with_conflicts: 1,
+                caveat: None
+            }
+        );
+    }
+
+    #[test]
+    fn glance_flags_incomplete_and_stale_history() {
+        let incomplete = ModHistory {
+            complete: false,
+            ..Default::default()
+        };
+        assert!(matches!(
+            glance(Some(&incomplete), &scope(), false, false),
+            Glance::Counts {
+                caveat: Some(GlanceCaveat::Incomplete),
+                ..
+            }
+        ));
+        let complete = ModHistory {
+            complete: true,
+            ..Default::default()
+        };
+        for (loading, failed) in [(true, false), (false, true)] {
+            assert!(matches!(
+                glance(Some(&complete), &scope(), loading, failed),
+                Glance::Counts {
+                    caveat: Some(GlanceCaveat::MayBeStale),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn glance_card_fits_1024x600_at_160_percent_and_labels_the_tab() {
+        // 1024x600 at 160% scaling is a 640x375 logical viewport.
+        let history = ModHistory {
+            complete: false,
+            ..Default::default()
+        };
+        for g in [
+            glance(Some(&history), &scope(), false, false),
+            Glance::NeedIdentity,
+            Glance::Loading,
+        ] {
+            let context = egui::Context::default();
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(640.0, 375.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.set_pixels_per_point(1.6);
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let right = ui.max_rect().right();
+                        glance_card(ui, &g);
+                        assert!(ui.min_rect().right() <= right + 1.0, "{g:?} overflows");
+                    });
+                },
+            );
+        }
+        let source = include_str!("mods.rs");
+        assert!(source.contains("(Tab::Stack, \"Recorded changes\")"));
+        assert!(!source.contains(&format!("(Tab::Stack, \"{} {}\")", "Active", "stack")));
     }
 }
