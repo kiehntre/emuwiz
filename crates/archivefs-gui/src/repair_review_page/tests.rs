@@ -1380,6 +1380,7 @@ fn result_stub(applied: usize, failed: usize, skipped: usize) -> RepairTransacti
             applied,
             failed,
             skipped,
+            unresolved: 0,
             rollback: Default::default(),
             started_at_unix: None,
             ended_at_unix: None,

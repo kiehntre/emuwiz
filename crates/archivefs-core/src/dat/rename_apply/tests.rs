@@ -2928,3 +2928,6 @@ fn an_outer_archive_rename_refuses_safely_on_an_existing_destination() {
         "the pre-existing destination archive must not be overwritten"
     );
 }
+
+#[path = "dirsync_tests.rs"]
+mod dirsync_tests;

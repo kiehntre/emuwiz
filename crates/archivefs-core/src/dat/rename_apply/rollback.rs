@@ -30,6 +30,9 @@ use super::model::{
 use super::noclobber::{NoClobberError, rename_noreplace};
 use crate::safe_read::TrustedRoots;
 
+/// Internal marker: the reverse rename happened but its directory sync failed.
+const IN_FLIGHT_MARK: &str = "\u{1}in-flight:";
+
 /// The outcome of a rollback pass (fully / partially / failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackOutcome {
@@ -144,6 +147,7 @@ fn rollback_transaction_inner(
                 matches!(
                     issue.kind,
                     super::reconcile::RecoveryIssueKind::BothSourceAndDestination
+                        | super::reconcile::RecoveryIssueKind::DirectorySyncFailed
                         | super::reconcile::RecoveryIssueKind::BothAbsent
                         | super::reconcile::RecoveryIssueKind::DestinationIdentityChanged
                         | super::reconcile::RecoveryIssueKind::SourceIdentityChanged
@@ -190,7 +194,29 @@ fn rollback_transaction_inner(
         transaction.entries[index].state = EntryState::RollingBack;
         write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
 
-        match rollback_mutation(&transaction.entries[index], trusted) {
+        // The reverse rename must have durable directory entries before
+        // `RolledBack` is recorded. A sync failure leaves the entry in flight
+        // (`RollingBack`): the file may already be back at the source, so it
+        // is neither retried nor reported as unchanged; a later reconcile
+        // decides from the filesystem and re-attempts the sync first.
+        let attempted = rollback_mutation(&transaction.entries[index], trusted).and_then(|()| {
+            let entry = &transaction.entries[index];
+            if matches!(entry.operation, TransactionOperation::RenameMove) {
+                super::dirsync::sync_rename_parents(&entry.destination_path, &entry.source_path)
+                    .map_err(|error| {
+                        IN_FLIGHT_MARK.to_string()
+                            + &format!(
+                                "the reverse rename completed but its directory entries could \
+                                 not be synchronised ({error}); the file is back at the original \
+                                 path and the rollback was not recorded - review before any \
+                                 further action"
+                            )
+                    })
+            } else {
+                Ok(())
+            }
+        });
+        match attempted {
             Ok(()) => {
                 transaction.entries[index].state = EntryState::RolledBack;
                 transaction.entries[index].rolled_back_at_unix =
@@ -199,10 +225,13 @@ fn rollback_transaction_inner(
                 rolled_back.push(transaction.entries[index].source_path.clone());
             }
             Err(reason) => {
-                transaction.entries[index].state = if matches!(
-                    transaction.entries[index].operation,
-                    TransactionOperation::ReplaceExisting { .. }
-                ) {
+                let in_flight = reason.starts_with(IN_FLIGHT_MARK);
+                let reason = reason.trim_start_matches(IN_FLIGHT_MARK).to_string();
+                transaction.entries[index].state = if in_flight
+                    || matches!(
+                        transaction.entries[index].operation,
+                        TransactionOperation::ReplaceExisting { .. }
+                    ) {
                     EntryState::RollingBack
                 } else {
                     EntryState::RollbackFailed

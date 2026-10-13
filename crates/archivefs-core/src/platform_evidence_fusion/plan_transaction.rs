@@ -836,12 +836,24 @@ pub fn assess_recovery(
         matches!(
             issue.kind,
             RecoveryIssueKind::BothSourceAndDestination
+                | RecoveryIssueKind::DirectorySyncFailed
                 | RecoveryIssueKind::BothAbsent
                 | RecoveryIssueKind::DestinationIdentityChanged
                 | RecoveryIssueKind::SourceIdentityChanged
         )
     });
-    if unresolved {
+    // An entry still in flight after reconciliation has no established
+    // filesystem outcome (even with no recorded issue, e.g. a persisted
+    // `Applying` after a restart). Resuming would repeat a rename that may
+    // already have happened, so it is never resumable without review.
+    let in_flight = transaction.entries.iter().any(|entry| {
+        matches!(
+            entry.state,
+            crate::dat::rename_apply::EntryState::Applying
+                | crate::dat::rename_apply::EntryState::RollingBack
+        )
+    });
+    if unresolved || in_flight {
         return RecoveryAssessment::ManualRecoveryRequired;
     }
     match transaction.state {

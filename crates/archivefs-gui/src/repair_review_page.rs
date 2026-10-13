@@ -1493,6 +1493,13 @@ fn show_transaction_result_body(ui: &mut egui::Ui, result: &RepairTransactionRes
     detail_label(ui, "Applied", &result.summary.applied.to_string());
     detail_label(ui, "Failed", &result.summary.failed.to_string());
     detail_label(ui, "Skipped", &result.summary.skipped.to_string());
+    if result.summary.unresolved > 0 {
+        detail_label(
+            ui,
+            "Unresolved (in flight)",
+            &result.summary.unresolved.to_string(),
+        );
+    }
     detail_label(ui, "Rollback", result.summary.rollback.label());
     if !result.reverify.is_empty() {
         ui.add_space(4.0);
@@ -1538,7 +1545,9 @@ fn show_transaction_result_body(ui: &mut egui::Ui, result: &RepairTransactionRes
 /// is reported distinctly from a genuine full completion.
 fn quarantine_group_headline(result: &RepairTransactionResult) -> &'static str {
     let summary = &result.summary;
-    if summary.applied == 0 {
+    if summary.unresolved > 0 {
+        "Quarantine group has unresolved in-flight changes - review before continuing"
+    } else if summary.applied == 0 {
         "Quarantine group produced no applied changes"
     } else if summary.failed > 0 || summary.skipped > 0 {
         "Quarantine group partially applied"

@@ -509,7 +509,23 @@ pub(crate) fn apply_mutation(entry: &TransactionEntry) -> Result<(), (EntryState
         Ok(()) => {
             // The filesystem must confirm the rename before Applied.
             match confirm_rename(entry) {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    // The directory entries must be durable before success is
+                    // recorded. The rename has already happened, so a failure
+                    // leaves the entry in flight (`Applying`), never `Applied`
+                    // and never reported as unchanged; it is not retried.
+                    super::dirsync::sync_rename_parents(&entry.source_path, &entry.destination_path)
+                        .map_err(|error| {
+                            (
+                                EntryState::Applying,
+                                format!(
+                                    "the rename completed but its directory entries could not be \
+                                 synchronised ({error}); the file is at the destination and the \
+                                 completion was not recorded - review before any further action"
+                                ),
+                            )
+                        })
+                }
                 Err(reason) => restore_failed_rename(entry, reason),
             }
         }
@@ -538,10 +554,24 @@ fn restore_failed_rename(
         );
     if moved_foreign_object {
         return match rename_noreplace(&entry.destination_path, &entry.source_path) {
-            Ok(()) => Err((
-                EntryState::ApplyFailed,
-                format!("{reason}; the replacement object was restored to the source path"),
-            )),
+            Ok(()) => {
+                let durability = super::dirsync::sync_rename_parents(
+                    &entry.destination_path,
+                    &entry.source_path,
+                );
+                Err((
+                    EntryState::ApplyFailed,
+                    match durability {
+                        Ok(()) => format!(
+                            "{reason}; the replacement object was restored to the source path"
+                        ),
+                        Err(error) => format!(
+                            "{reason}; the replacement object was restored to the source path \
+                             but the directory entries could not be synchronised ({error})"
+                        ),
+                    },
+                ))
+            }
             Err(error) => Err((
                 EntryState::ApplyFailed,
                 format!("{reason}; could not restore the moved replacement: {error}"),
@@ -643,6 +673,14 @@ fn apply_copy_mutation(
         rename_noreplace(&temporary, &entry.destination_path)
             .map_err(|error| (EntryState::ApplyFailed, error.to_string()))?;
         published = true;
+        super::dirsync::sync_rename_parents(&temporary, &entry.destination_path).map_err(
+            |error| {
+                (
+                    EntryState::ApplyFailed,
+                    format!("the copy was published but its directory entry could not be synchronised: {error}"),
+                )
+            },
+        )?;
         let source_after = capture_identity(&entry.source_path)
             .map_err(|_| (EntryState::ApplyFailed, "copy source disappeared".into()))?;
         let destination_after = capture_identity(&entry.destination_path).map_err(|_| {

@@ -412,6 +412,14 @@ impl RenameTransaction {
             .count()
     }
 
+    /// Entries left in flight (`Applying` / `RollingBack`).
+    pub fn unresolved_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| matches!(entry.state, EntryState::Applying | EntryState::RollingBack))
+            .count()
+    }
+
     pub fn failed_count(&self) -> usize {
         self.entries
             .iter()
@@ -471,6 +479,11 @@ pub struct TransactionSummary {
     pub applied: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// Entries whose filesystem outcome is not established: still `Applying`
+    /// or `RollingBack` (for example a rename that succeeded but whose
+    /// directory sync failed). Never counted as applied, failed or skipped,
+    /// and never allowed to vanish from the totals.
+    pub unresolved: usize,
     pub rollback: RollbackStatus,
     /// Seconds since the Unix epoch when the run started/ended, when known.
     pub started_at_unix: Option<u64>,
@@ -485,6 +498,7 @@ impl TransactionSummary {
             applied: transaction.applied_count(),
             skipped: transaction.skipped_count(),
             failed: transaction.failed_count(),
+            unresolved: transaction.unresolved_count(),
             rollback: match transaction.state {
                 TransactionState::RolledBack => RollbackStatus::FullyRolledBack,
                 TransactionState::RollbackFailed => RollbackStatus::RollbackFailed,

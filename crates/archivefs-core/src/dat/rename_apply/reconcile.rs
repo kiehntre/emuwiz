@@ -40,6 +40,10 @@ pub enum RecoveryIssueKind {
     BothSourceAndDestination,
     /// Neither source nor destination exists. Unknown; left unresolved.
     BothAbsent,
+    /// The filesystem shows the rename happened (or was reversed) but its
+    /// directory entries could not be synchronised, so completion cannot be
+    /// recorded. Left unresolved; never retried automatically.
+    DirectorySyncFailed,
     /// The destination exists but is not the recorded object. Unsafe external
     /// change; left unresolved.
     DestinationIdentityChanged,
@@ -54,6 +58,7 @@ impl RecoveryIssueKind {
             Self::RenameDidNotHappen => "Rename did not happen",
             Self::RenameConfirmed => "Rename confirmed by the filesystem",
             Self::BothSourceAndDestination => "Source and destination both exist",
+            Self::DirectorySyncFailed => "Directory entries could not be synchronised",
             Self::BothAbsent => "Neither source nor destination exists",
             Self::DestinationIdentityChanged => "Destination identity changed",
             Self::SourceIdentityChanged => "Source identity changed",
@@ -88,7 +93,31 @@ pub fn reconcile_recovery(
         if !matches!(state, EntryState::Applying | EntryState::RollingBack) {
             continue;
         }
-        let issue = classify_entry(&transaction.entries[index], index);
+        let mut issue = classify_entry(&transaction.entries[index], index);
+        // Promoting an entry on the strength of a rename the filesystem shows
+        // must not outrun the durability of that rename's directory entries.
+        // Nothing was mutated for "did not happen" while Applying.
+        let mutated = match issue.kind {
+            RecoveryIssueKind::RenameConfirmed => state == EntryState::Applying,
+            RecoveryIssueKind::RenameDidNotHappen => state == EntryState::RollingBack,
+            _ => false,
+        };
+        if mutated {
+            let e = &transaction.entries[index];
+            if matches!(e.operation, TransactionOperation::RenameMove)
+                && let Err(error) =
+                    super::dirsync::sync_rename_parents(&e.source_path, &e.destination_path)
+            {
+                issue = RecoveryIssue {
+                    entry_index: index,
+                    kind: RecoveryIssueKind::DirectorySyncFailed,
+                    detail: format!(
+                        "the filesystem shows the rename happened but its directory entries \
+                         could not be synchronised: {error}"
+                    ),
+                };
+            }
+        }
         match issue.kind {
             RecoveryIssueKind::RenameDidNotHappen => {
                 // Applying: the rename did not happen. RollingBack: the reverse
