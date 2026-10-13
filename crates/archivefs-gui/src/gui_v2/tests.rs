@@ -9419,4 +9419,152 @@ mod ppsspp_profile_resolution {
         // No wording promises a launch executable.
         assert!(!strings.iter().any(|t| t.contains("PPSSPP will launch")));
     }
+
+    fn visible_in_clip(output: &egui::FullOutput, needle: &str) -> bool {
+        fn is_visible(shape: &egui::Shape, clip: egui::Rect, needle: &str) -> bool {
+            match shape {
+                egui::Shape::Text(text) => {
+                    text.galley.text() == needle
+                        && clip
+                            .contains_rect(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().any(|s| is_visible(s, clip, needle)),
+                _ => false,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .any(|shape| is_visible(&shape.shape, shape.clip_rect, needle))
+    }
+
+    const DUCK_TITLE: &str = "DuckStation: shared resolver recommendation (preview)";
+    const PPSSPP_TITLE: &str = "PPSSPP: shared resolver recommendation (preview)";
+
+    /// Real frame rendering with real mouse-wheel input: scrolls the actual
+    /// Emulators route until `needle` is fully visible inside its clip.
+    /// Returns the number of wheel steps it took (None if never reached).
+    fn scroll_until_visible(
+        context: &egui::Context,
+        app: &mut App,
+        size: [f32; 2],
+        needle: &str,
+    ) -> Option<usize> {
+        let mut output = frame(context, app, size);
+        for step in 0..200 {
+            if visible_in_clip(&output, needle) {
+                return Some(step);
+            }
+            let event = egui::Event::MouseWheel {
+                phase: egui::TouchPhase::Move,
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -240.0),
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = context.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(size[0], size[1]),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(egui::pos2(
+                            size[0] * [0.6, 0.45, 0.8][step % 3],
+                            size[1] * [0.5, 0.7, 0.35][(step / 3) % 3],
+                        )),
+                        event,
+                    ],
+                    ..Default::default()
+                },
+                |context| app.show(context),
+            );
+            for _ in 0..3 {
+                output = frame(context, app, size);
+            }
+        }
+        None
+    }
+
+    fn ready_app(context: &egui::Context) -> App {
+        let mut app = fixture(context);
+        app.router.current = Route::Section(Section::Emulators);
+        bridge(&mut app, context);
+        readiness(&mut app).duckstation_resolution_generation = 7;
+        readiness(&mut app).duckstation_resolution = DuckStationResolutionState::Ready {
+            generation: 7,
+            view: Box::new(nothing_found()),
+        };
+        readiness(&mut app).ppsspp_resolution_generation = 9;
+        readiness(&mut app).ppsspp_resolution = PpssppResolutionState::Ready {
+            generation: 9,
+            view: Box::new(nothing_found()),
+        };
+        app
+    }
+
+    /// Native-page regression: on the real GUI-v2 Emulators route, both
+    /// resolver cards are reachable by ordinary mouse-wheel scrolling, and the
+    /// PPSSPP card (which sits below the page's controls) does not move the
+    /// page's primary action.
+    #[test]
+    fn both_resolver_cards_are_reachable_by_scrolling_on_the_emulators_route() {
+        let mut failures = Vec::new();
+        // (label, window in px, interface zoom, simple shell on)
+        for (label, window, zoom, simple) in [
+            ("classic 1280x820", [1280.0_f32, 820.0], 1.0_f32, false),
+            ("classic 1024x600", [1024.0, 600.0], 1.0, false),
+            // 160% at 1024x600 is a documented pre-existing shell limitation
+            // (page body squeezed to a few points; also Sources/DAT/Check)
+            // and is deliberately not asserted here.
+            ("simple 1280x820", [1280.0, 820.0], 1.0, true),
+            ("simple 1024x600", [1024.0, 600.0], 1.0, true),
+        ] {
+            let context = egui::Context::default();
+            let mut app = ready_app(&context);
+            app.simple.enabled = simple;
+            let size = [window[0] / zoom, window[1] / zoom];
+            frame(&context, &mut app, size);
+            if zoom != 1.0 {
+                // After the first frame: the shell applies its own saved
+                // scale on that frame, then the viewport is rescaled.
+                context.set_zoom_factor(zoom);
+            }
+            frame(&context, &mut app, size);
+            assert!(
+                (context.zoom_factor() - zoom).abs() < 1e-6,
+                "{label}: zoom {}",
+                context.zoom_factor()
+            );
+            let duck = scroll_until_visible(&context, &mut app, size, DUCK_TITLE);
+            let pp = scroll_until_visible(&context, &mut app, size, PPSSPP_TITLE);
+            eprintln!("REACHRESULT {label}: duck={duck:?} ppsspp={pp:?}");
+            if duck.is_none() || pp.is_none() {
+                failures.push(label);
+            }
+        }
+        assert!(failures.is_empty(), "unreachable cards in: {failures:?}");
+    }
+
+    /// The PPSSPP card is placed after the page's controls, so whatever it
+    /// shows must not change where the primary action is drawn.
+    #[test]
+    fn the_ppsspp_card_content_does_not_move_the_primary_action() {
+        let position = |state: PpssppResolutionState| {
+            let context = egui::Context::default();
+            let mut app = ready_app(&context);
+            readiness(&mut app).ppsspp_resolution = state;
+            frame(&context, &mut app, [1280.0, 820.0]);
+            let output = frame(&context, &mut app, [1280.0, 820.0]);
+            text_bounds(&output, "Check Emulators")
+        };
+        let ready = position(PpssppResolutionState::Ready {
+            generation: 9,
+            view: Box::new(nothing_found()),
+        });
+        let errored = position(PpssppResolutionState::Error(
+            "PPSSPP profile resolution stopped unexpectedly. ".repeat(6),
+        ));
+        assert!(!ready.is_empty());
+        assert_eq!(ready, errored);
+    }
 }
