@@ -4,8 +4,9 @@ use super::profile_resolution::ppsspp::{
     PpssppResolutionInputs, PpssppResolutionState, spawn_ppsspp_resolution,
 };
 use super::profile_resolution::{
-    DuckStationResolutionInputs, DuckStationResolutionState, DuckStationResolutionView,
-    ResolutionView, ResolverSubject, present_resolution, present_resolution_for,
+    DuckStationLaunchAuthority, DuckStationLaunchSelection, DuckStationResolutionInputs,
+    DuckStationResolutionState, DuckStationResolutionView, ResolutionView, ResolverSubject,
+    present_resolution, present_resolution_for, select_for_launch,
     show_profile_resolution, spawn_duckstation_resolution,
 };
 
@@ -296,8 +297,6 @@ impl ArchiveFsApp {
             "Emulators",
             "Check which emulators are installed and ready.",
         );
-        // The resolver's answer comes first so it is visible without scrolling.
-        self.show_duckstation_profile_resolution(ui, context);
         let setup_action = emulator_setup_page::show(
             ui,
             &mut self.emulator_readiness.emulator_setup_page,
@@ -335,8 +334,9 @@ impl ArchiveFsApp {
             self.invalidate_duckstation_resolution();
             self.invalidate_ppsspp_resolution();
         }
-        // Below the main controls on purpose: the preview must never push the
-        // page's primary actions further down.
+        // Below the main controls on purpose: neither resolver panel may push
+        // the page's primary actions further down.
+        self.show_duckstation_profile_resolution(ui, context);
         self.show_ppsspp_profile_resolution(ui, context);
         ui.add_space(theme::SECTION_GAP);
         // The managed-emulator download catalogue is always shown: a beginner
@@ -1296,10 +1296,18 @@ impl ArchiveFsApp {
             managed_appimage_explicit_executables(&managed_appimage_installs, "DuckStation");
         let managed_xemu_appimages: Vec<PathBuf> =
             managed_appimage_explicit_executables(&managed_appimage_installs, "xemu");
-        if let Ok(roots) =
-            archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots::from_environment()
-        {
-            let discovery = archivefs_core::patch_manager::discover_duckstation_profiles(&roots);
+        // Launch consumes the shared resolver's answer for DuckStation: only
+        // the pair it authorises is offered, and a refusal blocks DuckStation
+        // outright instead of falling back to a separate discovery.
+        let duckstation_selection: Option<DuckStationLaunchSelection> =
+            DuckStationResolutionInputs::from_environment(
+                &self.emulator_readiness.emulator_setup_overrides,
+                &managed_duckstation_appimages,
+            )
+            .ok()
+            .map(|inputs| select_for_launch(&inputs));
+        if let Some(selection) = &duckstation_selection {
+            let discovery = &selection.discovery;
             let request = archivefs_core::patch_manager::DuckStationGameRequest {
                 verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
                     archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
@@ -1326,6 +1334,20 @@ impl ArchiveFsApp {
                     ),
                 }
             }));
+            if matches!(
+                selection.authority,
+                DuckStationLaunchAuthority::Refused { .. }
+            ) {
+                // A visible, ineligible DuckStation entry: Launch is blocked
+                // by the resolver's decision, not "no emulator found".
+                standalone_profiles.push(archivefs_core::launch::StandaloneProfileInput {
+                    adapter_id: "duckstation",
+                    profile_id: "duckstation:shared-resolver-refused".to_string(),
+                    profile_path: None,
+                    eligible: false,
+                    firmware: archivefs_core::launch::FirmwareReadiness::NotRequired,
+                });
+            }
         }
         if let Ok(mut roots) =
             archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
@@ -1475,32 +1497,20 @@ impl ArchiveFsApp {
             let _ = (title_id, media_id);
         }
 
-        let duckstation_context =
-            archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots::from_environment()
-                .ok()
-                .map(|mut roots| {
-                    // Feed an already-validated EmuWiz-managed DuckStation
-                    // AppImage (if one exists) as a caller-confirmed explicit
-                    // executable; the launch context re-runs discovery at
-                    // preflight time, so its roots must carry it. Empty ->
-                    // no-op, behaviour unchanged.
-                    roots
-                        .explicit_executables
-                        .extend(managed_duckstation_appimages.iter().cloned());
-                    launch_readiness_page::DuckStationLaunchContext {
-                        discovery: archivefs_core::patch_manager::discover_duckstation_profiles(
-                            &roots,
-                        ),
-                        roots,
-                        firmware_evidence: Vec::new(),
-                        verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
-                            archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
-                                Some(serial.clone())
-                            }
-                            _ => None,
-                        }),
+        let duckstation_context = duckstation_selection.map(|selection| {
+            launch_readiness_page::DuckStationLaunchContext {
+                discovery: selection.discovery,
+                roots: selection.roots,
+                firmware_evidence: Vec::new(),
+                authority: selection.authority,
+                verified_ps1_serial: verified_facts.iter().find_map(|fact| match fact {
+                    archivefs_core::launch::VerifiedIdentityFact::Ps1Serial(serial) => {
+                        Some(serial.clone())
                     }
-                });
+                    _ => None,
+                }),
+            }
+        });
         let ppsspp_context =
             archivefs_core::patch_manager::PpssppProfileDiscoveryRoots::from_environment()
                 .ok()
@@ -2085,8 +2095,13 @@ impl ArchiveFsApp {
 
     /// Starts the read-only DuckStation resolution off the GUI thread.
     pub(crate) fn start_duckstation_resolution(&mut self, context: Option<egui::Context>) {
+        let managed = managed_appimage_explicit_executables(
+            &discover_managed_appimage_installations(),
+            "DuckStation",
+        );
         let inputs = DuckStationResolutionInputs::from_environment(
             &self.emulator_readiness.emulator_setup_overrides,
+            &managed,
         );
         self.start_duckstation_resolution_with(inputs, context);
     }
@@ -2152,12 +2167,12 @@ impl ArchiveFsApp {
         let mut recheck = false;
         widgets::card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.strong("DuckStation: shared resolver recommendation (preview)");
+                ui.strong("DuckStation: shared resolver selection");
                 recheck = ui.button("Re-check").clicked();
             });
             ui.label(
                 egui::RichText::new(
-                    "This is what EmuWiz's shared resolver recommends. Launch and Cheats & Mods are not connected to it yet, so it does not guarantee which installation they use. Changing saved preferences is not supported here yet.",
+                    "This is EmuWiz's shared resolver selection. Launch uses this result for DuckStation; Cheats & Mods is not connected to it yet. Changing saved preferences is not supported here yet.",
                 )
                 .small()
                 .color(theme::muted(ui)),

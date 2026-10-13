@@ -36,9 +36,16 @@ pub(crate) struct DuckStationResolutionInputs {
 }
 
 impl DuckStationResolutionInputs {
-    pub(crate) fn from_environment(overrides: &EmulatorPathOverrides) -> Result<Self, String> {
+    pub(crate) fn from_environment(
+        overrides: &EmulatorPathOverrides,
+        managed_executables: &[PathBuf],
+    ) -> Result<Self, String> {
         let mut roots =
             DuckStationProfileDiscoveryRoots::from_environment().map_err(|e| e.to_string())?;
+        // Validated EmuWiz-managed AppImages are caller-confirmed evidence.
+        roots
+            .explicit_executables
+            .extend(managed_executables.iter().cloned());
         // An old override is evidence for the resolver, never an order.
         if let Some(executable) = &overrides.duckstation_executable {
             roots.explicit_executables.push(executable.clone());
@@ -157,6 +164,182 @@ pub(crate) enum DuckStationResolutionState {
         view: Box<DuckStationResolutionView>,
     },
     Error(String),
+}
+
+// ---- Launch authority -----------------------------------------------------
+
+/// What the shared resolver authorises Launch to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DuckStationLaunchAuthority {
+    /// Exactly this executable + configuration profile (possibly after a
+    /// permitted PREFERRED fallback, which `notes` records).
+    Authorised {
+        executable: PathBuf,
+        profile_root: PathBuf,
+        layout: ProfileLayout,
+        mode: &'static str,
+        /// A PREFERRED choice was unavailable and the resolver authorised
+        /// this fallback instead.
+        fallback: bool,
+        /// Why the resolver selected this pair.
+        why: Vec<String>,
+        /// Every warning the resolver attached (including the bypassed
+        /// preference and an unreadable remembered choice).
+        notes: Vec<String>,
+    },
+    /// The resolver refused, found nothing usable, or cannot choose. Launch
+    /// must not fall back to any other discovery.
+    Refused { reason: String },
+}
+
+/// The legacy discovery profiles Launch may use, narrowed to the resolver's
+/// authoritative pair, plus the authority that produced them.
+#[derive(Debug, Clone)]
+pub(crate) struct DuckStationLaunchSelection {
+    pub(crate) roots: DuckStationProfileDiscoveryRoots,
+    pub(crate) discovery: archivefs_core::patch_manager::DuckStationProfileDiscovery,
+    pub(crate) authority: DuckStationLaunchAuthority,
+}
+
+pub(crate) fn launch_authority(view: &DuckStationResolutionView) -> DuckStationLaunchAuthority {
+    let presentation = present_resolution(view);
+    match &view.outcome {
+        ResolutionOutcome::Resolved(resolution) => DuckStationLaunchAuthority::Authorised {
+            executable: resolution.profile.executable.clone(),
+            profile_root: resolution.profile.profile_root.clone(),
+            layout: resolution.profile.layout,
+            mode: presentation.mode_label,
+            fallback: matches!(
+                resolution.profile.preference,
+                PreferenceState::PreferredBypassed(_)
+            ),
+            why: presentation.why,
+            notes: presentation.warnings,
+        },
+        _ => {
+            let mut reason = format!(
+                "{} ({} mode).",
+                presentation.headline, presentation.mode_label
+            );
+            for line in presentation.why.iter().chain(presentation.warnings.iter()) {
+                reason.push(' ');
+                reason.push_str(line);
+            }
+            DuckStationLaunchAuthority::Refused { reason }
+        }
+    }
+}
+
+/// Asks the shared resolver and narrows the legacy profiles to its answer.
+/// A resolver pair that the legacy launch binding cannot start exactly is a
+/// refusal - never a different profile.
+pub(crate) fn select_for_launch(
+    inputs: &DuckStationResolutionInputs,
+) -> DuckStationLaunchSelection {
+    let view = compute_duckstation_resolution(inputs);
+    let mut authority = launch_authority(&view);
+    let mut roots = inputs.roots.clone();
+    if let DuckStationLaunchAuthority::Authorised {
+        profile_root,
+        layout,
+        ..
+    } = &authority
+    {
+        // The resolver has already proven this exact pair. Make the legacy
+        // discovery materialise that profile (it may live outside the
+        // locations legacy discovery would search on its own) so that the
+        // launch binding and the preflight, which re-run discovery with these
+        // same roots, describe the same pair.
+        let list = if *layout == ProfileLayout::Portable {
+            &mut roots.portable_configuration_roots
+        } else {
+            &mut roots.explicit_configuration_roots
+        };
+        if !list.contains(profile_root) {
+            list.push(profile_root.clone());
+        }
+    }
+    if let DuckStationLaunchAuthority::Authorised { executable, .. } = &authority
+        && roots.explicit_executables.contains(executable)
+    {
+        // Legacy discovery attaches every explicit executable to the default
+        // profile and then calls the result ambiguous. The resolver has
+        // already chosen between them, so offer only its executable (the
+        // preflight re-runs discovery with these same roots) and do not let
+        // PATH add another.
+        roots.explicit_executables = vec![executable.clone()];
+        roots.path_override = Some(Vec::new());
+    }
+    let mut discovery = archivefs_core::patch_manager::discover_duckstation_profiles(&roots);
+    match &authority {
+        DuckStationLaunchAuthority::Authorised {
+            executable,
+            profile_root,
+            ..
+        } => {
+            discovery.profiles.retain(|profile| {
+                profile.configuration_path == *profile_root
+                    && archivefs_core::patch_manager::resolve_duckstation_native_launch_binding(
+                        profile, &roots,
+                    )
+                    .is_ok_and(|binding| binding.executable == *executable)
+            });
+            if discovery.profiles.is_empty() {
+                authority = DuckStationLaunchAuthority::Refused {
+                    reason: format!(
+                        "The shared resolver selected {} with settings in {}, but Launch cannot start exactly that pair, so nothing was substituted.",
+                        executable.display(),
+                        profile_root.display()
+                    ),
+                };
+            }
+        }
+        DuckStationLaunchAuthority::Refused { .. } => discovery.profiles.clear(),
+    }
+    DuckStationLaunchSelection {
+        roots,
+        discovery,
+        authority,
+    }
+}
+
+impl DuckStationLaunchAuthority {
+    /// What Launch must say out loud about the resolver's decision. Empty
+    /// when the selection is exactly what the user chose or what AUTO found.
+    pub(crate) fn launch_notices(&self) -> Vec<String> {
+        match self {
+            Self::Refused { reason } => vec![format!(
+                "DuckStation is blocked by the shared resolver: {reason} Launch will not use any other installation."
+            )],
+            Self::Authorised {
+                executable,
+                profile_root,
+                fallback,
+                why,
+                notes,
+                ..
+            } => {
+                let mut out = Vec::new();
+                if *fallback {
+                    out.push(format!(
+                        "Your preferred DuckStation is unavailable, so Launch is using the shared resolver's fallback: {} with settings in {}. {} Your saved preference was not changed.",
+                        executable.display(),
+                        profile_root.display(),
+                        why.join(" ")
+                    ));
+                }
+                out.extend(
+                    notes
+                        .iter()
+                        .filter(|note| {
+                            note.contains("preferred") || note.contains("could not be read")
+                        })
+                        .cloned(),
+                );
+                out
+            }
+        }
+    }
 }
 
 // ---- presentation -------------------------------------------------------
@@ -432,9 +615,20 @@ pub(crate) fn present_resolution_for(
                 ResolutionHealth::Healthy
             };
             presentation.headline = if bypassed {
-                format!("Recommending a fallback — your preferred {name} is unavailable")
+                match subject {
+                    // Launch consumes DuckStation's result; PPSSPP is a preview.
+                    ResolverSubject::DuckStation => {
+                        "Using a fallback — your preferred DuckStation is unavailable".to_string()
+                    }
+                    ResolverSubject::Ppsspp => {
+                        format!("Recommending a fallback — your preferred {name} is unavailable")
+                    }
+                }
             } else {
-                format!("Recommended {name} installation")
+                match subject {
+                    ResolverSubject::DuckStation => "Selected DuckStation installation".to_string(),
+                    ResolverSubject::Ppsspp => format!("Recommended {name} installation"),
+                }
             };
             if bypassed {
                 presentation.next_steps.push(

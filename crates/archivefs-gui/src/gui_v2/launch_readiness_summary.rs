@@ -117,6 +117,7 @@ pub(crate) fn project(
         } => project_plan(plan, *retroarch_scanned, *standalone_scans_complete),
     };
     summary.freshness = freshness;
+    attach_duckstation_resolver_notices(&mut summary, input);
     attach_findings(&mut summary, input);
     if freshness == ReadinessFreshness::Stale {
         summary.status = ReadinessPresentationState::Stale;
@@ -126,6 +127,40 @@ pub(crate) fn project(
         summary.primary_action = Some(ReadinessAction::RecheckReadiness);
     }
     summary
+}
+
+/// The shared DuckStation resolver's fallback or refusal, shown with the
+/// Launch readiness so it is never a silent substitution.
+fn attach_duckstation_resolver_notices(
+    summary: &mut GameReadinessSummary,
+    input: &LaunchReadinessInput,
+) {
+    let LaunchReadinessInput::Plan {
+        plan, duckstation, ..
+    } = input
+    else {
+        return;
+    };
+    let Some(context) = duckstation else {
+        return;
+    };
+    let has_duckstation = plan.candidates.iter().any(|candidate| {
+        matches!(
+            &candidate.target,
+            LaunchTarget::Standalone {
+                adapter_id: "duckstation",
+                ..
+            }
+        )
+    });
+    if !has_duckstation {
+        return;
+    }
+    for notice in context.notices() {
+        if !summary.warnings.contains(&notice) {
+            summary.warnings.push(notice);
+        }
+    }
 }
 
 /// Adds the full list of blockers to a not-ready summary and points the
@@ -1304,5 +1339,107 @@ mod tests {
                 .iter()
                 .any(|label| label.contains("Firmware state unknown"))
         );
+    }
+
+    fn duckstation_input(
+        authority: crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority,
+    ) -> LaunchReadinessInput {
+        use archivefs_core::patch_manager::{
+            DuckStationProfileDiscovery, DuckStationProfileDiscoveryRoots,
+        };
+        let mut input = plan(vec![candidate(
+            LaunchReadiness::Ready,
+            FirmwareReadiness::NotRequired,
+            vec![],
+            vec![],
+            CandidatePreference::SoleEligible,
+            Some("/game.iso"),
+        )]);
+        if let LaunchReadinessInput::Plan { duckstation, .. } = &mut input {
+            *duckstation = Some(crate::launch_readiness_page::DuckStationLaunchContext {
+                discovery: DuckStationProfileDiscovery {
+                    profiles: Vec::new(),
+                    complete: true,
+                },
+                roots: DuckStationProfileDiscoveryRoots {
+                    home: PathBuf::from("/h"),
+                    xdg_config_home: PathBuf::from("/h/.config"),
+                    xdg_data_home: PathBuf::from("/h/.local/share"),
+                    xdg_config_home_explicit: false,
+                    explicit_configuration_roots: Vec::new(),
+                    portable_configuration_roots: Vec::new(),
+                    explicit_executables: Vec::new(),
+                    known_version_outputs: Default::default(),
+                    appimage_directory: None,
+                    path_override: Some(Vec::new()),
+                },
+                firmware_evidence: Vec::new(),
+                verified_ps1_serial: None,
+                authority,
+            });
+        }
+        input
+    }
+
+    #[test]
+    fn a_preferred_fallback_is_visible_in_launch_readiness_and_play_stays_available() {
+        use crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority as A;
+        let summary = project(
+            &duckstation_input(A::Authorised {
+                executable: PathBuf::from("/apps/DuckStation.AppImage"),
+                profile_root: PathBuf::from("/apps"),
+                layout: archivefs_core::emulator_profile_resolver::ProfileLayout::Portable,
+                mode: "PREFERRED",
+                fallback: true,
+                why: vec!["It is the only installation with a usable configuration.".into()],
+                notes: Vec::new(),
+            }),
+            ReadinessFreshness::Current,
+        );
+        let text = summary.warnings.join("\n");
+        assert!(
+            text.contains("preferred DuckStation is unavailable"),
+            "{text}"
+        );
+        assert!(text.contains("/apps/DuckStation.AppImage"), "{text}");
+        assert!(
+            text.contains("only installation with a usable configuration"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_resolver_refusal_is_visible_in_launch_readiness() {
+        use crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority as A;
+        let summary = project(
+            &duckstation_input(A::Refused {
+                reason: "Your forced DuckStation choice is unavailable.".into(),
+            }),
+            ReadinessFreshness::Current,
+        );
+        let text = summary.warnings.join("\n");
+        assert!(text.contains("blocked by the shared resolver"), "{text}");
+        assert!(
+            text.contains("will not use any other installation"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_resolver_selection_adds_no_launch_warning() {
+        use crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority as A;
+        let summary = project(
+            &duckstation_input(A::Authorised {
+                executable: PathBuf::from("/apps/DuckStation.AppImage"),
+                profile_root: PathBuf::from("/apps"),
+                layout: archivefs_core::emulator_profile_resolver::ProfileLayout::Portable,
+                mode: "AUTO",
+                fallback: false,
+                why: Vec::new(),
+                notes: Vec::new(),
+            }),
+            ReadinessFreshness::Current,
+        );
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
     }
 }

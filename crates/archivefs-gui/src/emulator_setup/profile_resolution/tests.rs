@@ -327,3 +327,328 @@ fn an_unreadable_remembered_choice_is_reported_not_hidden() {
     );
     assert_eq!(view.health, ResolutionHealth::HealthyWithNotes);
 }
+
+// ---- Launch consumes the shared resolver --------------------------------
+
+mod launch {
+    use super::*;
+    use archivefs_core::patch_manager::resolve_duckstation_native_launch_binding;
+
+    impl Machine {
+        /// An executable using the per-user default profile, which legacy
+        /// Launch binding can start. `complete` records finished setup;
+        /// `history` adds play history.
+        fn default_install(
+            &self,
+            folder: &str,
+            complete: bool,
+            history: bool,
+        ) -> (PathBuf, PathBuf) {
+            let exe = self
+                .home
+                .join("Applications")
+                .join(folder)
+                .join("DuckStation.AppImage");
+            executable(&exe);
+            let root = self.home.join(".local/share/duckstation");
+            let main = if complete {
+                COMPLETE
+            } else {
+                "[Main]\nSomething = 1\n"
+            };
+            write(&root.join("settings.ini"), main);
+            if history {
+                write(
+                    &root.join("playtime.dat"),
+                    "SCUS-94601   341   1783636844\n",
+                );
+            }
+            (exe, root)
+        }
+
+        /// A portable install the resolver can pick but legacy Launch
+        /// binding cannot start when it is only an explicit executable.
+        /// A portable install that was never set up or used.
+        fn portable_weak(&self, folder: &str) -> (PathBuf, PathBuf) {
+            let root = self.home.join("Applications").join(folder);
+            let exe = root.join("DuckStation.AppImage");
+            executable(&exe);
+            write(&root.join("portable.txt"), "");
+            write(&root.join("settings.ini"), "[Main]\nSomething = 1\n");
+            (exe, root)
+        }
+
+        fn portable_explicit(&self, folder: &str) -> (PathBuf, PathBuf) {
+            self.portable(folder)
+        }
+    }
+
+    fn selection(machine: &Machine, explicit: &[&Path]) -> DuckStationLaunchSelection {
+        select_for_launch(&machine.inputs(explicit))
+    }
+
+    fn authorised(selection: &DuckStationLaunchSelection) -> (&Path, &Path) {
+        match &selection.authority {
+            DuckStationLaunchAuthority::Authorised {
+                executable,
+                profile_root,
+                ..
+            } => (executable, profile_root),
+            other => panic!("expected an authorised pair, got {other:?}"),
+        }
+    }
+
+    fn refused(selection: &DuckStationLaunchSelection) -> &str {
+        match &selection.authority {
+            DuckStationLaunchAuthority::Refused { reason } => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The binding Launch would build for the single offered profile.
+    fn launch_executable(selection: &DuckStationLaunchSelection) -> PathBuf {
+        assert_eq!(selection.discovery.profiles.len(), 1, "{selection:#?}");
+        resolve_duckstation_native_launch_binding(
+            &selection.discovery.profiles[0],
+            &selection.roots,
+        )
+        .expect("launch binding")
+        .executable
+    }
+
+    #[test]
+    fn auto_launches_exactly_the_resolvers_pair() {
+        let machine = Machine::new();
+        let (exe, root) = machine.default_install("DuckStation", true, true);
+        let selection = selection(&machine, &[&exe]);
+        assert_eq!(authorised(&selection), (exe.as_path(), root.as_path()));
+        assert_eq!(launch_executable(&selection), exe);
+    }
+
+    #[test]
+    fn auto_with_a_clear_winner_launches_the_winner_not_an_ambiguous_legacy_pick() {
+        let machine = Machine::new();
+        let (a_exe, a_root) = machine.default_install("Main", true, true);
+        let (b_exe, _) = machine.portable_weak("Spare");
+        // Legacy discovery alone sees two executables for the default root.
+        let legacy = archivefs_core::patch_manager::discover_duckstation_profiles(
+            &machine.inputs(&[&a_exe, &b_exe]).roots,
+        );
+        let blocked = resolve_duckstation_native_launch_binding(
+            &legacy.profiles[0],
+            &machine.inputs(&[&a_exe, &b_exe]).roots,
+        );
+        assert!(blocked.is_err(), "legacy alone is ambiguous: {blocked:?}");
+
+        let selection = selection(&machine, &[&a_exe, &b_exe]);
+        assert_eq!(authorised(&selection), (a_exe.as_path(), a_root.as_path()));
+        assert_eq!(launch_executable(&selection), a_exe);
+    }
+
+    #[test]
+    fn preferred_is_honoured_over_a_stronger_candidate() {
+        let machine = Machine::new();
+        let (a_exe, a_root) = machine.default_install("Weak", false, false);
+        let (b_exe, _) = machine.portable_explicit("Strong");
+        machine.remember(&EmulatorSelectionMode::Preferred(identity(&a_exe, &a_root)));
+        let selection = selection(&machine, &[&a_exe, &b_exe]);
+        assert_eq!(authorised(&selection), (a_exe.as_path(), a_root.as_path()));
+        assert_eq!(launch_executable(&selection), a_exe);
+    }
+
+    #[test]
+    fn forced_is_honoured_exactly() {
+        let machine = Machine::new();
+        let (a_exe, a_root) = machine.default_install("Weak", false, false);
+        let (b_exe, _) = machine.portable_explicit("Strong");
+        machine.remember(&EmulatorSelectionMode::Forced(identity(&a_exe, &a_root)));
+        let selection = selection(&machine, &[&a_exe, &b_exe]);
+        assert_eq!(authorised(&selection), (a_exe.as_path(), a_root.as_path()));
+        assert_eq!(launch_executable(&selection), a_exe);
+    }
+
+    #[test]
+    fn a_resolver_pair_legacy_launch_cannot_start_is_refused_not_substituted() {
+        // AUTO picks the stronger portable explicit executable; legacy
+        // Launch binding cannot start it. The weaker, launchable install must
+        // NOT be used instead.
+        let machine = Machine::new();
+        let (a_exe, _) = machine.default_install("Weak", false, false);
+        let (b_exe, b_root) = machine.portable_explicit("Strong");
+        let selection = selection(&machine, &[&a_exe, &b_exe]);
+        assert!(
+            refused(&selection).contains("cannot start exactly that pair"),
+            "{selection:#?}"
+        );
+        assert!(refused(&selection).contains(&b_root.display().to_string()));
+        assert!(selection.discovery.profiles.is_empty(), "{selection:#?}");
+    }
+
+    #[test]
+    fn an_unavailable_preferred_target_falls_back_deterministically_with_a_note() {
+        let machine = Machine::new();
+        let (exe, root) = machine.default_install("DuckStation", true, true);
+        let gone = machine.home.join("Applications/Gone");
+        machine.remember(&EmulatorSelectionMode::Preferred(identity(
+            &gone.join("DuckStation.AppImage"),
+            &gone,
+        )));
+        let first = selection(&machine, &[&exe]);
+        let second = selection(&machine, &[&exe]);
+        assert_eq!(authorised(&first), (exe.as_path(), root.as_path()));
+        assert_eq!(first.authority, second.authority);
+        match &first.authority {
+            DuckStationLaunchAuthority::Authorised { mode, notes, .. } => {
+                assert_eq!(*mode, "PREFERRED");
+                assert!(notes.iter().any(|n| n.contains("preferred")), "{notes:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unavailable_forced_target_blocks_launch_without_falling_back() {
+        let machine = Machine::new();
+        let (exe, _) = machine.default_install("DuckStation", true, true); // healthy
+        let gone = machine.home.join("Applications/Gone");
+        machine.remember(&EmulatorSelectionMode::Forced(identity(
+            &gone.join("DuckStation.AppImage"),
+            &gone,
+        )));
+        let selection = selection(&machine, &[&exe]);
+        assert!(refused(&selection).contains("FORCED"), "{selection:#?}");
+        assert!(
+            selection.discovery.profiles.is_empty(),
+            "a healthy legacy profile must not be offered: {selection:#?}"
+        );
+    }
+
+    #[test]
+    fn ambiguity_and_nothing_installed_refuse_with_the_resolvers_reason() {
+        let machine = Machine::new();
+        let (a_exe, _) = machine.portable("DuckStationA");
+        let (b_exe, _) = machine.portable("DuckStationB");
+        let ambiguous = selection(&machine, &[&a_exe, &b_exe]);
+        assert!(
+            refused(&ambiguous).contains("equally good"),
+            "{ambiguous:#?}"
+        );
+        assert!(ambiguous.discovery.profiles.is_empty());
+
+        let empty = Machine::new();
+        let none = selection(&empty, &[]);
+        assert!(
+            refused(&none).contains("No DuckStation installation"),
+            "{none:#?}"
+        );
+        assert!(none.discovery.profiles.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_remembered_choice_is_carried_into_the_launch_decision() {
+        let machine = Machine::new();
+        let (exe, _) = machine.default_install("DuckStation", true, true);
+        write(
+            &machine.selection,
+            "[[emulator_selection]]\nemulator = \"DuckStation\"\nmode = \"forced\"\n",
+        );
+        let selection = selection(&machine, &[&exe]);
+        match &selection.authority {
+            DuckStationLaunchAuthority::Authorised { mode, notes, .. } => {
+                assert_eq!(*mode, "AUTO");
+                assert!(notes.iter().any(|n| n.contains("could not be read")));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn selecting_for_launch_changes_nothing_on_disk() {
+        let machine = Machine::new();
+        let (a_exe, a_root) = machine.default_install("A", false, false);
+        let (b_exe, _) = machine.portable_explicit("B");
+        machine.remember(&EmulatorSelectionMode::Preferred(identity(&a_exe, &a_root)));
+        let before = tree(&machine.home);
+        let stored = fs::read(&machine.selection).unwrap();
+        let _ = selection(&machine, &[&a_exe, &b_exe]);
+        assert_eq!(tree(&machine.home), before);
+        assert_eq!(fs::read(&machine.selection).unwrap(), stored);
+    }
+
+    #[test]
+    fn a_preferred_fallback_produces_a_launch_visible_notice_naming_the_pair() {
+        let machine = Machine::new();
+        let (exe, root) = machine.default_install("DuckStation", true, true);
+        let gone = machine.home.join("Applications/Gone");
+        machine.remember(&EmulatorSelectionMode::Preferred(identity(
+            &gone.join("DuckStation.AppImage"),
+            &gone,
+        )));
+        let selection = selection(&machine, &[&exe]);
+        let notices = selection.authority.launch_notices();
+        let joined = notices.join("\n");
+        assert!(
+            joined.contains("preferred DuckStation is unavailable"),
+            "{joined}"
+        );
+        assert!(joined.contains(&exe.display().to_string()), "{joined}");
+        assert!(joined.contains(&root.display().to_string()), "{joined}");
+        assert!(
+            joined.contains("saved preference was not changed"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn normal_selections_need_no_fallback_notice() {
+        let machine = Machine::new();
+        let (exe, root) = machine.default_install("DuckStation", true, true);
+        assert!(
+            selection(&machine, &[&exe])
+                .authority
+                .launch_notices()
+                .is_empty()
+        );
+        machine.remember(&EmulatorSelectionMode::Preferred(identity(&exe, &root)));
+        assert!(
+            selection(&machine, &[&exe])
+                .authority
+                .launch_notices()
+                .is_empty()
+        );
+        machine.remember(&EmulatorSelectionMode::Forced(identity(&exe, &root)));
+        assert!(
+            selection(&machine, &[&exe])
+                .authority
+                .launch_notices()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refusals_state_that_no_other_installation_will_be_used() {
+        let machine = Machine::new();
+        let (exe, _) = machine.default_install("DuckStation", true, true);
+        let gone = machine.home.join("Applications/Gone");
+        machine.remember(&EmulatorSelectionMode::Forced(identity(
+            &gone.join("DuckStation.AppImage"),
+            &gone,
+        )));
+        let notices = selection(&machine, &[&exe]).authority.launch_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("will not use any other installation"),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn no_legacy_duckstation_discovery_remains_in_the_launch_input_builder() {
+        let source = include_str!("../controller.rs");
+        assert!(
+            !source.contains("discover_duckstation_profiles("),
+            "Launch must obtain DuckStation profiles only through select_for_launch"
+        );
+        assert!(source.contains("select_for_launch("));
+    }
+}

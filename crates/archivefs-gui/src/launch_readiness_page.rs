@@ -486,6 +486,15 @@ pub(crate) struct DuckStationLaunchContext {
     pub(crate) roots: archivefs_core::patch_manager::DuckStationProfileDiscoveryRoots,
     pub(crate) firmware_evidence: Vec<FirmwareIdentityRecord>,
     pub(crate) verified_ps1_serial: Option<String>,
+    /// The shared resolver's decision that `discovery` was narrowed to.
+    pub(crate) authority: crate::emulator_setup::profile_resolution::DuckStationLaunchAuthority,
+}
+
+impl DuckStationLaunchContext {
+    /// Fallback / refusal text Launch must show beside DuckStation.
+    pub(crate) fn notices(&self) -> Vec<String> {
+        self.authority.launch_notices()
+    }
 }
 pub(crate) struct PpssppLaunchContext {
     pub(crate) discovery: archivefs_core::patch_manager::PpssppProfileDiscovery,
@@ -1847,6 +1856,21 @@ fn show_plan(
     amiga_whdload_launch_state: &mut AmigaWHDLoadLaunchState,
 ) -> bool {
     let mut open_doctor = false;
+    if let Some(context) = duckstation
+        && plan.candidates.iter().any(|candidate| {
+            matches!(
+                &candidate.target,
+                LaunchTarget::Standalone {
+                    adapter_id: "duckstation",
+                    ..
+                }
+            )
+        })
+    {
+        for notice in context.notices() {
+            ui.colored_label(ui.visuals().warn_fg_color, notice);
+        }
+    }
     if plan.candidates.is_empty() {
         widgets::empty_state(
             ui,

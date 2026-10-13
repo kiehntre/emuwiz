@@ -9235,7 +9235,8 @@ mod duckstation_profile_resolution {
             generation: 7,
             view: Box::new(nothing_found()),
         };
-        let strings = text(&frame(&context, &mut app, [1280.0, 820.0]));
+        // Tall viewport: the panel sits below the candidate grid.
+        let strings = text(&frame(&context, &mut app, [1280.0, 6000.0]));
         // Existing Setup page is unchanged...
         assert!(strings.iter().any(|text| text == "Emulators"));
         assert!(
@@ -9247,7 +9248,7 @@ mod duckstation_profile_resolution {
         assert!(
             strings
                 .iter()
-                .any(|text| text.contains("shared resolver recommendation (preview)"))
+                .any(|text| text.contains("shared resolver selection"))
         );
         assert!(
             strings
