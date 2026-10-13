@@ -60,7 +60,7 @@ fn patch_bytes(format: &str, source: &[u8], offset: usize, value: u8) -> Vec<u8>
         "bps" => {
             let mut body = Vec::new();
             body.extend(var(((offset as u64 - 1) << 2) | 0));
-            body.extend(var((1_u64 - 1) << 2 | 1));
+            body.extend(var(1));
             body.push(value);
             body.extend(var((((source.len() - offset - 1) as u64 - 1) << 2) | 0));
             let mut patch = b"BPS1".to_vec();

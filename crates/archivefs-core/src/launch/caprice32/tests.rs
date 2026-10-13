@@ -612,7 +612,7 @@ fn a_missing_unreadable_or_replaced_scratch_config_refuses_before_spawn_and_neve
         match attack {
             "removed" => std::fs::remove_file(&scratch).unwrap(),
             "unreadable" => {
-                std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0)).unwrap()
+                std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o0)).unwrap()
             }
             "symlink to the live config" => {
                 std::fs::remove_file(&scratch).unwrap();

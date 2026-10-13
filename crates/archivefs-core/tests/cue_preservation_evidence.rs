@@ -361,7 +361,7 @@ fn unreadable_backing_file_is_indeterminate_with_a_path_diagnostic() {
     }
     let (dir, p) = fixture(SINGLE, &[1, 2, 3]);
     let bin = dir.path().join("disc.bin");
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o0)).unwrap();
     let c = compare(&p, &p);
     assert_eq!(c.outcome, CueComparisonOutcome::Indeterminate);
     assert!(

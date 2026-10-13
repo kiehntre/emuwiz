@@ -721,7 +721,7 @@ fn recovery_real_eacces_preserves_evidence() {
     let stage = world.only_journal().staged_path.unwrap();
     let receipt = fs::read(&path).unwrap();
     let permissions = fs::metadata(&stage).unwrap().permissions();
-    fs::set_permissions(&stage, fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(&stage, fs::Permissions::from_mode(0o0)).unwrap();
     assert_eq!(
         fs::File::open(&stage).unwrap_err().raw_os_error(),
         Some(libc::EACCES)
