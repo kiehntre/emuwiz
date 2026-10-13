@@ -1170,7 +1170,13 @@ pub(super) fn show_page_scroll<R>(
             content,
         );
     } else {
-        show_focus_reveal_scroll(ui, salt, [false, false], content);
+        show_focus_reveal_scroll_inner(
+            ui,
+            salt,
+            [false, false],
+            section == Section::Check,
+            content,
+        );
     }
 }
 
@@ -1184,19 +1190,61 @@ pub(super) fn show_focus_reveal_scroll<R>(
     shrink: [bool; 2],
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    egui::ScrollArea::vertical()
+    show_focus_reveal_scroll_inner(ui, salt, shrink, false, content);
+}
+
+fn show_focus_reveal_scroll_inner<R>(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash + Copy,
+    shrink: [bool; 2],
+    paging: bool,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    let id = ui.make_persistent_id(salt);
+    let mut scroll = egui::ScrollArea::vertical()
         .id_salt(salt)
         .auto_shrink(shrink)
-        // A revealed control must be in view in the pass that finds it.
-        .animated(false)
-        .show(ui, |ui| {
-            let layer = ui.layer_id();
-            let first = widgets_in_layer(ui.ctx(), layer);
-            let inner = content(ui);
-            let owned = widgets_created_since(ui.ctx(), layer, first);
-            reveal_new_keyboard_focus(ui, egui::Id::new(salt), &owned);
-            inner
+        .animated(false);
+    // Check's PageUp/Down and Home/End belong to the page, not a nested
+    // viewport. It has buttons, so existing button focus must not block paging.
+    if paging && ui.input(|i| !i.modifiers.alt && !i.modifiers.ctrl) {
+        let offset = egui::scroll_area::State::load(ui.ctx(), id)
+            .unwrap_or_default()
+            .offset
+            .y;
+        let height = ui.available_height();
+        let maximum = ui
+            .data(|d| d.get_temp::<f32>(id.with("content_height")))
+            .map(|content| (content - height).max(0.0))
+            .unwrap_or(0.0);
+        let target = ui.input(|i| {
+            if i.key_pressed(egui::Key::Home) {
+                Some(0.0)
+            } else if i.key_pressed(egui::Key::End) {
+                Some(maximum)
+            } else if i.key_pressed(egui::Key::PageDown) {
+                Some((offset + height * 0.9).min(maximum))
+            } else if i.key_pressed(egui::Key::PageUp) {
+                Some((offset - height * 0.9).max(0.0))
+            } else {
+                None
+            }
         });
+        if let Some(target) = target {
+            scroll = scroll.vertical_scroll_offset(target);
+        }
+    }
+    let output = scroll.show(ui, |ui| {
+        let layer = ui.layer_id();
+        let first = widgets_in_layer(ui.ctx(), layer);
+        let inner = content(ui);
+        let owned = widgets_created_since(ui.ctx(), layer, first);
+        reveal_new_keyboard_focus(ui, egui::Id::new(salt), &owned);
+        inner
+    });
+    if paging {
+        ui.data_mut(|d| d.insert_temp(id.with("content_height"), output.content_size.y));
+    }
 }
 
 /// Widgets registered so far in `layer` during this pass. egui only appends,

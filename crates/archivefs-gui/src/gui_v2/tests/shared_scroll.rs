@@ -1,0 +1,310 @@
+//! Real native-page frames: only clipped, on-screen text counts as reachable.
+use super::*;
+use crate::emulator_setup::profile_resolution::ppsspp::PpssppResolutionState;
+use crate::emulator_setup::profile_resolution::{DuckStationResolutionState, ResolutionView};
+use archivefs_core::emulator_profile_resolver::{EmulatorSelectionMode, ResolutionOutcome};
+
+const CASES: [([f32; 2], f32); 3] = [
+    ([1280., 820.], 1.),
+    ([1024., 600.], 1.),
+    ([1024., 600.], 1.6),
+];
+fn ready(context: &egui::Context, section: Section, simple: bool, scale: f32) -> App {
+    let mut app = super::tests::fixture(context);
+    app.simple.enabled = simple;
+    app.simple.set_ui_scale(scale);
+    app.router.current = Route::Section(section);
+    app.library = Arc::new(Library::new(
+        (0..12)
+            .map(|i| {
+                super::tests::archive(i, &format!("Game {i}"), Some(&format!("Platform {i:02}")))
+            })
+            .collect(),
+    ));
+    let mut native = native_workflows::NativeWorkflows::new(context.clone());
+    let empty = || ResolutionView {
+        mode: EmulatorSelectionMode::Auto,
+        selection_note: None,
+        outcome: ResolutionOutcome::NoInstallation {
+            assessments: vec![],
+        },
+    };
+    native
+        .app
+        .emulator_readiness
+        .duckstation_resolution_generation = 7;
+    native.app.emulator_readiness.duckstation_resolution = DuckStationResolutionState::Ready {
+        generation: 7,
+        view: Box::new(empty()),
+    };
+    native.app.emulator_readiness.ppsspp_resolution_generation = 9;
+    native.app.emulator_readiness.ppsspp_resolution = PpssppResolutionState::Ready {
+        generation: 9,
+        view: Box::new(empty()),
+    };
+    app.native_workflows = Some(native);
+    app
+}
+fn frame(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    context.run(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0], size[1]),
+            )),
+            events,
+            ..Default::default()
+        },
+        |ctx| app.show(ctx),
+    )
+}
+fn visible(
+    output: &egui::FullOutput,
+    size: [f32; 2],
+    needle: &str,
+) -> Option<(egui::Rect, egui::Rect)> {
+    fn visit(
+        shape: &egui::Shape,
+        clip: egui::Rect,
+        needle: &str,
+    ) -> Option<(egui::Rect, egui::Rect)> {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text() == needle => {
+                let rect = egui::Rect::from_min_size(t.pos, t.galley.size());
+                clip.contains_rect(rect).then_some((rect, clip))
+            }
+            egui::Shape::Vec(v) => v.iter().find_map(|s| visit(s, clip, needle)),
+            _ => None,
+        }
+    }
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+    output
+        .shapes
+        .iter()
+        .find_map(|s| visit(&s.shape, s.clip_rect.intersect(screen), needle))
+}
+fn settled(context: &egui::Context, app: &mut App, size: [f32; 2]) -> egui::FullOutput {
+    let mut output = frame(context, app, size, vec![]);
+    for _ in 0..4 {
+        output = frame(context, app, size, vec![]);
+    }
+    output
+}
+fn wheel(context: &egui::Context, app: &mut App, size: [f32; 2], delta: f32) -> egui::FullOutput {
+    frame(
+        context,
+        app,
+        size,
+        vec![
+            egui::Event::PointerMoved(egui::pos2(size[0] * 0.8, size[1] * 0.65)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0., delta),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            },
+        ],
+    );
+    settled(context, app, size)
+}
+fn targets(section: Section) -> Vec<&'static str> {
+    match section {
+        Section::Emulators => vec![
+            "DuckStation: shared resolver recommendation (preview)",
+            "Check Emulators",
+        ],
+        Section::Sources => vec!["Add source", "ROM hack identification (HackHash)"],
+        Section::Dat => vec!["Import DAT…", "No-Intro pack import"],
+        Section::Check => vec![
+            "Choose a platform",
+            "Check Platform 00",
+            "Check Platform 11",
+        ],
+        _ => unreachable!(),
+    }
+}
+#[test]
+fn native_pages_and_actions_are_reachable_with_bounded_wheel_scrolling() {
+    let mut failures = vec![];
+    for simple in [false, true] {
+        for (window, scale) in CASES {
+            for section in [
+                Section::Emulators,
+                Section::Sources,
+                Section::Dat,
+                Section::Check,
+            ] {
+                let context = egui::Context::default();
+                let mut app = ready(&context, section, simple, scale);
+                let size = [window[0] / scale, window[1] / scale];
+                let mut output = settled(&context, &mut app, size);
+                assert!((context.zoom_factor() - scale).abs() < 0.001);
+                let mut wanted = targets(section);
+                for step in 0..=40 {
+                    wanted.retain(|needle| {
+                        if let Some((_, clip)) = visible(&output, size, needle) {
+                            eprintln!(
+                                "SCROLL {section:?} {window:?} {scale} simple={simple}: {needle} step={step} viewport_height={}",
+                                clip.height()
+                            );
+                            assert!(clip.height() >= 160., "body viewport too small: {clip:?}");
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    if wanted.is_empty() {
+                        break;
+                    }
+                    output = wheel(&context, &mut app, size, -120.);
+                }
+                if !wanted.is_empty() {
+                    failures.push(format!(
+                        "{section:?} {window:?} {scale} simple={simple}: {wanted:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "unreachable: {failures:#?}");
+}
+
+fn key(
+    context: &egui::Context,
+    app: &mut App,
+    size: [f32; 2],
+    key: egui::Key,
+    reverse: bool,
+) -> egui::FullOutput {
+    let modifiers = egui::Modifiers {
+        shift: reverse,
+        ..Default::default()
+    };
+    frame(
+        context,
+        app,
+        size,
+        [true, false]
+            .into_iter()
+            .map(|pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            })
+            .collect(),
+    );
+    settled(context, app, size)
+}
+#[test]
+fn native_primary_actions_receive_visible_tab_and_reverse_tab_focus() {
+    for simple in [false, true] {
+        for (window, scale) in CASES {
+            for section in [
+                Section::Emulators,
+                Section::Sources,
+                Section::Dat,
+                Section::Check,
+            ] {
+                for reverse in [false, true] {
+                    let context = egui::Context::default();
+                    let mut app = ready(&context, section, simple, scale);
+                    let size = [window[0] / scale, window[1] / scale];
+                    settled(&context, &mut app, size);
+                    let target = match section {
+                        Section::Emulators => "Check Emulators",
+                        Section::Sources => "Add source",
+                        Section::Dat => "Import DAT…",
+                        Section::Check => "Check Platform 11",
+                        _ => unreachable!(),
+                    };
+                    let mut reached = false;
+                    for step in 0..180 {
+                        let output = key(&context, &mut app, size, egui::Key::Tab, reverse);
+                        let Some(response) = context
+                            .memory(|m| m.focused())
+                            .and_then(|id| context.read_response(id))
+                        else {
+                            continue;
+                        };
+                        if let Some((label, clip)) = visible(&output, size, target) {
+                            if response.rect.contains_rect(label) {
+                                assert!(
+                                    clip.expand(1.).contains_rect(response.rect),
+                                    "focused button clipped: {section:?} {window:?} {scale} simple={simple} reverse={reverse}: {:?} {clip:?}",
+                                    response.rect
+                                );
+                                eprintln!(
+                                    "KEYBOARD {section:?} {window:?} {scale} simple={simple} reverse={reverse}: {target} tabs={}",
+                                    step + 1
+                                );
+                                reached = true;
+                                break;
+                            }
+                        }
+                    }
+                    assert!(
+                        reached,
+                        "keyboard target unreachable: {section:?} {window:?} {scale} simple={simple} reverse={reverse}: {target}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// Placement after the candidate grid belongs to the Launch integration lane.
+// Keep the distance visible in evidence while proving the single viewport can
+// reach the card with ordinary wheel input at every supported test size.
+#[test]
+fn ppsspp_card_remains_reachable_with_deferred_placement() {
+    for simple in [false, true] {
+        for (window, scale) in CASES {
+            let context = egui::Context::default();
+            let mut app = ready(&context, Section::Emulators, simple, scale);
+            let size = [window[0] / scale, window[1] / scale];
+            let mut output = settled(&context, &mut app, size);
+            let mut reached = false;
+            for step in 0..=240 {
+                if visible(
+                    &output,
+                    size,
+                    "PPSSPP: shared resolver recommendation (preview)",
+                )
+                .is_some()
+                {
+                    eprintln!("PPSSPP {window:?} {scale} simple={simple}: wheel_steps={step}");
+                    reached = true;
+                    break;
+                }
+                output = wheel(&context, &mut app, size, -120.);
+            }
+            assert!(
+                reached,
+                "PPSSPP unreachable: {window:?} {scale} simple={simple}"
+            );
+        }
+    }
+}
+
+#[test]
+fn check_home_and_end_reveal_actual_viewport_content() {
+    for simple in [false, true] {
+        for (window, scale) in CASES {
+            let context = egui::Context::default();
+            let mut app = ready(&context, Section::Check, simple, scale);
+            let size = [window[0] / scale, window[1] / scale];
+            settled(&context, &mut app, size);
+            let end = key(&context, &mut app, size, egui::Key::End, false);
+            assert!(visible(&end, size, "Check Platform 11").is_some());
+            let home = key(&context, &mut app, size, egui::Key::Home, false);
+            assert!(visible(&home, size, "Check Platform 11").is_none());
+        }
+    }
+}

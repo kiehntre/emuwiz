@@ -16,7 +16,7 @@ use archivefs_core::persistent_state_inventory::{
 };
 use std::{fs, path::Path, sync::atomic::Ordering};
 
-fn archive(id: i64, title: &str, platform: Option<&str>) -> PersistedArchive {
+pub(super) fn archive(id: i64, title: &str, platform: Option<&str>) -> PersistedArchive {
     PersistedArchive {
         id,
         source_folder_id: 1,
@@ -36,7 +36,7 @@ fn archive(id: i64, title: &str, platform: Option<&str>) -> PersistedArchive {
     }
 }
 
-fn fixture(context: &egui::Context) -> App {
+pub(super) fn fixture(context: &egui::Context) -> App {
     readable_style(context);
     App {
         router: Router::default(),

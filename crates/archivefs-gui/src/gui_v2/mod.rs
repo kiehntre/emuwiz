@@ -40,6 +40,9 @@ mod routes;
 mod saturn_manifest;
 mod saves_states;
 mod setup_portability;
+#[cfg(test)]
+#[path = "tests/shared_scroll.rs"]
+mod shared_scroll_tests;
 mod simple_shell;
 mod sources_providers;
 mod storage_review;

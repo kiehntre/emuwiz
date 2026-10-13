@@ -534,34 +534,16 @@ impl App {
                 });
         }
         egui::CentralPanel::default().show(context, |ui| {
-            if self.simple.simple_navigation() {
-                self.simple_breadcrumbs(ui);
-            }
-            self.page_header(ui);
-            if let Some(notice) = &self.notice {
-                let mut dismiss = false;
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.strong("Needs attention");
-                    ui.label(&notice.message);
-                    ui.collapsing("Technical details", |ui| {
-                        ui.label(&notice.technical);
-                    });
-                    dismiss = ui.button("Dismiss message").clicked();
-                });
-                if dismiss {
-                    self.notice = None;
-                }
-            }
-            if let Some(status) = self.handoff_status.clone() {
-                let mut dismiss = false;
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.strong("Separate window");
-                    ui.label(status);
-                    dismiss = ui.button("Dismiss").clicked();
-                });
-                if dismiss {
-                    self.handoff_status = None;
-                }
+            let scrolling_intro = matches!(
+                self.router.current,
+                Route::Section(
+                    Section::Emulators | Section::Sources | Section::Dat | Section::Check
+                )
+            );
+            // These native pages own one page scroller. Their introduction must
+            // share it: at large text sizes pinning it can consume the viewport.
+            if !scrolling_intro {
+                self.page_intro(ui);
             }
             let route = self.router.current.clone();
             let guidance = self.guidance_context(&route);
@@ -571,8 +553,9 @@ impl App {
             // When the viewport is short (a large scale on a small window)
             // the strip would leave the page almost no body, so it scrolls
             // with the page instead of pinning above it.
-            let compact = ui.available_height() < COMPACT_BODY_HEIGHT
-                && !matches!(route, Route::BrowsePlay | Route::BrowsePlayGame(_));
+            let compact = scrolling_intro
+                || (ui.available_height() < COMPACT_BODY_HEIGHT
+                    && !matches!(route, Route::BrowsePlay | Route::BrowsePlayGame(_)));
             let mut pinned_guidance = None;
             if self.beginner_hints_enabled
                 && let Some(guidance) = guidance
@@ -617,6 +600,9 @@ impl App {
                 self.simple.simple_navigation()
                     && route == Route::Section(Section::OrganisationFamily),
                 |ui| {
+                    if scrolling_intro {
+                        self.page_intro(ui);
+                    }
                     // Settings leads with its size controls, so there the
                     // strip follows the page rather than preceding it.
                     let guidance_last = route == Route::Section(Section::Settings);
@@ -1116,6 +1102,38 @@ impl App {
             self.preferences_dirty = Some(std::time::Instant::now());
         }
         ui.separator();
+    }
+
+    fn page_intro(&mut self, ui: &mut egui::Ui) {
+        if self.simple.simple_navigation() {
+            self.simple_breadcrumbs(ui);
+        }
+        self.page_header(ui);
+        if let Some(notice) = &self.notice {
+            let mut dismiss = false;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Needs attention");
+                ui.label(&notice.message);
+                ui.collapsing("Technical details", |ui| {
+                    ui.label(&notice.technical);
+                });
+                dismiss = ui.button("Dismiss message").clicked();
+            });
+            if dismiss {
+                self.notice = None;
+            }
+        }
+        if let Some(status) = self.handoff_status.clone() {
+            let mut dismiss = false;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.strong("Separate window");
+                ui.label(status);
+                dismiss = ui.button("Dismiss").clicked();
+            });
+            if dismiss {
+                self.handoff_status = None;
+            }
+        }
     }
 
     fn page_header(&mut self, ui: &mut egui::Ui) {
@@ -1745,13 +1763,6 @@ impl App {
     }
 
     fn check_games(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
-        let platform = self.check_platform.clone();
-        check_scroll(ui, platform.as_deref(), |ui| {
-            self.check_games_content(ui, game_id)
-        });
-    }
-
-    fn check_games_content(&mut self, ui: &mut egui::Ui, game_id: Option<i64>) {
         if let Some(game_id) = game_id
             && let Some((title, platform_name)) = self
                 .library
@@ -2955,9 +2966,8 @@ impl App {
         let workflows = self
             .native_workflows
             .get_or_insert_with(|| super::native_workflows::NativeWorkflows::new(ui.ctx().clone()));
-        egui::ScrollArea::vertical()
-            .id_salt("v2_native_emulator_setup")
-            .show(ui, |ui| workflows.show_setup(ui, environment.as_ref()));
+        // The shared page owns wheel input and keyboard focus reveal.
+        workflows.show_setup(ui, environment.as_ref());
     }
 
     fn firmware(&mut self, ui: &mut egui::Ui) {
