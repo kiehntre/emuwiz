@@ -178,6 +178,9 @@ test-support = []
 # Integration tests link the library without `cfg(test)`; this self-dependency
 # turns on the test-support feature for them (and only for test builds).
 archivefs-core = { path = ".", features = ["test-support"] }
+# Test builds only: expose chd's codec API so tests/chd_zstd_ruzstd_bounds.rs can
+# exercise the vendored chd Zstandard codecs directly. Adds no new package.
+chd = { version = "0.3.4", features = ["codec_api"] }
 # Same crate, fuller feature set: only test fixtures need to *write* 7z
 # files (solid, encrypted, multi-member) to exercise the read-only reader
 # against real archives. Cargo unifies features for one crate across
