@@ -349,6 +349,8 @@ pub fn inspect_exact_resume(
 pub fn resume_exact_transaction(
     execution: &mut ExactResumeExecution<'_>,
 ) -> Result<ExactResumeOutcome, ExactResumeError> {
+    super::journal::verify_applied_containment(execution.transaction)
+        .map_err(|e| ExactResumeError::Journal(e.to_string()))?;
     let envelope = match read_envelope(execution.transaction) {
         Ok(Some(envelope)) => envelope,
         Ok(None) => {

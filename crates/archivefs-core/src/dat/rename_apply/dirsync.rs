@@ -17,21 +17,17 @@
 //!     `O_NOFOLLOW` walk; otherwise the parents must be their own real paths. A redirected,
 //!     moved or symlink-substituted ancestor cannot bind, so the entry stays unresolved and
 //!     is never promoted to Applied on file identity alone.
-//!   * CONCURRENT EXTERNAL WRITERS (documented limitation, not a guarantee): containment is
-//!     proved at the moment of the final verification. A process with write access to the
-//!     collection that relocates an ancestor AFTER that check but BEFORE the journal is
-//!     published can leave a durable `Applied` record for an object that is no longer
-//!     where it was verified. This is indistinguishable from the same relocation after a
-//!     normal completion. `Applied` records what happened and was verified; it does not
-//!     promise the path stays contained. Later operations (undo, restore, cleanup
-//!     classification) re-check identity and containment themselves and do not trust the
-//!     journalled state alone.
-//!   * TRUSTED-ROOT ASSUMPTION: the trusted root path itself is opened by following links,
-//!     so a root that is (or is later replaced by) a symlink is accepted as the anchor and
-//!     is not re-proved. Everything BELOW the root is walked without following symlinks.
-//!     Callers must supply roots they control.
-//!   * Any parent replaced after binding is detected after the fact (`verify_bound`): the
-//!     entry stays in flight; completion is never recorded.
+//!   * CONCURRENT EXTERNAL WRITERS: verification observes a point in time, not
+//!     exclusion. Recovery retains bindings through publication and makes one
+//!     unresolved correction attempt on a detected late swap. A later swap or
+//!     failed correction can still leave historical Applied bytes on disk.
+//!     Reload and execution reject demonstrably redirected Applied paths; those
+//!     records are not proof of a current location. Enforced writer exclusion
+//!     is required for an atomic containment/publication guarantee.
+//!   * Roots must be their own real paths, opened O_NOFOLLOW and identity-bound
+//!     through verification. A journal cannot prove an old symlink-root identity.
+//!     Configured symlink aliases can still supply a previously resolved real
+//!     root, but journal aliases without such independent proof are refused.
 //!   * Creating destination directories (`create_dir` in plan apply and quarantine) and
 //!     removing created directories during rollback (`remove_dir`) do not fsync their
 //!     parent directory, so those directory-entry changes are not proven durable.
@@ -47,6 +43,15 @@ use std::path::Path;
 
 #[cfg(test)]
 pub(crate) use hook::{DirSyncEvent, set_open_hook, set_test_hook};
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct RootBinding {
+    path: std::path::PathBuf,
+    identity: (u64, u64),
+    // Retain the inode itself, not only an inode number that might be reused.
+    _handle: std::sync::Arc<std::fs::File>,
+}
 
 /// The two parent directories of a rename, opened and identity-checked BEFORE
 /// the rename and retained until completion is recorded.
@@ -78,8 +83,8 @@ pub(crate) struct RenameDirs {
     destination_id: (u64, u64),
     /// The trusted root each parent was resolved from (None: anchor-less bind, which
     /// requires the path to be its own real path).  Used to RE-PROVE containment.
-    source_root: Option<std::path::PathBuf>,
-    destination_root: Option<std::path::PathBuf>,
+    source_root: Option<RootBinding>,
+    destination_root: Option<RootBinding>,
 }
 
 #[cfg(unix)]
@@ -141,6 +146,8 @@ impl RenameDirs {
         if let Some(anchor) = anchor.filter(|a| a.is_absolute() && !a.as_os_str().is_empty()) {
             let below = |p: &Path| p.parent().is_some_and(|parent| parent.starts_with(anchor));
             if below(source) && below(destination) {
+                // A journal path is not proof of an originally configured symlink.
+                require_own_real_path(anchor)?;
                 let roots = crate::safe_read::TrustedRoots::from_paths([anchor]);
                 return Self::open_in(source, destination, &roots);
             }
@@ -313,7 +320,13 @@ impl RenameDirs {
             // subtree can be moved elsewhere and reached through a substituted ancestor
             // with its identities unchanged.
             let contained = match root {
-                Some(root) => plain_below_root(root, path),
+                Some(binding) => require_own_real_path(&binding.path).and_then(|()| {
+                    let root = &binding.path;
+                    if path_identity(root)? != binding.identity {
+                        return Err(io::Error::other("trusted root identity changed"));
+                    }
+                    plain_below_root(root, path)
+                }),
                 None => require_own_real_path(path),
             };
             if let Err(error) = contained {
@@ -386,7 +399,7 @@ fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
 fn open_under_root(
     parent: &Path,
     trusted: &crate::safe_read::TrustedRoots,
-) -> io::Result<(std::fs::File, (u64, u64), std::path::PathBuf)> {
+) -> io::Result<(std::fs::File, (u64, u64), RootBinding)> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -404,11 +417,18 @@ fn open_under_root(
                 format!("{} is outside every trusted root", parent.display()),
             )
         })?;
+    require_own_real_path(root)?;
+    let root_id = path_identity(root)?;
     let relative = parent.strip_prefix(root).map_err(io::Error::other)?;
     let mut current = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(root)?;
+    let opened_root = current.metadata()?;
+    if (opened_root.dev(), opened_root.ino()) != root_id {
+        return Err(io::Error::other("trusted root changed during open"));
+    }
+    let root_handle = std::sync::Arc::new(current.try_clone()?);
     let mut walked = root.to_path_buf();
     for component in relative.components() {
         let Component::Normal(name) = component else {
@@ -457,7 +477,19 @@ fn open_under_root(
             parent.display()
         )));
     }
-    Ok((current, id, root.to_path_buf()))
+    require_own_real_path(root)?;
+    if path_identity(root)? != root_id {
+        return Err(io::Error::other("trusted root changed during traversal"));
+    }
+    Ok((
+        current,
+        id,
+        RootBinding {
+            path: root.to_path_buf(),
+            identity: root_id,
+            _handle: root_handle,
+        },
+    ))
 }
 
 /// Every component of `parent` below `root` is (still) a real directory, never a

@@ -85,8 +85,11 @@ pub fn reconcile_recovery(
     transaction: &mut RenameTransaction,
     journal_dir: &Path,
 ) -> Result<Vec<RecoveryIssue>, String> {
+    super::journal::verify_applied_containment(transaction).map_err(|e| e.to_string())?;
     let mut issues = Vec::new();
     let mut changed = false;
+    let original_state = transaction.state;
+    let mut published_bindings = Vec::new();
 
     for index in 0..transaction.entries.len() {
         let state = transaction.entries[index].state;
@@ -192,6 +195,14 @@ pub fn reconcile_recovery(
                 // Unsafe or unknown: leave unresolved for manual review.
             }
         }
+        if matches!(
+            issue.kind,
+            RecoveryIssueKind::RenameConfirmed | RecoveryIssueKind::RenameDidNotHappen
+        ) {
+            if let Some(dirs) = bound {
+                published_bindings.push((index, state, dirs));
+            }
+        }
         issues.push(issue);
     }
 
@@ -199,6 +210,39 @@ pub fn reconcile_recovery(
 
     if changed {
         write_journal(journal_dir, transaction).map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        AFTER_PUBLICATION.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let mut invalid = false;
+        for (index, state, dirs) in published_bindings {
+            if let Err(error) = dirs.verify_bound() {
+                invalid = true;
+                transaction.entries[index].state = state;
+                transaction.entries[index].failure_reason = Some(format!(
+                    "containment lost during recovery publication: {error}"
+                ));
+                if let Some(issue) = issues.iter_mut().find(|i| i.entry_index == index) {
+                    issue.kind = RecoveryIssueKind::DirectorySyncFailed;
+                    issue.detail = transaction.entries[index].failure_reason.clone().unwrap();
+                }
+            }
+        }
+        if invalid {
+            transaction.state = if original_state == TransactionState::RollingBack {
+                original_state
+            } else {
+                TransactionState::Applying
+            };
+            // One correction attempt, never a claim of atomic exclusion. If it
+            // fails, return an error with unresolved in-memory state. Reload
+            // checks redirected Applied paths independently of this write.
+            write_journal(journal_dir, transaction).map_err(|error| format!(
+                "recovery containment lost; unresolved correction could not be persisted; journal may still record historical completion: {error}"
+            ))?;
+        }
     }
     Ok(issues)
 }
@@ -499,6 +543,11 @@ fn classify_entry(entry: &TransactionEntry, index: usize) -> RecoveryIssue {
                 .to_string(),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_PUBLICATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -843,5 +892,175 @@ mod tests {
              rollback executor itself owns, and the new Applying-only reconciliation step must \
              never touch a RollingBack transaction"
         );
+    }
+    #[cfg(unix)]
+    fn residual_fixture() -> (tempfile::TempDir, RenameTransaction, std::path::PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("roms");
+        let parent = root.join("sub");
+        let journal = d.path().join("journal");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::create_dir(&journal).unwrap();
+        let source = root.join("a");
+        let destination = parent.join("b");
+        std::fs::write(&source, b"original bytes").unwrap();
+        let mut tx = transaction_with(entry(&source, &destination, EntryState::Applying));
+        tx.source_scan_root = root.to_string_lossy().into_owned();
+        std::fs::rename(&source, &destination).unwrap();
+        write_journal(&journal, &tx).unwrap();
+        (d, tx, journal)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn residual_root_symlink_cannot_establish_recovery_anchor() {
+        let (d, mut tx, journal) = residual_fixture();
+        let root = d.path().join("roms");
+        let moved = d.path().join("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &root).unwrap();
+        let issues = reconcile_recovery(&mut tx, &journal).unwrap();
+        assert_eq!(issues[0].kind, RecoveryIssueKind::DirectorySyncFailed);
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert_eq!(
+            std::fs::read(moved.join("sub/b")).unwrap(),
+            b"original bytes"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn residual_late_swap_corrected_and_reload_remains_unresolved() {
+        residual_late_swap(false);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn residual_failed_correction_rejects_stale_applied_on_reload_and_undo() {
+        residual_late_swap(true);
+    }
+
+    #[cfg(unix)]
+    fn residual_late_swap(fail_correction: bool) {
+        let (d, mut tx, journal) = residual_fixture();
+        let parent = d.path().join("roms/sub");
+        let moved = d.path().join("moved");
+        let old_journal = d.path().join("preserved-journal");
+        let hook_journal = journal.clone();
+        let hook_old = old_journal.clone();
+        let hook_moved = moved.clone();
+        AFTER_PUBLICATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&parent, &hook_moved).unwrap();
+                std::os::unix::fs::symlink(&hook_moved, &parent).unwrap();
+                if fail_correction {
+                    std::fs::rename(&hook_journal, &hook_old).unwrap();
+                    std::fs::write(&hook_journal, b"blocked correction").unwrap();
+                }
+            }))
+        });
+        let result = reconcile_recovery(&mut tx, &journal);
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert_eq!(tx.state, TransactionState::Applying);
+        assert_eq!(std::fs::read(moved.join("b")).unwrap(), b"original bytes");
+        let saved = if fail_correction {
+            &old_journal
+        } else {
+            &journal
+        };
+        let path = super::super::journal::journal_path(saved, &tx.transaction_id).unwrap();
+        let raw: RenameTransaction =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        if fail_correction {
+            assert!(result.unwrap_err().contains("could not be persisted"));
+            assert_eq!(raw.entries[0].state, EntryState::Applied);
+            assert!(super::super::journal::read_journal(&path).is_err());
+            assert_eq!(
+                super::super::history::classify_recovery_cleanup(&raw),
+                super::super::history::RecoveryCleanupClassification::Uncertain
+            );
+            let mut raw = raw;
+            let before = std::fs::read(&path).unwrap();
+            assert!(
+                super::super::rollback::rollback_transaction(
+                    &mut raw,
+                    saved,
+                    &std::sync::atomic::AtomicBool::new(false)
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        } else {
+            assert_eq!(
+                result.unwrap()[0].kind,
+                RecoveryIssueKind::DirectorySyncFailed
+            );
+            assert_eq!(raw.entries[0].state, EntryState::Applying);
+            let mut reloaded = super::super::journal::read_journal(&path).unwrap();
+            assert_eq!(
+                reconcile_recovery(&mut reloaded, saved).unwrap()[0].kind,
+                RecoveryIssueKind::DirectorySyncFailed
+            );
+            assert_eq!(reloaded.entries[0].state, EntryState::Applying);
+        }
+        assert_eq!(std::fs::read(moved.join("b")).unwrap(), b"original bytes");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn residual_normal_recovery_and_reload_still_work() {
+        let (_d, mut tx, journal) = residual_fixture();
+        assert_eq!(
+            reconcile_recovery(&mut tx, &journal).unwrap()[0].kind,
+            RecoveryIssueKind::RenameConfirmed
+        );
+        assert_eq!(tx.state, TransactionState::Applied);
+        let path = super::super::journal::journal_path(&journal, &tx.transaction_id).unwrap();
+        assert_eq!(super::super::journal::read_journal(&path).unwrap(), tx);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn residual_root_swap_during_nested_open_is_refused() {
+        let (d, mut tx, journal) = residual_fixture();
+        tx.entries[0].source_path = d.path().join("roms/sub/a");
+        let root = d.path().join("roms");
+        let moved = d.path().join("moved");
+        let destination = moved.join("sub/b");
+        let mut fired = false;
+        super::super::dirsync::set_open_hook(Some(Box::new(move |_| {
+            if !fired {
+                fired = true;
+                std::fs::rename(&root, &moved).unwrap();
+                std::os::unix::fs::symlink(&moved, &root).unwrap();
+            }
+        })));
+        let result = reconcile_recovery(&mut tx, &journal);
+        super::super::dirsync::set_open_hook(None);
+        assert_eq!(
+            result.unwrap()[0].kind,
+            RecoveryIssueKind::DirectorySyncFailed
+        );
+        assert_eq!(tx.entries[0].state, EntryState::Applying);
+        assert_eq!(std::fs::read(destination).unwrap(), b"original bytes");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn residual_preconfigured_symlink_uses_original_resolved_root() {
+        let (d, tx, _journal) = residual_fixture();
+        let alias = d.path().join("configured-alias");
+        let root = d.path().join("roms");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let trusted = crate::safe_read::TrustedRoots::from_paths([&alias]);
+        let dirs = super::super::dirsync::RenameDirs::open_in(
+            &tx.entries[0].source_path,
+            &tx.entries[0].destination_path,
+            &trusted,
+        )
+        .unwrap();
+        // Retained resolved-root identity is independent of a later alias change.
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(d.path(), &alias).unwrap();
+        dirs.verify_bound().unwrap();
     }
 }

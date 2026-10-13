@@ -77,6 +77,9 @@ impl RecoveryCleanupClassification {
 /// identity checks. Any envelope is retained as actionable because this
 /// function cannot prove current plan generation/digest compatibility.
 pub fn classify_recovery_cleanup(transaction: &RenameTransaction) -> RecoveryCleanupClassification {
+    if super::journal::verify_applied_containment(transaction).is_err() {
+        return RecoveryCleanupClassification::Uncertain;
+    }
     let has_applied = transaction
         .entries
         .iter()

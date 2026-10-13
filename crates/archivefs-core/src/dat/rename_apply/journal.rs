@@ -92,12 +92,45 @@ pub fn write_journal(dir: &Path, transaction: &RenameTransaction) -> Result<(), 
 pub fn read_journal(path: &Path) -> Result<RenameTransaction, ArchiveFsError> {
     let text = std::fs::read_to_string(path)
         .map_err(|source| ArchiveFsError::io(path.to_path_buf(), source))?;
-    serde_json::from_str(&text).map_err(|error| {
+    let transaction: RenameTransaction = serde_json::from_str(&text).map_err(|error| {
         ArchiveFsError::Config(format!(
             "failed to parse rename transaction journal {}: {error}",
             path.display()
         ))
-    })
+    })?;
+    verify_applied_containment(&transaction)?;
+    Ok(transaction)
+}
+
+pub(super) fn verify_applied_containment(
+    transaction: &RenameTransaction,
+) -> Result<(), ArchiveFsError> {
+    // Applied is historical evidence, never proof of current containment.
+    // Reject demonstrably redirected paths on reload; absence is handled by
+    // existing identity/recovery checks rather than inventing a new location.
+    for entry in &transaction.entries {
+        if entry.state == super::model::EntryState::Applied
+            && entry.operation == super::model::TransactionOperation::RenameMove
+        {
+            for path in [
+                Some(Path::new(&transaction.source_scan_root)),
+                entry.source_path.parent(),
+                entry.destination_path.parent(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if path.is_absolute() && std::fs::canonicalize(path).is_ok_and(|real| real != path)
+                {
+                    return Err(ArchiveFsError::Config(format!(
+                        "journal records historical Applied but {} is redirected; current containment is unverified; preserve journal and review recovery",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every transaction journal in `dir`, parsed, in a stable order.
