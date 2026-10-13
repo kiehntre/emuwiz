@@ -185,6 +185,28 @@ pub(super) struct UpgradeLock {
 }
 
 impl UpgradeLock {
+    /// Like [`acquire`](Self::acquire) but waits (bounded) for another holder,
+    /// for callers that must serialise rather than fail, such as concurrent
+    /// first-run database creation.
+    pub(super) fn acquire_waiting(
+        database_path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match Self::acquire(database_path) {
+                Ok(lock) => return Ok(lock),
+                Err(error)
+                    if error.to_string().contains("is already running")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(super) fn acquire(database_path: &Path) -> Result<Self> {
         let mut name = file_name_of(database_path)?.to_os_string();
         name.push(".upgrade.lock");
@@ -498,6 +520,12 @@ fn open_regular(path: &Path) -> std::result::Result<(File, fs::Metadata), Upgrad
                 path.display()
             )));
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(UpgradeBackupState::Inconsistent(format!(
+                "{} is missing (an ownership receipt without its backup, or a vanished file)",
+                path.display()
+            )));
+        }
         Err(error) => {
             return Err(UpgradeBackupState::Inconsistent(format!(
                 "{} could not be opened safely (symlink or substitution?): {error}",
@@ -637,6 +665,47 @@ pub(super) fn inspect_upgrade_backup(
 /// Nothing is created, adopted, reused, restored or removed.
 pub fn inspect_upgrade_backups(database_path: &Path) -> Result<Vec<UpgradeBackupInspection>> {
     Ok(recognised_backups(database_path)?
+        .into_iter()
+        .map(|backup_path| UpgradeBackupInspection {
+            state: inspect_upgrade_backup(database_path, &backup_path),
+            backup_path,
+        })
+        .collect())
+}
+
+/// Read-only evidence listing for History: every recognised backup, plus any
+/// ownership receipt whose backup file is missing (classified `Inconsistent`).
+/// Unlike [`inspect_upgrade_backups`] this surfaces orphan receipts; like it, it
+/// creates, adopts, reuses, restores and deletes nothing and grants no authority.
+pub fn inspect_upgrade_backup_evidence(
+    database_path: &Path,
+) -> Result<Vec<UpgradeBackupInspection>> {
+    let mut targets = recognised_backups(database_path)?;
+    let database_name = file_name_of(database_path)?;
+    let entries = fs::read_dir(parent_of(database_path)).map_err(|error| {
+        db_error(format!(
+            "could not list {}: {error}",
+            parent_of(database_path).display()
+        ))
+    })?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name
+            .as_bytes()
+            .strip_suffix(BACKUP_RECEIPT_SUFFIX.as_bytes())
+        else {
+            continue;
+        };
+        let stem = OsStr::from_bytes(stem);
+        if recognised_backup_name(database_name, stem) {
+            let backup = parent_of(database_path).join(stem);
+            if !targets.contains(&backup) {
+                targets.push(backup);
+            }
+        }
+    }
+    targets.sort();
+    Ok(targets
         .into_iter()
         .map(|backup_path| UpgradeBackupInspection {
             state: inspect_upgrade_backup(database_path, &backup_path),

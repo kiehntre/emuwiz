@@ -3475,3 +3475,71 @@ fn switching_pages_and_back_leaves_no_stale_merged_rows() {
         "returning to the Library must show the reloaded catalogue, not the stale one"
     );
 }
+
+fn directory_listing(dir: &Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    let mut rows: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name(),
+                std::fs::read(entry.path()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn plain_load_of_missing_or_outdated_databases_creates_and_changes_nothing() {
+    let dir = database_test_dir("plain-load-no-side-effects");
+    let missing = dir.join("missing").join("library.sqlite3");
+    let result = load_database_snapshot_at(&missing, &dir.join("config.toml"), None);
+    assert!(matches!(result, Err(DatabaseLoadError::NotCreated { .. })));
+    assert!(!missing.exists());
+    assert!(!missing.parent().unwrap().exists());
+
+    let outdated = dir.join("library.sqlite3");
+    create_schema_seven_database(&outdated);
+    let before = directory_listing(&dir);
+    let result = load_database_snapshot_at(&outdated, &dir.join("config.toml"), None);
+    assert!(matches!(result, Err(DatabaseLoadError::Outdated { .. })));
+    assert_eq!(
+        directory_listing(&dir),
+        before,
+        "no backup, lock or receipt"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn scan_refuses_an_unreconcilable_journal_instead_of_recovering_or_upgrading() {
+    let dir = database_test_dir("scan-unsafe-journal");
+    let database_path = dir.join("library.sqlite3");
+    create_schema_seven_database(&database_path);
+    std::fs::write(dir.join("library.sqlite3-journal"), vec![0x5a_u8; 4096]).unwrap();
+    let source = dir.join("source");
+    let mount = dir.join("mount");
+    std::fs::create_dir_all(&source).unwrap();
+    let config = config_for(&source, &mount);
+    let before: Vec<_> = directory_listing(&dir)
+        .into_iter()
+        .filter(|(name, _)| name != "source" && name != "mount")
+        .collect();
+
+    let result = load_database_snapshot_at(&database_path, &dir.join("config.toml"), Some(&config));
+
+    assert!(matches!(result, Err(DatabaseLoadError::Failed { .. })));
+    assert!(database_upgrade_backups(&database_path).is_empty());
+    let after: Vec<_> = directory_listing(&dir)
+        .into_iter()
+        .filter(|(name, _)| {
+            name != "source"
+                && name != "mount"
+                && !name.to_string_lossy().ends_with(".upgrade.lock")
+        })
+        .collect();
+    assert_eq!(after, before);
+    let _ = std::fs::remove_dir_all(dir);
+}

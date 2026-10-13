@@ -66,6 +66,10 @@ mod catalogue_health;
 #[path = "database/catalogue_health_tests.rs"]
 mod catalogue_health_tests;
 pub(crate) mod forget_missing;
+mod journal_state;
+#[cfg(test)]
+#[path = "database/migration_protection_tests.rs"]
+mod migration_protection_tests;
 pub(crate) mod reconciliation;
 mod restore;
 #[cfg(test)]
@@ -489,7 +493,8 @@ fn trusted_persistable_topology(set: &MediaSet) -> bool {
 
 pub use backup_ownership::{
     BACKUP_CAPACITY_HEADROOM_BYTES, BACKUP_RECEIPT_SUFFIX, MAX_RETAINED_UPGRADE_BACKUPS,
-    UpgradeBackupInspection, UpgradeBackupState, inspect_upgrade_backups, receipt_path_for,
+    UpgradeBackupInspection, UpgradeBackupState, inspect_upgrade_backup_evidence,
+    inspect_upgrade_backups, receipt_path_for,
 };
 
 /// The durable result of an explicitly requested library-database upgrade.
@@ -1195,26 +1200,17 @@ impl Database {
             .map_err(|error| db_error("failed to roll back source refresh savepoint", error))
     }
 
-    /// Opens the database at `path`, creating the file and its parent
-    /// directory if needed, and applying any pending migrations inside
-    /// transactions. Fails clearly, without mutating the file, if its
-    /// schema version is newer than this build of EmuWiz understands.
+    /// Opens the database at `path` for read/write use. A missing (or empty,
+    /// unversioned) database is created and given the full schema under the
+    /// exclusive upgrade lock. An existing database must already be at the
+    /// current schema: this entry point **never migrates**. An outdated
+    /// database is refused with an upgrade-required error; upgrading is the
+    /// separate, explicit [`upgrade_library_database`] operation, which owns
+    /// the backup, ownership receipt and lock. A database with an unrecoverable
+    /// rollback journal, a newer schema or an ambiguous state is also refused,
+    /// without being modified.
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)
-                .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
-        }
-
-        let mut connection = open_connection(path)?;
-        apply_migrations(&mut connection, MIGRATIONS)?;
-
-        Ok(Self {
-            connection,
-            path: path.to_path_buf(),
-        })
+        open_or_create_with_migrations(path.as_ref(), MIGRATIONS)
     }
 
     /// Opens the database at [`default_database_path`], creating it (and
@@ -1621,6 +1617,137 @@ mod source_role_tests {
     }
 }
 
+/// Test seam: a genuine older-schema database built from the real migration
+/// chain, for suites outside this module.
+#[cfg(test)]
+pub(crate) fn create_older_database_for_tests(path: &Path, steps: usize) {
+    let mut connection = open_connection(path).unwrap();
+    apply_migrations(&mut connection, &MIGRATIONS[..steps]).unwrap();
+}
+
+/// What an existing file at the database path is, as far as a plain open may
+/// act on it.
+enum ExistingDatabase {
+    Current,
+    /// No schema objects and `user_version` 0: nothing to lose, may be built.
+    EmptyUnversioned,
+}
+
+/// Read-only classification of an existing database file. Never writes.
+fn classify_existing_database(path: &Path, migrations: &[Migration]) -> Result<ExistingDatabase> {
+    backup_ownership::SourceIdentity::capture(path)?;
+    journal_state::require_inert_rollback_journal(path)?;
+    let connection = open_read_only_connection(path)?;
+    let version = schema_version(&connection)?;
+    let latest = latest_known_version(migrations);
+    if version == latest {
+        return Ok(ExistingDatabase::Current);
+    }
+    if version > latest {
+        return Err(ArchiveFsError::Database(format!(
+            "database schema version {version} is newer than the highest version ({latest}) \
+             this build of EmuWiz understands; refusing to open it automatically. Nothing was \
+             changed."
+        )));
+    }
+    if version == 0 {
+        let objects: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+            .map_err(|error| {
+                ArchiveFsError::Database(format!(
+                    "could not inspect the unversioned library database: {error}"
+                ))
+            })?;
+        if objects == 0 {
+            return Ok(ExistingDatabase::EmptyUnversioned);
+        }
+        return Err(ArchiveFsError::Database(format!(
+            "The library database at {} is unversioned (schema 0) but already contains \
+             objects, so it is neither a new nor a known EmuWiz database. Refusing to modify \
+             it. Nothing was changed.",
+            path.display()
+        )));
+    }
+    Err(ArchiveFsError::Database(format!(
+        "The library database at {} uses schema {version}, but this build requires schema \
+         {latest}. It has not been changed. Upgrade it with \"Scan and upgrade library\" (the \
+         protected upgrade that takes a verified backup first); ordinary opens never migrate.",
+        path.display()
+    )))
+}
+
+fn open_existing_current(path: &Path, migrations: &[Migration]) -> Result<Database> {
+    let connection = open_connection_with(path, false)?;
+    // The file may have been replaced between classification and this open;
+    // trust only the connection that is actually in use.
+    let version = schema_version(&connection)?;
+    let latest = latest_known_version(migrations);
+    if version != latest {
+        return Err(ArchiveFsError::Database(format!(
+            "the library database at {} changed from the current schema to schema {version} \
+             while it was being opened; refusing to use or migrate it. Nothing was changed.",
+            path.display()
+        )));
+    }
+    Ok(Database {
+        connection,
+        path: path.to_path_buf(),
+    })
+}
+
+fn open_or_create_with_migrations(path: &Path, migrations: &[Migration]) -> Result<Database> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            if matches!(
+                classify_existing_database(path, migrations)?,
+                ExistingDatabase::Current
+            ) {
+                return open_existing_current(path, migrations);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ArchiveFsError::io(path.to_path_buf(), error));
+        }
+    }
+
+    // Creation. Serialised with every other creator and upgrader, then the
+    // state is re-read: another caller may have finished the job.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|source| ArchiveFsError::io(parent.to_path_buf(), source))?;
+    }
+    let _lock = backup_ownership::UpgradeLock::acquire_waiting(path, Duration::from_secs(10))?;
+    let exists = match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(ArchiveFsError::io(path.to_path_buf(), error)),
+    };
+    if exists {
+        match classify_existing_database(path, migrations)? {
+            ExistingDatabase::Current => return open_existing_current(path, migrations),
+            ExistingDatabase::EmptyUnversioned => {}
+        }
+    }
+    journal_state::require_inert_rollback_journal(path)?;
+    let mut connection = open_connection(path)?;
+    let observed = schema_version(&connection)?;
+    if observed != 0 {
+        return Err(ArchiveFsError::Database(format!(
+            "the library database at {} appeared at schema {observed} while it was being \
+             created; refusing to migrate it. Nothing was changed.",
+            path.display()
+        )));
+    }
+    apply_migrations(&mut connection, migrations)?;
+    Ok(Database {
+        connection,
+        path: path.to_path_buf(),
+    })
+}
+
 /// Backs up and upgrades an existing, older library database using the
 /// migration chain already compiled into this build. This is deliberately a
 /// separate, write-authorized entry point: read-only health checks and normal
@@ -1633,6 +1760,31 @@ mod source_role_tests {
 /// backup that contains the exact pre-upgrade schema and data.
 pub fn upgrade_library_database(path: impl AsRef<Path>) -> Result<DatabaseUpgradeReport> {
     upgrade_library_database_with_migrations(path.as_ref(), MIGRATIONS)
+}
+
+#[cfg(test)]
+type UpgradeStageHook = Box<dyn Fn(&str, &Path) -> std::result::Result<(), String>>;
+
+#[cfg(test)]
+thread_local! {
+    static UPGRADE_STAGE_HOOK: std::cell::RefCell<Option<UpgradeStageHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Deterministic fault-injection seam for tests: lets a test replace files or
+/// simulate an interruption at a named transition boundary of the upgrade.
+#[cfg(test)]
+fn upgrade_stage(stage: &str, path: &Path) -> Result<()> {
+    UPGRADE_STAGE_HOOK.with(|hook| match hook.borrow().as_ref() {
+        Some(hook) => hook(stage, path).map_err(ArchiveFsError::Database),
+        None => Ok(()),
+    })
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn upgrade_stage(_stage: &str, _path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn upgrade_library_database_with_migrations(
@@ -1649,8 +1801,15 @@ fn upgrade_library_database_with_migrations(
     // only one upgrade of a database may run at a time.
     let source_identity = backup_ownership::SourceIdentity::capture(path)?;
     let _upgrade_lock = backup_ownership::UpgradeLock::acquire(path)?;
+    upgrade_stage("after-lock", path)?;
+    // The identity was captured before the lock was held; confirm that the
+    // path still names that file and that its sidecars are reconcilable
+    // before SQLite is allowed to open it at all.
+    source_identity.recheck(path)?;
+    journal_state::require_reconcilable_for_migration(path)?;
 
     let source = open_read_only_connection(path)?;
+    source_identity.recheck(path)?;
     let from_version = schema_version(&source)?;
     let to_version = latest_known_version(migrations);
     if from_version > to_version {
@@ -1730,9 +1889,13 @@ fn upgrade_library_database_with_migrations(
     }
 
     let migration_result = (|| {
-        // The path must still name the file that was backed up.
+        upgrade_stage("after-backup", path)?;
+        // The path must still name the file that was backed up, and its
+        // journal/WAL state must still be reconcilable.
         source_identity.recheck(path)?;
-        let mut connection = open_connection(path)?;
+        journal_state::require_reconcilable_for_migration(path)?;
+        let mut connection = open_connection_with(path, false)?;
+        source_identity.recheck(path)?;
         let observed_version = schema_version(&connection)?;
         if observed_version != from_version {
             return Err(ArchiveFsError::Database(format!(
@@ -1740,7 +1903,9 @@ fn upgrade_library_database_with_migrations(
                  the backup was being prepared; refusing to migrate it"
             )));
         }
-        apply_migrations(&mut connection, migrations)?;
+        apply_migrations_checked(&mut connection, migrations, &mut |_| {
+            source_identity.recheck(path)
+        })?;
         let migrated_version = schema_version(&connection)?;
         if migrated_version != to_version {
             return Err(ArchiveFsError::Database(format!(
@@ -2367,14 +2532,17 @@ fn sqlite_diagnostic(error: &rusqlite::Error) -> DatabaseDiagnostic {
 }
 
 fn open_connection(path: &Path) -> Result<Connection> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    )
-    .map_err(|error| {
+    open_connection_with(path, true)
+}
+
+fn open_connection_with(path: &Path, create: bool) -> Result<Connection> {
+    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    if create {
+        flags |= OpenFlags::SQLITE_OPEN_CREATE;
+    }
+    let connection = Connection::open_with_flags(path, flags).map_err(|error| {
         ArchiveFsError::Database(format!("failed to open {}: {error}", path.display()))
     })?;
     connection
@@ -2469,6 +2637,17 @@ fn foreign_keys_enabled(connection: &Connection) -> Result<bool> {
 /// whose recorded version is higher than any migration this build knows
 /// about is rejected before anything is touched.
 fn apply_migrations(connection: &mut Connection, migrations: &[Migration]) -> Result<()> {
+    apply_migrations_checked(connection, migrations, &mut |_| Ok(()))
+}
+
+/// [`apply_migrations`] with a caller-supplied check run immediately before
+/// each migration step begins (used by the protected upgrade to re-verify the
+/// database file identity at every step boundary).
+fn apply_migrations_checked(
+    connection: &mut Connection,
+    migrations: &[Migration],
+    before_step: &mut dyn FnMut(i64) -> Result<()>,
+) -> Result<()> {
     let current_version = schema_version(connection)?;
     let target_version = latest_known_version(migrations);
 
@@ -2484,6 +2663,7 @@ fn apply_migrations(connection: &mut Connection, migrations: &[Migration]) -> Re
         if migration.version <= current_version {
             continue;
         }
+        before_step(migration.version)?;
 
         let tx = connection.transaction().map_err(|error| {
             ArchiveFsError::Database(format!("failed to start migration transaction: {error}"))
@@ -10005,6 +10185,7 @@ mod tests {
         // then let the normal migration runner advance that copy.
         let restored_path = root.join("restored.sqlite3");
         fs::copy(&backup_path, &restored_path).unwrap();
+        upgrade_library_database(&restored_path).unwrap();
         let restored = Database::open_or_create(&restored_path).unwrap();
         assert_eq!(
             restored.schema_version().unwrap(),
@@ -10367,6 +10548,7 @@ mod tests {
         let root = temp_dir("v05-upgrade");
         let database_path = root.join("library.sqlite3");
         create_representative_older_database(&database_path, 3);
+        upgrade_library_database(&database_path).unwrap();
 
         let database = Database::open_or_create(&database_path).unwrap();
         assert_eq!(database.schema_version().unwrap(), latest_schema_version());
@@ -10387,6 +10569,7 @@ mod tests {
         let root = temp_dir("v06-upgrade");
         let database_path = root.join("library.sqlite3");
         create_representative_older_database(&database_path, 4);
+        upgrade_library_database(&database_path).unwrap();
 
         let database = Database::open_or_create(&database_path).unwrap();
         assert_eq!(database.schema_version().unwrap(), latest_schema_version());
@@ -10458,6 +10641,7 @@ mod tests {
         let root = temp_dir(name);
         let database_path = root.join("library.sqlite3");
         create_representative_older_database(&database_path, 7);
+        upgrade_library_database(&database_path).unwrap();
         let database = Database::open_or_create(&database_path).unwrap();
         assert_eq!(database.schema_version().unwrap(), latest_schema_version());
         (root, database)
@@ -10848,7 +11032,11 @@ mod tests {
 
         let error = Database::open_or_create(&linked_path).unwrap_err();
 
-        assert!(error.to_string().contains("failed to open"));
+        let text = error.to_string();
+        assert!(
+            text.contains("failed to open") || text.contains("not a regular file"),
+            "{text}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -13953,6 +14141,7 @@ mod tests {
             1
         );
 
+        upgrade_library_database(&db_path).unwrap();
         let database = Database::open_or_create(&db_path).unwrap();
         assert_eq!(database.schema_version().unwrap(), latest_schema_version());
         let source_folder_count: i64 = database
@@ -18325,6 +18514,7 @@ mod tests {
             let root = temp_dir("v08-upgrade");
             let database_path = root.join("library.sqlite3");
             create_representative_older_database(&database_path, 7);
+            upgrade_library_database(&database_path).unwrap();
 
             let mut database = Database::open_or_create(&database_path).unwrap();
             assert_eq!(database.schema_version().unwrap(), latest_schema_version());

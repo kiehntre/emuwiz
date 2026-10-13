@@ -246,9 +246,17 @@ impl OperationRegistry {
     }
 
     /// Enumerates retained database backup files as historical operations.
-    /// Their presence is useful history, but their original hash and
-    /// pre-operation state are not persisted by the legacy naming format, so
-    /// rollback is never advertised.
+    ///
+    /// Canonical pre-upgrade backups (`<db>.schema-<from>-before-<to>.backup[.N]`)
+    /// are classified from their ownership receipt by the read-only
+    /// `inspect_upgrade_backup_evidence`: only a complete, verified owned backup
+    /// is reported as verified; incomplete, unowned, inconsistent and
+    /// inaccessible material is reported as exactly that. Receipt sidecars are
+    /// evidence for their backup, never separate backups. Recognition here is
+    /// descriptive only: every record carries no resume, rollback or review
+    /// action, so History never grants reuse, migration or restoration authority.
+    /// Older `.before-` names (no receipt format) remain listed as legacy,
+    /// unrecoverable records.
     pub fn append_database_backup_history(&mut self, database_path: &Path) {
         let Some(parent) = database_path.parent() else {
             return;
@@ -256,6 +264,19 @@ impl OperationRegistry {
         let Some(database_name) = database_path.file_name() else {
             return;
         };
+        let mut canonical = std::collections::HashSet::new();
+        match crate::inspect_upgrade_backup_evidence(database_path) {
+            Ok(found) => {
+                for inspection in found {
+                    canonical.insert(inspection.backup_path.clone());
+                    self.records
+                        .push(upgrade_backup_record(database_path, &inspection));
+                }
+            }
+            Err(error) => self
+                .problems
+                .push(format!("{}: {error}", database_path.display())),
+        }
         let prefix = format!("{}.schema-", database_name.to_string_lossy());
         let Ok(entries) = std::fs::read_dir(parent) else {
             return;
@@ -265,7 +286,11 @@ impl OperationRegistry {
             let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
                 continue;
             };
-            if !name.starts_with(&prefix) || !name.contains(".before-") || !name.contains(".backup")
+            if canonical.contains(&path)
+                || name.ends_with(crate::database::BACKUP_RECEIPT_SUFFIX)
+                || !name.starts_with(&prefix)
+                || !name.contains(".before-")
+                || !name.contains(".backup")
             {
                 continue;
             }
@@ -290,7 +315,7 @@ impl OperationRegistry {
                     outputs: vec![OperationOutput {
                         path: path.to_string_lossy().into_owned(),
                         changed: true,
-                        verified: hash != "unavailable",
+                        verified: false,
                         before_state: None,
                         after_state: Some(format!("sha256:{hash}")),
                     }],
@@ -757,6 +782,120 @@ pub fn database_recovery_operation(
             },
         },
         error: (!verified).then_some(reason.into()),
+    }
+}
+
+/// Projects one upgrade-backup inspection into a descriptive History record.
+/// The record never advertises an action; see `append_database_backup_history`.
+fn upgrade_backup_record(
+    database_path: &Path,
+    inspection: &crate::UpgradeBackupInspection,
+) -> OperationRecord {
+    use crate::UpgradeBackupState as Backup;
+    let path_text = inspection.backup_path.to_string_lossy().into_owned();
+    let name_hex: String = inspection
+        .backup_path
+        .file_name()
+        .map(|name| {
+            std::os::unix::ffi::OsStrExt::as_bytes(name)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let (state, verified, after_state, summary, explanation, error, classification, label) =
+        match &inspection.state {
+            Backup::Verified {
+                from_version,
+                to_version,
+                len,
+                sha256,
+            } => (
+                OperationState::Completed,
+                true,
+                Some(format!("sha256:{sha256}")),
+                format!(
+                    "Pre-upgrade database backup (schema {from_version} to {to_version}, {len} bytes): ownership receipt, SHA-256 and SQLite integrity verified"
+                ),
+                "A complete owned backup is retained. Recognising it in History grants no restore, reuse or migration authority.".to_string(),
+                None,
+                RecoveryClassification::RequiresReview,
+                "verified_owned",
+            ),
+            Backup::Incomplete => (
+                OperationState::Interrupted,
+                false,
+                None,
+                "Pre-upgrade database backup was never completed; it is retained but not usable".to_string(),
+                "Incomplete backup: its ownership receipt never completed. It is not adopted and cannot be used.".to_string(),
+                Some("incomplete backup".to_string()),
+                RecoveryClassification::Unrecoverable,
+                "incomplete",
+            ),
+            Backup::Unowned => (
+                OperationState::Completed,
+                false,
+                None,
+                "File with a backup name but no ownership receipt; provenance unknown".to_string(),
+                "Unowned file: it was not created under an ownership receipt, so it is not trusted, adopted or offered for recovery.".to_string(),
+                None,
+                RecoveryClassification::Unrecoverable,
+                "unowned",
+            ),
+            Backup::Inconsistent(reason) => (
+                OperationState::Failed,
+                false,
+                None,
+                "Pre-upgrade database backup and its ownership receipt do not agree".to_string(),
+                format!("Missing or inconsistent evidence: {reason}"),
+                Some(reason.clone()),
+                RecoveryClassification::Unrecoverable,
+                "inconsistent",
+            ),
+            Backup::Inaccessible(reason) => (
+                OperationState::Failed,
+                false,
+                None,
+                "Pre-upgrade database backup material could not be read".to_string(),
+                format!("Inaccessible: {reason}. Recovery accessibility is not established."),
+                Some(reason.clone()),
+                RecoveryClassification::Unrecoverable,
+                "inaccessible",
+            ),
+        };
+    OperationRecord {
+        schema_version: OPERATION_RECEIPT_SCHEMA_VERSION,
+        operation_id: format!("database-backup:{label}:{name_hex}"),
+        kind: OperationKind::DatabaseBackup,
+        state,
+        created_at_unix: 0,
+        started_at_unix: None,
+        completed_at_unix: None,
+        input: OperationInputSnapshot {
+            source_root: Some(database_path.to_string_lossy().into_owned()),
+            plan_generation: None,
+            plan_hash: None,
+            freshness_evidence: vec![format!("upgrade_backup_{label}")],
+            destination_occupancy_checked: false,
+        },
+        destination: Some(path_text.clone()),
+        output: OperationOutputReceipt {
+            outputs: vec![OperationOutput {
+                path: path_text,
+                changed: true,
+                verified,
+                before_state: None,
+                after_state,
+            }],
+            journal_reference: None,
+            summary,
+        },
+        recovery: OperationRecoveryStatus {
+            classification,
+            explanation,
+            actions: OperationActionAvailability::default(),
+        },
+        error,
     }
 }
 
@@ -2131,5 +2270,197 @@ mod tests {
         ));
         // No journal directory was ever created for this refused attempt.
         assert!(!dir.path().join("journal").exists());
+    }
+
+    // ---- database backup history recognition -------------------------------
+
+    fn history_for(db: &Path) -> OperationRegistry {
+        let mut registry = OperationRegistry::default();
+        registry.append_database_backup_history(db);
+        registry
+    }
+
+    fn backup_record<'a>(registry: &'a OperationRegistry, name: &str) -> &'a OperationRecord {
+        registry
+            .records
+            .iter()
+            .find(|record| {
+                record
+                    .destination
+                    .as_deref()
+                    .is_some_and(|path| path.ends_with(name))
+            })
+            .unwrap_or_else(|| panic!("no history record for {name}"))
+    }
+
+    fn synthetic_old_database(path: &Path) {
+        crate::database::create_older_database_for_tests(path, 7);
+    }
+
+    #[test]
+    fn history_recognises_canonical_backups_and_never_lists_receipts_as_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("library.sqlite3");
+        synthetic_old_database(&db);
+        let report = crate::upgrade_library_database(&db).unwrap();
+        let name = report
+            .backup_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let registry = history_for(&db);
+        assert_eq!(
+            registry.records.len(),
+            1,
+            "one backup, receipt is not a second record: {:?}",
+            registry.records
+        );
+        let record = backup_record(&registry, &name);
+        assert_eq!(record.kind, OperationKind::DatabaseBackup);
+        assert_eq!(record.state, OperationState::Completed);
+        assert!(record.output.outputs[0].verified);
+        assert_eq!(
+            record.output.outputs[0].after_state.as_deref(),
+            Some(format!("sha256:{}", report.backup_sha256).as_str())
+        );
+        // Recognition is descriptive: no action of any kind is offered.
+        assert_eq!(
+            record.recovery.actions,
+            OperationActionAvailability::default()
+        );
+        assert!(!registry.records.iter().any(|r| {
+            r.destination
+                .as_deref()
+                .is_some_and(|p| p.ends_with(".receipt.json"))
+        }));
+    }
+
+    #[test]
+    fn history_distinguishes_incomplete_unowned_inconsistent_and_missing_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("library.sqlite3");
+        synthetic_old_database(&db);
+        let report = crate::upgrade_library_database(&db).unwrap();
+        let base = dir.path();
+        let verified = report.backup_path.clone();
+
+        // Unowned: canonical name, no receipt.
+        let unowned = base.join("library.sqlite3.schema-3-before-9.backup");
+        fs::copy(&verified, &unowned).unwrap();
+        // Inconsistent: receipt present, backup bytes differ.
+        let tampered = base.join("library.sqlite3.schema-3-before-9.backup.1");
+        fs::copy(&verified, &tampered).unwrap();
+        fs::copy(
+            crate::database::receipt_path_for(&verified),
+            crate::database::receipt_path_for(&tampered),
+        )
+        .unwrap();
+        // Orphan receipt: receipt without a backup file.
+        let orphan = base.join("library.sqlite3.schema-3-before-9.backup.2");
+        fs::copy(
+            crate::database::receipt_path_for(&verified),
+            crate::database::receipt_path_for(&orphan),
+        )
+        .unwrap();
+
+        let registry = history_for(&db);
+        let get = |p: &Path| backup_record(&registry, &p.file_name().unwrap().to_string_lossy());
+        assert!(get(&verified).output.outputs[0].verified);
+        for (path, label) in [
+            (&unowned, "unowned"),
+            (&tampered, "inconsistent"),
+            (&orphan, "inconsistent"),
+        ] {
+            let record = get(path);
+            assert!(!record.output.outputs[0].verified, "{label}: {path:?}");
+            assert_eq!(
+                record.recovery.classification,
+                RecoveryClassification::Unrecoverable,
+                "{label}"
+            );
+            assert_eq!(
+                record.recovery.actions,
+                OperationActionAvailability::default()
+            );
+            assert!(
+                record.input.freshness_evidence[0].contains(label),
+                "{label}"
+            );
+        }
+        // None of these were adopted: a fresh upgrade claims a new name.
+        assert!(!registry.records.is_empty());
+    }
+
+    #[test]
+    fn history_listing_creates_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("library.sqlite3");
+        synthetic_old_database(&db);
+        crate::upgrade_library_database(&db).unwrap();
+        let before: Vec<_> = {
+            let mut rows: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| {
+                    let e = e.unwrap();
+                    (e.file_name(), fs::read(e.path()).unwrap_or_default())
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        let _ = history_for(&db);
+        let mut after: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), fs::read(e.path()).unwrap_or_default())
+            })
+            .collect();
+        after.sort();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn history_still_lists_legacy_dot_before_names_as_unrecoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("library.sqlite3");
+        fs::write(&db, b"x").unwrap();
+        fs::write(
+            dir.path().join("library.sqlite3.schema-1.before-2.backup"),
+            b"old",
+        )
+        .unwrap();
+        let registry = history_for(&db);
+        assert_eq!(registry.records.len(), 1);
+        assert!(!registry.records[0].output.outputs[0].verified);
+        assert_eq!(
+            registry.records[0].recovery.classification,
+            RecoveryClassification::Unrecoverable
+        );
+    }
+
+    #[test]
+    fn history_reports_an_in_progress_receipt_as_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("library.sqlite3");
+        synthetic_old_database(&db);
+        let report = crate::upgrade_library_database(&db).unwrap();
+        let receipt = crate::database::receipt_path_for(&report.backup_path);
+        let text = fs::read_to_string(&receipt).unwrap();
+        assert!(text.contains("\"complete\""));
+        fs::write(&receipt, text.replace("\"complete\"", "\"in_progress\"")).unwrap();
+
+        let registry = history_for(&db);
+        assert_eq!(registry.records.len(), 1);
+        let record = &registry.records[0];
+        assert_eq!(record.state, OperationState::Interrupted);
+        assert!(!record.output.outputs[0].verified);
+        assert!(record.input.freshness_evidence[0].contains("incomplete"));
+        assert_eq!(
+            record.recovery.actions,
+            OperationActionAvailability::default()
+        );
     }
 }
